@@ -595,13 +595,7 @@ A final agent result is not a substitute for checking `git diff`, tests, or othe
 
 # `my-lubko-agent wait <id>`
 
-Wait until an agent stops actively running.
-
-```sh
-my-lubko-agent wait 8e064622
-```
-
-A timeout can be used when appropriate:
+Wait until an agent stops actively running. A timeout must be used:
 
 ```sh
 my-lubko-agent wait 8e064622 --timeout 300
