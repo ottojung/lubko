@@ -761,6 +761,10 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
     Returns:
         The persisted final status.
     """
+    # The whole result object is assembled atomically with jsonb_build_object.
+    # A bare to_jsonb(NULL) inside jsonb_set would make the whole update SQL
+    # NULL, violating payload NOT NULL; jsonb_build_object turns SQL null into
+    # JSON null and replaces/creates the result parent in one jsonb_set call.
     set_chain = _jsonb_set_chain(
         "payload::jsonb",
         [
@@ -776,12 +780,14 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
             ),
             ("state,finished_at", UTC_ISO_SQL),
             ("state,updated_at", UTC_ISO_SQL),
-            ("result,stdout", "to_jsonb(%(stdout)s::text)"),
-            ("result,stderr", "to_jsonb(%(stderr)s::text)"),
-            ("result,exit_code", "to_jsonb(%(exit_code)s::int)"),
             (
-                "result,cancellation_note",
+                "result",
                 (
+                    "jsonb_build_object("
+                    "'stdout', to_jsonb(%(stdout)s::text), "
+                    "'stderr', to_jsonb(%(stderr)s::text), "
+                    "'exit_code', to_jsonb(%(exit_code)s::int), "
+                    "'cancellation_note', "
                     "CASE\n"
                     "    WHEN (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
                     "        THEN COALESCE(\n"
@@ -789,6 +795,7 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
                     "            to_jsonb('cancelled by request'::text))\n"
                     "    ELSE to_jsonb(%(cancellation_note)s::text)\n"
                     "END"
+                    ")"
                 ),
             ),
         ],
@@ -887,7 +894,11 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
         SchemaInvariantError: If the table does not have exactly ``id`` and
             ``payload`` as its only columns, with ``payload`` of type ``text``.
     """
-    with conn.cursor(row_factory=tuple_row) as cursor:
+    # The read runs inside its own top-level transaction so it commits cleanly
+    # before the processing loop. Without it the default implicit transaction
+    # stays open and every later conn.transaction() block becomes a savepoint,
+    # so claimed job updates would never commit.
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT column_name, data_type\n"
             "FROM information_schema.columns\n"

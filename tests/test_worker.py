@@ -627,6 +627,7 @@ def test_finish_job_persists_success_result() -> None:
     assert status == "succeeded"
     sql, params = conn.executions[0]
     assert "CASE" in sql
+    assert "jsonb_build_object" in sql
     assert "'running'" in sql
     assert "payload::jsonb" in sql
     assert "::text" in sql
@@ -656,9 +657,48 @@ def test_finish_job_persists_cancellation_result() -> None:
     assert status == "cancelled"
     sql, params = conn.executions[0]
     assert "CASE" in sql
+    assert "jsonb_build_object" in sql
     assert "payload::jsonb" in sql
     assert "::text" in sql
     assert isinstance(params, dict)
     assert params["status"] == "cancelled"
     assert params["exit_code"] == -signal.SIGTERM
     assert params["cancellation_note"] == "cancelled: sent SIGTERM to process group"
+
+
+def test_finish_job_builds_result_atomically_as_json_object() -> None:
+    """finish_job assembles the whole result in one jsonb_build_object.
+
+    A per-field jsonb_set path ending in ``to_jsonb(NULL)`` would make the
+    whole update SQL NULL and violate the payload NOT NULL constraint. The
+    result parent must also be created when absent, so only the ``{result}``
+    path is written.
+    """
+    conn = _RecordingConnection()
+    conn.rows = [("succeeded",)]
+    job_id = uuid4()
+    result = JobResult(
+        status="succeeded",
+        exit_code=0,
+        stdout="out\n",
+        stderr="err\n",
+        cancellation_note=None,
+    )
+
+    finish_job(as_db(conn), job_id, result)
+
+    result_path = "'{" + "result" + "}'"
+    field_paths = [
+        "'{" + "result,stdout" + "}'",
+        "'{" + "result,stderr" + "}'",
+        "'{" + "result,exit_code" + "}'",
+        "'{" + "result,cancellation_note" + "}'",
+    ]
+    sql, params = conn.executions[0]
+    assert "jsonb_build_object" in sql
+    assert result_path in sql
+    for path in field_paths:
+        assert path not in sql
+    assert "::text" in sql
+    assert isinstance(params, dict)
+    assert params["cancellation_note"] is None

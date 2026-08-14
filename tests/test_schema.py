@@ -1,5 +1,7 @@
 """Tests enforcing the two-column transport invariant and the migration files."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Final, Self, cast
 
@@ -39,9 +41,15 @@ class _FakeConnection:
 
     def __init__(self, rows: list[tuple[str, str]]) -> None:
         self._rows = rows
+        self.transaction_count = 0
 
     def cursor(self, **_kwargs: object) -> "_FakeCursor":
         return _FakeCursor(self._rows)
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        self.transaction_count += 1
+        yield
 
 
 def as_connection(conn: _FakeConnection) -> psycopg.Connection[tuple[object, ...]]:
@@ -61,6 +69,20 @@ def test_verify_accepts_exactly_two_columns() -> None:
     conn = as_connection(_FakeConnection([("id", "uuid"), ("payload", "text")]))
 
     verify_jobs_table_invariant(conn)
+
+
+def test_verify_wraps_invariant_read_in_own_transaction() -> None:
+    """The invariant read commits in its own top-level transaction.
+
+    A bare SELECT on a default psycopg connection would leave an implicit
+    transaction open, turning every later ``conn.transaction()`` block into a
+    savepoint so claimed job updates never commit.
+    """
+    fake = _FakeConnection([("id", "uuid"), ("payload", "text")])
+
+    verify_jobs_table_invariant(as_connection(fake))
+
+    assert fake.transaction_count == 1
 
 
 def test_verify_rejects_legacy_multi_column_schema() -> None:
