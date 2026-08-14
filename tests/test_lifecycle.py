@@ -1,5 +1,6 @@
 """Tests for Lubko worker lifecycle management."""
 
+import argparse
 import os
 import shutil
 import signal
@@ -15,7 +16,7 @@ from unittest import mock
 import psycopg
 import pytest
 
-from lubko import lifecycle
+from lubko import lifecycle, toolchain
 from lubko.config import DatabaseConfig
 from lubko.lifecycle import (
     EXIT_ERROR,
@@ -249,6 +250,65 @@ def write_fake_uv(directory: Path, *, fail_on: str | None = None) -> str:
     script.write_text("\n".join(lines) + "\n")
     script.chmod(0o755)
     return str(script)
+
+
+def write_uv_executable(directory: Path, *, name: str = "uv") -> str:
+    """Write a trivial executable named for resolution tests.
+
+    Args:
+        directory: Directory to write the script into.
+        name: Executable file name.
+
+    Returns:
+        The absolute path of the executable.
+    """
+    script = directory / name
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+def make_deploy_args(tmp_path: Path, *, uv: str | None) -> argparse.Namespace:
+    """Build CLI deploy arguments for resolution tests.
+
+    Args:
+        tmp_path: Repository path to record.
+        uv: The ``--uv`` value.
+
+    Returns:
+        A namespace matching the deploy subparser.
+    """
+    return argparse.Namespace(
+        repo=tmp_path,
+        uv=uv,
+        bootstrap=False,
+        grace_seconds=0.5,
+        db_timeout=1.0,
+        lock_timeout=1.0,
+        validation_timeout=5.0,
+        git_timeout=5.0,
+    )
+
+
+def capture_deploy_uv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    """Replace lifecycle.deploy with a resolver capture.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        A list filled with the uv path passed to deploy.
+    """
+    captured: list[str] = []
+
+    def recording_deploy(options: lifecycle.DeployOptions) -> int:
+        captured.append(options.uv_path)
+        return EXIT_OK
+
+    monkeypatch.setattr(lifecycle, "deploy", recording_deploy)
+    return captured
 
 
 @pytest.fixture(autouse=True)
@@ -698,3 +758,98 @@ def test_main_status_dispatch(
     """The CLI dispatches the status subcommand."""
     assert lifecycle.main(["status"]) == EXIT_OK
     assert "state: unmanaged" in capsys.readouterr().out
+
+
+def test_deploy_cmd_prefers_explicit_uv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit --uv wins over PATH and recorded executables."""
+    explicit = write_uv_executable(tmp_path, name="explicit-uv")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_uv_executable(bin_dir)
+    recorded = write_uv_executable(tmp_path, name="recorded-uv")
+    toolchain.write_toolchain(recorded)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    captured = capture_deploy_uv(monkeypatch)
+    args = make_deploy_args(tmp_path, uv=explicit)
+    assert lifecycle.deploy_cmd(args) == EXIT_OK
+    assert captured == [explicit]
+
+
+def test_deploy_cmd_uses_path_uv_before_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Uv on PATH wins over the recorded executable."""
+    path_dir = tmp_path / "path"
+    path_dir.mkdir()
+    on_path = write_uv_executable(path_dir)
+    recorded = write_uv_executable(tmp_path, name="recorded-uv")
+    toolchain.write_toolchain(recorded)
+    monkeypatch.setenv("PATH", str(path_dir))
+
+    captured = capture_deploy_uv(monkeypatch)
+    args = make_deploy_args(tmp_path, uv=None)
+    assert lifecycle.deploy_cmd(args) == EXIT_OK
+    assert captured == [on_path]
+
+
+def test_deploy_cmd_uses_recorded_uv_when_not_on_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With uv off PATH, the recorded executable is used."""
+    recorded = write_uv_executable(tmp_path, name="recorded-uv")
+    toolchain.write_toolchain(recorded)
+    monkeypatch.setenv("PATH", "/nonexistent")
+
+    captured = capture_deploy_uv(monkeypatch)
+    args = make_deploy_args(tmp_path, uv=None)
+    assert lifecycle.deploy_cmd(args) == EXIT_OK
+    assert captured == [recorded]
+
+
+def test_deploy_cmd_rejects_broken_explicit_uv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A broken explicit --uv is refused even though uv is on PATH."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    write_uv_executable(bin_dir)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    args = make_deploy_args(tmp_path, uv=str(tmp_path / "missing-uv"))
+    assert lifecycle.deploy_cmd(args) == EXIT_ERROR
+    assert "explicit uv executable" in capsys.readouterr().err
+
+
+def test_deploy_cmd_fails_without_any_uv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Without uv on PATH or a recorded toolchain, deploy fails clearly."""
+    monkeypatch.setenv("PATH", "/nonexistent")
+
+    args = make_deploy_args(tmp_path, uv=None)
+    assert lifecycle.deploy_cmd(args) == EXIT_ERROR
+    assert "uv" in capsys.readouterr().err
+
+
+def test_deploy_cmd_fails_on_stale_recorded_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A stale recorded path prevents deployment without uv on PATH."""
+    toolchain.write_toolchain(str(tmp_path / "gone-uv"))
+    monkeypatch.setenv("PATH", "/nonexistent")
+
+    args = make_deploy_args(tmp_path, uv=None)
+    assert lifecycle.deploy_cmd(args) == EXIT_ERROR
+    assert "recorded" in capsys.readouterr().err

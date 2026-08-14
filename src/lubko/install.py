@@ -6,6 +6,10 @@ directory (``$XDG_BIN_HOME`` or ``~/.local/bin``) using ``uv tool install``.
 That directory is already on PATH for login and interactive shells, so the
 maintained commands stay available everywhere without any hand-maintained
 copies or ad-hoc shell aliases.
+
+The exact ``uv`` executable that successfully installs the tools is recorded
+into the per-user Lubko state (``$XDG_STATE_HOME/lubko/toolchain.json``), so
+later deployments keep working even when ``uv`` is no longer on PATH.
 """
 
 from __future__ import annotations
@@ -17,6 +21,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Final
+
+from lubko.toolchain import UvResolutionError, resolve_uv, write_toolchain
 
 ENTRY_POINTS: Final = ("lubko-agent", "lubko-worker", "lubko-deploy")
 PACKAGE_NAME: Final = "lubko"
@@ -111,8 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--uv",
-        default="uv",
-        help="uv executable (default: uv on PATH)",
+        default=None,
+        help="uv executable (default: uv on PATH, then the recorded Lubko toolchain path)",
     )
     parser.add_argument(
         "--dry-run",
@@ -138,16 +144,16 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     if not args.dry_run:
-        uv_path = shutil.which(args.uv) or args.uv
-        if shutil.which(uv_path) is None and not (
-            Path(uv_path).is_file() and os.access(uv_path, os.X_OK)
-        ):
-            _err(f"uv executable not found: {args.uv}")
+        try:
+            uv_path = resolve_uv(args.uv)
+        except UvResolutionError as exc:
+            _err(str(exc))
             return EXIT_ERROR
         code = tool_install(repo, uv_path)
         if code != 0:
             _err(f"uv tool install failed with exit code {code}")
             return EXIT_ERROR
+        write_toolchain(uv_path)
 
     missing = missing_entry_points()
     if missing:

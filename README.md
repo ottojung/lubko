@@ -122,12 +122,13 @@ identity to stop or replace that worker later — never via broad `pkill`,
 `killall`, or process-name matching.
 
 Per-user lifecycle state follows XDG conventions under
-`$XDG_STATE_HOME/lubko/worker` (default `~/.local/state/lubko/worker`):
+`$XDG_STATE_HOME/lubko` (default `~/.local/state/lubko`):
 
-- `meta.json` — lifecycle metadata, written atomically;
-- `worker.log` — appended stdout/stderr of the maintained worker;
-- `deploy.log` — deployment event log;
-- `.deploy.lock` — flock-protected serialization of deployments.
+- `worker/meta.json` — lifecycle metadata, written atomically;
+- `worker/worker.log` — appended stdout/stderr of the maintained worker;
+- `worker/deploy.log` — deployment event log;
+- `worker/.deploy.lock` — flock-protected serialization of deployments;
+- `toolchain.json` — versioned record of the maintained `uv` executable.
 
 ### Commands
 
@@ -140,6 +141,18 @@ lubko-deploy log [--lines N]
 
 `lubko-deploy status` reports the current worker state, its PID/process-group/
 session identity, the deployed git commit, and the log path.
+
+`lubko-deploy deploy` resolves the `uv` executable with this strict
+precedence:
+
+1. an explicit `--uv` argument, validated and never silently replaced;
+2. `uv` found on the current PATH;
+3. the `uv` executable recorded in `toolchain.json` (validated to still exist
+   and be executable).
+
+If none is usable, deployment fails with a clear, actionable error. The
+resolved executable is used to run validation (`uv sync`, `ruff`, `mypy`,
+`pytest`) and to start the replacement worker.
 
 `lubko-deploy deploy`:
 
@@ -243,3 +256,14 @@ lubko-install --repo /path/to/lubko --dry-run
 prepended to PATH for login and interactive shells. Rebuilding or reinstalling
 the Lubko checkout recreates the commands reproducibly; no shell aliases or
 `~/.local/bin` copies need to be maintained by hand.
+
+The exact `uv` executable a successful install used is recorded, with a schema
+version, in `$XDG_STATE_HOME/lubko/toolchain.json` (default
+`~/.local/state/lubko/toolchain.json`). `lubko-deploy deploy` then falls back
+to that recorded executable when `uv` is not on PATH, so deployments keep
+working even after `uv` itself is removed from PATH. Reinstall with an explicit
+path when `uv` is unavailable on PATH:
+
+```sh
+lubko-install --repo /path/to/lubko --uv /absolute/path/to/uv
+```

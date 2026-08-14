@@ -958,9 +958,19 @@ Deployment behavior:
   silent pull, reset, stash, or checkout).
 
 Per-user lifecycle state and logs live under
-`$XDG_STATE_HOME/lubko/worker` (default `~/.local/state/lubko/worker`), with
-`meta.json`, `worker.log`, `deploy.log`, and a `.deploy.lock` serializing
-concurrent deployments.
+`$XDG_STATE_HOME/lubko` (default `~/.local/state/lubko`), with
+`worker/meta.json`, `worker/worker.log`, `worker/deploy.log`, a
+`worker/.deploy.lock` serializing concurrent deployments, and
+`toolchain.json` recording the maintained `uv` executable.
+
+`deploy` resolves the `uv` executable with this strict precedence:
+
+1. an explicit `--uv` argument, validated and never silently replaced;
+2. `uv` found on the current PATH;
+3. the `uv` executable recorded in `toolchain.json` (validated to still exist
+   and be executable).
+
+If none is usable, deployment fails with a clear, actionable error.
 
 ### Bootstrap and the unmanaged legacy worker
 
@@ -992,6 +1002,15 @@ that every maintained command resolves on PATH. Rebuilding or reinstalling the
 Lubko checkout recreates the commands without any hand-maintained copy.
 `my-lubko-agent` remains available as a transition alias for the same
 `lubko-agent` interface.
+
+The exact `uv` executable a successful install used is recorded in
+`$XDG_STATE_HOME/lubko/toolchain.json`, so `lubko-deploy deploy` keeps working
+even when `uv` is no longer on PATH. To reinstall when `uv` is off PATH, pass
+the known working path explicitly:
+
+```sh
+lubko-install --repo /workspace/Lubko --uv /absolute/path/to/uv
+```
 
 ---
 

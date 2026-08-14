@@ -5,13 +5,18 @@ previously maintained worker with a freshly started one, and records enough
 exact process identity to stop or replace that worker later without any broad
 ``pkill``/``killall``/process-name matching.
 
-Per-user state lives under ``$XDG_STATE_HOME/lubko/worker`` (default
-``$HOME/.local/state/lubko/worker``):
+Per-user state lives under ``$XDG_STATE_HOME/lubko`` (default
+``$HOME/.local/state/lubko``):
 
-- ``meta.json`` — lifecycle metadata written atomically;
-- ``worker.log`` — appended stdout/stderr of the maintained worker;
-- ``deploy.log`` — deployment event log;
-- ``.deploy.lock`` — flock-protected serialization of deployments.
+- ``worker/meta.json`` — lifecycle metadata written atomically;
+- ``worker/worker.log`` — appended stdout/stderr of the maintained worker;
+- ``worker/deploy.log`` — deployment event log;
+- ``worker/.deploy.lock`` — flock-protected serialization of deployments;
+- ``toolchain.json`` — versioned record of the maintained ``uv`` executable.
+
+The ``uv`` executable used to run validation and to spawn the worker is
+resolved with a strict precedence: an explicit ``--uv``, then ``uv`` on PATH,
+then the executable recorded in ``toolchain.json``; see :mod:`lubko.toolchain`.
 """
 
 from __future__ import annotations
@@ -21,7 +26,6 @@ import fcntl
 import json
 import os
 import secrets
-import shutil
 import signal
 import socket
 import subprocess
@@ -36,6 +40,8 @@ import psycopg
 from psycopg.rows import tuple_row
 
 from lubko.config import load_database_config
+from lubko.state import state_root
+from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import group_has_members
 
 if TYPE_CHECKING:
@@ -51,8 +57,6 @@ STATE_RUNNING: Final = "running"
 STATE_STOPPED: Final = "stopped"
 
 LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
-STATE_ROOT_ENV: Final = "XDG_STATE_HOME"
-STATE_ROOT_FALLBACK: Final = ".local/state"
 
 DEFAULT_STOP_GRACE_SECONDS: Final = 5.0
 DEFAULT_POSTGRES_TIMEOUT_SECONDS: Final = 5.0
@@ -192,16 +196,6 @@ class DeployOptions:
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-
-
-def state_root() -> Path:
-    """Return the per-user Lubko state root following XDG conventions.
-
-    Returns:
-        ``$XDG_STATE_HOME/lubko``, falling back to ``~/.local/state/lubko``.
-    """
-    base = os.environ.get(STATE_ROOT_ENV) or str(Path.home() / STATE_ROOT_FALLBACK)
-    return Path(base) / "lubko"
 
 
 def worker_state_dir() -> Path:
@@ -1075,9 +1069,14 @@ def deploy_cmd(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
+    try:
+        uv_path = resolve_uv(args.uv)
+    except UvResolutionError as exc:
+        _err(str(exc))
+        return EXIT_ERROR
     options = DeployOptions(
         repo=args.repo,
-        uv_path=shutil.which(args.uv) or args.uv,
+        uv_path=uv_path,
         bootstrap=args.bootstrap,
         stop_grace_seconds=args.grace_seconds,
         postgres_timeout_seconds=args.db_timeout,
@@ -1112,7 +1111,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path.cwd(),
         help="repository checkout to deploy",
     )
-    deploy_parser.add_argument("--uv", default="uv", help="uv executable (default: uv)")
+    deploy_parser.add_argument(
+        "--uv",
+        default=None,
+        help="uv executable (default: uv on PATH, then the recorded Lubko toolchain path)",
+    )
     deploy_parser.add_argument(
         "--bootstrap",
         action="store_true",
