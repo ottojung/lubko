@@ -33,7 +33,7 @@ DEFAULT_MODEL = "opencode-go/deepseek-v4-flash"
 DEFAULT_VARIANT = "high"
 OPENCODE_TITLE_PREFIX = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES = ("succeeded", "failed", "stopped", "killed")
-PROG = "my-lubko-agent"
+PROG = "lubko-agent"
 
 # Exit codes.
 EXIT_OK = 0
