@@ -688,7 +688,10 @@ def _fork_watchdog(gate_writer: int, lock_timeout_seconds: float) -> None:
         raise DeployCtlError(msg) from exc
     if pid != 0:
         return
-    _close_gate(gate_writer)
+    # The fork happens while the parent holds deploy_lock(). Close every
+    # inherited non-stdio descriptor before entering the watchdog loop so a
+    # parent crash cannot leave the child owning the inherited flock or gate.
+    os.closerange(3, int(os.sysconf("SC_OPEN_MAX")))
     with suppress(OSError):
         os.setsid()
     try:
