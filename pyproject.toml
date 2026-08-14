@@ -70,6 +70,7 @@ convention = "google"
     "suspicious-subprocess-import",
     "too-many-nested-blocks",
     "too-many-statements-in-try-clause",
+    "try-consider-else",
     "typing-only-first-party-import",
 ]
 "src/lubko/agent.py" = [
