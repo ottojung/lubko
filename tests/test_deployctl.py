@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -196,3 +197,21 @@ def test_watchdog_rollback_condition_uses_deadline_or_candidate_death(
     assert calls == [state]
     assert result["phase"] == "idle"
     assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
+
+
+def test_watchdog_child_drops_inherited_file_descriptors(tmp_path: Path) -> None:
+    """A forked watchdog drops inherited descriptors without closing the parent's copy."""
+    fd = os.open(tmp_path / "held", os.O_CREAT | os.O_RDWR)
+    pid = os.fork()
+    if pid == 0:
+        os.closerange(3, int(os.sysconf("SC_OPEN_MAX")))
+        try:
+            os.fstat(fd)
+        except OSError:
+            os._exit(0)
+        os._exit(1)
+
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    os.fstat(fd)
+    os.close(fd)
