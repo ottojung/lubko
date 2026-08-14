@@ -12,6 +12,8 @@ dependencies = [
 lubko-worker = "lubko.worker:main"
 lubko-deploy = "lubko.lifecycle:main"
 lubko-agent = "lubko.agent:main"
+my-lubko-agent = "lubko.agent:main"
+lubko-install = "lubko.install:main"
 
 [dependency-groups]
 dev = [
@@ -49,6 +51,14 @@ convention = "google"
     "suspicious-subprocess-import",
 ]
 "src/lubko/lifecycle.py" = [
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
+"src/lubko/agent.py" = [
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
+"src/lubko/install.py" = [
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]

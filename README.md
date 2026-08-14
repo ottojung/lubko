@@ -186,3 +186,60 @@ lubko-deploy deploy --bootstrap
 ```
 
 Subsequent upgrades replace maintained workers with no manual PID discovery.
+
+## Agent management CLI
+
+`lubko-agent` is the maintained interface for managed AI agent sessions inside
+the Lubko container. It provides stable Lubko agent IDs, explicit working
+directories, durable logs, continuation, waiting, stopping, killing, deletion,
+and cleanup:
+
+```text
+lubko-agent new [--cwd DIR] --prompt TEXT [--title TEXT] [--json]
+lubko-agent list [--running|--finished|--succeeded|--failed|--stopped|--killed] [--limit N] [--json]
+lubko-agent status <id> [--json]
+lubko-agent prompt <id> --prompt TEXT [--steer] [--json]
+lubko-agent log <id> [--lines N] [--follow]
+lubko-agent result <id> [--json]
+lubko-agent wait <id> --timeout SEC
+lubko-agent stop <id>
+lubko-agent kill <id>
+lubko-agent delete <id> [--force]
+lubko-agent clean [--days N] [--dry-run]
+lubko-agent last
+```
+
+The orchestrator deals only with Lubko agent IDs; the underlying agent
+implementation, its session IDs, its process tree, and its storage are
+implementation details. `my-lubko-agent` is kept as a transition alias for the
+same interface.
+
+Per-agent state lives under `$XDG_STATE_HOME/lubko/agents/<id>/` (default
+`~/.local/state/lubko/agents/<id>/`) with `meta.json`, `output.log`, and a
+`.lock` file serializing metadata updates. Agent IDs are stable and never
+reused.
+
+## Installing the maintained commands
+
+The maintained entry points (`lubko-agent`, `lubko-worker`, `lubko-deploy`)
+are versioned in `pyproject.toml`. In a checkout they are available through the
+project virtualenv (`uv sync`); to make them available on PATH in every login
+and interactive shell without a hand-maintained copy, install them into the
+user bin directory with:
+
+```sh
+uv tool install --force --from /path/to/lubko lubko
+```
+
+This is wrapped by the maintained `lubko-install` command, which also verifies
+that every command resolves on PATH:
+
+```sh
+lubko-install --repo /path/to/lubko
+lubko-install --repo /path/to/lubko --dry-run
+```
+
+`lubko-install` targets `$XDG_BIN_HOME` or `~/.local/bin`, which is already
+prepended to PATH for login and interactive shells. Rebuilding or reinstalling
+the Lubko checkout recreates the commands reproducibly; no shell aliases or
+`~/.local/bin` copies need to be maintained by hand.

@@ -1,6 +1,6 @@
 ---
 name: lubko
-description: Orchestrate development work inside the isolated Lubko workspace through Supabase jobs, with my-lubko-agent as the preferred interface for substantial development, investigation, and multi-step work.
+description: Orchestrate development work inside the isolated Lubko workspace through Supabase jobs, with lubko-agent as the preferred interface for substantial development, investigation, and multi-step work.
 ---
 
 # Lubko
@@ -35,7 +35,7 @@ ChatGPT
 
 Supabase is only the transport used to get commands into the Lubko container and retrieve their results.
 
-For substantial work inside the container, the preferred execution interface is **`my-lubko-agent`**. It provides managed AI agent sessions with stable IDs, explicit working directories, logs, status, continuation, results, waiting, stopping, killing, deletion, and cleanup.
+For substantial work inside the container, the preferred execution interface is **`lubko-agent`**. It provides managed AI agent sessions with stable IDs, explicit working directories, logs, status, continuation, results, waiting, stopping, killing, deletion, and cleanup.
 
 Use Lubko whenever work needs to be performed in the user's development environment, including:
 
@@ -126,7 +126,7 @@ cancelled
 
 The worker atomically claims pending jobs using PostgreSQL row locking, including `FOR UPDATE SKIP LOCKED`.
 
-The orchestrator should use Supabase to submit commands and retrieve their results. The commands themselves should usually be high-level Lubko commands, especially `my-lubko-agent`, rather than long improvised shell programs.
+The orchestrator should use Supabase to submit commands and retrieve their results. The commands themselves should usually be high-level Lubko commands, especially `lubko-agent`, rather than long improvised shell programs.
 
 ---
 
@@ -135,13 +135,13 @@ The orchestrator should use Supabase to submit commands and retrieve their resul
 ChatGPT is responsible for:
 
 1. deciding what operation should be performed;
-2. deciding whether the operation should be a direct shell command or a managed `my-lubko-agent` task;
+2. deciding whether the operation should be a direct shell command or a managed `lubko-agent` task;
 3. submitting the operation through the Supabase connector;
 4. recording the returned Supabase job ID;
 5. polling that job until it reaches a terminal state;
 6. reading stdout, stderr, and exit code;
 7. when an agent was created, recording its Lubko agent ID;
-8. observing and steering that agent through `my-lubko-agent` commands;
+8. observing and steering that agent through `lubko-agent` commands;
 9. independently verifying important repository results where appropriate;
 10. iterating until the requested task is actually complete.
 
@@ -179,7 +179,7 @@ status: pending
 
 The `cwd` is the shell working directory for the queued command.
 
-The command may itself launch or manage a `my-lubko-agent` session whose own working directory is specified with `--cwd`.
+The command may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
 
 ---
 
@@ -292,23 +292,23 @@ After cancelling, keep polling the job until it reaches a terminal state.
 
 ---
 
-# Prefer `my-lubko-agent` for substantial work
+# Prefer `lubko-agent` for substantial work
 
 The container provides:
 
 ```sh
-my-lubko-agent
+lubko-agent
 ```
 
 This is the preferred high-level interface for substantial development work.
 
-The orchestrator should use `my-lubko-agent` aggressively for tasks that involve reasoning, multiple steps, code changes, investigation, iteration, or potentially long execution.
+The orchestrator should use `lubko-agent` aggressively for tasks that involve reasoning, multiple steps, code changes, investigation, iteration, or potentially long execution.
 
 Prefer it over manually composing long shell command sequences.
 
 ## Why the agent interface is preferred
 
-`my-lubko-agent` is safer and more reliable than ad-hoc shell orchestration for substantial work because it provides:
+`lubko-agent` is safer and more reliable than ad-hoc shell orchestration for substantial work because it provides:
 
 - a stable Lubko-managed agent ID;
 - an explicit working directory;
@@ -357,7 +357,7 @@ run one already-known command
 
 A good default rule is:
 
-> **If the task needs judgment, context, iteration, or more than a couple of obvious shell commands, use `my-lubko-agent`.**
+> **If the task needs judgment, context, iteration, or more than a couple of obvious shell commands, use `lubko-agent`.**
 
 Another useful rule is:
 
@@ -365,23 +365,23 @@ Another useful rule is:
 
 ---
 
-# `my-lubko-agent` command model
+# `lubko-agent` command model
 
 The primary interface is:
 
 ```text
-my-lubko-agent new
-my-lubko-agent list
-my-lubko-agent status <id>
-my-lubko-agent prompt <id>
-my-lubko-agent log <id>
-my-lubko-agent result <id>
-my-lubko-agent wait <id>
-my-lubko-agent stop <id>
-my-lubko-agent kill <id>
-my-lubko-agent delete <id>
-my-lubko-agent clean
-my-lubko-agent last
+lubko-agent new
+lubko-agent list
+lubko-agent status <id>
+lubko-agent prompt <id>
+lubko-agent log <id>
+lubko-agent result <id>
+lubko-agent wait <id>
+lubko-agent stop <id>
+lubko-agent kill <id>
+lubko-agent delete <id>
+lubko-agent clean
+lubko-agent last
 ```
 
 Each managed session has a short stable **Lubko agent ID**, for example:
@@ -394,14 +394,14 @@ Always use the Lubko agent ID for later operations. Do not try to infer or use i
 
 ---
 
-# `my-lubko-agent new`
+# `lubko-agent new`
 
 Create a new managed agent session.
 
 Typical form:
 
 ```sh
-my-lubko-agent new \
+lubko-agent new \
     --cwd /workspace/project \
     --prompt 'Inspect the repository, implement the requested change, run the project checks, and summarize what changed.'
 ```
@@ -440,12 +440,12 @@ Do not rely on `last` as a substitute for recording the ID when multiple agents 
 
 ---
 
-# `my-lubko-agent list`
+# `lubko-agent list`
 
 List Lubko-managed agents.
 
 ```sh
-my-lubko-agent list
+lubko-agent list
 ```
 
 Typical output contains:
@@ -477,12 +477,12 @@ Do not assume that a finished agent should be deleted immediately. A completed s
 
 ---
 
-# `my-lubko-agent status <id>`
+# `lubko-agent status <id>`
 
 Show detailed state for one exact agent.
 
 ```sh
-my-lubko-agent status 8e064622
+lubko-agent status 8e064622
 ```
 
 Status may include:
@@ -505,12 +505,12 @@ If an agent appears to be taking longer than expected, inspect `status` and `log
 
 ---
 
-# `my-lubko-agent prompt <id>`
+# `lubko-agent prompt <id>`
 
 Continue one exact existing agent session with another instruction.
 
 ```sh
-my-lubko-agent prompt 8e064622 \
+lubko-agent prompt 8e064622 \
     --prompt 'Now fix the remaining mypy failure and rerun all required checks.'
 ```
 
@@ -533,12 +533,12 @@ Do not accidentally prompt the wrong agent. Always use the recorded Lubko agent 
 
 ---
 
-# `my-lubko-agent log <id>`
+# `lubko-agent log <id>`
 
 Inspect an agent's output log.
 
 ```sh
-my-lubko-agent log 8e064622
+lubko-agent log 8e064622
 ```
 
 Useful options include:
@@ -551,8 +551,8 @@ Useful options include:
 Examples:
 
 ```sh
-my-lubko-agent log 8e064622 --lines 100
-my-lubko-agent log 8e064622 --follow
+lubko-agent log 8e064622 --lines 100
+lubko-agent log 8e064622 --follow
 ```
 
 Use logs for observability while the agent is working.
@@ -571,12 +571,12 @@ For the final concise answer from a completed agent, prefer `result` instead of 
 
 ---
 
-# `my-lubko-agent result <id>`
+# `lubko-agent result <id>`
 
 Show the final concise result from a completed agent.
 
 ```sh
-my-lubko-agent result 8e064622
+lubko-agent result 8e064622
 ```
 
 Use this after an agent finishes successfully or fails naturally.
@@ -593,12 +593,12 @@ A final agent result is not a substitute for checking `git diff`, tests, or othe
 
 ---
 
-# `my-lubko-agent wait <id>`
+# `lubko-agent wait <id>`
 
 Wait until an agent stops actively running. A timeout must be used:
 
 ```sh
-my-lubko-agent wait 8e064622 --timeout 300
+lubko-agent wait 8e064622 --timeout 300
 ```
 
 A timeout only stops waiting. It does not automatically terminate the agent.
@@ -609,12 +609,12 @@ For longer or uncertain tasks, it is often better to poll `status` and occasiona
 
 ---
 
-# `my-lubko-agent stop <id>`
+# `lubko-agent stop <id>`
 
 Gracefully stop one exact running agent.
 
 ```sh
-my-lubko-agent stop 8e064622
+lubko-agent stop 8e064622
 ```
 
 This uses the managed process identity for the selected agent rather than a broad process-name match.
@@ -633,12 +633,12 @@ Prefer `stop` before `kill`.
 
 ---
 
-# `my-lubko-agent kill <id>`
+# `lubko-agent kill <id>`
 
 Forcefully terminate one exact agent.
 
 ```sh
-my-lubko-agent kill 8e064622
+lubko-agent kill 8e064622
 ```
 
 Use `kill` only when graceful stopping is insufficient or an immediate hard termination is specifically required.
@@ -647,16 +647,16 @@ It targets the selected agent's managed process group.
 
 A killed agent should normally end in state `killed` with a signal-derived exit status.
 
-Do not use generic `killall`, `pkill`, or process-name matching when `my-lubko-agent kill` can target the exact session.
+Do not use generic `killall`, `pkill`, or process-name matching when `lubko-agent kill` can target the exact session.
 
 ---
 
-# `my-lubko-agent delete <id>`
+# `lubko-agent delete <id>`
 
 Delete the local Lubko management state and logs for an agent.
 
 ```sh
-my-lubko-agent delete 8e064622
+lubko-agent delete 8e064622
 ```
 
 Use deletion when the session is no longer useful and does not need to be continued or inspected later.
@@ -669,18 +669,18 @@ Do not routinely delete every successful agent immediately. Keeping recent compl
 
 ---
 
-# `my-lubko-agent clean`
+# `lubko-agent clean`
 
 Garbage-collect old finished agent sessions.
 
 ```sh
-my-lubko-agent clean
+lubko-agent clean
 ```
 
 Prefer previewing cleanup when available:
 
 ```sh
-my-lubko-agent clean --dry-run
+lubko-agent clean --dry-run
 ```
 
 Use this for housekeeping, not as part of every development task.
@@ -689,12 +689,12 @@ Running agents must never be removed by normal cleanup.
 
 ---
 
-# `my-lubko-agent last`
+# `lubko-agent last`
 
 Print the most recently used Lubko agent ID.
 
 ```sh
-my-lubko-agent last
+lubko-agent last
 ```
 
 This is a convenience and recovery mechanism.
@@ -716,7 +716,7 @@ For substantial development, use this pattern by default.
 Submit a Supabase job containing something like:
 
 ```sh
-my-lubko-agent new \
+lubko-agent new \
     --cwd /workspace/project \
     --title 'fix parser' \
     --prompt 'Inspect the repository and AGENTS.md. Fix the parser bug described by the user. Add or update tests. Run all required validation. Do not deploy anything.' \
@@ -730,13 +730,13 @@ Poll the Supabase job and record the returned agent ID.
 Use:
 
 ```sh
-my-lubko-agent status <id>
+lubko-agent status <id>
 ```
 
 and, when useful:
 
 ```sh
-my-lubko-agent log <id> --lines 100
+lubko-agent log <id> --lines 100
 ```
 
 ## 3. Let it finish or steer it
@@ -744,19 +744,19 @@ my-lubko-agent log <id> --lines 100
 If no intervention is needed:
 
 ```sh
-my-lubko-agent wait <id>
+lubko-agent wait <id> --timeout 300
 ```
 
 If another instruction is needed:
 
 ```sh
-my-lubko-agent prompt <id> --prompt 'Address the remaining test failure, then rerun the full validation suite.'
+lubko-agent prompt <id> --prompt 'Address the remaining test failure, then rerun the full validation suite.'
 ```
 
 ## 4. Read the result
 
 ```sh
-my-lubko-agent result <id>
+lubko-agent result <id>
 ```
 
 ## 5. Verify objective state
@@ -782,7 +782,7 @@ Keep the session while follow-up is plausible.
 Delete it later when it is no longer useful:
 
 ```sh
-my-lubko-agent delete <id>
+lubko-agent delete <id>
 ```
 
 ---
@@ -860,7 +860,7 @@ Repositories generally live underneath it, for example:
 For a substantial repository task, prefer starting the agent directly in the repository root:
 
 ```sh
-my-lubko-agent new --cwd /workspace/Lubko --prompt '...'
+lubko-agent new --cwd /workspace/Lubko --prompt '...'
 ```
 
 The agent should inspect repository-local instructions itself.
@@ -976,6 +976,23 @@ lubko-deploy deploy --bootstrap
 Subsequent upgrades replace maintained workers without any manual PID
 discovery.
 
+### Keeping the maintained commands on PATH
+
+The maintained commands (`lubko-agent`, `lubko-worker`, `lubko-deploy`) are
+installed reproducibly into the user's bin directory
+(`$XDG_BIN_HOME` or `~/.local/bin`, which is already on PATH for login and
+interactive shells) by:
+
+```sh
+lubko-install --repo /workspace/Lubko
+```
+
+`lubko-install` uses `uv tool install` against the checkout and then verifies
+that every maintained command resolves on PATH. Rebuilding or reinstalling the
+Lubko checkout recreates the commands without any hand-maintained copy.
+`my-lubko-agent` remains available as a transition alias for the same
+`lubko-agent` interface.
+
 ---
 
 # Direct shell commands versus managed agents
@@ -992,7 +1009,7 @@ check a path
 run a single known test command
 ```
 
-Use `my-lubko-agent` when the task involves any meaningful development reasoning.
+Use `lubko-agent` when the task involves any meaningful development reasoning.
 
 Examples:
 
@@ -1028,10 +1045,10 @@ Do not assume the agent itself failed merely because a surrounding shell invocat
 
 ## Agent failure
 
-If `my-lubko-agent status <id>` reports a failed agent:
+If `lubko-agent status <id>` reports a failed agent:
 
-1. inspect `my-lubko-agent result <id>`;
-2. inspect `my-lubko-agent log <id> --lines 100` or another focused tail;
+1. inspect `lubko-agent result <id>`;
+2. inspect `lubko-agent log <id> --lines 100` or another focused tail;
 3. decide whether to continue the same session with a corrective prompt or start a new agent.
 
 Prefer continuing the same agent when it retains useful task context.
@@ -1109,7 +1126,7 @@ Examples:
 
 ```sh
 git status --short
-my-lubko-agent log <id> --lines 100
+lubko-agent log <id> --lines 100
 sed -n '1,200p' file
 ```
 
@@ -1127,7 +1144,7 @@ Be proactive.
 
 Use Supabase as transport.
 
-Use `my-lubko-agent` as the preferred abstraction for substantial work.
+Use `lubko-agent` as the preferred abstraction for substantial work.
 
 Inspect status and logs yourself.
 

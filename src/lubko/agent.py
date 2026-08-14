@@ -15,6 +15,7 @@ file used to serialize metadata updates.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -27,108 +28,196 @@ import subprocess
 import sys
 import textwrap
 import time
+from dataclasses import dataclass
+from itertools import starmap
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# Agent metadata: a JSON-serializable mapping with heterogeneous values.
+Meta = dict[str, Any]
 
 # Implementation details (hidden from the user-facing interface).
-DEFAULT_MODEL = "opencode-go/deepseek-v4-flash"
-DEFAULT_VARIANT = "high"
-OPENCODE_TITLE_PREFIX = "lubko-"  # native session title prefix used for discovery
-TERMINAL_STATES = ("succeeded", "failed", "stopped", "killed")
-PROG = "lubko-agent"
+DEFAULT_MODEL: Final = "opencode-go/deepseek-v4-flash"
+DEFAULT_VARIANT: Final = "high"
+OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
+TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
+STOP_REASONS: Final = frozenset({"stop", "kill"})
+PROG: Final = "lubko-agent"
 
 # Exit codes.
-EXIT_OK = 0
-EXIT_ERROR = 1
-EXIT_USAGE = 2
-EXIT_NOT_FOUND = 3
-EXIT_TIMEOUT = 124
+EXIT_OK: Final = 0
+EXIT_ERROR: Final = 1
+EXIT_USAGE: Final = 2
+EXIT_NOT_FOUND: Final = 3
+EXIT_TIMEOUT: Final = 124
+
+# Tuning constants.
+SECONDS_PER_MINUTE: Final = 60
+MINUTES_PER_HOUR: Final = 60
+HOURS_PER_DAY: Final = 24
+SECONDS_PER_DAY: Final = 86400
+PID_START_WINDOW_SECONDS: Final = 60
+SESSION_DISCOVER_TIMEOUT_SECONDS: Final = 60
+SESSION_DISCOVER_POLL_SECONDS: Final = 1
+SESSION_CONTINUE_TIMEOUT_SECONDS: Final = 10
+SESSION_CONTINUE_POLL_SECONDS: Final = 0.5
+STOP_WAIT_SECONDS: Final = 10.0
+KILL_WAIT_SECONDS: Final = 5.0
+IDLE_BREAK_SECONDS: Final = 5
+STATUS_TAIL_LINES: Final = 50
+STATUS_TAIL_CHARS: Final = 2000
+RESULT_TAIL_LINES: Final = 50
+RESULT_TAIL_CHARS: Final = 2000
+DEFAULT_RETENTION_DAYS: Final = 14
+RUNNER_ARGV_LENGTH: Final = 3
+
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+_LAST_ASSISTANT_SQL: Final = """
+SELECT p.data
+FROM part p
+JOIN message m ON p.message_id = m.id
+WHERE p.session_id = ?
+  AND json_extract(m.data, '$.role') = 'assistant'
+  AND json_extract(p.data, '$.type') = 'text'
+ORDER BY p.time_created DESC, p.id DESC
+LIMIT 1
+"""
 
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-def _home() -> str:
-    return os.path.expanduser("~")
+
+def _home() -> Path:
+    return Path.home()
 
 
-def state_root() -> str:
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(_home(), ".local", "state")
-    return os.path.join(base, "lubko")
+def state_root() -> Path:
+    """Return the per-user Lubko state root following XDG conventions.
+
+    Returns:
+        ``$XDG_STATE_HOME/lubko``, falling back to ``~/.local/state/lubko``.
+    """
+    base = Path(os.environ.get("XDG_STATE_HOME") or (_home() / ".local" / "state"))
+    return base / "lubko"
 
 
-def agents_dir() -> str:
-    return os.path.join(state_root(), "agents")
+def agents_dir() -> Path:
+    """Return the directory holding per-agent state.
+
+    Returns:
+        The agents state directory.
+    """
+    return state_root() / "agents"
 
 
-def agent_dir(aid: str) -> str:
-    return os.path.join(agents_dir(), aid)
+def agent_dir(aid: str) -> Path:
+    """Return the state directory for one agent.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        The agent's state directory.
+    """
+    return agents_dir() / aid
 
 
-def last_file() -> str:
-    return os.path.join(state_root(), "last.txt")
+def last_file() -> Path:
+    """Return the path of the most-recently-used agent marker.
+
+    Returns:
+        The ``last.txt`` path.
+    """
+    return state_root() / "last.txt"
 
 
 def opencode_db_path() -> str:
-    """Path to the underlying agent's local session database, if present."""
-    base = os.environ.get("XDG_DATA_HOME") or os.path.join(_home(), ".local", "share")
-    db = os.path.join(base, "opencode", "opencode.db")
-    return db if os.path.isfile(db) else ""
+    """Return the path of the underlying agent's session database, if present.
+
+    Returns:
+        The absolute database path, or an empty string when no database exists.
+    """
+    base = Path(os.environ.get("XDG_DATA_HOME") or (_home() / ".local" / "share"))
+    db = base / "opencode" / "opencode.db"
+    return str(db) if db.is_file() else ""
 
 
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
 
+
 def new_agent_id() -> str:
-    existing = set()
-    try:
-        existing = {d for d in os.listdir(agents_dir()) if os.path.isdir(os.path.join(agents_dir(), d))}
-    except OSError:
-        pass
+    """Return a fresh, collision-free Lubko agent ID.
+
+    Returns:
+        A new 8-hex-character agent ID.
+    """
+    existing: set[str] = set()
+    with contextlib.suppress(OSError):
+        existing = {entry.name for entry in agents_dir().iterdir() if entry.is_dir()}
     while True:
         aid = secrets.token_hex(4)
         if aid not in existing:
             return aid
 
 
-def read_meta(aid: str) -> dict | None:
-    path = os.path.join(agent_dir(aid), "meta.json")
+def read_meta(aid: str) -> Meta | None:
+    """Load an agent's metadata, tolerating absence and corruption.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        The metadata mapping, or ``None`` when unavailable.
+    """
+    path = agent_dir(aid) / "meta.json"
     try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except FileNotFoundError:
-        return None
+        with path.open(encoding="utf-8") as fh:
+            data: Meta = json.load(fh)
+            return data
     except (OSError, ValueError):
         return None
 
 
-def write_meta(aid: str, meta: dict) -> None:
-    """Atomically replace an agent's metadata file."""
+def write_meta(aid: str, meta: Meta) -> None:
+    """Atomically replace an agent's metadata file.
+
+    Args:
+        aid: Lubko agent ID.
+        meta: Metadata mapping to persist.
+    """
     directory = agent_dir(aid)
-    os.makedirs(directory, exist_ok=True)
-    tmp = os.path.join(directory, "meta.json.tmp")
-    path = os.path.join(directory, "meta.json")
-    with open(tmp, "w", encoding="utf-8") as fh:
+    directory.mkdir(parents=True, exist_ok=True)
+    tmp = directory / "meta.json.tmp"
+    path = directory / "meta.json"
+    with tmp.open("w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, sort_keys=True)
         fh.write("\n")
-    os.replace(tmp, path)
+    tmp.replace(path)
 
 
-def update_meta(aid: str, fn) -> None:
+def update_meta(aid: str, fn: Callable[[Meta], None]) -> None:
     """Apply ``fn(meta)`` to an agent's metadata under an exclusive lock.
 
     If the agent has been deleted, this is a no-op: a late background runner
     must never resurrect a deleted agent's directory.
+
+    Args:
+        aid: Lubko agent ID.
+        fn: Mutation to apply to the metadata under the lock.
     """
     directory = agent_dir(aid)
-    if not os.path.isdir(directory):
+    if not directory.is_dir():
         return
-    lock_path = os.path.join(directory, ".lock")
-    try:
-        lock = open(lock_path, "w", encoding="utf-8")
-    except OSError:
-        return
-    with lock:
+    lock_path = directory / ".lock"
+    with contextlib.suppress(OSError), lock_path.open("w", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             meta = read_meta(aid)
@@ -140,15 +229,27 @@ def update_meta(aid: str, fn) -> None:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def base_meta(aid: str, cwd: str, prompt: str, title: str | None, is_continue: bool) -> dict:
+def base_meta(aid: str, cwd: str, prompt: str, title: str | None, *, is_continue: bool) -> Meta:
+    """Build the initial metadata mapping for a new agent.
+
+    Args:
+        aid: New Lubko agent ID.
+        cwd: Working directory for the agent.
+        prompt: Initial instruction.
+        title: Optional display title.
+        is_continue: Whether this is a continuation invocation.
+
+    Returns:
+        The initial metadata mapping.
+    """
     now = time.time()
-    meta: dict = {
+    meta: Meta = {
         "id": aid,
         "created_at": now,
         "last_activity_at": now,
         "state": "running",
         "cwd": cwd,
-        "title": title if title else _first_line(prompt),
+        "title": title or _first_line(prompt),
         "model": os.environ.get("LUBKO_MODEL", DEFAULT_MODEL),
         "variant": os.environ.get("LUBKO_VARIANT", DEFAULT_VARIANT),
         "native_session_id": None,
@@ -176,14 +277,18 @@ def base_meta(aid: str, cwd: str, prompt: str, title: str | None, is_continue: b
 
 
 def mark_last(aid: str) -> None:
+    """Record ``aid`` as the most recently used agent.
+
+    Args:
+        aid: Lubko agent ID to record.
+    """
     root = state_root()
-    os.makedirs(root, exist_ok=True)
-    tmp = os.path.join(root, "last.txt.tmp")
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = root / "last.txt.tmp"
     path = last_file()
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(aid + "\n")
-        os.replace(tmp, path)
+        tmp.write_text(aid + "\n", encoding="utf-8")
+        tmp.replace(path)
     except OSError:
         pass
 
@@ -192,32 +297,48 @@ def mark_last(aid: str) -> None:
 # Process identity
 # ---------------------------------------------------------------------------
 
+
 def proc_start_ticks(pid: int) -> int | None:
-    """Return the process start time in clock ticks (unique per boot)."""
+    """Return the process start time in clock ticks (unique per boot).
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        The start time in clock ticks, or ``None`` when unavailable.
+    """
     try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
-            stat = fh.read()
-        rest = stat[stat.rfind(")") + 1 :].split()
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rest = stat[stat.rfind(")") + 1 :].split()
+    try:
         return int(rest[19])
-    except Exception:
+    except (ValueError, IndexError):
         return None
 
 
 def _env_has_marker(pid: int, aid: str) -> bool:
     marker = f"LUBKO_AGENT_ID={aid}".encode()
     try:
-        with open(f"/proc/{pid}/environ", "rb") as fh:
-            return marker in fh.read()
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
         return False
+    return marker in environ
 
 
-def is_alive(meta: dict) -> bool:
-    """True only if the recorded process is really our agent process.
+def is_alive(meta: Meta) -> bool:
+    """Return whether the recorded process is really our agent process.
 
     A PID alone is not trusted: the process start time (ticks) and a
     per-agent environment marker must both match, so a reused or recycled
     PID can never be mistaken for our agent.
+
+    Args:
+        meta: Agent metadata.
+
+    Returns:
+        ``True`` only when a live process matches every recorded identity.
     """
     pid = meta.get("pid")
     if not pid:
@@ -233,18 +354,30 @@ def is_alive(meta: dict) -> bool:
     return True
 
 
-def send_signal_group(meta: dict, sig: int) -> None:
-    """Deliver a signal to the agent's process group (session leader)."""
+def send_signal_group(meta: Meta, sig: int) -> None:
+    """Deliver a signal to the agent's process group (session leader).
+
+    Args:
+        meta: Agent metadata.
+        sig: Signal to deliver.
+    """
     pid = meta.get("pid")
     if not pid:
         return
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.killpg(pid, sig)  # the agent was launched as its own session leader
-    except ProcessLookupError:
-        pass
 
 
-def wait_dead(meta: dict, timeout: float) -> bool:
+def wait_dead(meta: Meta, timeout: float) -> bool:
+    """Wait until the recorded agent process is gone.
+
+    Args:
+        meta: Agent metadata.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        ``True`` when the process is gone within the timeout.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not is_alive(meta):
@@ -257,8 +390,16 @@ def wait_dead(meta: dict, timeout: float) -> bool:
 # State
 # ---------------------------------------------------------------------------
 
-def derive_state(meta: dict | None) -> str:
-    """Live state: verify process liveness rather than trusting metadata."""
+
+def derive_state(meta: Meta | None) -> str:
+    """Return the live state, verifying process liveness rather than trusting metadata.
+
+    Args:
+        meta: Agent metadata, or ``None``.
+
+    Returns:
+        The effective agent state.
+    """
     if not meta:
         return "unknown"
     state = meta.get("state")
@@ -270,17 +411,16 @@ def derive_state(meta: dict | None) -> str:
     if not pid:
         # Launched but the runner has not recorded the PID yet.
         launched = meta.get("started_at") or meta.get("created_at") or 0
-        if time.time() - launched < 60:
-            return "running"
-        return "unknown"
+        return "running" if time.time() - launched < PID_START_WINDOW_SECONDS else "unknown"
     if meta.get("finished_at"):
-        return state  # runner finalized it
+        return str(state)  # runner finalized it
     return "unknown"
 
 
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
+
 
 def _first_line(text: str) -> str:
     line = text.splitlines()[0] if text.splitlines() else ""
@@ -293,7 +433,15 @@ def _truncate(text: str, width: int) -> str:
     return text[: width - 1] + "~"
 
 
-def fmt_time(epoch) -> str:
+def fmt_time(epoch: float | None) -> str:
+    """Format an epoch timestamp for display.
+
+    Args:
+        epoch: Epoch timestamp, or ``None``.
+
+    Returns:
+        A ``YYYY-MM-DD HH:MM:SS`` string, or ``-`` when unknown.
+    """
     if epoch is None:
         return "-"
     try:
@@ -302,29 +450,46 @@ def fmt_time(epoch) -> str:
         return "-"
 
 
-def fmt_age(epoch) -> str:
+def fmt_age(epoch: float | None) -> str:
+    """Format an epoch timestamp as a compact age.
+
+    Args:
+        epoch: Epoch timestamp, or ``None``.
+
+    Returns:
+        A compact age string, or ``-`` when unknown.
+    """
     if epoch is None:
         return "-"
     seconds = max(0, int(time.time() - epoch))
-    if seconds < 60:
+    if seconds < SECONDS_PER_MINUTE:
         return f"{seconds}s"
-    minutes = seconds // 60
-    if minutes < 60:
+    minutes = seconds // SECONDS_PER_MINUTE
+    if minutes < MINUTES_PER_HOUR:
         return f"{minutes}m"
-    hours = minutes // 60
-    if hours < 24:
-        return f"{hours}h{minutes % 60}m"
-    return f"{hours // 24}d{hours % 24}h"
+    hours = minutes // MINUTES_PER_HOUR
+    if hours < HOURS_PER_DAY:
+        return f"{hours}h{minutes % MINUTES_PER_HOUR}m"
+    return f"{hours // HOURS_PER_DAY}d{hours % HOURS_PER_DAY}h"
 
 
-_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-
-
-def log_excerpt(path: str, max_lines: int = 50, max_chars: int = 2000) -> list[str]:
+def log_excerpt(
+    path: Path,
+    max_lines: int = STATUS_TAIL_LINES,
+    max_chars: int = STATUS_TAIL_CHARS,
+) -> list[str]:
     """Return a short plain-text tail of a log file for display.
 
     Shows at most ``max_lines`` lines within the newest ``max_chars`` bytes,
     with ANSI escape sequences stripped.
+
+    Args:
+        path: Log file path.
+        max_lines: Maximum number of lines.
+        max_chars: Maximum bytes to consider.
+
+    Returns:
+        The plain-text tail lines.
     """
     return [_ANSI_CSI_RE.sub("", line) for line in tail_lines(path, max_lines, max_chars)]
 
@@ -334,6 +499,10 @@ def print_box(lines: list[str], max_width: int = 80) -> None:
 
     Long lines are wrapped (word-wise, hard-breaking overlong tokens) so the
     completed box is never wider than ``max_width`` characters.
+
+    Args:
+        lines: Lines to render.
+        max_width: Maximum rendered width.
     """
     if not lines:
         return
@@ -351,93 +520,125 @@ def print_box(lines: list[str], max_width: int = 80) -> None:
         folded.extend(wrapped or [""])
     width = max(len(line) for line in folded) + 4
     bar = "|" + "-" * width + "|"
-    print(bar)
+    _out(bar)
     for line in folded:
-        print("| " + line.ljust(width - 1) + "|")
-    print(bar)
+        _out("| " + line.ljust(width - 1) + "|")
+    _out(bar)
 
 
 # ---------------------------------------------------------------------------
 # Underlying agent integration (internal)
 # ---------------------------------------------------------------------------
 
+
 def discover_session_id(aid: str) -> str | None:
-    """Find the underlying session id for a Lubko agent, if discoverable."""
+    """Find the underlying session id for a Lubko agent, if discoverable.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        The underlying session ID, or ``None`` when undiscoverable.
+    """
     db = opencode_db_path()
     if not db:
         return None
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        try:
-            row = conn.execute(
-                "SELECT id FROM session WHERE title=? ORDER BY time_created DESC LIMIT 1",
-                (OPENCODE_TITLE_PREFIX + aid,),
-            ).fetchone()
-        finally:
-            conn.close()
-        return row[0] if row else None
-    except Exception:
+    except sqlite3.Error:
         return None
+    try:
+        row = conn.execute(
+            "SELECT id FROM session WHERE title=? ORDER BY time_created DESC LIMIT 1",
+            (OPENCODE_TITLE_PREFIX + aid,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return row[0] if row else None
 
 
 def last_assistant_text(session_id: str) -> str | None:
-    """Extract the final assistant text message from the session transcript."""
+    """Extract the final assistant text message from the session transcript.
+
+    Args:
+        session_id: Underlying session ID.
+
+    Returns:
+        The final assistant text, or ``None`` when unavailable.
+    """
     db = opencode_db_path()
     if not db:
         return None
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        try:
-            row = conn.execute(
-                """
-                SELECT p.data
-                FROM part p
-                JOIN message m ON p.message_id = m.id
-                WHERE p.session_id = ?
-                  AND json_extract(m.data, '$.role') = 'assistant'
-                  AND json_extract(p.data, '$.type') = 'text'
-                ORDER BY p.time_created DESC, p.id DESC
-                LIMIT 1
-                """,
-                (session_id,),
-            ).fetchone()
-        finally:
-            conn.close()
-        if not row:
-            return None
-        return json.loads(row[0]).get("text")
-    except Exception:
+    except sqlite3.Error:
         return None
+    try:
+        row = conn.execute(_LAST_ASSISTANT_SQL, (session_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        text = json.loads(row[0]).get("text")
+    except (ValueError, TypeError):
+        return None
+    return text if isinstance(text, str) else None
 
 
-def build_agent_command(meta: dict, prompt: str, is_continue: bool) -> list[str] | None:
-    """Return the argv used to launch the underlying agent for this invocation."""
+def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[str] | None:
+    """Return the argv used to launch the underlying agent for this invocation.
+
+    Args:
+        meta: Agent metadata.
+        prompt: Instruction to run.
+        is_continue: Whether to continue the existing underlying session.
+
+    Returns:
+        The command argv, or ``None`` when continuation is impossible.
+    """
     env_cmd = os.environ.get("LUBKO_AGENT_CMD")
     if env_cmd:
         return ["/bin/sh", "-c", env_cmd]
     model = meta.get("model") or DEFAULT_MODEL
     variant = meta.get("variant") or DEFAULT_VARIANT
-    cwd = meta.get("cwd") or os.getcwd()
+    cwd = meta.get("cwd") or str(Path.cwd())
     if is_continue:
         session_id = meta.get("native_session_id") or discover_session_id(meta.get("id", ""))
         if not session_id:
             return None
         return [
-            "opencode", "run", "--auto",
-            "--session", session_id,
-            "--model", model,
-            "--variant", variant,
+            "opencode",
+            "run",
+            "--auto",
+            "--session",
+            session_id,
+            "--model",
+            model,
+            "--variant",
+            variant,
             "--thinking",
-            "--dir", cwd,
+            "--dir",
+            cwd,
             prompt,
         ]
     return [
-        "opencode", "run", "--auto",
-        "--title", OPENCODE_TITLE_PREFIX + meta.get("id", ""),
-        "--model", model,
-        "--variant", variant,
+        "opencode",
+        "run",
+        "--auto",
+        "--title",
+        OPENCODE_TITLE_PREFIX + meta.get("id", ""),
+        "--model",
+        model,
+        "--variant",
+        variant,
         "--thinking",
-        "--dir", cwd,
+        "--dir",
+        cwd,
         prompt,
     ]
 
@@ -446,21 +647,27 @@ def build_agent_command(meta: dict, prompt: str, is_continue: bool) -> list[str]
 # Runner (background monitor for one agent invocation)
 # ---------------------------------------------------------------------------
 
+
 def runner(aid: str, mode: str) -> None:
     """Detached monitor: run the current invocation, then any queued steers.
 
     Runs one invocation, records its result, then — if steer instructions
     are queued — immediately runs them in FIFO order until the queue drains.
+
+    Args:
+        aid: Lubko agent ID.
+        mode: Invocation mode (``new`` or ``continue``).
     """
     meta = read_meta(aid)
     if meta is None:
         return
     directory = agent_dir(aid)
-    os.makedirs(directory, exist_ok=True)
-    log_path = os.path.join(directory, "output.log")
-    cwd = meta.get("cwd") or os.getcwd()
+    directory.mkdir(parents=True, exist_ok=True)
+    log_path = directory / "output.log"
+    cwd = meta.get("cwd") or str(Path.cwd())
     env = dict(os.environ)
     env["LUBKO_AGENT_ID"] = aid
+    ctx = _RunnerContext(aid=aid, log_path=log_path, cwd=cwd, env=env)
     is_continue = mode == "continue"
     first = True
 
@@ -477,105 +684,200 @@ def runner(aid: str, mode: str) -> None:
         if not prompt:
             update_meta(aid, lambda m: m.update(active_runner=False))
             return
-
-        env["LUBKO_PROMPT"] = prompt
-        cmd = build_agent_command(meta, prompt, is_continue)
-        if cmd is None:
-            update_meta(aid, lambda m: _finalize_terminal(m, None, None, "failed",
-                          "cannot continue: underlying session not available"))
-            update_meta(aid, lambda m: m.update(active_runner=False))
+        next_prompt = _run_invocation(ctx, prompt, is_continue=is_continue)
+        if next_prompt is None:
             return
 
+
+@dataclass(frozen=True, slots=True)
+class _RunnerContext:
+    """Shared state for one runner invocation stream."""
+
+    aid: str
+    log_path: Path
+    cwd: str
+    env: dict[str, str]
+
+
+def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> str | None:
+    """Run one agent invocation and decide whether a queued steer follows.
+
+    Args:
+        ctx: Shared runner context.
+        prompt: Instruction to run.
+        is_continue: Whether to continue the underlying session.
+
+    Returns:
+        The next queued prompt, or ``None`` when the runner should stop.
+    """
+    aid = ctx.aid
+    meta = read_meta(aid)
+    if meta is None:
+        return None
+    ctx.env["LUBKO_PROMPT"] = prompt
+    cmd = build_agent_command(meta, prompt, is_continue=is_continue)
+    if cmd is None:
+        update_meta(
+            aid,
+            lambda m: _finalize_terminal(
+                m,
+                None,
+                None,
+                "failed",
+                "cannot continue: underlying session not available",
+            ),
+        )
+        update_meta(aid, lambda m: m.update(active_runner=False))
+        return None
+    try:
+        log = ctx.log_path.open("ab")
+    except OSError:
+        return None  # agent directory no longer exists
+    with log:
         try:
-            log = open(log_path, "ab")
-        except OSError:
-            return  # agent directory no longer exists
-        with log:
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=log,
-                    cwd=cwd,
-                    start_new_session=True,
-                    close_fds=True,
-                    env=env,
-                )
-            except OSError as exc:
-                log.write(f"LUBKO RUNNER: failed to start agent: {exc}\n".encode("utf-8", "replace"))
-                update_meta(aid, lambda m: _finalize_terminal(m, 127, None, "failed", str(exc)))
-                update_meta(aid, lambda m: m.update(active_runner=False))
-                return
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                cwd=ctx.cwd,
+                start_new_session=True,
+                close_fds=True,
+                env=ctx.env,
+            )
+        except OSError as exc:
+            error = str(exc)
+            log.write(f"LUBKO RUNNER: failed to start agent: {error}\n".encode("utf-8", "replace"))
+            update_meta(aid, lambda m: _finalize_terminal(m, 127, None, "failed", error))
+            update_meta(aid, lambda m: m.update(active_runner=False))
+            return None
 
-            start = proc_start_ticks(proc.pid)
+        start = proc_start_ticks(proc.pid)
+        update_meta(aid, _record_running(proc, start))
 
-            def _record_running(m: dict) -> None:
-                m["pid"] = proc.pid
-                m["pgid"] = proc.pid
-                m["start_time"] = start
-                m["runner_pid"] = os.getpid()
-                m["started_at"] = time.time()
-                m["last_activity_at"] = time.time()
-                m["state"] = "running"
-                m["finished_at"] = None
-                m["exit_code"] = None
-                m["exit_signal"] = None
-                m["intent"] = None
-                m["active_runner"] = True
+        if not is_continue and not os.environ.get("LUBKO_AGENT_CMD"):
+            deadline = time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
+            while time.time() < deadline and proc.poll() is None:
+                sid = discover_session_id(aid)
+                if sid:
+                    update_meta(aid, _set_native_session(sid))
+                    break
+                time.sleep(SESSION_DISCOVER_POLL_SECONDS)
 
-            update_meta(aid, _record_running)
+        rc = proc.wait()
+        update_meta(aid, _finalize_after(rc))
 
-            if not is_continue and not os.environ.get("LUBKO_AGENT_CMD"):
-                deadline = time.time() + 60
-                while time.time() < deadline and proc.poll() is None:
-                    sid = discover_session_id(aid)
-                    if sid:
-                        update_meta(aid, lambda m: m.update(native_session_id=sid))
-                        break
-                    time.sleep(1)
+    return _drain_next(aid)
 
-            rc = proc.wait()
 
-            def _finalize(m: dict) -> None:
-                if m.get("state") != "running":
-                    return  # already finalized (e.g. by stop/kill/steer)
-                sig = -rc if rc < 0 else None
-                intent = m.get("intent")
-                m["stop_reason"] = intent
-                if intent == "stop":
-                    state = "stopped"
-                elif intent == "kill":
-                    state = "killed"
-                elif intent == "steer":
-                    state = "stopped" if rc < 0 else ("succeeded" if rc == 0 else "failed")
-                elif rc == 0:
-                    state = "succeeded"
-                else:
-                    state = "failed"
-                _finalize_terminal(m, rc, sig, state, None)
+def _record_running(proc: subprocess.Popen[bytes], start: int | None) -> Callable[[Meta], None]:
+    """Return a metadata mutation that records a running agent process.
 
-            update_meta(aid, _finalize)
+    Args:
+        proc: The spawned agent process.
+        start: The process start time in clock ticks.
 
-        next_holder: dict = {"prompt": None}
+    Returns:
+        The metadata mutation.
+    """
 
-        def _drain(m: dict) -> None:
-            if m.get("stop_reason") in ("stop", "kill"):
-                m["active_runner"] = False
-                return
-            if not (m.get("steer_queue") or []):
-                m["active_runner"] = False
-                return
-            item = _pop_into_pending(m, time.time())
-            m["active_runner"] = True
-            next_holder["prompt"] = item.get("prompt") if item else None
+    def record(m: Meta) -> None:
+        m["pid"] = proc.pid
+        m["pgid"] = proc.pid
+        m["start_time"] = start
+        m["runner_pid"] = os.getpid()
+        m["started_at"] = time.time()
+        m["last_activity_at"] = time.time()
+        m["state"] = "running"
+        m["finished_at"] = None
+        m["exit_code"] = None
+        m["exit_signal"] = None
+        m["intent"] = None
+        m["active_runner"] = True
 
-        update_meta(aid, _drain)
-        if next_holder["prompt"] is None:
+    return record
+
+
+def _set_native_session(sid: str) -> Callable[[Meta], None]:
+    """Return a metadata mutation that records the underlying session ID.
+
+    Args:
+        sid: Underlying session ID to record.
+
+    Returns:
+        The metadata mutation.
+    """
+
+    def setter(m: Meta) -> None:
+        m.update(native_session_id=sid)
+
+    return setter
+
+
+def _finalize_after(rc: int) -> Callable[[Meta], None]:
+    """Return a metadata mutation that records the result of an invocation.
+
+    Args:
+        rc: The invocation's return code.
+
+    Returns:
+        The metadata mutation.
+    """
+
+    def finalize(m: Meta) -> None:
+        if m.get("state") != "running":
+            return  # already finalized (e.g. by stop/kill/steer)
+        sig = -rc if rc < 0 else None
+        intent = m.get("intent")
+        m["stop_reason"] = intent
+        if intent == "stop":
+            state = "stopped"
+        elif intent == "kill":
+            state = "killed"
+        elif intent == "steer":
+            state = "stopped" if rc < 0 else ("succeeded" if rc == 0 else "failed")
+        elif rc == 0:
+            state = "succeeded"
+        else:
+            state = "failed"
+        _finalize_terminal(m, rc, sig, state, None)
+
+    return finalize
+
+
+def _drain_next(aid: str) -> str | None:
+    """Move the next queued steer into a pending invocation, if any.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        The next prompt to run, or ``None`` when the runner should stop.
+    """
+    holder: dict[str, str | None] = {"prompt": None}
+
+    def drain(m: Meta) -> None:
+        if m.get("stop_reason") in STOP_REASONS:
+            m["active_runner"] = False
             return
+        if not (m.get("steer_queue") or []):
+            m["active_runner"] = False
+            return
+        item = _pop_into_pending(m, time.time())
+        m["active_runner"] = True
+        holder["prompt"] = item.get("prompt") if item else None
+
+    update_meta(aid, drain)
+    return holder["prompt"]
 
 
-def _finalize_terminal(meta: dict, exit_code, exit_signal, state: str, note: str | None) -> None:
+def _finalize_terminal(
+    meta: Meta,
+    exit_code: int | None,
+    exit_signal: int | None,
+    state: str,
+    note: str | None,
+) -> None:
     meta["state"] = state
     meta["exit_code"] = exit_code
     meta["exit_signal"] = exit_signal
@@ -586,8 +888,14 @@ def _finalize_terminal(meta: dict, exit_code, exit_signal, state: str, note: str
         meta["error"] = note
 
 
-def _queue_steer(meta: dict, prompt: str, now: float) -> None:
-    """Append a steer instruction to the agent's FIFO queue."""
+def _queue_steer(meta: Meta, prompt: str, now: float) -> None:
+    """Append a steer instruction to the agent's FIFO queue.
+
+    Args:
+        meta: Agent metadata.
+        prompt: Steer instruction.
+        now: Queue timestamp.
+    """
     queue = meta.get("steer_queue") or []
     seq = (meta.get("steer_seq") or 0) + 1
     queue.append({"seq": seq, "prompt": prompt, "queued_at": now})
@@ -596,12 +904,20 @@ def _queue_steer(meta: dict, prompt: str, now: float) -> None:
     meta["last_activity_at"] = now
 
 
-def _pop_into_pending(meta: dict, now: float) -> dict | None:
-    """Move the head of the steer queue into a runnable pending invocation."""
+def _pop_into_pending(meta: Meta, now: float) -> Meta | None:
+    """Move the head of the steer queue into a runnable pending invocation.
+
+    Args:
+        meta: Agent metadata.
+        now: Invocation timestamp.
+
+    Returns:
+        The popped steer item, or ``None`` when the queue is empty.
+    """
     queue = meta.get("steer_queue") or []
     if not queue:
         return None
-    item = queue.pop(0)
+    item: Meta = queue.pop(0)
     meta["steer_queue"] = queue
     meta["state"] = "running"
     meta["pending_prompt"] = item.get("prompt", "")
@@ -619,15 +935,26 @@ def _pop_into_pending(meta: dict, now: float) -> dict | None:
     return item
 
 
-def _begin_stop_like(meta: dict, intent: str) -> None:
-    """Prepare an agent for stop/kill: drop pending steers, mark intent."""
+def _begin_stop_like(meta: Meta, intent: str) -> None:
+    """Prepare an agent for stop/kill: drop pending steers, mark intent.
+
+    Args:
+        meta: Agent metadata.
+        intent: The stop-like intent (``stop`` or ``kill``).
+    """
     meta["intent"] = intent
     meta["last_activity_at"] = time.time()
     meta["steer_queue"] = []
     meta["pending_prompt"] = None
 
 
-def _mark_terminal(meta: dict, exit_code, exit_signal, state: str, stop_reason: str) -> None:
+def _mark_terminal(
+    meta: Meta,
+    exit_code: int | None,
+    exit_signal: int | None,
+    state: str,
+    stop_reason: str,
+) -> None:
     _finalize_terminal(meta, exit_code, exit_signal, state, None)
     meta["stop_reason"] = stop_reason
     meta["active_runner"] = False
@@ -637,7 +964,16 @@ def _mark_terminal(meta: dict, exit_code, exit_signal, state: str, stop_reason: 
 # Exit status mapping
 # ---------------------------------------------------------------------------
 
-def exit_code_for(meta: dict | None) -> int:
+
+def exit_code_for(meta: Meta | None) -> int:
+    """Map an agent's live state to a process exit code.
+
+    Args:
+        meta: Agent metadata, or ``None``.
+
+    Returns:
+        The exit code implied by the agent state.
+    """
     state = derive_state(meta) if meta else "unknown"
     if state == "succeeded":
         return EXIT_OK
@@ -648,13 +984,43 @@ def exit_code_for(meta: dict | None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+
+def _out(message: str) -> None:
+    """Write a user-facing line to standard output.
+
+    Args:
+        message: Message to write.
+    """
+    sys.stdout.write(message + "\n")
+
+
+def _err(message: str) -> None:
+    """Write a user-facing line to standard error.
+
+    Args:
+        message: Message to write.
+    """
+    sys.stderr.write(message + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 
+
 def spawn_runner(aid: str, mode: str) -> None:
-    script = os.path.abspath(__file__)
+    """Detach a background runner monitor for an agent.
+
+    Args:
+        aid: Lubko agent ID.
+        mode: Invocation mode (``new`` or ``continue``).
+    """
+    script = Path(__file__).resolve()
     subprocess.Popen(
-        [sys.executable, script, "_runner", aid, mode],
+        [sys.executable, str(script), "_runner", aid, mode],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -664,28 +1030,42 @@ def spawn_runner(aid: str, mode: str) -> None:
 
 
 def cmd_new(args: argparse.Namespace) -> int:
+    """Create a new agent session.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     prompt = args.prompt or args.prompt_text
     if not prompt:
-        print(f"{PROG}: new: a prompt is required", file=sys.stderr)
+        _err(f"{PROG}: new: a prompt is required")
         return EXIT_USAGE
-    cwd = os.path.abspath(args.cwd or os.getcwd())
-    if not os.path.isdir(cwd):
-        print(f"{PROG}: new: working directory does not exist: {cwd}", file=sys.stderr)
+    cwd = str(Path(args.cwd or Path.cwd()).resolve())
+    if not Path(cwd).is_dir():
+        _err(f"{PROG}: new: working directory does not exist: {cwd}")
         return EXIT_ERROR
 
     aid = new_agent_id()
     meta = base_meta(aid, cwd, prompt, args.title, is_continue=False)
     meta["prompt_count"] = 1
-    os.makedirs(agent_dir(aid), exist_ok=True)
+    agent_dir(aid).mkdir(parents=True, exist_ok=True)
     write_meta(aid, meta)
     mark_last(aid)
     spawn_runner(aid, "new")
 
     if args.json:
-        print(json.dumps({"id": aid, "state": "running", "cwd": cwd,
-                          "created_at": meta["created_at"]}))
+        _out(
+            json.dumps({
+                "id": aid,
+                "state": "running",
+                "cwd": cwd,
+                "created_at": meta["created_at"],
+            })
+        )
     else:
-        print(f"Created agent with id {aid}. Check progress with `{PROG} status {aid}`.")
+        _out(f"Created agent with id {aid}. Check progress with `{PROG} status {aid}`.")
     sys.stdout.flush()
 
     if args.sync:
@@ -695,57 +1075,62 @@ def cmd_new(args: argparse.Namespace) -> int:
 
 
 def cmd_prompt(args: argparse.Namespace) -> int:
+    """Send another instruction to an agent.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
     prompt = args.prompt or args.prompt_text
     if not prompt:
-        print(f"{PROG}: prompt: a prompt is required", file=sys.stderr)
+        _err(f"{PROG}: prompt: a prompt is required")
         return EXIT_USAGE
     meta = read_meta(aid)
     if meta is None:
-        print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+        _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
     state = derive_state(meta)
     if state == "running":
         if args.steer:
-            return _steer_busy(args, meta, prompt)
-        print(f"{PROG}: agent {aid} is still running; use --steer to redirect it", file=sys.stderr)
+            return _steer_busy(args, prompt)
+        _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
         return EXIT_ERROR
     return _start_continuation(args, meta, prompt)
 
 
-def _start_continuation(args: argparse.Namespace, meta: dict, prompt: str) -> int:
+def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> int:
+    """Start a continuation invocation of an agent.
+
+    Args:
+        args: Parsed command arguments.
+        meta: Agent metadata.
+        prompt: Continuation instruction.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
 
     # The underlying session must be available to continue.
-    if meta.get("native_session_id") or discover_session_id(aid):
-        pass
-    else:
-        deadline = time.time() + 10
-        session_id = None
-        while time.time() < deadline:
-            session_id = discover_session_id(aid)
-            if session_id:
-                break
-            time.sleep(0.5)
-        if not session_id:
-            print(
-                f"{PROG}: cannot continue agent {aid}: its underlying session is not available",
-                file=sys.stderr,
-            )
-            return EXIT_ERROR
+    session_id = meta.get("native_session_id") or discover_session_id(aid)
+    if not session_id:
+        session_id = _wait_for_session(aid)
+    if not session_id:
+        _err(f"{PROG}: cannot continue agent {aid}: its underlying session is not available")
+        return EXIT_ERROR
 
     now = time.time()
-    update_meta(
-        aid,
-        lambda m: _begin_invocation(m, prompt, now),
-    )
+    update_meta(aid, lambda m: _begin_invocation(m, prompt, now))
     mark_last(aid)
     spawn_runner(aid, "continue")
 
     if args.json:
-        print(json.dumps({"id": aid, "state": "running"}))
+        _out(json.dumps({"id": aid, "state": "running"}))
     else:
-        print(f"Started agent with id {aid}. Check progress with `{PROG} status {aid}`.")
+        _out(f"Started agent with id {aid}. Check progress with `{PROG} status {aid}`.")
     sys.stdout.flush()
 
     if args.sync:
@@ -754,17 +1139,42 @@ def _start_continuation(args: argparse.Namespace, meta: dict, prompt: str) -> in
     return EXIT_OK
 
 
-def _steer_busy(args: argparse.Namespace, meta: dict, prompt: str) -> int:
+def _wait_for_session(aid: str) -> str | None:
+    """Poll briefly for the underlying session of an agent.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        The underlying session ID, or ``None`` when unavailable.
+    """
+    deadline = time.time() + SESSION_CONTINUE_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        session_id = discover_session_id(aid)
+        if session_id:
+            return session_id
+        time.sleep(SESSION_CONTINUE_POLL_SECONDS)
+    return discover_session_id(aid)
+
+
+def _steer_busy(args: argparse.Namespace, prompt: str) -> int:
     """Redirect a busy agent: queue the instruction and interrupt the run.
 
     Fire-and-forget: returns immediately.  The running runner picks up the
     queued instruction as soon as the interrupted invocation has exited.
+
+    Args:
+        args: Parsed command arguments.
+        prompt: Steer instruction.
+
+    Returns:
+        A process exit code.
     """
     aid = args.agent_id
     now = time.time()
     spawn_needed = {"yes": False}
 
-    def _apply(m: dict) -> None:
+    def apply(m: Meta) -> None:
         _queue_steer(m, prompt, now)
         alive = is_alive(m)
         had_runner = bool(m.get("active_runner"))
@@ -775,27 +1185,32 @@ def _steer_busy(args: argparse.Namespace, meta: dict, prompt: str) -> int:
             _pop_into_pending(m, now)
             spawn_needed["yes"] = True
 
-    update_meta(aid, _apply)
-    meta = read_meta(aid)
-    if meta is not None and meta.get("intent") == "steer" and is_alive(meta):
-        send_signal_group(meta, signal.SIGTERM)
+    update_meta(aid, apply)
+    current = read_meta(aid)
+    if current is not None and current.get("intent") == "steer" and is_alive(current):
+        send_signal_group(current, signal.SIGTERM)
     if spawn_needed["yes"]:
         spawn_runner(aid, "continue")
     mark_last(aid)
 
     if args.json:
-        print(json.dumps({"id": aid, "state": "running", "steer": True}))
+        _out(json.dumps({"id": aid, "state": "running", "steer": True}))
     else:
-        print(aid)
+        _out(aid)
         sys.stdout.flush()
-        print(
-            f"{PROG}: steer queued; {'starting now' if spawn_needed['yes'] else 'interrupting current run'}",
-            file=sys.stderr,
-        )
+        detail = "starting now" if spawn_needed["yes"] else "interrupting current run"
+        _err(f"{PROG}: steer queued; {detail}")
     return EXIT_OK
 
 
-def _begin_invocation(meta: dict, prompt: str, now: float) -> None:
+def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
+    """Mark an agent as starting a new invocation.
+
+    Args:
+        meta: Agent metadata.
+        prompt: Instruction to run.
+        now: Invocation timestamp.
+    """
     meta["state"] = "running"
     meta["started_at"] = now
     meta["last_activity_at"] = now
@@ -814,127 +1229,186 @@ def _begin_invocation(meta: dict, prompt: str, now: float) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    try:
-        ids = sorted(
-            d for d in os.listdir(agents_dir())
-            if os.path.isdir(os.path.join(agents_dir(), d))
-        )
-    except OSError:
-        ids = []
+    """List Lubko-managed agents.
 
-    entries = []
-    for aid in ids:
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
+    entries = _list_entries(args)
+    if args.json:
+        _out(json.dumps({"agents": list(starmap(_entry_json, entries))}))
+        return EXIT_OK
+    if not entries:
+        _out("(no agents)")
+        return EXIT_OK
+    _print_agent_table(entries)
+    return EXIT_OK
+
+
+def _agent_ids() -> list[str]:
+    """Return the sorted agent IDs stored locally.
+
+    Returns:
+        The sorted agent IDs.
+    """
+    with contextlib.suppress(OSError):
+        return sorted(entry.name for entry in agents_dir().iterdir() if entry.is_dir())
+    return []
+
+
+def _matches_filters(args: argparse.Namespace, state: str) -> bool:
+    """Return whether an agent state passes the list filters.
+
+    Args:
+        args: Parsed command arguments.
+        state: Agent state.
+
+    Returns:
+        ``True`` when the state is not filtered out.
+    """
+    if args.running and state != "running":
+        return False
+    if args.finished and state not in TERMINAL_STATES:
+        return False
+    return not (
+        (args.succeeded and state != "succeeded")
+        or (args.failed and state != "failed")
+        or (args.stopped and state != "stopped")
+        or (args.killed and state != "killed")
+    )
+
+
+def _list_entries(args: argparse.Namespace) -> list[tuple[str, str, Meta]]:
+    """Build the filtered, sorted list of (aid, state, meta) entries.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        The entries, newest first, limited when requested.
+    """
+    entries: list[tuple[str, str, Meta]] = []
+    for aid in _agent_ids():
         meta = read_meta(aid)
-        state = derive_state(meta)
-        if args.running and state != "running":
-            continue
-        if args.finished and state not in TERMINAL_STATES:
-            continue
-        if args.succeeded and state != "succeeded":
-            continue
-        if args.failed and state != "failed":
-            continue
-        if args.stopped and state != "stopped":
-            continue
-        if args.killed and state != "killed":
-            continue
         if meta is None:
             meta = {"id": aid}
+        state = derive_state(meta)
+        if not _matches_filters(args, state):
+            continue
         entries.append((aid, state, meta))
-
-    entries.sort(key=lambda e: e[2].get("created_at") or 0, reverse=True)
+    entries.sort(key=lambda entry: entry[2].get("created_at") or 0, reverse=True)
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
+    return entries
 
-    if args.json:
-        out = []
-        for aid, state, meta in entries:
-            out.append(
-                {
-                    "id": aid,
-                    "state": state,
-                    "prompts": meta.get("prompt_count"),
-                    "cwd": meta.get("cwd"),
-                    "title": meta.get("title"),
-                    "created_at": meta.get("created_at"),
-                    "last_activity_at": meta.get("last_activity_at"),
-                    "finished_at": meta.get("finished_at"),
-                }
-            )
-        print(json.dumps({"agents": out}))
-        return EXIT_OK
 
-    if not entries:
-        print("(no agents)")
-        return EXIT_OK
+def _entry_json(aid: str, state: str, meta: Meta) -> Meta:
+    """Build the JSON mapping for one agent list entry.
 
+    Args:
+        aid: Agent ID.
+        state: Agent state.
+        meta: Agent metadata.
+
+    Returns:
+        The JSON-safe mapping.
+    """
+    return {
+        "id": aid,
+        "state": state,
+        "prompts": meta.get("prompt_count"),
+        "cwd": meta.get("cwd"),
+        "title": meta.get("title"),
+        "created_at": meta.get("created_at"),
+        "last_activity_at": meta.get("last_activity_at"),
+        "finished_at": meta.get("finished_at"),
+    }
+
+
+def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
+    """Print the agent list table.
+
+    Args:
+        entries: The (aid, state, meta) entries to print.
+    """
     rows = []
     for aid, state, meta in entries:
         cwd = _truncate(meta.get("cwd") or "", 24)
         title = _truncate((meta.get("title") or "").replace("\n", " "), 40)
-        rows.append(
-            (aid, state, str(meta.get("prompt_count") or 0),
-             fmt_age(meta.get("created_at")), cwd, title)
-        )
-    widths = [max(len(r[i]) for r in rows) for i in range(6)]
-    widths[0] = max(widths[0], len("ID"))
-    widths[1] = max(widths[1], len("STATE"))
-    widths[2] = max(widths[2], len("P"))
-    widths[3] = max(widths[3], len("AGE"))
-    widths[4] = max(widths[4], len("CWD"))
-    widths[5] = max(widths[5], len("TITLE"))
-    header = "  ".join(
-        label.ljust(widths[i]) for i, label in enumerate(("ID", "STATE", "P", "AGE", "CWD", "TITLE"))
-    )
-    print(header)
+        rows.append((
+            aid,
+            state,
+            str(meta.get("prompt_count") or 0),
+            fmt_age(meta.get("created_at")),
+            cwd,
+            title,
+        ))
+    widths = [max(len(row[i]) for row in rows) for i in range(6)]
+    labels = ("ID", "STATE", "P", "AGE", "CWD", "TITLE")
+    for i, label in enumerate(labels):
+        widths[i] = max(widths[i], len(label))
+    _out("  ".join(label.ljust(widths[i]) for i, label in enumerate(labels)))
     for row in rows:
-        print("  ".join(row[i].ljust(widths[i]) for i in range(6)))
-    return EXIT_OK
+        _out("  ".join(row[i].ljust(widths[i]) for i in range(6)))
 
 
 def cmd_status(args: argparse.Namespace) -> int:
+    """Show detailed status of one agent.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
     meta = read_meta(aid)
     if meta is None:
-        print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+        _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
     state = derive_state(meta)
     alive = is_alive(meta)
     if args.json:
-        print(json.dumps(_status_json(aid, meta, state, alive), indent=2))
+        _out(json.dumps(_status_json(aid, meta, state, alive=alive), indent=2))
         return EXIT_OK
 
-    pid = meta.get("pid")
-    pgid = meta.get("pgid")
-    pid_text = f"{pid} (pgid {pgid}, alive)" if pid and alive else (f"{pid} (dead)" if pid else "(starting)")
-    runner_pid = meta.get("runner_pid") or "-"
-    sid = meta.get("native_session_id")
-    if not sid:
-        sid = discover_session_id(aid)
-    if not sid:
-        sid = "(unknown)"
-    log_path = os.path.join(agent_dir(aid), "output.log")
-    print(f"agent:      {aid}")
-    print(f"state:      {state}")
-    print(f"alive:      {'yes' if alive else 'no'}")
-    print(f"cwd:        {meta.get('cwd') or '-'}")
-    print(f"created:    {fmt_time(meta.get('created_at'))}")
-    print(f"started:    {fmt_time(meta.get('started_at'))}")
-    print(f"finished:   {fmt_time(meta.get('finished_at'))}")
-    print(f"exit code:  {meta.get('exit_code') if meta.get('exit_code') is not None else '-'}")
-    print(f"prompts:    {meta.get('prompt_count') or 0}")
+    log_path = agent_dir(aid) / "output.log"
+    _out(f"agent:      {aid}")
+    _out(f"state:      {state}")
+    _out(f"alive:      {'yes' if alive else 'no'}")
+    _out(f"cwd:        {meta.get('cwd') or '-'}")
+    _out(f"created:    {fmt_time(meta.get('created_at'))}")
+    _out(f"started:    {fmt_time(meta.get('started_at'))}")
+    _out(f"finished:   {fmt_time(meta.get('finished_at'))}")
+    exit_code = meta.get("exit_code")
+    _out(f"exit code:  {exit_code if exit_code is not None else '-'}")
+    _out(f"prompts:    {meta.get('prompt_count') or 0}")
     steers = meta.get("steer_queue") or []
     if steers:
-        print(f"steers:     {len(steers)} queued: {_first_line(steers[0].get('prompt') or '')}")
-    print(f"title:      {meta.get('title') or '-'}")
-    print(f"tail(log):")
-    excerpt = log_excerpt(log_path, 50, 2000)
+        _out(f"steers:     {len(steers)} queued: {_first_line(steers[0].get('prompt') or '')}")
+    _out(f"title:      {meta.get('title') or '-'}")
+    _out("tail(log):")
+    excerpt = log_excerpt(log_path, STATUS_TAIL_LINES, STATUS_TAIL_CHARS)
     if excerpt:
         print_box(excerpt)
     return EXIT_OK
 
 
-def _status_json(aid: str, meta: dict, state: str, alive: bool) -> dict:
+def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
+    """Build the JSON status mapping for an agent.
+
+    Args:
+        aid: Agent ID.
+        meta: Agent metadata.
+        state: Effective agent state.
+        alive: Whether the agent process is alive.
+
+    Returns:
+        The JSON-safe mapping.
+    """
     return {
         "id": aid,
         "state": state,
@@ -953,29 +1427,32 @@ def _status_json(aid: str, meta: dict, state: str, alive: bool) -> dict:
         "exit_signal": meta.get("exit_signal"),
         "prompts": meta.get("prompt_count"),
         "steers_pending": len(meta.get("steer_queue") or []),
-        "next_steer": _first_line((meta.get("steer_queue") or [{}])[0].get("prompt") or "")
-                      if meta.get("steer_queue") else None,
+        "next_steer": (
+            _first_line((meta.get("steer_queue") or [{}])[0].get("prompt") or "")
+            if meta.get("steer_queue")
+            else None
+        ),
         "model": meta.get("model"),
         "variant": meta.get("variant"),
-        "log": os.path.join(agent_dir(aid), "output.log"),
+        "log": str(agent_dir(aid) / "output.log"),
     }
 
 
-def tail_lines(path: str, n: int, max_chars: int = 0) -> list[str]:
-    """Return the last ``n`` lines of a file (all lines when ``n <= 0``).
+def _read_tail_window(path: Path, max_chars: int) -> tuple[bytes, int, bytes] | None:
+    """Read the newest bytes of a file plus the byte before the window.
 
-    ``max_chars > 0`` limits the tail to the newest ``max_chars`` bytes; a
-    mid-line fragment at the start is dropped when fuller lines follow.
+    Args:
+        path: File path.
+        max_chars: Maximum bytes to read (``<= 0`` for the whole file).
+
+    Returns:
+        A ``(data, start, prev)`` tuple, or ``None`` when the file is empty.
     """
-    try:
-        fh = open(path, "rb")
-    except OSError:
-        return []
-    with fh:
+    with path.open("rb") as fh:
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
         if size == 0:
-            return []
+            return None
         window = size if max_chars <= 0 else min(size, max_chars)
         start = size - window
         fh.seek(start)
@@ -984,39 +1461,66 @@ def tail_lines(path: str, n: int, max_chars: int = 0) -> list[str]:
         if start > 0:
             fh.seek(start - 1)
             prev = fh.read(1)
+        return data, start, prev
+
+
+def tail_lines(path: Path, n: int, max_chars: int = 0) -> list[str]:
+    """Return the last ``n`` lines of a file (all lines when ``n <= 0``).
+
+    ``max_chars > 0`` limits the tail to the newest ``max_chars`` bytes; a
+    mid-line fragment at the start is dropped when fuller lines follow.
+
+    Args:
+        path: File path.
+        n: Number of trailing lines.
+        max_chars: Maximum bytes to consider.
+
+    Returns:
+        The trailing lines.
+    """
+    try:
+        window = _read_tail_window(path, max_chars)
+    except OSError:
+        return []
+    if window is None:
+        return []
+    data, start, prev = window
     lines = data.decode("utf-8", errors="replace").split("\n")
     if start > 0 and prev != b"\n" and any(lines[1:]):
         lines = lines[1:]
-    while lines and lines[-1] == "":
+    while lines and not lines[-1]:
         lines.pop()
     if n > 0:
         lines = lines[-n:]
     return lines
 
 
-def tail_snapshot(path: str, max_lines: int = 50, max_chars: int = 2000) -> tuple[bytes, int]:
+def tail_snapshot(path: Path, max_lines: int = 50, max_chars: int = 2000) -> tuple[bytes, int]:
     """Return (newest output bytes, byte offset to continue following from).
 
     The bytes cover at most ``max_lines`` lines within the newest
     ``max_chars`` bytes.  The offset is the end of that snapshot, so following
     from it neither reprints the shown output nor skips newly appended output.
+
+    Args:
+        path: File path.
+        max_lines: Maximum number of lines.
+        max_chars: Maximum bytes to consider.
+
+    Returns:
+        A ``(bytes, offset)`` tuple.
     """
     try:
-        fh = open(path, "rb")
+        window = _read_tail_window(path, max_chars)
     except OSError:
         return b"", 0
-    with fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        if size == 0:
-            return b"", 0
-        window = size if max_chars <= 0 else min(size, max_chars)
-        start = size - window
-        fh.seek(start)
-        data = fh.read(window)
+    if window is None:
+        return b"", 0
+    data, start, _prev = window
+    size = start + len(data)
     lines = data.split(b"\n")
     if max_lines > 0 and len(lines) > max_lines:
-        keep_lines = lines[-(max_lines + 1):]
+        keep_lines = lines[-(max_lines + 1) :]
         keep = b"\n".join(keep_lines)
         if keep.startswith(b"\n"):
             keep = keep[1:]
@@ -1025,128 +1529,249 @@ def tail_snapshot(path: str, max_lines: int = 50, max_chars: int = 2000) -> tupl
     return keep, size
 
 
-def stream_log_until_terminal(aid: str, follow_lines: int = 50, max_chars: int = 2000) -> None:
-    """Print the recent tail, then stream new output until the agent is done."""
-    log_path = os.path.join(agent_dir(aid), "output.log")
-    if os.path.isfile(log_path):
-        kept, offset = tail_snapshot(log_path, follow_lines, max_chars)
-        if kept:
-            sys.stdout.buffer.write(kept)
-            sys.stdout.buffer.flush()
-    else:
-        offset = 0
+def stream_log_until_terminal(
+    aid: str,
+    follow_lines: int = STATUS_TAIL_LINES,
+    max_chars: int = STATUS_TAIL_CHARS,
+) -> None:
+    """Print the recent tail, then stream new output until the agent is done.
 
-    handle = None
-    idle_since = None
+    Args:
+        aid: Lubko agent ID.
+        follow_lines: Number of recent lines to show first.
+        max_chars: Maximum bytes of the initial snapshot.
+    """
+    log_path = agent_dir(aid) / "output.log"
+    offset = _print_snapshot(log_path, follow_lines, max_chars)
+    handle: BinaryIO | None = None
+    idle_since: float | None = None
+
     while True:
         if handle is None:
-            try:
-                handle = open(log_path, "rb")
-            except OSError:
-                meta = read_meta(aid)
-                if meta is None or derive_state(meta) in TERMINAL_STATES or derive_state(meta) == "unknown":
+            handle = _open_log(log_path, offset)
+            if handle is None:
+                if _terminal_or_unknown(aid):
                     return
                 time.sleep(0.3)
                 continue
-            handle.seek(offset)
-        data = handle.read()
-        if data:
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.flush()
+        if _consume_log(handle):
             idle_since = None
-        meta = read_meta(aid)
-        if meta is None:
-            break
-        state = derive_state(meta)
-        if state in TERMINAL_STATES or state == "unknown":
-            data = handle.read()
-            if data:
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.flush()
-            break
-        if meta.get("state") == "running" and meta.get("pid") and not is_alive(meta):
+        if _terminal_or_unknown(aid):
+            _drain_and_stop(handle)
+            return
+        if _stale_running(aid):
             if idle_since is None:
                 idle_since = time.time()
-            elif time.time() - idle_since > 5:
-                data = handle.read()
-                if data:
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.buffer.flush()
-                break
+            elif time.time() - idle_since > IDLE_BREAK_SECONDS:
+                _drain_and_stop(handle)
+                return
         time.sleep(0.4)
 
 
+def _print_snapshot(path: Path, follow_lines: int, max_chars: int) -> int:
+    """Print the recent tail snapshot and return its end offset.
+
+    Args:
+        path: Log file path.
+        follow_lines: Number of recent lines to show.
+        max_chars: Maximum bytes to consider.
+
+    Returns:
+        The byte offset to continue following from.
+    """
+    if not path.is_file():
+        return 0
+    kept, offset = tail_snapshot(path, follow_lines, max_chars)
+    if kept:
+        sys.stdout.buffer.write(kept)
+        sys.stdout.buffer.flush()
+    return offset
+
+
+def _open_log(log_path: Path, offset: int) -> BinaryIO | None:
+    """Open the agent log at ``offset``, or ``None`` when unavailable.
+
+    Args:
+        log_path: Log file path.
+        offset: Byte offset to begin reading from.
+
+    Returns:
+        The open binary stream, or ``None`` when the file cannot be opened.
+    """
+    try:
+        handle = log_path.open("rb")
+    except OSError:
+        return None
+    handle.seek(offset)
+    return handle
+
+
+def _consume_log(handle: BinaryIO) -> bool:
+    """Write any newly available log bytes to stdout.
+
+    Args:
+        handle: Open log stream.
+
+    Returns:
+        ``True`` when new bytes were written.
+    """
+    data = handle.read()
+    if not data:
+        return False
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    return True
+
+
+def _drain_and_stop(handle: BinaryIO) -> None:
+    """Write any remaining log bytes and stop streaming.
+
+    Args:
+        handle: Open log stream.
+    """
+    data = handle.read()
+    if data:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+
+def _terminal_or_unknown(aid: str) -> bool:
+    """Return whether the agent is terminal, unknown, or deleted.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when streaming should stop.
+    """
+    meta = read_meta(aid)
+    if meta is None:
+        return True
+    state = derive_state(meta)
+    return state in TERMINAL_STATES or state == "unknown"
+
+
+def _stale_running(aid: str) -> bool:
+    """Return whether the agent records a running process that is dead.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when the recorded process has stopped while state is running.
+    """
+    meta = read_meta(aid)
+    if meta is None:
+        return False
+    return bool(meta.get("state") == "running" and meta.get("pid") and not is_alive(meta))
+
+
 def cmd_log(args: argparse.Namespace) -> int:
+    """Show agent output.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
     meta = read_meta(aid)
     if meta is None:
-        print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+        _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    log_path = os.path.join(agent_dir(aid), "output.log")
-    if not os.path.isfile(log_path):
+    log_path = agent_dir(aid) / "output.log"
+    if not log_path.is_file():
         if args.follow:
             # wait for the first output to appear
             time.sleep(0.5)
-            if not os.path.isfile(log_path):
-                print("(no output yet)", file=sys.stderr)
+            if not log_path.is_file():
+                _err("(no output yet)")
                 return EXIT_OK
         else:
-            print("(no output yet)", file=sys.stderr)
+            _err("(no output yet)")
             return EXIT_OK
+    max_chars = 0 if args.lines <= 0 else STATUS_TAIL_CHARS
     if args.follow:
-        stream_log_until_terminal(aid, follow_lines=args.lines,
-                                  max_chars=(0 if args.lines <= 0 else 2000))
+        stream_log_until_terminal(aid, follow_lines=args.lines, max_chars=max_chars)
     else:
-        for line in tail_lines(log_path, args.lines, (0 if args.lines <= 0 else 2000)):
-            print(line)
+        for line in tail_lines(log_path, args.lines, max_chars):
+            _out(line)
     return EXIT_OK
 
 
 def cmd_result(args: argparse.Namespace) -> int:
+    """Show the agent's final result.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
     meta = read_meta(aid)
     if meta is None:
-        print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+        _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
     state = derive_state(meta)
     if state == "running":
-        print(f"{PROG}: agent {aid} is still running; no final result yet", file=sys.stderr)
+        _err(f"{PROG}: agent {aid} is still running; no final result yet")
         return EXIT_NOT_FOUND
     if state == "unknown":
-        print(f"{PROG}: agent {aid} is in an unknown state; no reliable result", file=sys.stderr)
+        _err(f"{PROG}: agent {aid} is in an unknown state; no reliable result")
         return EXIT_NOT_FOUND
 
     session_id = meta.get("native_session_id") or discover_session_id(aid)
     text = last_assistant_text(session_id) if session_id else None
     if text is not None:
         if args.json:
-            print(json.dumps({"id": aid, "state": state, "exit_code": meta.get("exit_code"),
-                              "result": text}))
+            _out(
+                json.dumps({
+                    "id": aid,
+                    "state": state,
+                    "exit_code": meta.get("exit_code"),
+                    "result": text,
+                })
+            )
         else:
-            print(text)
+            _out(text)
         return EXIT_OK
 
     # Fallback: last lines of the captured output.
-    log_path = os.path.join(agent_dir(aid), "output.log")
-    lines = tail_lines(log_path, 50, 2000)
+    log_path = agent_dir(aid) / "output.log"
+    lines = tail_lines(log_path, RESULT_TAIL_LINES, RESULT_TAIL_CHARS)
     if args.json:
-        print(json.dumps({"id": aid, "state": state, "exit_code": meta.get("exit_code"),
-                          "result": "\n".join(lines) if lines else None}))
+        _out(
+            json.dumps({
+                "id": aid,
+                "state": state,
+                "exit_code": meta.get("exit_code"),
+                "result": "\n".join(lines) if lines else None,
+            })
+        )
+    elif lines:
+        _out("(no structured result; showing the tail of agent output)")
+        for line in lines:
+            _out(line)
     else:
-        if lines:
-            print("(no structured result; showing the tail of agent output)")
-            for line in lines:
-                print(line)
-        else:
-            print("(no result available)")
+        _out("(no result available)")
     return EXIT_OK
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
+    """Wait until an agent finishes.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
     meta = read_meta(aid)
     if meta is None:
-        print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+        _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
     timeout = args.timeout
     deadline = time.time() + timeout if timeout else None
@@ -1154,19 +1779,19 @@ def cmd_wait(args: argparse.Namespace) -> int:
     while True:
         meta = read_meta(aid)
         if meta is None:
-            print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+            _err(f"{PROG}: unknown agent: {aid}")
             return EXIT_NOT_FOUND
         if is_alive(meta):
             if deadline and time.time() >= deadline:
-                print(f"{PROG}: wait: agent {aid} still running after {timeout}s", file=sys.stderr)
+                _err(f"{PROG}: wait: agent {aid} still running after {timeout}s")
                 return EXIT_TIMEOUT
             time.sleep(1)
             continue
         # Process is gone; give the runner a moment to finalize state.
         for _ in range(20):
-            m = read_meta(aid)
-            if m is not None and m.get("state") != "running":
-                meta = m
+            current = read_meta(aid)
+            if current is not None and current.get("state") != "running":
+                meta = current
                 break
             time.sleep(0.25)
         break
@@ -1175,136 +1800,394 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
+    """Gracefully stop a running agent.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
     meta = read_meta(aid)
     if meta is None:
-        print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+        _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
     if not is_alive(meta):
-        print(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
+        _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
         return EXIT_OK
     update_meta(aid, lambda m: _begin_stop_like(m, "stop"))
     send_signal_group(meta, signal.SIGTERM)
-    if wait_dead(meta, 10.0):
-        update_meta(aid, lambda m: _mark_terminal(m, -signal.SIGTERM, signal.SIGTERM, "stopped", "stop"))
-        print(f"stopped agent {aid}")
+    if wait_dead(meta, STOP_WAIT_SECONDS):
+        update_meta(
+            aid,
+            lambda m: _mark_terminal(m, -signal.SIGTERM, signal.SIGTERM, "stopped", "stop"),
+        )
+        _out(f"stopped agent {aid}")
         return EXIT_OK
     update_meta(aid, lambda m: m.update(intent=None))
-    print(f"{PROG}: agent {aid} did not stop within 10s; use 'kill'", file=sys.stderr)
+    _err(f"{PROG}: agent {aid} did not stop within {STOP_WAIT_SECONDS:.0f}s; use 'kill'")
     return EXIT_ERROR
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
+    """Forcefully terminate a running agent.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
     meta = read_meta(aid)
     if meta is None:
-        print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+        _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
     if not is_alive(meta):
-        print(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
+        _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
         return EXIT_OK
     update_meta(aid, lambda m: _begin_stop_like(m, "kill"))
     send_signal_group(meta, signal.SIGKILL)
-    if wait_dead(meta, 5.0):
-        update_meta(aid, lambda m: _mark_terminal(m, -signal.SIGKILL, signal.SIGKILL, "killed", "kill"))
-        print(f"killed agent {aid}")
+    if wait_dead(meta, KILL_WAIT_SECONDS):
+        update_meta(
+            aid,
+            lambda m: _mark_terminal(m, -signal.SIGKILL, signal.SIGKILL, "killed", "kill"),
+        )
+        _out(f"killed agent {aid}")
         return EXIT_OK
     update_meta(aid, lambda m: m.update(intent=None))
-    print(f"{PROG}: agent {aid} could not be killed", file=sys.stderr)
+    _err(f"{PROG}: agent {aid} could not be killed")
     return EXIT_ERROR
 
 
 def cmd_delete(args: argparse.Namespace) -> int:
+    """Delete an agent's local state and logs.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
     aid = args.agent_id
     meta = read_meta(aid)
     if meta is None:
-        print(f"{PROG}: unknown agent: {aid}", file=sys.stderr)
+        _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
     if is_alive(meta):
         if not args.force:
-            print(f"{PROG}: agent {aid} is running; stop it first or use --force", file=sys.stderr)
+            _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
             return EXIT_ERROR
         update_meta(aid, lambda m: m.update(intent="kill", last_activity_at=time.time()))
         send_signal_group(meta, signal.SIGKILL)
-        wait_dead(meta, 5.0)
+        wait_dead(meta, KILL_WAIT_SECONDS)
     shutil.rmtree(agent_dir(aid), ignore_errors=True)
     _forget_last(aid)
-    print(f"deleted agent {aid}")
+    _out(f"deleted agent {aid}")
     return EXIT_OK
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
-    days = args.days
-    if days is None:
-        try:
-            days = int(os.environ.get("LUBKO_AGENT_RETENTION_DAYS", "14"))
-        except ValueError:
-            days = 14
+    """Garbage-collect old finished agents.
+
+    Args:
+        args: Parsed command arguments.
+
+    Returns:
+        A process exit code.
+    """
+    days = _retention_days(args.days)
     if days < 0:
-        print(f"{PROG}: clean: invalid retention days: {days}", file=sys.stderr)
+        _err(f"{PROG}: clean: invalid retention days: {days}")
         return EXIT_USAGE
-    cutoff = time.time() - days * 86400
-    try:
-        ids = sorted(
-            d for d in os.listdir(agents_dir())
-            if os.path.isdir(os.path.join(agents_dir(), d))
-        )
-    except OSError:
-        ids = []
-
-    candidates = []
-    for aid in ids:
-        meta = read_meta(aid)
-        if meta is None:
-            continue
-        if derive_state(meta) in TERMINAL_STATES:
-            finished = meta.get("finished_at")
-            if finished is not None and finished < cutoff:
-                candidates.append(aid)
-
+    candidates = _clean_candidates(days)
     for aid in candidates:
         if args.dry_run:
-            print(f"would remove agent {aid}")
+            _out(f"would remove agent {aid}")
         else:
             shutil.rmtree(agent_dir(aid), ignore_errors=True)
             _forget_last(aid)
-            print(f"removed agent {aid}")
+            _out(f"removed agent {aid}")
 
     if not candidates:
-        print("(nothing to clean)")
+        _out("(nothing to clean)")
     else:
-        print(f"({len(candidates)} agent(s))")
+        _out(f"({len(candidates)} agent(s))")
     return EXIT_OK
 
 
-def cmd_last(args: argparse.Namespace) -> int:
+def _retention_days(explicit: int | None) -> int:
+    """Resolve the retention period in days.
+
+    Args:
+        explicit: Explicit retention days, or ``None``.
+
+    Returns:
+        The effective retention days.
+    """
+    if explicit is not None:
+        return explicit
     try:
-        with open(last_file(), encoding="utf-8") as fh:
-            aid = fh.read().strip()
+        return int(os.environ.get("LUBKO_AGENT_RETENTION_DAYS", str(DEFAULT_RETENTION_DAYS)))
+    except ValueError:
+        return DEFAULT_RETENTION_DAYS
+
+
+def _clean_candidates(days: int) -> list[str]:
+    """Return terminal agents finished before the retention cutoff.
+
+    Args:
+        days: Retention period in days.
+
+    Returns:
+        The agent IDs that may be removed.
+    """
+    cutoff = time.time() - days * SECONDS_PER_DAY
+    candidates = []
+    for aid in _agent_ids():
+        meta = read_meta(aid)
+        if meta is None:
+            continue
+        if derive_state(meta) not in TERMINAL_STATES:
+            continue
+        finished = meta.get("finished_at")
+        if finished is not None and finished < cutoff:
+            candidates.append(aid)
+    return candidates
+
+
+def cmd_last(_args: argparse.Namespace) -> int:
+    """Print the most recently used Lubko agent ID.
+
+    Args:
+        _args: Parsed command arguments (unused).
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        aid = last_file().read_text(encoding="utf-8").strip()
     except OSError:
         aid = ""
-    if aid and os.path.isdir(agent_dir(aid)):
-        print(aid)
+    if aid and agent_dir(aid).is_dir():
+        _out(aid)
         return EXIT_OK
-    print(f"{PROG}: no previous agent", file=sys.stderr)
+    _err(f"{PROG}: no previous agent")
     return EXIT_NOT_FOUND
 
 
 def _forget_last(aid: str) -> None:
+    """Clear the recorded last agent when it matches ``aid``.
+
+    Args:
+        aid: Lubko agent ID.
+    """
     try:
-        with open(last_file(), encoding="utf-8") as fh:
-            current = fh.read().strip()
-        if current == aid:
-            os.remove(last_file())
+        current = last_file().read_text(encoding="utf-8").strip()
     except OSError:
-        pass
+        return
+    if current == aid:
+        with contextlib.suppress(OSError):
+            last_file().unlink()
 
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True, slots=True)
+class _ArgumentSpec:
+    """Specification for one command line argument."""
+
+    flags: tuple[str, ...]
+    kwargs: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class _SubcommandSpec:
+    """Specification for one subcommand."""
+
+    name: str
+    help: str
+    func: Callable[[argparse.Namespace], int]
+    arguments: tuple[_ArgumentSpec, ...]
+
+
+def _arg(*flags: str, **kwargs: object) -> _ArgumentSpec:
+    """Build an argument specification.
+
+    Args:
+        *flags: Argument flags and names.
+        **kwargs: Argument keyword options.
+
+    Returns:
+        The argument specification.
+    """
+    return _ArgumentSpec(flags=flags, kwargs=kwargs)
+
+
+SUBCOMMANDS: Final = (
+    _SubcommandSpec(
+        name="new",
+        help="create a new agent session",
+        func=cmd_new,
+        arguments=(
+            _arg(
+                "--cwd",
+                metavar="DIR",
+                default=None,
+                help="working directory for the agent (default: current directory)",
+            ),
+            _arg("--prompt", metavar="TEXT", default=None, help="initial instruction"),
+            _arg(
+                "prompt_text", nargs="?", metavar="PROMPT", help="initial instruction (positional)"
+            ),
+            _arg("--title", metavar="TEXT", default=None, help="short display title"),
+            _arg("--json", action="store_true", help="machine-readable output"),
+            _arg("--sync", action="store_true", help=argparse.SUPPRESS),
+        ),
+    ),
+    _SubcommandSpec(
+        name="list",
+        help="list Lubko-managed agents",
+        func=cmd_list,
+        arguments=(
+            _arg("--running", action="store_true", help="only running agents"),
+            _arg("--finished", action="store_true", help="only finished agents"),
+            _arg("--succeeded", action="store_true", help="only succeeded agents"),
+            _arg("--failed", action="store_true", help="only failed agents"),
+            _arg("--stopped", action="store_true", help="only stopped agents"),
+            _arg("--killed", action="store_true", help="only killed agents"),
+            _arg(
+                "--limit",
+                type=int,
+                default=None,
+                metavar="N",
+                help="maximum number of agents to show",
+            ),
+            _arg("--json", action="store_true", help="machine-readable output"),
+        ),
+    ),
+    _SubcommandSpec(
+        name="status",
+        help="show detailed status of one agent",
+        func=cmd_status,
+        arguments=(
+            _arg("agent_id", metavar="ID"),
+            _arg("--json", action="store_true", help="machine-readable output"),
+        ),
+    ),
+    _SubcommandSpec(
+        name="prompt",
+        help="send another instruction to an agent",
+        func=cmd_prompt,
+        arguments=(
+            _arg("agent_id", metavar="ID"),
+            _arg(
+                "--steer",
+                action="store_true",
+                help="send while busy: interrupt the current run and redirect it",
+            ),
+            _arg("--prompt", metavar="TEXT", default=None, help="instruction to send"),
+            _arg("prompt_text", nargs="?", metavar="PROMPT", help="instruction (positional)"),
+            _arg("--json", action="store_true", help="machine-readable output"),
+            _arg("--sync", action="store_true", help=argparse.SUPPRESS),
+        ),
+    ),
+    _SubcommandSpec(
+        name="log",
+        help="show agent output",
+        func=cmd_log,
+        arguments=(
+            _arg("agent_id", metavar="ID"),
+            _arg(
+                "--lines",
+                type=int,
+                default=50,
+                metavar="N",
+                help="number of recent lines (0 for all, default 50)",
+            ),
+            _arg("--follow", action="store_true", help="stream new output until the agent exits"),
+        ),
+    ),
+    _SubcommandSpec(
+        name="result",
+        help="show the agent's final result",
+        func=cmd_result,
+        arguments=(
+            _arg("agent_id", metavar="ID"),
+            _arg("--json", action="store_true", help="machine-readable output"),
+        ),
+    ),
+    _SubcommandSpec(
+        name="wait",
+        help="wait until an agent finishes",
+        func=cmd_wait,
+        arguments=(
+            _arg("agent_id", metavar="ID"),
+            _arg(
+                "--timeout",
+                type=int,
+                default=None,
+                metavar="SEC",
+                required=True,
+                help="give up after SEC seconds without killing the agent",
+            ),
+        ),
+    ),
+    _SubcommandSpec(
+        name="stop",
+        help="gracefully stop a running agent",
+        func=cmd_stop,
+        arguments=(_arg("agent_id", metavar="ID"),),
+    ),
+    _SubcommandSpec(
+        name="kill",
+        help="forcefully terminate a running agent",
+        func=cmd_kill,
+        arguments=(_arg("agent_id", metavar="ID"),),
+    ),
+    _SubcommandSpec(
+        name="delete",
+        help="delete an agent's local state and logs",
+        func=cmd_delete,
+        arguments=(
+            _arg("agent_id", metavar="ID"),
+            _arg("--force", action="store_true", help="kill a running agent before deleting it"),
+        ),
+    ),
+    _SubcommandSpec(
+        name="clean",
+        help="garbage-collect old finished agents",
+        func=cmd_clean,
+        arguments=(
+            _arg(
+                "--days",
+                type=int,
+                default=None,
+                metavar="N",
+                help="retention period in days (default 14)",
+            ),
+            _arg("--dry-run", action="store_true", help="only list what would be removed"),
+        ),
+    ),
+    _SubcommandSpec(
+        name="last",
+        help="print the most recently used agent ID",
+        func=cmd_last,
+        arguments=(),
+    ),
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
+    """Build the ``lubko-agent`` command line parser.
+
+    Returns:
+        The configured parser.
+    """
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
@@ -1313,95 +2196,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
-
-    p_new = sub.add_parser("new", help="create a new agent session")
-    p_new.add_argument("--cwd", metavar="DIR", default=None,
-                       help="working directory for the agent (default: current directory)")
-    p_new.add_argument("--prompt", metavar="TEXT", default=None, help="initial instruction")
-    p_new.add_argument("prompt_text", nargs="?", metavar="PROMPT", help="initial instruction (positional)")
-    p_new.add_argument("--title", metavar="TEXT", default=None, help="short display title")
-    p_new.add_argument("--json", action="store_true", help="machine-readable output")
-    p_new.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
-    p_new.set_defaults(func=cmd_new)
-
-    p_list = sub.add_parser("list", help="list Lubko-managed agents")
-    p_list.add_argument("--running", action="store_true", help="only running agents")
-    p_list.add_argument("--finished", action="store_true", help="only finished agents")
-    p_list.add_argument("--succeeded", action="store_true", help="only succeeded agents")
-    p_list.add_argument("--failed", action="store_true", help="only failed agents")
-    p_list.add_argument("--stopped", action="store_true", help="only stopped agents")
-    p_list.add_argument("--killed", action="store_true", help="only killed agents")
-    p_list.add_argument("--limit", type=int, default=None, metavar="N",
-                        help="maximum number of agents to show")
-    p_list.add_argument("--json", action="store_true", help="machine-readable output")
-    p_list.set_defaults(func=cmd_list)
-
-    p_status = sub.add_parser("status", help="show detailed status of one agent")
-    p_status.add_argument("agent_id", metavar="ID")
-    p_status.add_argument("--json", action="store_true", help="machine-readable output")
-    p_status.set_defaults(func=cmd_status)
-
-    p_prompt = sub.add_parser("prompt", help="send another instruction to an agent")
-    p_prompt.add_argument("agent_id", metavar="ID")
-    p_prompt.add_argument("--steer", action="store_true",
-                          help="send while busy: interrupt the current run and redirect it")
-    p_prompt.add_argument("--prompt", metavar="TEXT", default=None, help="instruction to send")
-    p_prompt.add_argument("prompt_text", nargs="?", metavar="PROMPT", help="instruction (positional)")
-    p_prompt.add_argument("--json", action="store_true", help="machine-readable output")
-    p_prompt.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
-    p_prompt.set_defaults(func=cmd_prompt)
-
-    p_log = sub.add_parser("log", help="show agent output")
-    p_log.add_argument("agent_id", metavar="ID")
-    p_log.add_argument("--lines", type=int, default=50, metavar="N",
-                       help="number of recent lines (0 for all, default 50)")
-    p_log.add_argument("--follow", action="store_true", help="stream new output until the agent exits")
-    p_log.set_defaults(func=cmd_log)
-
-    p_result = sub.add_parser("result", help="show the agent's final result")
-    p_result.add_argument("agent_id", metavar="ID")
-    p_result.add_argument("--json", action="store_true", help="machine-readable output")
-    p_result.set_defaults(func=cmd_result)
-
-    p_wait = sub.add_parser("wait", help="wait until an agent finishes")
-    p_wait.add_argument("agent_id", metavar="ID")
-    p_wait.add_argument("--timeout", type=int, default=None, metavar="SEC", required=True,
-                        help="give up after SEC seconds without killing the agent")
-    p_wait.set_defaults(func=cmd_wait)
-
-    p_stop = sub.add_parser("stop", help="gracefully stop a running agent")
-    p_stop.add_argument("agent_id", metavar="ID")
-    p_stop.set_defaults(func=cmd_stop)
-
-    p_kill = sub.add_parser("kill", help="forcefully terminate a running agent")
-    p_kill.add_argument("agent_id", metavar="ID")
-    p_kill.set_defaults(func=cmd_kill)
-
-    p_delete = sub.add_parser("delete", help="delete an agent's local state and logs")
-    p_delete.add_argument("agent_id", metavar="ID")
-    p_delete.add_argument("--force", action="store_true",
-                          help="kill a running agent before deleting it")
-    p_delete.set_defaults(func=cmd_delete)
-
-    p_clean = sub.add_parser("clean", help="garbage-collect old finished agents")
-    p_clean.add_argument("--days", type=int, default=None, metavar="N",
-                         help="retention period in days (default 14)")
-    p_clean.add_argument("--dry-run", action="store_true", help="only list what would be removed")
-    p_clean.set_defaults(func=cmd_clean)
-
-    p_last = sub.add_parser("last", help="print the most recently used agent ID")
-    p_last.set_defaults(func=cmd_last)
-
+    for spec in SUBCOMMANDS:
+        subparser = sub.add_parser(spec.name, help=spec.help)
+        for argument in spec.arguments:
+            subparser.add_argument(*argument.flags, **cast("Any", argument.kwargs))
+        subparser.set_defaults(func=spec.func)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the ``lubko-agent`` command line interface.
+
+    Args:
+        argv: Command line arguments, or ``None`` to use ``sys.argv``.
+
+    Returns:
+        A process exit code.
+    """
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     argv = list(argv) if argv is not None else sys.argv[1:]
 
     # Hidden internal entry point used by the background runner.
     if argv and argv[0] == "_runner":
-        if len(argv) != 3:
+        if len(argv) != RUNNER_ARGV_LENGTH:
             return EXIT_USAGE
         runner(argv[1], argv[2])
         return EXIT_OK
@@ -1411,7 +2228,7 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "command", None):
         parser.print_help()
         return EXIT_USAGE
-    return args.func(args)
+    return cast("int", args.func(args))
 
 
 if __name__ == "__main__":
