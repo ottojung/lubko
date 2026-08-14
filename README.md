@@ -61,27 +61,69 @@ Jobs run through `bash -lc` directly in the container, in the directory
 requested by each job. Each job is started as its own session and process
 group leader.
 
-## Cancellation
+## Two-column transport invariant
 
-The orchestrator can cancel a job by setting its cancellation marker:
+The transport table `lubko.jobs` has **exactly two columns forever**:
 
 ```sql
-update lubko.jobs
-set cancel_requested_at = now()
-where id = '<job-id>' and status in ('pending', 'running');
+id      uuid primary key default gen_random_uuid()
+payload text not null
 ```
 
-A job that is still `pending` may instead be marked `cancelled` immediately,
-without ever being claimed or executed:
+`payload` is one string containing a JSON object; all evolving job/request/
+result/state/cancellation/process-identity data lives inside it. **Never add a
+third column.** See `docs/protocol.md` for the versioned binding: the payload
+carries a protocol version `v` (currently `1`, kind `command`) with `request`,
+`state`, and `result` sections. SQL casts `payload::jsonb` only transiently for
+predicates and atomic updates and stores `::text` back. The worker refuses to
+start against a table that violates this invariant.
+
+Submit a job in protocol v1 form:
+
+```sql
+insert into lubko.jobs (payload)
+values ('{"v":1,"type":"command","request":{"cwd":"/workspace/project","command":"git status --short"},"state":{"status":"pending"}}')
+returning id;
+```
+
+Poll it with:
+
+```sql
+select id, (payload::jsonb)->'state'->>'status' as status
+from lubko.jobs
+where id = '<job-id>';
+```
+
+## Cancellation
+
+The orchestrator cancels a job by writing to its JSON payload; no extra column
+is involved. A `pending` job is cancelled immediately, without ever being
+claimed or executed:
 
 ```sql
 update lubko.jobs
-set status = 'cancelled',
-    cancel_requested_at = now(),
-    cancellation_note = 'cancelled before the worker claimed the job',
-    finished_at = now(),
-    updated_at = now()
-where id = '<job-id>' and status = 'pending';
+set payload = (
+    jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(
+        payload::jsonb,
+        '{state,status}', '"cancelled"'),
+        '{state,cancel_requested_at}', to_jsonb(now())),
+        '{state,finished_at}', to_jsonb(now())),
+        '{state,updated_at}', to_jsonb(now())),
+        '{result}', '{"stdout":"","stderr":"","exit_code":null,"cancellation_note":"cancelled before the worker claimed the job"}'::jsonb)
+)::text
+where id = '<job-id>' and (payload::jsonb)->'state'->>'status' = 'pending';
+```
+
+A `running` job is cancelled by setting its cancellation marker:
+
+```sql
+update lubko.jobs
+set payload = jsonb_set(
+    jsonb_set(payload::jsonb,
+        '{state,cancel_requested_at}', to_jsonb(now())),
+        '{state,updated_at}', to_jsonb(now())
+)::text
+where id = '<job-id>' and (payload::jsonb)->'state'->>'status' = 'running';
 ```
 
 Cancellation requests are only accepted while a job is `pending` or `running`.
@@ -90,12 +132,13 @@ worker finalizes the job, cancellation wins and the final status is
 `cancelled`.
 
 While a job runs, the worker records its exact process identity in
-`process_pid` and `process_pgid`. On cancellation it sends `SIGTERM` to the
-recorded process group, waits `LUBKO_CANCEL_GRACE_SECONDS`, then sends
-`SIGKILL` to the group while any member remains. It never uses `pkill`,
-`killall`, or process-name matching, and it never signals a group after the
-tracked process is known to be fully gone. The final `cancelled` result keeps
-the output accumulated so far and records a diagnostic in `cancellation_note`.
+`state.process_pid` and `state.process_pgid` inside the payload. On
+cancellation it sends `SIGTERM` to the recorded process group, waits
+`LUBKO_CANCEL_GRACE_SECONDS`, then sends `SIGKILL` to the group while any
+member remains. It never uses `pkill`, `killall`, or process-name matching,
+and it never signals a group after the tracked process is known to be fully
+gone. The final `cancelled` result keeps the output accumulated so far and
+records a diagnostic in `result.cancellation_note`.
 
 ## Database schema and migrations
 
@@ -103,10 +146,15 @@ Schema changes live in `migrations/` as idempotent SQL files applied in
 filename order, for example with `psql`:
 
 ```sh
-psql "$DATABASE_URL" -f migrations/0001_job_cancellation.sql
+psql "$DATABASE_URL" -f migrations/0002_two_column_protocol.sql
 ```
 
 Each migration is safe to apply more than once.
+
+The two-column protocol was introduced in `0002_two_column_protocol.sql`
+(additive preparation) and `0003_cutover_two_column_protocol.sql` (cutover).
+`0003` must only be applied after the legacy worker is stopped; see
+`docs/protocol.md` for the ordered live-migration plan.
 
 Run with:
 

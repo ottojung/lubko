@@ -1,5 +1,6 @@
 """Tests for the Lubko worker."""
 
+import json
 import os
 import shutil
 import signal
@@ -12,14 +13,17 @@ from pathlib import Path
 from typing import Final, Self, cast
 from uuid import UUID, uuid4
 
-import psycopg
 import pytest
 
+from lubko.protocol import parse_payload
 from lubko.worker import (
+    PROTOCOL_ERROR_EXIT_CODE,
     TRUNCATION_MARKER,
     Job,
     JobResult,
+    JobsConnection,
     Settings,
+    claim_and_process_one,
     claim_job,
     finish_job,
     group_has_members,
@@ -34,6 +38,7 @@ from lubko.worker import (
 EXECUTION_ERROR_EXIT_CODE: Final = 127
 COMMAND_FAILURE_EXIT_CODE: Final = 7
 CANCEL_UPDATE_STATEMENTS: Final = 2
+CLAIM_AND_FINISH_UPDATE_STATEMENTS: Final = 2
 
 
 class _RecordingCursor:
@@ -77,7 +82,7 @@ class _RecordingConnection:
         return nullcontext()
 
 
-def as_db(conn: _RecordingConnection) -> psycopg.Connection[Job]:
+def as_db(conn: _RecordingConnection) -> JobsConnection:
     """Adapt the recording test double to the worker's connection type.
 
     Args:
@@ -86,7 +91,7 @@ def as_db(conn: _RecordingConnection) -> psycopg.Connection[Job]:
     Returns:
         The same object typed as a psycopg connection.
     """
-    return cast("psycopg.Connection[Job]", conn)
+    return cast("JobsConnection", conn)
 
 
 def make_settings(
@@ -216,7 +221,7 @@ def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
     """The exact process group is reported while alive and gone after death."""
     shell = resolve_shell()
     assert shell is not None
-    run = spawn_job(Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30"), shell)
+    run = spawn_job(Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell)
     assert group_has_members(run.pgid)
     os.killpg(run.pgid, signal.SIGKILL)
     run.proc.wait(timeout=10)
@@ -227,7 +232,7 @@ def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> Non
     """A spawned job is a session leader whose group ID equals its PID."""
     shell = resolve_shell()
     assert shell is not None
-    run = spawn_job(Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30"), shell)
+    run = spawn_job(Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell)
     try:
         assert run.pgid == run.pid
         assert os.getpgid(run.pid) == run.pid
@@ -249,7 +254,7 @@ def test_run_job_runs_directly_without_docker(
         lambda name: original_which(name) if name != "docker" else None,
     )
 
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo direct")
+    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo direct", args=None)
     result = run_job(as_db(_RecordingConnection()), job, make_settings())
 
     assert result.status == "succeeded"
@@ -260,7 +265,7 @@ def test_run_job_runs_directly_without_docker(
 
 def test_run_job_honors_cwd(tmp_path: Path) -> None:
     """A job runs from the requested working directory."""
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="pwd")
+    job = Job(id=uuid4(), cwd=str(tmp_path), command="pwd", args=None)
 
     result = run_job(as_db(_RecordingConnection()), job, make_settings())
 
@@ -271,7 +276,7 @@ def test_run_job_honors_cwd(tmp_path: Path) -> None:
 
 def test_run_job_success(tmp_path: Path) -> None:
     """A successful job reports a zero exit code and its stdout."""
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hello world")
+    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hello world", args=None)
 
     result = run_job(as_db(_RecordingConnection()), job, make_settings())
 
@@ -280,9 +285,33 @@ def test_run_job_success(tmp_path: Path) -> None:
     assert not result.stderr
 
 
+def test_run_job_executes_args_directly(tmp_path: Path) -> None:
+    """An argv-style job runs directly without a shell."""
+    args = [shutil.which("pwd") or "pwd"]
+    job = Job(id=uuid4(), cwd=str(tmp_path), command=None, args=tuple(args))
+
+    result = run_job(as_db(_RecordingConnection()), job, make_settings())
+
+    assert result.status == "succeeded"
+    assert result.exit_code == 0
+    assert result.stdout.strip() == os.path.realpath(str(tmp_path))
+    assert not result.stderr
+
+
+def test_run_job_rejects_request_without_command_or_args(tmp_path: Path) -> None:
+    """A job request with neither command nor args fails with a clear error."""
+    job = Job(id=uuid4(), cwd=str(tmp_path), command=None, args=None)
+
+    result = run_job(as_db(_RecordingConnection()), job, make_settings())
+
+    assert result.status == "failed"
+    assert result.exit_code == EXECUTION_ERROR_EXIT_CODE
+    assert "neither command nor args" in result.stderr
+
+
 def test_run_job_reports_command_failure(tmp_path: Path) -> None:
     """A failing command preserves its exit code and output."""
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo oops >&2; exit 7")
+    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo oops >&2; exit 7", args=None)
 
     result = run_job(as_db(_RecordingConnection()), job, make_settings())
 
@@ -295,7 +324,7 @@ def test_run_job_reports_command_failure(tmp_path: Path) -> None:
 def test_run_job_reports_missing_cwd(tmp_path: Path) -> None:
     """A missing working directory produces a useful error."""
     missing = tmp_path / "missing"
-    job = Job(id=uuid4(), cwd=str(missing), command="echo hi")
+    job = Job(id=uuid4(), cwd=str(missing), command="echo hi", args=None)
 
     result = run_job(as_db(_RecordingConnection()), job, make_settings())
 
@@ -309,7 +338,7 @@ def test_run_job_reports_non_directory_cwd(tmp_path: Path) -> None:
     """A working directory that is a regular file produces a useful error."""
     target = tmp_path / "file"
     target.write_text("not a directory")
-    job = Job(id=uuid4(), cwd=str(target), command="echo hi")
+    job = Job(id=uuid4(), cwd=str(target), command="echo hi", args=None)
 
     result = run_job(as_db(_RecordingConnection()), job, make_settings())
 
@@ -331,7 +360,7 @@ def test_run_job_reports_missing_shell(
         lambda name: original_which(name) if name != "bash" else None,
     )
 
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hi")
+    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hi", args=None)
 
     result = run_job(as_db(_RecordingConnection()), job, make_settings())
 
@@ -344,15 +373,17 @@ def test_run_job_reports_missing_shell(
 def test_run_job_persists_process_identity(tmp_path: Path) -> None:
     """The worker records the exact PID and PGID of the spawned shell."""
     conn = _RecordingConnection()
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hi")
+    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hi", args=None)
 
     run_job(as_db(conn), job, make_settings())
 
     persist_sqls = [(sql, params) for sql, params in conn.executions if "process_pgid" in sql]
     assert len(persist_sqls) == 1
     sql, params = persist_sqls[0]
-    assert "process_pid" in sql
-    assert "process_pgid" in sql
+    assert "{state,process_pid}" in sql
+    assert "{state,process_pgid}" in sql
+    assert "payload::jsonb" in sql
+    assert "::text" in sql
     assert isinstance(params, tuple)
     pid, pgid, recorded_job_id = params
     assert recorded_job_id == job.id
@@ -366,7 +397,7 @@ def test_cancellation_kills_shell_and_spawned_child(
     """Cancellation terminates the shell and its spawned child process."""
     child_pid_path = tmp_path / "child.pid"
     command = f"sleep 30 & child=$!; echo $child > {child_pid_path}; wait"
-    job = Job(id=uuid4(), cwd=str(tmp_path), command=command)
+    job = Job(id=uuid4(), cwd=str(tmp_path), command=command, args=None)
     persisted_event, cancel_event, persisted = install_cancel_harness(monkeypatch)
     result_box: list[JobResult] = []
 
@@ -408,7 +439,7 @@ def test_cancellation_leaves_unrelated_process_group_untouched(
     sleep = shutil.which("sleep")
     assert sleep is not None
     unrelated = subprocess.Popen([sleep, "30"], start_new_session=True)
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30")
+    job = Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None)
     persisted_event, cancel_event, _ = install_cancel_harness(monkeypatch)
     result_box: list[JobResult] = []
 
@@ -440,7 +471,7 @@ def test_cancellation_sigkills_term_ignoring_shell(
     """A shell that ignores SIGTERM is force-killed after the grace period."""
     ready_path = tmp_path / "ready"
     command = f"trap '' TERM; echo ready > {ready_path}; while true; do sleep 1; done"
-    job = Job(id=uuid4(), cwd=str(tmp_path), command=command)
+    job = Job(id=uuid4(), cwd=str(tmp_path), command=command, args=None)
     persisted_event, cancel_event, persisted = install_cancel_harness(monkeypatch)
     settings = make_settings(process_poll_interval_seconds=0.02, cancel_grace_seconds=0.3)
     result_box: list[JobResult] = []
@@ -478,8 +509,11 @@ def test_request_cancel_cancels_pending_job_without_spawning() -> None:
 
     assert status == "cancelled"
     sql, params = conn.executions[0]
-    assert "status = 'cancelled'" in sql
-    assert "status = 'pending'" in sql
+    assert "{state,status}" in sql
+    assert "'cancelled'" in sql
+    assert "payload::jsonb" in sql
+    assert "::text" in sql
+    assert "'pending'" in sql
     assert params == (job_id,)
     assert len(conn.executions) == 1
 
@@ -494,8 +528,9 @@ def test_request_cancel_marks_running_job() -> None:
 
     assert status == "running"
     sql, params = conn.executions[1]
-    assert "cancel_requested_at = now()" in sql
-    assert "status = 'running'" in sql
+    assert "cancel_requested_at" in sql
+    assert "'running'" in sql
+    assert "payload::jsonb" in sql
     assert params == (job_id,)
 
 
@@ -510,24 +545,68 @@ def test_request_cancel_leaves_terminal_job_unchanged() -> None:
     assert status == "succeeded"
     updates = [sql for sql, _ in conn.executions if "UPDATE" in sql]
     assert len(updates) == CANCEL_UPDATE_STATEMENTS
-    assert "status = 'pending'" in updates[0]
-    assert "status = 'running'" in updates[1]
+    assert "'pending'" in updates[0]
+    assert "'running'" in updates[1]
 
 
 def test_claim_job_marks_job_running() -> None:
     """claim_job marks the job running and returns it for execution."""
     conn = _RecordingConnection()
     job_id = uuid4()
-    conn.rows = [Job(id=job_id, cwd="/workspace", command="echo hi")]
+    claimed_payload = json.dumps({
+        "v": 1,
+        "type": "command",
+        "request": {"cwd": "/workspace", "command": "echo hi"},
+        "state": {"status": "running"},
+    })
+    conn.rows = [(job_id, claimed_payload)]
 
     claimed = claim_job(as_db(conn), "test-worker")
 
     assert claimed is not None
     assert claimed.id == job_id
+    assert isinstance(claimed.payload, str)
+    parsed = parse_payload(claimed.payload)
+    assert parsed.request.cwd == "/workspace"
+    assert parsed.request.command == "echo hi"
+    assert parsed.status == "running"
     sql, params = conn.executions[0]
-    assert "status = 'running'" in sql
-    assert "worker_id = %s" in sql
+    assert "{state,status}" in sql
+    assert "'running'" in sql
+    assert "'pending'" in sql
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "payload::jsonb" in sql
+    assert "::text" in sql
     assert params == ("test-worker",)
+
+
+def test_claim_and_process_one_fails_unparseable_payload() -> None:
+    """A claimed job with an invalid payload is failed without executing it."""
+    conn = _RecordingConnection()
+    job_id = uuid4()
+    conn.rows = [(job_id, "{not json"), ("failed",)]
+
+    processed = claim_and_process_one(as_db(conn), make_settings())
+
+    assert processed is True
+    updates = [(sql, params) for sql, params in conn.executions if "UPDATE" in sql]
+    assert len(updates) == CLAIM_AND_FINISH_UPDATE_STATEMENTS
+    finish_params = updates[1][1]
+    assert isinstance(finish_params, dict)
+    assert finish_params["status"] == "failed"
+    assert finish_params["exit_code"] == PROTOCOL_ERROR_EXIT_CODE
+    assert "invalid job payload" in finish_params["stderr"]
+
+
+def test_claim_and_process_one_returns_false_when_queue_empty() -> None:
+    """An empty queue is reported without any writes past the claim query."""
+    conn = _RecordingConnection()
+
+    processed = claim_and_process_one(as_db(conn), make_settings())
+
+    assert processed is False
+    assert len(conn.executions) == 1
+    assert "RETURNING job.id" in conn.executions[0][0]
 
 
 def test_finish_job_persists_success_result() -> None:
@@ -535,7 +614,6 @@ def test_finish_job_persists_success_result() -> None:
     conn = _RecordingConnection()
     conn.rows = [("succeeded",)]
     job_id = uuid4()
-    job = Job(id=job_id, cwd="/workspace", command="echo hi")
     result = JobResult(
         status="succeeded",
         exit_code=0,
@@ -544,12 +622,14 @@ def test_finish_job_persists_success_result() -> None:
         cancellation_note=None,
     )
 
-    status = finish_job(as_db(conn), job, result)
+    status = finish_job(as_db(conn), job_id, result)
 
     assert status == "succeeded"
     sql, params = conn.executions[0]
-    assert "status = CASE" in sql
-    assert "status = 'running'" in sql
+    assert "CASE" in sql
+    assert "'running'" in sql
+    assert "payload::jsonb" in sql
+    assert "::text" in sql
     assert isinstance(params, dict)
     assert params["status"] == "succeeded"
     assert params["stdout"] == "hi\n"
@@ -563,7 +643,6 @@ def test_finish_job_persists_cancellation_result() -> None:
     conn = _RecordingConnection()
     conn.rows = [("cancelled",)]
     job_id = uuid4()
-    job = Job(id=job_id, cwd="/workspace", command="sleep 30")
     result = JobResult(
         status="cancelled",
         exit_code=-signal.SIGTERM,
@@ -572,11 +651,13 @@ def test_finish_job_persists_cancellation_result() -> None:
         cancellation_note="cancelled: sent SIGTERM to process group",
     )
 
-    status = finish_job(as_db(conn), job, result)
+    status = finish_job(as_db(conn), job_id, result)
 
     assert status == "cancelled"
     sql, params = conn.executions[0]
-    assert "status = CASE" in sql
+    assert "CASE" in sql
+    assert "payload::jsonb" in sql
+    assert "::text" in sql
     assert isinstance(params, dict)
     assert params["status"] == "cancelled"
     assert params["exit_code"] == -signal.SIGTERM

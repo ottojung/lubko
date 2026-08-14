@@ -89,42 +89,37 @@ Lubko jobs live in the PostgreSQL table:
 lubko.jobs
 ```
 
-The current logical schema contains fields equivalent to:
+The transport table has **exactly two columns forever**:
 
-```text
-id
-created_at
-updated_at
-
-status
-cwd
-command
-
-stdout
-stderr
-exit_code
-
-worker_id
-started_at
-finished_at
-
-process_pid
-process_pgid
-cancel_requested_at
-cancellation_note
+```sql
+id      uuid primary key default gen_random_uuid()
+payload text not null
 ```
 
-Typical status values are:
+`payload` is one string containing a JSON object (protocol v1, documented in
+`docs/protocol.md`). Every evolving job/request/result/state/cancellation/
+process-identity field lives inside it:
 
 ```text
-pending
-running
-succeeded
-failed
-cancelled
+payload.v              protocol version (currently 1)
+payload.type           job kind (currently "command")
+payload.request.cwd    working directory
+payload.request.command     shell command, or
+payload.request.args        argv list (exactly one of the two)
+payload.state.status   pending | running | succeeded | failed | cancelled
+payload.state.created_at / updated_at / started_at / finished_at
+payload.state.worker_id
+payload.state.process_pid / process_pgid
+payload.state.cancel_requested_at
+payload.result.stdout / stderr / exit_code / cancellation_note
 ```
 
-The worker atomically claims pending jobs using PostgreSQL row locking, including `FOR UPDATE SKIP LOCKED`.
+Never add a third column to `lubko.jobs`; evolve the protocol inside
+`payload` instead. SQL casts `payload::jsonb` only transiently for predicates
+and atomic updates, and stores `::text` back.
+
+The worker atomically claims pending jobs using PostgreSQL row locking and a
+JSON compare-and-swap, including `FOR UPDATE SKIP LOCKED`.
 
 The orchestrator should use Supabase to submit commands and retrieve their results. The commands themselves should usually be high-level Lubko commands, especially `lubko-agent`, rather than long improvised shell programs.
 
@@ -160,12 +155,11 @@ Use the connected Supabase application and its SQL execution capability.
 A basic job insertion looks like:
 
 ```sql
-insert into lubko.jobs (cwd, command)
+insert into lubko.jobs (payload)
 values (
-    '/workspace/Lubko',
-    'git status --short'
+    '{"v":1,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
 )
-returning id, status, created_at;
+returning id;
 ```
 
 Always retain the returned UUID.
@@ -174,10 +168,11 @@ Example result:
 
 ```text
 id: 12345678-1234-1234-1234-123456789abc
-status: pending
 ```
 
-The `cwd` is the shell working directory for the queued command.
+The `payload.request.cwd` is the shell working directory for the queued
+command, and `payload.state.status` must be `"pending"` for the worker to
+claim it.
 
 The command may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
 
@@ -190,13 +185,13 @@ After submitting a job, query it by ID:
 ```sql
 select
     id,
-    status,
-    stdout,
-    stderr,
-    exit_code,
-    worker_id,
-    started_at,
-    finished_at
+    (payload::jsonb)->'state'->>'status' as status,
+    (payload::jsonb)->'result'->>'stdout' as stdout,
+    (payload::jsonb)->'result'->>'stderr' as stderr,
+    (payload::jsonb)->'result'->>'exit_code' as exit_code,
+    (payload::jsonb)->'state'->>'worker_id' as worker_id,
+    (payload::jsonb)->'state'->>'started_at' as started_at,
+    (payload::jsonb)->'state'->>'finished_at' as finished_at
 from lubko.jobs
 where id = '12345678-1234-1234-1234-123456789abc';
 ```
@@ -226,9 +221,9 @@ Supabase job lifecycle != Lubko agent lifecycle
 For completed jobs, inspect:
 
 ```text
-stdout
-stderr
-exit_code
+payload.result.stdout
+payload.result.stderr
+payload.result.exit_code
 ```
 
 Do not equate non-empty `stderr` with failure. Many Unix programs write informational output to stderr.
@@ -236,8 +231,8 @@ Do not equate non-empty `stderr` with failure. Many Unix programs write informat
 The authoritative shell-job success indicator is normally:
 
 ```text
-status = succeeded
-exit_code = 0
+payload.state.status = succeeded
+payload.result.exit_code = 0
 ```
 
 When a command fails, use its output diagnostically and submit a corrective job when appropriate.
@@ -246,12 +241,16 @@ When a command fails, use its output diagnostically and submit a corrective job 
 
 # Cancelling a Supabase job
 
-To cancel a job, set its cancellation marker:
+To cancel a job, set its cancellation marker inside the JSON payload:
 
 ```sql
 update lubko.jobs
-set cancel_requested_at = now()
-where id = '<job-id>' and status in ('pending', 'running');
+set payload = jsonb_set(
+    jsonb_set(payload::jsonb,
+        '{state,cancel_requested_at}', to_jsonb(now())),
+        '{state,updated_at}', to_jsonb(now())
+)::text
+where id = '<job-id>' and (payload::jsonb)->'state'->>'status' in ('pending', 'running');
 ```
 
 A job that is still `pending` may be cancelled immediately, without being
@@ -259,23 +258,28 @@ claimed or executed:
 
 ```sql
 update lubko.jobs
-set status = 'cancelled',
-    cancel_requested_at = now(),
-    cancellation_note = 'cancelled before the worker claimed the job',
-    finished_at = now(),
-    updated_at = now()
-where id = '<job-id>' and status = 'pending';
+set payload = (
+    jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(
+        payload::jsonb,
+        '{state,status}', '"cancelled"'),
+        '{state,cancel_requested_at}', to_jsonb(now())),
+        '{state,finished_at}', to_jsonb(now())),
+        '{state,updated_at}', to_jsonb(now())),
+        '{result}', '{"stdout":"","stderr":"","exit_code":null,"cancellation_note":"cancelled before the worker claimed the job"}'::jsonb)
+)::text
+where id = '<job-id>' and (payload::jsonb)->'state'->>'status' = 'pending';
 ```
 
 Cancellation is only accepted while the job is `pending` or `running`.
 Already terminal jobs are unchanged. If a request is accepted before the
 worker has finalized the job, cancellation wins and the final status is
-`cancelled` with the output accumulated so far retained in `stdout`/`stderr`
-and a diagnostic in `cancellation_note`.
+`cancelled` with the output accumulated so far retained in
+`payload.result.stdout`/`stderr` and a diagnostic in
+`payload.result.cancellation_note`.
 
 When a running job is cancelled, the worker uses the job's recorded
-`process_pgid` and signals only that exact process group: `SIGTERM`, then
-`SIGKILL` after a bounded grace period while members remain. It never uses
+`payload.state.process_pgid` and signals only that exact process group:
+`SIGTERM`, then `SIGKILL` after a bounded grace period while members remain. It never uses
 `pkill`, `killall`, or process-name matching, and it never signals a process
 group after the tracked process is known to be fully gone.
 

@@ -1,4 +1,12 @@
-"""Poll PostgreSQL for jobs, execute them directly, and support cancellation."""
+"""Poll PostgreSQL for jobs, execute them directly, and support cancellation.
+
+The transport table ``lubko.jobs`` keeps exactly two columns forever: ``id``
+(unique random) and ``payload`` (one string containing a JSON object). All
+job/request/result/state/cancellation/process-identity data lives inside
+``payload`` using the versioned binding in :mod:`lubko.protocol` (see
+``docs/protocol.md``). The worker refuses to start against a table that
+violates the two-column invariant.
+"""
 
 from __future__ import annotations
 
@@ -12,17 +20,20 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import psycopg
-from psycopg.rows import class_row, tuple_row
+from psycopg.rows import tuple_row
 
 from lubko.config import load_database_config
+from lubko.protocol import TWO_COLUMN_INVARIANT, ProtocolError, parse_payload
 
 if TYPE_CHECKING:
     from uuid import UUID
 
     from lubko.config import DatabaseConfig
+
+JobsConnection = psycopg.Connection[tuple[Any, ...]]
 
 LOGGER: Final = logging.getLogger(__name__)
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 1.0
@@ -33,15 +44,60 @@ SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
 STAT_MIN_FIELDS: Final = 3
 STAT_PGRP_FIELD_INDEX: Final = 2
 TRUNCATION_MARKER: Final = b"\n... [output truncated] ...\n"
+PROTOCOL_ERROR_EXIT_CODE: Final = 2
+JOBS_SCHEMA: Final = "lubko"
+JOBS_TABLE: Final = "jobs"
+JOBS_COLUMN_TYPES: Final = (("id", "uuid"), ("payload", "text"))
+UTC_ISO_SQL: Final = (
+    "to_jsonb(to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'))"
+)
+
+
+def _jsonb_set_chain(base: str, updates: list[tuple[str, str]]) -> str:
+    """Compose nested ``jsonb_set`` calls updating JSON sub-paths.
+
+    The outer value of every chain is cast back to ``::text`` by the caller so
+    the ``payload`` column always stores opaque JSON text.
+
+    Args:
+        base: SQL expression producing the ``jsonb`` to start from, normally
+            ``payload::jsonb``.
+        updates: ``(path, value)`` pairs, outermost last, where ``path`` is a
+            comma-separated JSON path and ``value`` is a ``jsonb`` expression.
+
+    Returns:
+        A nested ``jsonb_set`` SQL expression.
+    """
+    expr = base
+    for path, value in updates:
+        expr = f"jsonb_set({expr}, '{{{path}}}', {value})"
+    return expr
 
 
 @dataclass(frozen=True, slots=True)
 class Job:
-    """A claimed shell job."""
+    """A claimed shell job.
+
+    A job carries either a shell ``command`` (run through ``bash -lc``) or an
+    argv-style ``args`` list (executed directly), never both.
+    """
 
     id: UUID
     cwd: str
-    command: str
+    command: str | None
+    args: tuple[str, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedJob:
+    """A claimed job together with its raw JSON payload text."""
+
+    id: UUID
+    payload: str
+
+
+class SchemaInvariantError(RuntimeError):
+    """Raised when ``lubko.jobs`` violates the two-column transport invariant."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,47 +189,69 @@ def truncate_output(data: bytes, limit: int) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
-def claim_job(conn: psycopg.Connection[Job], worker_id: str) -> Job | None:
+def claim_job(conn: JobsConnection, worker_id: str) -> ClaimedJob | None:
     """Atomically claim the oldest pending job.
+
+    Claiming uses the same two-phase approach as before: the pending selection
+    is locked with ``FOR UPDATE SKIP LOCKED`` and the mutable claim state is
+    written with a compare-and-swap update of the JSON payload, so several
+    workers can safely compete for the same queue. No table column is added.
 
     Args:
         conn: Open PostgreSQL connection.
         worker_id: Identifier to record on the claimed job.
 
     Returns:
-        The claimed job, or ``None`` if the queue is empty.
+        The claimed job and its payload text, or ``None`` if the queue is empty.
     """
-    with conn.transaction(), conn.cursor() as cursor:
+    set_chain = _jsonb_set_chain(
+        "job.payload::jsonb",
+        [
+            ("state,status", "to_jsonb('running'::text)"),
+            (
+                "state,created_at",
+                f"COALESCE((job.payload::jsonb)->'state'->'created_at', {UTC_ISO_SQL})",
+            ),
+            ("state,started_at", UTC_ISO_SQL),
+            ("state,worker_id", "to_jsonb(%s::text)"),
+            ("state,updated_at", UTC_ISO_SQL),
+        ],
+    )
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        # The SQL text is assembled from internal constants only; every value
+        # from the outside is bound as a %s parameter. No user input ever
+        # reaches the SQL string itself.
         cursor.execute(
-            """
-            WITH next AS (
-                SELECT id
-                FROM lubko.jobs
-                WHERE status = 'pending'
-                ORDER BY created_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            UPDATE lubko.jobs AS job
-            SET status = 'running',
-                worker_id = %s,
-                started_at = now(),
-                updated_at = now()
-            FROM next
-            WHERE job.id = next.id
-            RETURNING job.id, job.cwd, job.command
-            """,
+            "WITH next AS (\n"  # ruff: ignore[hardcoded-sql-expression]
+            "    SELECT id\n"
+            "    FROM lubko.jobs\n"
+            "    WHERE (payload::jsonb)->'state'->>'status' = 'pending'\n"
+            "    ORDER BY (payload::jsonb)->'state'->>'created_at', id\n"
+            "    FOR UPDATE SKIP LOCKED\n"
+            "    LIMIT 1\n"
+            ")\n"
+            "UPDATE lubko.jobs AS job\n"
+            "SET payload = " + set_chain + "::text\n"
+            "FROM next\n"
+            "WHERE job.id = next.id\n"
+            "RETURNING job.id, job.payload\n",
             (worker_id,),
         )
-        return cursor.fetchone()
+        row = cursor.fetchone()
+    if row is None:
+        return None
+    job_id, payload = row
+    return ClaimedJob(id=job_id, payload=payload)
 
 
-def request_cancel(conn: psycopg.Connection[Job], job_id: UUID) -> str:
+def request_cancel(conn: JobsConnection, job_id: UUID) -> str:
     """Request cancellation of a job using the documented SQL contract.
 
     A pending job is cancelled immediately without ever being spawned. A
-    running job has its ``cancel_requested_at`` marker set and is terminated
-    by the worker. An already terminal job is left unchanged.
+    running job has its ``state.cancel_requested_at`` marker set and is
+    terminated by the worker. An already terminal job is left unchanged. All
+    cancellation state lives inside the JSON ``payload``; no table column is
+    added.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -186,18 +264,50 @@ def request_cancel(conn: psycopg.Connection[Job], job_id: UUID) -> str:
     Raises:
         ValueError: If the job does not exist.
     """
+    pending_chain = _jsonb_set_chain(
+        "payload::jsonb",
+        [
+            ("state,status", "to_jsonb('cancelled'::text)"),
+            ("state,cancel_requested_at", UTC_ISO_SQL),
+            ("state,finished_at", UTC_ISO_SQL),
+            ("state,updated_at", UTC_ISO_SQL),
+            (
+                "result",
+                (
+                    "jsonb_build_object("
+                    "'stdout', '', "
+                    "'stderr', '', "
+                    "'exit_code', null, "
+                    "'cancellation_note', 'cancelled before the worker claimed the job')"
+                ),
+            ),
+        ],
+    )
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            """
-            UPDATE lubko.jobs
-            SET status = 'cancelled',
-                cancel_requested_at = now(),
-                cancellation_note = 'cancelled before the worker claimed the job',
-                finished_at = now(),
-                updated_at = now()
-            WHERE id = %s AND status = 'pending'
-            RETURNING status
-            """,
+            "UPDATE lubko.jobs\n"
+            "SET payload = " + pending_chain + "::text\n"
+            "WHERE id = %s AND (payload::jsonb)->'state'->>'status' = 'pending'\n"
+            "RETURNING (payload::jsonb)->'state'->>'status'\n",
+            (job_id,),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            return str(row[0])
+
+    running_chain = _jsonb_set_chain(
+        "payload::jsonb",
+        [
+            ("state,cancel_requested_at", UTC_ISO_SQL),
+            ("state,updated_at", UTC_ISO_SQL),
+        ],
+    )
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = " + running_chain + "::text\n"
+            "WHERE id = %s AND (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "RETURNING (payload::jsonb)->'state'->>'status'\n",
             (job_id,),
         )
         row = cursor.fetchone()
@@ -206,21 +316,9 @@ def request_cancel(conn: psycopg.Connection[Job], job_id: UUID) -> str:
 
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            """
-            UPDATE lubko.jobs
-            SET cancel_requested_at = now(),
-                updated_at = now()
-            WHERE id = %s AND status = 'running'
-            RETURNING status
-            """,
+            "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
             (job_id,),
         )
-        row = cursor.fetchone()
-        if row is not None:
-            return str(row[0])
-
-    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
-        cursor.execute("SELECT status FROM lubko.jobs WHERE id = %s", (job_id,))
         row = cursor.fetchone()
     if row is None:
         msg = f"job {job_id} not found"
@@ -237,8 +335,11 @@ def resolve_shell() -> str | None:
     return shutil.which("bash")
 
 
-def _persist_process(conn: psycopg.Connection[Job], job_id: UUID, pid: int, pgid: int) -> None:
+def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) -> None:
     """Persist the exact process identity of a running job.
+
+    The identity is written into ``payload.state.process_pid`` and
+    ``payload.state.process_pgid``, keeping the two-column table invariant.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -246,20 +347,22 @@ def _persist_process(conn: psycopg.Connection[Job], job_id: UUID, pid: int, pgid
         pid: Exact process ID of the shell process.
         pgid: Exact process group ID of the shell process.
     """
+    set_chain = _jsonb_set_chain(
+        "payload::jsonb",
+        [
+            ("state,process_pid", "to_jsonb(%s::int)"),
+            ("state,process_pgid", "to_jsonb(%s::int)"),
+            ("state,updated_at", UTC_ISO_SQL),
+        ],
+    )
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
-            """
-            UPDATE lubko.jobs
-            SET process_pid = %s,
-                process_pgid = %s,
-                updated_at = now()
-            WHERE id = %s
-            """,
+            "UPDATE lubko.jobs\nSET payload = " + set_chain + "::text\nWHERE id = %s\n",
             (pid, pgid, job_id),
         )
 
 
-def _is_cancel_requested(conn: psycopg.Connection[Job], job_id: UUID) -> bool:
+def _is_cancel_requested(conn: JobsConnection, job_id: UUID) -> bool:
     """Return whether the job has a cancellation request pending.
 
     Args:
@@ -267,18 +370,19 @@ def _is_cancel_requested(conn: psycopg.Connection[Job], job_id: UUID) -> bool:
         job_id: Identifier of the running job.
 
     Returns:
-        ``True`` when ``cancel_requested_at`` is set.
+        ``True`` when ``state.cancel_requested_at`` is set.
     """
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT cancel_requested_at FROM lubko.jobs WHERE id = %s",
+            "SELECT (payload::jsonb)->'state'->>'cancel_requested_at'\n"
+            "FROM lubko.jobs WHERE id = %s",
             (job_id,),
         )
         row = cursor.fetchone()
     return row is not None and row[0] is not None
 
 
-def _read_job_status(conn: psycopg.Connection[Job], job_id: UUID) -> str:
+def _read_job_status(conn: JobsConnection, job_id: UUID) -> str:
     """Read the current status of a job.
 
     Args:
@@ -292,7 +396,10 @@ def _read_job_status(conn: psycopg.Connection[Job], job_id: UUID) -> str:
         RuntimeError: If the job no longer exists.
     """
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
-        cursor.execute("SELECT status FROM lubko.jobs WHERE id = %s", (job_id,))
+        cursor.execute(
+            "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
+            (job_id,),
+        )
         row = cursor.fetchone()
     if row is None:
         msg = f"job {job_id} disappeared while finalizing"
@@ -396,25 +503,38 @@ def _cleanup_output_files(stdout_path: Path, stderr_path: Path) -> None:
 
 
 def spawn_job(job: Job, shell: str) -> ProcessRun:
-    """Start a job shell as a new session and process group leader.
+    """Start a job as a new session and process group leader.
+
+    A shell ``command`` job runs through ``bash -lc``; an ``args`` job is
+    executed directly. Both are started as a new session so cancellation can
+    signal the exact process group.
 
     Args:
         job: Claimed job to execute.
-        shell: Absolute path to the shell executable.
+        shell: Absolute path to the shell executable, used for ``command``
+            jobs and ignored for ``args`` jobs.
 
     Returns:
         Handle to the running process with its captured output files.
 
     Raises:
-        OSError: If the shell cannot be started.
+        OSError: If the command cannot be started.
+        ValueError: If the job request has neither ``command`` nor ``args``.
     """
+    if job.command is not None:
+        argv = [shell, "-lc", job.command]
+    elif job.args:
+        argv = list(job.args)
+    else:
+        msg = "job request must provide command or args"
+        raise ValueError(msg)
     stdout_fd, stdout_name = tempfile.mkstemp()
     stderr_fd, stderr_name = tempfile.mkstemp()
     stdout_path = Path(stdout_name)
     stderr_path = Path(stderr_name)
     try:
         proc = subprocess.Popen(
-            [shell, "-lc", job.command],
+            argv,
             cwd=job.cwd,
             stdin=subprocess.DEVNULL,
             stdout=stdout_fd,
@@ -498,9 +618,7 @@ def cancel_process_group(run: ProcessRun, settings: Settings) -> tuple[int, str]
         return run.proc.poll() or 0, note
 
 
-def monitor_job(
-    conn: psycopg.Connection[Job], job: Job, run: ProcessRun, settings: Settings
-) -> JobResult:
+def monitor_job(conn: JobsConnection, job: Job, run: ProcessRun, settings: Settings) -> JobResult:
     """Poll a running job for completion or a cancellation request.
 
     Args:
@@ -550,7 +668,7 @@ def monitor_job(
     )
 
 
-def run_job(conn: psycopg.Connection[Job], job: Job, settings: Settings) -> JobResult:
+def run_job(conn: JobsConnection, job: Job, settings: Settings) -> JobResult:
     """Execute one job directly in its requested working directory.
 
     The job is started as a new session and process group leader and may be
@@ -564,15 +682,26 @@ def run_job(conn: psycopg.Connection[Job], job: Job, settings: Settings) -> JobR
     Returns:
         The final job result.
     """
-    shell = resolve_shell()
-    if shell is None:
-        return JobResult(
-            status="failed",
-            exit_code=127,
-            stdout="",
-            stderr="unable to execute job: shell executable not found",
-            cancellation_note=None,
-        )
+    if job.command is not None:
+        shell = resolve_shell()
+        if shell is None:
+            return JobResult(
+                status="failed",
+                exit_code=127,
+                stdout="",
+                stderr="unable to execute job: shell executable not found",
+                cancellation_note=None,
+            )
+    else:
+        if not job.args:
+            return JobResult(
+                status="failed",
+                exit_code=127,
+                stdout="",
+                stderr="unable to execute job: request has neither command nor args",
+                cancellation_note=None,
+            )
+        shell = ""
 
     if not Path(job.cwd).is_dir():
         return JobResult(
@@ -617,57 +746,75 @@ def run_job(conn: psycopg.Connection[Job], job: Job, settings: Settings) -> JobR
     return monitor_job(conn, job, run, settings)
 
 
-def finish_job(conn: psycopg.Connection[Job], job: Job, result: JobResult) -> str:
-    """Persist the final result of a job.
+def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
+    """Persist the final result of a job into its JSON payload.
 
     A cancellation request accepted before finalization wins over a natural
-    completion. Already terminal jobs are never rewritten.
+    completion. Already terminal jobs are never rewritten. Only ``id`` and
+    ``payload`` are touched, preserving the two-column table invariant.
 
     Args:
         conn: Open PostgreSQL connection.
-        job: Job being completed.
+        job_id: Identifier of the job being completed.
         result: Final job result.
 
     Returns:
         The persisted final status.
     """
+    set_chain = _jsonb_set_chain(
+        "payload::jsonb",
+        [
+            (
+                "state,status",
+                (
+                    "CASE\n"
+                    "    WHEN (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
+                    "        THEN to_jsonb('cancelled'::text)\n"
+                    "    ELSE to_jsonb(%(status)s::text)\n"
+                    "END"
+                ),
+            ),
+            ("state,finished_at", UTC_ISO_SQL),
+            ("state,updated_at", UTC_ISO_SQL),
+            ("result,stdout", "to_jsonb(%(stdout)s::text)"),
+            ("result,stderr", "to_jsonb(%(stderr)s::text)"),
+            ("result,exit_code", "to_jsonb(%(exit_code)s::int)"),
+            (
+                "result,cancellation_note",
+                (
+                    "CASE\n"
+                    "    WHEN (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
+                    "        THEN COALESCE(\n"
+                    "            to_jsonb(%(cancellation_note)s::text),\n"
+                    "            to_jsonb('cancelled by request'::text))\n"
+                    "    ELSE to_jsonb(%(cancellation_note)s::text)\n"
+                    "END"
+                ),
+            ),
+        ],
+    )
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            """
-            UPDATE lubko.jobs
-            SET status = CASE
-                    WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
-                    ELSE %(status)s
-                END,
-                stdout = %(stdout)s,
-                stderr = %(stderr)s,
-                exit_code = %(exit_code)s,
-                cancellation_note = CASE
-                    WHEN cancel_requested_at IS NOT NULL
-                        THEN COALESCE(%(cancellation_note)s, 'cancelled by request')
-                    ELSE cancellation_note
-                END,
-                finished_at = now(),
-                updated_at = now()
-            WHERE id = %(job_id)s AND status = 'running'
-            RETURNING status
-            """,
+            "UPDATE lubko.jobs\n"
+            "SET payload = " + set_chain + "::text\n"
+            "WHERE id = %(job_id)s AND (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "RETURNING (payload::jsonb)->'state'->>'status'\n",
             {
                 "status": result.status,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "exit_code": result.exit_code,
                 "cancellation_note": result.cancellation_note,
-                "job_id": job.id,
+                "job_id": job_id,
             },
         )
         row = cursor.fetchone()
     if row is not None:
         return str(row[0])
-    return _read_job_status(conn, job.id)
+    return _read_job_status(conn, job_id)
 
 
-def claim_and_process_one(conn: psycopg.Connection[Job], settings: Settings) -> bool:
+def claim_and_process_one(conn: JobsConnection, settings: Settings) -> bool:
     """Claim and process a single pending job.
 
     Args:
@@ -677,13 +824,33 @@ def claim_and_process_one(conn: psycopg.Connection[Job], settings: Settings) -> 
     Returns:
         ``True`` if a job was processed, ``False`` if the queue was empty.
     """
-    job = claim_job(conn, settings.worker_id)
-    if job is None:
+    claimed = claim_job(conn, settings.worker_id)
+    if claimed is None:
         return False
 
+    try:
+        payload = parse_payload(claimed.payload)
+    except ProtocolError as exc:
+        LOGGER.warning("rejecting unparseable job %s: %s", claimed.id, exc)
+        result = JobResult(
+            status="failed",
+            exit_code=PROTOCOL_ERROR_EXIT_CODE,
+            stdout="",
+            stderr=f"invalid job payload: {exc}",
+            cancellation_note=None,
+        )
+        finish_job(conn, claimed.id, result)
+        return True
+
+    job = Job(
+        id=claimed.id,
+        cwd=payload.request.cwd,
+        command=payload.request.command,
+        args=payload.request.args,
+    )
     LOGGER.info("claimed job %s", job.id)
     result = run_job(conn, job, settings)
-    final_status = finish_job(conn, job, result)
+    final_status = finish_job(conn, job.id, result)
     LOGGER.info(
         "finished job %s with status %s and exit code %d",
         job.id,
@@ -693,7 +860,7 @@ def claim_and_process_one(conn: psycopg.Connection[Job], settings: Settings) -> 
     return True
 
 
-def process_jobs(conn: psycopg.Connection[Job], settings: Settings) -> None:
+def process_jobs(conn: JobsConnection, settings: Settings) -> None:
     """Process jobs until the database connection fails or the process exits.
 
     Args:
@@ -705,8 +872,46 @@ def process_jobs(conn: psycopg.Connection[Job], settings: Settings) -> None:
             time.sleep(settings.poll_interval_seconds)
 
 
+def verify_jobs_table_invariant(conn: JobsConnection) -> None:
+    """Assert that ``lubko.jobs`` keeps exactly the two protocol columns.
+
+    The transport table must have exactly two columns forever: ``id`` (unique
+    random ``uuid``) and ``payload`` (one string containing a JSON object,
+    stored as ``text``). The worker refuses to run against a table that
+    drifted, enforcing the invariant documented in ``docs/protocol.md``.
+
+    Args:
+        conn: Open PostgreSQL connection.
+
+    Raises:
+        SchemaInvariantError: If the table does not have exactly ``id`` and
+            ``payload`` as its only columns, with ``payload`` of type ``text``.
+    """
+    with conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT column_name, data_type\n"
+            "FROM information_schema.columns\n"
+            "WHERE table_schema = %s AND table_name = %s\n"
+            "ORDER BY column_name\n",
+            (JOBS_SCHEMA, JOBS_TABLE),
+        )
+        columns = [(str(row[0]), str(row[1])) for row in cursor.fetchall()]
+    if columns != list(JOBS_COLUMN_TYPES):
+        found = ", ".join(f"{name} {kind}" for name, kind in columns) if columns else "none"
+        expected = ", ".join(f"{name} {kind}" for name, kind in JOBS_COLUMN_TYPES)
+        msg = (
+            f"lubko.jobs violates the two-column transport invariant: "
+            f"expected columns {expected} but found {found}. "
+            f"{TWO_COLUMN_INVARIANT}"
+        )
+        raise SchemaInvariantError(msg)
+
+
 def run(settings: Settings, database: DatabaseConfig) -> None:
     """Reconnect to PostgreSQL as needed and process jobs forever.
+
+    Every connection is first checked against the two-column transport
+    invariant; the worker exits loudly if the schema drifted.
 
     Args:
         settings: Worker runtime settings.
@@ -714,7 +919,8 @@ def run(settings: Settings, database: DatabaseConfig) -> None:
     """
     while True:
         try:
-            with psycopg.connect(database.conninfo(), row_factory=class_row(Job)) as conn:
+            with psycopg.connect(database.conninfo(), row_factory=tuple_row) as conn:
+                verify_jobs_table_invariant(conn)
                 process_jobs(conn, settings)
         except psycopg.Error:
             LOGGER.exception("database connection failed; retrying")
