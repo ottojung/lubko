@@ -107,6 +107,11 @@ exit_code
 worker_id
 started_at
 finished_at
+
+process_pid
+process_pgid
+cancel_requested_at
+cancellation_note
 ```
 
 Typical status values are:
@@ -236,6 +241,54 @@ exit_code = 0
 ```
 
 When a command fails, use its output diagnostically and submit a corrective job when appropriate.
+
+---
+
+# Cancelling a Supabase job
+
+To cancel a job, set its cancellation marker:
+
+```sql
+update lubko.jobs
+set cancel_requested_at = now()
+where id = '<job-id>' and status in ('pending', 'running');
+```
+
+A job that is still `pending` may be cancelled immediately, without being
+claimed or executed:
+
+```sql
+update lubko.jobs
+set status = 'cancelled',
+    cancel_requested_at = now(),
+    cancellation_note = 'cancelled before the worker claimed the job',
+    finished_at = now(),
+    updated_at = now()
+where id = '<job-id>' and status = 'pending';
+```
+
+Cancellation is only accepted while the job is `pending` or `running`.
+Already terminal jobs are unchanged. If a request is accepted before the
+worker has finalized the job, cancellation wins and the final status is
+`cancelled` with the output accumulated so far retained in `stdout`/`stderr`
+and a diagnostic in `cancellation_note`.
+
+When a running job is cancelled, the worker uses the job's recorded
+`process_pgid` and signals only that exact process group: `SIGTERM`, then
+`SIGKILL` after a bounded grace period while members remain. It never uses
+`pkill`, `killall`, or process-name matching, and it never signals a process
+group after the tracked process is known to be fully gone.
+
+The worker-side helper `lubko.worker.request_cancel` implements this contract
+and returns the resulting status:
+
+- `cancelled` — the job was still pending and was cancelled immediately;
+- `running` — the cancellation marker was set and the worker will terminate
+  the process group;
+- an existing terminal status — the job had already finished and was left
+  unchanged.
+
+After cancelling, keep polling the job until it reaches a terminal state.
 
 ---
 

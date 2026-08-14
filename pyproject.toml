@@ -46,7 +46,11 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
-"tests/**/*.py" = ["assert"]
+"tests/**/*.py" = [
+    "assert",
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
 
 [tool.ruff.format]
 preview = true
