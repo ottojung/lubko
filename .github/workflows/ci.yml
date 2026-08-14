@@ -24,35 +24,8 @@ jobs:
       - name: Ruff format
         run: uv run ruff format --check .
       - name: Ruff
-        run: uv run ruff check . --output-format=github
+        run: uv run ruff check .
       - name: Mypy
-        shell: bash
-        run: |
-          set +e
-          uv run mypy . --show-column-numbers --show-error-codes 2>&1 | tee /tmp/mypy.txt
-          rc=${PIPESTATUS[0]}
-          while IFS= read -r line; do
-            if [[ "$line" =~ ^([^:]+):([0-9]+):([0-9]+):\ error:\ (.*)$ ]]; then
-              file=${BASH_REMATCH[1]}
-              lineno=${BASH_REMATCH[2]}
-              col=${BASH_REMATCH[3]}
-              message=${BASH_REMATCH[4]}
-              echo "::error file=$file,line=$lineno,col=$col::$message"
-            fi
-          done < /tmp/mypy.txt
-          exit "$rc"
+        run: uv run mypy .
       - name: Tests
-        shell: bash
-        run: |
-          set +e
-          uv run pytest --tb=short 2>&1 | tee /tmp/pytest.txt
-          rc=${PIPESTATUS[0]}
-          while IFS= read -r line; do
-            if [[ "$line" =~ ^([^:]+\.py):([0-9]+):\ (.*)$ ]]; then
-              file=${BASH_REMATCH[1]}
-              lineno=${BASH_REMATCH[2]}
-              message=${BASH_REMATCH[3]}
-              echo "::error file=$file,line=$lineno::$message"
-            fi
-          done < /tmp/pytest.txt
-          exit "$rc"
+        run: uv run pytest
