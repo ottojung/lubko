@@ -82,7 +82,14 @@ def meta_for_process(aid: str, proc: subprocess.Popen[bytes], cwd: str) -> agent
     meta = agent.base_meta(aid, cwd, "initial prompt", None, is_continue=False)
     meta["pid"] = proc.pid
     meta["pgid"] = proc.pid
-    meta["start_time"] = agent.proc_start_ticks(proc.pid)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        start_time = agent.proc_start_ticks(proc.pid)
+        if start_time is not None:
+            meta["start_time"] = start_time
+            if agent.is_alive(meta):
+                break
+        time.sleep(0.01)
     return meta
 
 

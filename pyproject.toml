@@ -11,6 +11,7 @@ dependencies = [
 [project.scripts]
 lubko-worker = "lubko.worker:main"
 lubko-deploy = "lubko.lifecycle:main"
+lubko-deploy-ctl = "lubko.deployctl:main"
 lubko-agent = "lubko.agent:main"
 my-lubko-agent = "lubko.agent:main"
 lubko-install = "lubko.install:main"
@@ -54,6 +55,24 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
+"src/lubko/deployctl.py" = [
+    "collapsible-if",
+    "docstring-missing-exception",
+    "f-string-in-exception",
+    "hardcoded-sql-expression",
+    "line-too-long",
+    "multiple-with-statements",
+    "raise-vanilla-args",
+    "raise-within-try",
+    "raw-string-in-exception",
+    "start-process-with-partial-path",
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+    "too-many-nested-blocks",
+    "too-many-statements-in-try-clause",
+    "try-consider-else",
+    "typing-only-first-party-import",
+]
 "src/lubko/agent.py" = [
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
@@ -66,6 +85,9 @@ convention = "google"
     "assert",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
+]
+"tests/test_deployctl.py" = [
+    "private-member-access",
 ]
 
 [tool.ruff.format]
@@ -84,6 +106,10 @@ enable_error_code = [
     "truthy-bool",
     "unused-awaitable",
 ]
+
+[[tool.mypy.overrides]]
+module = "lubko.deployctl"
+disable_error_code = ["arg-type", "call-overload"]
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "-q"]

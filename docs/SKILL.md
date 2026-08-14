@@ -158,6 +158,56 @@ Do not ask the user to manually inspect output when the orchestrator can retriev
 
 Do not stop merely because a task requires several steps. Use an agent when the work benefits from reasoning, continuity, iteration, or multiple commands.
 
+## Review substantial work as the orchestrator
+
+The orchestrator is not only a dispatcher. It is another capable reasoning layer and should independently review important agent-produced changes before publication or deployment.
+
+Automated checks are evidence, not proof. Agents can produce code that is green while still violating ordering, lifecycle, concurrency, state-transition, or completeness invariants. After substantial changes, inspect the resulting combined diff and trace the important execution paths yourself.
+
+For a dedicated read-only review pass, follow [`docs/skills/review.md`](skills/review.md). In particular:
+
+- establish the actual task contract;
+- read tests as evidence rather than as proof;
+- trace soundness, completeness, regression safety, maintainability, and performance;
+- search touched paths for obsolete compatibility machinery;
+- report concrete trigger/result/remedy findings;
+- fix Errors before treating the work as complete, while genuinely non-critical follow-ups may become explicit GitHub issues.
+
+## Parallel agents and branch reconciliation
+
+Use multiple agents in parallel when work can be separated cleanly. Independent implementation, acceptance-test, research, documentation, and review agents often produce a better result faster than one agent doing every role sequentially.
+
+The preferred pattern is:
+
+1. clone the repository into separate temporary directories, for example `/tmp/lubko-<task>-core` and `/tmp/lubko-<task>-acceptance`;
+2. create a dedicated Git branch in each clone;
+3. give each agent a narrow, non-overlapping responsibility and its own working directory;
+4. keep independent acceptance/review agents from inspecting the implementation branch when independence is valuable;
+5. let the agents work concurrently without rushing them merely because they are quiet;
+6. freeze each useful result as a commit;
+7. create a fresh reconciliation clone/branch and combine the commits semantically rather than resolving conflicts with blind `ours`/`theirs` choices;
+8. run the checks and independent acceptance tests on the combined result;
+9. perform an orchestrator review of the final reconciled revision.
+
+Do not let several agents edit the same working tree concurrently. Prefer separate clones because they isolate branch state, dependencies, test artifacts, and accidental edits.
+
+## Supervised version-changing deployments
+
+A fresh environment may establish its first maintained worker with ordinary `lubko-deploy`. Once a known-good maintained worker exists, use `lubko-deploy-ctl` for version-changing self-deployments; see [`docs/issue21-deploy-protocol.md`](issue21-deploy-protocol.md).
+
+The normal supervised sequence is:
+
+```text
+checkout exact commit
+    -> provisional candidate + armed rollback watchdog
+confirm exact commit
+    -> random challenge
+confirm exact commit + reversed challenge
+    -> terminal confirmation
+```
+
+Both confirmation requests must traverse the replacement worker. Do not consider a deployment stable merely because checkout returned successfully or the candidate process exists. Until the second confirmation succeeds, the watchdog may restore the previous exact maintained commit automatically.
+
 ---
 
 # Creating a Supabase job
