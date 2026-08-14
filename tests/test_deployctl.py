@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -97,7 +98,7 @@ def test_second_confirmation_writes_meta_before_terminal_state(
     """Successful confirmation records candidate metadata before terminal state."""
     state = pending_state()
     challenge = "challenge-value"
-    challenged = dc.replace(state, challenge_hash=dc._challenge_digest(challenge))
+    challenged = replace(state, challenge_hash=dc._challenge_digest(challenge))
     events: list[str] = []
     written: list[dc.RollbackState] = []
 
@@ -129,7 +130,7 @@ def test_second_confirmation_writes_meta_before_terminal_state(
 def test_wrong_challenge_rolls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     """An incorrect second factor immediately invokes rollback."""
     state = pending_state()
-    challenged = dc.replace(state, challenge_hash=dc._challenge_digest("expected"))
+    challenged = replace(state, challenge_hash=dc._challenge_digest("expected"))
     rollbacks: list[dc.RollbackState] = []
     monkeypatch.setattr(dc, "_read_state", lambda: challenged)
     monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
@@ -155,7 +156,7 @@ def test_watchdog_rollback_condition_uses_deadline_or_candidate_death(
 ) -> None:
     """Status lazily rolls back a dead pending candidate under the same lock."""
     state = pending_state()
-    rolled_back = dc.replace(state, status=dc.STATUS_ROLLED_BACK)
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
     states = iter((state, state, rolled_back))
     calls: list[dc.RollbackState] = []
 
