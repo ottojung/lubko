@@ -4,15 +4,11 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 
 from lubko import deployctl as dc
 from lubko.lifecycle import SCHEMA_VERSION, STATE_RUNNING, WorkerMeta
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 
 def worker_meta(commit: str, *, pid: int = 100) -> WorkerMeta:
@@ -119,13 +115,11 @@ def test_second_confirmation_writes_meta_before_terminal_state(
     monkeypatch.setattr(dc, "_write_state", record_state)
     monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
 
-    response = dc._confirm_locked(
-        {
-            "type": "confirm",
-            "commit": state.commit,
-            "challenge": challenge[::-1],
-        }
-    )
+    response = dc._confirm_locked({
+        "type": "confirm",
+        "commit": state.commit,
+        "challenge": challenge[::-1],
+    })
 
     assert response["confirmed"] is True
     assert events == ["meta", "state"]
@@ -147,13 +141,11 @@ def test_wrong_challenge_rolls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dc, "_rollback_locked", rollback)
 
     with pytest.raises(dc.DeployCtlError, match="incorrect"):
-        dc._confirm_locked(
-            {
-                "type": "confirm",
-                "commit": state.commit,
-                "challenge": "wrong",
-            }
-        )
+        dc._confirm_locked({
+            "type": "confirm",
+            "commit": state.commit,
+            "challenge": "wrong",
+        })
 
     assert rollbacks == [challenged]
 
