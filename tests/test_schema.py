@@ -1,4 +1,4 @@
-"""Tests enforcing the two-column transport invariant and the migration files."""
+"""Tests enforcing the two-column transport invariant and the baseline migration."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,8 +12,16 @@ from lubko.worker import JOBS_COLUMN_TYPES, SchemaInvariantError, verify_jobs_ta
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR: Final = REPO_ROOT / "migrations"
+BASELINE_MIGRATION: Final = MIGRATIONS_DIR / "0001_two_column_protocol.sql"
 PROTOCOL_INVARIANT_PHRASE: Final = "exactly two columns forever"
 TWO_COLUMN_COUNT: Final = 2
+FORBIDDEN_LEGACY_PHRASES: Final = (
+    "jobs_v2",
+    "jobs_legacy",
+    "legacy",
+    "cutover",
+    "backfill",
+)
 
 
 class _FakeCursor:
@@ -85,8 +93,24 @@ def test_verify_wraps_invariant_read_in_own_transaction() -> None:
     assert fake.transaction_count == 1
 
 
-def test_verify_rejects_legacy_multi_column_schema() -> None:
-    """The legacy multi-column schema is rejected."""
+def test_verify_rejects_missing_payload_column() -> None:
+    """A table without the payload column is rejected."""
+    conn = as_connection(_FakeConnection([("id", "uuid")]))
+
+    with pytest.raises(SchemaInvariantError, match=PROTOCOL_INVARIANT_PHRASE):
+        verify_jobs_table_invariant(conn)
+
+
+def test_verify_rejects_extra_third_column() -> None:
+    """Any third column is rejected, even a jsonb one."""
+    conn = as_connection(_FakeConnection([("id", "uuid"), ("payload", "text"), ("status", "text")]))
+
+    with pytest.raises(SchemaInvariantError, match=PROTOCOL_INVARIANT_PHRASE):
+        verify_jobs_table_invariant(conn)
+
+
+def test_verify_rejects_many_extra_columns() -> None:
+    """Any multi-column table is rejected, never just an exact third column."""
     conn = as_connection(
         _FakeConnection([
             ("cancel_requested_at", "timestamp with time zone"),
@@ -107,22 +131,6 @@ def test_verify_rejects_legacy_multi_column_schema() -> None:
             ("worker_id", "text"),
         ])
     )
-
-    with pytest.raises(SchemaInvariantError, match=PROTOCOL_INVARIANT_PHRASE):
-        verify_jobs_table_invariant(conn)
-
-
-def test_verify_rejects_missing_payload_column() -> None:
-    """A table without the payload column is rejected."""
-    conn = as_connection(_FakeConnection([("id", "uuid")]))
-
-    with pytest.raises(SchemaInvariantError, match=PROTOCOL_INVARIANT_PHRASE):
-        verify_jobs_table_invariant(conn)
-
-
-def test_verify_rejects_extra_third_column() -> None:
-    """Any third column is rejected, even a jsonb one."""
-    conn = as_connection(_FakeConnection([("id", "uuid"), ("payload", "text"), ("status", "text")]))
 
     with pytest.raises(SchemaInvariantError, match=PROTOCOL_INVARIANT_PHRASE):
         verify_jobs_table_invariant(conn)
@@ -193,91 +201,74 @@ def _create_table_columns(sql: str, table: str) -> list[str]:
     return [part.strip() for part in _split_top_level(sql[start:end])]
 
 
-def _read_migration(name: str) -> str:
-    return (MIGRATIONS_DIR / name).read_text(encoding="utf-8")
+def _read_baseline_migration() -> str:
+    """Read the baseline migration SQL text.
+
+    Returns:
+        The baseline migration file contents.
+    """
+    return BASELINE_MIGRATION.read_text(encoding="utf-8")
 
 
-def test_prep_migration_creates_exactly_two_columns() -> None:
-    """Migration 0002 creates a table with exactly id uuid + payload text."""
-    sql = _read_migration("0002_two_column_protocol.sql")
-
-    columns = _create_table_columns(sql, "lubko.jobs_v2")
+def test_baseline_migration_creates_exactly_two_columns() -> None:
+    """The baseline migration creates exactly id uuid plus payload text."""
+    columns = _create_table_columns(_read_baseline_migration(), "lubko.jobs")
 
     assert len(columns) == TWO_COLUMN_COUNT
     assert columns[0].startswith("id uuid")
     assert columns[1].startswith("payload text")
 
 
-def test_prep_migration_never_touches_legacy_table() -> None:
-    """Migration 0002 must stay additive so the legacy worker keeps running."""
-    sql = _read_migration("0002_two_column_protocol.sql")
+def test_baseline_migration_declares_payload_as_text_with_checks() -> None:
+    """The baseline declares payload as text with the JSON-object checks."""
+    sql = _read_baseline_migration()
 
-    assert "alter table lubko.jobs " not in sql
-    assert "drop table" not in sql
-    assert "rename to" not in sql
-
-
-def test_cutover_migration_promotes_two_column_table() -> None:
-    """Migration 0003 retires the legacy table and promotes jobs_v2."""
-    sql = _read_migration("0003_cutover_two_column_protocol.sql")
-
-    assert "rename to lubko.jobs_legacy" in sql
-    assert "rename to lubko.jobs" in sql
-    assert "lubko.jobs_v2" in sql
+    assert "payload text not null" in sql
+    assert "jsonb_typeof(payload::jsonb) = 'object'" in sql
+    assert "(payload::jsonb) ? 'v'" in sql
+    assert "((payload::jsonb)->'state'->>'status') is not null" in sql
 
 
-def test_prep_migration_is_idempotent_by_guards() -> None:
-    """Migration 0002 uses create-if-not-exists and guarded backfill."""
-    sql = _read_migration("0002_two_column_protocol.sql")
-
-    assert "create table if not exists" in sql
-    assert "create index if not exists" in sql
-    assert "on conflict (id) do update" in sql
-    assert "to_regclass" in sql
-
-
-def test_cutover_migration_is_idempotent_by_guards() -> None:
-    """Migration 0003 guards every step with schema checks."""
-    sql = _read_migration("0003_cutover_two_column_protocol.sql")
-
-    assert "to_regclass" in sql
-    assert "information_schema.columns" in sql
-
-
-def test_prep_migration_grants_worker_access() -> None:
-    """Migration 0002 grants the worker role the same SELECT/UPDATE it needs."""
-    sql = _read_migration("0002_two_column_protocol.sql")
-
-    assert "grant select, update on table lubko.jobs_v2 to lubko_worker" in sql
-    assert "to_regrole('lubko_worker')" in sql
-
-
-def test_prep_migration_copies_legacy_grants() -> None:
-    """Migration 0002 mirrors every legacy lubko.jobs grant onto jobs_v2."""
-    sql = _read_migration("0002_two_column_protocol.sql")
-
-    assert "information_schema.role_table_grants" in sql
-    assert "table_name = 'jobs'" in sql
-    assert "quote_ident" in sql
-    assert "'PUBLIC'" in sql
-    assert "with grant option" in sql
-
-
-def test_prep_migration_repairs_grants_on_rerun() -> None:
-    """Migration 0002 uses idempotent GRANT so re-applying repairs privileges."""
-    sql = _read_migration("0002_two_column_protocol.sql")
-
-    assert "create table if not exists" in sql
-    assert "grant select, update on table lubko.jobs_v2 to lubko_worker" in sql
-    assert "is_grantable" in sql
-
-
-def test_cutover_migration_reasserts_worker_grant() -> None:
-    """Migration 0003 re-asserts the worker grant on the promoted table."""
-    sql = _read_migration("0003_cutover_two_column_protocol.sql")
+def test_baseline_migration_grants_worker_access() -> None:
+    """The baseline grants the worker role SELECT and UPDATE on lubko.jobs."""
+    sql = _read_baseline_migration()
 
     assert "grant select, update on table lubko.jobs to lubko_worker" in sql
     assert "to_regrole('lubko_worker')" in sql
+
+
+def test_baseline_migration_creates_queue_index() -> None:
+    """The baseline creates the queue expression index on the two columns."""
+    sql = _read_baseline_migration()
+
+    assert "create index if not exists jobs_queue_idx" in sql
+    assert "((payload::jsonb)->'state'->>'status')" in sql
+    assert "((payload::jsonb)->'state'->>'created_at')" in sql
+
+
+def test_baseline_migration_is_idempotent() -> None:
+    """Every baseline statement is safe to apply more than once."""
+    sql = _read_baseline_migration()
+
+    assert "create table if not exists" in sql
+    assert "create index if not exists" in sql
+    assert "to_regrole('lubko_worker')" in sql
+
+
+def test_baseline_migration_documents_the_invariant() -> None:
+    """The baseline carries the invariant comment on the transport table."""
+    sql = _read_baseline_migration()
+
+    assert "comment on table lubko.jobs is" in sql
+    assert "Never add a third column" in sql
+
+
+def test_migrations_contain_no_legacy_references() -> None:
+    """No migration may reintroduce legacy compatibility paths."""
+    for migration in MIGRATIONS_DIR.glob("*.sql"):
+        sql = migration.read_text(encoding="utf-8")
+        for phrase in FORBIDDEN_LEGACY_PHRASES:
+            assert phrase not in sql, migration
 
 
 def test_worker_role_access_is_part_of_the_binding() -> None:
@@ -289,25 +280,13 @@ def test_worker_role_access_is_part_of_the_binding() -> None:
     assert "lubko_worker" in readme
 
 
-def test_payload_column_is_text_in_migrations() -> None:
-    """Migrations declare payload as text and store JSON back as text."""
-    for name in ("0002_two_column_protocol.sql", "0003_cutover_two_column_protocol.sql"):
-        sql = _read_migration(name)
-        assert "payload text not null" in sql
-        assert "::text" in sql
-    prep = _read_migration("0002_two_column_protocol.sql")
-    assert "payload::jsonb" in prep
-    assert "jsonb_typeof(payload::jsonb) = 'object'" in prep
-
-
 def test_invariant_phrase_appears_in_code_docs_and_migrations() -> None:
     """The invariant is documented prominently everywhere it can drift."""
     targets = [
         REPO_ROOT / "README.md",
         REPO_ROOT / "docs" / "SKILL.md",
         REPO_ROOT / "docs" / "protocol.md",
-        MIGRATIONS_DIR / "0002_two_column_protocol.sql",
-        MIGRATIONS_DIR / "0003_cutover_two_column_protocol.sql",
+        BASELINE_MIGRATION,
         REPO_ROOT / "src" / "lubko" / "protocol.py",
         REPO_ROOT / "src" / "lubko" / "worker.py",
     ]

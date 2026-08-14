@@ -44,18 +44,17 @@ create index jobs_queue_idx
 ## Worker role access (part of the binding)
 
 `lubko_worker` is the stable role the worker connects as (see the README
-database configuration) and must keep the same table privileges it holds on
-the legacy table, so it can claim, cancel, poll, and finalize jobs:
+database configuration) and must hold the table privileges it needs to claim,
+cancel, poll, and finalize jobs:
 
 ```sql
 grant select, update on table lubko.jobs to lubko_worker;
 ```
 
-`migrations/0002_two_column_protocol.sql` grants `SELECT, UPDATE` on
-`lubko.jobs_v2` to `lubko_worker` and mirrors every other grant the legacy
-`lubko.jobs` carries; `0003` re-asserts the grant after the table is promoted.
-Table privileges survive a `RENAME`, so the promoted `lubko.jobs` keeps the
-required access. Both `GRANT` statements are idempotent.
+The baseline migration `migrations/0001_two_column_protocol.sql` applies this
+`GRANT` (guarded by `to_regrole` so a fresh environment without the role does
+not fail). `GRANT` is idempotent, so re-applying the baseline repairs the
+access contract.
 
 ## Versioning
 
@@ -167,31 +166,20 @@ PostgreSQL compare-and-swap (CAS) predicates plus row locking:
   Cancellation wins: if `state.cancel_requested_at` is set at finalization the
   status is forced to `cancelled`.
 
-## Live migration and cutover plan
+## Fresh-install schema
 
-The live legacy worker depends on the multi-column `lubko.jobs`, so the
-schema is migrated in two steps with a short, coordinated cutover window.
+A fresh installation applies the single baseline migration
+`migrations/0001_two_column_protocol.sql`, which creates the canonical
+two-column `lubko.jobs` table (with its checks, index, invariant comment, and
+the worker role grant). The migration is idempotent and safe to apply more
+than once.
 
-1. **Prepare (additive, no interruption).** Apply
-   `migrations/0002_two_column_protocol.sql` while the legacy worker keeps
-   running. It creates `lubko.jobs_v2` (the two-column table), its checks,
-   index, invariant comment, and backfills every legacy row as a protocol v1
-   payload. It never touches `lubko.jobs`.
-2. **Pause submissions.** The orchestrator stops submitting new jobs so no job
-   is written to a table with no live reader during the cutover.
-3. **Stop the legacy worker** (`lubko-deploy stop`, or the manual stop for the
-   legacy unmanaged daemon). Pending/running jobs may be drained or cancelled
-   first.
-4. **Cutover.** Apply `migrations/0003_cutover_two_column_protocol.sql`. It
-   performs a final incremental backfill of any rows that changed since step 1,
-   renames `lubko.jobs` to `lubko.jobs_legacy` (kept for rollback), and
-   promotes `lubko.jobs_v2` to `lubko.jobs`.
-5. **Deploy the new worker** with `lubko-deploy deploy` against the same
-   checkout. The new worker verifies the two-column invariant on connect and
-   refuses to start against any other schema.
-6. **Resume submissions** in protocol v1 JSON form:
-   `insert into lubko.jobs (payload) values ('{"v":1,"type":"command","request":{"cwd":"...","command":"..."},"state":{"status":"pending"}}')`.
+There is no legacy schema, no staging table, and no rollback path: the
+two-column table is the only supported binding, and the worker refuses to
+start against any other shape. After the table exists, submit jobs in
+protocol v1 JSON form:
 
-Steps 2–5 are the only window with no live worker; it is kept short and
-coordinated. `lubko.jobs_legacy` may be dropped later once rollback is no
-longer needed.
+```sql
+insert into lubko.jobs (payload)
+values ('{"v":1,"type":"command","request":{"cwd":"...","command":"..."},"state":{"status":"pending"}}');
+```

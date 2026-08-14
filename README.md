@@ -142,19 +142,20 @@ records a diagnostic in `result.cancellation_note`.
 
 ## Database schema and migrations
 
-Schema changes live in `migrations/` as idempotent SQL files applied in
-filename order, for example with `psql`:
+A fresh installation applies the single baseline migration
+`migrations/0001_two_column_protocol.sql`, which creates the canonical
+two-column `lubko.jobs` table, its checks, the queue index, the invariant
+comment, and the worker role grant. Schema changes live in `migrations/` as
+idempotent SQL files applied in filename order, for example with `psql`:
 
 ```sh
-psql "$DATABASE_URL" -f migrations/0002_two_column_protocol.sql
+psql "$DATABASE_URL" -f migrations/0001_two_column_protocol.sql
 ```
 
-Each migration is safe to apply more than once.
-
-The two-column protocol was introduced in `0002_two_column_protocol.sql`
-(additive preparation) and `0003_cutover_two_column_protocol.sql` (cutover).
-`0003` must only be applied after the legacy worker is stopped; see
-`docs/protocol.md` for the ordered live-migration plan.
+Each migration is safe to apply more than once. There is no legacy schema or
+rollback path: the two-column table is the only supported binding, and the
+worker refuses to start against any other shape. See `docs/protocol.md` for
+the authoritative binding.
 
 Run with:
 
