@@ -25,60 +25,6 @@ jobs:
         run: uv sync --frozen
       - name: Normalize branch
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("src/lubko/deployctl.py")
-          text = path.read_text(encoding="utf-8")
-          old = '''            previous = data["previous_meta"]
-              replacement = data["new_meta"]
-              if not isinstance(previous, dict) or not isinstance(replacement, dict):
-                  raise TypeError
-              return cls(
-                  schema_version=int(data["schema_version"]),
-                  status=str(data["status"]),
-                  commit=str(data["commit"]),
-                  previous_commit=str(data["previous_commit"]),
-                  challenge_hash=_optional_string(data.get("challenge_hash")),
-                  deadline=float(data["deadline"]),
-                  repo=str(data["repo"]),
-                  uv_path=str(data["uv_path"]),
-                  stop_grace_seconds=float(data["stop_grace_seconds"]),
-                  git_timeout_seconds=float(data["git_timeout_seconds"]),
-                  previous_meta=WorkerMeta.from_dict(previous),
-                  new_meta=WorkerMeta.from_dict(replacement),
-              )'''.replace("              ", "            ", 1)
-          new = '''            previous = data["previous_meta"]
-            replacement = data["new_meta"]
-            schema_version = data["schema_version"]
-            deadline = data["deadline"]
-            stop_grace_seconds = data["stop_grace_seconds"]
-            git_timeout_seconds = data["git_timeout_seconds"]
-            if not isinstance(previous, dict) or not isinstance(replacement, dict):
-                raise TypeError
-            if not isinstance(schema_version, int):
-                raise TypeError
-            numeric_values = (deadline, stop_grace_seconds, git_timeout_seconds)
-            if not all(isinstance(value, (int, float)) for value in numeric_values):
-                raise TypeError
-            return cls(
-                schema_version=schema_version,
-                status=str(data["status"]),
-                commit=str(data["commit"]),
-                previous_commit=str(data["previous_commit"]),
-                challenge_hash=_optional_string(data.get("challenge_hash")),
-                deadline=float(deadline),
-                repo=str(data["repo"]),
-                uv_path=str(data["uv_path"]),
-                stop_grace_seconds=float(stop_grace_seconds),
-                git_timeout_seconds=float(git_timeout_seconds),
-                previous_meta=WorkerMeta.from_dict(previous),
-                new_meta=WorkerMeta.from_dict(replacement),
-            )'''
-          if old not in text:
-              raise SystemExit("rollback-state decode block not found")
-          path.write_text(text.replace(old, new), encoding="utf-8")
-          PY
           uv run ruff format .
           uv run ruff check . --fix || true
           uv run ruff format .
@@ -86,7 +32,7 @@ jobs:
             git config user.name github-actions[bot]
             git config user.email 41898282+github-actions[bot]@users.noreply.github.com
             git add .
-            git commit -m "Make rollback state decoding type-safe"
+            git commit -m "Apply safe Ruff fixes for issue 21 rebuild"
             git push origin HEAD:issue21-safe-deploy-rebuild
           fi
       - name: Ruff format
