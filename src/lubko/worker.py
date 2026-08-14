@@ -17,8 +17,12 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import class_row, tuple_row
 
+from lubko.config import load_database_config
+
 if TYPE_CHECKING:
     from uuid import UUID
+
+    from lubko.config import DatabaseConfig
 
 LOGGER: Final = logging.getLogger(__name__)
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 1.0
@@ -701,15 +705,16 @@ def process_jobs(conn: psycopg.Connection[Job], settings: Settings) -> None:
             time.sleep(settings.poll_interval_seconds)
 
 
-def run(settings: Settings) -> None:
+def run(settings: Settings, database: DatabaseConfig) -> None:
     """Reconnect to PostgreSQL as needed and process jobs forever.
 
     Args:
         settings: Worker runtime settings.
+        database: Database connection settings loaded from the restricted file.
     """
     while True:
         try:
-            with psycopg.connect("", row_factory=class_row(Job)) as conn:
+            with psycopg.connect(database.conninfo(), row_factory=class_row(Job)) as conn:
                 process_jobs(conn, settings)
         except psycopg.Error:
             LOGGER.exception("database connection failed; retrying")
@@ -717,12 +722,21 @@ def run(settings: Settings) -> None:
 
 
 def main() -> None:
-    """Run the Lubko worker."""
+    """Run the Lubko worker.
+
+    Raises:
+        SystemExit: If the database configuration file cannot be loaded.
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    run(Settings.from_environment())
+    try:
+        database = load_database_config()
+    except (OSError, ValueError):
+        LOGGER.exception("unable to load database configuration")
+        raise SystemExit(1) from None
+    run(Settings.from_environment(), database)
 
 
 if __name__ == "__main__":

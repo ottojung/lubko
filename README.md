@@ -16,10 +16,33 @@ uv run pytest
 
 ## Runtime
 
-The worker uses libpq environment variables (`PGHOST`, `PGPORT`, `PGDATABASE`,
-`PGUSER`, `PGPASSWORD`) for PostgreSQL.
+The worker reads its PostgreSQL connection settings from a single
+permission-restricted file rather than from environment variables, so no
+database host, port, database name, user, or password ever appears in the
+worker process environment.
 
-Optional settings:
+The configuration file path is `$LUBKO_DATABASE_CONFIG` when set, otherwise
+`$XDG_CONFIG_HOME/lubko/database.conf`, defaulting to
+`~/.config/lubko/database.conf`.
+
+The file uses a simple `key=value` format, one setting per line, with `#`
+comments and blank lines ignored:
+
+```text
+# Lubko PostgreSQL connection settings.
+host=db.example.com
+port=5432
+dbname=postgres
+user=lubko_worker
+password=...
+```
+
+The required settings are `host`, `port`, `dbname`, `user`, and `password`.
+The file must be readable and writable only by the owning user (mode `0600`);
+the worker and `lubko-deploy` refuse to use a file that is accessible by the
+group or by other users.
+
+Optional runtime settings:
 
 - `LUBKO_WORKER_ID` — worker identifier, default is the host name.
 - `LUBKO_POLL_INTERVAL_SECONDS` — idle polling interval, default `1`.
@@ -29,6 +52,10 @@ Optional settings:
   job's process group is force-killed, default `5`.
 - `LUBKO_MAX_OUTPUT_BYTES` — maximum bytes retained from each output stream,
   default `262144`.
+
+`lubko-deploy` strips libpq `PG*` variables, `DATABASE_URL`, and other
+credential-bearing variables from the environment it hands to a deployed
+worker, so credentials are never carried in the worker process environment.
 
 Jobs run through `bash -lc` directly in the container, in the directory
 requested by each job. Each job is started as its own session and process

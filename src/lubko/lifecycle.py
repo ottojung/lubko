@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import tuple_row
 
+from lubko.config import load_database_config
 from lubko.worker import group_has_members
 
 if TYPE_CHECKING:
@@ -647,10 +648,11 @@ def git_commit(repo: Path, timeout_seconds: float) -> str | None:
 
 
 def check_postgres(timeout_seconds: float) -> bool:
-    """Verify PostgreSQL is reachable using the worker's libpq environment.
+    """Verify PostgreSQL is reachable using the worker's file-based config.
 
-    Uses the same ``PG*`` environment variables the worker relies on, with a
-    bounded connect timeout. Connection details are never printed.
+    Connection settings are loaded from the same permission-restricted
+    database configuration file the worker reads, with a bounded connect
+    timeout. Connection details are never printed.
 
     Args:
         timeout_seconds: Bounded connect timeout.
@@ -659,9 +661,15 @@ def check_postgres(timeout_seconds: float) -> bool:
         ``True`` when a trivial query succeeds.
     """
     try:
+        config = load_database_config()
+    except (OSError, ValueError):
+        return False
+    try:
         with (
             psycopg.connect(
-                "", connect_timeout=int(timeout_seconds), row_factory=tuple_row
+                config.conninfo(),
+                connect_timeout=int(timeout_seconds),
+                row_factory=tuple_row,
             ) as conn,
             conn.cursor() as cursor,
         ):
@@ -721,8 +729,30 @@ def spawn_worker(
         )
 
 
+def _credential_environment_variable(name: str) -> bool:
+    """Return whether an environment variable may carry credentials.
+
+    Args:
+        name: Environment variable name.
+
+    Returns:
+        ``True`` for libpq ``PG*`` variables, ``DATABASE_URL``, and any
+        variable whose name suggests a password, secret, or credential.
+    """
+    if name.startswith("PG") or name == "DATABASE_URL":
+        return True
+    lowered = name.lower()
+    return any(token in lowered for token in ("password", "secret", "credential"))
+
+
 def worker_env(token: str) -> dict[str, str]:
     """Build the worker environment with the lifecycle token marker.
+
+    Database credentials are deliberately not inherited: libpq ``PG*``
+    variables, connection strings, and other credential-bearing variables are
+    stripped so the worker never exposes secrets through its environment. The
+    worker instead reads its connection settings from the restricted database
+    configuration file.
 
     Args:
         token: Unique lifecycle token for this deployment.
@@ -730,7 +760,11 @@ def worker_env(token: str) -> dict[str, str]:
     Returns:
         The worker environment.
     """
-    env = dict(os.environ)
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not _credential_environment_variable(name)
+    }
     env[LIFECYCLE_MARKER_VAR] = token
     return env
 

@@ -16,6 +16,7 @@ import psycopg
 import pytest
 
 from lubko import lifecycle
+from lubko.config import DatabaseConfig
 from lubko.lifecycle import (
     EXIT_ERROR,
     EXIT_OK,
@@ -31,6 +32,7 @@ SHORT_MARKER: Final = "tok"
 GIT_SHA: Final = "a" * 40
 GIT_SHA_LENGTH: Final = 40
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
+TEST_PASSWORD: Final = "secret-value"  # ruff: ignore[hardcoded-password-string] - test credential
 
 
 def spawn_controlled(marker: str = MARKER) -> subprocess.Popen[bytes]:
@@ -593,20 +595,43 @@ def test_run_validation_reports_first_failure(tmp_path: Path) -> None:
 
 
 def test_check_postgres_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    """check_postgres returns True when a trivial query succeeds."""
+    """check_postgres connects using the file-based database configuration."""
+    config = DatabaseConfig(
+        host="db.example.com",
+        port=5432,
+        dbname="postgres",
+        user="lubko_worker",
+        password=TEST_PASSWORD,
+    )
+    monkeypatch.setattr(lifecycle, "load_database_config", lambda: config)
     connection = mock.MagicMock()
     connection.__enter__.return_value = connection
     cursor = mock.MagicMock()
     cursor.__enter__.return_value = cursor
     cursor.fetchone.return_value = (1,)
     connection.cursor.return_value = cursor
+    captured: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
-    monkeypatch.setattr("lubko.lifecycle.psycopg.connect", lambda *_a, **_k: connection)
+    def recording_connect(*args: str, **kwargs: object) -> object:
+        captured.append((args, kwargs))
+        return connection
+
+    monkeypatch.setattr("lubko.lifecycle.psycopg.connect", recording_connect)
     assert lifecycle.check_postgres(1.0)
+    assert captured[0][0][0] == config.conninfo()
+    assert captured[0][1]["connect_timeout"] == 1
 
 
 def test_check_postgres_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """check_postgres returns False when the connection fails."""
+    config = DatabaseConfig(
+        host="db.example.com",
+        port=5432,
+        dbname="postgres",
+        user="lubko_worker",
+        password=TEST_PASSWORD,
+    )
+    monkeypatch.setattr(lifecycle, "load_database_config", lambda: config)
 
     def fake_connect(*_args: object, **_kwargs: object) -> object:
         msg = "boom"
@@ -614,6 +639,49 @@ def test_check_postgres_failure(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("lubko.lifecycle.psycopg.connect", fake_connect)
     assert not lifecycle.check_postgres(1.0)
+
+
+def test_check_postgres_missing_config_returns_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """check_postgres returns False when the configuration file is unavailable."""
+
+    def missing() -> object:
+        msg = "no config"
+        raise FileNotFoundError(msg)
+
+    monkeypatch.setattr(lifecycle, "load_database_config", missing)
+    assert not lifecycle.check_postgres(1.0)
+
+
+def test_worker_env_removes_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """worker_env strips libpq, connection-string, and credential variables."""
+    monkeypatch.setenv("PGHOST", "db.example.com")
+    monkeypatch.setenv("PGPASSWORD", "secret-value")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db.example.com/db")
+    monkeypatch.setenv("POSTGRES_PASSWORD", "secret-value")
+    monkeypatch.setenv("LUBKO_WORKER_ID", "phoebe")
+    monkeypatch.setenv("LUBKO_LIFECYCLE_TOKEN", "outer")
+
+    env = lifecycle.worker_env(MARKER)
+
+    assert "PGHOST" not in env
+    assert "PGPASSWORD" not in env
+    assert "DATABASE_URL" not in env
+    assert "POSTGRES_PASSWORD" not in env
+    assert env[lifecycle.LIFECYCLE_MARKER_VAR] == MARKER
+    assert env["LUBKO_WORKER_ID"] == "phoebe"
+
+
+def test_worker_env_keeps_unrelated_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    """worker_env preserves unrelated environment variables."""
+    monkeypatch.setenv("HOME", "/home/user1")
+    monkeypatch.setenv("PATH", "/bin")
+
+    env = lifecycle.worker_env(MARKER)
+
+    assert env["HOME"] == "/home/user1"
+    assert env["PATH"] == "/bin"
 
 
 def test_git_commit_reads_head() -> None:
