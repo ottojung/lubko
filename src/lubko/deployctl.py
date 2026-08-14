@@ -667,7 +667,7 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
         time.sleep(WATCHDOG_POLL_SECONDS)
 
 
-def _fork_watchdog(gate_writer: int, lock_timeout_seconds: float) -> None:
+def _fork_watchdog(lock_timeout_seconds: float) -> None:
     """Fork the already-loaded stable wrapper before destructive handoff.
 
     The child closes its copy of the gate writer immediately. Therefore, if the
@@ -675,7 +675,6 @@ def _fork_watchdog(gate_writer: int, lock_timeout_seconds: float) -> None:
     candidate exits rather than becoming an orphan queue consumer.
 
     Args:
-        gate_writer: Candidate gate writer inherited across ``fork``.
         lock_timeout_seconds: Lock timeout used by the watchdog.
 
     Raises:
@@ -768,7 +767,7 @@ def _deploy_locked(options: Options, commit: str) -> RollbackState:
     )
     _write_state(state)
     try:
-        _fork_watchdog(gated.gate_writer, options.lock_timeout_seconds)
+        _fork_watchdog(options.lock_timeout_seconds)
         if not stop_worker(previous, options.stop_grace_seconds):
             raise DeployCtlError("could not stop the known-good worker")
         _release_gate(gated.gate_writer)
