@@ -3,72 +3,29 @@ name: CI
 on:
   push:
     branches:
-      - issue21-safe-deploy-rebuild
+      - main
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: issue21-safe-deploy-rebuild
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install uv
         run: python -m pip install uv
       - name: Sync
         run: uv sync --frozen
-      - name: Normalize branch
-        run: |
-          python -c 'import base64,pathlib; p=pathlib.Path("tests/test_agent.py"); s=p.read_text(); a=base64.b64decode("ICAgIG1ldGFbInBpZCJdID0gcHJvYy5waWQKICAgIG1ldGFbInBnaWQiXSA9IHByb2MucGlkCiAgICBtZXRhWyJzdGFydF90aW1lIl0gPSBhZ2VudC5wcm9jX3N0YXJ0X3RpY2tzKHByb2MucGlkKQogICAgcmV0dXJuIG1ldGE=").decode(); b=base64.b64decode("ICAgIG1ldGFbInBpZCJdID0gcHJvYy5waWQKICAgIG1ldGFbInBnaWQiXSA9IHByb2MucGlkCiAgICBkZWFkbGluZSA9IHRpbWUubW9ub3RvbmljKCkgKyAyLjAKICAgIHdoaWxlIHRpbWUubW9ub3RvbmljKCkgPCBkZWFkbGluZToKICAgICAgICBzdGFydF90aW1lID0gYWdlbnQucHJvY19zdGFydF90aWNrcyhwcm9jLnBpZCkKICAgICAgICBpZiBzdGFydF90aW1lIGlzIG5vdCBOb25lOgogICAgICAgICAgICBtZXRhWyJzdGFydF90aW1lIl0gPSBzdGFydF90aW1lCiAgICAgICAgICAgIGlmIGFnZW50LmlzX2FsaXZlKG1ldGEpOgogICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICB0aW1lLnNsZWVwKDAuMDEpCiAgICByZXR1cm4gbWV0YQ==").decode(); p.write_text(s.replace(a,b) if a in s else s)'
-          python -c 'import base64,pathlib; p=pathlib.Path("docs/SKILL.md"); s=p.read_text(); a=base64.b64decode("RG8gbm90IHN0b3AgbWVyZWx5IGJlY2F1c2UgYSB0YXNrIHJlcXVpcmVzIHNldmVyYWwgc3RlcHMuIFVzZSBhbiBhZ2VudCB3aGVuIHRoZSB3b3JrIGJlbmVmaXRzIGZyb20gcmVhc29uaW5nLCBjb250aW51aXR5LCBpdGVyYXRpb24sIG9yIG11bHRpcGxlIGNvbW1hbmRzLgoKLS0tCgojIENyZWF0aW5nIGEgU3VwYWJhc2Ugam9i").decode(); b=base64.b64decode("RG8gbm90IHN0b3AgbWVyZWx5IGJlY2F1c2UgYSB0YXNrIHJlcXVpcmVzIHNldmVyYWwgc3RlcHMuIFVzZSBhbiBhZ2VudCB3aGVuIHRoZSB3b3JrIGJlbmVmaXRzIGZyb20gcmVhc29uaW5nLCBjb250aW51aXR5LCBpdGVyYXRpb24sIG9yIG11bHRpcGxlIGNvbW1hbmRzLgoKIyMgUmV2aWV3IHN1YnN0YW50aWFsIHdvcmsgYXMgdGhlIG9yY2hlc3RyYXRvcgoKVGhlIG9yY2hlc3RyYXRvciBpcyBub3Qgb25seSBhIGRpc3BhdGNoZXIuIEl0IGlzIGFub3RoZXIgY2FwYWJsZSByZWFzb25pbmcgbGF5ZXIgYW5kIHNob3VsZCBpbmRlcGVuZGVudGx5IHJldmlldyBpbXBvcnRhbnQgYWdlbnQtcHJvZHVjZWQgY2hhbmdlcyBiZWZvcmUgcHVibGljYXRpb24gb3IgZGVwbG95bWVudC4KCkF1dG9tYXRlZCBjaGVja3MgYXJlIGV2aWRlbmNlLCBub3QgcHJvb2YuIEFnZW50cyBjYW4gcHJvZHVjZSBjb2RlIHRoYXQgaXMgZ3JlZW4gd2hpbGUgc3RpbGwgdmlvbGF0aW5nIG9yZGVyaW5nLCBsaWZlY3ljbGUsIGNvbmN1cnJlbmN5LCBzdGF0ZS10cmFuc2l0aW9uLCBvciBjb21wbGV0ZW5lc3MgaW52YXJpYW50cy4gQWZ0ZXIgc3Vic3RhbnRpYWwgY2hhbmdlcywgaW5zcGVjdCB0aGUgcmVzdWx0aW5nIGNvbWJpbmVkIGRpZmYgYW5kIHRyYWNlIHRoZSBpbXBvcnRhbnQgZXhlY3V0aW9uIHBhdGhzIHlvdXJzZWxmLgoKRm9yIGEgZGVkaWNhdGVkIHJlYWQtb25seSByZXZpZXcgcGFzcywgZm9sbG93IFtgZG9jcy9za2lsbHMvcmV2aWV3Lm1kYF0oc2tpbGxzL3Jldmlldy5tZCkuIEluIHBhcnRpY3VsYXI6CgotIGVzdGFibGlzaCB0aGUgYWN0dWFsIHRhc2sgY29udHJhY3Q7Ci0gcmVhZCB0ZXN0cyBhcyBldmlkZW5jZSByYXRoZXIgdGhhbiBhcyBwcm9vZjsKLSB0cmFjZSBzb3VuZG5lc3MsIGNvbXBsZXRlbmVzcywgcmVncmVzc2lvbiBzYWZldHksIG1haW50YWluYWJpbGl0eSwgYW5kIHBlcmZvcm1hbmNlOwotIHNlYXJjaCB0b3VjaGVkIHBhdGhzIGZvciBvYnNvbGV0ZSBjb21wYXRpYmlsaXR5IG1hY2hpbmVyeTsKLSByZXBvcnQgY29uY3JldGUgdHJpZ2dlci9yZXN1bHQvcmVtZWR5IGZpbmRpbmdzOwotIGZpeCBFcnJvcnMgYmVmb3JlIHRyZWF0aW5nIHRoZSB3b3JrIGFzIGNvbXBsZXRlLCB3aGlsZSBnZW51aW5lbHkgbm9uLWNyaXRpY2FsIGZvbGxvdy11cHMgbWF5IGJlY29tZSBleHBsaWNpdCBHaXRIdWIgaXNzdWVzLgoKIyMgUGFyYWxsZWwgYWdlbnRzIGFuZCBicmFuY2ggcmVjb25jaWxpYXRpb24KClVzZSBtdWx0aXBsZSBhZ2VudHMgaW4gcGFyYWxsZWwgd2hlbiB3b3JrIGNhbiBiZSBzZXBhcmF0ZWQgY2xlYW5seS4gSW5kZXBlbmRlbnQgaW1wbGVtZW50YXRpb24sIGFjY2VwdGFuY2UtdGVzdCwgcmVzZWFyY2gsIGRvY3VtZW50YXRpb24sIGFuZCByZXZpZXcgYWdlbnRzIG9mdGVuIHByb2R1Y2UgYSBiZXR0ZXIgcmVzdWx0IGZhc3RlciB0aGFuIG9uZSBhZ2VudCBkb2luZyBldmVyeSByb2xlIHNlcXVlbnRpYWxseS4KClRoZSBwcmVmZXJyZWQgcGF0dGVybiBpczoKCjEuIGNsb25lIHRoZSByZXBvc2l0b3J5IGludG8gc2VwYXJhdGUgdGVtcG9yYXJ5IGRpcmVjdG9yaWVzLCBmb3IgZXhhbXBsZSBgL3RtcC9sdWJrby08dGFzaz4tY29yZWAgYW5kIGAvdG1wL2x1YmtvLTx0YXNrPi1hY2NlcHRhbmNlYDsKMi4gY3JlYXRlIGEgZGVkaWNhdGVkIEdpdCBicmFuY2ggaW4gZWFjaCBjbG9uZTsKMy4gZ2l2ZSBlYWNoIGFnZW50IGEgbmFycm93LCBub24tb3ZlcmxhcHBpbmcgcmVzcG9uc2liaWxpdHkgYW5kIGl0cyBvd24gd29ya2luZyBkaXJlY3Rvcnk7CjQuIGtlZXAgaW5kZXBlbmRlbnQgYWNjZXB0YW5jZS9yZXZpZXcgYWdlbnRzIGZyb20gaW5zcGVjdGluZyB0aGUgaW1wbGVtZW50YXRpb24gYnJhbmNoIHdoZW4gaW5kZXBlbmRlbmNlIGlzIHZhbHVhYmxlOwo1LiBsZXQgdGhlIGFnZW50cyB3b3JrIGNvbmN1cnJlbnRseSB3aXRob3V0IHJ1c2hpbmcgdGhlbSBtZXJlbHkgYmVjYXVzZSB0aGV5IGFyZSBxdWlldDsKNi4gZnJlZXplIGVhY2ggdXNlZnVsIHJlc3VsdCBhcyBhIGNvbW1pdDsKNy4gY3JlYXRlIGEgZnJlc2ggcmVjb25jaWxpYXRpb24gY2xvbmUvYnJhbmNoIGFuZCBjb21iaW5lIHRoZSBjb21taXRzIHNlbWFudGljYWxseSByYXRoZXIgdGhhbiByZXNvbHZpbmcgY29uZmxpY3RzIHdpdGggYmxpbmQgYG91cnNgL2B0aGVpcnNgIGNob2ljZXM7CjguIHJ1biB0aGUgY2hlY2tzIGFuZCBpbmRlcGVuZGVudCBhY2NlcHRhbmNlIHRlc3RzIG9uIHRoZSBjb21iaW5lZCByZXN1bHQ7CjkuIHBlcmZvcm0gYW4gb3JjaGVzdHJhdG9yIHJldmlldyBvZiB0aGUgZmluYWwgcmVjb25jaWxlZCByZXZpc2lvbi4KCkRvIG5vdCBsZXQgc2V2ZXJhbCBhZ2VudHMgZWRpdCB0aGUgc2FtZSB3b3JraW5nIHRyZWUgY29uY3VycmVudGx5LiBQcmVmZXIgc2VwYXJhdGUgY2xvbmVzIGJlY2F1c2UgdGhleSBpc29sYXRlIGJyYW5jaCBzdGF0ZSwgZGVwZW5kZW5jaWVzLCB0ZXN0IGFydGlmYWN0cywgYW5kIGFjY2lkZW50YWwgZWRpdHMuCgojIyBTdXBlcnZpc2VkIHZlcnNpb24tY2hhbmdpbmcgZGVwbG95bWVudHMKCkEgZnJlc2ggZW52aXJvbm1lbnQgbWF5IGVzdGFibGlzaCBpdHMgZmlyc3QgbWFpbnRhaW5lZCB3b3JrZXIgd2l0aCBvcmRpbmFyeSBgbHVia28tZGVwbG95YC4gT25jZSBhIGtub3duLWdvb2QgbWFpbnRhaW5lZCB3b3JrZXIgZXhpc3RzLCB1c2UgYGx1YmtvLWRlcGxveS1jdGxgIGZvciB2ZXJzaW9uLWNoYW5naW5nIHNlbGYtZGVwbG95bWVudHM7IHNlZSBbYGRvY3MvaXNzdWUyMS1kZXBsb3ktcHJvdG9jb2wubWRgXShpc3N1ZTIxLWRlcGxveS1wcm90b2NvbC5tZCkuCgpUaGUgbm9ybWFsIHN1cGVydmlzZWQgc2VxdWVuY2UgaXM6CgpgYGB0ZXh0CmNoZWNrb3V0IGV4YWN0IGNvbW1pdAogICAgLT4gcHJvdmlzaW9uYWwgY2FuZGlkYXRlICsgYXJtZWQgcm9sbGJhY2sgd2F0Y2hkb2cKY29uZmlybSBleGFjdCBjb21taXQKICAgIC0+IHJhbmRvbSBjaGFsbGVuZ2UKY29uZmlybSBleGFjdCBjb21taXQgKyByZXZlcnNlZCBjaGFsbGVuZ2UKICAgIC0+IHRlcm1pbmFsIGNvbmZpcm1hdGlvbgpgYGAKCkJvdGggY29uZmlybWF0aW9uIHJlcXVlc3RzIG11c3QgdHJhdmVyc2UgdGhlIHJlcGxhY2VtZW50IHdvcmtlci4gRG8gbm90IGNvbnNpZGVyIGEgZGVwbG95bWVudCBzdGFibGUgbWVyZWx5IGJlY2F1c2UgY2hlY2tvdXQgcmV0dXJuZWQgc3VjY2Vzc2Z1bGx5IG9yIHRoZSBjYW5kaWRhdGUgcHJvY2VzcyBleGlzdHMuIFVudGlsIHRoZSBzZWNvbmQgY29uZmlybWF0aW9uIHN1Y2NlZWRzLCB0aGUgd2F0Y2hkb2cgbWF5IHJlc3RvcmUgdGhlIHByZXZpb3VzIGV4YWN0IG1haW50YWluZWQgY29tbWl0IGF1dG9tYXRpY2FsbHkuCgotLS0KCiMgQ3JlYXRpbmcgYSBTdXBhYmFzZSBqb2I=").decode(); p.write_text(s.replace(a,b) if a in s else s)'
-          uv run ruff format .
-          uv run ruff check . --fix || true
-          uv run ruff format .
-          if ! git diff --quiet; then
-            git config user.name github-actions[bot]
-            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-            git add .
-            git commit -m "Update orchestrator workflow guidance"
-            git push origin HEAD:issue21-safe-deploy-rebuild
-          fi
       - name: Ruff format
         run: uv run ruff format --check .
       - name: Ruff
-        run: uv run ruff check . --output-format=github
+        run: uv run ruff check .
       - name: Mypy
-        shell: bash
-        run: |
-          set +e
-          uv run mypy . --show-column-numbers --show-error-codes 2>&1 | tee /tmp/mypy.txt
-          rc=${PIPESTATUS[0]}
-          while IFS= read -r line; do
-            if [[ "$line" =~ ^([^:]+):([0-9]+):([0-9]+):\ error:\ (.*)$ ]]; then
-              file=${BASH_REMATCH[1]}
-              lineno=${BASH_REMATCH[2]}
-              col=${BASH_REMATCH[3]}
-              message=${BASH_REMATCH[4]}
-              echo "::error file=$file,line=$lineno,col=$col::$message"
-            fi
-          done < /tmp/mypy.txt
-          exit "$rc"
+        run: uv run mypy .
       - name: Tests
-        shell: bash
-        run: |
-          set +e
-          uv run pytest --tb=short 2>&1 | tee /tmp/pytest.txt
-          rc=${PIPESTATUS[0]}
-          while IFS= read -r line; do
-            if [[ "$line" =~ ^([^:]+\.py):([0-9]+):\ (.*)$ ]]; then
-              file=${BASH_REMATCH[1]}
-              lineno=${BASH_REMATCH[2]}
-              message=${BASH_REMATCH[3]}
-              echo "::error file=$file,line=$lineno::$message"
-            fi
-          done < /tmp/pytest.txt
-          exit "$rc"
+        run: uv run pytest
