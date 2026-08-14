@@ -157,7 +157,7 @@ def test_watchdog_rollback_condition_uses_deadline_or_candidate_death(
     """Status lazily rolls back a dead pending candidate under the same lock."""
     state = pending_state()
     rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
-    states = iter((state, state, rolled_back))
+    states = iter((state, rolled_back))
     calls: list[dc.RollbackState] = []
 
     class FakeLock:
