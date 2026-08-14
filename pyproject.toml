@@ -86,6 +86,9 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
+"tests/test_deployctl.py" = [
+    "private-member-access",
+]
 
 [tool.ruff.format]
 preview = true
