@@ -52,6 +52,15 @@ Optional runtime settings:
   job's process group is force-killed, default `5`.
 - `LUBKO_MAX_OUTPUT_BYTES` — maximum bytes retained from each output stream,
   default `262144`.
+- `LUBKO_LEASE_DURATION_SECONDS` — how far in the future a claim or heartbeat
+  pushes a running job's lease deadline, default `30`.
+- `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS` — how often the worker heartbeats
+  (refreshes) the lease of its running job, default `5`.
+- `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS` — how often the worker scans for
+  running jobs whose lease has expired and recovers them, default `10`.
+
+The lease refresh interval must be smaller than the lease duration; the worker
+refuses to start with an invalid combination.
 
 `lubko-deploy` strips libpq `PG*` variables, `DATABASE_URL`, and other
 credential-bearing variables from the environment it hands to a deployed
@@ -139,6 +148,33 @@ member remains. It never uses `pkill`, `killall`, or process-name matching,
 and it never signals a group after the tracked process is known to be fully
 gone. The final `cancelled` result keeps the output accumulated so far and
 records a diagnostic in `result.cancellation_note`.
+
+## Lease, heartbeat, and recovery
+
+A worker can claim a job and then crash or be restarted before writing the
+final result, leaving the row stuck in `running`. Lubko recovers such stale
+jobs automatically with a lease/heartbeat model kept entirely inside the JSON
+payload:
+
+- **Claim** — when a worker claims a pending job it writes
+  `state.worker_incarnation` (a unique per-worker-process identity) and sets
+  `state.lease_expires_at` to `now + LUBKO_LEASE_DURATION_SECONDS`.
+- **Heartbeat** — while a job runs, the owning worker refreshes
+  `state.lease_expires_at` every `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`, so a
+  genuinely live long-running job always shows a fresh lease and is never
+  stolen.
+- **Recovery** — every `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS` each worker
+  atomically scans for `running` jobs whose lease is present and expired
+  (`FOR UPDATE SKIP LOCKED` plus a single JSON compare-and-swap update) and
+  marks them `failed` with a clear `result.recovery_note` naming the expired
+  lease and the owning worker. Recovery **never re-executes** an abandoned job,
+  so two workers can never execute the same job concurrently. A running job
+  without a lease field is never selected and is left for manual repair.
+
+The lease refresh interval must be smaller than the lease duration; the worker
+refuses to start with an invalid combination. Recovery never signals process
+groups it does not own: a surviving orphan process runs to completion inside
+the container and its output is discarded.
 
 ## Database schema and migrations
 

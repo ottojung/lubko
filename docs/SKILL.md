@@ -109,9 +109,11 @@ payload.request.args        argv list (exactly one of the two)
 payload.state.status   pending | running | succeeded | failed | cancelled
 payload.state.created_at / updated_at / started_at / finished_at
 payload.state.worker_id
+payload.state.worker_incarnation
+payload.state.lease_expires_at / recovered_at
 payload.state.process_pid / process_pgid
 payload.state.cancel_requested_at
-payload.result.stdout / stderr / exit_code / cancellation_note
+payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
 ```
 
 Never add a third column to `lubko.jobs`; evolve the protocol inside
@@ -120,6 +122,16 @@ and atomic updates, and stores `::text` back.
 
 The worker atomically claims pending jobs using PostgreSQL row locking and a
 JSON compare-and-swap, including `FOR UPDATE SKIP LOCKED`.
+
+Running jobs carry a lease (`payload.state.lease_expires_at`) that the owning
+worker refreshes by heartbeat. If a worker crashes or is restarted, its jobs
+stop being heartbeated; once a lease truly expires, any worker's recovery pass
+atomically marks the abandoned job `failed` with a clear
+`payload.result.recovery_note` rather than re-executing it. A genuinely live
+long-running job is never stolen, and recovery never lets two workers execute
+the same job concurrently. Recovery and lease timing are configurable
+(`LUBKO_LEASE_DURATION_SECONDS`, `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`,
+`LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS`); see the README.
 
 The orchestrator should use Supabase to submit commands and retrieve their results. The commands themselves should usually be high-level Lubko commands, especially `lubko-agent`, rather than long improvised shell programs.
 

@@ -17,6 +17,9 @@ import pytest
 
 from lubko.protocol import parse_payload
 from lubko.worker import (
+    DEFAULT_LEASE_DURATION_SECONDS,
+    DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS,
+    DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS,
     PROTOCOL_ERROR_EXIT_CODE,
     TRUNCATION_MARKER,
     Job,
@@ -27,7 +30,9 @@ from lubko.worker import (
     claim_job,
     finish_job,
     group_has_members,
+    process_jobs,
     read_output,
+    recover_stale_jobs,
     request_cancel,
     resolve_shell,
     run_job,
@@ -39,6 +44,7 @@ EXECUTION_ERROR_EXIT_CODE: Final = 127
 COMMAND_FAILURE_EXIT_CODE: Final = 7
 CANCEL_UPDATE_STATEMENTS: Final = 2
 CLAIM_AND_FINISH_UPDATE_STATEMENTS: Final = 2
+MIN_LEASE_HEARTBEATS: Final = 2
 
 
 class _RecordingCursor:
@@ -54,6 +60,11 @@ class _RecordingCursor:
         if self._conn.rows:
             return self._conn.rows.pop(0)
         return None
+
+    def fetchall(self) -> list[object]:
+        rows = self._conn.rows
+        self._conn.rows = []
+        return rows
 
     def __enter__(self) -> Self:
         return self
@@ -98,6 +109,9 @@ def make_settings(
     *,
     process_poll_interval_seconds: float = 0.02,
     cancel_grace_seconds: float = 1.0,
+    lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS,
+    lease_refresh_interval_seconds: float = DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS,
+    lease_recovery_interval_seconds: float = DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS,
 ) -> Settings:
     """Build worker settings for tests.
 
@@ -110,6 +124,9 @@ def make_settings(
         process_poll_interval_seconds=process_poll_interval_seconds,
         cancel_grace_seconds=cancel_grace_seconds,
         max_output_bytes=256 * 1024,
+        lease_duration_seconds=lease_duration_seconds,
+        lease_refresh_interval_seconds=lease_refresh_interval_seconds,
+        lease_recovery_interval_seconds=lease_recovery_interval_seconds,
     )
 
 
@@ -560,8 +577,9 @@ def test_claim_job_marks_job_running() -> None:
         "state": {"status": "running"},
     })
     conn.rows = [(job_id, claimed_payload)]
+    settings = make_settings()
 
-    claimed = claim_job(as_db(conn), "test-worker")
+    claimed = claim_job(as_db(conn), settings)
 
     assert claimed is not None
     assert claimed.id == job_id
@@ -577,7 +595,142 @@ def test_claim_job_marks_job_running() -> None:
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "payload::jsonb" in sql
     assert "::text" in sql
-    assert params == ("test-worker",)
+    assert "{state,worker_incarnation}" in sql
+    assert "{state,lease_expires_at}" in sql
+    assert "make_interval" in sql
+    assert params == (
+        settings.worker_id,
+        settings.worker_incarnation,
+        settings.lease_duration_seconds,
+    )
+
+
+def test_recover_stale_jobs_marks_failed_with_diagnostic() -> None:
+    """recover_stale_jobs atomically fails expired-lease running jobs."""
+    conn = _RecordingConnection()
+    job_id = uuid4()
+    recovered_payload = json.dumps({
+        "v": 1,
+        "type": "command",
+        "request": {"cwd": "/workspace", "command": "sleep 30"},
+        "state": {
+            "status": "failed",
+            "worker_id": "old-worker",
+            "worker_incarnation": "old-incarnation",
+            "lease_expires_at": "2020-01-01T00:00:00.000000Z",
+        },
+    })
+    conn.rows = [(job_id, recovered_payload)]
+
+    recovered = recover_stale_jobs(as_db(conn))
+
+    assert recovered == [(job_id, recovered_payload)]
+    sql, params = conn.executions[0]
+    assert "WITH stale AS" in sql
+    assert "'running'" in sql
+    assert "lease_expires_at" in sql
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "'failed'" in sql
+    assert "{state,recovered_at}" in sql
+    assert "recovery_note" in sql
+    assert "payload::jsonb" in sql
+    assert "::text" in sql
+    assert params == {"limit": 100}
+
+
+def test_recover_stale_jobs_returns_empty_when_none_stale() -> None:
+    """An empty recovery scan returns no rows."""
+    conn = _RecordingConnection()
+
+    recovered = recover_stale_jobs(as_db(conn))
+
+    assert recovered == []
+    assert len(conn.executions) == 1
+
+
+def test_process_jobs_runs_recovery_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The processing loop runs a recovery pass before claiming."""
+    conn = _RecordingConnection()
+    calls: list[str] = []
+
+    def recording_recover(_conn: object) -> list[object]:
+        calls.append("recover")
+        return []
+
+    def stop(_conn: object, _settings: Settings) -> bool:
+        calls.append("claim")
+        raise SystemExit(0)
+
+    monkeypatch.setattr("lubko.worker.recover_stale_jobs", recording_recover)
+    monkeypatch.setattr("lubko.worker.claim_and_process_one", stop)
+
+    with pytest.raises(SystemExit):
+        process_jobs(as_db(conn), make_settings(lease_recovery_interval_seconds=1.0))
+
+    assert calls == ["recover", "claim"]
+
+
+def test_settings_reads_lease_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lease timing is configurable through environment variables."""
+    monkeypatch.setenv("LUBKO_LEASE_DURATION_SECONDS", "12.5")
+    monkeypatch.setenv("LUBKO_LEASE_REFRESH_INTERVAL_SECONDS", "2.5")
+    monkeypatch.setenv("LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS", "4.5")
+
+    settings = Settings.from_environment()
+
+    assert settings.lease_duration_seconds == pytest.approx(12.5)
+    assert settings.lease_refresh_interval_seconds == pytest.approx(2.5)
+    assert settings.lease_recovery_interval_seconds == pytest.approx(4.5)
+
+
+def test_settings_defaults_and_unique_incarnation() -> None:
+    """Settings default to the documented lease values and unique incarnations."""
+    first = Settings.from_environment()
+    second = Settings.from_environment()
+
+    assert first.lease_duration_seconds == DEFAULT_LEASE_DURATION_SECONDS
+    assert first.lease_refresh_interval_seconds == DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
+    assert first.lease_recovery_interval_seconds == DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
+    assert first.worker_incarnation
+    assert first.worker_incarnation != second.worker_incarnation
+
+
+def test_settings_rejects_refresh_at_least_lease() -> None:
+    """A refresh interval at or above the lease duration is refused."""
+    with pytest.raises(ValueError, match="smaller than"):
+        Settings(
+            worker_id="w",
+            poll_interval_seconds=1.0,
+            process_poll_interval_seconds=0.1,
+            cancel_grace_seconds=5.0,
+            max_output_bytes=1024,
+            lease_duration_seconds=5.0,
+            lease_refresh_interval_seconds=5.0,
+            lease_recovery_interval_seconds=1.0,
+        )
+
+
+def test_running_job_refreshes_its_lease(tmp_path: Path) -> None:
+    """A running job heartbeats its lease until it finishes."""
+    conn = _RecordingConnection()
+    job = Job(id=uuid4(), cwd=str(tmp_path), command="sleep 0.5", args=None)
+    settings = make_settings(
+        process_poll_interval_seconds=0.02,
+        lease_refresh_interval_seconds=0.05,
+    )
+
+    result = run_job(as_db(conn), job, settings)
+
+    assert result.status == "succeeded"
+    lease_updates = [(sql, params) for sql, params in conn.executions if "lease_expires_at" in sql]
+    assert len(lease_updates) >= MIN_LEASE_HEARTBEATS
+    for sql, params in lease_updates:
+        assert "make_interval" in sql
+        assert params == (settings.lease_duration_seconds, job.id)
 
 
 def test_claim_and_process_one_fails_unparseable_payload() -> None:

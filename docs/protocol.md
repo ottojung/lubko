@@ -115,6 +115,9 @@ orchestrator.
 | `started_at`          | timestamp | UTC ISO-8601, set when claimed                       |
 | `finished_at`         | timestamp | UTC ISO-8601, set when terminal                      |
 | `worker_id`           | string   | claiming worker identity                             |
+| `worker_incarnation`  | string   | unique per-worker-process identity, recorded at claim |
+| `lease_expires_at`    | timestamp | UTC ISO-8601 lease deadline; refreshed by the worker's heartbeat while running |
+| `recovered_at`        | timestamp | UTC ISO-8601, set when a recovery pass marks a stale running job failed |
 | `process_pid`         | integer  | exact PID of the spawned process while running       |
 | `process_pgid`        | integer  | exact process group of the spawned process           |
 | `cancel_requested_at` | timestamp | UTC ISO-8601, set by the orchestrator to cancel      |
@@ -132,6 +135,7 @@ Optional object, set when the job is terminal.
 | `stderr`             | string | captured standard error                     |
 | `exit_code`          | integer | process exit code, or negative on a signal  |
 | `cancellation_note`  | string | human-readable cancellation diagnostic      |
+| `recovery_note`      | string | human-readable diagnostic when a recovery pass marked a stale running job failed |
 
 ### Timestamps
 
@@ -152,9 +156,22 @@ PostgreSQL compare-and-swap (CAS) predicates plus row locking:
 
 - **Claiming (atomic, multi-worker):** the claim transaction selects the
   oldest `pending` row with `FOR UPDATE SKIP LOCKED`, then flips
-  `state.status` to `running`, records `worker_id`, `started_at`,
-  `updated_at`, and (if absent) `created_at`, all through one atomic
-  `jsonb_set` chain stored back as `::text`.
+  `state.status` to `running`, records `worker_id`, `worker_incarnation`,
+  `started_at`, `updated_at`, a fresh `lease_expires_at`, and (if absent)
+  `created_at`, all through one atomic `jsonb_set` chain stored back as
+  `::text`.
+- **Lease heartbeat:** while a job runs, the worker rewrites
+  `state.lease_expires_at` (and `state.updated_at`) on an interval, guarded by
+  `status = 'running'`. A healthy long-running job therefore always shows a
+  fresh lease and is never stolen.
+- **Recovering stale running jobs (atomic, multi-worker):** a rate-limited
+  recovery pass selects `running` rows whose `state.lease_expires_at` is
+  present and in the past with `FOR UPDATE SKIP LOCKED`, then atomically marks
+  them `failed`, records `state.recovered_at`, `state.finished_at`, and a
+  `result` object whose `recovery_note` names the expired lease and the owning
+  worker. Recovery never re-executes a job, so two workers can never execute
+  the same job concurrently; a running job without a lease field is never
+  selected and is left for manual repair.
 - **Cancelling a pending job:** a CAS update flips `state.status` to
   `cancelled` and writes the `result` object, guarded by
   `(payload::jsonb)->'state'->>'status' = 'pending'`.
@@ -165,6 +182,31 @@ PostgreSQL compare-and-swap (CAS) predicates plus row locking:
   status guarded by `(payload::jsonb)->'state'->>'status' = 'running'`.
   Cancellation wins: if `state.cancel_requested_at` is set at finalization the
   status is forced to `cancelled`.
+
+## Lease, heartbeat, and recovery
+
+Every claimed job carries a lease deadline in `state.lease_expires_at`, and the
+owning worker refreshes that deadline by heartbeat while the job runs. If a
+worker crashes or is restarted, its jobs stop being heartbeated; once their
+lease truly expires, any worker's recovery pass atomically marks them `failed`
+with a clear `result.recovery_note` instead of re-executing them. Re-executing
+an abandoned job is deliberately avoided: a job may have already performed
+side effects (git pushes, agent launches, deployments) that must not run twice.
+
+The worker behavior is configurable through environment variables:
+
+| Variable                                | Default | Meaning                                          |
+| --------------------------------------- | ------- | ------------------------------------------------ |
+| `LUBKO_LEASE_DURATION_SECONDS`          | `30`    | how far in the future a claim or heartbeat pushes the lease deadline |
+| `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`  | `5`     | how often the worker heartbeats its running job  |
+| `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS` | `10`    | how often a worker runs the stale-job recovery pass |
+
+The refresh interval must be smaller than the lease duration so a healthy
+worker's lease never expires between heartbeats; the worker refuses to start
+with an invalid combination. Recovery never signals process groups it does not
+own: a surviving orphan process runs to completion inside the container and its
+output is discarded, which keeps the pass safe from recycled process groups and
+never lets it steal a live job.
 
 ## Fresh-install schema
 

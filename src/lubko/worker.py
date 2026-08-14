@@ -1,11 +1,19 @@
-"""Poll PostgreSQL for jobs, execute them directly, and support cancellation.
+"""Poll PostgreSQL for jobs, execute them directly, and support cancellation and recovery.
 
 The transport table ``lubko.jobs`` keeps exactly two columns forever: ``id``
 (unique random) and ``payload`` (one string containing a JSON object). All
-job/request/result/state/cancellation/process-identity data lives inside
+job/request/result/state/cancellation/process-identity/lease data lives inside
 ``payload`` using the versioned binding in :mod:`lubko.protocol` (see
 ``docs/protocol.md``). The worker refuses to start against a table that
 violates the two-column invariant.
+
+Running jobs carry a lease: ``state.lease_expires_at`` is set at claim time and
+refreshed by a heartbeat while the job runs. When a lease truly expires the
+worker that owns the job is presumed dead or unreachable, and any worker
+running a recovery pass atomically marks the abandoned job ``failed`` with a
+clear diagnostic rather than re-executing it. Recovery is atomic across many
+workers and never steals a genuinely live job, whose lease is continuously
+refreshed.
 """
 
 from __future__ import annotations
@@ -18,9 +26,10 @@ import socket
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
+from uuid import uuid4
 
 import psycopg
 from psycopg.rows import tuple_row
@@ -40,6 +49,10 @@ DEFAULT_POLL_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_PROCESS_POLL_INTERVAL_SECONDS: Final = 0.1
 DEFAULT_CANCEL_GRACE_SECONDS: Final = 5.0
 DEFAULT_MAX_OUTPUT_BYTES: Final = 256 * 1024
+DEFAULT_LEASE_DURATION_SECONDS: Final = 30.0
+DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS: Final = 5.0
+DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS: Final = 10.0
+LEASE_RECOVERY_LIMIT: Final = 100
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
 STAT_MIN_FIELDS: Final = 3
 STAT_PGRP_FIELD_INDEX: Final = 2
@@ -48,8 +61,12 @@ PROTOCOL_ERROR_EXIT_CODE: Final = 2
 JOBS_SCHEMA: Final = "lubko"
 JOBS_TABLE: Final = "jobs"
 JOBS_COLUMN_TYPES: Final = (("id", "uuid"), ("payload", "text"))
-UTC_ISO_SQL: Final = (
-    "to_jsonb(to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'))"
+UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+UTC_ISO_SQL: Final = f"to_jsonb({UTC_ISO_TEXT_SQL})"
+LEASE_EXPIRES_AT_SQL: Final = (
+    "to_jsonb(to_char("
+    "now() at time zone 'utc' + make_interval(secs => %s), "
+    '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\'))'
 )
 
 
@@ -124,13 +141,46 @@ class ProcessRun:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """Runtime settings loaded from environment variables."""
+    """Runtime settings loaded from environment variables.
+
+    Every running job carries a lease (``state.lease_expires_at``) that the
+    owning worker refreshes by heartbeat; when the lease expires, a recovery
+    pass marks the abandoned job failed. The lease duration must comfortably
+    exceed the refresh interval so a healthy long-running job is never stolen.
+    """
 
     worker_id: str
     poll_interval_seconds: float
     process_poll_interval_seconds: float
     cancel_grace_seconds: float
     max_output_bytes: int
+    worker_incarnation: str = field(default_factory=lambda: uuid4().hex)
+    lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS
+    lease_refresh_interval_seconds: float = DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
+    lease_recovery_interval_seconds: float = DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
+
+    def __post_init__(self) -> None:
+        """Validate lease timing so a live worker's lease never expires idle.
+
+        Raises:
+            ValueError: If any lease timing value is unusable.
+        """
+        if self.lease_duration_seconds <= 0:
+            msg = "LUBKO_LEASE_DURATION_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.lease_refresh_interval_seconds <= 0:
+            msg = "LUBKO_LEASE_REFRESH_INTERVAL_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.lease_recovery_interval_seconds <= 0:
+            msg = "LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.lease_refresh_interval_seconds >= self.lease_duration_seconds:
+            msg = (
+                "LUBKO_LEASE_REFRESH_INTERVAL_SECONDS must be smaller than "
+                "LUBKO_LEASE_DURATION_SECONDS so a healthy worker's lease never "
+                "expires between heartbeats"
+            )
+            raise ValueError(msg)
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -162,6 +212,24 @@ class Settings:
             max_output_bytes=int(
                 os.getenv("LUBKO_MAX_OUTPUT_BYTES", str(DEFAULT_MAX_OUTPUT_BYTES))
             ),
+            lease_duration_seconds=float(
+                os.getenv(
+                    "LUBKO_LEASE_DURATION_SECONDS",
+                    str(DEFAULT_LEASE_DURATION_SECONDS),
+                )
+            ),
+            lease_refresh_interval_seconds=float(
+                os.getenv(
+                    "LUBKO_LEASE_REFRESH_INTERVAL_SECONDS",
+                    str(DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS),
+                )
+            ),
+            lease_recovery_interval_seconds=float(
+                os.getenv(
+                    "LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS",
+                    str(DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS),
+                )
+            ),
         )
 
 
@@ -189,7 +257,7 @@ def truncate_output(data: bytes, limit: int) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
-def claim_job(conn: JobsConnection, worker_id: str) -> ClaimedJob | None:
+def claim_job(conn: JobsConnection, settings: Settings) -> ClaimedJob | None:
     """Atomically claim the oldest pending job.
 
     Claiming uses the same two-phase approach as before: the pending selection
@@ -197,9 +265,14 @@ def claim_job(conn: JobsConnection, worker_id: str) -> ClaimedJob | None:
     written with a compare-and-swap update of the JSON payload, so several
     workers can safely compete for the same queue. No table column is added.
 
+    The claim records the worker's incarnation and grants the job a lease by
+    writing ``state.lease_expires_at``; the owning worker refreshes that lease
+    by heartbeat while the job runs. Recovery acts only on leases that have
+    truly expired.
+
     Args:
         conn: Open PostgreSQL connection.
-        worker_id: Identifier to record on the claimed job.
+        settings: Worker runtime settings.
 
     Returns:
         The claimed job and its payload text, or ``None`` if the queue is empty.
@@ -210,10 +283,16 @@ def claim_job(conn: JobsConnection, worker_id: str) -> ClaimedJob | None:
             ("state,status", "to_jsonb('running'::text)"),
             (
                 "state,created_at",
-                f"COALESCE((job.payload::jsonb)->'state'->'created_at', {UTC_ISO_SQL})",
+                (
+                    "COALESCE("
+                    f"to_jsonb((job.payload::jsonb)->'state'->>'created_at'), "
+                    f"{UTC_ISO_SQL})"
+                ),
             ),
             ("state,started_at", UTC_ISO_SQL),
             ("state,worker_id", "to_jsonb(%s::text)"),
+            ("state,worker_incarnation", "to_jsonb(%s::text)"),
+            ("state,lease_expires_at", LEASE_EXPIRES_AT_SQL),
             ("state,updated_at", UTC_ISO_SQL),
         ],
     )
@@ -235,7 +314,11 @@ def claim_job(conn: JobsConnection, worker_id: str) -> ClaimedJob | None:
             "FROM next\n"
             "WHERE job.id = next.id\n"
             "RETURNING job.id, job.payload\n",
-            (worker_id,),
+            (
+                settings.worker_id,
+                settings.worker_incarnation,
+                settings.lease_duration_seconds,
+            ),
         )
         row = cursor.fetchone()
     if row is None:
@@ -362,6 +445,34 @@ def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) ->
         )
 
 
+def _refresh_lease(conn: JobsConnection, job_id: UUID, lease_duration_seconds: float) -> None:
+    """Refresh the running job's lease by heartbeat.
+
+    The heartbeat rewrites ``state.lease_expires_at`` (and ``state.updated_at``)
+    inside the JSON payload, keeping the two-column table invariant. A healthy
+    long-running job therefore never appears stale to a recovery pass.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        job_id: Identifier of the running job.
+        lease_duration_seconds: How far into the future the refreshed lease runs.
+    """
+    set_chain = _jsonb_set_chain(
+        "payload::jsonb",
+        [
+            ("state,lease_expires_at", LEASE_EXPIRES_AT_SQL),
+            ("state,updated_at", UTC_ISO_SQL),
+        ],
+    )
+    with conn.transaction(), conn.cursor() as cursor:
+        cursor.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = " + set_chain + "::text\n"
+            "WHERE id = %s AND (payload::jsonb)->'state'->>'status' = 'running'\n",
+            (lease_duration_seconds, job_id),
+        )
+
+
 def _is_cancel_requested(conn: JobsConnection, job_id: UUID) -> bool:
     """Return whether the job has a cancellation request pending.
 
@@ -405,6 +516,89 @@ def _read_job_status(conn: JobsConnection, job_id: UUID) -> str:
         msg = f"job {job_id} disappeared while finalizing"
         raise RuntimeError(msg)
     return str(row[0])
+
+
+def _recovery_result_expression() -> str:
+    """Build the SQL result object recorded on a recovered stale job.
+
+    The diagnostic names the expired lease and the owning worker incarnation so
+    the orchestrator can see exactly why the job failed. Only internal constants
+    and the row's own JSON are referenced; no external input reaches the SQL.
+
+    Returns:
+        A ``jsonb_build_object`` expression suitable for ``jsonb_set``.
+    """
+    return (
+        "jsonb_build_object("
+        "'stdout', to_jsonb(''::text), "
+        "'stderr', to_jsonb(''::text), "
+        "'exit_code', to_jsonb(NULL::int), "
+        "'recovery_note', to_jsonb("
+        "'lease expired at ' || COALESCE("
+        "(job.payload::jsonb)->'state'->>'lease_expires_at', '<none>') || "
+        "'; owning worker ' || COALESCE("
+        "(job.payload::jsonb)->'state'->>'worker_id', '<unknown>') || "
+        "' (incarnation ' || COALESCE("
+        "(job.payload::jsonb)->'state'->>'worker_incarnation', '<unknown>') || "
+        "') stopped heartbeating; job marked failed rather than re-executed'"
+        ")"
+        ")"
+    )
+
+
+def recover_stale_jobs(conn: JobsConnection) -> list[tuple[UUID, str]]:
+    """Atomically mark jobs whose lease has truly expired as failed.
+
+    A job whose ``state.lease_expires_at`` is in the past is presumed abandoned
+    by a crashed or unreachable worker. Recovery marks it ``failed`` with a
+    clear diagnostic and never re-executes it, so two workers can never execute
+    the same job. Rows are locked with ``FOR UPDATE SKIP LOCKED`` and the status
+    transition is a single atomic update, making the pass safe under many
+    concurrent workers.
+
+    A running job without a lease field is never selected: recovery acts only on
+    leases that are present and expired, so pre-lease payloads are left for
+    manual repair.
+
+    Args:
+        conn: Open PostgreSQL connection.
+
+    Returns:
+        The ``(id, payload)`` pairs of the recovered jobs.
+    """
+    set_chain = _jsonb_set_chain(
+        "job.payload::jsonb",
+        [
+            ("state,status", "to_jsonb('failed'::text)"),
+            ("state,finished_at", UTC_ISO_SQL),
+            ("state,recovered_at", UTC_ISO_SQL),
+            ("state,updated_at", UTC_ISO_SQL),
+            ("result", _recovery_result_expression()),
+        ],
+    )
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "WITH stale AS (\n"  # ruff: ignore[hardcoded-sql-expression]
+            "    SELECT id\n"
+            "    FROM lubko.jobs\n"
+            "    WHERE (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "        AND (payload::jsonb)->'state'->>'lease_expires_at' IS NOT NULL\n"
+            "        AND ((payload::jsonb)->'state'->>'lease_expires_at') < "
+            + UTC_ISO_TEXT_SQL
+            + "\n"
+            "    ORDER BY id\n"
+            "    FOR UPDATE SKIP LOCKED\n"
+            "    LIMIT %(limit)s\n"
+            ")\n"
+            "UPDATE lubko.jobs AS job\n"
+            "SET payload = " + set_chain + "::text\n"
+            "FROM stale\n"
+            "WHERE job.id = stale.id\n"
+            "RETURNING job.id, job.payload\n",
+            {"limit": LEASE_RECOVERY_LIMIT},
+        )
+        rows = cursor.fetchall()
+    return [(row[0], str(row[1])) for row in rows]
 
 
 def _process_pgrp(pid: int) -> int | None:
@@ -618,6 +812,43 @@ def cancel_process_group(run: ProcessRun, settings: Settings) -> tuple[int, str]
         return run.proc.poll() or 0, note
 
 
+def _monitor_poll_loop(
+    conn: JobsConnection,
+    job: Job,
+    run: ProcessRun,
+    settings: Settings,
+) -> str | None:
+    """Poll a running job until it exits or a cancellation request arrives.
+
+    On every loop iteration the job's cancellation marker is checked; the lease
+    is refreshed by heartbeat at most once per ``lease_refresh_interval_seconds``
+    so a healthy long-running job never looks stale to a recovery pass. Any
+    database error propagates to :func:`monitor_job`, which terminates the exact
+    process group before reconnecting.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        job: Running job.
+        run: Running job process.
+        settings: Worker runtime settings.
+
+    Returns:
+        The cancellation diagnostic, or ``None`` if the job ran to completion.
+    """
+    cancellation_note: str | None = None
+    next_heartbeat_at = 0.0
+    while run.proc.poll() is None:
+        if _is_cancel_requested(conn, job.id):
+            _, cancellation_note = cancel_process_group(run, settings)
+            break
+        now = time.monotonic()
+        if now >= next_heartbeat_at:
+            _refresh_lease(conn, job.id, settings.lease_duration_seconds)
+            next_heartbeat_at = now + settings.lease_refresh_interval_seconds
+        time.sleep(settings.process_poll_interval_seconds)
+    return cancellation_note
+
+
 def monitor_job(conn: JobsConnection, job: Job, run: ProcessRun, settings: Settings) -> JobResult:
     """Poll a running job for completion or a cancellation request.
 
@@ -634,13 +865,8 @@ def monitor_job(conn: JobsConnection, job: Job, run: ProcessRun, settings: Setti
         psycopg.Error: If polling the database fails; the process group is
             terminated first.
     """
-    cancellation_note: str | None = None
     try:
-        while run.proc.poll() is None:
-            if _is_cancel_requested(conn, job.id):
-                _, cancellation_note = cancel_process_group(run, settings)
-                break
-            time.sleep(settings.process_poll_interval_seconds)
+        cancellation_note = _monitor_poll_loop(conn, job, run, settings)
     except psycopg.Error:
         LOGGER.exception("database error while polling job %s", job.id)
         try:
@@ -831,7 +1057,7 @@ def claim_and_process_one(conn: JobsConnection, settings: Settings) -> bool:
     Returns:
         ``True`` if a job was processed, ``False`` if the queue was empty.
     """
-    claimed = claim_job(conn, settings.worker_id)
+    claimed = claim_job(conn, settings)
     if claimed is None:
         return False
 
@@ -870,11 +1096,25 @@ def claim_and_process_one(conn: JobsConnection, settings: Settings) -> bool:
 def process_jobs(conn: JobsConnection, settings: Settings) -> None:
     """Process jobs until the database connection fails or the process exits.
 
+    Before every claim, a rate-limited recovery pass marks any job whose lease
+    has truly expired as failed, so jobs stranded by a crashed worker are
+    recovered automatically even when a freshly started worker is the only one
+    running.
+
     Args:
         conn: Open PostgreSQL connection.
         settings: Worker runtime settings.
     """
+    next_recovery_at = 0.0
     while True:
+        now = time.monotonic()
+        if now >= next_recovery_at:
+            for job_id, _payload in recover_stale_jobs(conn):
+                LOGGER.warning(
+                    "recovered stale job %s: lease expired; marked failed rather than re-executed",
+                    job_id,
+                )
+            next_recovery_at = time.monotonic() + settings.lease_recovery_interval_seconds
         if not claim_and_process_one(conn, settings):
             time.sleep(settings.poll_interval_seconds)
 
@@ -942,7 +1182,8 @@ def main() -> None:
     """Run the Lubko worker.
 
     Raises:
-        SystemExit: If the database configuration file cannot be loaded.
+        SystemExit: If the database configuration file cannot be loaded or the
+            runtime settings are invalid.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -953,7 +1194,12 @@ def main() -> None:
     except (OSError, ValueError):
         LOGGER.exception("unable to load database configuration")
         raise SystemExit(1) from None
-    run(Settings.from_environment(), database)
+    try:
+        settings = Settings.from_environment()
+    except ValueError:
+        LOGGER.exception("invalid worker runtime settings")
+        raise SystemExit(1) from None
+    run(settings, database)
 
 
 if __name__ == "__main__":
