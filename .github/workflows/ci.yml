@@ -7,15 +7,13 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: issue21-safe-deploy-rebuild
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -23,15 +21,6 @@ jobs:
         run: python -m pip install uv
       - name: Sync
         run: uv sync --frozen
-      - name: Patch watchdog child
-        run: |
-          python -c 'import base64,pathlib; p=pathlib.Path("src/lubko/deployctl.py"); s=p.read_text(); a=base64.b64decode("ICAgIGlmIHBpZCAhPSAwOgogICAgICAgIHJldHVybgogICAgX2Nsb3NlX2dhdGUoZ2F0ZV93cml0ZXIpCiAgICB3aXRoIHN1cHByZXNzKE9TRXJyb3IpOgogICAgICAgIG9zLnNldHNpZCgpCg==").decode(); b=base64.b64decode("ICAgIGlmIHBpZCAhPSAwOgogICAgICAgIHJldHVybgogICAgIyBUaGUgZm9yayBoYXBwZW5zIHdoaWxlIHRoZSBwYXJlbnQgaG9sZHMgZGVwbG95X2xvY2soKS4gQ2xvc2UgZXZlcnkKICAgICMgaW5oZXJpdGVkIG5vbi1zdGRpbyBkZXNjcmlwdG9yIGJlZm9yZSBlbnRlcmluZyB0aGUgd2F0Y2hkb2cgbG9vcCBzbyBhCiAgICAjIHBhcmVudCBjcmFzaCBjYW5ub3QgbGVhdmUgdGhlIGNoaWxkIG93bmluZyB0aGUgaW5oZXJpdGVkIGZsb2NrIG9yIGdhdGUuCiAgICBvcy5jbG9zZXJhbmdlKDMsIGludChvcy5zeXNjb25mKCJTQ19PUEVOX01BWCIpKSkKICAgIHdpdGggc3VwcHJlc3MoT1NFcnJvcik6CiAgICAgICAgb3Muc2V0c2lkKCkK").decode(); assert a in s; p.write_text(s.replace(a,b), encoding="utf-8")'
-          uv run ruff format src/lubko/deployctl.py
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/lubko/deployctl.py
-          git commit -m "Drop inherited descriptors in rollback watchdog"
-          git push origin HEAD:issue21-safe-deploy-rebuild
       - name: Ruff format
         run: uv run ruff format --check .
       - name: Ruff
