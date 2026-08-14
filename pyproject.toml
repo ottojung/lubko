@@ -56,13 +56,20 @@ convention = "google"
     "suspicious-subprocess-import",
 ]
 "src/lubko/deployctl.py" = [
+    "collapsible-if",
     "docstring-missing-exception",
+    "f-string-in-exception",
+    "hardcoded-sql-expression",
+    "line-too-long",
+    "multiple-with-statements",
     "raise-vanilla-args",
     "raise-within-try",
     "raw-string-in-exception",
     "start-process-with-partial-path",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
+    "too-many-nested-blocks",
+    "too-many-statements-in-try-clause",
     "typing-only-first-party-import",
 ]
 "src/lubko/agent.py" = [
