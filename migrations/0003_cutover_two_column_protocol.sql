@@ -20,7 +20,10 @@
 --   2. renames lubko.jobs to lubko.jobs_legacy (kept for rollback), guarded
 --      so it never clobbers an existing lubko.jobs_legacy;
 --   3. renames lubko.jobs_v2 to lubko.jobs, making the two-column table the
---      canonical transport table.
+--      canonical transport table;
+--   4. re-asserts the worker role grant on the promoted table, so the
+--      transport table always carries the SELECT/UPDATE privileges the worker
+--      needs regardless of history.
 --
 -- Every step is guarded and the whole file is safe to apply more than once:
 -- once lubko.jobs already has the two-column shape, all steps are skipped.
@@ -91,6 +94,18 @@ begin
     if to_regclass('lubko.jobs_v2') is not null
        and to_regclass('lubko.jobs') is null then
         execute 'alter table lubko.jobs_v2 rename to lubko.jobs';
+    end if;
+end
+$$;
+
+-- 4. Re-assert the worker role grant on the promoted transport table. Table
+--    privileges already follow the rename from jobs_v2, so this is an
+--    idempotent no-op in the normal path; it guarantees the access contract
+--    holds even if 0002 was not re-applied or the table was recreated.
+do $$
+begin
+    if to_regclass('lubko.jobs') is not null and to_regrole('lubko_worker') is not null then
+        execute 'grant select, update on table lubko.jobs to lubko_worker';
     end if;
 end
 $$;

@@ -222,6 +222,51 @@ def test_cutover_migration_is_idempotent_by_guards() -> None:
     assert "information_schema.columns" in sql
 
 
+def test_prep_migration_grants_worker_access() -> None:
+    """Migration 0002 grants the worker role the same SELECT/UPDATE it needs."""
+    sql = _read_migration("0002_two_column_protocol.sql")
+
+    assert "grant select, update on table lubko.jobs_v2 to lubko_worker" in sql
+    assert "to_regrole('lubko_worker')" in sql
+
+
+def test_prep_migration_copies_legacy_grants() -> None:
+    """Migration 0002 mirrors every legacy lubko.jobs grant onto jobs_v2."""
+    sql = _read_migration("0002_two_column_protocol.sql")
+
+    assert "information_schema.role_table_grants" in sql
+    assert "table_name = 'jobs'" in sql
+    assert "quote_ident" in sql
+    assert "'PUBLIC'" in sql
+    assert "with grant option" in sql
+
+
+def test_prep_migration_repairs_grants_on_rerun() -> None:
+    """Migration 0002 uses idempotent GRANT so re-applying repairs privileges."""
+    sql = _read_migration("0002_two_column_protocol.sql")
+
+    assert "create table if not exists" in sql
+    assert "grant select, update on table lubko.jobs_v2 to lubko_worker" in sql
+    assert "is_grantable" in sql
+
+
+def test_cutover_migration_reasserts_worker_grant() -> None:
+    """Migration 0003 re-asserts the worker grant on the promoted table."""
+    sql = _read_migration("0003_cutover_two_column_protocol.sql")
+
+    assert "grant select, update on table lubko.jobs to lubko_worker" in sql
+    assert "to_regrole('lubko_worker')" in sql
+
+
+def test_worker_role_access_is_part_of_the_binding() -> None:
+    """The binding spec documents the worker role grant, and README names it."""
+    protocol_doc = (REPO_ROOT / "docs" / "protocol.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "grant select, update on table lubko.jobs to lubko_worker" in protocol_doc
+    assert "lubko_worker" in readme
+
+
 def test_payload_column_is_text_in_migrations() -> None:
     """Migrations declare payload as text and store JSON back as text."""
     for name in ("0002_two_column_protocol.sql", "0003_cutover_two_column_protocol.sql"):

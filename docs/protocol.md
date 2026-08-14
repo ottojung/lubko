@@ -41,6 +41,22 @@ create index jobs_queue_idx
     on lubko.jobs (((payload::jsonb)->'state'->>'status'), ((payload::jsonb)->'state'->>'created_at'));
 ```
 
+## Worker role access (part of the binding)
+
+`lubko_worker` is the stable role the worker connects as (see the README
+database configuration) and must keep the same table privileges it holds on
+the legacy table, so it can claim, cancel, poll, and finalize jobs:
+
+```sql
+grant select, update on table lubko.jobs to lubko_worker;
+```
+
+`migrations/0002_two_column_protocol.sql` grants `SELECT, UPDATE` on
+`lubko.jobs_v2` to `lubko_worker` and mirrors every other grant the legacy
+`lubko.jobs` carries; `0003` re-asserts the grant after the table is promoted.
+Table privileges survive a `RENAME`, so the promoted `lubko.jobs` keeps the
+required access. Both `GRANT` statements are idempotent.
+
 ## Versioning
 
 - `payload.v` is a required integer protocol version.
