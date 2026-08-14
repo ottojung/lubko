@@ -49,7 +49,7 @@ from lubko.lifecycle import (
     worker_log_path,
     write_meta,
 )
-from lubko.state import rollback_state_path, worker_state_dir
+from lubko.state import rollback_state_path
 from lubko.toolchain import UvResolutionError, resolve_uv
 
 if TYPE_CHECKING:
