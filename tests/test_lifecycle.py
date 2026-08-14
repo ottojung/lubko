@@ -1,0 +1,632 @@
+"""Tests for Lubko worker lifecycle management."""
+
+import os
+import shutil
+import signal
+import subprocess
+import time
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import replace
+from pathlib import Path
+from typing import Final
+from unittest import mock
+
+import psycopg
+import pytest
+
+from lubko import lifecycle
+from lubko.lifecycle import (
+    EXIT_ERROR,
+    EXIT_OK,
+    ProcessIdentity,
+    ValidationReport,
+    WorkerMeta,
+)
+
+MARKER: Final = "test-marker"
+STALE_MARKER: Final = "stale"
+OTHER_MARKER: Final = "other-marker"
+SHORT_MARKER: Final = "tok"
+GIT_SHA: Final = "a" * 40
+GIT_SHA_LENGTH: Final = 40
+SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
+
+
+def spawn_controlled(marker: str = MARKER) -> subprocess.Popen[bytes]:
+    """Spawn a controlled long-lived session-leader process.
+
+    Args:
+        marker: Lifecycle token to place in the process environment.
+
+    Returns:
+        The spawned process.
+    """
+    env = dict(os.environ)
+    env[lifecycle.LIFECYCLE_MARKER_VAR] = marker
+    return subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+
+
+def identity_of(proc: subprocess.Popen[bytes]) -> ProcessIdentity:
+    """Wait for a spawned process to establish its own session.
+
+    Args:
+        proc: The spawned process.
+
+    Returns:
+        The established exact identity.
+    """
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        identity = lifecycle.process_identity(proc.pid)
+        if identity is not None and identity.pgid == proc.pid and identity.sid == proc.pid:
+            return identity
+        time.sleep(0.01)
+    identity = lifecycle.process_identity(proc.pid)
+    assert identity is not None
+    return identity
+
+
+def meta_for_process(proc: subprocess.Popen[bytes], repo: Path) -> WorkerMeta:
+    """Build running metadata for a controlled process.
+
+    Args:
+        proc: The controlled process.
+        repo: Repository path to record.
+
+    Returns:
+        Running metadata for the process.
+    """
+    identity = identity_of(proc)
+    return WorkerMeta(
+        schema_version=1,
+        state=lifecycle.STATE_RUNNING,
+        pid=identity.pid,
+        pgid=identity.pgid,
+        sid=identity.sid,
+        start_time_ticks=identity.start_time_ticks,
+        token=MARKER,
+        repo=str(repo),
+        git_commit=GIT_SHA,
+        worker_id="test-worker",
+        log_path=str(lifecycle.worker_log_path()),
+        started_at=time.time(),
+        stopped_at=None,
+    )
+
+
+def kill_proc(proc: subprocess.Popen[bytes]) -> None:
+    """Force-kill a controlled process and reap it.
+
+    Args:
+        proc: The controlled process.
+    """
+    if proc.poll() is None:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=5)
+
+
+def kill_many(procs: list[subprocess.Popen[bytes]]) -> None:
+    """Force-kill a list of controlled processes.
+
+    Args:
+        procs: The controlled processes.
+    """
+    for proc in procs:
+        kill_proc(proc)
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
+    """Poll until a predicate holds, raising if the deadline expires.
+
+    Args:
+        predicate: Condition to satisfy.
+        timeout: Maximum seconds to wait.
+
+    Raises:
+        AssertionError: If the condition is not met within the timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    msg = "condition not met within timeout"
+    raise AssertionError(msg)
+
+
+def make_options(repo: Path, *, bootstrap: bool) -> lifecycle.DeployOptions:
+    """Build deployment options for tests.
+
+    Args:
+        repo: Repository path to deploy.
+        bootstrap: Whether to allow the unmanaged bootstrap case.
+
+    Returns:
+        Deployment options.
+    """
+    return lifecycle.DeployOptions(
+        repo=repo,
+        uv_path="uv",
+        bootstrap=bootstrap,
+        stop_grace_seconds=0.5,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=5.0,
+        git_timeout_seconds=5.0,
+    )
+
+
+def patch_deploy(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    validation_ok: bool = True,
+    postgres_ok: bool = True,
+) -> list[subprocess.Popen[bytes]]:
+    """Patch deploy dependencies and return spawned worker handles.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        validation_ok: Whether validation should pass.
+        postgres_ok: Whether the PostgreSQL check should pass.
+
+    Returns:
+        The worker processes spawned during deployment.
+    """
+
+    def fake_validation(
+        _repo: Path,
+        _uv: str,
+        _timeout: float,
+    ) -> ValidationReport:
+        return ValidationReport(ok=validation_ok, detail="boom")
+
+    def fake_postgres(_timeout: float) -> bool:
+        return postgres_ok
+
+    def fake_commit(_repo: Path, _timeout: float) -> str:
+        return GIT_SHA
+
+    monkeypatch.setattr(lifecycle, "run_validation", fake_validation)
+    monkeypatch.setattr(lifecycle, "check_postgres", fake_postgres)
+    monkeypatch.setattr(lifecycle, "git_commit", fake_commit)
+
+    spawned: list[subprocess.Popen[bytes]] = []
+
+    def fake_worker_command(_uv_path: str) -> list[str]:
+        return [SLEEP_BIN, "300"]
+
+    original_spawn = lifecycle.spawn_worker
+
+    def tracking_spawn(
+        repo: Path,
+        uv_path: str,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> subprocess.Popen[bytes]:
+        proc = original_spawn(repo, uv_path, log_path, env)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(lifecycle, "_worker_command", fake_worker_command)
+    monkeypatch.setattr(lifecycle, "spawn_worker", tracking_spawn)
+    return spawned
+
+
+def write_fake_uv(directory: Path, *, fail_on: str | None = None) -> str:
+    """Write a controllable fake ``uv`` executable.
+
+    Args:
+        directory: Directory to write the script into.
+        fail_on: When present, any invocation whose joined args contain this
+            substring exits with code 7.
+
+    Returns:
+        The path of the fake ``uv`` executable.
+    """
+    lines = ["#!/bin/sh"]
+    if fail_on is None:
+        lines.append("exit 0")
+    else:
+        lines.extend((
+            'case "$*" in',
+            f"  *{fail_on}*) exit 7 ;;",
+            "  *) exit 0 ;;",
+            "esac",
+        ))
+    script = directory / "fake-uv"
+    script.write_text("\n".join(lines) + "\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+@pytest.fixture(autouse=True)
+def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the lifecycle state directory at a temporary location.
+
+    Returns:
+        The temporary lifecycle state directory.
+    """
+    state = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    return state
+
+
+def test_status_reports_unmanaged(capsys: pytest.CaptureFixture[str]) -> None:
+    """With no metadata, status reports the unmanaged bootstrap case."""
+    assert lifecycle.status_cmd() == EXIT_OK
+    out = capsys.readouterr().out
+    assert "state: unmanaged" in out
+    assert "legacy" in out
+
+
+def test_status_reports_running_worker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With live matching metadata, status reports the running worker."""
+    proc = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(proc, tmp_path))
+        assert lifecycle.status_cmd() == EXIT_OK
+        out = capsys.readouterr().out
+        assert "state: running" in out
+        assert str(proc.pid) in out
+    finally:
+        kill_proc(proc)
+
+
+def test_deploy_unmanaged_refuses_without_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Deploying over an unmanaged worker is refused unless acknowledged."""
+    spawned = patch_deploy(monkeypatch)
+    try:
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_ERROR
+        assert not spawned
+        assert lifecycle.read_meta() is None
+        assert "unmanaged" in capsys.readouterr().err
+    finally:
+        kill_many(spawned)
+
+
+def test_deploy_unmanaged_with_bootstrap_starts_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the bootstrap flag, the first maintained worker is started."""
+    spawned = patch_deploy(monkeypatch)
+    try:
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=True))
+        assert code == EXIT_OK
+        assert len(spawned) == 1
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.state == lifecycle.STATE_RUNNING
+        assert meta.pid == spawned[0].pid
+    finally:
+        kill_many(spawned)
+
+
+def test_deploy_failed_validation_preserves_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing validation leaves the previous worker untouched."""
+    old = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(old, tmp_path))
+        spawned = patch_deploy(monkeypatch, validation_ok=False)
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_ERROR
+        assert not spawned
+        assert old.poll() is None
+        current = lifecycle.read_meta()
+        assert current is not None
+        assert current.pid == old.pid
+    finally:
+        kill_proc(old)
+
+
+def test_deploy_validates_before_replacing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation runs before any worker process is spawned."""
+    old = spawn_controlled()
+    spawned: list[subprocess.Popen[bytes]] = []
+    try:
+        lifecycle.write_meta(meta_for_process(old, tmp_path))
+        order: list[str] = []
+
+        def recording_validation(
+            _repo: Path,
+            _uv: str,
+            _timeout: float,
+        ) -> ValidationReport:
+            order.append("validation")
+            return ValidationReport(ok=True, detail="")
+
+        monkeypatch.setattr(lifecycle, "run_validation", recording_validation)
+        monkeypatch.setattr(lifecycle, "check_postgres", lambda _timeout: True)
+        monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: GIT_SHA)
+        original_spawn = lifecycle.spawn_worker
+
+        def recording_spawn(
+            repo: Path,
+            uv_path: str,
+            log_path: Path,
+            env: dict[str, str],
+        ) -> subprocess.Popen[bytes]:
+            order.append("spawn")
+            proc = original_spawn(repo, uv_path, log_path, env)
+            spawned.append(proc)
+            return proc
+
+        monkeypatch.setattr(lifecycle, "_worker_command", lambda _uv: [SLEEP_BIN, "300"])
+        monkeypatch.setattr(lifecycle, "spawn_worker", recording_spawn)
+
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_OK
+        assert order == ["validation", "spawn"]
+    finally:
+        kill_proc(old)
+        kill_many(spawned)
+
+
+def test_deploy_verification_failure_preserves_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement that fails verification is rolled back."""
+    old = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(old, tmp_path))
+        spawned = patch_deploy(monkeypatch, postgres_ok=False)
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_ERROR
+        assert len(spawned) == 1
+        assert spawned[0].poll() is not None
+        assert old.poll() is None
+        current = lifecycle.read_meta()
+        assert current is not None
+        assert current.pid == old.pid
+    finally:
+        kill_proc(old)
+        kill_many(spawned)
+
+
+def test_deploy_success_replaces_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A successful deploy records metadata and reports the git commit."""
+    old = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(old, tmp_path))
+        spawned = patch_deploy(monkeypatch)
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_OK
+        assert len(spawned) == 1
+        wait_until(lambda: old.poll() is not None)
+        assert spawned[0].poll() is None
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.state == lifecycle.STATE_RUNNING
+        assert meta.pid == spawned[0].pid
+        assert meta.git_commit == GIT_SHA
+        assert lifecycle.worker_log_path().is_file()
+        out = capsys.readouterr().out
+        assert "deployed git commit" in out
+        assert GIT_SHA in out
+    finally:
+        kill_proc(old)
+        kill_many(spawned)
+
+
+def test_deploy_replaces_stale_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale metadata pointing at a dead worker is replaced cleanly."""
+    stale = WorkerMeta(
+        schema_version=1,
+        state=lifecycle.STATE_RUNNING,
+        pid=999_999,
+        pgid=999_999,
+        sid=999_999,
+        start_time_ticks=1,
+        token=STALE_MARKER,
+        repo=str(tmp_path),
+        git_commit="old",
+        worker_id="old",
+        log_path=str(tmp_path / "old.log"),
+        started_at=1.0,
+        stopped_at=None,
+    )
+    lifecycle.write_meta(stale)
+    spawned = patch_deploy(monkeypatch)
+    try:
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_OK
+        assert len(spawned) == 1
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == spawned[0].pid
+    finally:
+        kill_many(spawned)
+
+
+def test_stop_cmd_stops_maintained_worker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The stop command terminates the maintained worker by identity."""
+    proc = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(proc, tmp_path))
+        code = lifecycle.stop_cmd(0.5)
+        assert code == EXIT_OK
+        wait_until(lambda: proc.poll() is not None)
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.state == lifecycle.STATE_STOPPED
+        assert "stopped" in capsys.readouterr().out
+    finally:
+        kill_proc(proc)
+
+
+def test_stop_cmd_refuses_unmanaged(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The stop command refuses to claim it can stop a legacy worker."""
+    code = lifecycle.stop_cmd(0.5)
+    assert code == EXIT_ERROR
+    assert "unmanaged" in capsys.readouterr().err
+
+
+def test_stop_worker_kills_exact_group_only(
+    tmp_path: Path,
+) -> None:
+    """Stopping signals only the recorded worker's process group."""
+    tracked = spawn_controlled()
+    unrelated = spawn_controlled()
+    try:
+        assert lifecycle.stop_worker(meta_for_process(tracked, tmp_path), 0.5)
+        wait_until(lambda: tracked.poll() is not None)
+        assert unrelated.poll() is None
+    finally:
+        kill_proc(tracked)
+        kill_proc(unrelated)
+
+
+def test_stop_worker_refuses_wrong_start_time(
+    tmp_path: Path,
+) -> None:
+    """A mismatched start time (PID reuse) prevents signalling."""
+    proc = spawn_controlled()
+    try:
+        meta = meta_for_process(proc, tmp_path)
+        forged = replace(meta, start_time_ticks=(meta.start_time_ticks or 0) + 1)
+        assert not lifecycle.worker_alive(forged)
+        assert lifecycle.stop_worker(forged, 0.2)
+        assert proc.poll() is None
+    finally:
+        kill_proc(proc)
+
+
+def test_stop_worker_refuses_wrong_marker(
+    tmp_path: Path,
+) -> None:
+    """A mismatched lifecycle marker prevents signalling."""
+    proc = spawn_controlled()
+    try:
+        meta = meta_for_process(proc, tmp_path)
+        forged = replace(meta, token=OTHER_MARKER)
+        assert not lifecycle.worker_alive(forged)
+        assert lifecycle.stop_worker(forged, 0.2)
+        assert proc.poll() is None
+    finally:
+        kill_proc(proc)
+
+
+def test_meta_roundtrip_atomic(tmp_path: Path) -> None:
+    """Metadata survives a write/read round trip without temp residue."""
+    meta = WorkerMeta(
+        schema_version=1,
+        state=lifecycle.STATE_RUNNING,
+        pid=1,
+        pgid=1,
+        sid=1,
+        start_time_ticks=2,
+        token=SHORT_MARKER,
+        repo=str(tmp_path),
+        git_commit="abc",
+        worker_id="w",
+        log_path=str(tmp_path / "w.log"),
+        started_at=1.0,
+        stopped_at=None,
+    )
+    lifecycle.write_meta(meta)
+    assert lifecycle.read_meta() == meta
+    state = lifecycle.worker_state_dir()
+    assert not (state / "meta.json.tmp").exists()
+
+
+def test_deploy_lock_serializes() -> None:
+    """Two concurrent deployments cannot both hold the lock."""
+    with (
+        lifecycle.deploy_lock(1.0),
+        pytest.raises(lifecycle.LockTimeoutError, match="timed out"),
+        lifecycle.deploy_lock(0.2),
+    ):
+        pass
+
+
+def test_run_validation_success(tmp_path: Path) -> None:
+    """All validation commands pass with a healthy uv."""
+    uv = write_fake_uv(tmp_path)
+    report = lifecycle.run_validation(tmp_path, uv, 5.0)
+    assert report.ok
+    assert not report.detail
+
+
+def test_run_validation_reports_first_failure(tmp_path: Path) -> None:
+    """The first failing validation command is reported."""
+    uv = write_fake_uv(tmp_path, fail_on="pytest")
+    report = lifecycle.run_validation(tmp_path, uv, 5.0)
+    assert not report.ok
+    assert "pytest" in report.detail
+
+
+def test_check_postgres_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """check_postgres returns True when a trivial query succeeds."""
+    connection = mock.MagicMock()
+    connection.__enter__.return_value = connection
+    cursor = mock.MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = (1,)
+    connection.cursor.return_value = cursor
+
+    monkeypatch.setattr("lubko.lifecycle.psycopg.connect", lambda *_a, **_k: connection)
+    assert lifecycle.check_postgres(1.0)
+
+
+def test_check_postgres_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """check_postgres returns False when the connection fails."""
+
+    def fake_connect(*_args: object, **_kwargs: object) -> object:
+        msg = "boom"
+        raise psycopg.OperationalError(msg)
+
+    monkeypatch.setattr("lubko.lifecycle.psycopg.connect", fake_connect)
+    assert not lifecycle.check_postgres(1.0)
+
+
+def test_git_commit_reads_head() -> None:
+    """git_commit reads the checkout HEAD hash without mutating git."""
+    repo = Path(__file__).resolve().parents[1]
+    commit = lifecycle.git_commit(repo, 5.0)
+    assert commit is not None
+    assert len(commit) == GIT_SHA_LENGTH
+
+
+def test_main_status_dispatch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The CLI dispatches the status subcommand."""
+    assert lifecycle.main(["status"]) == EXIT_OK
+    assert "state: unmanaged" in capsys.readouterr().out

@@ -86,3 +86,76 @@ Run with:
 ```sh
 uv run lubko-worker
 ```
+
+## Self-deployment and worker lifecycle
+
+Upgrades are deployed through `lubko-deploy`, which validates a checkout,
+replaces the previously maintained worker, and records enough exact process
+identity to stop or replace that worker later — never via broad `pkill`,
+`killall`, or process-name matching.
+
+Per-user lifecycle state follows XDG conventions under
+`$XDG_STATE_HOME/lubko/worker` (default `~/.local/state/lubko/worker`):
+
+- `meta.json` — lifecycle metadata, written atomically;
+- `worker.log` — appended stdout/stderr of the maintained worker;
+- `deploy.log` — deployment event log;
+- `.deploy.lock` — flock-protected serialization of deployments.
+
+### Commands
+
+```sh
+lubko-deploy status
+lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
+lubko-deploy stop [--grace-seconds N]
+lubko-deploy log [--lines N]
+```
+
+`lubko-deploy status` reports the current worker state, its PID/process-group/
+session identity, the deployed git commit, and the log path.
+
+`lubko-deploy deploy`:
+
+1. acquires an exclusive deployment lock so two deploys cannot race;
+2. validates the checkout by running `uv sync` followed by
+   `ruff format --check`, `ruff check`, `mypy`, and `pytest`. If any command
+   fails, deployment is refused and the current worker is left untouched;
+3. reads the git commit of the checkout — it never pulls, resets, stashes, or
+   otherwise mutates git state;
+4. starts the replacement worker detached from the invoking shell as its own
+   session and process-group leader, appending its output to `worker.log`;
+5. verifies the replacement is alive with an exact identity match and can reach
+   PostgreSQL with a bounded timeout, rather than merely spawning it. On
+   verification failure the replacement is stopped and the previous worker is
+   left untouched;
+6. stops the previous maintained worker using its recorded PID/process-group/
+   session identity: `SIGTERM`, then a bounded `SIGKILL` while members remain;
+7. atomically records the new worker's identity and the deployed commit, and
+   reports the deployed git commit.
+
+`lubko-deploy stop` terminates the maintained worker with the same precise
+identity validation; it never signals a process that no longer matches the
+recorded identity.
+
+### Identity and PID reuse
+
+A worker's metadata records its PID, process-group ID, session ID, start time
+in clock ticks, and a per-deployment lifecycle token placed in the process
+environment. Identity checks require every recorded field to match, so a
+recycled PID can never be mistaken for the maintained worker, and stopping
+only ever signals the exact recorded process group.
+
+### Bootstrap from an unmanaged legacy worker
+
+Before the first managed deployment, the worker is an unmanaged legacy daemon
+with no lifecycle metadata. `lubko-deploy status` reports this, and both
+`deploy` and `stop` refuse to claim they can stop it by identity.
+
+The one-time migration is a single manual stop of the legacy worker, after
+which the first managed deployment is started with:
+
+```sh
+lubko-deploy deploy --bootstrap
+```
+
+Subsequent upgrades replace maintained workers with no manual PID discovery.

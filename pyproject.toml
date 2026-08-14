@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 lubko-worker = "lubko.worker:main"
+lubko-deploy = "lubko.lifecycle:main"
 
 [dependency-groups]
 dev = [
@@ -43,6 +44,10 @@ convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "src/lubko/worker.py" = [
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
+"src/lubko/lifecycle.py" = [
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]

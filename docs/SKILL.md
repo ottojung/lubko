@@ -934,6 +934,56 @@ Explicitly include `do not deploy` in an agent prompt when this distinction matt
 
 ---
 
+# Deploying Lubko upgrades
+
+When the user asks to upgrade or redeploy the Lubko worker, use the
+deterministic lifecycle CLI instead of manual process-tree inspection:
+
+```sh
+lubko-deploy status
+lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
+lubko-deploy stop [--grace-seconds N]
+lubko-deploy log [--lines N]
+```
+
+`deploy` first validates the checkout by running `uv sync` and the
+repository-required checks (`ruff format --check`, `ruff check`, `mypy`,
+`pytest`). If validation fails, deployment is refused and the current worker is
+left untouched. Only a passing checkout is deployed.
+
+Deployment behavior:
+
+- the replacement worker is started detached, as its own session and process
+  group leader, with output appended to a stable per-user log;
+- the replacement is verified alive and able to reach PostgreSQL before the
+  previous worker is stopped;
+- the previous maintained worker is stopped by its exact recorded
+  PID/process-group/session identity — never by `pkill`, `killall`, or
+  process-name matching;
+- the deployed git commit is reported, and git state is never mutated (no
+  silent pull, reset, stash, or checkout).
+
+Per-user lifecycle state and logs live under
+`$XDG_STATE_HOME/lubko/worker` (default `~/.local/state/lubko/worker`), with
+`meta.json`, `worker.log`, `deploy.log`, and a `.deploy.lock` serializing
+concurrent deployments.
+
+### Bootstrap and the unmanaged legacy worker
+
+Before the first managed deployment the running worker is an unmanaged legacy
+daemon with no recorded identity. `lubko-deploy status` reports `unmanaged`,
+and `deploy`/`stop` refuse to claim they can stop it by identity. The one-time
+migration is a single manual stop of the legacy worker followed by:
+
+```sh
+lubko-deploy deploy --bootstrap
+```
+
+Subsequent upgrades replace maintained workers without any manual PID
+discovery.
+
+---
+
 # Direct shell commands versus managed agents
 
 Use direct shell commands when the task is tiny and deterministic.
