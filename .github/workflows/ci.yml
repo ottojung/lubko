@@ -23,14 +23,16 @@ jobs:
         run: python -m pip install uv
       - name: Sync
         run: uv sync --frozen
-      - name: Format branch
+      - name: Normalize branch
         run: |
+          uv run ruff format .
+          uv run ruff check . --fix || true
           uv run ruff format .
           if ! git diff --quiet; then
             git config user.name github-actions[bot]
             git config user.email 41898282+github-actions[bot]@users.noreply.github.com
             git add .
-            git commit -m "Format issue 21 rebuild"
+            git commit -m "Apply safe Ruff fixes for issue 21 rebuild"
             git push origin HEAD:issue21-safe-deploy-rebuild
           fi
       - name: Ruff format
