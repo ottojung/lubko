@@ -1,7 +1,8 @@
 # Lubko
 
 Lubko is a small worker that claims shell jobs from PostgreSQL and executes them
-inside a Docker development container.
+directly inside the Lubko container, honoring each job's requested working
+directory.
 
 ## Development
 
@@ -20,11 +21,13 @@ The worker uses libpq environment variables (`PGHOST`, `PGPORT`, `PGDATABASE`,
 
 Optional settings:
 
-- `LUBKO_CONTAINER` — Docker container name, default `phoebe-dev`.
 - `LUBKO_WORKER_ID` — worker identifier, default is the host name.
 - `LUBKO_POLL_INTERVAL_SECONDS` — idle polling interval, default `1`.
 - `LUBKO_MAX_OUTPUT_BYTES` — maximum bytes retained from each output stream,
   default `262144`.
+
+Jobs run through `bash -lc` directly in the container, in the directory
+requested by each job.
 
 Run with:
 

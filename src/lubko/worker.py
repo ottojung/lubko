@@ -1,4 +1,4 @@
-"""Poll PostgreSQL for jobs and execute them in a Docker development container."""
+"""Poll PostgreSQL for jobs and execute them directly in the Lubko container."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import socket
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import psycopg
@@ -18,7 +19,6 @@ if TYPE_CHECKING:
     from uuid import UUID
 
 LOGGER: Final = logging.getLogger(__name__)
-DEFAULT_CONTAINER: Final = "phoebe-dev"
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_MAX_OUTPUT_BYTES: Final = 256 * 1024
 TRUNCATION_MARKER: Final = b"\n... [output truncated] ...\n"
@@ -37,7 +37,6 @@ class Job:
 class Settings:
     """Runtime settings loaded from environment variables."""
 
-    container: str
     worker_id: str
     poll_interval_seconds: float
     max_output_bytes: int
@@ -50,7 +49,6 @@ class Settings:
             Settings derived from the process environment.
         """
         return cls(
-            container=os.getenv("LUBKO_CONTAINER", DEFAULT_CONTAINER),
             worker_id=os.getenv("LUBKO_WORKER_ID", socket.gethostname()),
             poll_interval_seconds=float(
                 os.getenv(
@@ -123,8 +121,17 @@ def claim_job(conn: psycopg.Connection[Job], worker_id: str) -> Job | None:
         return cursor.fetchone()
 
 
+def resolve_shell() -> str | None:
+    """Locate the shell executable used to run jobs.
+
+    Returns:
+        Absolute path to the shell, or ``None`` if it is not installed.
+    """
+    return shutil.which("bash")
+
+
 def execute_job(job: Job, settings: Settings) -> tuple[int, str, str]:
-    """Execute one job inside the configured Docker container.
+    """Execute one job directly in its requested working directory.
 
     Args:
         job: Claimed job to execute.
@@ -133,30 +140,28 @@ def execute_job(job: Job, settings: Settings) -> tuple[int, str, str]:
     Returns:
         Exit code, standard output, and standard error.
     """
-    docker = shutil.which("docker")
-    if docker is None:
-        return 127, "", "unable to execute docker: executable not found"
+    shell = resolve_shell()
+    if shell is None:
+        return 127, "", "unable to execute job: shell executable not found"
+
+    if not Path(job.cwd).is_dir():
+        return (
+            127,
+            "",
+            f"unable to enter working directory {job.cwd!r}: directory does not exist",
+        )
 
     try:
         completed = subprocess.run(
-            [
-                docker,
-                "exec",
-                "-i",
-                "-u",
-                "root",
-                "-w",
-                job.cwd,
-                settings.container,
-                "bash",
-                "-lc",
-                job.command,
-            ],
+            [shell, "-lc", job.command],
+            cwd=job.cwd,
             check=False,
             capture_output=True,
         )
+    except PermissionError as exc:
+        return 127, "", f"unable to enter working directory {job.cwd!r}: {exc}"
     except OSError as exc:
-        return 127, "", f"unable to execute docker: {exc}"
+        return 127, "", f"unable to execute job: {exc}"
 
     return (
         completed.returncode,

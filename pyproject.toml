@@ -1,7 +1,7 @@
 [project]
 name = "lubko"
 version = "0.1.0"
-description = "Execute queued development jobs inside a Docker workspace."
+description = "Execute queued development jobs directly inside the Lubko container."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
