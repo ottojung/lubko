@@ -1010,7 +1010,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grace-seconds", type=float, default=DEFAULT_STOP_GRACE_SECONDS)
     parser.add_argument("--db-timeout", type=float, default=DEFAULT_POSTGRES_TIMEOUT_SECONDS)
     parser.add_argument("--lock-timeout", type=float, default=DEFAULT_LOCK_TIMEOUT_SECONDS)
-    parser.add_argument("--validation-timeout", type=float, default=DEFAULT_VALIDATION_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--validation-timeout", type=float, default=DEFAULT_VALIDATION_TIMEOUT_SECONDS
+    )
     parser.add_argument("--git-timeout", type=float, default=DEFAULT_GIT_TIMEOUT_SECONDS)
     return parser
 
