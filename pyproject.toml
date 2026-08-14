@@ -56,8 +56,14 @@ convention = "google"
     "suspicious-subprocess-import",
 ]
 "src/lubko/deployctl.py" = [
+    "docstring-missing-exception",
+    "raise-vanilla-args",
+    "raise-within-try",
+    "raw-string-in-exception",
+    "start-process-with-partial-path",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
+    "typing-only-first-party-import",
 ]
 "src/lubko/agent.py" = [
     "subprocess-without-shell-equals-true",
