@@ -32,7 +32,7 @@ def worker_meta(commit: str, *, pid: int = 100) -> WorkerMeta:
         repo="/workspace/Lubko",
         git_commit=commit,
         worker_id="test-worker",
-        log_path="/tmp/worker.log",
+        log_path="/workspace/worker.log",
         started_at=1.0,
         stopped_at=None,
     )
