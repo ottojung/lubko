@@ -1,6 +1,7 @@
 """Tests for the Lubko command line tool installer."""
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -287,3 +288,44 @@ def test_main_fails_on_broken_explicit_uv(
     code = install.main(["--repo", str(repo_with_commit), "--uv", str(tmp_path / "missing-uv")])
     assert code == install.EXIT_ERROR
     assert "explicit uv executable" in capsys.readouterr().err
+
+
+def test_main_activation_failure_preserves_prior_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
+    tmp_path: Path,
+) -> None:
+    """A failed CLI switch keeps the previous environment intact and usable."""
+    old_commit = cli.git_commit(repo_with_commit, 10.0)
+    assert old_commit is not None
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    bin_dir = tmp_path / "bin"
+    cli.build_cli_root(repo_with_commit, old_commit, "uv", 60.0)
+    cli.install_launchers(bin_dir)
+    cli.set_current(old_commit)
+
+    uv_dir = tmp_path / "uv-dir"
+    uv_dir.mkdir()
+    write_uv_executable(uv_dir)
+    monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
+    patch_path(monkeypatch, uv_dir, bin_dir)
+
+    def broken_set_current(_commit: str) -> None:
+        msg = "switch boom"
+        raise cli.CliError(msg)
+
+    monkeypatch.setattr(cli, "set_current", broken_set_current)
+
+    code = install.main(["--repo", str(repo_with_commit)])
+    assert code == install.EXIT_ERROR
+    assert cli.current_commit() == old_commit
+    assert cli.cli_commit_dir(old_commit).is_dir()
+    assert toolchain.read_toolchain() is None
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-agent")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == f"lubko-agent@{old_commit}"

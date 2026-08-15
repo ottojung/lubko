@@ -142,13 +142,17 @@ def cli_entry_executable(commit: str, entry: str) -> Path | None:
 def _root_is_usable(commit: str) -> bool:
     """Return whether a commit's CLI environment looks fully built.
 
+    Every maintained entry point must exist: older commits may predate one of
+    the six entry points, and activating such a root would leave that global
+    command broken.
+
     Args:
         commit: Exact commit hash.
 
     Returns:
-        ``True`` when the per-commit environment exists with its entry points.
+        ``True`` when the per-commit environment has every entry point.
     """
-    return cli_entry_executable(commit, "lubko-agent") is not None
+    return all(cli_entry_executable(commit, entry) is not None for entry in ENTRY_POINTS)
 
 
 # ---------------------------------------------------------------------------
@@ -336,12 +340,18 @@ def remove_cli_root(commit: str) -> None:
 def gc_cli_roots(keep: Sequence[str]) -> None:
     """Remove every CLI environment except the commits listed.
 
-    The ``current`` symlink itself is never removed.
+    The environment selected by the ``current`` symlink is always preserved,
+    even when it is absent from ``keep``. Activation may have failed after
+    durable state was written, so a cleanup must never delete the root that the
+    global CLIs currently resolve to.
 
     Args:
         keep: Commits whose environments must be retained.
     """
     keep_set = set(keep)
+    current = current_commit()
+    if current is not None:
+        keep_set.add(current)
     for path in cli_root_dir().iterdir() if cli_root_dir().is_dir() else ():
         if path.name in {CURRENT_LINK_NAME, CURRENT_TMP_NAME}:
             continue
@@ -357,13 +367,17 @@ def gc_cli_roots(keep: Sequence[str]) -> None:
 def launcher_source(entry: str) -> str:
     """Return the stable shell launcher text for one maintained entry point.
 
+    The embedded state root is shell-quoted so a path containing a single
+    quote cannot break the generated script.
+
     Args:
         entry: Maintained entry point name.
 
     Returns:
         Executable shell script resolving the active CLI commit.
     """
-    return _LAUNCHER_TEMPLATE.format(state_root=state_root(), entry=entry)
+    escaped_root = str(state_root()).replace("'", "'\\''")
+    return _LAUNCHER_TEMPLATE.format(state_root=escaped_root, entry=entry)
 
 
 def install_launchers(bin_dir: Path) -> None:

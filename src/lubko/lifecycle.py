@@ -962,21 +962,31 @@ def _prepare_maintained_cli(options: DeployOptions, commit: str) -> bool:
     return True
 
 
-def _activate_maintained_cli(commit: str) -> None:
-    """Activate the confirmed CLI commit and garbage-collect older roots.
+def _activate_maintained_cli(commit: str) -> bool:
+    """Activate the confirmed CLI commit, preserving the prior coherent CLI.
 
-    Activation happens only after the new worker metadata is durable, so a
-    failure here leaves the CLIs stale (previous confirmed version), never
-    stranded on unconfirmed candidate code.
+    Activation happens only after the new worker metadata is durable. On
+    failure the previous CLI commit stays active and its environment is never
+    garbage-collected, so the global CLIs remain usable even though they are
+    temporarily behind the worker.
 
     Args:
         commit: Exact commit to activate.
+
+    Returns:
+        ``True`` when the pointer now selects ``commit``, ``False`` otherwise.
     """
     try:
         cli.set_current(commit)
     except cli.CliError as exc:
-        _err(f"warning: maintained CLI activation failed: {exc}")
+        _err(f"error: maintained CLI activation failed: {exc}")
+        _err(
+            "the previous CLI commit remains active and usable; run 'lubko-deploy-ctl status' "
+            "or 'lubko-install' to repair the maintained CLIs"
+        )
+        return False
     cli.gc_cli_roots((commit,))
+    return True
 
 
 def _deploy_locked(options: DeployOptions) -> int:
@@ -1048,11 +1058,21 @@ def _deploy_locked(options: DeployOptions) -> int:
             raise DeployAbortedError
 
     write_meta(new_meta)
-    _activate_maintained_cli(commit)
-    append_deploy_log(f"deployed commit {commit} pid={new_meta.pid}")
+    cli_ok = _activate_maintained_cli(commit)
+    append_deploy_log(
+        f"deployed commit {commit} pid={new_meta.pid}"
+        + ("" if cli_ok else "; maintained CLI activation failed")
+    )
     _out(f"deployed git commit {commit}")
     _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     _out(f"log: {log_file}")
+    if not cli_ok:
+        _err("error: the worker runs the new commit but the maintained CLIs could not be switched")
+        _err(
+            "the previous CLI commit remains active and usable; run 'lubko-deploy-ctl status' "
+            "or 'lubko-install' to repair"
+        )
+        return EXIT_ERROR
     return EXIT_OK
 
 

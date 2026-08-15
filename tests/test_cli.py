@@ -246,9 +246,26 @@ def test_gc_cli_roots_keeps_only_listed(
     cli.build_cli_root(repo, third, "uv", 60.0)
     cli.set_current(first)
     cli.gc_cli_roots((second, third))
-    assert not cli.cli_commit_dir(first).exists()
     assert cli.cli_commit_dir(second).is_dir()
     assert cli.cli_commit_dir(third).is_dir()
+    assert cli.current_commit() == first
+
+
+def test_gc_cli_roots_preserves_current_root(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup never deletes the root the current pointer selects."""
+    repo, first, second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    cli.set_current(first)
+
+    cli.gc_cli_roots((second,))
+
+    assert cli.cli_commit_dir(first).is_dir()
+    assert cli.cli_commit_dir(second).is_dir()
     assert cli.current_commit() == first
 
 
@@ -304,6 +321,25 @@ def test_launcher_source_embeds_state_root() -> None:
     source = cli.launcher_source("lubko-agent")
     assert str(state_root()) in source
     assert "lubko-agent" in source
+
+
+def test_launcher_escapes_single_quote_in_state_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A quoted state root cannot break the generated launcher shell."""
+    quoted = tmp_path / "x'y"
+    monkeypatch.setattr(cli, "state_root", lambda: quoted)
+    source = cli.launcher_source("lubko-agent")
+    assert "'\\''" in source
+    proc = subprocess.run(
+        [shutil.which("sh") or "sh", "-n"],
+        input=source,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
 
 
 def test_git_commit_reads_head(two_commit_repo: tuple[Path, str, str]) -> None:

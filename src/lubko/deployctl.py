@@ -940,9 +940,9 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     _write_state(replace(state, status=STATUS_CONFIRMED))
     try:
         cli.set_current(state.commit)
-        cli.gc_cli_roots((state.commit, state.previous_commit))
     except cli.CliError as exc:
         append_deploy_log(f"supervised deployment confirmed but CLI activation failed: {exc}")
+    cli.gc_cli_roots((state.commit, state.previous_commit))
     append_deploy_log(f"supervised deployment confirmed commit {state.commit}")
     return {"type": "confirm", "ok": True, "commit": state.commit, "confirmed": True}
 

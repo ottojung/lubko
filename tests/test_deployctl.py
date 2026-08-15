@@ -428,6 +428,52 @@ def test_provisional_candidate_build_does_not_switch_clis(
     assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
 
 
+def test_confirmation_activation_failure_keeps_previous_root(
+    coherent_environment: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed CLI switch during confirmation never breaks the prior CLI."""
+    repo, first, second, bin_dir = coherent_environment
+    state = pending_state(repo=str(repo), old=first, new=second)
+    challenged = replace(state, challenge_hash=dc._challenge_digest("challenge"))
+    dc._write_state(challenged)
+    write_meta(worker_meta(first, pid=100, repo=str(repo)))
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    options = make_options(repo)
+
+    original_set_current = cli.set_current
+    attempts: list[str] = []
+
+    def flaky_set_current(commit: str) -> None:
+        attempts.append(commit)
+        if len(attempts) == 1:
+            msg = "switch boom"
+            raise cli.CliError(msg)
+        original_set_current(commit)
+
+    monkeypatch.setattr(cli, "set_current", flaky_set_current)
+
+    response = dc._confirm_locked(
+        {
+            "type": "confirm",
+            "commit": second,
+            "challenge": "challenge"[::-1],
+        },
+        options,
+    )
+
+    assert response["confirmed"] is True
+    assert cli.current_commit() == first
+    assert cli.cli_commit_dir(first).is_dir()
+    assert cli.cli_commit_dir(second).is_dir()
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+
+    dc._handle_status(options)
+
+    assert cli.current_commit() == second
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{second}"
+
+
 def test_checkout_aborts_and_restores_when_candidate_cli_build_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
