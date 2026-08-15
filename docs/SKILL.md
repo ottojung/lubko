@@ -35,7 +35,7 @@ ChatGPT
 
 Supabase is only the transport used to get commands into the Lubko container and retrieve their results.
 
-For substantial work inside the container, the preferred execution interface is **`lubko-agent`**. It provides managed AI agent sessions with stable IDs, explicit working directories, logs, status, continuation, results, waiting, stopping, killing, deletion, and cleanup.
+For substantial work inside the container, the preferred execution interface is **`lubko-agent`**. It provides managed AI agent sessions with stable, caller-chosen IDs, explicit working directories, logs, status, continuation, waiting, stopping, killing, deletion, and cleanup.
 
 Use Lubko whenever work needs to be performed in the user's development environment, including:
 
@@ -113,32 +113,41 @@ id      uuid primary key default gen_random_uuid()
 payload text not null
 ```
 
-`payload` is one string containing a JSON object (protocol v1, documented in
+`payload` is one string containing a JSON object (protocol v2, documented in
 `docs/protocol.md`). Every evolving job/request/result/state/cancellation/
-process-identity field lives inside it:
+process-identity/output field lives inside it:
 
 ```text
-payload.v              protocol version (currently 1)
-payload.type           job kind (currently "command")
-payload.request.cwd    working directory
-payload.request.command     shell command, or
-payload.request.args        argv list (exactly one of the two)
-payload.state.status   pending | running | succeeded | failed | cancelled
+payload.v                  protocol version (currently 2)
+payload.type               job kind: "command" or "output_chunk"
+payload.request.cwd        working directory
+payload.request.command    shell command, or
+payload.request.args       argv list (exactly one of the two)
+payload.state.status       pending | running | succeeded | failed | cancelled
 payload.state.created_at / updated_at / started_at / finished_at
 payload.state.worker_id
 payload.state.worker_incarnation
 payload.state.lease_expires_at / recovered_at
 payload.state.process_pid / process_pgid
 payload.state.cancel_requested_at
+payload.output.<stream>.tail / start / end / previous   bounded live output window
 payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
 ```
 
+Immutable historical output lives in separate `output_chunk` rows in the same
+two-column table, explicitly owned by a root job via `payload.thread`. Root
+live output tails are bounded rolling windows of the newest up to 4000 raw
+bytes per stream (decoded to at most 4000 characters) and are never shortened
+by archival rotation.
+
 Never add a third column to `lubko.jobs`; evolve the protocol inside
 `payload` instead. SQL casts `payload::jsonb` only transiently for predicates
-and atomic updates, and stores `::text` back.
+and atomic updates, and stores `::text` back. Constraints are type-aware:
+`command` rows need a `request` object and `state.status`, while
+`output_chunk` rows need explicit `thread` ownership and value/offset shape.
 
-The worker atomically claims pending jobs using PostgreSQL row locking and a
-JSON compare-and-swap, including `FOR UPDATE SKIP LOCKED`.
+The worker atomically claims pending `command` rows using PostgreSQL row
+locking and a JSON compare-and-swap, including `FOR UPDATE SKIP LOCKED`.
 
 Running jobs carry a lease (`payload.state.lease_expires_at`) that the owning
 worker refreshes by heartbeat. If a worker crashes or is restarted, its jobs
@@ -150,6 +159,11 @@ the same job concurrently. Recovery and lease timing are configurable
 (`LUBKO_LEASE_DURATION_SECONDS`, `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`,
 `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS`); see the README.
 
+One Lubko worker is a single nonblocking supervisor and can run arbitrarily
+many jobs concurrently; there is no application-level concurrency limit, and
+submitting several independent jobs lets those commands genuinely run at the
+same time.
+
 The orchestrator should use Supabase to submit commands and retrieve their results. The commands themselves should usually be high-level Lubko commands, especially `lubko-agent`, rather than long improvised shell programs.
 
 ---
@@ -160,14 +174,15 @@ ChatGPT is responsible for:
 
 1. deciding what operation should be performed;
 2. deciding whether the operation should be a direct shell command or a managed `lubko-agent` task;
-3. submitting the operation through the Supabase connector;
-4. recording the returned Supabase job ID;
-5. polling that job until it reaches a terminal state;
-6. reading stdout, stderr, and exit code;
-7. when an agent was created, recording its Lubko agent ID;
-8. observing and steering that agent through `lubko-agent` commands;
-9. independently verifying important repository results where appropriate;
-10. iterating until the requested task is actually complete.
+3. choosing the Lubko agent ID up front when an agent will be used;
+4. submitting the operation through the Supabase connector;
+5. recording the returned Supabase job ID;
+6. polling that job until it reaches a terminal state;
+7. reading stdout, stderr, and exit code from the bounded live output tail;
+8. when an agent was created, using its preassigned Lubko agent ID for `prompt`/`status`/`log`;
+9. observing and steering that agent through `lubko-agent` commands;
+10. independently verifying important repository results where appropriate;
+11. iterating until the requested task is actually complete.
 
 Keep the orchestrator role disciplined: decide *what* should happen, specify
 *constraints*, delegate the *how*, then verify the *result* independently.
@@ -239,7 +254,7 @@ A basic job insertion looks like:
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":1,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
+    '{"v":2,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
 )
 returning id;
 ```
@@ -268,8 +283,8 @@ After submitting a job, query it by ID:
 select
     id,
     (payload::jsonb)->'state'->>'status' as status,
-    (payload::jsonb)->'result'->>'stdout' as stdout,
-    (payload::jsonb)->'result'->>'stderr' as stderr,
+    (payload::jsonb)->'output'->'stdout'->>'tail' as stdout_tail,
+    (payload::jsonb)->'output'->'stderr'->>'tail' as stderr_tail,
     (payload::jsonb)->'result'->>'exit_code' as exit_code,
     (payload::jsonb)->'state'->>'worker_id' as worker_id,
     (payload::jsonb)->'state'->>'started_at' as started_at,
@@ -288,6 +303,28 @@ Interpret states as follows:
 
 For a running job, poll again rather than assuming failure.
 
+The root row's `payload.output.<stream>.tail` is a bounded rolling live window
+of the newest up to 4000 raw bytes of stdout/stderr (decoded to at most 4000
+characters). Checking one root job by
+ID is always safe and useful: the row always contains current lifecycle state
+plus a substantial recent rolling output window, independent of chunk
+rotation.
+
+## Bounded multi-job polling
+
+To observe several jobs (for example several parallel attached agents) at
+once, poll them together with one bounded query:
+
+```sql
+select id, payload
+from lubko.jobs
+where id in ('<JOB A UUID>', '<JOB B UUID>');
+```
+
+Each row remains bounded and contains a useful recent live tail. When many
+parallel jobs exist, poll them in bounded batches of IDs rather than one
+unbounded `select`.
+
 A Supabase job that launches an asynchronous Lubko agent may finish quickly while the agent itself continues running. In that case, use the returned **Lubko agent ID** for subsequent observation and control.
 
 This distinction is important:
@@ -303,9 +340,10 @@ Supabase job lifecycle != Lubko agent lifecycle
 For completed jobs, inspect:
 
 ```text
-payload.result.stdout
-payload.result.stderr
+payload.state.status
 payload.result.exit_code
+payload.output.stdout.tail
+payload.output.stderr.tail
 ```
 
 Do not equate non-empty `stderr` with failure. Many Unix programs write informational output to stderr.
@@ -356,14 +394,15 @@ Cancellation is only accepted while the job is `pending` or `running`.
 Already terminal jobs are unchanged. If a request is accepted before the
 worker has finalized the job, cancellation wins and the final status is
 `cancelled` with the output accumulated so far retained in
-`payload.result.stdout`/`stderr` and a diagnostic in
+`payload.output` / `payload.result.stdout` and a diagnostic in
 `payload.result.cancellation_note`.
 
 When a running job is cancelled, the worker uses the job's recorded
 `payload.state.process_pgid` and signals only that exact process group:
 `SIGTERM`, then `SIGKILL` after a bounded grace period while members remain. It never uses
 `pkill`, `killall`, or process-name matching, and it never signals a process
-group after the tracked process is known to be fully gone.
+group after the tracked process is known to be fully gone. Cancelling or
+failing one job never affects unrelated jobs.
 
 The worker-side helper `lubko.worker.request_cancel` implements this contract
 and returns the resulting status:
@@ -396,13 +435,12 @@ Prefer it over manually composing long shell command sequences.
 
 `lubko-agent` is safer and more reliable than ad-hoc shell orchestration for substantial work because it provides:
 
-- a stable Lubko-managed agent ID;
+- a stable Lubko agent ID chosen by the caller in advance;
 - an explicit working directory;
 - persistent session identity across separate Supabase jobs;
 - a clear status model;
 - process-group-aware lifecycle control;
 - durable logs;
-- a concise final result interface;
 - exact-session continuation;
 - deterministic stop and kill operations;
 - cleanup and deletion semantics;
@@ -416,6 +454,8 @@ composing long shell command chains by hand. The sharpest failures have come
 from work that needed reasoning but was executed as a series of short,
 stateless shell commands: each command re-inspects the world from zero,
 accumulates no context, and cannot iterate.
+
+The orchestrator should therefore favor an agent for tasks such as:
 
 The orchestrator should therefore favor an agent for tasks such as:
 
@@ -464,73 +504,163 @@ Another useful rule is:
 The primary interface is:
 
 ```text
-lubko-agent new
-lubko-agent list
-lubko-agent status <id>
-lubko-agent prompt <id>
-lubko-agent log <id>
-lubko-agent result <id>
-lubko-agent wait <id>
+lubko-agent new --id <ID> [--cwd DIR] [--title TEXT] [--json]
+lubko-agent list [...]
+lubko-agent status <id> / status --id <ID> [--json]
+lubko-agent prompt --id <ID> [--steer] [--detach] PROMPT
+lubko-agent log <id> [--lines N] [--follow]
+lubko-agent wait <id> --timeout SEC
 lubko-agent stop <id>
 lubko-agent kill <id>
-lubko-agent delete <id>
-lubko-agent clean
-lubko-agent last
+lubko-agent delete <id> [--force]
+lubko-agent clean [--days N] [--dry-run]
 ```
 
-Each managed session has a short stable **Lubko agent ID**, for example:
+There is no `lubko-agent last` and no `lubko-agent result`; those commands do
+not exist.
+
+Agent IDs are **preassigned by the orchestrator** as fresh base-16 strings, for
+example:
 
 ```text
-8e064622
+a13f09c2
 ```
+
+The generator/orchestrator chooses a fresh hex ID before submitting any Lubko
+transport job, so the ID is known up front and can safely be used from several
+later jobs without scraping it out of command output.
 
 Always use the Lubko agent ID for later operations. Do not try to infer or use internal native session IDs or raw PIDs unless debugging the Lubko implementation itself.
 
 ---
 
-# `lubko-agent new`
+# `lubko-agent new --id <ID>`
 
-Create a new managed agent session.
-
-Typical form:
+Create a managed agent session record with a caller-supplied ID.
 
 ```sh
-lubko-agent new \
-    --cwd /workspace/project \
-    --prompt 'Inspect the repository, implement the requested change, run the project checks, and summarize what changed.'
+lubko-agent new --id a13f09c2 --cwd /workspace/project
 ```
 
-Useful options include:
+Requirements:
+
+- `--id <ID>` is required and must be a base-16 string; malformed IDs are
+  rejected clearly;
+- an ID that already exists is rejected rather than silently reused;
+- the supplied ID is preserved exactly as the stable Lubko agent identity
+  (normalized only by lower-casing hex digits);
+- Lubko never generates an agent ID internally and has no application-level ID
+  allocator.
+
+Useful options:
 
 ```text
 --cwd DIR
---prompt TEXT
 --title TEXT
 --json
 ```
 
-The working directory should normally be the root of the repository being modified.
+`new` is **pure session creation**: it only creates the managed Lubko agent
+record. It does not launch the underlying AI agent and does not accept an
+initial prompt. `new` therefore accepts no `--prompt`, no positional prompt,
+no `--sync`, and no `--detach` — there is nothing to follow or detach from at
+creation time.
 
-Use a detailed prompt. Include:
-
-- the actual objective;
-- relevant architectural context;
-- explicit constraints;
-- repository-local instructions such as `AGENTS.md`;
-- tests or checks that must be run;
-- things that must not be done, such as deployment when the user only asked for code changes.
-
-The command starts the agent asynchronously and returns quickly.
+A freshly-created but never-prompted agent has a clear idle
+(not-yet-started) state rather than pretending to be running or terminal.
 
 Example machine-readable result:
 
 ```json
-{"id":"8e064622","state":"running","cwd":"/workspace/project","created_at":1786681506.5262172}
+{"id": "a13f09c2", "state": "idle", "cwd": "/workspace/project", "created_at": 1786681506.5262172}
 ```
 
-Record the returned agent ID immediately.
+Record the agent ID — you already chose it, so record it before submitting the
+command. The first invocation happens later through `lubko-agent prompt`.
 
-Do not rely on `last` as a substitute for recording the ID when multiple agents may exist.
+---
+
+# `lubko-agent prompt --id <ID> PROMPT`
+
+The primary prompt form is:
+
+```sh
+lubko-agent prompt --id a13f09c2 'Investigate issue #25, implement it, run validation, and summarize the result.'
+```
+
+The prompt text is given positionally. `--id <ID>` selects the exact agent;
+the caller always knows the ID because it generated it.
+
+`prompt` is **attached by default**:
+
+- it starts (or queues) the requested invocation;
+- it streams/follows the invocation's output;
+- it returns only when that invocation finishes;
+- it propagates the mapped invocation exit status.
+
+The explicit asynchronous form remains:
+
+```sh
+lubko-agent prompt --id a13f09c2 --detach 'Investigate independently and keep working.'
+```
+
+`--detach` starts/queues the invocation and returns immediately. The enclosing
+Lubko root job finishes quickly while the agent keeps working; observe the
+agent with `status`/`log`/`wait`.
+
+### First prompt creates the native session
+
+A freshly created agent has no underlying native session yet. The **first**
+`prompt --id <ID> ...` creates and starts the native session. Later prompts on
+the same agent continue that exact native session. This is why `new` can
+create only an idle record: the native session materializes on first use.
+
+### `--steer` semantics
+
+`--steer` only changes behavior when the selected agent is **currently
+running**:
+
+```sh
+lubko-agent prompt --id a13f09c2 --steer 'Stop this approach and use the parser-level fix instead.'
+```
+
+While the agent is running, `--steer` interrupts/redirects the current
+invocation according to the steer model, then follows the resulting invocation
+unless `--detach` is also supplied.
+
+If the agent is **not currently running** (idle, finished, stopped, or
+never-started), then:
+
+```sh
+lubko-agent prompt --id a13f09c2 --steer 'task'
+```
+
+is exactly equivalent to:
+
+```sh
+lubko-agent prompt --id a13f09c2 'task'
+```
+
+`--steer` is harmless and redundant on an idle/finished/not-yet-started agent;
+it is never rejected merely because there is nothing currently running to
+interrupt. This lets caller code always request "make the latest instruction
+take precedence" without first branching on whether the agent happens to be
+busy.
+
+### Inspect before you steer
+
+The most over-orchestrated agents are the ones whose orchestrator sent frequent
+prompts ("now do X", "are you done?") without first reading status or the log.
+Each such prompt interrupts the agent's reasoning and can push it to declare
+premature completion.
+
+Before any prompt, read the evidence: the agent's `status`, then a focused log
+tail when more detail is needed. Only prompt when the evidence shows a concrete
+problem or a new requirement.
+
+Steer with *constraints and acceptance criteria*, not with play-by-play
+instructions. One precise follow-up that says what is wrong and what "done"
+means is worth ten that say what to type next.
 
 ---
 
@@ -547,6 +677,7 @@ Typical output contains:
 ```text
 ID        STATE      P  AGE  CWD                    TITLE
 8e064622  succeeded  2  2m   /workspace/project     fix parser
+a13f09c2  running    1  1m   /workspace/project-a   review storage
 ```
 
 Use this command when:
@@ -559,6 +690,7 @@ Use this command when:
 Possible states include values such as:
 
 ```text
+idle
 running
 succeeded
 failed
@@ -566,6 +698,8 @@ stopped
 killed
 unknown
 ```
+
+`idle` means a session was created but has never received a prompt.
 
 Do not assume that a finished agent should be deleted immediately. A completed session may be useful for follow-up prompts.
 
@@ -577,6 +711,12 @@ Show detailed state for one exact agent.
 
 ```sh
 lubko-agent status 8e064622
+```
+
+The `--id` flag form is also supported:
+
+```sh
+lubko-agent status --id 8e064622
 ```
 
 Status may include:
@@ -596,49 +736,6 @@ Status may include:
 Use `status` as the primary health check for an agent.
 
 If an agent appears to be taking longer than expected, inspect `status` and `log` rather than assuming it is stuck.
-
----
-
-# `lubko-agent prompt <id>`
-
-Continue one exact existing agent session with another instruction.
-
-```sh
-lubko-agent prompt 8e064622 \
-    --prompt 'Now fix the remaining mypy failure and rerun all required checks.'
-```
-
-This is the preferred way to continue work.
-
-It preserves the agent's accumulated context while avoiding ambiguous global continuation semantics.
-
-Use follow-up prompts when:
-
-- the first implementation is incomplete;
-- tests reveal another issue;
-- the user changes or narrows the request;
-- the orchestrator wants the same agent to review its own work;
-- more evidence becomes available;
-- a final cleanup or verification pass is needed.
-
-Prefer continuing an appropriate existing agent over starting from scratch when the work is clearly part of the same task.
-
-Do not accidentally prompt the wrong agent. Always use the recorded Lubko agent ID.
-
-### Inspect before you steer
-
-The most over-orchestrated agents are the ones whose orchestrator sent frequent
-prompts ("now do X", "are you done?") without first reading status or the log.
-Each such prompt interrupts the agent's reasoning and can push it to declare
-premature completion.
-
-Before any prompt, read the evidence: the agent's `status`, then a focused log
-tail when more detail is needed. Only prompt when the evidence shows a concrete
-problem or a new requirement.
-
-Steer with *constraints and acceptance criteria*, not with play-by-play
-instructions. One precise follow-up that says what is wrong and what "done"
-means is worth ten that say what to type next.
 
 ---
 
@@ -664,7 +761,8 @@ lubko-agent log 8e064622 --lines 100
 lubko-agent log 8e064622 --follow
 ```
 
-Use logs for observability while the agent is working.
+`log --follow` attaches to an already-running detached agent and streams its
+output. Use logs for observability while the agent is working.
 
 Logs are appropriate for:
 
@@ -676,29 +774,10 @@ Logs are appropriate for:
 
 Do not dump enormous logs by default. Prefer a useful tail such as 100 or 200 lines.
 
-For the final concise answer from a completed agent, prefer `result` instead of reading the entire log.
-
----
-
-# `lubko-agent result <id>`
-
-Show the final concise result from a completed agent.
-
-```sh
-lubko-agent result 8e064622
-```
-
-Use this after an agent finishes successfully or fails naturally.
-
-This command is designed to answer:
-
-> What did the agent ultimately report?
-
-It is usually much more efficient than reading the full log.
-
-The orchestrator should still independently verify important claims when appropriate, especially repository state, tests, or user-visible changes.
-
-A final agent result is not a substitute for checking `git diff`, tests, or other objective state when those checks matter.
+For an attached `prompt`, the invocation's current/final output is also exposed
+through the enclosing Lubko root job's bounded rolling output, so the normal
+progress/result view is the root job itself; `log` provides durable older
+output.
 
 ---
 
@@ -798,104 +877,6 @@ Running agents must never be removed by normal cleanup.
 
 ---
 
-# `lubko-agent last`
-
-Print the most recently used Lubko agent ID.
-
-```sh
-lubko-agent last
-```
-
-This is a convenience and recovery mechanism.
-
-It is useful when there is clearly only one active line of work and the orchestrator needs to recover the most recent session ID.
-
-Do not use it when several agents may exist and exact identity matters. Prefer recording and using explicit IDs.
-
-After the most recent agent is deleted, `last` may report that there is no previous agent.
-
----
-
-# Recommended orchestration workflow
-
-For substantial development, use this pattern by default.
-
-## 1. Launch an agent
-
-Submit a Supabase job containing something like:
-
-```sh
-lubko-agent new \
-    --cwd /workspace/project \
-    --title 'fix parser' \
-    --prompt 'Inspect the repository and AGENTS.md. Fix the parser bug described by the user. Add or update tests. Run all required validation. Do not deploy anything.' \
-    --json
-```
-
-Poll the Supabase job and record the returned agent ID.
-
-## 2. Observe the agent
-
-Use:
-
-```sh
-lubko-agent status <id>
-```
-
-and, when useful:
-
-```sh
-lubko-agent log <id> --lines 100
-```
-
-## 3. Let it finish or steer it
-
-If no intervention is needed:
-
-```sh
-lubko-agent wait <id> --timeout 300
-```
-
-If another instruction is needed:
-
-```sh
-lubko-agent prompt <id> --prompt 'Address the remaining test failure, then rerun the full validation suite.'
-```
-
-## 4. Read the result
-
-```sh
-lubko-agent result <id>
-```
-
-## 5. Verify objective state
-
-Use direct shell observations when appropriate:
-
-```sh
-git status -sb
-git diff --stat
-git diff
-```
-
-Run relevant tests independently when needed.
-
-## 6. Continue the same agent if necessary
-
-If verification finds a problem, send another exact-session prompt rather than unnecessarily creating a new agent.
-
-## 7. Keep or delete the session
-
-Keep the session while follow-up is plausible.
-
-Delete it later when it is no longer useful:
-
-```sh
-lubko-agent delete <id>
-```
-
----
-
 # Let agents think without arbitrary time pressure
 
 Agents that were stopped or killed because the orchestrator judged them "slow"
@@ -922,6 +903,175 @@ Rules:
 
 ---
 
+# Parallel-agent workflow
+
+Once daemon concurrency is available, parallel attached agent jobs are a
+first-class pattern.
+
+The orchestrator first generates distinct fresh hex IDs, for example `<ID1>`
+and `<ID2>`.
+
+Then submit independent Lubko root jobs containing commands such as:
+
+```sh
+lubko-agent new --id <ID1> --cwd /workspace/project-a &&
+lubko-agent prompt --id <ID1> 'Investigate and fix issue A. Run validation.'
+```
+
+and:
+
+```sh
+lubko-agent new --id <ID2> --cwd /workspace/project-b &&
+lubko-agent prompt --id <ID2> 'Review subsystem B and fix the identified problem. Run validation.'
+```
+
+Those two root jobs both run at the same time while their corresponding agents
+work.
+
+Then observe them together with one bounded query:
+
+```sql
+select id, payload
+from lubko.jobs
+where id in ('<JOB A UUID>', '<JOB B UUID>');
+```
+
+Each row remains bounded, contains a useful recent live tail, and becomes
+terminal when its corresponding attached prompt finishes.
+
+The agent IDs are already known before submission, so there is no need to
+scrape them from output or consult global state.
+
+---
+
+# Context-safety contract
+
+Lubko guarantees:
+
+> Every individual job payload and output chunk has a strict maximum size, and every documented orchestrator polling/read operation has a bounded result size.
+
+This guarantee is about Lubko's row representation and documented workflows;
+literally arbitrary SQL is not bounded, because an orchestrator can always
+intentionally issue a huge query.
+
+Checking one root job by ID is safe and useful: the root row always contains
+current lifecycle state plus a substantial recent rolling output window
+(the newest up to 4000 raw bytes per stream, decoded to at most 4000
+characters), independent of chunk rotation.
+
+---
+
+# Recommended orchestration workflow
+
+For substantial development, use this pattern by default.
+
+## 1. Choose an agent ID and create the session
+
+The canonical pattern for starting agent work is:
+
+```sh
+lubko-agent new --id <ID1> --cwd /workspace/project &&
+lubko-agent prompt --id <ID1> 'task A'
+```
+
+For example, submit a Supabase job containing something like:
+
+```sh
+lubko-agent new --id a13f09c2 --cwd /workspace/project &&
+lubko-agent prompt --id a13f09c2 'Read AGENTS.md. Investigate issue #25, implement it completely, run the relevant tests and linters, and summarize what you changed.'
+```
+
+`new --id <ID1>` creates the named managed session immediately and does not
+run AI work. The orchestrator/generator chooses `<ID1>` (a fresh base-16
+string) before submitting the command.
+
+Poll the Supabase job. While `prompt` follows the agent, the enclosing Lubko
+root job remains running, and the root job's bounded rolling output is the
+normal progress/result view.
+
+## 2. Observe the agent
+
+Use:
+
+```sh
+lubko-agent status a13f09c2
+```
+
+and, when useful:
+
+```sh
+lubko-agent log a13f09c2 --lines 100
+```
+
+and poll the enclosing Supabase root job to read its bounded live output tail.
+
+## 3. Let it finish or steer it
+
+If no intervention is needed:
+
+```sh
+lubko-agent wait a13f09c2 --timeout 300
+```
+
+If another instruction is needed:
+
+```sh
+lubko-agent prompt --id a13f09c2 'Address the remaining test failure, then rerun the full validation suite.'
+```
+
+Again, poll the one root Lubko job carrying that attached prompt.
+
+If the agent is busy and the newest instruction must take precedence:
+
+```sh
+lubko-agent prompt --id a13f09c2 --steer 'Stop the current approach and use the parser-level fix instead.'
+```
+
+Use `--detach` only when the orchestrator intentionally wants the prompt
+command to return immediately and plans to observe/manage the agent
+separately afterward:
+
+```sh
+lubko-agent prompt --id a13f09c2 --detach 'Perform an independent review of the storage layer.'
+```
+
+## 4. Read the result
+
+For an attached prompt, the result is the root job's final bounded output plus
+its exit code/status. For older output, use `log`.
+
+## 5. Verify objective state
+
+Use direct shell observations when appropriate:
+
+```sh
+git status -sb
+git diff --stat
+git diff
+```
+
+Run relevant tests independently when needed.
+
+## 6. Continue the same agent if necessary
+
+If verification finds a problem, send another exact-session prompt rather than unnecessarily creating a new agent:
+
+```sh
+lubko-agent prompt --id a13f09c2 'Address the review findings, rerun the affected tests, and report the final state.'
+```
+
+## 7. Keep or delete the session
+
+Keep the session while follow-up is plausible.
+
+Delete it later when it is no longer useful:
+
+```sh
+lubko-agent delete a13f09c2
+```
+
+---
+
 # Parallel agents
 
 Multiple managed agents may exist at the same time.
@@ -931,6 +1081,15 @@ This can be useful for genuinely independent work, for example:
 - one agent investigating a test failure while another reviews documentation;
 - separate agents working in separate repositories;
 - one agent analyzing a subsystem while another performs an independent review.
+
+When using multiple agents:
+
+- generate every agent ID before submitting anything and record every ID;
+- give each a clear title;
+- give each an explicit `--cwd`;
+- avoid sending two write-heavy agents into the same files unless intentional;
+- use explicit IDs for every `prompt`, `status`, `log`, `wait`, `stop`, `kill`, and `delete` operation;
+- observe parallel agents together with bounded multi-job polling.
 
 ## Isolation: separate clones/worktrees and branches
 
@@ -990,8 +1149,7 @@ When using multiple agents:
 - give each a clear title;
 - give each an explicit `--cwd`;
 - avoid sending two write-heavy agents into the same files unless intentional;
-- use explicit IDs for every `status`, `prompt`, `log`, `wait`, `stop`, `kill`, `result`, and `delete` operation;
-- do not rely on `last`.
+- use explicit IDs for every `status`, `prompt`, `log`, `wait`, `stop`, `kill`, and `delete` operation;
 
 ---
 
@@ -1086,7 +1244,8 @@ Repositories generally live underneath it, for example:
 For a substantial repository task, prefer starting the agent directly in the repository root:
 
 ```sh
-lubko-agent new --cwd /workspace/Lubko --prompt '...'
+lubko-agent new --id <ID> --cwd /workspace/Lubko &&
+lubko-agent prompt --id <ID> 'Inspect the repository and AGENTS.md, implement the requested change, run validation, and summarize.'
 ```
 
 The agent should inspect repository-local instructions itself.
@@ -1680,9 +1839,8 @@ Do not assume the agent itself failed merely because a surrounding shell invocat
 
 If `lubko-agent status <id>` reports a failed agent:
 
-1. inspect `lubko-agent result <id>`;
-2. inspect `lubko-agent log <id> --lines 100` or another focused tail;
-3. decide whether to continue the same session with a corrective prompt or start a new agent.
+1. inspect `lubko-agent log <id> --lines 100` or another focused tail;
+2. decide whether to continue the same session with a corrective prompt or start a new agent.
 
 Prefer continuing the same agent when it retains useful task context.
 
@@ -1807,7 +1965,9 @@ lubko-agent log <id> --lines 100
 sed -n '1,200p' file
 ```
 
-The Lubko worker may truncate very large stdout or stderr streams.
+Lubko represents stdout/stderr as bounded rolling live tails; older output is
+available from immutable `output_chunk` rows only through explicit structured
+queries.
 
 If important output was truncated, run a narrower follow-up command.
 
@@ -1822,6 +1982,8 @@ Be proactive.
 Use Supabase as transport.
 
 Use `lubko-agent` as the preferred abstraction for substantial work.
+
+Generate agent IDs up front and keep them explicit.
 
 Inspect status and logs yourself.
 
@@ -1873,3 +2035,4 @@ Within that boundary, make full use of managed agents and the development enviro
 | Deployment | only when asked, via the managed tool, then a real smoke | implicit deploy, manual signals |
 | Secrets | design them out; verify by absence | printing/dumping values |
 | Destructive action | only after durable rollback state exists | delete-then-hope |
+

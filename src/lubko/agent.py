@@ -20,7 +20,6 @@ import fcntl
 import json
 import os
 import re
-import secrets
 import shutil
 import signal
 import sqlite3
@@ -48,6 +47,7 @@ OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for 
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
 STOP_REASONS: Final = frozenset({"stop", "kill"})
 PROG: Final = "lubko-agent"
+HEX_DIGITS: Final = frozenset("0123456789abcdef")
 
 # Exit codes.
 EXIT_OK: Final = 0
@@ -64,30 +64,16 @@ SECONDS_PER_DAY: Final = 86400
 PID_START_WINDOW_SECONDS: Final = 60
 SESSION_DISCOVER_TIMEOUT_SECONDS: Final = 60
 SESSION_DISCOVER_POLL_SECONDS: Final = 1
-SESSION_CONTINUE_TIMEOUT_SECONDS: Final = 10
-SESSION_CONTINUE_POLL_SECONDS: Final = 0.5
 STOP_WAIT_SECONDS: Final = 10.0
 KILL_WAIT_SECONDS: Final = 5.0
 IDLE_BREAK_SECONDS: Final = 5
+STABLE_TERMINAL_SECONDS: Final = 0.5
 STATUS_TAIL_LINES: Final = 50
 STATUS_TAIL_CHARS: Final = 2000
-RESULT_TAIL_LINES: Final = 50
-RESULT_TAIL_CHARS: Final = 2000
 DEFAULT_RETENTION_DAYS: Final = 14
 RUNNER_ARGV_LENGTH: Final = 3
 
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-
-_LAST_ASSISTANT_SQL: Final = """
-SELECT p.data
-FROM part p
-JOIN message m ON p.message_id = m.id
-WHERE p.session_id = ?
-  AND json_extract(m.data, '$.role') = 'assistant'
-  AND json_extract(p.data, '$.type') = 'text'
-ORDER BY p.time_created DESC, p.id DESC
-LIMIT 1
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +116,25 @@ def agent_dir(aid: str) -> Path:
     return agents_dir() / aid
 
 
-def last_file() -> Path:
-    """Return the path of the most-recently-used agent marker.
+def normalize_agent_id(raw: str | None) -> str | None:
+    """Validate and normalize a caller-supplied base-16 agent ID.
+
+    The ID must be a non-empty base-16 string. It is normalized by stripping
+    surrounding whitespace and lower-casing hex digits; the result is preserved
+    exactly as the stable Lubko agent identity.
+
+    Args:
+        raw: The raw caller-supplied ID.
 
     Returns:
-        The ``last.txt`` path.
+        The normalized ID, or ``None`` when it is malformed.
     """
-    return state_root() / "last.txt"
+    if not raw:
+        return None
+    value = raw.strip().lower()
+    if not value or any(char not in HEX_DIGITS for char in value):
+        return None
+    return value
 
 
 def opencode_db_path() -> str:
@@ -153,21 +151,6 @@ def opencode_db_path() -> str:
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
-
-
-def new_agent_id() -> str:
-    """Return a fresh, collision-free Lubko agent ID.
-
-    Returns:
-        A new 8-hex-character agent ID.
-    """
-    existing: set[str] = set()
-    with contextlib.suppress(OSError):
-        existing = {entry.name for entry in agents_dir().iterdir() if entry.is_dir()}
-    while True:
-        aid = secrets.token_hex(4)
-        if aid not in existing:
-            return aid
 
 
 def read_meta(aid: str) -> Meta | None:
@@ -279,21 +262,49 @@ def base_meta(aid: str, cwd: str, prompt: str, title: str | None, *, is_continue
     return meta
 
 
-def mark_last(aid: str) -> None:
-    """Record ``aid`` as the most recently used agent.
+def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
+    """Build the metadata mapping of a freshly created, never-prompted agent.
+
+    ``lubko-agent new`` only creates the managed session record: it launches no
+    underlying AI invocation. The agent is idle until the first ``prompt``
+    creates and starts the native session.
 
     Args:
-        aid: Lubko agent ID to record.
+        aid: Lubko agent ID.
+        cwd: Working directory for the agent.
+        title: Optional display title.
+
+    Returns:
+        The idle metadata mapping.
     """
-    root = state_root()
-    root.mkdir(parents=True, exist_ok=True)
-    tmp = root / "last.txt.tmp"
-    path = last_file()
-    try:
-        tmp.write_text(aid + "\n", encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        pass
+    now = time.time()
+    return {
+        "id": aid,
+        "created_at": now,
+        "last_activity_at": now,
+        "state": "idle",
+        "cwd": cwd,
+        "title": title,
+        "model": os.environ.get("LUBKO_MODEL", DEFAULT_MODEL),
+        "variant": os.environ.get("LUBKO_VARIANT", DEFAULT_VARIANT),
+        "native_session_id": None,
+        "pid": None,
+        "pgid": None,
+        "start_time": None,
+        "runner_pid": None,
+        "runner_start_time": None,
+        "started_at": None,
+        "finished_at": None,
+        "exit_code": None,
+        "exit_signal": None,
+        "intent": None,
+        "stop_reason": None,
+        "active_runner": False,
+        "steer_queue": [],
+        "steer_seq": 0,
+        "prompt_count": 0,
+        "agent_version": 3,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -621,37 +632,6 @@ def discover_session_id(aid: str) -> str | None:
     return row[0] if row else None
 
 
-def last_assistant_text(session_id: str) -> str | None:
-    """Extract the final assistant text message from the session transcript.
-
-    Args:
-        session_id: Underlying session ID.
-
-    Returns:
-        The final assistant text, or ``None`` when unavailable.
-    """
-    db = opencode_db_path()
-    if not db:
-        return None
-    try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return None
-    try:
-        row = conn.execute(_LAST_ASSISTANT_SQL, (session_id,)).fetchone()
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
-    if not row:
-        return None
-    try:
-        text = json.loads(row[0]).get("text")
-    except (ValueError, TypeError):
-        return None
-    return text if isinstance(text, str) else None
-
-
 def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[str] | None:
     """Return the argv used to launch the underlying agent for this invocation.
 
@@ -789,7 +769,10 @@ def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
         if meta is None:
             return
         if first:
-            prompt = meta.get("pending_prompt") if is_continue else meta.get("initial_prompt")
+            # The first invocation always comes from pending_prompt; a freshly
+            # created agent carries no initial_prompt (``new`` never accepts a
+            # prompt). The initial_prompt fallback only supports legacy state.
+            prompt = meta.get("pending_prompt") or meta.get("initial_prompt")
             first = False
         else:
             prompt = meta.get("pending_prompt")
@@ -1250,7 +1233,11 @@ def spawn_runner(aid: str, mode: str) -> None:
 
 
 def cmd_new(args: argparse.Namespace) -> int:
-    """Create a new agent session.
+    """Create an idle managed agent session with a caller-supplied ID.
+
+    ``new`` only creates the managed Lubko agent record. It never launches the
+    underlying AI agent and never accepts an initial prompt; the first
+    invocation happens later through ``lubko-agent prompt --id <ID> PROMPT``.
 
     Args:
         args: Parsed command arguments.
@@ -1258,44 +1245,48 @@ def cmd_new(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
-    prompt = args.prompt or args.prompt_text
-    if not prompt:
-        _err(f"{PROG}: new: a prompt is required")
+    aid = normalize_agent_id(args.id)
+    if aid is None:
+        _err(f"{PROG}: new: --id is required and must be a base-16 string")
         return EXIT_USAGE
+    if agent_dir(aid).exists():
+        _err(f"{PROG}: new: agent {aid} already exists")
+        return EXIT_ERROR
     cwd = str(Path(args.cwd or Path.cwd()).resolve())
     if not Path(cwd).is_dir():
         _err(f"{PROG}: new: working directory does not exist: {cwd}")
         return EXIT_ERROR
 
-    aid = new_agent_id()
-    meta = base_meta(aid, cwd, prompt, args.title, is_continue=False)
-    meta["prompt_count"] = 1
+    meta = idle_meta(aid, cwd, args.title)
     agent_dir(aid).mkdir(parents=True, exist_ok=True)
     write_meta(aid, meta)
-    mark_last(aid)
-    spawn_runner(aid, "new")
 
     if args.json:
         _out(
             json.dumps({
                 "id": aid,
-                "state": "running",
+                "state": "idle",
                 "cwd": cwd,
                 "created_at": meta["created_at"],
             })
         )
     else:
-        _out(f"Created agent with id {aid}. Check progress with `{PROG} status {aid}`.")
+        _out(
+            f"Created agent with id {aid} (idle). Start work with "
+            f"`{PROG} prompt --id {aid} 'task'`."
+        )
     sys.stdout.flush()
-
-    if args.sync:
-        stream_log_until_terminal(aid)
-        return exit_code_for(read_meta(aid))
     return EXIT_OK
 
 
 def cmd_prompt(args: argparse.Namespace) -> int:
-    """Send another instruction to an agent.
+    """Send an instruction to an agent, creating its native session on first use.
+
+    ``prompt`` follows/streams the invocation by default and returns only when
+    that invocation finishes, propagating the mapped invocation exit status.
+    ``--detach`` is the explicit fire-and-forget mode. ``--steer`` only changes
+    behavior while the agent is currently running; on an idle, finished, or
+    never-started agent it is exactly equivalent to an ordinary prompt.
 
     Args:
         args: Parsed command arguments.
@@ -1303,8 +1294,11 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
-    aid = args.agent_id
-    prompt = args.prompt or args.prompt_text
+    aid = args.id
+    if not aid:
+        _err(f"{PROG}: prompt: an agent ID is required via --id")
+        return EXIT_USAGE
+    prompt = args.prompt_text or args.prompt
     if not prompt:
         _err(f"{PROG}: prompt: a prompt is required")
         return EXIT_USAGE
@@ -1314,15 +1308,40 @@ def cmd_prompt(args: argparse.Namespace) -> int:
         return EXIT_NOT_FOUND
     state = derive_state(meta)
     if state == "running":
-        if args.steer:
-            return _steer_busy(args, prompt)
-        _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
-        return EXIT_ERROR
+        if not args.steer:
+            _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
+            return EXIT_ERROR
+        return _steer_busy(args, prompt)
     return _start_continuation(args, meta, prompt)
 
 
+def _follow_attached(aid: str) -> int:
+    """Stream an invocation's output until the agent stably reaches a terminal state.
+
+    A stable terminal is required because the background runner transitions
+    through a brief terminal state between queued steers; following must not
+    stop on that transient blip.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        The mapped invocation exit status.
+    """
+    stream_log_until_terminal(aid)
+    return exit_code_for(read_meta(aid))
+
+
 def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> int:
-    """Start a continuation invocation of an agent.
+    """Start an invocation of an idle, finished, or never-started agent.
+
+    The first invocation of a fresh agent creates the underlying native session
+    (mode ``new``); later prompts continue that exact native session (mode
+    ``continue``). A prompt is refused only when a native session was previously
+    established and has genuinely disappeared; an agent that never established a
+    native session may always retry as a new session, even after a failed first
+    attempt. By default the invocation is followed and its exit status is
+    propagated; ``--detach`` returns immediately.
 
     Args:
         args: Parsed command arguments.
@@ -1332,32 +1351,31 @@ def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> in
     Returns:
         A process exit code.
     """
-    aid = args.agent_id
+    aid = args.id or args.agent_id
 
-    # The underlying session must be available to continue.
-    session_id = meta.get("native_session_id") or discover_session_id(aid)
-    if not session_id:
-        session_id = _wait_for_session(aid)
-    if not session_id:
+    recorded = meta.get("native_session_id")
+    discovered = discover_session_id(aid)
+    if recorded is not None and discovered is None:
         _err(f"{PROG}: cannot continue agent {aid}: its underlying session is not available")
         return EXIT_ERROR
+    mode = "continue" if (recorded or discovered) is not None else "new"
 
     now = time.time()
     update_meta(aid, lambda m: _begin_invocation(m, prompt, now))
-    mark_last(aid)
     if not _runner_will_pick_up(aid):
-        spawn_runner(aid, "continue")
+        spawn_runner(aid, mode)
 
-    if args.json:
-        _out(json.dumps({"id": aid, "state": "running"}))
-    else:
-        _out(f"Started agent with id {aid}. Check progress with `{PROG} status {aid}`.")
-    sys.stdout.flush()
-
-    if args.sync:
-        stream_log_until_terminal(aid)
-        return exit_code_for(read_meta(aid))
-    return EXIT_OK
+    if args.detach:
+        if args.json:
+            _out(json.dumps({"id": aid, "state": "running", "detached": True}))
+        else:
+            _out(
+                "Started agent " + aid + " in the background. Observe it with "
+                f"`{PROG} log {aid} --follow`."
+            )
+        sys.stdout.flush()
+        return EXIT_OK
+    return _follow_attached(aid)
 
 
 def _runner_will_pick_up(aid: str) -> bool:
@@ -1383,29 +1401,13 @@ def _runner_will_pick_up(aid: str) -> bool:
     return runner_alive(meta)
 
 
-def _wait_for_session(aid: str) -> str | None:
-    """Poll briefly for the underlying session of an agent.
-
-    Args:
-        aid: Lubko agent ID.
-
-    Returns:
-        The underlying session ID, or ``None`` when unavailable.
-    """
-    deadline = time.time() + SESSION_CONTINUE_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        session_id = discover_session_id(aid)
-        if session_id:
-            return session_id
-        time.sleep(SESSION_CONTINUE_POLL_SECONDS)
-    return discover_session_id(aid)
-
-
 def _steer_busy(args: argparse.Namespace, prompt: str) -> int:
     """Redirect a busy agent: queue the instruction and interrupt the run.
 
-    Fire-and-forget: returns immediately.  The running runner picks up the
-    queued instruction as soon as the interrupted invocation has exited.
+    The running runner picks up the queued instruction as soon as the
+    interrupted invocation has exited. With ``--detach`` the command returns
+    immediately; otherwise it follows the resulting (steered) invocation and
+    propagates its exit status.
 
     Args:
         args: Parsed command arguments.
@@ -1414,7 +1416,7 @@ def _steer_busy(args: argparse.Namespace, prompt: str) -> int:
     Returns:
         A process exit code.
     """
-    aid = args.agent_id
+    aid = args.id or args.agent_id
     now = time.time()
     spawn_needed = {"yes": False}
 
@@ -1435,16 +1437,17 @@ def _steer_busy(args: argparse.Namespace, prompt: str) -> int:
         send_signal_group(current, signal.SIGTERM)
     if spawn_needed["yes"]:
         spawn_runner(aid, "continue")
-    mark_last(aid)
 
-    if args.json:
-        _out(json.dumps({"id": aid, "state": "running", "steer": True}))
-    else:
-        _out(aid)
+    if args.detach:
+        if args.json:
+            _out(json.dumps({"id": aid, "state": "running", "steer": True, "detached": True}))
+        else:
+            _out(aid)
+            detail = "starting now" if spawn_needed["yes"] else "interrupting current run"
+            _err(f"{PROG}: steer queued; {detail}")
         sys.stdout.flush()
-        detail = "starting now" if spawn_needed["yes"] else "interrupting current run"
-        _err(f"{PROG}: steer queued; {detail}")
-    return EXIT_OK
+        return EXIT_OK
+    return _follow_attached(aid)
 
 
 def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
@@ -1611,7 +1614,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
-    aid = args.agent_id
+    aid = args.id or args.agent_id
+    if not aid:
+        _err(f"{PROG}: status: an agent ID is required")
+        return EXIT_USAGE
     meta = read_meta(aid)
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
@@ -1792,6 +1798,7 @@ def stream_log_until_terminal(
     offset = _print_snapshot(log_path, follow_lines, max_chars)
     handle: BinaryIO | None = None
     idle_since: float | None = None
+    terminal_since: float | None = None
 
     while True:
         if handle is None:
@@ -1803,7 +1810,8 @@ def stream_log_until_terminal(
                 continue
         if _consume_log(handle):
             idle_since = None
-        if _terminal_or_unknown(aid):
+        stop, terminal_since = _stable_terminal(aid, terminal_since)
+        if stop:
             _drain_and_stop(handle)
             return
         if _stale_running(aid):
@@ -1813,6 +1821,30 @@ def stream_log_until_terminal(
                 _drain_and_stop(handle)
                 return
         time.sleep(0.4)
+
+
+def _stable_terminal(aid: str, terminal_since: float | None) -> tuple[bool, float | None]:
+    """Track whether an agent has been terminal for a stable period.
+
+    A stable terminal is required because the runner passes through a brief
+    terminal state between queued steers; following must not stop on that
+    transient blip.
+
+    Args:
+        aid: Lubko agent ID.
+        terminal_since: Time the terminal state was first observed, or ``None``.
+
+    Returns:
+        A ``(stop, terminal_since)`` pair where ``stop`` is ``True`` only once
+        the terminal state has persisted for at least ``STABLE_TERMINAL_SECONDS``.
+    """
+    if _terminal_or_unknown(aid):
+        if terminal_since is None:
+            return False, time.time()
+        if time.time() - terminal_since >= STABLE_TERMINAL_SECONDS:
+            return True, terminal_since
+        return False, terminal_since
+    return False, None
 
 
 def _print_snapshot(path: Path, follow_lines: int, max_chars: int) -> int:
@@ -1944,65 +1976,6 @@ def cmd_log(args: argparse.Namespace) -> int:
     else:
         for line in tail_lines(log_path, args.lines, max_chars):
             _out(line)
-    return EXIT_OK
-
-
-def cmd_result(args: argparse.Namespace) -> int:
-    """Show the agent's final result.
-
-    Args:
-        args: Parsed command arguments.
-
-    Returns:
-        A process exit code.
-    """
-    aid = args.agent_id
-    meta = read_meta(aid)
-    if meta is None:
-        _err(f"{PROG}: unknown agent: {aid}")
-        return EXIT_NOT_FOUND
-    state = derive_state(meta)
-    if state == "running":
-        _err(f"{PROG}: agent {aid} is still running; no final result yet")
-        return EXIT_NOT_FOUND
-    if state == "unknown":
-        _err(f"{PROG}: agent {aid} is in an unknown state; no reliable result")
-        return EXIT_NOT_FOUND
-
-    session_id = meta.get("native_session_id") or discover_session_id(aid)
-    text = last_assistant_text(session_id) if session_id else None
-    if text is not None:
-        if args.json:
-            _out(
-                json.dumps({
-                    "id": aid,
-                    "state": state,
-                    "exit_code": meta.get("exit_code"),
-                    "result": text,
-                })
-            )
-        else:
-            _out(text)
-        return EXIT_OK
-
-    # Fallback: last lines of the captured output.
-    log_path = agent_dir(aid) / "output.log"
-    lines = tail_lines(log_path, RESULT_TAIL_LINES, RESULT_TAIL_CHARS)
-    if args.json:
-        _out(
-            json.dumps({
-                "id": aid,
-                "state": state,
-                "exit_code": meta.get("exit_code"),
-                "result": "\n".join(lines) if lines else None,
-            })
-        )
-    elif lines:
-        _out("(no structured result; showing the tail of agent output)")
-        for line in lines:
-            _out(line)
-    else:
-        _out("(no result available)")
     return EXIT_OK
 
 
@@ -2149,7 +2122,6 @@ def cmd_delete(args: argparse.Namespace) -> int:
         send_signal_group(meta, signal.SIGKILL)
         wait_group_dead(meta, KILL_WAIT_SECONDS)
     shutil.rmtree(agent_dir(aid), ignore_errors=True)
-    _forget_last(aid)
     _out(f"deleted agent {aid}")
     return EXIT_OK
 
@@ -2173,7 +2145,6 @@ def cmd_clean(args: argparse.Namespace) -> int:
             _out(f"would remove agent {aid}")
         else:
             shutil.rmtree(agent_dir(aid), ignore_errors=True)
-            _forget_last(aid)
             _out(f"removed agent {aid}")
 
     if not candidates:
@@ -2223,41 +2194,6 @@ def _clean_candidates(days: int) -> list[str]:
     return candidates
 
 
-def cmd_last(_args: argparse.Namespace) -> int:
-    """Print the most recently used Lubko agent ID.
-
-    Args:
-        _args: Parsed command arguments (unused).
-
-    Returns:
-        A process exit code.
-    """
-    try:
-        aid = last_file().read_text(encoding="utf-8").strip()
-    except OSError:
-        aid = ""
-    if aid and agent_dir(aid).is_dir():
-        _out(aid)
-        return EXIT_OK
-    _err(f"{PROG}: no previous agent")
-    return EXIT_NOT_FOUND
-
-
-def _forget_last(aid: str) -> None:
-    """Clear the recorded last agent when it matches ``aid``.
-
-    Args:
-        aid: Lubko agent ID.
-    """
-    try:
-        current = last_file().read_text(encoding="utf-8").strip()
-    except OSError:
-        return
-    if current == aid:
-        with contextlib.suppress(OSError):
-            last_file().unlink()
-
-
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -2297,22 +2233,23 @@ def _arg(*flags: str, **kwargs: object) -> _ArgumentSpec:
 SUBCOMMANDS: Final = (
     _SubcommandSpec(
         name="new",
-        help="create a new agent session",
+        help="create an idle managed agent session with a caller-supplied ID",
         func=cmd_new,
         arguments=(
+            _arg(
+                "--id",
+                metavar="ID",
+                default=None,
+                help="base-16 agent ID chosen by the caller (required)",
+            ),
             _arg(
                 "--cwd",
                 metavar="DIR",
                 default=None,
                 help="working directory for the agent (default: current directory)",
             ),
-            _arg("--prompt", metavar="TEXT", default=None, help="initial instruction"),
-            _arg(
-                "prompt_text", nargs="?", metavar="PROMPT", help="initial instruction (positional)"
-            ),
             _arg("--title", metavar="TEXT", default=None, help="short display title"),
             _arg("--json", action="store_true", help="machine-readable output"),
-            _arg("--sync", action="store_true", help=argparse.SUPPRESS),
         ),
     ),
     _SubcommandSpec(
@@ -2341,25 +2278,35 @@ SUBCOMMANDS: Final = (
         help="show detailed status of one agent",
         func=cmd_status,
         arguments=(
-            _arg("agent_id", metavar="ID"),
+            _arg("--id", metavar="ID", default=None, help="agent ID (preferred)"),
+            _arg("agent_id", nargs="?", metavar="ID", help="agent ID (positional alias)"),
             _arg("--json", action="store_true", help="machine-readable output"),
         ),
     ),
     _SubcommandSpec(
         name="prompt",
-        help="send another instruction to an agent",
+        help="start or continue an agent invocation, following it by default",
         func=cmd_prompt,
         arguments=(
-            _arg("agent_id", metavar="ID"),
+            _arg(
+                "--id",
+                metavar="ID",
+                default=None,
+                help="agent ID (required; chosen by the caller)",
+            ),
             _arg(
                 "--steer",
                 action="store_true",
-                help="send while busy: interrupt the current run and redirect it",
+                help="while the agent is running: interrupt the current run and redirect it",
             ),
-            _arg("--prompt", metavar="TEXT", default=None, help="instruction to send"),
-            _arg("prompt_text", nargs="?", metavar="PROMPT", help="instruction (positional)"),
+            _arg(
+                "--detach",
+                action="store_true",
+                help="start/queue the invocation and return immediately without following",
+            ),
+            _arg("--prompt", metavar="TEXT", default=None, help=argparse.SUPPRESS),
+            _arg("prompt_text", metavar="PROMPT", help="instruction (positional)"),
             _arg("--json", action="store_true", help="machine-readable output"),
-            _arg("--sync", action="store_true", help=argparse.SUPPRESS),
         ),
     ),
     _SubcommandSpec(
@@ -2376,15 +2323,6 @@ SUBCOMMANDS: Final = (
                 help="number of recent lines (0 for all, default 50)",
             ),
             _arg("--follow", action="store_true", help="stream new output until the agent exits"),
-        ),
-    ),
-    _SubcommandSpec(
-        name="result",
-        help="show the agent's final result",
-        func=cmd_result,
-        arguments=(
-            _arg("agent_id", metavar="ID"),
-            _arg("--json", action="store_true", help="machine-readable output"),
         ),
     ),
     _SubcommandSpec(
@@ -2438,12 +2376,6 @@ SUBCOMMANDS: Final = (
             ),
             _arg("--dry-run", action="store_true", help="only list what would be removed"),
         ),
-    ),
-    _SubcommandSpec(
-        name="last",
-        help="print the most recently used agent ID",
-        func=cmd_last,
-        arguments=(),
     ),
 )
 

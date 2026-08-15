@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -33,225 +31,12 @@ from lubko.worker import (
 from tests import _process_guard as guard
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable
     from uuid import UUID
 
+    from tests import _pg
+
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
-BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
-
-POSTGRES_NAMES: Final = ("initdb", "postgres", "pg_ctl")
-
-
-class _Cluster:
-    """A running isolated PostgreSQL server on a unix socket."""
-
-    def __init__(
-        self,
-        binaries: dict[str, str],
-        data_dir: Path,
-        socket_dir: Path,
-        port: int,
-        env: dict[str, str],
-    ) -> None:
-        self.binaries = binaries
-        self.data_dir = data_dir
-        self.socket_dir = socket_dir
-        self.port = port
-        self.env = env
-        self.postmaster_pid: int | None = None
-
-    def conninfo(self) -> str:
-        return f"host={self.socket_dir} port={self.port} dbname=postgres user=postgres"
-
-    def start(self) -> None:
-        subprocess.run(
-            [
-                self.binaries["pg_ctl"],
-                "-D",
-                str(self.data_dir),
-                "-o",
-                f"-p {self.port} -k {self.socket_dir}",
-                "-l",
-                str(self.data_dir.parent / "server.log"),
-                "start",
-            ],
-            env=self.env,
-            check=True,
-            capture_output=True,
-        )
-        pidfile = self.data_dir / "postmaster.pid"
-        try:
-            self.postmaster_pid = int(pidfile.read_text(encoding="utf-8").splitlines()[0])
-        except (OSError, ValueError, IndexError):
-            self.postmaster_pid = None
-
-    def stop(self) -> None:
-        """Stop the cluster and confirm the exact postmaster is gone.
-
-        The postmaster is stopped through ``pg_ctl`` and then verified by its
-        exact recorded PID; if it still lives afterwards the exact PID is
-        force-killed, so a cluster teardown never leaks a postmaster.
-        """
-        subprocess.run(
-            [
-                self.binaries["pg_ctl"],
-                "-D",
-                str(self.data_dir),
-                "-m",
-                "immediate",
-                "stop",
-            ],
-            env=self.env,
-            check=False,
-            capture_output=True,
-        )
-        self._assert_postmaster_gone()
-
-    def _assert_postmaster_gone(self) -> None:
-        pid = self.postmaster_pid
-        if pid is None:
-            return
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and _process_live(pid):
-            time.sleep(0.05)
-        if _process_live(pid):
-            with suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline and _process_live(pid):
-                time.sleep(0.05)
-        if _process_live(pid):
-            msg = f"postgres postmaster pid {pid} still live after cluster teardown"
-            raise AssertionError(msg)
-
-
-def _process_live(pid: int) -> bool:
-    """Return whether a process exists and is not a zombie.
-
-    Args:
-        pid: Process ID to probe.
-
-    Returns:
-        ``True`` when a running (non-zombie) process with that ID exists.
-    """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return False
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return True
-    fields = stat[close_paren + 2 :].split()
-    if not fields:
-        return True
-    return fields[0] not in {b"Z", b"X"}
-
-
-def _postgres_binaries() -> dict[str, str] | None:
-    """Locate a usable PostgreSQL server installation.
-
-    Returns:
-        A mapping of binary name to path, or ``None`` when unavailable.
-    """
-    resolved: dict[str, str] = {}
-    for name in POSTGRES_NAMES:
-        path = shutil.which(name)
-        if path is None:
-            break
-        resolved[name] = path
-    else:
-        return resolved
-    for store in Path("/gnu/store").glob("*postgresql-*/bin"):
-        candidate = {name: str(store / name) for name in POSTGRES_NAMES}
-        if all(Path(path).is_file() for path in candidate.values()):
-            return candidate
-    return None
-
-
-def _postgres_lib_dir(binary_dir: Path) -> str | None:
-    """Return a sibling ``lib`` directory for ``LD_LIBRARY_PATH``, if any.
-
-    Args:
-        binary_dir: Directory containing the PostgreSQL binaries.
-
-    Returns:
-        The library directory, or ``None`` when the loader already finds it.
-    """
-    lib = binary_dir.parent / "lib"
-    if lib.is_dir():
-        return str(lib)
-    return None
-
-
-def _free_port() -> int:
-    """Return an ephemeral TCP port that is currently free.
-
-    Returns:
-        A port number.
-    """
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-@pytest.fixture(scope="module")
-def cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Cluster]:
-    """Start an isolated PostgreSQL cluster, or skip when unavailable.
-
-    Args:
-        tmp_path_factory: Pytest temporary path factory.
-
-    Yields:
-        The running cluster.
-    """
-    binaries = _postgres_binaries()
-    if binaries is None:
-        pytest.skip("PostgreSQL server binaries not available on this host")
-    root = tmp_path_factory.mktemp("lubko-pg")
-    data_dir = root / "data"
-    socket_dir = root / "sock"
-    socket_dir.mkdir()
-    port = _free_port()
-    env = dict(os.environ)
-    lib = _postgres_lib_dir(Path(binaries["postgres"]).parent)
-    if lib is not None:
-        env["LD_LIBRARY_PATH"] = lib
-    subprocess.run(
-        [
-            binaries["initdb"],
-            "-D",
-            str(data_dir),
-            "-U",
-            "postgres",
-            "--auth=trust",
-        ],
-        env=env,
-        check=True,
-        capture_output=True,
-    )
-    current = _Cluster(binaries, data_dir, socket_dir, port, env)
-    current.start()
-    try:
-        yield current
-    finally:
-        current.stop()
-
-
-@pytest.fixture
-def db(cluster: _Cluster) -> str:
-    """Apply the baseline migration on a fresh ``lubko.jobs`` table.
-
-    Args:
-        cluster: The running PostgreSQL cluster.
-
-    Returns:
-        A connection string usable with :func:`psycopg.connect`.
-    """
-    with psycopg.connect(cluster.conninfo()) as conn:
-        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
-        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
-        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
-    return cluster.conninfo()
 
 
 def make_settings(*, worker_id: str = "test-worker") -> Settings:
@@ -268,15 +53,28 @@ def make_settings(*, worker_id: str = "test-worker") -> Settings:
         poll_interval_seconds=0.05,
         process_poll_interval_seconds=0.01,
         cancel_grace_seconds=0.5,
-        max_output_bytes=64 * 1024,
         lease_duration_seconds=1.0,
         lease_refresh_interval_seconds=0.2,
         lease_recovery_interval_seconds=0.1,
+        lease_safety_margin_seconds=0.2,
     )
 
 
+@pytest.fixture
+def db(jobs_db: str) -> str:
+    """Provide the shared migrated ``lubko.jobs`` table.
+
+    Args:
+        jobs_db: Connection string from the shared fixture.
+
+    Returns:
+        The connection string.
+    """
+    return jobs_db
+
+
 def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v1 pending command job.
+    """Insert a protocol v2 pending command job.
 
     Args:
         conninfo: PostgreSQL connection string.
@@ -287,7 +85,7 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 1,
+        "v": 2,
         "type": "command",
         "request": {"cwd": cwd, "command": command},
         "state": {"status": "pending"},
@@ -302,7 +100,7 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
 
 
 def insert_running_without_lease(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a running job that predates the lease protocol.
+    """Insert a running job that carries no lease deadline.
 
     Args:
         conninfo: PostgreSQL connection string.
@@ -313,13 +111,13 @@ def insert_running_without_lease(conninfo: str, cwd: str, command: str) -> UUID:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 1,
+        "v": 2,
         "type": "command",
         "request": {"cwd": cwd, "command": command},
         "state": {
             "status": "running",
-            "worker_id": "legacy-worker",
-            "worker_incarnation": "legacy-incarnation",
+            "worker_id": "stale-worker",
+            "worker_incarnation": "stale-incarnation",
             "started_at": "2026-01-01T00:00:00.000000Z",
         },
     })
@@ -438,7 +236,7 @@ def test_running_job_without_lease_is_left_for_manual_repair(
     db: str,
     tmp_path: Path,
 ) -> None:
-    """A pre-lease running job is never auto-recovered (no compatibility path)."""
+    """A running job without a lease is never auto-recovered."""
     job_id = insert_running_without_lease(db, str(tmp_path), "sleep 30")
 
     with psycopg.connect(db) as conn:
@@ -522,7 +320,7 @@ def wait_for_recovery(db: str, job_id: UUID, marker: Path) -> None:
 
 def test_worker_crash_is_recovered_by_replacement_worker(
     db: str,
-    cluster: _Cluster,
+    pg_cluster: _pg.PgCluster,
     tmp_path: Path,
 ) -> None:
     """An end-to-end worker crash is recovered without duplicate execution."""
@@ -532,8 +330,8 @@ def test_worker_crash_is_recovered_by_replacement_worker(
 
     conf = tmp_path / "database.conf"
     conf.write_text(
-        f"host={cluster.socket_dir}\n"
-        f"port={cluster.port}\n"
+        f"host={pg_cluster.socket_dir}\n"
+        f"port={pg_cluster.port}\n"
         "dbname=postgres\n"
         "user=postgres\n"
         "password=local-trust\n"
@@ -546,6 +344,7 @@ def test_worker_crash_is_recovered_by_replacement_worker(
     env["LUBKO_LEASE_DURATION_SECONDS"] = "1.0"
     env["LUBKO_LEASE_REFRESH_INTERVAL_SECONDS"] = "0.2"
     env["LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS"] = "0.1"
+    env["LUBKO_LEASE_SAFETY_MARGIN_SECONDS"] = "0.2"
 
     def spawn_worker() -> subprocess.Popen[bytes]:
         proc = subprocess.Popen(

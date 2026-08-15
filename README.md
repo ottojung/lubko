@@ -50,14 +50,20 @@ Optional runtime settings:
   process state and its cancellation marker, default `0.1`.
 - `LUBKO_CANCEL_GRACE_SECONDS` — grace period after `SIGTERM` before a running
   job's process group is force-killed, default `5`.
-- `LUBKO_MAX_OUTPUT_BYTES` — maximum bytes retained from each output stream,
-  default `262144`.
 - `LUBKO_LEASE_DURATION_SECONDS` — how far in the future a claim or heartbeat
   pushes a running job's lease deadline, default `30`.
 - `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS` — how often the worker heartbeats
-  (refreshes) the lease of its running job, default `5`.
+  (refreshes) the leases of its running jobs, default `5`.
 - `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS` — how often the worker scans for
   running jobs whose lease has expired and recovers them, default `10`.
+- `LUBKO_OUTPUT_PUBLICATION_INTERVAL_SECONDS` — how often changed output
+  tails/chunks are published, default `1`.
+- `LUBKO_CLAIM_BATCH_LIMIT` — maximum claiming work in one supervisor turn, a
+  fairness bound (never a concurrency cap), default `8`.
+- `LUBKO_LEASE_SAFETY_MARGIN_SECONDS` — how long before lease expiry the
+  daemon terminates an owned process group during a database outage, default `5`.
+- `LUBKO_DB_OPERATION_TIMEOUT_SECONDS` — statement/connect timeout bounding
+  database operations, default `15`.
 
 The lease refresh interval must be smaller than the lease duration; the worker
 refuses to start with an invalid combination.
@@ -90,18 +96,19 @@ payload text not null
 ```
 
 `payload` is one string containing a JSON object; all evolving job/request/
-result/state/cancellation/process-identity data lives inside it. **Never add a
-third column.** See `docs/protocol.md` for the versioned binding: the payload
-carries a protocol version `v` (currently `1`, kind `command`) with `request`,
-`state`, and `result` sections. SQL casts `payload::jsonb` only transiently for
-predicates and atomic updates and stores `::text` back. The worker refuses to
-start against a table that violates this invariant.
+result/state/cancellation/process-identity/output data lives inside it.
+**Never add a third column.** See `docs/protocol.md` for the versioned binding:
+the payload carries a protocol version `v` (currently `2`) with `command` rows
+(`request`, `state`, optional terminal `result`, and bounded live `output`
+tails) and immutable `output_chunk` rows. SQL casts `payload::jsonb` only
+transiently for predicates and atomic updates and stores `::text` back. The
+worker refuses to start against a table that violates this invariant.
 
-Submit a job in protocol v1 form:
+Submit a job in protocol v2 form:
 
 ```sql
 insert into lubko.jobs (payload)
-values ('{"v":1,"type":"command","request":{"cwd":"/workspace/project","command":"git status --short"},"state":{"status":"pending"}}')
+values ('{"v":2,"type":"command","request":{"cwd":"/workspace/project","command":"git status --short"},"state":{"status":"pending"}}')
 returning id;
 ```
 
@@ -112,6 +119,28 @@ select id, (payload::jsonb)->'state'->>'status' as status
 from lubko.jobs
 where id = '<job-id>';
 ```
+
+While a job runs, the root row carries a bounded rolling live output window in
+`payload.output` — the newest up to 4000 raw bytes of stdout/stderr per
+stream, plus byte offsets and a `previous` pointer to the newest immutable
+chunk. Historical output is archived into immutable `output_chunk` rows in the
+same two-column table, keyed by explicit `thread` ownership. Archiving never
+shortens the live tail, and every payload Lubko writes is strictly bounded.
+See `docs/protocol.md` for reading history and cleaning up chunks.
+
+## Concurrent jobs
+
+The worker is a single nonblocking supervisor. It holds one PostgreSQL
+connection and an in-memory registry of active jobs; each shell command runs as
+its own OS process/session/process group, and the daemon never allocates a
+thread or a connection per job and never synchronously waits for any one child.
+There is **no application-level concurrency limit**: 2, 20, or 200 independent
+pending jobs can all run at the same time if the host can start them. If the
+OS refuses to start a particular process, that job fails clearly and
+independently while the daemon stays alive to supervise the jobs that did
+start. A database outage stops new claims but keeps local supervision and
+terminates any owned process group before its lease can expire, so a live
+command process is never knowingly allowed to become unowned.
 
 ## Cancellation
 
@@ -186,24 +215,31 @@ refuses to start with an invalid combination. Recovery never signals process
 groups it does not own: a surviving orphan process runs to completion inside
 the container and its output is discarded.
 
-## Database schema and migrations
+## Database schema
 
-A fresh installation applies the single baseline migration
-`migrations/0001_two_column_protocol.sql`, which creates the canonical
-two-column `lubko.jobs` table, its checks, the queue index, the invariant
-comment, and the worker role grant. Schema changes live in `migrations/` as
-idempotent SQL files applied in filename order, for example with `psql`:
+Lubko uses a single canonical baseline migration for a fresh (purged)
+database:
 
 ```sh
 psql "$DATABASE_URL" -f migrations/0001_two_column_protocol.sql
 ```
 
-Each migration is safe to apply more than once. There is no legacy schema or
+The baseline is idempotent and safe to apply more than once. It creates the
+canonical two-column `lubko.jobs` table with its type-aware checks, the
+command queue index, the output-chunk ownership/ordering indexes, the
+invariant comment, and the worker role grant. There is no older schema and no
 rollback path: the two-column table is the only supported binding, and the
-worker refuses to start against any other shape. See `docs/protocol.md` for
-the authoritative binding.
+worker verifies the protocol v2 output-chunk shape at startup, refusing to
+run against any other table. See `docs/protocol.md` for the authoritative
+binding.
 
-Run with:
+The baseline grants the `lubko_worker` role everything protocol v2 needs:
+`USAGE` on the `lubko` schema and `SELECT`, `INSERT`, `UPDATE` on
+`lubko.jobs` (INSERT is required to publish immutable `output_chunk` rows).
+The grant is guarded by `to_regrole`, so applying the baseline before the role
+is provisioned does not fail.
+
+Run the worker with:
 
 ```sh
 uv run lubko-worker
@@ -298,24 +334,32 @@ Subsequent upgrades replace maintained workers with no manual PID discovery.
 ## Agent management CLI
 
 `lubko-agent` is the maintained interface for managed AI agent sessions inside
-the Lubko container. It provides stable Lubko agent IDs, explicit working
-directories, durable logs, continuation, waiting, stopping, killing, deletion,
-and cleanup:
+the Lubko container. It provides stable, caller-chosen Lubko agent IDs, explicit
+working directories, durable logs, continuation, waiting, stopping, killing,
+deletion, and cleanup:
 
 ```text
-lubko-agent new [--cwd DIR] --prompt TEXT [--title TEXT] [--json]
+lubko-agent new --id <ID> [--cwd DIR] [--title TEXT] [--json]
 lubko-agent list [--running|--finished|--succeeded|--failed|--stopped|--killed] [--limit N] [--json]
-lubko-agent status <id> [--json]
-lubko-agent prompt <id> --prompt TEXT [--steer] [--json]
+lubko-agent status <id> / status --id <ID> [--json]
+lubko-agent prompt --id <ID> [--steer] [--detach] PROMPT
 lubko-agent log <id> [--lines N] [--follow]
-lubko-agent result <id> [--json]
 lubko-agent wait <id> --timeout SEC
 lubko-agent stop <id>
 lubko-agent kill <id>
 lubko-agent delete <id> [--force]
 lubko-agent clean [--days N] [--dry-run]
-lubko-agent last
 ```
+
+The orchestrator generates each agent ID (a fresh base-16 string) before
+submitting any transport job, so the ID is known up front and never has to be
+scraped from output. `new --id <ID>` only creates an idle managed session
+record — it launches no AI work and accepts no prompt. The first
+`prompt --id <ID> PROMPT` creates and starts the underlying native agent
+session and follows/streams it by default, returning only when that invocation
+finishes; `--detach` is the explicit fire-and-forget mode. `--steer` only
+changes behavior while the agent is currently running; on an idle, finished,
+or never-started agent it is exactly equivalent to an ordinary prompt.
 
 The orchestrator deals only with Lubko agent IDs; the underlying agent
 implementation, its session IDs, its process tree, and its storage are

@@ -10,16 +10,23 @@ group is asserted to be gone.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import os
+import subprocess
+from pathlib import Path
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
+from tests import _pg
 from tests import _process_guard as guard
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 LOGGER = logging.getLogger(__name__)
+
+REPO_ROOT: Final = Path(__file__).resolve().parent.parent
+BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -47,3 +54,63 @@ def _process_teardown() -> Iterator[None]:
     stopped = guard.teardown_tracked()
     if stopped:
         LOGGER.debug("test teardown stopped %d leaked process(es)", stopped)
+
+
+@pytest.fixture(scope="module")
+def pg_cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_pg.PgCluster]:
+    """Start an isolated PostgreSQL cluster, or skip when unavailable.
+
+    Args:
+        tmp_path_factory: Pytest temporary path factory.
+
+    Yields:
+        The running cluster.
+    """
+    binaries = _pg.postgres_binaries()
+    if binaries is None:
+        pytest.skip("PostgreSQL server binaries not available on this host")
+    root = tmp_path_factory.mktemp("lubko-pg")
+    data_dir = root / "data"
+    socket_dir = root / "sock"
+    socket_dir.mkdir()
+    port = _pg.free_port()
+    env = dict(os.environ)
+    lib = _pg.postgres_lib_dir(Path(binaries["postgres"]).parent)
+    if lib is not None:
+        env["LD_LIBRARY_PATH"] = lib
+    subprocess.run(
+        [
+            binaries["initdb"],
+            "-D",
+            str(data_dir),
+            "-U",
+            "postgres",
+            "--auth=trust",
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    current = _pg.PgCluster(binaries, data_dir, socket_dir, port, env)
+    current.start()
+    try:
+        yield current
+    finally:
+        current.stop()
+
+
+@pytest.fixture
+def jobs_db(pg_cluster: _pg.PgCluster) -> str:
+    """Apply the canonical baseline on a fresh ``lubko.jobs`` table.
+
+    Args:
+        pg_cluster: The running PostgreSQL cluster.
+
+    Returns:
+        A connection string usable with :func:`psycopg.connect`.
+    """
+    with __import__("psycopg").connect(pg_cluster.conninfo()) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+    return pg_cluster.conninfo()
