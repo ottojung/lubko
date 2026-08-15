@@ -1372,6 +1372,23 @@ Lubko represents stdout/stderr as bounded rolling live tails; older output is av
 
 ---
 
+# Scheduled issue heartbeat coordination
+
+Recurring scheduled orchestrators that work GitHub issues must additionally follow [`docs/skills/scheduled.md`](skills/scheduled.md). Their durable soft-ownership signal is **one editable status comment on the target issue**, not Lubko command traffic.
+
+For scheduled issue work:
+
+- create or inherit the issue's scheduled-orchestrator status comment before substantial work;
+- while the status is `working`, refresh its heartbeat at least every 5 minutes;
+- treat a `working` heartbeat at least 10 minutes old as abandoned and inheritable;
+- before every heartbeat refresh, re-read the status comment and stop orchestrating the issue if its owner has changed;
+- keep concrete recovery handles in the comment — worktree/clone paths, branch, PR, Lubko agent IDs, root job UUIDs, and similar identifiers as applicable;
+- do not infer scheduled ownership or abandonment from agent silence, CPU activity, lack of new commits, or lack of newly submitted Lubko commands.
+
+This coordination mechanism is deliberately **GitHub-layer only**. It does not add task IDs, owner IDs, lease keys, or other authorization fields to `lubko.jobs`, and `lubko-agent` remains unaware of scheduled-orchestrator ownership.
+
+---
+
 # Working philosophy
 
 Lubko exists to make ChatGPT an effective development orchestrator.
@@ -1402,6 +1419,7 @@ Do not turn routine development operations back into instructions for the user w
 | Base commits | cut branches from a known, clean, tested SHA | cutting from a drifted tree |
 | Blockers/correctness bugs | fix before merge, on the current PR | merging known-correctness bugs |
 | Important non-critical findings | open an issue with context, rationale, evidence, and a link to the branch/commit; postpone | expanding the current task / losing the finding in logs or chat |
+| Scheduled issue ownership | one editable issue status comment; heartbeat at least every 5 minutes; inherit after 10 minutes stale | inferring ownership from Lubko command traffic or agent silence |
 | Commit/push/deploy | separate, explicit, in order; push work branches early; direct push to the default branch only with established user intent | conflating any two |
 | Deployment | only when asked, via the managed tool, then a real smoke | implicit deploy, manual signals |
 | Secrets | design them out; verify by absence | printing/dumping values |
