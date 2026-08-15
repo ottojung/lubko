@@ -5,6 +5,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext, suppress
@@ -313,6 +314,49 @@ def test_spawn_job_runs_command_and_cleanup_files(tmp_path: Path) -> None:
         assert read_output(stdout_path) == b"hi\n"
         assert stdout_path.is_file()
         assert stderr_path.is_file()
+    finally:
+        guard.unregister(proc)
+        proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
+def test_spawn_job_injects_exact_root_job_uuid(tmp_path: Path) -> None:
+    """A shell command job inherits its exact root job UUID as LUBKO_JOB_ID."""
+    shell = resolve_shell()
+    assert shell is not None
+    job_id = uuid4()
+    proc, stdout_path, stderr_path, _pgid = spawn_job(
+        Job(id=job_id, cwd=str(tmp_path), command='printf "%s" "$LUBKO_JOB_ID"', args=None),
+        shell,
+    )
+    guard.register(proc)
+    try:
+        proc.wait(timeout=10)
+        assert read_output(stdout_path) == str(job_id).encode()
+    finally:
+        guard.unregister(proc)
+        proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
+def test_spawn_job_injects_exact_root_job_uuid_into_args_environment(
+    tmp_path: Path,
+) -> None:
+    """An argv job (direct exec) inherits its exact root job UUID as LUBKO_JOB_ID."""
+    shell = resolve_shell()
+    assert shell is not None
+    job_id = uuid4()
+    probe = "import os; print(os.environ['LUBKO_JOB_ID'])"
+    proc, stdout_path, stderr_path, _pgid = spawn_job(
+        Job(id=job_id, cwd=str(tmp_path), command=None, args=(sys.executable, "-c", probe)),
+        shell,
+    )
+    guard.register(proc)
+    try:
+        proc.wait(timeout=10)
+        assert read_output(stdout_path) == str(job_id).encode() + b"\n"
     finally:
         guard.unregister(proc)
         proc.wait(timeout=5)

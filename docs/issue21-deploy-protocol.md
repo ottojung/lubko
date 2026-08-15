@@ -21,9 +21,31 @@ The candidate is first spawned behind a stable pipe gate. It cannot consume `lub
 
 Only then does it stop the previous worker and release the candidate. Therefore there is never an intentional interval with two queue consumers, and a controller crash before release closes the gate rather than orphaning an unconfirmed consumer.
 
+Just before the previous worker is stopped, the controller durably records that
+its retirement has begun (`previous_retiring` in the rollback state file). The
+watchdog reads that marker after any controller crash, so it always knows
+whether the previous worker may already be mid-shutdown.
+
 The checkout remains provisional. The watchdog restores the previous exact commit if the candidate dies or the confirmation deadline expires. The global CLIs are untouched during the provisional phase: the `current` symlink under `$XDG_STATE_HOME/lubko/cli/` still selects the previous confirmed commit, so a rollback can never strand them on candidate code. If the candidate CLI environment cannot be built, the checkout is aborted and the previous checkout is restored.
 
-When checkout itself was invoked as a Lubko queue job, the stable controller finalizes that job before returning because the worker that originally claimed it has intentionally been replaced.
+### Queue-invoked checkout (the control job survives the old worker's shutdown)
+
+When checkout itself is submitted through the Lubko queue, the worker that claims it is the very worker about to be replaced. The worker's correct general shutdown invariant terminates every tracked active job group, including the group running the controller — so the controller must hand off before any destructive step. It does so without any worker-side special/exempt argv, process group, environment, or name: an ordinary job remains ordinary and is terminated/reaped like every other active job.
+
+The worker injects the exact root job UUID of every spawned command into the command environment as `LUBKO_JOB_ID` before the child execs. The controller therefore identifies its own queue row from that exact injected value and validates it directly, never by querying `process_pgid` — so queue detection cannot race the worker's asynchronous persistence of the process identity.
+
+The queue-invoked controller forks a detached handoff helper (its own session and process group) over a pipe:
+
+1. The helper acquires the deployment lock and performs only reversible preparation: it persists the pending rollback mission with `previous_retiring=false`, arms the watchdog, and spawns the gated candidate. The durable-success wait deadline is computed only after preparation returns, so a long validation phase can never expire it before it starts.
+2. It delivers the normal candidate (or an error) response to the controller parent over the pipe and stops there — the previous worker is not yet touched.
+3. The controller parent prints the response and exits: zero for a genuine candidate response, non-zero for a helper error or helper death. The owning worker therefore finalizes the checkout row as durably `succeeded` only when the checkout genuinely proceeded, and as `failed` when the helper reported an error or died before reporting — a dead helper can never leave a falsely-successful row. The controller never rewrites a terminal queue result itself.
+4. The helper polls that exact captured row until PostgreSQL durably reports `succeeded` with no cancellation marker. A `failed`/`cancelled`/deleted row or an expired handoff deadline aborts the mission.
+5. Only then — still holding the deployment lock — it durably records `previous_retiring=true` before stopping the old worker, releases the gate, verifies the candidate, extends the confirmation deadline, writes the live pending state, and exits. The old worker's shutdown still terminates every ordinary active job group; the detached helper is simply no longer one of them.
+6. If preparation, the initiating row, or the handoff deadline fails before durable success, the helper closes the gated candidate, restores the previous checkout, and leaves the previous worker running — it never crosses the destructive boundary, and the armed watchdog completes the rollback.
+
+The initiating checkout row is therefore durably terminal `succeeded` before the destructive previous-worker retirement begins, with no transient `cancelled` row along the way.
+
+A manual (non-queue) invocation retains the synchronous safe path: preparation is immediately followed by the destructive handoff under the deployment lock.
 
 ## Confirmation handshake
 
@@ -86,11 +108,18 @@ Rollback authority does not execute candidate code. The forked stable watchdog:
 
 1. stops the candidate by its recorded exact process identity;
 2. force-checks out the exact previously maintained commit;
-3. reuses the previous worker if it is still alive, otherwise starts that previous commit;
+3. restores the previous worker: if retirement had not yet begun and the
+   recorded previous worker is still alive, its exact identity is reused;
+   otherwise the old identity is deterministically stopped and awaited dead and
+   a fresh previous-commit worker is spawned, so a worker that is merely in the
+   middle of shutting down is never accepted as the restored consumer;
 4. verifies the restored worker and PostgreSQL connectivity;
 5. writes restored maintained-worker metadata;
 6. removes the provisional candidate CLI environment (the `current` symlink was never moved);
 7. records terminal `rolled_back` state.
+
+Terminal `rolled_back` therefore always means the checkout is the previous
+commit and a genuinely restored, verified maintained worker exists.
 
 If restoration cannot complete, the state remains pending and the watchdog retries. A later checkout must not silently supersede an unresolved rollback mission.
 

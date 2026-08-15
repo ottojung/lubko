@@ -121,6 +121,7 @@ STOP_REASON_SHUTDOWN: Final = "shutdown"
 STOP_REASON_LEASE: Final = "lease"
 STOP_REASON_ROW_LOST: Final = "row_lost"
 STOP_REASON_PERSIST: Final = "persist"
+JOB_ID_ENV: Final = "LUBKO_JOB_ID"
 
 
 def _jsonb_set_chain(base: str, updates: list[tuple[str, str]]) -> str:
@@ -855,6 +856,11 @@ def spawn_job(job: Job, shell: str) -> tuple[subprocess.Popen[bytes], Path, Path
     executed directly. Both are started as a new session so cancellation can
     signal the exact process group.
 
+    The exact root job UUID is injected into the child environment as
+    ``LUBKO_JOB_ID`` before the child execs, so every process of the job can
+    identify its owning queue row deterministically without depending on the
+    timing of any later database write.
+
     Args:
         job: Claimed job to execute.
         shell: Absolute path to the shell executable, used for ``command``
@@ -874,6 +880,8 @@ def spawn_job(job: Job, shell: str) -> tuple[subprocess.Popen[bytes], Path, Path
     else:
         msg = "job request must provide command or args"
         raise ValueError(msg)
+    env = dict(os.environ)
+    env[JOB_ID_ENV] = str(job.id)
     stdout_fd, stdout_name = tempfile.mkstemp()
     stderr_fd, stderr_name = tempfile.mkstemp()
     stdout_path = Path(stdout_name)
@@ -886,6 +894,7 @@ def spawn_job(job: Job, shell: str) -> tuple[subprocess.Popen[bytes], Path, Path
             stdout=stdout_fd,
             stderr=stderr_fd,
             start_new_session=True,
+            env=env,
         )
     except OSError:
         os.close(stdout_fd)

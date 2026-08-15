@@ -31,6 +31,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
+from uuid import UUID
 
 import psycopg
 from psycopg.rows import tuple_row
@@ -58,6 +59,7 @@ from lubko.lifecycle import (
 )
 from lubko.state import rollback_state_path
 from lubko.toolchain import UvResolutionError, resolve_uv
+from lubko.worker import JOB_ID_ENV
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -80,7 +82,10 @@ IDENTITY_POLL_SECONDS: Final = 0.02
 POST_RELEASE_STABILITY_SECONDS: Final = 0.25
 WATCHDOG_POLL_SECONDS: Final = 0.5
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}")
-UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+HANDOFF_POLL_SECONDS: Final = 0.1
+HANDOFF_RESPONSE_MAX_BYTES: Final = 1048576
+HELPER_ERROR_MAX_CHARS: Final = 8000
+HANDOFF_DURABLE_WAIT_SECONDS: Final = 60.0
 
 GATED_SHIM_SOURCE: Final = """
 import os
@@ -130,6 +135,7 @@ class RollbackState:
     uv_path: str
     stop_grace_seconds: float
     git_timeout_seconds: float
+    previous_retiring: bool
     previous_meta: WorkerMeta
     new_meta: WorkerMeta
 
@@ -150,6 +156,7 @@ class RollbackState:
             "uv_path": self.uv_path,
             "stop_grace_seconds": self.stop_grace_seconds,
             "git_timeout_seconds": self.git_timeout_seconds,
+            "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
             "new_meta": self.new_meta.to_dict(),
         }
@@ -183,6 +190,7 @@ class RollbackState:
                 uv_path=str(data["uv_path"]),
                 stop_grace_seconds=float(data["stop_grace_seconds"]),
                 git_timeout_seconds=float(data["git_timeout_seconds"]),
+                previous_retiring=data.get("previous_retiring", False) is True,
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
             )
@@ -488,92 +496,241 @@ def _candidate_response(state: RollbackState) -> dict[str, object]:
 
 
 def _current_queue_job_id() -> tuple[object | None, bool]:
-    """Find the currently running queue job by its live process group.
+    """Identify the current queue job from the exact injected root job UUID.
 
-    Historical PGID reuse cannot collide because only ``running`` rows are
-    considered, and a live process group can belong to at most one Lubko job.
+    The owning worker injects the exact root job UUID as ``LUBKO_JOB_ID`` into
+    every spawned command environment before the child execs, so queue
+    detection never depends on the timing of ``process_pgid`` persistence: the
+    command is a queue job if and only if that exact injected value is present.
+    The matching row is then validated as needed: a missing row is a deleted
+    job and a cancellation marker is reported, so a queue-invoked checkout can
+    never silently fall back to the manual destructive path.
 
     Returns:
         ``(job_id, cancelled)`` when invoked from a queue job, otherwise
         ``(None, False)``.
 
     Raises:
-        DeployCtlError: If more than one running row claims the current group.
+        DeployCtlError: If the injected job cannot be validated.
     """
+    job_text = os.environ.get(JOB_ID_ENV)
+    if job_text is None:
+        return None, False
+    try:
+        job_id = UUID(job_text)
+    except ValueError:
+        msg = f"malformed {JOB_ID_ENV} in the command environment"
+        raise DeployCtlError(msg) from None
     try:
         database = load_database_config()
-    except (OSError, ValueError):
-        return None, False
-    pgid = os.getpgrp()
-    try:
-        with psycopg.connect(database.conninfo(), row_factory=tuple_row) as conn:
-            with conn.transaction(), conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT id, (payload::jsonb)->'state'->>'cancel_requested_at' "
-                    "FROM lubko.jobs "
-                    "WHERE (payload::jsonb)->'state'->>'status' = 'running' "
-                    "AND ((payload::jsonb)->'state'->>'process_pgid')::bigint = %s "
-                    "FOR UPDATE",
-                    (pgid,),
-                )
-                rows = cursor.fetchall()
-    except psycopg.Error as exc:
-        msg = f"could not identify the current queue job: {exc.__class__.__name__}"
+    except (OSError, ValueError) as exc:
+        msg = f"cannot validate the injected queue job: {exc}"
         raise DeployCtlError(msg) from exc
-    if len(rows) > 1:
-        raise DeployCtlError("multiple running jobs claim the current process group")
-    if not rows:
-        return None, False
-    return rows[0][0], rows[0][1] is not None
-
-
-def _self_finalize_checkout(response: dict[str, object]) -> None:
-    """Persist checkout success before the owning old worker is gone.
-
-    The checkout command itself is a queue job owned by the worker being
-    replaced. After the handoff that worker can no longer finalize the row, so
-    the stable wrapper atomically finishes its own currently-running row. Manual
-    invocations have no matching running process group and simply return.
-
-    Args:
-        response: JSON response also written to stdout.
-
-    Raises:
-        DeployCtlError: If a queue invocation cannot be finalized safely.
-    """
-    job_id, cancelled = _current_queue_job_id()
-    if job_id is None:
-        return
-    if cancelled:
-        raise DeployCtlError("checkout job was cancelled during deployment")
     try:
-        database = load_database_config()
-        stdout = json.dumps(response, sort_keys=True) + "\n"
         with psycopg.connect(database.conninfo(), row_factory=tuple_row) as conn:
             with conn.transaction(), conn.cursor() as cursor:
                 cursor.execute(
-                    "UPDATE lubko.jobs SET payload = "
-                    "jsonb_set("
-                    "jsonb_set("
-                    "jsonb_set(payload::jsonb, '{state,status}', to_jsonb('succeeded'::text)), "
-                    "'{state,finished_at}', to_jsonb(" + UTC_ISO_TEXT_SQL + ")), "
-                    "'{result}', jsonb_build_object("
-                    "'stdout', to_jsonb(%s::text), 'stderr', to_jsonb(''::text), "
-                    "'exit_code', to_jsonb(0::int), 'cancellation_note', to_jsonb(NULL::text)))::text "
-                    "WHERE id = %s AND (payload::jsonb)->'state'->>'status' = 'running' "
-                    "RETURNING id",
-                    (stdout, job_id),
+                    "SELECT (payload::jsonb)->'state'->>'status', "
+                    "(payload::jsonb)->'state'->>'cancel_requested_at' "
+                    "FROM lubko.jobs WHERE id = %s",
+                    (job_id,),
                 )
                 row = cursor.fetchone()
-    except (OSError, ValueError, psycopg.Error) as exc:
-        msg = f"could not finalize checkout queue job: {exc.__class__.__name__}"
+    except psycopg.Error as exc:
+        msg = f"could not validate the injected queue job: {exc.__class__.__name__}"
         raise DeployCtlError(msg) from exc
     if row is None:
-        raise DeployCtlError("checkout queue job stopped being running before finalization")
+        raise DeployCtlError("the current queue job row does not exist")
+    status = str(row[0])
+    if status == "cancelled":
+        return job_id, True
+    if status != "running":
+        msg = f"the current queue job is {status} rather than running"
+        raise DeployCtlError(msg)
+    return job_id, row[1] is not None
+
+
+def _send_helper_response(writer: int, response: dict[str, object]) -> None:
+    """Send one JSON response line to the controller parent over a pipe.
+
+    Args:
+        writer: Write end of the pipe back to the controller parent.
+        response: Response object to deliver.
+    """
+    payload = json.dumps(response, sort_keys=True) + "\n"
+    with suppress(OSError):
+        os.write(writer, payload.encode())
+
+
+def _send_helper_error(writer: int, message: str) -> None:
+    """Send one protocol-style error response to the controller parent.
+
+    The message is bounded so a pipe delivery can never block or overflow the
+    controller parent's bounded response read.
+
+    Args:
+        writer: Write end of the pipe back to the controller parent.
+        message: Error description.
+    """
+    bounded = message[:HELPER_ERROR_MAX_CHARS]
+    if len(message) > HELPER_ERROR_MAX_CHARS:
+        bounded += "..."
+    _send_helper_response(writer, {"ok": False, "error": bounded})
+
+
+def _read_pipe_line(reader: int) -> str:
+    """Read one newline-terminated line from a pipe, bounded and deterministic.
+
+    Returns:
+        The decoded line without its trailing newline, or ``""`` at EOF.
+
+    Raises:
+        DeployCtlError: If the line exceeds the bounded response size.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while total < HANDOFF_RESPONSE_MAX_BYTES:
+        chunk = os.read(reader, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if chunk.endswith(b"\n"):
+            break
+    if total >= HANDOFF_RESPONSE_MAX_BYTES:
+        raise DeployCtlError("deployment handoff helper response exceeded the bounded size")
+    return b"".join(chunks).decode("utf-8", errors="replace").strip()
+
+
+def _wait_for_durable_success(job_id: object, deadline: float) -> None:
+    """Wait until the checkout queue job is durably succeeded and not cancelled.
+
+    The controller parent exits zero so the owning worker finalizes the row.
+    The helper may cross the destructive handoff boundary only once the row is
+    durably terminal ``succeeded`` in PostgreSQL with no cancellation marker;
+    a ``failed``/``cancelled``/deleted row or an expired deadline aborts the
+    mission before any destructive step. The row is only ever read, never
+    rewritten, so a transient terminal state can never be overwritten.
+
+    Args:
+        job_id: Identifier of the checkout queue row.
+        deadline: Monotonic-handoff deadline for durable success.
+
+    Raises:
+        DeployCtlError: If the row cannot be trusted as durably succeeded.
+    """
+    try:
+        database = load_database_config()
+    except (OSError, ValueError) as exc:
+        msg = f"handoff helper cannot load database configuration: {exc}"
+        raise DeployCtlError(msg) from exc
+    try:
+        conn = psycopg.connect(database.conninfo(), row_factory=tuple_row)
+    except psycopg.Error as exc:
+        msg = f"handoff helper cannot reach PostgreSQL: {exc.__class__.__name__}"
+        raise DeployCtlError(msg) from exc
+    try:
+        while time.time() < deadline:
+            try:
+                with conn.transaction(), conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT (payload::jsonb)->'state'->>'status', "
+                        "(payload::jsonb)->'state'->>'cancel_requested_at' "
+                        "FROM lubko.jobs "
+                        "WHERE id = %s",
+                        (job_id,),
+                    )
+                    row = cursor.fetchone()
+            except psycopg.Error:
+                time.sleep(HANDOFF_POLL_SECONDS)
+                continue
+            if row is None:
+                raise DeployCtlError("checkout queue job was deleted before durable success")
+            status = str(row[0])
+            if status == "succeeded" and row[1] is None:
+                return
+            if status in {"failed", "cancelled"}:
+                msg = f"checkout queue job reached {status} before durable success"
+                raise DeployCtlError(msg)
+            time.sleep(HANDOFF_POLL_SECONDS)
+        raise DeployCtlError("checkout queue job did not reach durable success before the deadline")
+    finally:
+        with suppress(Exception):
+            conn.close()
+
+
+def _abort_mission(gated: GatedWorker, state: RollbackState) -> None:
+    """Undo a prepared mission without crossing the destructive boundary.
+
+    The initiating checkout row failed, was cancelled, was deleted, or never
+    reached durable success. The gated candidate is closed (it exits on EOF),
+    the previous exact checkout is restored, and the previous worker is left
+    running; the armed watchdog completes the state transition to rolled_back.
+    ``previous_retiring`` is never set, so rollback always reuses or restores
+    the previous worker without treating retirement as begun.
+
+    Args:
+        gated: The gated candidate process and identity.
+        state: The pending rollback mission.
+    """
+    _close_gate(gated.gate_writer)
+    _checkout(
+        Path(state.repo),
+        state.previous_commit,
+        state.git_timeout_seconds,
+        force=True,
+    )
+    cli.remove_cli_root(state.commit)
+
+
+def _complete_handoff(options: Options, state: RollbackState, gated: GatedWorker) -> RollbackState:
+    """Stop the old worker and release the candidate after durable success.
+
+    This is the destructive handoff: it may only run after the initiating
+    queue row is durably ``succeeded``. The durable ``previous_retiring``
+    marker is persisted before the previous worker is stopped so a forked
+    watchdog never accepts a momentarily-alive retiring identity after a crash.
+
+    Args:
+        options: Deployment options.
+        state: Pending rollback mission.
+        gated: The gated candidate process and identity.
+
+    Returns:
+        The live pending rollback state with an extended confirmation deadline.
+
+    Raises:
+        DeployCtlError: If the handoff cannot complete; rollback is attempted.
+    """
+    retiring = replace(state, previous_retiring=True)
+    _write_state(retiring)
+    try:
+        if not stop_worker(state.previous_meta, options.stop_grace_seconds):
+            raise DeployCtlError("could not stop the known-good worker")
+        _release_gate(gated.gate_writer)
+        if not _wait_for_released_worker(gated.meta):
+            raise DeployCtlError("candidate worker exited immediately after release")
+        live = replace(retiring, deadline=time.time() + options.confirm_window_seconds)
+        _write_state(live)
+        return live
+    except DeployCtlError:
+        _close_gate(gated.gate_writer)
+        _rollback_locked(retiring)
+        raise
 
 
 def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     """Restore the previous known-good worker process.
+
+    A previous worker that was never told to retire and is still alive is
+    reused under its exact recorded identity (old watchdog behavior). Once the
+    controller has durably marked ``previous_retiring`` before stopping that
+    worker, a momentarily alive process is never trusted: retirement may have
+    begun, so the exact old identity is deterministically stopped and awaited
+    dead before a fresh previous-commit worker is spawned and verified. That
+    guarantees terminal ``rolled_back`` never means a worker that is about to
+    exit, so zero queue consumers cannot be the outcome of a completed
+    rollback.
 
     Args:
         state: Rollback mission.
@@ -581,11 +738,14 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     Returns:
         Restored worker metadata, or ``None`` on failure.
     """
-    if worker_alive(state.previous_meta):
-        return state.previous_meta
+    previous = state.previous_meta
+    if not state.previous_retiring and worker_alive(previous):
+        return previous
+    if worker_alive(previous) and not stop_worker(previous, state.stop_grace_seconds):
+        return None
     token = secrets.token_hex(16)
     env = worker_env(token)
-    worker_id = env.get("LUBKO_WORKER_ID") or state.previous_meta.worker_id or socket.gethostname()
+    worker_id = env.get("LUBKO_WORKER_ID") or previous.worker_id or socket.gethostname()
     try:
         proc = spawn_worker(
             Path(state.repo),
@@ -733,18 +893,27 @@ def _cleanup_pending_locked() -> None:
         raise DeployCtlError("an unresolved rollback is still pending")
 
 
-def _deploy_locked(options: Options, commit: str) -> RollbackState:
-    """Prepare and hand off one exact candidate while holding the deploy lock.
+def _prepare_locked(options: Options, commit: str) -> tuple[RollbackState, GatedWorker]:
+    """Prepare an exact candidate without crossing the destructive boundary.
+
+    Performs only reversible preparation while holding the deploy lock: resolve
+    any abandoned mission, validate the exact clean commits, check out the
+    candidate, validate it, build its provisional CLI environment, spawn the
+    gated candidate, verify PostgreSQL, persist the pending rollback mission
+    with ``previous_retiring=False``, and arm the watchdog. The previous worker
+    is never stopped here; the caller decides when the mission may cross into
+    the destructive handoff.
 
     Args:
         options: Deployment options.
         commit: Exact candidate commit.
 
     Returns:
-        Pending rollback state.
+        The pending rollback state and its gated candidate.
 
     Raises:
-        DeployCtlError: On any unsafe or incomplete handoff.
+        DeployCtlError: On any unsafe or failed preparation; the previous
+            checkout is restored and the previous worker is left untouched.
     """
     _cleanup_pending_locked()
     previous = read_meta()
@@ -760,18 +929,18 @@ def _deploy_locked(options: Options, commit: str) -> RollbackState:
         raise DeployCtlError(f"could not check out candidate commit {commit}")
     report = run_validation(options.repo, options.uv_path, options.validation_timeout_seconds)
     if not report.ok:
-        _checkout(options.repo, previous_commit, options.git_timeout_seconds, force=True)
+        _restore_previous_prep(options, previous_commit, commit)
         raise DeployCtlError(f"candidate validation failed: {report.detail}")
     try:
         cli.build_cli_root(options.repo, commit, options.uv_path, options.cli_timeout_seconds)
     except cli.CliError as exc:
-        _checkout(options.repo, previous_commit, options.git_timeout_seconds, force=True)
+        _restore_previous_prep(options, previous_commit, commit)
         msg = f"candidate CLI environment could not be built: {exc}"
         raise DeployCtlError(msg) from exc
     gated = _spawn_gated_candidate(options, commit)
     if not check_postgres(options.postgres_timeout_seconds):
         _close_gate(gated.gate_writer)
-        _checkout(options.repo, previous_commit, options.git_timeout_seconds, force=True)
+        _restore_previous_prep(options, previous_commit, commit)
         raise DeployCtlError("stable wrapper cannot reach PostgreSQL before handoff")
     state = RollbackState(
         schema_version=ROLLBACK_SCHEMA_VERSION,
@@ -784,28 +953,181 @@ def _deploy_locked(options: Options, commit: str) -> RollbackState:
         uv_path=options.uv_path,
         stop_grace_seconds=options.stop_grace_seconds,
         git_timeout_seconds=options.git_timeout_seconds,
+        previous_retiring=False,
         previous_meta=previous,
         new_meta=gated.meta,
     )
     _write_state(state)
     try:
         _fork_watchdog(options.lock_timeout_seconds)
-        if not stop_worker(previous, options.stop_grace_seconds):
-            raise DeployCtlError("could not stop the known-good worker")
-        _release_gate(gated.gate_writer)
-        if not _wait_for_released_worker(gated.meta):
-            raise DeployCtlError("candidate worker exited immediately after release")
-        live = replace(state, deadline=time.time() + options.confirm_window_seconds)
-        _write_state(live)
-        return live
     except DeployCtlError:
         _close_gate(gated.gate_writer)
         _rollback_locked(state)
         raise
+    return state, gated
+
+
+def _restore_previous_prep(options: Options, previous_commit: str, candidate_commit: str) -> None:
+    """Restore the reversible preparation state before a checkout failure.
+
+    The candidate checkout is force-restored to the exact previous commit and
+    the provisional candidate CLI environment is removed, leaving the previous
+    worker untouched.
+
+    Args:
+        options: Deployment options.
+        previous_commit: Exact previously maintained commit.
+        candidate_commit: Exact candidate commit whose environment to remove.
+    """
+    _checkout(options.repo, previous_commit, options.git_timeout_seconds, force=True)
+    cli.remove_cli_root(candidate_commit)
+
+
+def _deploy_locked(options: Options, commit: str) -> RollbackState:
+    """Prepare and hand off one exact candidate while holding the deploy lock.
+
+    The synchronous path used by manual (non-queue) invocations: preparation is
+    immediately followed by the destructive handoff.
+
+    Args:
+        options: Deployment options.
+        commit: Exact candidate commit.
+
+    Returns:
+        Pending rollback state.
+    """
+    state, gated = _prepare_locked(options, commit)
+    return _complete_handoff(options, state, gated)
+
+
+def _run_helper(options: Options, commit: str, job_id: object, writer: int) -> None:
+    """Run the detached queue-handoff helper to completion in the child.
+
+    The child detaches into its own session immediately so the retiring
+    worker's group shutdown can never reach it, acquires the deployment lock
+    itself, performs the reversible preparation, delivers the candidate or
+    error response to the parent, waits for the initiating row to be durably
+    succeeded, and only then crosses the destructive boundary. This function
+    never returns: it exits the child process.
+
+    Args:
+        options: Deployment options.
+        commit: Exact candidate commit.
+        job_id: Captured checkout queue row identifier.
+        writer: Write end of the response pipe to the parent.
+    """
+    with suppress(OSError):
+        os.setsid()
+    try:
+        try:
+            with deploy_lock(options.lock_timeout_seconds):
+                _helper_locked(options, commit, job_id, writer)
+        except LockTimeoutError as exc:
+            _send_helper_error(writer, f"timed out waiting for the deployment lock: {exc}")
+        except DeployCtlError as exc:
+            _send_helper_error(writer, str(exc))
+        except OSError as exc:
+            _send_helper_error(writer, f"operating-system error: {exc}")
+    finally:
+        with suppress(OSError):
+            os.close(writer)
+    os._exit(0)
+
+
+def _helper_locked(options: Options, commit: str, job_id: object, writer: int) -> None:
+    """Run one lock-held queue handoff mission in the detached helper.
+
+    The candidate or error response is delivered to the parent before any
+    destructive step. The parent exits zero only for a genuine candidate
+    response so the owning worker finalizes the checkout row as durably
+    ``succeeded``; a helper error or helper death makes it exit non-zero so the
+    row is durably ``failed``. The helper then waits for that exact row to be
+    durably succeeded before stopping the previous worker. The durable-success
+    wait deadline is computed only after preparation returns (it is not the
+    confirmation deadline captured during preparation), so a long validation
+    phase can never expire the handoff wait before it starts. Any failure
+    before durable success aborts the mission with the previous worker left
+    running.
+
+    Args:
+        options: Deployment options.
+        commit: Exact candidate commit.
+        job_id: Captured checkout queue row identifier.
+        writer: Write end of the response pipe to the parent.
+    """
+    state, gated = _prepare_locked(options, commit)
+    durable_deadline = time.time() + HANDOFF_DURABLE_WAIT_SECONDS
+    _send_helper_response(writer, _candidate_response(state))
+    try:
+        _wait_for_durable_success(job_id, durable_deadline)
+    except DeployCtlError:
+        _abort_mission(gated, state)
+        append_deploy_log("queue checkout aborted before the destructive handoff")
+        return
+    try:
+        _complete_handoff(options, state, gated)
+    except DeployCtlError as exc:
+        append_deploy_log(f"queue handoff failed after durable success: {exc}")
+
+
+def _queue_checkout(options: Options, commit: str, job_id: object) -> dict[str, object]:
+    """Handle a queue-invoked checkout through a detached helper process.
+
+    The controller forks a helper into a separate session; the helper performs
+    all reversible preparation and the destructive handoff, while this parent
+    delivers the response and exits zero so the owning worker finalizes the
+    checkout row as durably succeeded. The parent never waits for the helper
+    and never touches the terminal row itself.
+
+    Args:
+        options: Deployment options.
+        commit: Exact candidate commit.
+        job_id: Captured checkout queue row identifier.
+
+    Returns:
+        The protocol response delivered by the helper.
+
+    Raises:
+        DeployCtlError: If the helper cannot be forked or never reports.
+    """
+    reader, writer = os.pipe()
+    try:
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            msg = f"could not fork the deployment handoff helper: {exc}"
+            raise DeployCtlError(msg) from exc
+        if pid == 0:
+            os.close(reader)
+            _run_helper(options, commit, job_id, writer)
+        os.close(writer)
+        try:
+            raw = _read_pipe_line(reader)
+        finally:
+            os.close(reader)
+    finally:
+        with suppress(OSError):
+            os.close(reader)
+        with suppress(OSError):
+            os.close(writer)
+    if not raw:
+        raise DeployCtlError("deployment handoff helper exited before reporting an outcome")
+    try:
+        response = json.loads(raw)
+    except ValueError as exc:
+        msg = "deployment handoff helper reported an invalid response"
+        raise DeployCtlError(msg) from exc
+    if not isinstance(response, dict):
+        raise DeployCtlError("deployment handoff helper reported a non-object response")
+    return response
 
 
 def _handle_checkout(options: Options, request: dict[str, object]) -> dict[str, object]:
     """Handle an exact-commit checkout request.
+
+    A queue-invoked checkout runs through a detached helper that waits for the
+    initiating row to be durably succeeded before the destructive handoff; a
+    manual invocation retains the synchronous safe path.
 
     Args:
         options: Deployment options.
@@ -813,26 +1135,23 @@ def _handle_checkout(options: Options, request: dict[str, object]) -> dict[str, 
 
     Returns:
         Protocol response.
+
+    Raises:
+        DeployCtlError: If the checkout is unsafe or cannot be reported.
     """
     commit = request.get("commit")
     if not isinstance(commit, str):
         raise DeployCtlError("checkout request requires string field 'commit'")
+    job_id, cancelled = _current_queue_job_id()
+    if job_id is not None:
+        if cancelled:
+            raise DeployCtlError("checkout job was cancelled during deployment")
+        return _queue_checkout(options, commit, job_id)
     try:
         with deploy_lock(options.lock_timeout_seconds):
             _reconcile_cli(_read_state())
             state = _deploy_locked(options, commit)
-            response = _candidate_response(state)
-            try:
-                _self_finalize_checkout(response)
-            except DeployCtlError:
-                if not _rollback_locked(state):
-                    raise DeployCtlError(
-                        "checkout succeeded but its queue result could not be finalized; rollback is incomplete"
-                    ) from None
-                raise DeployCtlError(
-                    "checkout queue result could not be finalized; deployment was rolled back"
-                ) from None
-            return response
+            return _candidate_response(state)
     except LockTimeoutError as exc:
         raise DeployCtlError("timed out waiting for the deployment lock") from exc
 
@@ -1101,6 +1420,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _request_type(request: dict[str, object]) -> str:
+    """Return the protocol request type, or an empty string.
+
+    Args:
+        request: Decoded request object.
+
+    Returns:
+        The ``type`` field when it is a string, otherwise ``""``.
+    """
+    value = request.get("type")
+    return value if isinstance(value, str) else ""
+
+
+def _checkout_failure_exit_code(request_type: str, response: dict[str, object]) -> int:
+    """Return the process exit code for one controller response.
+
+    A failed ``checkout`` must exit non-zero: the owning queue worker then
+    records the row as ``failed``, so a helper death or a reported error can
+    never leave a falsely-successful checkout row. Every other protocol
+    rejection keeps returning zero so its structured JSON error reaches the
+    orchestrator.
+
+    Args:
+        request_type: Protocol request type.
+        response: The emitted response object.
+
+    Returns:
+        ``EXIT_ERROR`` for a failed checkout, ``EXIT_OK`` otherwise.
+    """
+    if request_type == "checkout" and response.get("ok") is not True:
+        return EXIT_ERROR
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one stable-wrapper protocol request.
 
@@ -1108,11 +1461,14 @@ def main(argv: list[str] | None = None) -> int:
         argv: CLI arguments, or ``None`` for ``sys.argv``.
 
     Returns:
-        Process exit code. Protocol-level rejections still return zero so queue
-        jobs can deliver their structured JSON error to the orchestrator.
+        Process exit code. A failed ``checkout`` exits non-zero so the owning
+        queue job is durably recorded as ``failed``; other protocol rejections
+        still return zero so queue jobs can deliver their structured JSON error
+        to the orchestrator.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+    request_type = ""
     try:
         uv_path = resolve_uv(args.uv)
         options = Options(
@@ -1128,15 +1484,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         if options.confirm_window_seconds <= 0:
             raise DeployCtlError("confirmation window must be positive")
-        response = _dispatch(options, _parse_request(args.request))
+        request = _parse_request(args.request)
+        request_type = _request_type(request)
+        response = _dispatch(options, request)
     except (DeployCtlError, UvResolutionError) as exc:
-        _emit({"ok": False, "error": str(exc)})
-        return EXIT_OK
+        response = {"ok": False, "error": str(exc)}
+        _emit(response)
+        return _checkout_failure_exit_code(request_type, response)
     except OSError as exc:
-        _emit({"ok": False, "error": f"operating-system error: {exc}"})
+        response = {"ok": False, "error": f"operating-system error: {exc}"}
+        _emit(response)
         return EXIT_ERROR
     _emit(response)
-    return EXIT_OK
+    return _checkout_failure_exit_code(request_type, response)
 
 
 if __name__ == "__main__":
