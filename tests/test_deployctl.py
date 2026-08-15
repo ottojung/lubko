@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from tests import _pg
 
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
+CHALLENGE_RE: Final = re.compile(r"[0-9a-f]{7}")
 LINGER_SOURCE: Final = (
     "import signal,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(300)\n"
 )
@@ -360,11 +362,11 @@ def test_rollback_state_round_trip() -> None:
     assert dc._read_state() == state
 
 
-def test_first_confirmation_persists_only_challenge_digest(
+def test_first_confirmation_returns_7_hex_challenge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The first confirmation returns a challenge but stores only its digest."""
+    """The first confirmation returns a 7-hex challenge but stores only its digest."""
     state = pending_state()
     options = make_options(tmp_path / "repo")
     written: list[dc.RollbackState] = []
@@ -376,7 +378,9 @@ def test_first_confirmation_persists_only_challenge_digest(
 
     challenge = response["challenge"]
     assert isinstance(challenge, str)
-    assert challenge
+    assert CHALLENGE_RE.fullmatch(challenge) is not None
+    assert len(challenge) == 7
+    assert challenge == challenge.lower()
     assert written[-1].challenge_hash == dc._challenge_digest(challenge)
     assert challenge not in written[-1].to_dict().values()
 
@@ -388,7 +392,7 @@ def test_second_confirmation_writes_meta_before_terminal_state(
     """Successful confirmation records candidate metadata before terminal state."""
     state = pending_state()
     options = make_options(tmp_path / "repo")
-    challenge = "challenge-value"
+    challenge = "3fa91c0"
     challenged = replace(state, challenge_hash=dc._challenge_digest(challenge))
     events: list[str] = []
     written: list[dc.RollbackState] = []
@@ -431,7 +435,7 @@ def test_wrong_challenge_rolls_back(
     """An incorrect second factor immediately invokes rollback."""
     state = pending_state()
     options = make_options(tmp_path / "repo")
-    challenged = replace(state, challenge_hash=dc._challenge_digest("expected"))
+    challenged = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
     rollbacks: list[dc.RollbackState] = []
     monkeypatch.setattr(dc, "_read_state", lambda: challenged)
     monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
@@ -447,12 +451,76 @@ def test_wrong_challenge_rolls_back(
             {
                 "type": "confirm",
                 "commit": state.commit,
-                "challenge": "wrong",
+                "challenge": "1111111",
             },
             options,
         )
 
     assert rollbacks == [challenged]
+
+
+def test_wrong_length_challenge_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A second factor of the wrong length never confirms the candidate."""
+    state = pending_state()
+    options = make_options(tmp_path / "repo")
+    challenged = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
+    rollbacks: list[dc.RollbackState] = []
+    monkeypatch.setattr(dc, "_read_state", lambda: challenged)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    for answer in ("3fa91c", "3fa91c00"):
+        with pytest.raises(dc.DeployCtlError, match="malformed"):
+            dc._confirm_locked(
+                {
+                    "type": "confirm",
+                    "commit": state.commit,
+                    "challenge": answer,
+                },
+                options,
+            )
+
+    assert rollbacks == [challenged, challenged]
+
+
+def test_non_hex_challenge_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A non-hexadecimal second factor never confirms the candidate."""
+    state = pending_state()
+    options = make_options(tmp_path / "repo")
+    challenged = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
+    rollbacks: list[dc.RollbackState] = []
+    monkeypatch.setattr(dc, "_read_state", lambda: challenged)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    for answer in ("zzzzzzz", "3FA91C0"):
+        with pytest.raises(dc.DeployCtlError, match="malformed"):
+            dc._confirm_locked(
+                {
+                    "type": "confirm",
+                    "commit": state.commit,
+                    "challenge": answer,
+                },
+                options,
+            )
+
+    assert rollbacks == [challenged, challenged]
 
 
 def test_watchdog_rollback_condition_uses_deadline_or_candidate_death(
@@ -559,7 +627,7 @@ def test_wrong_challenge_rollback_preserves_previous_cli(
     """A failed confirmation rolls back without moving the CLI pointer."""
     repo, first, second, bin_dir = coherent_environment
     state = pending_state(repo=str(repo), old=first, new=second)
-    challenged = replace(state, challenge_hash=dc._challenge_digest("expected"))
+    challenged = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
     dc._write_state(challenged)
     monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
     options = make_options(repo)
@@ -570,7 +638,7 @@ def test_wrong_challenge_rollback_preserves_previous_cli(
             {
                 "type": "confirm",
                 "commit": second,
-                "challenge": "wrong-answer",
+                "challenge": "1111111",
             },
             options,
         )
@@ -621,7 +689,7 @@ def test_confirmation_activation_failure_keeps_previous_root(
     """A failed CLI switch during confirmation never breaks the prior CLI."""
     repo, first, second, bin_dir = coherent_environment
     state = pending_state(repo=str(repo), old=first, new=second)
-    challenged = replace(state, challenge_hash=dc._challenge_digest("challenge"))
+    challenged = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
     dc._write_state(challenged)
     write_meta(worker_meta(first, pid=100, repo=str(repo)))
     monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
@@ -643,7 +711,7 @@ def test_confirmation_activation_failure_keeps_previous_root(
         {
             "type": "confirm",
             "commit": second,
-            "challenge": "challenge"[::-1],
+            "challenge": "3fa91c0"[::-1],
         },
         options,
     )
@@ -2155,7 +2223,8 @@ def _run_confirmation_handshake(jobs_db: str, repo: Path, fake_uv: Path, commit:
     confirm1 = json.loads(str(read_job(jobs_db, confirm1_id)["result"]["stdout"]))
     challenge = confirm1["challenge"]
     assert isinstance(challenge, str)
-    assert challenge
+    assert CHALLENGE_RE.fullmatch(challenge) is not None
+    assert len(challenge) == 7
 
     confirm2_id = insert_pending_args_job(
         jobs_db,

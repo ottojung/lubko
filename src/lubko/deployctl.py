@@ -2,11 +2,11 @@
 
 ``lubko-deploy-ctl`` is the stable control plane used for version-changing
 self-deployments. A checkout is provisional until two requests traverse the
-replacement worker: first an exact-commit confirmation that returns a random
-challenge, then a second exact-commit confirmation containing that challenge
-reversed. Until both complete, a forked watchdog retains the known-good process
-image and restores the previous commit automatically on timeout or candidate
-failure.
+replacement worker: first an exact-commit confirmation that returns a fresh
+7-character lowercase hexadecimal challenge, then a second exact-commit
+confirmation containing that challenge reversed. Until both complete, a forked
+watchdog retains the known-good process image and restores the previous commit
+automatically on timeout or candidate failure.
 
 The global command line tools are kept coherent with the confirmed commit:
 the candidate CLI environment is built during the provisional phase, and the
@@ -82,6 +82,7 @@ IDENTITY_POLL_SECONDS: Final = 0.02
 POST_RELEASE_STABILITY_SECONDS: Final = 0.25
 WATCHDOG_POLL_SECONDS: Final = 0.5
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}")
+CHALLENGE_RE: Final = re.compile(r"[0-9a-f]{7}")
 HANDOFF_POLL_SECONDS: Final = 0.1
 HANDOFF_RESPONSE_MAX_BYTES: Final = 1048576
 HELPER_ERROR_MAX_CHARS: Final = 8000
@@ -1156,6 +1157,15 @@ def _handle_checkout(options: Options, request: dict[str, object]) -> dict[str, 
         raise DeployCtlError("timed out waiting for the deployment lock") from exc
 
 
+def _generate_challenge() -> str:
+    """Return a fresh 7-character lowercase hexadecimal confirmation challenge.
+
+    Returns:
+        A challenge matching ``[0-9a-f]{7}``.
+    """
+    return secrets.token_hex(4)[:7]
+
+
 def _challenge_digest(challenge: str) -> str:
     """Return the durable digest of one confirmation challenge.
 
@@ -1211,6 +1221,28 @@ def _reconcile_cli(state: RollbackState | None) -> None:
         append_deploy_log(f"reconciled maintained CLI pointer to commit {target}")
 
 
+def _verify_challenge(state: RollbackState, answer: object) -> None:
+    """Validate a second-confirmation challenge answer or roll back.
+
+    Args:
+        state: Live pending deployment state.
+        answer: Decoded challenge response.
+
+    Raises:
+        DeployCtlError: If the challenge response is unexpected, malformed, or
+            does not match the stored challenge.
+    """
+    if not isinstance(answer, str) or state.challenge_hash is None:
+        _rollback_locked(state)
+        raise DeployCtlError("unexpected challenge response; deployment was rolled back")
+    if CHALLENGE_RE.fullmatch(answer) is None:
+        _rollback_locked(state)
+        raise DeployCtlError("malformed challenge response; deployment was rolled back")
+    if not secrets.compare_digest(_challenge_digest(answer[::-1]), state.challenge_hash):
+        _rollback_locked(state)
+        raise DeployCtlError("challenge response is incorrect; deployment was rolled back")
+
+
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
     """Advance one pending deployment through the two-phase handshake.
 
@@ -1236,7 +1268,7 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
         raise DeployCtlError("confirmation commit does not match the proposed commit; rolled back")
     answer = request.get("challenge")
     if answer is None:
-        challenge = secrets.token_urlsafe(24)
+        challenge = _generate_challenge()
         _write_state(replace(state, challenge_hash=_challenge_digest(challenge)))
         return {
             "type": "confirm",
@@ -1244,12 +1276,7 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
             "commit": state.commit,
             "challenge": challenge,
         }
-    if not isinstance(answer, str) or state.challenge_hash is None:
-        _rollback_locked(state)
-        raise DeployCtlError("unexpected challenge response; deployment was rolled back")
-    if not secrets.compare_digest(_challenge_digest(answer[::-1]), state.challenge_hash):
-        _rollback_locked(state)
-        raise DeployCtlError("challenge response is incorrect; deployment was rolled back")
+    _verify_challenge(state, answer)
     if time.time() >= state.deadline or not worker_alive(state.new_meta):
         _rollback_locked(state)
         raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
