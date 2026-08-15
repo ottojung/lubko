@@ -73,7 +73,7 @@ Second request:
 
 The controller rechecks the deadline and candidate process identity while holding the deployment lock. Only after the response is valid does it write the candidate as maintained-worker metadata and persist terminal `confirmed` state.
 
-A wrong commit, missing, wrong-length or non-hex challenge, candidate failure, or timeout triggers rollback rather than leaving the candidate accepted ambiguously.
+A wrong commit, a wrong-length or non-hex challenge response, a challenge supplied before any first-stage state exists, candidate failure, or timeout triggers rollback rather than leaving the candidate accepted ambiguously. An omitted `challenge` field is not a failure: it is treated as another first-stage confirmation request that issues or refreshes a fresh 7-character hex challenge and leaves the deployment pending confirmation.
 
 ## Global CLI coherence
 
