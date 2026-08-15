@@ -504,10 +504,10 @@ Another useful rule is:
 The primary interface is:
 
 ```text
-lubko-agent new --id <ID> [--cwd DIR] [--title TEXT] [--json]
+lubko-agent new --id <ID> [--cwd DIR] [--title TEXT]
 lubko-agent list [...]
-lubko-agent status <id> / status --id <ID> [--json]
-lubko-agent prompt --id <ID> [--steer] [--detach] PROMPT
+lubko-agent status <id> / status --id <ID>
+lubko-agent prompt --id <ID> [--steer] PROMPT
 lubko-agent log <id> [--lines N] [--follow]
 lubko-agent wait <id> --timeout SEC
 lubko-agent stop <id>
@@ -515,9 +515,6 @@ lubko-agent kill <id>
 lubko-agent delete <id> [--force]
 lubko-agent clean [--days N] [--dry-run]
 ```
-
-There is no `lubko-agent last` and no `lubko-agent result`; those commands do
-not exist.
 
 Agent IDs are **preassigned by the orchestrator** as fresh base-16 strings, for
 example:
@@ -561,10 +558,7 @@ Useful options:
 ```
 
 `new` is **pure session creation**: it only creates the managed Lubko agent
-record. It does not launch the underlying AI agent and does not accept an
-initial prompt. `new` therefore accepts no `--prompt`, no positional prompt,
-no `--sync`, and no `--detach` — there is nothing to follow or detach from at
-creation time.
+record. It does not launch the underlying AI agent.
 
 A freshly-created but never-prompted agent has a clear idle
 (not-yet-started) state rather than pretending to be running or terminal.
@@ -574,9 +568,6 @@ Example machine-readable result:
 ```json
 {"id": "a13f09c2", "state": "idle", "cwd": "/workspace/project", "created_at": 1786681506.5262172}
 ```
-
-Record the agent ID — you already chose it, so record it before submitting the
-command. The first invocation happens later through `lubko-agent prompt`.
 
 ---
 
@@ -598,15 +589,7 @@ the caller always knows the ID because it generated it.
 - it returns only when that invocation finishes;
 - it propagates the mapped invocation exit status.
 
-The explicit asynchronous form remains:
-
-```sh
-lubko-agent prompt --id a13f09c2 --detach 'Investigate independently and keep working.'
-```
-
-`--detach` starts/queues the invocation and returns immediately. The enclosing
-Lubko root job finishes quickly while the agent keeps working; observe the
-agent with `status`/`log`/`wait`.
+`--detach` starts/queues the invocation and returns immediately. Don't use this flag unless absolutely necessary. 
 
 ### First prompt creates the native session
 
@@ -625,8 +608,7 @@ lubko-agent prompt --id a13f09c2 --steer 'Stop this approach and use the parser-
 ```
 
 While the agent is running, `--steer` interrupts/redirects the current
-invocation according to the steer model, then follows the resulting invocation
-unless `--detach` is also supplied.
+invocation according to the steer model, then follows the resulting invocation.
 
 If the agent is **not currently running** (idle, finished, stopped, or
 never-started), then:
@@ -761,7 +743,7 @@ lubko-agent log 8e064622 --lines 100
 lubko-agent log 8e064622 --follow
 ```
 
-`log --follow` attaches to an already-running detached agent and streams its
+`log --follow` attaches to an already-running agent and streams its
 output. Use logs for observability while the agent is working.
 
 Logs are appropriate for:
@@ -1025,14 +1007,6 @@ If the agent is busy and the newest instruction must take precedence:
 
 ```sh
 lubko-agent prompt --id a13f09c2 --steer 'Stop the current approach and use the parser-level fix instead.'
-```
-
-Use `--detach` only when the orchestrator intentionally wants the prompt
-command to return immediately and plans to observe/manage the agent
-separately afterward:
-
-```sh
-lubko-agent prompt --id a13f09c2 --detach 'Perform an independent review of the storage layer.'
 ```
 
 ## 4. Read the result
