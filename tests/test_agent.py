@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import BinaryIO, Final, cast
+from typing import Any, BinaryIO, Final, cast
 
 import pytest
 
@@ -641,6 +641,142 @@ def test_cmd_log_follow_snapshots_folded_tail_then_stops(
     assert "hello" in out
     assert "x" * agent.FOLD_WIDTH in out
     assert "x" * (agent.FOLD_WIDTH + 10) not in out
+
+
+def test_tail_lines_strips_ansi(state_dir: Path) -> None:
+    """tail_lines strips ANSI CSI/SGR sequences from displayed lines."""
+    log = state_dir / "out.log"
+    log.write_text("\x1b[31;1mbold red\x1b[0m\n\x1b[2m\x1b[36mcyan dim\x1b[0m\nplain\n")
+    assert agent.tail_lines(log, 0) == ["bold red", "cyan dim", "plain"]
+    assert agent.tail_lines(log, 2) == ["cyan dim", "plain"]
+
+
+def test_tail_snapshot_strips_ansi(state_dir: Path) -> None:
+    """The follow snapshot strips ANSI CSI/SGR sequences from displayed bytes."""
+    log = state_dir / "out.log"
+    log.write_text("\x1b[32mgreen\x1b[0m\nplain\n")
+    kept, offset = agent.tail_snapshot(log, 5)
+    assert offset == log.stat().st_size
+    assert kept == b"green\nplain\n"
+
+
+def test_cmd_log_strips_ansi_without_follow(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log without --follow presents colored output stripped of escape sequences."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_text("\x1b[31mred line\x1b[0m\n\x1b[1m\x1b[38;5;123mbold\x1b[0m\nplain\n")
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "red line" in out
+    assert "bold" in out
+    assert "plain" in out
+
+
+def test_cmd_log_follow_snapshot_strips_ansi(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow presents the colored snapshot stripped of escape sequences."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_text("\x1b[34mblue\x1b[0m\n\x1b[4munderline\x1b[0m\n")
+    assert agent.main(["log", "aaaaaaaa", "--follow", "--lines", "5"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "blue" in out
+    assert "underline" in out
+
+
+def test_log_normalizer_strips_ansi_across_chunk_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A CSI sequence split across reads is still fully stripped."""
+    normalizer = cast(
+        "type[Any]",
+        agent.__dict__["_LogNormalizer"],
+    )()
+    normalizer.write(b"\x1b[3")
+    normalizer.write(b"1mgreen\x1b[0")
+    normalizer.write(b"m end\n")
+    normalizer.close()
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert out == "green end\n"
+
+
+def test_log_normalizer_preserves_utf8_across_chunk_boundary(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Multi-byte UTF-8 text split across reads is preserved undamaged."""
+    normalizer = cast(
+        "type[Any]",
+        agent.__dict__["_LogNormalizer"],
+    )()
+    normalizer.write(b"caf\xc3\xa9 \xe2")
+    normalizer.write(b"\x98\x95 tail")
+    normalizer.write(b"\x1b[33myellow\x1b[0m done\n")
+    normalizer.close()
+    out = capsys.readouterr().out
+    assert "café ☕ tail" in out
+    assert "\x1b" not in out
+    assert "yellow done" in out
+
+
+def test_cmd_log_preserves_utf8_without_follow(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log without --follow preserves ordinary UTF-8 text."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_text("\x1b[32mnaïve café ☕\x1b[0m\n")
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "naïve café ☕" in out
+
+
+def test_cmd_prompt_attached_normalizes_colored_output(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Attached prompt strips ANSI from streamed output and still extracts the result."""
+    agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
+
+    def colored_command(
+        _meta: agent.Meta,
+        _prompt: str,
+        *,
+        is_continue: bool,
+    ) -> list[str]:
+        del is_continue
+        return ["sh", "-c", "printf '\\x1b[36m%s\\x1b[0m\\n' \"$LUBKO_PROMPT\""]
+
+    monkeypatch.setattr(agent, "build_agent_command", colored_command)
+    runner_threads: list[threading.Thread] = []
+
+    def spawn_in_thread(_aid: str, mode: str) -> None:
+        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+        thread.start()
+        runner_threads.append(thread)
+
+    monkeypatch.setattr(agent, "spawn_runner", spawn_in_thread)
+    code = agent.main(["prompt", "--id", "aaaaaaaa", "do work"])
+    assert code == agent.EXIT_OK
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "do work" in output
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    assert meta["state"] == "succeeded"
+    assert meta["exit_code"] == 0
+    for thread in runner_threads:
+        thread.join(timeout=10)
 
 
 def test_cmd_status_tail_shows_folded_long_lines(
