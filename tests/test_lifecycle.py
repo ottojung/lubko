@@ -16,7 +16,7 @@ from unittest import mock
 import psycopg
 import pytest
 
-from lubko import lifecycle, toolchain
+from lubko import cli, lifecycle, toolchain
 from lubko.config import DatabaseConfig
 from lubko.lifecycle import (
     EXIT_ERROR,
@@ -173,6 +173,7 @@ def make_options(repo: Path, *, bootstrap: bool) -> lifecycle.DeployOptions:
         lock_timeout_seconds=1.0,
         validation_timeout_seconds=5.0,
         git_timeout_seconds=5.0,
+        cli_timeout_seconds=5.0,
     )
 
 
@@ -209,6 +210,17 @@ def patch_deploy(
     monkeypatch.setattr(lifecycle, "run_validation", fake_validation)
     monkeypatch.setattr(lifecycle, "check_postgres", fake_postgres)
     monkeypatch.setattr(lifecycle, "git_commit", fake_commit)
+
+    def fake_cli_build(
+        _repo: Path,
+        commit: str,
+        _uv: str,
+        _timeout: float,
+    ) -> Path:
+        cli.cli_commit_dir(commit).mkdir(parents=True, exist_ok=True)
+        return cli.cli_commit_dir(commit)
+
+    monkeypatch.setattr(cli, "build_cli_root", fake_cli_build)
 
     spawned: list[subprocess.Popen[bytes]] = []
 
@@ -295,6 +307,7 @@ def make_deploy_args(tmp_path: Path, *, uv: str | None) -> argparse.Namespace:
         lock_timeout=1.0,
         validation_timeout=5.0,
         git_timeout=5.0,
+        cli_timeout=5.0,
     )
 
 
@@ -432,6 +445,7 @@ def test_deploy_validates_before_replacing(
         monkeypatch.setattr(lifecycle, "run_validation", recording_validation)
         monkeypatch.setattr(lifecycle, "check_postgres", lambda _timeout: True)
         monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: GIT_SHA)
+        monkeypatch.setattr(cli, "build_cli_root", lambda *_args, **_kwargs: Path())
         original_spawn = lifecycle.spawn_worker
 
         def recording_spawn(

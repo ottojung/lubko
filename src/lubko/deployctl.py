@@ -7,6 +7,12 @@ challenge, then a second exact-commit confirmation containing that challenge
 reversed. Until both complete, a forked watchdog retains the known-good process
 image and restores the previous commit automatically on timeout or candidate
 failure.
+
+The global command line tools are kept coherent with the confirmed commit:
+the candidate CLI environment is built during the provisional phase, and the
+``current`` pointer is switched only after durable ``confirmed`` state exists,
+so rollback can never strand the global CLIs on candidate code. See
+:mod:`lubko.cli`.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import tuple_row
 
+from lubko import cli
 from lubko.config import load_database_config
 from lubko.lifecycle import (
     SCHEMA_VERSION,
@@ -67,6 +74,7 @@ DEFAULT_POSTGRES_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_LOCK_TIMEOUT_SECONDS: Final = 30.0
 DEFAULT_VALIDATION_TIMEOUT_SECONDS: Final = 1200.0
 DEFAULT_GIT_TIMEOUT_SECONDS: Final = 10.0
+DEFAULT_CLI_TIMEOUT_SECONDS: Final = cli.DEFAULT_BUILD_TIMEOUT_SECONDS
 IDENTITY_TIMEOUT_SECONDS: Final = 5.0
 IDENTITY_POLL_SECONDS: Final = 0.02
 POST_RELEASE_STABILITY_SECONDS: Final = 0.25
@@ -105,6 +113,7 @@ class Options:
     lock_timeout_seconds: float
     validation_timeout_seconds: float
     git_timeout_seconds: float
+    cli_timeout_seconds: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -636,6 +645,7 @@ def _rollback_locked(state: RollbackState) -> bool:
         return False
     write_meta(restored)
     _write_state(replace(state, status=STATUS_ROLLED_BACK, challenge_hash=None))
+    cli.remove_cli_root(state.commit)
     append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
     return True
 
@@ -746,6 +756,12 @@ def _deploy_locked(options: Options, commit: str) -> RollbackState:
     if not report.ok:
         _checkout(options.repo, previous_commit, options.git_timeout_seconds, force=True)
         raise DeployCtlError(f"candidate validation failed: {report.detail}")
+    try:
+        cli.build_cli_root(options.repo, commit, options.uv_path, options.cli_timeout_seconds)
+    except cli.CliError as exc:
+        _checkout(options.repo, previous_commit, options.git_timeout_seconds, force=True)
+        msg = f"candidate CLI environment could not be built: {exc}"
+        raise DeployCtlError(msg) from exc
     gated = _spawn_gated_candidate(options, commit)
     if not check_postgres(options.postgres_timeout_seconds):
         _close_gate(gated.gate_writer)
@@ -826,11 +842,12 @@ def _challenge_digest(challenge: str) -> str:
     return hashlib.sha256(challenge.encode()).hexdigest()
 
 
-def _confirm_locked(request: dict[str, object]) -> dict[str, object]:
+def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
     """Advance one pending deployment through the two-phase handshake.
 
     Args:
         request: Decoded confirm request.
+        options: Runtime options.
 
     Returns:
         Protocol response.
@@ -867,8 +884,21 @@ def _confirm_locked(request: dict[str, object]) -> dict[str, object]:
     if time.time() >= state.deadline or not worker_alive(state.new_meta):
         _rollback_locked(state)
         raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
+    try:
+        cli.build_cli_root(
+            Path(state.repo), state.commit, state.uv_path, options.cli_timeout_seconds
+        )
+    except cli.CliError as exc:
+        _rollback_locked(state)
+        msg = f"confirmed CLI environment could not be prepared; deployment was rolled back: {exc}"
+        raise DeployCtlError(msg) from exc
     write_meta(state.new_meta)
     _write_state(replace(state, status=STATUS_CONFIRMED))
+    try:
+        cli.set_current(state.commit)
+        cli.gc_cli_roots((state.commit, state.previous_commit))
+    except cli.CliError as exc:
+        append_deploy_log(f"supervised deployment confirmed but CLI activation failed: {exc}")
     append_deploy_log(f"supervised deployment confirmed commit {state.commit}")
     return {"type": "confirm", "ok": True, "commit": state.commit, "confirmed": True}
 
@@ -885,7 +915,7 @@ def _handle_confirm(options: Options, request: dict[str, object]) -> dict[str, o
     """
     try:
         with deploy_lock(options.lock_timeout_seconds):
-            return _confirm_locked(request)
+            return _confirm_locked(request, options)
     except LockTimeoutError as exc:
         raise DeployCtlError("timed out waiting for the deployment lock") from exc
 
@@ -1016,6 +1046,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--validation-timeout", type=float, default=DEFAULT_VALIDATION_TIMEOUT_SECONDS
     )
     parser.add_argument("--git-timeout", type=float, default=DEFAULT_GIT_TIMEOUT_SECONDS)
+    parser.add_argument("--cli-timeout", type=float, default=DEFAULT_CLI_TIMEOUT_SECONDS)
     return parser
 
 
@@ -1042,6 +1073,7 @@ def main(argv: list[str] | None = None) -> int:
             lock_timeout_seconds=args.lock_timeout,
             validation_timeout_seconds=args.validation_timeout,
             git_timeout_seconds=args.git_timeout,
+            cli_timeout_seconds=args.cli_timeout,
         )
         if options.confirm_window_seconds <= 0:
             raise DeployCtlError("confirmation window must be positive")

@@ -81,6 +81,11 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
+"src/lubko/cli.py" = [
+    "start-process-with-partial-path",
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
 "tests/**/*.py" = [
     "assert",
     "magic-value-comparison",

@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import tuple_row
 
+from lubko import cli
 from lubko.config import load_database_config
 from lubko.state import state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
@@ -63,6 +64,7 @@ DEFAULT_POSTGRES_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_LOCK_TIMEOUT_SECONDS: Final = 30.0
 DEFAULT_VALIDATION_TIMEOUT_SECONDS: Final = 1200.0
 DEFAULT_GIT_TIMEOUT_SECONDS: Final = 10.0
+DEFAULT_CLI_TIMEOUT_SECONDS: Final = cli.DEFAULT_BUILD_TIMEOUT_SECONDS
 LOCK_POLL_INTERVAL_SECONDS: Final = 0.1
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 5.0
 SESSION_WAIT_INTERVAL_SECONDS: Final = 0.01
@@ -191,6 +193,7 @@ class DeployOptions:
     lock_timeout_seconds: float
     validation_timeout_seconds: float
     git_timeout_seconds: float
+    cli_timeout_seconds: float
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +877,75 @@ def _verify_replacement(new_meta: WorkerMeta, options: DeployOptions) -> bool:
     return True
 
 
+def _validate_and_prepare(options: DeployOptions) -> str:
+    """Validate a checkout and prepare its maintained CLI environment.
+
+    Args:
+        options: Deployment inputs.
+
+    Returns:
+        The exact checkout commit.
+
+    Raises:
+        DeployAbortedError: If the checkout is not deployable.
+    """
+    _out("validating checkout ...")
+    report = run_validation(options.repo, options.uv_path, options.validation_timeout_seconds)
+    if not report.ok:
+        _err("validation failed; the current worker is left untouched")
+        _err(report.detail)
+        raise DeployAbortedError
+    commit = git_commit(options.repo, options.git_timeout_seconds)
+    if commit is None:
+        _err("could not read the git commit of the deployment checkout")
+        raise DeployAbortedError from None
+    if not _prepare_maintained_cli(options, commit):
+        raise DeployAbortedError from None
+    return commit
+
+
+def _prepare_maintained_cli(options: DeployOptions, commit: str) -> bool:
+    """Build the maintained CLI environment for one exact commit.
+
+    A failed CLI build aborts before any worker is replaced, so the current
+    worker and the prior confirmed CLIs both stay untouched.
+
+    Args:
+        options: Deployment inputs.
+        commit: Exact commit to build the CLI environment for.
+
+    Returns:
+        ``True`` when the environment is usable, ``False`` otherwise.
+    """
+    _out("preparing the maintained CLI environment ...")
+    try:
+        cli.build_cli_root(options.repo, commit, options.uv_path, options.cli_timeout_seconds)
+    except cli.CliError as exc:
+        _err(
+            "could not prepare the maintained CLI environment; the current worker is left untouched"
+        )
+        _err(str(exc))
+        return False
+    return True
+
+
+def _activate_maintained_cli(commit: str) -> None:
+    """Activate the confirmed CLI commit and garbage-collect older roots.
+
+    Activation happens only after the new worker metadata is durable, so a
+    failure here leaves the CLIs stale (previous confirmed version), never
+    stranded on unconfirmed candidate code.
+
+    Args:
+        commit: Exact commit to activate.
+    """
+    try:
+        cli.set_current(commit)
+    except cli.CliError as exc:
+        _err(f"warning: maintained CLI activation failed: {exc}")
+    cli.gc_cli_roots((commit,))
+
+
 def _deploy_locked(options: DeployOptions) -> int:
     """Perform a deployment while holding the deployment lock.
 
@@ -897,14 +969,8 @@ def _deploy_locked(options: DeployOptions) -> int:
             raise DeployAbortedError
         _out("bootstrap: no maintained worker metadata; assuming the legacy worker was stopped")
 
-    _out("validating checkout ...")
-    report = run_validation(options.repo, options.uv_path, options.validation_timeout_seconds)
-    if not report.ok:
-        _err("validation failed; the current worker is left untouched")
-        _err(report.detail)
-        raise DeployAbortedError
+    commit = _validate_and_prepare(options)
 
-    commit = git_commit(options.repo, options.git_timeout_seconds)
     log_file = worker_log_path()
     token = secrets.token_hex(16)
     env = worker_env(token)
@@ -949,8 +1015,9 @@ def _deploy_locked(options: DeployOptions) -> int:
             raise DeployAbortedError
 
     write_meta(new_meta)
-    append_deploy_log(f"deployed commit {commit or 'unknown'} pid={new_meta.pid}")
-    _out(f"deployed git commit {commit or 'unknown'}")
+    _activate_maintained_cli(commit)
+    append_deploy_log(f"deployed commit {commit} pid={new_meta.pid}")
+    _out(f"deployed git commit {commit}")
     _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     _out(f"log: {log_file}")
     return EXIT_OK
@@ -1083,6 +1150,7 @@ def deploy_cmd(args: argparse.Namespace) -> int:
         lock_timeout_seconds=args.lock_timeout,
         validation_timeout_seconds=args.validation_timeout,
         git_timeout_seconds=args.git_timeout,
+        cli_timeout_seconds=args.cli_timeout,
     )
     return deploy(options)
 
@@ -1150,6 +1218,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_GIT_TIMEOUT_SECONDS,
         help="git commit lookup timeout in seconds (default: 10)",
+    )
+    deploy_parser.add_argument(
+        "--cli-timeout",
+        type=float,
+        default=DEFAULT_CLI_TIMEOUT_SECONDS,
+        help="maintained CLI environment build timeout in seconds (default: 600)",
     )
 
     stop_parser = subparsers.add_parser(
