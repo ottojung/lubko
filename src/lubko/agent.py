@@ -354,6 +354,8 @@ def _lifetime_cpu_percent(starttime_ticks: int, cpu_seconds: float, clk_tck: int
 
     Returns:
         The average CPU percentage, or ``0.0`` when it cannot be computed.
+        The value is not clamped: a multithreaded process can legitimately
+        consume more than one CPU's worth of time and report over 100%.
     """
     boot = _boot_time()
     if boot is None:
@@ -361,7 +363,7 @@ def _lifetime_cpu_percent(starttime_ticks: int, cpu_seconds: float, clk_tck: int
     elapsed = time.time() - (boot + starttime_ticks / clk_tck)
     if elapsed <= 0:
         return 0.0
-    return min(cpu_seconds / elapsed * 100.0, 100.0)
+    return cpu_seconds / elapsed * 100.0
 
 
 def proc_cpu_usage(pid: int) -> dict[str, float] | None:

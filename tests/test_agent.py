@@ -459,6 +459,40 @@ def test_proc_cpu_usage_reports_live_process() -> None:
         kill_proc(proc)
 
 
+def test_proc_cpu_usage_preserves_percent_above_100(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPU percentages above 100 are preserved, never clamped.
+
+    A multithreaded process can legitimately consume more than one CPU's
+    worth of time and report over 100%, so the ps-style lifetime average
+    must not be capped at 100.0. A process that used 25 CPU seconds over a
+    10-second wall-clock lifetime reports 250%, not 100%.
+    """
+    monkeypatch.setattr(agent, "_proc_stat_fields", lambda _pid: _stat_fields())
+    monkeypatch.setattr(agent, "_clock_ticks", lambda: 100)
+    monkeypatch.setattr(agent, "_boot_time", lambda: 1000.0)
+    monkeypatch.setattr(time, "time", lambda: 1011.0)
+    usage = agent.proc_cpu_usage(12345)
+    assert usage is not None
+    assert usage["user"] == pytest.approx(20.0)
+    assert usage["system"] == pytest.approx(5.0)
+    assert usage["total"] == pytest.approx(25.0)
+    assert usage["percent"] == pytest.approx(250.0)
+
+
+def _stat_fields() -> list[str]:
+    """Build a crafted /proc/<pid>/stat field list for CPU tests.
+
+    ``utime`` (index 11) is 2000 ticks, ``stime`` (index 12) 500 ticks, and
+    ``starttime`` (index 19) 100 ticks, matching a 100-tick clock.
+
+    Returns:
+        The 20 numeric fields following the process name.
+    """
+    return ["S"] + ["0"] * 10 + ["2000", "500"] + ["0"] * 6 + ["100"]
+
+
 def test_cmd_status_reports_cpu_usage(
     state_dir: Path,
     capsys: pytest.CaptureFixture[str],
