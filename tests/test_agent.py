@@ -340,26 +340,27 @@ def test_tail_snapshot_folds_and_returns_raw_offset(state_dir: Path) -> None:
     log = state_dir / "out.log"
     logical = [f"{i:02d}" + "y" * agent.FOLD_WIDTH for i in range(10)]
     log.write_text("\n".join(logical) + "\n")
-    kept, offset = agent.tail_snapshot(log, 3)
-    assert offset == log.stat().st_size
+    snapshot = agent.tail_snapshot(log, 3)
+    assert snapshot.offset == log.stat().st_size
+    assert not snapshot.pending
     expected = agent.tail_lines(log, 3)
     assert len(expected) == 3
-    assert kept == ("\n".join(expected) + "\n").encode()
-    all_kept, all_offset = agent.tail_snapshot(log, 100)
-    assert all_offset == log.stat().st_size
-    assert all_kept == ("\n".join(agent.tail_lines(log, 0)) + "\n").encode()
+    assert snapshot.display == ("\n".join(expected) + "\n").encode()
+    all_snapshot = agent.tail_snapshot(log, 100)
+    assert all_snapshot.offset == log.stat().st_size
+    assert all_snapshot.display == ("\n".join(agent.tail_lines(log, 0)) + "\n").encode()
 
 
 def test_tail_snapshot_trailing_newline_reflects_file(state_dir: Path) -> None:
     """The snapshot keeps a trailing newline only when the log has one."""
     log = state_dir / "out.log"
     log.write_text("line1\nline2")
-    kept, offset = agent.tail_snapshot(log, 5)
-    assert kept == b"line1\nline2"
-    assert offset == log.stat().st_size
+    snapshot = agent.tail_snapshot(log, 5)
+    assert snapshot.display == b"line1\nline2"
+    assert snapshot.offset == log.stat().st_size
     log.write_text("line1\nline2\n")
-    kept_newline, _offset = agent.tail_snapshot(log, 5)
-    assert kept_newline == b"line1\nline2\n"
+    snapshot_newline = agent.tail_snapshot(log, 5)
+    assert snapshot_newline.display == b"line1\nline2\n"
 
 
 def test_tail_snapshot_race_appends_after_size_capture(
@@ -371,20 +372,20 @@ def test_tail_snapshot_race_appends_after_size_capture(
     initial = b"first\nsecond\n"
     log.write_text(initial.decode())
     snapshot_from = cast(
-        "Callable[[BinaryIO, int, int], tuple[bytes, int]]",
+        "Callable[[BinaryIO, int, int], agent.LogSnapshot]",
         agent.__dict__["_tail_snapshot_from"],
     )
 
-    def wrapped(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, int]:
+    def wrapped(fh: BinaryIO, end: int, max_lines: int) -> agent.LogSnapshot:
         with log.open("ab") as writer:
             writer.write(b"third\n")
         return snapshot_from(fh, end, max_lines)
 
     monkeypatch.setattr(agent, "_tail_snapshot_from", wrapped)
-    kept, offset = agent.tail_snapshot(log, 10)
-    assert offset == len(initial)
-    assert kept == initial
-    assert b"third" not in kept
+    snapshot = agent.tail_snapshot(log, 10)
+    assert snapshot.offset == len(initial)
+    assert snapshot.display == initial
+    assert b"third" not in snapshot.display
     assert log.read_bytes().endswith(b"third\n")
 
 
@@ -655,9 +656,108 @@ def test_tail_snapshot_strips_ansi(state_dir: Path) -> None:
     """The follow snapshot strips ANSI CSI/SGR sequences from displayed bytes."""
     log = state_dir / "out.log"
     log.write_text("\x1b[32mgreen\x1b[0m\nplain\n")
-    kept, offset = agent.tail_snapshot(log, 5)
-    assert offset == log.stat().st_size
-    assert kept == b"green\nplain\n"
+    snapshot = agent.tail_snapshot(log, 5)
+    assert snapshot.offset == log.stat().st_size
+    assert snapshot.display == b"green\nplain\n"
+
+
+def test_tail_snapshot_holds_dangling_fragment_for_follow(state_dir: Path) -> None:
+    """A snapshot ending mid-CSI holds the fragment back instead of leaking it."""
+    log = state_dir / "out.log"
+    log.write_bytes(b"intro\n\x1b[3")
+    snapshot = agent.tail_snapshot(log, 5)
+    assert snapshot.offset == log.stat().st_size
+    assert b"\x1b" not in snapshot.display
+    assert snapshot.display == b"intro\n"
+    assert snapshot.pending == "\x1b[3"
+
+
+def test_snapshot_follow_handoff_continues_boundary_sequence(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The follow normalizer completes stripping of a snapshot-boundary sequence."""
+    log = state_dir / "out.log"
+    log.write_bytes(b"intro\n\x1b[3")
+    snapshot = agent.tail_snapshot(log, 5)
+    assert snapshot.pending == "\x1b[3"
+    with log.open("ab") as writer:
+        writer.write(b"1mrest\x1b[0m done\n")
+    normalizer = cast(
+        "type[Any]",
+        agent.__dict__["_LogNormalizer"],
+    )(pending=snapshot.pending)
+    with log.open("rb") as fh:
+        fh.seek(snapshot.offset)
+        normalizer.write(fh.read())
+    normalizer.close()
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "rest" in out
+    assert "done" in out
+
+
+def test_cmd_log_drops_dangling_fragment_without_follow(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log without --follow never shows an incomplete trailing escape fragment."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_bytes(b"clean\n\x1b[3")
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "clean" in out
+
+
+def test_cmd_log_follow_normalizes_growing_boundary_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Growing --follow output is normalized, including the snapshot-boundary split."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
+        log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+        log_path.write_bytes(b"start\n\x1b[3")
+
+        def append_and_finish() -> None:
+            time.sleep(0.5)
+            with log_path.open("ab") as writer:
+                writer.write(b"1mgreen text\x1b[0m\nend\n")
+            agent.update_meta(
+                "aaaaaaaa",
+                lambda m: m.update(state="succeeded", finished_at=time.time()),
+            )
+
+        writer = threading.Thread(target=append_and_finish, daemon=True)
+        writer.start()
+        code = agent.main(["log", "aaaaaaaa", "--follow", "--lines", "5"])
+        assert code == agent.EXIT_OK
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "start" in out
+        assert "green text" in out
+        assert "end" in out
+        writer.join(timeout=5)
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_log_preserves_durable_raw_log(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The durable output.log retains raw control bytes while display is normalized."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    raw = b"\x1b[31mred\x1b[0m\nplain\n"
+    log_path.write_bytes(raw)
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "red" in out
+    assert log_path.read_bytes() == raw
 
 
 def test_cmd_log_strips_ansi_without_follow(
@@ -708,6 +808,22 @@ def test_log_normalizer_strips_ansi_across_chunk_boundary(
     assert out == "green end\n"
 
 
+def test_log_normalizer_strips_osc_st_split_across_chunks(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An OSC ST terminator split across reads is still fully stripped."""
+    normalizer = cast(
+        "type[Any]",
+        agent.__dict__["_LogNormalizer"],
+    )()
+    normalizer.write(b"a\x1b]8;;url\x1b")
+    normalizer.write(b"\\done\x1b]8;;\x1b\\end\n")
+    normalizer.close()
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert out == "adoneend\n"
+
+
 def test_log_normalizer_preserves_utf8_across_chunk_boundary(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -738,6 +854,61 @@ def test_cmd_log_preserves_utf8_without_follow(
     out = capsys.readouterr().out
     assert "\x1b" not in out
     assert "naïve café ☕" in out
+
+
+def test_cmd_log_strips_osc_sequences(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log strips common OSC sequences, including OSC 8 hyperlinks."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_text(
+        "\x1b]8;;https://example.com\x07link\x1b]8;;\x07\n"
+        "\x1b]8;;https://example.org\x1b\\styled\x1b]8;;\x1b\\\n"
+        "\x1b]0;title set\x07after\n"
+    )
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "link" in out
+    assert "styled" in out
+    assert "after" in out
+
+
+def test_cmd_log_strips_full_csi_parameter_bytes(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log strips CSI sequences with colon/less/equal/greater parameter bytes."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_text(
+        "\x1b[38:2:255:0:0mcolon params\x1b[0m\n"
+        "\x1b[?25lhide cursor\x1b[?25h\n"
+        "\x1b[1;2:3mcombined\x1b[0m\n"
+    )
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "colon params" in out
+    assert "hide cursor" in out
+    assert "combined" in out
+
+
+def test_cmd_log_does_not_overstrip_unterminated_osc(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unterminated OSC mid-log is treated as text, not over-stripped."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_text("first\nnote \x1b]8;;url without terminator\nlast\n")
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "first" in out
+    assert "note \x1b]8;;url without terminator" in out
+    assert "last" in out
 
 
 def test_cmd_prompt_attached_normalizes_colored_output(
