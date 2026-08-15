@@ -529,6 +529,25 @@ def test_cmd_status_cpu_is_unknown_without_live_process(
     assert "cpu:        -" in capsys.readouterr().out
 
 
+def test_cmd_status_hides_cpu_for_reused_pid(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Status hides CPU time when a stored PID belongs to another process."""
+    make_agent(state_dir, "aaaaaaaa", state_value="running", pid=os.getpid())
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    cpu = agent.proc_cpu_seconds(os.getpid())
+    assert cpu is not None
+    assert cpu > 0
+    assert agent.is_alive(meta) is False
+    assert agent.main(["status", "aaaaaaaa", "--json"]) == agent.EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    assert data["cpu_seconds"] is None
+    assert agent.main(["status", "aaaaaaaa"]) == agent.EXIT_OK
+    assert "cpu:        -" in capsys.readouterr().out
+
+
 def test_cmd_new_creates_idle_agent_with_supplied_id(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

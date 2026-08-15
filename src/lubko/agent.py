@@ -1648,7 +1648,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     _out(f"agent:      {aid}")
     _out(f"state:      {state}")
     _out(f"alive:      {'yes' if alive else 'no'}")
-    _out(f"cpu:        {fmt_cpu(proc_cpu_seconds(meta.get('pid')))}")
+    _out(f"cpu:        {fmt_cpu(_status_cpu_seconds(meta, alive=alive))}")
     _out(f"cwd:        {meta.get('cwd') or '-'}")
     _out(f"created:    {fmt_time(meta.get('created_at'))}")
     _out(f"started:    {fmt_time(meta.get('started_at'))}")
@@ -1667,6 +1667,25 @@ def cmd_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _status_cpu_seconds(meta: Meta, *, alive: bool) -> float | None:
+    """Return the agent's CPU time, gated on the exact process identity.
+
+    CPU time is only meaningful when the recorded PID is verified to be the
+    exact live agent process. A stored PID that exists but was reused by an
+    unrelated process must never surface CPU time.
+
+    Args:
+        meta: Agent metadata.
+        alive: Whether the exact agent process is alive.
+
+    Returns:
+        The total CPU seconds, or ``None`` when not alive.
+    """
+    if not alive:
+        return None
+    return proc_cpu_seconds(meta.get("pid"))
+
+
 def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
     """Build the JSON status mapping for an agent.
 
@@ -1683,7 +1702,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "id": aid,
         "state": state,
         "alive": alive,
-        "cpu_seconds": proc_cpu_seconds(meta.get("pid")),
+        "cpu_seconds": _status_cpu_seconds(meta, alive=alive),
         "native_session_id": meta.get("native_session_id"),
         "pid": meta.get("pid"),
         "pgid": meta.get("pgid"),
