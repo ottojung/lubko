@@ -57,7 +57,9 @@ First request:
 {"type":"confirm","commit":"<exact proposed commit>"}
 ```
 
-The controller returns a fresh random challenge and stores only its digest.
+The controller returns a fresh random challenge and stores only its digest. The
+challenge is exactly 7 characters of lowercase hexadecimal text (canonical form
+`^[0-9a-f]{7}$`, for example `3fa91c0`); any other value is malformed.
 
 Second request:
 
@@ -65,13 +67,13 @@ Second request:
 {
   "type":"confirm",
   "commit":"<exact proposed commit>",
-  "challenge":"<the first challenge reversed>"
+  "challenge":"<the first 7-character hex challenge reversed>"
 }
 ```
 
 The controller rechecks the deadline and candidate process identity while holding the deployment lock. Only after the response is valid does it write the candidate as maintained-worker metadata and persist terminal `confirmed` state.
 
-A wrong commit, missing or wrong challenge, candidate failure, or timeout triggers rollback rather than leaving the candidate accepted ambiguously.
+A wrong commit, missing, wrong-length or non-hex challenge, candidate failure, or timeout triggers rollback rather than leaving the candidate accepted ambiguously.
 
 ## Global CLI coherence
 

@@ -1089,7 +1089,7 @@ The normal supervised sequence is:
 checkout exact commit
     -> provisional candidate + armed rollback watchdog
 confirm exact commit
-    -> random challenge
+    -> 7-character hex challenge
 confirm exact commit + reversed challenge
     -> terminal confirmation
 ```
