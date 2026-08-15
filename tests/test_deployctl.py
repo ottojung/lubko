@@ -8,17 +8,22 @@ rollback/failure path preserves the prior confirmed CLI version.
 
 from __future__ import annotations
 
+import json
 import os
+import secrets
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
+from uuid import uuid4
 
+import psycopg
 import pytest
 
 from lubko import cli, lifecycle
@@ -32,11 +37,16 @@ from lubko.lifecycle import (
     worker_alive,
     write_meta,
 )
+from lubko.worker import group_has_members
 from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any
+
     from lubko.lifecycle import ProcessIdentity
+    from tests import _pg
 
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
 LINGER_SOURCE: Final = (
@@ -976,3 +986,1084 @@ def test_watchdog_rollback_bad_candidate_restores_maintained_worker(
         with suppress(Exception):
             candidate_proc.wait(timeout=5)
         kill_many(spawned)
+
+
+def write_database_config(tmp_path: Path, cluster: _pg.PgCluster) -> Path:
+    """Write a private database configuration file for the cluster.
+
+    Args:
+        tmp_path: Temporary directory for the configuration file.
+        cluster: The running PostgreSQL cluster.
+
+    Returns:
+        The configuration file path.
+    """
+    conf = tmp_path / "database.conf"
+    conf.write_text(
+        f"host={cluster.socket_dir}\n"
+        f"port={cluster.port}\n"
+        "dbname=postgres\n"
+        "user=postgres\n"
+        "password=local-trust\n",
+        encoding="utf-8",
+    )
+    conf.chmod(0o600)
+    return conf
+
+
+def insert_running_job(conninfo: str, cwd: str, command: str) -> object:
+    """Insert a protocol v2 running command job and return its id.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        cwd: Working directory for the job.
+        command: Shell command to run.
+
+    Returns:
+        The job identifier.
+    """
+    payload = json.dumps({
+        "v": 2,
+        "type": "command",
+        "request": {"cwd": cwd, "command": command},
+        "state": {"status": "running"},
+    })
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (payload,),
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def read_job_status(conninfo: str, job_id: object) -> str:
+    """Read the current status of one job row.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        job_id: The job identifier.
+
+    Returns:
+        The job status.
+    """
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
+            (job_id,),
+        ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def test_read_pipe_line_reads_one_line() -> None:
+    """The parent reads exactly one newline-terminated helper response line."""
+    reader, writer = os.pipe()
+    try:
+        os.write(writer, b'{"type": "checkout", "ok": true}\n')
+        assert dc._read_pipe_line(reader) == '{"type": "checkout", "ok": true}'
+    finally:
+        os.close(reader)
+        os.close(writer)
+
+
+def test_read_pipe_line_returns_empty_on_eof() -> None:
+    """A helper that dies before writing yields an empty read deterministically."""
+    reader, writer = os.pipe()
+    os.close(writer)
+    try:
+        assert not dc._read_pipe_line(reader)
+    finally:
+        os.close(reader)
+
+
+def test_queue_checkout_parent_reports_helper_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The queue-checkout parent reports the helper response and returns."""
+    expected = {"type": "checkout", "ok": True, "phase": "pending"}
+
+    def fake_helper(_options: dc.Options, _commit: str, _job_id: object, writer: int) -> None:
+        del _options, _commit, _job_id
+        os.write(writer, (json.dumps(expected, sort_keys=True) + "\n").encode())
+        os._exit(0)
+
+    monkeypatch.setattr(dc, "_run_helper", fake_helper)
+    response = dc._queue_checkout(make_options(Path("/repo")), "2" * 40, uuid4())
+
+    assert response == expected
+    assert response["ok"] is True
+
+
+def test_queue_checkout_raises_when_helper_dies_silently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A helper that dies before writing reports a deterministic parent error."""
+    monkeypatch.setattr(dc, "_run_helper", lambda *_args: os._exit(0))
+
+    with pytest.raises(dc.DeployCtlError, match="exited before reporting"):
+        dc._queue_checkout(make_options(Path("/repo")), "2" * 40, uuid4())
+
+
+def test_queue_checkout_parent_does_not_wait_for_helper_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent exits as soon as the response is delivered, never the handoff."""
+    released = threading.Event()
+
+    def fake_helper(_options: dc.Options, _commit: str, _job_id: object, writer: int) -> None:
+        os.write(writer, b'{"type": "checkout", "ok": true}\n')
+        released.wait(timeout=10)
+        os._exit(0)
+
+    monkeypatch.setattr(dc, "_run_helper", fake_helper)
+
+    start = time.monotonic()
+    dc._queue_checkout(make_options(Path("/repo")), "2" * 40, uuid4())
+    elapsed = time.monotonic() - start
+    released.set()
+
+    assert elapsed < 2.0
+
+
+def test_handle_checkout_uses_queue_path_when_queue_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A queue-owned checkout dispatches to the helper path with the captured id."""
+    job_id = uuid4()
+    captured: list[object] = []
+    monkeypatch.setattr(dc, "_current_queue_job_id", lambda: (job_id, False))
+
+    def fake_queue(_options: dc.Options, _commit: str, received: object) -> dict[str, object]:
+        captured.append(received)
+        return {"type": "checkout", "ok": True, "phase": "pending"}
+
+    monkeypatch.setattr(dc, "_queue_checkout", fake_queue)
+
+    response = dc._handle_checkout(make_options(tmp_path), {"type": "checkout", "commit": "2" * 40})
+
+    assert response["ok"] is True
+    assert captured == [job_id]
+
+
+def test_handle_checkout_rejects_cancelled_queue_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A cancelled queue owner aborts before any handoff work."""
+    monkeypatch.setattr(dc, "_current_queue_job_id", lambda: (uuid4(), True))
+
+    with pytest.raises(dc.DeployCtlError, match="cancelled"):
+        dc._handle_checkout(make_options(tmp_path), {"type": "checkout", "commit": "2" * 40})
+
+
+def test_handle_checkout_manual_path_stays_synchronous(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A manual checkout retains the synchronous locked safe path."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(dc, "_current_queue_job_id", lambda: (None, False))
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    state = pending_state(repo=str(repo), old=first, new=second)
+    acquired: list[bool] = []
+
+    class FakeLock:
+        """Minimal deployment-lock context for the manual path."""
+
+        def __enter__(self) -> None:
+            acquired.append(True)
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: FakeLock())
+    monkeypatch.setattr(dc, "_deploy_locked", lambda _options, _commit: state)
+
+    response = dc._handle_checkout(make_options(repo), {"type": "checkout", "commit": second})
+
+    assert acquired == [True]
+    assert response["ok"] is True
+    assert response["commit"] == second
+
+
+def test_prepare_locked_is_reversible_and_leaves_previous_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preparation never stops the previous worker and stays reversible."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    previous = worker_meta(first, pid=100, repo=str(repo))
+    written: list[dc.RollbackState] = []
+    stopped: list[WorkerMeta] = []
+    gated_proc: subprocess.Popen[bytes] | None = None
+
+    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
+    monkeypatch.setattr(dc, "read_meta", lambda: previous)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(dc, "_require_exact_commit", lambda *_args: None)
+    monkeypatch.setattr(dc, "_require_clean_checkout", lambda *_args: None)
+    monkeypatch.setattr(dc, "_checkout", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        dc,
+        "run_validation",
+        lambda _repo, _uv, _timeout: ValidationReport(ok=True, detail=""),
+    )
+    monkeypatch.setattr(cli, "build_cli_root", lambda *_args, **_kwargs: Path())
+    monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
+    monkeypatch.setattr(dc, "_write_state", written.append)
+    monkeypatch.setattr(dc, "_fork_watchdog", lambda _timeout: None)
+
+    def record_stop(meta: WorkerMeta, _grace: float) -> bool:
+        stopped.append(meta)
+        return True
+
+    monkeypatch.setattr(dc, "stop_worker", record_stop)
+
+    def fake_gated(_options: dc.Options, _commit: str) -> dc.GatedWorker:
+        nonlocal gated_proc
+        gated_proc = subprocess.Popen(
+            [SLEEP_BIN, "300"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        guard.register(gated_proc)
+        return dc.GatedWorker(
+            proc=gated_proc,
+            gate_writer=0,
+            meta=worker_meta(second, pid=200, repo=str(repo)),
+        )
+
+    monkeypatch.setattr(dc, "_spawn_gated_candidate", fake_gated)
+
+    try:
+        state, gated = dc._prepare_locked(make_options(repo), second)
+
+        assert state.previous_retiring is False
+        assert state.previous_meta == previous
+        assert state.new_meta == gated.meta
+        assert len(written) == 1
+        assert written[0].previous_retiring is False
+        assert stopped == []
+    finally:
+        if gated_proc is not None:
+            kill_proc(gated_proc)
+
+
+def test_prepare_locked_restores_previous_on_validation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed candidate validation restores the previous checkout."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    previous = worker_meta(first, pid=100, repo=str(repo))
+    checkouts: list[tuple[str, bool]] = []
+    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
+    monkeypatch.setattr(dc, "read_meta", lambda: previous)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(dc, "_require_exact_commit", lambda *_args: None)
+    monkeypatch.setattr(dc, "_require_clean_checkout", lambda *_args: None)
+
+    def checkout(_repo: Path, commit: str, _timeout: float, *, force: bool) -> bool:
+        checkouts.append((commit, force))
+        return True
+
+    monkeypatch.setattr(dc, "_checkout", checkout)
+    monkeypatch.setattr(
+        dc,
+        "run_validation",
+        lambda _repo, _uv, _timeout: ValidationReport(ok=False, detail="boom"),
+    )
+    monkeypatch.setattr(cli, "remove_cli_root", lambda _commit: None)
+
+    with pytest.raises(dc.DeployCtlError, match="validation failed"):
+        dc._prepare_locked(make_options(repo), second)
+
+    assert checkouts == [(second, False), (first, True)]
+
+
+def test_prepare_locked_rolls_back_when_watchdog_fork_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watchdog fork failure undoes the prepared mission completely."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    previous = worker_meta(first, pid=100, repo=str(repo))
+    written: list[dc.RollbackState] = []
+    rolled_back: list[dc.RollbackState] = []
+    closed: list[int] = []
+    gated_proc: subprocess.Popen[bytes] | None = None
+
+    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
+    monkeypatch.setattr(dc, "read_meta", lambda: previous)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(dc, "_require_exact_commit", lambda *_args: None)
+    monkeypatch.setattr(dc, "_require_clean_checkout", lambda *_args: None)
+    monkeypatch.setattr(dc, "_checkout", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        dc,
+        "run_validation",
+        lambda _repo, _uv, _timeout: ValidationReport(ok=True, detail=""),
+    )
+    monkeypatch.setattr(cli, "build_cli_root", lambda *_args, **_kwargs: Path())
+    monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
+    monkeypatch.setattr(dc, "_write_state", written.append)
+
+    def failing_fork_watchdog(_timeout: float) -> None:
+        msg = "fork boom"
+        raise dc.DeployCtlError(msg)
+
+    monkeypatch.setattr(dc, "_fork_watchdog", failing_fork_watchdog)
+
+    def record_close(fd: int) -> None:
+        closed.append(fd)
+
+    monkeypatch.setattr(dc, "_close_gate", record_close)
+
+    def record_rollback(state: dc.RollbackState) -> bool:
+        rolled_back.append(state)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", record_rollback)
+
+    def fake_gated(_options: dc.Options, _commit: str) -> dc.GatedWorker:
+        nonlocal gated_proc
+        gated_proc = subprocess.Popen(
+            [SLEEP_BIN, "300"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        guard.register(gated_proc)
+        return dc.GatedWorker(
+            proc=gated_proc,
+            gate_writer=7,
+            meta=worker_meta(second, pid=200, repo=str(repo)),
+        )
+
+    monkeypatch.setattr(dc, "_spawn_gated_candidate", fake_gated)
+
+    try:
+        with pytest.raises(dc.DeployCtlError, match="fork boom"):
+            dc._prepare_locked(make_options(repo), second)
+
+        assert len(written) == 1
+        assert written[0].previous_retiring is False
+        assert closed == [7]
+        assert len(rolled_back) == 1
+        assert rolled_back[0].previous_retiring is False
+    finally:
+        if gated_proc is not None:
+            kill_proc(gated_proc)
+
+
+def test_abort_mission_closes_gate_and_restores_without_stopping_previous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aborting a mission never crosses into the destructive boundary."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    state = pending_state(repo=str(repo), old=first, new=second)
+    closed: list[int] = []
+    restored: list[tuple[str, bool]] = []
+
+    def record_close(fd: int) -> None:
+        closed.append(fd)
+
+    monkeypatch.setattr(dc, "_close_gate", record_close)
+
+    def record_checkout(_repo: Path, commit: str, _timeout: float, *, force: bool) -> bool:
+        restored.append((commit, force))
+        return True
+
+    monkeypatch.setattr(dc, "_checkout", record_checkout)
+
+    dummy = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(dummy)
+    try:
+        dc._abort_mission(dc.GatedWorker(proc=dummy, gate_writer=9, meta=state.new_meta), state)
+    finally:
+        kill_proc(dummy)
+
+    assert closed == [9]
+    assert restored == [(first, True)]
+
+
+def test_wait_for_durable_success_polls_until_succeeded(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The helper waits for the exact row to become durably succeeded."""
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    job_id = insert_running_job(jobs_db, str(tmp_path), "echo hi")
+
+    def finalize() -> None:
+        time.sleep(0.3)
+        with psycopg.connect(jobs_db) as conn:
+            conn.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = jsonb_set(\n"
+                "    jsonb_set(payload::jsonb, '{state,status}', to_jsonb('succeeded'::text)),\n"
+                "    '{state,finished_at}', to_jsonb('2026-01-01T00:00:00.000000Z'::text)\n"
+                ")::text\n"
+                "WHERE id = %s",
+                (job_id,),
+            )
+
+    thread = threading.Thread(target=finalize)
+    thread.start()
+    try:
+        dc._wait_for_durable_success(job_id, time.time() + 10)
+    finally:
+        thread.join(timeout=10)
+
+    assert read_job_status(jobs_db, job_id) == "succeeded"
+
+
+def test_wait_for_durable_success_rejects_cancelled(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that reaches cancelled before success aborts the helper."""
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    job_id = insert_running_job(jobs_db, str(tmp_path), "echo hi")
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = jsonb_set("
+            "payload::jsonb, '{state,status}', to_jsonb('cancelled'::text))::text\n"
+            "WHERE id = %s",
+            (job_id,),
+        )
+
+    with pytest.raises(dc.DeployCtlError, match="cancelled before durable success"):
+        dc._wait_for_durable_success(job_id, time.time() + 5)
+
+
+def test_wait_for_durable_success_rejects_failed(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that reaches failed before success aborts the helper."""
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    job_id = insert_running_job(jobs_db, str(tmp_path), "echo hi")
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = jsonb_set("
+            "payload::jsonb, '{state,status}', to_jsonb('failed'::text))::text\n"
+            "WHERE id = %s",
+            (job_id,),
+        )
+
+    with pytest.raises(dc.DeployCtlError, match="failed before durable success"):
+        dc._wait_for_durable_success(job_id, time.time() + 5)
+
+
+def test_wait_for_durable_success_rejects_deleted(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted row aborts the helper before any destructive work."""
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    job_id = insert_running_job(jobs_db, str(tmp_path), "echo hi")
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute("DELETE FROM lubko.jobs WHERE id = %s", (job_id,))
+
+    with pytest.raises(dc.DeployCtlError, match="deleted before durable success"):
+        dc._wait_for_durable_success(job_id, time.time() + 5)
+
+
+def test_wait_for_durable_success_rejects_deadline(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that never reaches success before the deadline aborts the helper."""
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    job_id = insert_running_job(jobs_db, str(tmp_path), "echo hi")
+
+    with pytest.raises(dc.DeployCtlError, match="before the deadline"):
+        dc._wait_for_durable_success(job_id, time.time() + 0.2)
+
+
+# ---------------------------------------------------------------------------
+# End-to-end process tests
+# ---------------------------------------------------------------------------
+
+REPO_ROOT: Final = Path(__file__).resolve().parent.parent
+WORKER_TIMINGS: Final = {
+    "LUBKO_POLL_INTERVAL_SECONDS": "0.05",
+    "LUBKO_PROCESS_POLL_INTERVAL_SECONDS": "0.02",
+    "LUBKO_CANCEL_GRACE_SECONDS": "0.5",
+    "LUBKO_LEASE_DURATION_SECONDS": "2.0",
+    "LUBKO_LEASE_REFRESH_INTERVAL_SECONDS": "0.15",
+    "LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS": "0.2",
+    "LUBKO_LEASE_SAFETY_MARGIN_SECONDS": "0.3",
+    "LUBKO_OUTPUT_PUBLICATION_INTERVAL_SECONDS": "0.1",
+    "LUBKO_CLAIM_BATCH_LIMIT": "16",
+}
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = 60.0) -> None:
+    """Poll until a predicate holds, raising if the deadline expires.
+
+    Args:
+        predicate: Condition to satisfy.
+        timeout: Maximum seconds to wait.
+
+    Raises:
+        AssertionError: If the condition is not met within the timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    msg = "condition not met within timeout"
+    raise AssertionError(msg)
+
+
+def make_fake_uv(tmp_path: Path, python: str, *, bad_candidate_commit: str | None = None) -> Path:
+    """Write a stub ``uv`` that validates instantly and runs the real worker.
+
+    Every ``uv``-based validation step exits zero, while ``uv run
+    lubko-worker`` (used to spawn candidates and restored workers) executes the
+    real worker from the current project. When ``bad_candidate_commit`` is
+    given, the candidate commit fails to start so the handoff cannot complete.
+
+    Args:
+        tmp_path: Temporary directory for the script.
+        python: Python interpreter that runs the real worker.
+        bad_candidate_commit: Exact commit whose worker must fail to start.
+
+    Returns:
+        The fake ``uv`` executable path.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "uv"
+    lines = ["#!/bin/sh", 'if [ "$1" = "run" ] && [ "$2" = "lubko-worker" ]; then']
+    if bad_candidate_commit is not None:
+        lines.extend([
+            f'    if [ "$(git -C . rev-parse HEAD)" = "{bad_candidate_commit}" ]; then',
+            "        exit 7",
+            "    fi",
+        ])
+    lines.extend([f"    exec {python} -m lubko.worker", "fi", "exit 0"])
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def worker_env_with(token: str) -> dict[str, str]:
+    """Build the maintained-worker environment with fast timings.
+
+    Args:
+        token: Lifecycle token for the worker.
+
+    Returns:
+        The worker environment.
+    """
+    env = lifecycle.worker_env(token)
+    env["LUBKO_WORKER_ID"] = "e2e-worker"
+    env.update(WORKER_TIMINGS)
+    return env
+
+
+def spawn_maintained_worker(env: dict[str, str]) -> subprocess.Popen[bytes]:
+    """Spawn a real maintained worker process registered with the guard.
+
+    Args:
+        env: Worker environment.
+
+    Returns:
+        The spawned worker process.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "lubko.worker"],
+        cwd=REPO_ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(proc)
+    return proc
+
+
+def insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
+    """Insert a protocol v2 pending command job.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        cwd: Working directory for the job.
+        command: Shell command to run.
+
+    Returns:
+        The job identifier.
+    """
+    payload = json.dumps({
+        "v": 2,
+        "type": "command",
+        "request": {"cwd": cwd, "command": command},
+        "state": {"status": "pending"},
+    })
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (payload,),
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def insert_pending_args_job(conninfo: str, cwd: str, args: list[str]) -> object:
+    """Insert a protocol v2 pending argv-style command job.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        cwd: Working directory for the job.
+        args: Executable arguments.
+
+    Returns:
+        The job identifier.
+    """
+    payload = json.dumps({
+        "v": 2,
+        "type": "command",
+        "request": {"cwd": cwd, "args": args},
+        "state": {"status": "pending"},
+    })
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (payload,),
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def read_job(conninfo: str, job_id: object) -> dict[str, Any]:
+    """Read one job payload as a decoded mapping.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        job_id: The job identifier.
+
+    Returns:
+        The decoded job payload.
+    """
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "SELECT payload FROM lubko.jobs WHERE id = %s",
+            (job_id,),
+        ).fetchone()
+    assert row is not None
+    parsed = json.loads(str(row[0]))
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def deployctl_args(repo: Path, fake_uv: Path, request: str) -> list[str]:
+    """Build the argv of one supervised controller queue job.
+
+    Args:
+        repo: Deployment checkout.
+        fake_uv: Stub ``uv`` executable.
+        request: JSON request object.
+
+    Returns:
+        The controller argv.
+    """
+    return [
+        sys.executable,
+        "-m",
+        "lubko.deployctl",
+        request,
+        "--repo",
+        str(repo),
+        "--uv",
+        str(fake_uv),
+        "--confirm-window-seconds",
+        "120",
+        "--grace-seconds",
+        "1.0",
+        "--db-timeout",
+        "5",
+        "--lock-timeout",
+        "15",
+        "--validation-timeout",
+        "30",
+        "--git-timeout",
+        "10",
+        "--cli-timeout",
+        "60",
+    ]
+
+
+def kill_recorded_workers() -> None:
+    """Force-kill every worker recorded in lifecycle metadata or rollback state.
+
+    The candidate/restored workers are spawned by the controller subprocess and
+    therefore never appear in the process guard registry, so they are stopped
+    by exact recorded identity here.
+    """
+    recorded: list[WorkerMeta] = []
+    meta = read_meta()
+    if meta is not None:
+        recorded.append(meta)
+    state = dc._read_state()
+    if state is not None:
+        recorded.append(state.new_meta)
+    for worker in recorded:
+        pgid = worker.pgid or worker.pid
+        if pgid is None:
+            continue
+        if group_has_members(pgid):
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and group_has_members(pgid):
+                time.sleep(0.02)
+
+
+def any_lubko_processes() -> bool:
+    """Return whether any live controller/helper/worker process still exists.
+
+    Matches only the module invocation forms used by the deployment flow
+    (``lubko.deployctl`` for controller/helper/watchdog, ``lubko.worker`` for
+    maintained workers) so the host orchestrator's own ``lubko-worker`` daemon
+    is never mistaken for a leak.
+
+    Returns:
+        ``True`` when a stray controller/helper/worker process still exists.
+    """
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if b"lubko.deployctl" in cmdline or b"lubko.worker" in cmdline:
+            return True
+    return False
+
+
+def assert_no_lubko_leaks() -> None:
+    """Assert every controller/helper/worker process has fully exited."""
+    wait_until(lambda: not any_lubko_processes(), timeout=20.0)
+
+
+def _prepare_e2e(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pg_cluster: _pg.PgCluster,
+    *,
+    bad_candidate: bool = False,
+) -> tuple[Path, str, str, Path, subprocess.Popen[bytes], WorkerMeta, Path]:
+    """Build the shared end-to-end deployment environment.
+
+    Args:
+        tmp_path: Temporary directory for the test.
+        monkeypatch: Pytest monkeypatch fixture.
+        pg_cluster: The running cluster.
+        bad_candidate: Whether the candidate worker must fail to start.
+
+    Returns:
+        The repo, commits, database config, old worker process, old worker
+        metadata, and fake ``uv``.
+    """
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    repo, first, second = make_repo(tmp_path / "repo")
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    token = secrets.token_hex(16)
+    env = worker_env_with(token)
+    old = spawn_maintained_worker(env)
+    old_meta = real_meta(old, repo, first, token)
+    write_meta(old_meta)
+    bad_commit = second if bad_candidate else None
+    fake_uv = make_fake_uv(tmp_path, sys.executable, bad_candidate_commit=bad_commit)
+    return repo, first, second, conf, old, old_meta, fake_uv
+
+
+def _prepare_e2e_parts(
+    prepared: tuple[Path, str, str, Path, subprocess.Popen[bytes], WorkerMeta, Path],
+) -> tuple[Path, str, WorkerMeta, Path]:
+    """Select the parts most end-to-end tests need from a prepared environment.
+
+    Args:
+        prepared: Result of :func:`_prepare_e2e`.
+
+    Returns:
+        The repo, candidate commit, old worker metadata, and fake ``uv``.
+    """
+    return prepared[0], prepared[2], prepared[5], prepared[6]
+
+
+def _preparing_mission() -> bool:
+    """Return whether a pending mission is being prepared (not yet retiring)."""
+    state = dc._read_state()
+    return state is not None and state.status == dc.STATUS_PENDING and not state.previous_retiring
+
+
+def _live_handoff_done() -> bool:
+    """Return whether the destructive handoff completed with a live deadline."""
+    state = dc._read_state()
+    return state is not None and state.previous_retiring and state.deadline > time.time()
+
+
+def _rolled_back_state() -> bool:
+    """Return whether the deployment reached terminal rolled_back."""
+    state = dc._read_state()
+    return state is not None and state.status == dc.STATUS_ROLLED_BACK
+
+
+def _wait_for_checkout_success_and_old_death(
+    jobs_db: str, checkout_id: object, old_meta: WorkerMeta
+) -> None:
+    """Wait for durable checkout success and prove the old worker dies after.
+
+    The control job must reach durable ``succeeded`` before the old worker is
+    stopped; this is the exit-143 regression. Returns once both are observed.
+
+    Args:
+        jobs_db: Connection string.
+        checkout_id: The checkout queue job.
+        old_meta: The old worker metadata.
+    """
+    dead_at: float | None = None
+    succeeded_at: float | None = None
+    deadline = time.monotonic() + 90.0
+    while time.monotonic() < deadline:
+        status = read_job(jobs_db, checkout_id)["state"]["status"]
+        if succeeded_at is None and status == "succeeded":
+            succeeded_at = time.monotonic()
+        if dead_at is None and not worker_alive(old_meta):
+            dead_at = time.monotonic()
+        if succeeded_at is not None and dead_at is not None:
+            break
+        time.sleep(0.02)
+    assert succeeded_at is not None, "checkout row never reached succeeded"
+    assert dead_at is not None, "old worker never died"
+    assert dead_at >= succeeded_at, "old worker died before durable checkout success"
+
+
+def _run_confirmation_handshake(jobs_db: str, repo: Path, fake_uv: Path, commit: str) -> None:
+    """Run the two-request confirmation handshake through the replacement worker.
+
+    Args:
+        jobs_db: Connection string.
+        repo: Deployment checkout.
+        fake_uv: Stub ``uv`` executable.
+        commit: Exact proposed commit.
+    """
+    confirm1_id = insert_pending_args_job(
+        jobs_db,
+        str(repo),
+        deployctl_args(repo, fake_uv, json.dumps({"type": "confirm", "commit": commit})),
+    )
+    wait_until(
+        lambda: read_job(jobs_db, confirm1_id)["state"]["status"] == "succeeded",
+        timeout=60.0,
+    )
+    confirm1 = json.loads(str(read_job(jobs_db, confirm1_id)["result"]["stdout"]))
+    challenge = confirm1["challenge"]
+    assert isinstance(challenge, str)
+    assert challenge
+
+    confirm2_id = insert_pending_args_job(
+        jobs_db,
+        str(repo),
+        deployctl_args(
+            repo,
+            fake_uv,
+            json.dumps({"type": "confirm", "commit": commit, "challenge": challenge[::-1]}),
+        ),
+    )
+    wait_until(
+        lambda: read_job(jobs_db, confirm2_id)["state"]["status"] == "succeeded",
+        timeout=60.0,
+    )
+    confirm2 = json.loads(str(read_job(jobs_db, confirm2_id)["result"]["stdout"]))
+    assert confirm2["confirmed"] is True
+
+
+def test_end_to_end_queue_checkout_survives_old_worker_shutdown(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queue checkout completes even though the old worker shuts down.
+
+    The control job exits zero and reaches durable ``succeeded`` before the old
+    worker is stopped (the production exit-143 regression), the replacement
+    worker consumes both confirmation jobs, and unrelated active jobs are
+    terminated/reaped by the old worker's shutdown as before.
+    """
+    prepared = _prepare_e2e(tmp_path, monkeypatch, pg_cluster)
+    repo, second, old_meta, fake_uv = _prepare_e2e_parts(prepared)
+    try:
+        unrelated = insert_pending_job(jobs_db, str(repo), "sleep 30")
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
+        )
+        wait_until(
+            lambda: read_job(jobs_db, unrelated)["state"]["status"] == "running",
+            timeout=30.0,
+        )
+        _wait_for_checkout_success_and_old_death(jobs_db, checkout_id, old_meta)
+
+        checkout = read_job(jobs_db, checkout_id)
+        assert checkout["state"]["status"] == "succeeded"
+        result = checkout["result"]
+        assert isinstance(result, dict)
+        assert result["exit_code"] == 0
+        response = json.loads(str(result["stdout"]))
+        assert response["ok"] is True
+        assert response["commit"] == second
+
+        wait_until(
+            lambda: read_job(jobs_db, unrelated)["state"]["status"] in {"cancelled", "failed"},
+            timeout=30.0,
+        )
+        unrelated_payload = read_job(jobs_db, unrelated)
+        assert unrelated_payload["state"]["status"] == "cancelled"
+        pgid = unrelated_payload["state"].get("process_pgid")
+        assert pgid is not None
+        assert not group_has_members(int(str(pgid)))
+
+        wait_until(_live_handoff_done, timeout=30.0)
+        _run_confirmation_handshake(jobs_db, repo, fake_uv, second)
+
+        final_state = dc._read_state()
+        assert final_state is not None
+        assert final_state.status == dc.STATUS_CONFIRMED
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == second
+        assert cli.current_commit() == second
+        assert not group_has_members(old_meta.pgid or old_meta.pid or 0)
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()
+
+
+def test_end_to_end_bad_candidate_rolls_back(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate that dies at release rolls the deployment back."""
+    repo, first, second, _conf, _old, old_meta, fake_uv = _prepare_e2e(
+        tmp_path, monkeypatch, pg_cluster, bad_candidate=True
+    )
+    try:
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
+        )
+        wait_until(
+            lambda: read_job(jobs_db, checkout_id)["state"]["status"] == "succeeded",
+            timeout=60.0,
+        )
+        wait_until(_rolled_back_state, timeout=60.0)
+
+        rolled = dc._read_state()
+        assert rolled is not None
+        assert rolled.status == dc.STATUS_ROLLED_BACK
+        assert cli.git_commit(repo, 10.0) == first
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+        assert worker_alive(meta)
+        assert not worker_alive(old_meta)
+        assert not group_has_members(old_meta.pgid or old_meta.pid or 0)
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()
+
+
+def test_end_to_end_cancelled_checkout_leaves_previous_worker_running(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled initiating row aborts without ever stopping the old worker."""
+    repo, first, second, _conf, _old, old_meta, fake_uv = _prepare_e2e(
+        tmp_path, monkeypatch, pg_cluster
+    )
+    try:
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
+        )
+        wait_until(_preparing_mission, timeout=60.0)
+        with psycopg.connect(jobs_db) as conn:
+            conn.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = jsonb_set("
+                "payload::jsonb, "
+                "'{state,cancel_requested_at}', "
+                "to_jsonb('2026-01-01T00:00:00.000000Z'::text))::text\n"
+                "WHERE id = %s",
+                (checkout_id,),
+            )
+
+        wait_until(
+            lambda: read_job(jobs_db, checkout_id)["state"]["status"] == "cancelled",
+            timeout=30.0,
+        )
+        wait_until(_rolled_back_state, timeout=60.0)
+
+        rolled = dc._read_state()
+        assert rolled is not None
+        assert rolled.status == dc.STATUS_ROLLED_BACK
+        assert cli.git_commit(repo, 10.0) == first
+        assert worker_alive(old_meta)
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+        assert meta.pid == old_meta.pid
+        assert not group_has_members(rolled.new_meta.pgid or rolled.new_meta.pid or 0)
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()

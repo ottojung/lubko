@@ -28,7 +28,20 @@ whether the previous worker may already be mid-shutdown.
 
 The checkout remains provisional. The watchdog restores the previous exact commit if the candidate dies or the confirmation deadline expires. The global CLIs are untouched during the provisional phase: the `current` symlink under `$XDG_STATE_HOME/lubko/cli/` still selects the previous confirmed commit, so a rollback can never strand them on candidate code. If the candidate CLI environment cannot be built, the checkout is aborted and the previous checkout is restored.
 
-When checkout itself was invoked as a Lubko queue job, the stable controller finalizes that job before returning because the worker that originally claimed it has intentionally been replaced.
+### Queue-invoked checkout (the control job survives the old worker's shutdown)
+
+When checkout itself is submitted through the Lubko queue, the worker that claims it is the very worker about to be replaced. The worker's correct general shutdown invariant terminates every tracked active job group, including the group running the controller — so the controller must hand off before any destructive step. It does so without any worker-side special/exempt argv, process group, environment, or name: an ordinary job remains ordinary and is terminated/reaped like every other active job.
+
+The queue-invoked controller forks a detached handoff helper (its own session and process group) over a pipe:
+
+1. The helper acquires the deployment lock and performs only reversible preparation: it persists the pending rollback mission with `previous_retiring=false`, arms the watchdog, and spawns the gated candidate.
+2. It delivers the normal candidate (or an error) response to the controller parent over the pipe and stops there — the previous worker is not yet touched.
+3. The controller parent prints the response and exits zero, so the owning worker finalizes the checkout row as durably `succeeded`. The controller never rewrites a terminal queue result itself.
+4. The helper polls that exact captured row until PostgreSQL durably reports `succeeded` with no cancellation marker. A `failed`/`cancelled`/deleted row or an expired handoff deadline aborts the mission.
+5. Only then — still holding the deployment lock — it durably records `previous_retiring=true` before stopping the old worker, releases the gate, verifies the candidate, extends the confirmation deadline, writes the live pending state, and exits. The old worker's shutdown still terminates every ordinary active job group; the detached helper is simply no longer one of them.
+6. If preparation, the initiating row, or the handoff deadline fails before durable success, the helper closes the gated candidate, restores the previous checkout, and leaves the previous worker running — it never crosses the destructive boundary, and the armed watchdog completes the rollback.
+
+A manual (non-queue) invocation retains the synchronous safe path: preparation is immediately followed by the destructive handoff under the deployment lock.
 
 ## Confirmation handshake
 
