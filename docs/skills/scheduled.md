@@ -38,11 +38,12 @@ The issue status comment is the primary coordination signal between scheduled in
 2. Read <https://github.com/ottojung/lubko/blob/main/docs/SKILL.md> and obey it for normal Lubko operation.
 3. Identify the configured target repository from the scheduled-task prompt (its URL; see [Minimal scheduled-task description](#minimal-scheduled-task-description)).
 4. Inspect the target repository's open issues and their scheduled-orchestrator status comments before choosing work.
-5. Treat a `working` status whose heartbeat is less than 10 minutes old as actively owned by another scheduled invocation; do not intentionally work on that issue.
-6. Treat a `working` status whose heartbeat is at least 10 minutes old as abandoned and inheritable. Prefer inheriting abandoned target-project work over selecting a new issue.
-7. When inheriting, replace the status comment's owner with this invocation's fresh owner ID, refresh the heartbeat, then reconstruct the work from the recovery metadata, Lubko state, branches, PRs, and CI.
-8. If there is no abandoned work to resume, choose an actionable open issue from the **target repository**, claim it by creating or updating its single scheduled-orchestrator status comment, and start working on it.
-9. Continue doing the work according to the Lubko skills; do not stop after merely inspecting or reporting what could be done.
+5. Treat a `working` status whose GitHub comment `updated_at` is less than 10 minutes old as actively owned by another scheduled invocation; do not intentionally work on that issue.
+6. Treat a `working` status whose GitHub comment `updated_at` is at least 10 minutes old as abandoned and inheritable. Prefer inheriting abandoned target-project work over selecting a new issue.
+7. Treat a `completed` status as finished scheduled work even if the issue remains open while waiting for human promotion of the release branch; do not select it as new work.
+8. When inheriting, replace the status comment's owner with this invocation's fresh owner ID, refresh the heartbeat, then reconstruct the work from the recovery metadata, Lubko state, branches, PRs, and CI.
+9. If there is no abandoned work to resume, choose an actionable open issue from the **target repository** that has no active or completed scheduled status, claim it by creating or updating its single scheduled-orchestrator status comment, and start working on it.
+10. Continue doing the work according to the Lubko skills; do not stop after merely inspecting or reporting what could be done.
 
 ## Issue status comment: soft ownership, heartbeat, and recovery
 
@@ -69,22 +70,29 @@ The exact presentation may evolve, but the comment must make these facts unambig
 
 - `state`: normally `working` while this invocation owns the issue, and `completed` once its scheduled workflow is actually complete;
 - `owner`: a fresh short identifier chosen by the scheduled invocation when it claims or inherits the issue;
-- `heartbeat`: an absolute timestamp;
 - recovery metadata sufficient to find the actual work again: relevant worktree/clone directories, branches, PRs, Lubko agent IDs, root job UUIDs, or other concrete identifiers as applicable.
+
+The authoritative heartbeat time is the status comment's GitHub `updated_at`. A timestamp in the body is useful for humans and ensures a heartbeat edit changes the body, but abandonment calculations use GitHub's timestamp rather than trusting text supplied inside the comment.
 
 Do not put credentials, secret values, or unnecessary logs in this comment.
 
+### Canonical comment and races
+
+Normally there is exactly one marked scheduled-orchestrator status comment per issue. If a race causes multiple comments containing `<!-- lubko-scheduled-status -->`, treat the **most recently updated marked comment** as canonical. Do not create additional marked comments once one exists.
+
+Immediately after claiming or inheriting an issue, re-read the canonical status comment. If it does not contain this invocation's owner ID, another invocation won the race; yield and do not start or continue substantial work on that issue.
+
 ### Heartbeat cadence
 
-While an invocation intends to retain ownership of a `working` issue, it must refresh the status comment **at least once every 5 minutes**, even when no new Lubko command needs to be submitted.
+While an invocation intends to retain ownership of a `working` issue, it must refresh the canonical status comment **at least once every 5 minutes**, even when no new Lubko command needs to be submitted. Update the displayed heartbeat timestamp so the edit is material and GitHub refreshes the comment's `updated_at`.
 
 A quiet agent may legitimately think for a long time. Therefore:
 
-> **Do not infer abandonment from agent silence, lack of new shell commands, CPU observations, or lack of new commits. Scheduled ownership is determined by the GitHub issue heartbeat.**
+> **Do not infer abandonment from agent silence, lack of new shell commands, CPU observations, or lack of new commits. Scheduled ownership is determined by the GitHub issue status comment's `updated_at`.**
 
 The 5-minute refresh cadence deliberately leaves margin before the 10-minute abandonment threshold.
 
-Before refreshing the heartbeat, re-read the current issue status comment. If its `owner` is no longer this invocation's owner ID, another scheduled invocation has inherited the issue. Stop orchestrating that issue rather than overwriting the newer ownership record.
+Before refreshing the heartbeat, re-read the canonical issue status comment. If its `owner` is no longer this invocation's owner ID, another scheduled invocation has inherited the issue. Stop orchestrating that issue rather than overwriting the newer ownership record.
 
 ### Abandonment and inheritance
 
@@ -92,26 +100,27 @@ A task is abandoned for scheduled-orchestrator coordination when:
 
 ```text
 status.state == working
-AND now - status.heartbeat >= 10 minutes
+AND now - status_comment.updated_at >= 10 minutes
 ```
 
 Abandonment means **the previous scheduled orchestrator is no longer presumed responsible**. It does not mean its agents, branches, worktrees, jobs, or partial implementation should be discarded.
 
 To inherit abandoned work:
 
-1. re-read the issue and status comment immediately before takeover;
-2. replace `owner` with a fresh owner ID for the new invocation and refresh `heartbeat`;
-3. preserve and update the existing recovery metadata rather than erasing useful paths/IDs;
-4. inspect the referenced Lubko jobs/agents, worktrees, branches, PRs, issue discussion, and CI;
-5. continue the existing workflow from objective state.
+1. re-read the issue and canonical status comment immediately before takeover;
+2. replace `owner` with a fresh owner ID for the new invocation and refresh the displayed heartbeat;
+3. re-read the canonical comment and yield if this invocation is not its owner;
+4. preserve and update the existing recovery metadata rather than erasing useful paths/IDs;
+5. inspect the referenced Lubko jobs/agents, worktrees, branches, PRs, issue discussion, and CI;
+6. continue the existing workflow from objective state.
 
-This is deliberately a **soft lease, not a correctness-critical distributed lock**. Two invocations may still race around the 10-minute boundary. The owner re-read before each heartbeat, isolated branches/worktrees, review, tests, and Git merge-conflict handling are the correctness boundary.
+This is deliberately a **soft lease, not a correctness-critical distributed lock**. Two invocations may still race around the 10-minute boundary. The canonical-comment rule, owner re-read, isolated branches/worktrees, review, tests, and Git merge-conflict handling are the correctness boundary.
 
 ### Completion
 
 Only mark the status comment `completed` after the scheduled workflow for that issue is actually complete according to this document: implementation/review/validation is complete and the task PR has reached the intended release branch state.
 
-When completing, update the recovery section with the final PR/branch/commit information that makes the result easy to audit. A `completed` status does not heartbeat and is never treated as abandoned work.
+When completing, update the recovery section with the final PR/branch/commit information that makes the result easy to audit. A `completed` status does not heartbeat, is never treated as abandoned, and is not eligible for automatic issue selection merely because the GitHub issue remains open awaiting promotion of the release branch.
 
 ## Recovery from interrupted turns
 
@@ -146,7 +155,7 @@ Keep the issue status comment current enough that a later invocation has concret
 
 Do not add correctness-critical distributed locking merely to coordinate scheduled ChatGPT invocations. Multiple scheduled invocations may overlap; this is primarily an efficiency problem.
 
-> Multiple scheduled ChatGPT invocations may overlap. The target issue's scheduled-orchestrator status comment is the canonical soft-ownership signal: avoid issues with a fresh `working` heartbeat, inherit stale `working` issues, and re-read ownership before each heartbeat so an older invocation yields after takeover.
+> Multiple scheduled ChatGPT invocations may overlap. The target issue's scheduled-orchestrator status comment is the canonical soft-ownership signal: avoid issues with a fresh `working` heartbeat, inherit stale `working` issues, skip `completed` scheduled work, and re-read ownership before each heartbeat so an older invocation yields after takeover.
 
 If two orchestrators race, ordinary isolated branches/worktrees, tests, PR review, and git merge-conflict handling remain the correctness boundary.
 
@@ -210,11 +219,11 @@ Promotion of `release/*` into the target default branch is the human review boun
 
 ## Choosing new work
 
-If there is no abandoned work to inherit, inspect the configured target project's open GitHub issues and choose an actionable issue that does not have a fresh `working` scheduled-orchestrator heartbeat.
+If there is no abandoned work to inherit, inspect the configured target project's open GitHub issues and choose an actionable issue that has neither a fresh `working` status nor a `completed` scheduled-orchestrator status.
 
 Do not interpret "no Lubko work is active" as permission to modify the Lubko codebase. The chosen issue belongs to the **configured target repository** unless the scheduled task explicitly names Lubko as its target repository.
 
-Prefer a deterministic, understandable selection policy when useful, but do not over-engineer issue claiming/locking. Immediately after choosing an issue, claim it through its scheduled-orchestrator status comment before starting substantial work.
+Prefer a deterministic, understandable selection policy when useful, but do not over-engineer issue claiming/locking. Immediately after choosing an issue, claim it through its scheduled-orchestrator status comment before starting substantial work, then re-read the canonical comment to make sure the claim still belongs to this invocation.
 
 ## Minimal scheduled-task description
 
