@@ -1149,8 +1149,7 @@ When using multiple agents:
 - give each a clear title;
 - give each an explicit `--cwd`;
 - avoid sending two write-heavy agents into the same files unless intentional;
-- use explicit IDs for every `status`, `prompt`, `log`, `wait`, `stop`, `kill`, `result`, and `delete` operation;
-- do not rely on `last`.
+- use explicit IDs for every `status`, `prompt`, `log`, `wait`, `stop`, `kill`, and `delete` operation;
 
 ---
 
@@ -1187,7 +1186,7 @@ A strong agent prompt usually contains:
 5. **Local instructions** — tell the agent to read and obey `AGENTS.md`, `CONTRIBUTING.md`, or equivalent repository guidance.
 6. **Validation** — tests, linters, type checking, builds, or other required checks.
 7. **Completion criteria** — what counts as done.
-8. **Non-goals** — for example, "do not deploy" or "do not push" when the user only asked for local changes.
+8. **Non-goals / negative requirements** — explicitly what the agent must not do: "do not deploy", "do not push", "do not expose credentials", "do not close the issue yourself", "do not touch unrelated files", "do not expand scope into a sibling issue", "do not edit a file another agent owns".
 
 Example:
 
@@ -1573,6 +1572,9 @@ run checks and fix what fails
 The agent interface is not merely a convenience wrapper. It is the preferred operational abstraction for substantial work because it provides safety policy, context, lifecycle management, observability, exact continuation, and deterministic cleanup.
 
 Do not recreate those capabilities manually with long shell scripts unless there is a concrete reason the managed agent interface cannot perform the task.
+
+If a shell command needs quoting, conditionals, loops, or coordination between
+several files, it is no longer an observation — delegate it to an agent.
 
 ---
 
@@ -2010,3 +2012,27 @@ The development container is intentionally disposable and highly permissive.
 The host server is protected by the Lubko isolation boundary.
 
 Within that boundary, make full use of managed agents and the development environment.
+
+---
+
+# Quick reference
+
+| Situation | Do | Avoid |
+| --------- | -- | ----- |
+| Substantial work | launch an agent with a precise prompt | long improvised shell scripts |
+| Agent looks slow | check status, then a log tail | stopping or nagging it |
+| Course correction | a steering prompt with acceptance criteria | frequent steering |
+| Parallel work | separate clones/worktrees + branches + mandates | two writers in one tree |
+| Acceptance | contract-based tests, independent agent | tests derived from the implementation |
+| Verification | read the diff, review invariants, full checks | trusting a report of green |
+| Code review | run a read-only review pass before merge; see `docs/skills/review.md` | merging unreviewed work |
+| Reconcile | deliberate integration branch, checks after each step | blind merge, forced resolves |
+| Branches/PRs | one branch per task, draft PR early, review before merge, merge when green | unmerged dangling branches, force-pushed review history |
+| Base commits | cut branches from a known, clean, tested SHA | cutting from a drifted tree |
+| Blockers/correctness bugs | fix before merge, on the current PR | merging known-correctness bugs |
+| Important non-critical findings | open an issue with context, rationale, evidence, and a link to the branch/commit; postpone | expanding the current task / losing the finding in logs or chat |
+| Commit/push/deploy | separate, explicit, in order | conflating any two |
+| Deployment | only when asked, via the managed tool, then a real smoke | implicit deploy, manual signals |
+| Secrets | design them out; verify by absence | printing/dumping values |
+| Destructive action | only after durable rollback state exists | delete-then-hope |
+
