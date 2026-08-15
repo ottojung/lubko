@@ -26,37 +26,111 @@ A scheduled ChatGPT invocation is disposable: it may be externally interrupted a
 
 The sources of truth are:
 
+- the **target repository's GitHub issues**, especially the scheduled-orchestrator status comment described below, for durable work ownership, heartbeat, and recovery metadata;
 - the **Lubko server** for queued jobs, managed agents, worktrees/checkouts, and execution state;
-- the **target repository** for issues, branches, PRs, CI, and git history.
+- the rest of the **target repository** for branches, PRs, CI, and git history.
+
+The issue status comment is the primary coordination signal between scheduled invocations. Lubko execution state is evidence about what work exists, but it does not by itself decide whether another scheduled orchestrator still owns that work.
 
 ## Startup sequence for every scheduled run
 
 1. Read <https://github.com/ottojung/lubko/blob/main/docs/skills/scheduled.md>.
 2. Read <https://github.com/ottojung/lubko/blob/main/docs/SKILL.md> and obey it for normal Lubko operation.
 3. Identify the configured target repository from the scheduled-task prompt (its URL; see [Minimal scheduled-task description](#minimal-scheduled-task-description)).
-4. Inspect the Lubko server and the target repository before choosing new work.
-5. Reconstruct visibly unfinished work for the target project from real state (see [Recovery from interrupted turns](#recovery-from-interrupted-turns)).
-6. Prefer resuming unfinished work over starting another issue.
-7. Apply [soft exclusion](#soft-exclusion-not-locking) before selecting work.
-8. If there is no unfinished target-project work to resume, choose an actionable open issue from the **target repository** and start working on it (see [Choosing new work](#choosing-new-work)).
+4. Inspect the target repository's open issues and their scheduled-orchestrator status comments before choosing work.
+5. Treat a `working` status whose heartbeat is less than 10 minutes old as actively owned by another scheduled invocation; do not intentionally work on that issue.
+6. Treat a `working` status whose heartbeat is at least 10 minutes old as abandoned and inheritable. Prefer inheriting abandoned target-project work over selecting a new issue.
+7. When inheriting, replace the status comment's owner with this invocation's fresh owner ID, refresh the heartbeat, then reconstruct the work from the recovery metadata, Lubko state, branches, PRs, and CI.
+8. If there is no abandoned work to resume, choose an actionable open issue from the **target repository**, claim it by creating or updating its single scheduled-orchestrator status comment, and start working on it.
 9. Continue doing the work according to the Lubko skills; do not stop after merely inspecting or reporting what could be done.
+
+## Issue status comment: soft ownership, heartbeat, and recovery
+
+For every GitHub issue a scheduled orchestrator works on, maintain **one durable scheduled-orchestrator status comment on that issue**. Do not post a new heartbeat comment every few minutes. Create the comment once and edit that same comment as the work changes.
+
+Use a stable machine-recognizable marker and a compact human-readable body. For example:
+
+```text
+Scheduled orchestrator: working
+Owner: scheduled-7f3a
+Heartbeat: 2026-08-15T23:34:00Z
+
+Recovery:
+- worktrees: /workspace/volodyslav-task-123713, /workspace/volodyslav-task-7312361
+- branch: issue-7421273173
+- PR: #812
+- Lubko agents: a91c02
+- Lubko root jobs: <root UUIDs still relevant to recovery>
+
+<!-- lubko-scheduled-status -->
+```
+
+The exact presentation may evolve, but the comment must make these facts unambiguous:
+
+- `state`: normally `working` while this invocation owns the issue, and `completed` once its scheduled workflow is actually complete;
+- `owner`: a fresh short identifier chosen by the scheduled invocation when it claims or inherits the issue;
+- `heartbeat`: an absolute timestamp;
+- recovery metadata sufficient to find the actual work again: relevant worktree/clone directories, branches, PRs, Lubko agent IDs, root job UUIDs, or other concrete identifiers as applicable.
+
+Do not put credentials, secret values, or unnecessary logs in this comment.
+
+### Heartbeat cadence
+
+While an invocation intends to retain ownership of a `working` issue, it must refresh the status comment **at least once every 5 minutes**, even when no new Lubko command needs to be submitted.
+
+A quiet agent may legitimately think for a long time. Therefore:
+
+> **Do not infer abandonment from agent silence, lack of new shell commands, CPU observations, or lack of new commits. Scheduled ownership is determined by the GitHub issue heartbeat.**
+
+The 5-minute refresh cadence deliberately leaves margin before the 10-minute abandonment threshold.
+
+Before refreshing the heartbeat, re-read the current issue status comment. If its `owner` is no longer this invocation's owner ID, another scheduled invocation has inherited the issue. Stop orchestrating that issue rather than overwriting the newer ownership record.
+
+### Abandonment and inheritance
+
+A task is abandoned for scheduled-orchestrator coordination when:
+
+```text
+status.state == working
+AND now - status.heartbeat >= 10 minutes
+```
+
+Abandonment means **the previous scheduled orchestrator is no longer presumed responsible**. It does not mean its agents, branches, worktrees, jobs, or partial implementation should be discarded.
+
+To inherit abandoned work:
+
+1. re-read the issue and status comment immediately before takeover;
+2. replace `owner` with a fresh owner ID for the new invocation and refresh `heartbeat`;
+3. preserve and update the existing recovery metadata rather than erasing useful paths/IDs;
+4. inspect the referenced Lubko jobs/agents, worktrees, branches, PRs, issue discussion, and CI;
+5. continue the existing workflow from objective state.
+
+This is deliberately a **soft lease, not a correctness-critical distributed lock**. Two invocations may still race around the 10-minute boundary. The owner re-read before each heartbeat, isolated branches/worktrees, review, tests, and Git merge-conflict handling are the correctness boundary.
+
+### Completion
+
+Only mark the status comment `completed` after the scheduled workflow for that issue is actually complete according to this document: implementation/review/validation is complete and the task PR has reached the intended release branch state.
+
+When completing, update the recovery section with the final PR/branch/commit information that makes the result easy to audit. A `completed` status does not heartbeat and is never treated as abandoned work.
 
 ## Recovery from interrupted turns
 
 Assume every previous scheduled invocation may have disappeared without a final response. Recover by inspecting actual state, not by assuming the previous invocation completed cleanly.
 
-If Lubko still has managed agents or root jobs whose cwd, worktree, branch, title, or prompt clearly belongs to the configured target project, inspect those exact agents/jobs and continue the workflow.
+The issue status comment tells you which work was actively owned, which ownership is stale enough to inherit, and where the previous invocation says its work lives. Treat those paths and IDs as recovery leads, then verify them against actual Lubko and GitHub state before acting.
 
-Reconstruct visibly unfinished work for the target project from real state, including as applicable:
+For an inherited issue, reconstruct visibly unfinished work from real state, including as applicable:
 
+- the status comment's recorded worktree/clone paths, target branch, PR, Lubko agent IDs, and root job UUIDs;
 - Lubko root jobs and managed agents;
 - their cwd, worktree, branch, title, and prompt context;
 - target-repository worktrees/branches;
 - open target-repository PRs and their bases;
-- target-repository issues and CI state.
+- target-repository issue discussion and CI state.
 
 Never depend on conversation state as the only record of:
 
+- scheduled owner ID or heartbeat;
 - root job UUIDs;
 - Lubko agent IDs;
 - cwd/worktree;
@@ -66,13 +140,13 @@ Never depend on conversation state as the only record of:
 - current release branch;
 - expected completion state.
 
-When conversational bookkeeping is missing, reconcile from Lubko + GitHub evidence.
+Keep the issue status comment current enough that a later invocation has concrete recovery handles even when conversation state disappears.
 
 ## Soft exclusion, not locking
 
 Do not add correctness-critical distributed locking merely to coordinate scheduled ChatGPT invocations. Multiple scheduled invocations may overlap; this is primarily an efficiency problem.
 
-> Multiple scheduled ChatGPT invocations may overlap. Before choosing work, inspect active Lubko jobs/agents and the target repository's branches/PRs. Do not intentionally work on an issue or workstream that another active invocation appears to be handling. Perfect exclusion is not required; this is an efficiency rule, not a correctness invariant.
+> Multiple scheduled ChatGPT invocations may overlap. The target issue's scheduled-orchestrator status comment is the canonical soft-ownership signal: avoid issues with a fresh `working` heartbeat, inherit stale `working` issues, and re-read ownership before each heartbeat so an older invocation yields after takeover.
 
 If two orchestrators race, ordinary isolated branches/worktrees, tests, PR review, and git merge-conflict handling remain the correctness boundary.
 
@@ -136,11 +210,11 @@ Promotion of `release/*` into the target default branch is the human review boun
 
 ## Choosing new work
 
-If there is no unfinished work for the configured target project, inspect that project's open GitHub issues and choose an actionable issue.
+If there is no abandoned work to inherit, inspect the configured target project's open GitHub issues and choose an actionable issue that does not have a fresh `working` scheduled-orchestrator heartbeat.
 
 Do not interpret "no Lubko work is active" as permission to modify the Lubko codebase. The chosen issue belongs to the **configured target repository** unless the scheduled task explicitly names Lubko as its target repository.
 
-Prefer a deterministic, understandable selection policy when useful, but do not over-engineer issue claiming/locking.
+Prefer a deterministic, understandable selection policy when useful, but do not over-engineer issue claiming/locking. Immediately after choosing an issue, claim it through its scheduled-orchestrator status comment before starting substantial work.
 
 ## Minimal scheduled-task description
 
@@ -155,12 +229,13 @@ For example:
 >
 > Follow: <https://github.com/ottojung/lubko/blob/main/docs/skills/scheduled.md>
 
-Do not duplicate the orchestration rules in the scheduled-task description. In particular, the task prompt must not restate recovery rules, release-branch behavior, soft exclusion, issue-selection policy, Lubko operating details, or merge restrictions. All such behavior belongs in this document so it can evolve centrally without editing every ChatGPT scheduled task.
+Do not duplicate the orchestration rules in the scheduled-task description. In particular, the task prompt must not restate recovery rules, release-branch behavior, issue-heartbeat coordination, issue-selection policy, Lubko operating details, or merge restrictions. All such behavior belongs in this document so it can evolve centrally without editing every ChatGPT scheduled task.
 
 ## Operating within Lubko
 
 Operate through the Lubko platform exactly as <https://github.com/ottojung/lubko/blob/main/docs/SKILL.md> prescribes, and keep the target project's own operating instructions (`AGENTS.md`, `CONTRIBUTING.md`, design docs) authoritative for the target repository.
 
+- Keep the current target issue's scheduled-orchestrator status comment fresh at least every 5 minutes while the issue is `working`, regardless of whether new Lubko commands are needed.
 - Submit commands and managed agents through the Lubko transport (`lubko.jobs`); record the returned root job UUIDs and poll them to terminal state.
 - Prefer managed `lubko-agent` sessions for substantial target-project work, with preassigned agent IDs, an explicit cwd inside a target-project worktree, and durable logs.
 - Never passively wait: outstanding work requires another bounded observation/polling step in the current turn.
