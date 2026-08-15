@@ -505,7 +505,9 @@ history they produce is easy to reconcile, review, and share. GitHub pull
 requests are the primary observability tool for the human owner: every open,
 update, and merge of a PR is a durable, human-visible record of what happened.
 Use them by default for substantial changes; only trivial emergency fixes may
-skip the ceremony (Section 19.18).
+skip the ceremony (Section 19.18). GitHub issues are the complementary durable
+backlog for important-but-non-critical findings discovered along the way
+(Section 19.19).
 
 ### 19.1 One task, one agent, one branch
 
@@ -665,6 +667,42 @@ directly to the default branch when speed matters more than ceremony. Everything
 else flows through a PR. If a change is substantial enough that it could go
 wrong, it is substantial enough for a PR.
 
+### 19.19 Capture non-critical findings as issues, not scope
+
+**[Recommended]** GitHub issues are the durable backlog for important work that is
+not part of the current task. When an agent or the orchestrator discovers a real
+finding that does not block the current change — a high-effort non-critical bug,
+an architectural question or open decision, a refactor, or an improvement spotted
+while working on something else — record it in an issue and deliberately postpone
+it instead of letting it derail the current task or expand the current branch.
+
+**[Recommended]** Triage every finding into one of two classes:
+
+- **Blockers and correctness bugs** — a real bug that makes the current change
+  unsound, a violated invariant, or anything that must be resolved before this PR
+  merges. Fix these now, before merge.
+- **Important but non-critical findings** — real but safe to postpone: a bug in an
+  unrelated code path, a worth-doing refactor, an open design question. These do
+  not block the current merge; capture them in an issue and move on.
+
+**[Recommended]** A useful issue carries enough context to act on later without
+relying on the session that produced it:
+
+- What was found and where — file/function references, not just "something was
+  wrong."
+- Why it matters — the rationale and the impact if left unaddressed.
+- Reproduction or evidence — a failing test, a log excerpt, a traceback, a snippet.
+- Acceptance criteria, or the open questions that still need answering.
+- A link to the PR or commit where it was discovered, so the issue traces back to
+  the work that surfaced it.
+
+**[Recommended]** Create the issue as soon as the finding appears, mid-task if that
+is when it shows up. Creating issues early is what makes them durable: a finding
+left only in an agent log or a chat is lost when the session ends, while an issue
+survives the branch, the clone, and the session as a visible item in the backlog.
+The human owner sees the future work accumulating and can schedule and prioritize
+it deliberately, later, with the full backlog in view.
+
 ---
 
 ## 20. Common failure modes observed
@@ -800,14 +838,19 @@ can name why.
    stuckness or a changed requirement, using a precise steering prompt with
    acceptance criteria.
 8. Ask agents to surface blockers/invariant violations early and to commit
-   incrementally on their branch. Keep the branch pushed (Section 19).
+   incrementally on their branch. Keep the branch pushed (Section 19). Have agents
+   flag important-but-non-critical findings so you can capture them as issues
+   promptly (Section 19.19).
 
 ### Phase D — Independently verify
 
 9. When an agent finishes, read its final result.
 10. Do not stop there. Read the diff yourself (`git status --short`,
     `git diff --stat`, `git diff`). Review the invariants relevant to the
-    change (Section 8).
+    change (Section 8). Triage what you find: a blocker or correctness bug is
+    fixed before merge; an important-but-non-critical finding becomes a GitHub
+    issue with context and a link to this branch, deliberately postponed
+    (Section 19.19).
 11. Run the full checks yourself on the branch (Section 13).
 12. Run a read-only review pass for hard concurrency/lifecycle/soundness work.
 13. If acceptance is separate, run the acceptance suite against this branch and
@@ -823,7 +866,9 @@ can name why.
 17. Run the full checks on the integrated branch. Green here is the only green
     that counts.
 18. Get the change reviewed — the PR is the review surface — and only then
-    merge it. Opening and merging a PR is the default (Section 19).
+    merge it. Opening and merging a PR is the default (Section 19). Fix blockers
+    that review finds before merging; capture non-critical findings as issues and
+    postpone them (Section 19.19).
 
 ### Phase F — Ship (only when explicitly asked)
 
@@ -858,6 +903,8 @@ can name why.
 | Verification | read the diff, review invariants, full checks | trusting a report of green |
 | Reconcile | deliberate integration branch, checks after each step | blind merge, forced resolves |
 | Branches/PRs | one branch per task, draft PR early, review before merge, merge when green | unmerged dangling branches, force-pushed review history |
+| Blockers/correctness bugs | fix before merge, on the current PR | merging known-correctness bugs |
+| Important non-critical findings | open an issue with context, rationale, evidence, and a link to the branch/commit; postpone | expanding the current task / losing the finding in logs or chat |
 | Commit/push/deploy | separate, explicit, in order | conflating any two |
 | Deployment | only when asked, via the managed tool, then a real smoke | implicit deploy, manual signals |
 | Secrets | design them out; verify by absence | printing/dumping values |
