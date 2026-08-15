@@ -68,6 +68,7 @@ Substantial queued work normally invokes **`lubko-agent`** rather than a long im
 - **Use `lubko-agent` for substantial work.** Anything needing judgment, context, iteration, or more than a couple of obvious shell commands belongs in a managed agent.
 - **Use direct shell for tiny deterministic observations.** `pwd`, `git status --short`, reading one short file, printing a version, checking a path.
 - **Do not rush healthy agents.** If an agent seems slow, read `status` and a log tail; distinguish progress from stuck. Reserve `stop`/`kill` for abandoned work.
+- **Confirm an agent is really running with `lubko-agent status`, never the recorded state alone.** The recorded `state` can lag the process; `status`'s `alive` field verifies the exact recorded process (PID, start time, environment marker) is live and its CPU statistics show whether it is consuming time. `state: running` plus `alive: yes` means the agent is genuinely executing; `state: running` plus `alive: no` means the recorded process is gone and the agent is not working.
 - **Use as many agents as useful.** There is no general agent-count limit; the constraints are exclusive write trees/branches and clear, non-conflicting responsibilities.
 - **Isolate write-capable agents in separate trees/branches.** Never point two writers at the same working tree.
 - **Poll grouped.** When several root jobs are outstanding, poll all outstanding root UUIDs together in one bounded `where id in (...)` query, never one at a time.
@@ -542,7 +543,9 @@ Show detailed state for one exact agent:
 lubko-agent status 8e064622
 ```
 
-The `--id` flag form is also supported. Status may include the Lubko agent ID, current state, whether its process is alive, PID and process-group information, working directory, creation/start/finish timestamps, exit code, prompt count, title, log path, and the internal native session identifier for diagnostics. Use `status` as the primary health check for an agent. If an agent appears to be taking longer than expected, inspect `status` and `log` rather than assuming it is stuck.
+The `--id` flag form is also supported. Status may include the Lubko agent ID, current state, whether its process is alive, CPU usage statistics (user/system/total CPU seconds plus a lifetime-average CPU percentage, mirroring `ps`), PID and process-group information, working directory, creation/start/finish timestamps, exit code, prompt count, title, log path, and the internal native session identifier for diagnostics. Use `status` as the primary health check for an agent. If an agent appears to be taking longer than expected, inspect `status` and `log` rather than assuming it is stuck.
+
+**Use `status` to determine whether an agent is *really* running.** Do not infer liveness from the recorded `state` alone: the recorded `state` can lag the process. Read the `alive` field (the exact recorded process — PID, start time, and environment marker — is verified live) and the CPU statistics. `state: running` with `alive: yes` means the agent is genuinely executing; `state: running` with `alive: no` means the recorded process is gone and the agent is not working — inspect `status` and a focused log tail, then decide between a corrective prompt, `wait`, or `stop`. Checking an agent's `status` is always safe and is the correct first step whenever you need to know whether an agent is really running.
 
 ---
 
@@ -1263,7 +1266,7 @@ If `lubko-agent status <id>` reports a failed agent: inspect `lubko-agent log <i
 
 ## Agent appears stuck
 
-1. inspect `status`;
+1. inspect `status` — in particular whether the agent is *really* alive (`alive: yes`) and its CPU statistics, not just the recorded `state`;
 2. inspect recent `log` output;
 3. wait if it is making progress;
 4. send a clarifying prompt if appropriate;
@@ -1382,7 +1385,7 @@ Do not turn routine development operations back into instructions for the user w
 | --------- | -- | ----- |
 | Substantial work | launch an agent with a precise prompt | long improvised shell scripts |
 | Tiny deterministic observation | direct shell command | spinning up an agent |
-| Agent looks slow | check status, then a log tail | stopping or nagging it |
+| Agent looks slow | check `status` (`state`, `alive`, CPU), then a log tail | stopping or nagging it |
 | Course correction | a steering prompt with acceptance criteria | frequent steering |
 | Parallel work | separate clones/worktrees + branches + mandates; use as many agents as useful | two writers in one tree, or an arbitrary agent cap |
 | Several outstanding jobs | poll all outstanding root UUIDs together in one bounded query | polling parallel jobs one-by-one |

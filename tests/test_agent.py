@@ -285,6 +285,54 @@ def test_log_excerpt_strips_ansi(state_dir: Path) -> None:
     assert agent.log_excerpt(log, 5, 2000) == ["red", "plain"]
 
 
+def test_cmd_log_lines_is_decisive(state_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """An explicit --lines count is the decisive limit for log output.
+
+    Regression test for the bug where `log --lines N` was silently capped by
+    the bounded status window: the last N lines of a file larger than that
+    window must all be returned, not just the lines that fit in the window.
+    """
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded")
+    log = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    total = agent.STATUS_TAIL_CHARS // 100 + 20
+    lines = [f"line-{i:03d}-" + "x" * 100 for i in range(total)]
+    log.write_text("\n".join(lines) + "\n")
+    assert agent.main(["log", "aaaaaaaa", "--lines", str(total)]) == agent.EXIT_OK
+    out = capsys.readouterr().out.splitlines()
+    assert out == lines
+    assert len(out) == total
+
+
+def test_cmd_log_zero_lines_returns_everything(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--lines 0 means the whole log, even beyond the bounded window."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded")
+    log = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    lines = ["alpha", "beta", "gamma"]
+    log.write_text("\n".join(lines) + "\n")
+    assert agent.main(["log", "aaaaaaaa", "--lines", "0"]) == agent.EXIT_OK
+    assert capsys.readouterr().out.splitlines() == lines
+
+
+def test_cmd_log_default_keeps_bounded_window(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Without --lines the default tail stays bounded by the status window."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded")
+    log = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    total = agent.STATUS_TAIL_CHARS // 100 + 20
+    lines = [f"line-{i:03d}-" + "x" * 100 for i in range(total)]
+    log.write_text("\n".join(lines) + "\n")
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out.splitlines()
+    assert out[-1] == lines[-1]
+    assert out[0] != lines[0]
+    assert len(out) < total
+
+
 def test_cmd_new_creates_idle_agent_with_supplied_id(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -388,6 +436,71 @@ def test_cmd_status_unknown_agent(capsys: pytest.CaptureFixture[str]) -> None:
     """Status on an unknown agent returns not-found."""
     assert agent.main(["status", "deadbeef"]) == agent.EXIT_NOT_FOUND
     assert "unknown agent" in capsys.readouterr().err
+
+
+def test_proc_cpu_usage_returns_none_for_missing_process() -> None:
+    """A nonexistent process has no CPU statistics."""
+    assert agent.proc_cpu_usage(2**31 - 1) is None
+
+
+def test_proc_cpu_usage_reports_live_process() -> None:
+    """CPU usage statistics are reported for a live process."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        usage = agent.proc_cpu_usage(proc.pid)
+        assert usage is not None
+        assert set(usage) == {"user", "system", "total", "percent"}
+        assert usage["total"] >= 0
+        assert usage["user"] >= 0
+        assert usage["system"] >= 0
+        assert usage["percent"] >= 0
+        assert usage["total"] == pytest.approx(usage["user"] + usage["system"], abs=0.02)
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_status_reports_cpu_usage(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Status reports CPU usage statistics for a live agent in JSON."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, str(state_dir)))
+        assert agent.main(["status", "--id", "aaaaaaaa", "--json"]) == agent.EXIT_OK
+        data = json.loads(capsys.readouterr().out)
+        assert data["alive"] is True
+        cpu = data["cpu"]
+        assert cpu is not None
+        assert cpu["total"] >= 0
+        assert cpu["percent"] >= 0
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_status_text_reports_cpu(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The human-readable status output includes a CPU line."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, str(state_dir)))
+        assert agent.main(["status", "aaaaaaaa"]) == agent.EXIT_OK
+        assert "cpu:" in capsys.readouterr().out
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_status_cpu_is_none_without_live_process(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A terminal agent without a live process reports no CPU statistics."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    assert agent.main(["status", "aaaaaaaa", "--json"]) == agent.EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    assert data["cpu"] is None
 
 
 def test_cmd_prompt_first_prompt_creates_native_session(

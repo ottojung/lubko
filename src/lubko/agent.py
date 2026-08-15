@@ -285,6 +285,121 @@ def proc_start_ticks(pid: int) -> int | None:
         return None
 
 
+def _clock_ticks() -> int:
+    """Return the number of clock ticks per second used by ``/proc`` times.
+
+    Returns:
+        ``CLK_TCK`` (normally 100 on Linux), or 100 when unknown.
+    """
+    try:
+        name = os.sysconf_names.get("SC_CLK_TCK")
+        if name is None:
+            return 100
+        return int(os.sysconf(name))
+    except (OSError, TypeError, ValueError):
+        return 100
+
+
+def _proc_stat_fields(pid: int) -> list[str] | None:
+    """Return the numeric ``/proc/<pid>/stat`` fields, or ``None``.
+
+    The executable name (which may contain spaces and parentheses) is
+    skipped, so the returned fields are the whitespace-separated entries
+    that follow the closing ``)`` of the name.
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        The fields, or ``None`` when the process cannot be inspected.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return stat[stat.rfind(")") + 1 :].split()
+
+
+def _boot_time() -> float | None:
+    """Return the system boot time in epoch seconds, or ``None`` when unknown.
+
+    Returns:
+        The boot time, or ``None`` when unavailable.
+    """
+    try:
+        lines = Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("btime "):
+            try:
+                return float(line.split()[1])
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def _lifetime_cpu_percent(starttime_ticks: int, cpu_seconds: float, clk_tck: int) -> float:
+    """Return the process-lifetime average CPU percentage.
+
+    The percentage mirrors ``ps``'s ``%CPU`` column: cumulative CPU time
+    divided by wall-clock time since the process started. Because it is an
+    average over the whole lifetime, it is a stable snapshot that needs no
+    sampling window.
+
+    Args:
+        starttime_ticks: Process start time in clock ticks since boot.
+        cpu_seconds: Cumulative CPU seconds consumed.
+        clk_tck: Clock ticks per second.
+
+    Returns:
+        The average CPU percentage, or ``0.0`` when it cannot be computed.
+    """
+    boot = _boot_time()
+    if boot is None:
+        return 0.0
+    elapsed = time.time() - (boot + starttime_ticks / clk_tck)
+    if elapsed <= 0:
+        return 0.0
+    return min(cpu_seconds / elapsed * 100.0, 100.0)
+
+
+def proc_cpu_usage(pid: int) -> dict[str, float] | None:
+    """Return CPU usage statistics for a live process, or ``None``.
+
+    All values derive from ``/proc/<pid>/stat``: ``user`` and ``system`` are
+    the CPU seconds spent in user and kernel mode, ``total`` their sum, and
+    ``percent`` the lifetime average CPU utilization (see
+    ``_lifetime_cpu_percent``).
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        A ``{"user", "system", "total", "percent"}`` mapping, or ``None``
+        when the process cannot be inspected.
+    """
+    fields = _proc_stat_fields(pid)
+    if fields is None:
+        return None
+    try:
+        utime = int(fields[11])
+        stime = int(fields[12])
+        starttime = int(fields[19])
+    except (ValueError, IndexError):
+        return None
+    clk_tck = _clock_ticks()
+    user = utime / clk_tck
+    system = stime / clk_tck
+    total = user + system
+    return {
+        "user": round(user, 2),
+        "system": round(system, 2),
+        "total": round(total, 2),
+        "percent": round(_lifetime_cpu_percent(starttime, total, clk_tck), 1),
+    }
+
+
 def _env_has_marker(pid: int, aid: str) -> bool:
     """Return whether a process environment carries the exact agent marker.
 
@@ -1580,6 +1695,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     _out(f"agent:      {aid}")
     _out(f"state:      {state}")
     _out(f"alive:      {'yes' if alive else 'no'}")
+    cpu = _cpu_for_status(meta, alive=alive)
+    if cpu is None:
+        _out("cpu:        -")
+    else:
+        _out(
+            f"cpu:        {cpu['total']:.2f}s "
+            f"(user {cpu['user']:.2f}s system {cpu['system']:.2f}s, "
+            f"{cpu['percent']:.1f}%)"
+        )
     _out(f"cwd:        {meta.get('cwd') or '-'}")
     _out(f"created:    {fmt_time(meta.get('created_at'))}")
     _out(f"started:    {fmt_time(meta.get('started_at'))}")
@@ -1598,6 +1722,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _cpu_for_status(meta: Meta, *, alive: bool) -> dict[str, float] | None:
+    """Return CPU usage statistics for a live agent, or ``None``.
+
+    Args:
+        meta: Agent metadata.
+        alive: Whether the agent process is alive.
+
+    Returns:
+        The CPU statistics mapping, or ``None`` when no live process is
+        recorded.
+    """
+    pid = meta.get("pid")
+    if not alive or not pid:
+        return None
+    return proc_cpu_usage(int(pid))
+
+
 def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
     """Build the JSON status mapping for an agent.
 
@@ -1614,6 +1755,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "id": aid,
         "state": state,
         "alive": alive,
+        "cpu": _cpu_for_status(meta, alive=alive),
         "native_session_id": meta.get("native_session_id"),
         "pid": meta.get("pid"),
         "pgid": meta.get("pgid"),
@@ -1918,11 +2060,15 @@ def cmd_log(args: argparse.Namespace) -> int:
         else:
             _err("(no output yet)")
             return EXIT_OK
-    max_chars = 0 if args.lines <= 0 else STATUS_TAIL_CHARS
+    # An explicit --lines count is the decisive limit: the whole file is read
+    # so the last N lines are returned even when they span more than the
+    # bounded status window. Without --lines, keep the bounded default tail.
+    lines = STATUS_TAIL_LINES if args.lines is None else args.lines
+    max_chars = STATUS_TAIL_CHARS if args.lines is None else 0
     if args.follow:
-        stream_log_until_terminal(aid, follow_lines=args.lines, max_chars=max_chars)
+        stream_log_until_terminal(aid, follow_lines=lines, max_chars=max_chars)
     else:
-        for line in tail_lines(log_path, args.lines, max_chars):
+        for line in tail_lines(log_path, lines, max_chars):
             _out(line)
     return EXIT_OK
 
@@ -2266,7 +2412,7 @@ SUBCOMMANDS: Final = (
             _arg(
                 "--lines",
                 type=int,
-                default=50,
+                default=None,
                 metavar="N",
                 help="number of recent lines (0 for all, default 50)",
             ),
