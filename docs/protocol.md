@@ -346,8 +346,11 @@ PostgreSQL compare-and-swap (CAS) predicates plus row locking:
   historical output exists, immutable chunks are inserted and the root row's
   `previous` pointer / live-window metadata is updated **in the same
   transaction**, so a crash can never leave the root pointing at nonexistent
-  history. Live tails are always recomputed as the newest 4000 bytes, so
-  archiving never shortens them.
+  history. The transaction first retains the root `command` row with a
+  row-level lock: once a concurrent root deletion has committed, publication
+  observes no root and inserts no chunk rows, so publication itself never
+  leaves an explicitly owned orphan chunk. Live tails are always recomputed as
+  the newest 4000 bytes, so archiving never shortens them.
 - **Finalizing:** a CAS update writes the `result` object and the terminal
   status guarded by `(payload::jsonb)->'state'->>'status' = 'running'`.
   Cancellation wins: if `state.cancel_requested_at` is set at finalization the

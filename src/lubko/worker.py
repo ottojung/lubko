@@ -36,8 +36,10 @@ Output capture is bounded and versioned. While a job runs, the root row's
 ``output`` section carries a rolling live tail of at most
 ``OUTPUT_TAIL_MAX_BYTES`` raw bytes per stream; older output is archived into
 immutable ``output_chunk`` rows whose insertion and the root ``previous``
-pointer update happen in one transaction. Archiving never shortens the live
-tail. See :mod:`lubko.protocol` and ``docs/protocol.md``.
+pointer update happen in one transaction. Publication first retains the root
+``command`` row with a row-level lock, so a root deleted concurrently leaves
+no new chunk rows. Archiving never shortens the live tail. See
+:mod:`lubko.protocol` and ``docs/protocol.md``.
 """
 
 from __future__ import annotations
@@ -492,17 +494,21 @@ def publish_output(
     now: float,
     *,
     force: bool = False,
-) -> None:
+) -> bool:
     """Publish changed live tails and archive historical output for one job.
 
     Immutable ``output_chunk`` rows are inserted and the root row's live-window
     metadata (including the ``previous`` pointer) is updated in one PostgreSQL
     transaction, so a crash can never leave the root pointing at nonexistent
-    history. In-memory publication state is only advanced after the transaction
-    commits, so a failed transaction never leaves the registry pointing at
-    chunks that were not inserted. The live tail itself is always recomputed as
-    the newest ``OUTPUT_TAIL_MAX_BYTES`` bytes of the capture file, so archiving
-    is observationally invisible to a normal root-row ``SELECT``.
+    history. The transaction first retains the root ``command`` row with a
+    row-level lock: when a concurrent root deletion has already committed, no
+    chunk row is inserted at all and publication returns ``False``, so
+    publication itself never leaves an explicitly owned orphan chunk. In-memory
+    publication state is only advanced after the transaction commits, so a
+    failed transaction never leaves the registry pointing at chunks that were
+    not inserted. The live tail itself is always recomputed as the newest
+    ``OUTPUT_TAIL_MAX_BYTES`` bytes of the capture file, so archiving is
+    observationally invisible to a normal root-row ``SELECT``.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -510,13 +516,27 @@ def publish_output(
         stream_names: Which streams to publish.
         now: Monotonic time of this publication pass.
         force: Whether to publish regardless of the throttle interval.
+
+    Returns:
+        ``True`` when the root ``command`` row was retained (or nothing needed
+        publishing), ``False`` when the root row no longer exists and the
+        planned publication was skipped.
     """
     plans = _plan_streams(job, stream_names, force=force)
     if not plans:
-        return
+        return True
     windows = _full_windows(job, plans)
     output = {"stdout": windows["stdout"], "stderr": windows["stderr"]}
     with conn.transaction(), conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id\n"
+            "FROM lubko.jobs\n"
+            "WHERE id = %(job_id)s AND (payload::jsonb)->>'type' = 'command'\n"
+            "FOR UPDATE\n",
+            {"job_id": job.id},
+        )
+        if cursor.fetchone() is None:
+            return False
         for plan in plans.values():
             for chunk_id, chunk_payload in plan.chunks:
                 cursor.execute(
@@ -529,6 +549,7 @@ def publish_output(
         )
     for name, plan in plans.items():
         _apply_plan(getattr(job, name), plan, now)
+    return True
 
 
 def _full_windows(job: ActiveJob, plans: dict[str, _StreamPlan]) -> dict[str, dict[str, Any]]:
@@ -1663,8 +1684,9 @@ class Supervisor:
                 if size == stream.published_size:
                     continue
                 changed.append(name)
-            if changed:
-                publish_output(conn, job, changed, now)
+            if changed and not publish_output(conn, job, changed, now):
+                job.row_lost = True
+                request_stop(job, STOP_REASON_ROW_LOST)
 
     def _finalize_completed(self) -> None:
         """Publish final output and finalize every job whose process is fully gone."""
@@ -1678,10 +1700,26 @@ class Supervisor:
                 # Background members of the exact process group are still being
                 # reaped; finalizing (and untracking) now would leak them.
                 continue
-            publish_output(conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True)
+            if not publish_output(conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True):
+                self._untrack_lost_job(job)
+                continue
             if self._finalize_one(job):
                 job.finalized = True
                 self.active.pop(job.id, None)
+
+    def _untrack_lost_job(self, job: ActiveJob) -> None:
+        """Untrack a completed job whose root row was deleted concurrently.
+
+        The concurrent deletion already removed the root and every owned chunk
+        in one transaction, so there is nothing left to persist; only the local
+        capture files remain to clean up.
+
+        Args:
+            job: The completed active job to untrack.
+        """
+        cleanup_job(job)
+        job.finalized = True
+        self.active.pop(job.id, None)
 
     def _finalize_one(self, job: ActiveJob) -> bool:
         """Persist the terminal state of one completed job.
@@ -1976,7 +2014,7 @@ class Supervisor:
                 job.stop_reason = STOP_REASON_SHUTDOWN
                 job.cancellation_note = _stop_note(STOP_REASON_SHUTDOWN)
             try:
-                publish_output(
+                retained = publish_output(
                     self.conn,
                     job,
                     list(OUTPUT_STREAMS),
@@ -1985,6 +2023,9 @@ class Supervisor:
                 )
             except psycopg.Error:
                 LOGGER.exception("publishing shutdown output for job %s failed", job.id)
+                continue
+            if not retained:
+                self._untrack_lost_job(job)
                 continue
             if self._finalize_one(job):
                 job.finalized = True

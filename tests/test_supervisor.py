@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import signal
+import subprocess
 import threading
 import time
 from contextlib import contextmanager, suppress
@@ -26,16 +27,21 @@ from lubko.config import DatabaseConfig
 from lubko.worker import (
     CHUNK_ORDER_INDEX_NAME,
     CHUNK_OWNER_INDEX_NAME,
+    OUTPUT_STREAM_STDOUT,
     TYPE_AWARE_CONSTRAINT_NAME,
+    ActiveJob,
+    OutputStream,
     SchemaInvariantError,
     Settings,
     Supervisor,
     delete_job_and_chunks,
     group_has_members,
+    publish_output,
     request_cancel,
     verify_jobs_table_invariant,
     verify_v2_schema,
 )
+from tests import _process_guard as guard
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -730,6 +736,103 @@ def test_cleanup_deletes_root_and_all_owned_chunks(
         delete_job_and_chunks(conn, job_id)
 
     assert count_rows(jobs_db, job_id) == 0
+
+
+def _publish_job_for(job_id: UUID, cwd: str) -> ActiveJob:
+    """Build an active job publishing one 9000-byte stdout capture.
+
+    Args:
+        job_id: Identifier matching an existing root ``command`` row.
+        cwd: Working directory used as the temporary capture-file base.
+
+    Returns:
+        An active job whose stdout capture would archive three chunks.
+    """
+    proc = subprocess.Popen(
+        ["/bin/true"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    job = ActiveJob(
+        id=job_id,
+        cwd=cwd,
+        command="sleep 30",
+        args=None,
+        proc=proc,
+        pid=proc.pid,
+        pgid=proc.pid,
+        started_mono=time.monotonic(),
+    )
+    job.stdout = OutputStream(path=Path(cwd) / "stdout.cap")
+    job.stderr = OutputStream(path=Path(cwd) / "stderr.cap")
+    return job
+
+
+def _publish_on_connection(conninfo: str, job: ActiveJob, results: list[bool]) -> None:
+    """Publish one job's output on a dedicated connection, recording the result.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        job: The active job to publish.
+        results: List receiving the publication result (root retained?).
+    """
+    conn = psycopg.connect(conninfo)
+    try:
+        results.append(
+            publish_output(conn, job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+        )
+    finally:
+        conn.close()
+
+
+def test_publish_output_concurrent_root_deletion_leaves_no_orphan_chunks(
+    jobs_db: str,
+    tmp_path: Path,
+) -> None:
+    """A root deleted while output publishes leaves no new chunk rows.
+
+    The issue #32 race is forced deterministically: the publication transaction
+    blocks on a row lock held by a second connection, and the root is deleted
+    and committed while publication is in flight. Publication first retains the
+    root ``command`` row with a row-level lock, so once the concurrent delete
+    has committed it observes no root, inserts no immutable ``output_chunk``
+    row, and does not advance its in-memory publication state.
+    """
+    job_id = insert_job(jobs_db, str(tmp_path), "sleep 30")
+    job = _publish_job_for(job_id, str(tmp_path))
+    job.stdout.path.write_bytes(b"x" * 9000)
+
+    results: list[bool] = []
+    holder = psycopg.connect(jobs_db)
+    try:
+        with holder.transaction():
+            locked = holder.execute(
+                "SELECT id FROM lubko.jobs WHERE id = %s FOR UPDATE",
+                (job_id,),
+            ).fetchone()
+            assert locked is not None
+            thread = threading.Thread(
+                target=_publish_on_connection,
+                args=(jobs_db, job, results),
+                daemon=True,
+            )
+            thread.start()
+            time.sleep(0.2)
+            holder.execute("DELETE FROM lubko.jobs WHERE id = %s", (job_id,))
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    finally:
+        holder.close()
+
+    assert results == [False]
+    assert count_rows(jobs_db, job_id) == 0
+    assert read_chunks(jobs_db, job_id) == []
+    assert job.stdout.archived_upto == 0
+    assert job.stdout.sequence == 0
+    assert job.stdout.tail_end == 0
 
 
 def test_database_outage_stops_claims_and_never_lets_a_child_outlive_its_lease(
