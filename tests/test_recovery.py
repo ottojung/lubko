@@ -30,6 +30,7 @@ from lubko.worker import (
     group_has_members,
     recover_stale_jobs,
 )
+from tests import _process_guard as guard
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -57,11 +58,40 @@ class _Cluster:
         self.socket_dir = socket_dir
         self.port = port
         self.env = env
+        self.postmaster_pid: int | None = None
 
     def conninfo(self) -> str:
         return f"host={self.socket_dir} port={self.port} dbname=postgres user=postgres"
 
+    def start(self) -> None:
+        subprocess.run(
+            [
+                self.binaries["pg_ctl"],
+                "-D",
+                str(self.data_dir),
+                "-o",
+                f"-p {self.port} -k {self.socket_dir}",
+                "-l",
+                str(self.data_dir.parent / "server.log"),
+                "start",
+            ],
+            env=self.env,
+            check=True,
+            capture_output=True,
+        )
+        pidfile = self.data_dir / "postmaster.pid"
+        try:
+            self.postmaster_pid = int(pidfile.read_text(encoding="utf-8").splitlines()[0])
+        except (OSError, ValueError, IndexError):
+            self.postmaster_pid = None
+
     def stop(self) -> None:
+        """Stop the cluster and confirm the exact postmaster is gone.
+
+        The postmaster is stopped through ``pg_ctl`` and then verified by its
+        exact recorded PID; if it still lives afterwards the exact PID is
+        force-killed, so a cluster teardown never leaks a postmaster.
+        """
         subprocess.run(
             [
                 self.binaries["pg_ctl"],
@@ -75,6 +105,46 @@ class _Cluster:
             check=False,
             capture_output=True,
         )
+        self._assert_postmaster_gone()
+
+    def _assert_postmaster_gone(self) -> None:
+        pid = self.postmaster_pid
+        if pid is None:
+            return
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and _process_live(pid):
+            time.sleep(0.05)
+        if _process_live(pid):
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and _process_live(pid):
+                time.sleep(0.05)
+        if _process_live(pid):
+            msg = f"postgres postmaster pid {pid} still live after cluster teardown"
+            raise AssertionError(msg)
+
+
+def _process_live(pid: int) -> bool:
+    """Return whether a process exists and is not a zombie.
+
+    Args:
+        pid: Process ID to probe.
+
+    Returns:
+        ``True`` when a running (non-zombie) process with that ID exists.
+    """
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+    except OSError:
+        return False
+    close_paren = stat.rfind(b")")
+    if close_paren == -1:
+        return True
+    fields = stat[close_paren + 2 :].split()
+    if not fields:
+        return True
+    return fields[0] not in {b"Z", b"X"}
 
 
 def _postgres_binaries() -> dict[str, str] | None:
@@ -159,22 +229,8 @@ def cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Cluster]:
         check=True,
         capture_output=True,
     )
-    subprocess.run(
-        [
-            binaries["pg_ctl"],
-            "-D",
-            str(data_dir),
-            "-o",
-            f"-p {port} -k {socket_dir}",
-            "-l",
-            str(root / "server.log"),
-            "start",
-        ],
-        env=env,
-        check=True,
-        capture_output=True,
-    )
     current = _Cluster(binaries, data_dir, socket_dir, port, env)
+    current.start()
     try:
         yield current
     finally:
@@ -431,6 +487,7 @@ def terminate(proc: subprocess.Popen[bytes]) -> None:
     """
     proc.kill()
     proc.wait(timeout=10)
+    guard.unregister(proc)
 
 
 def wait_for_claimed_run(db: str, job_id: UUID, marker: Path) -> None:
@@ -491,14 +548,17 @@ def test_worker_crash_is_recovered_by_replacement_worker(
     env["LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS"] = "0.1"
 
     def spawn_worker() -> subprocess.Popen[bytes]:
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, "-m", "lubko.worker"],
             cwd=REPO_ROOT,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
+        guard.register(proc)
+        return proc
 
     first = spawn_worker()
     replacement: subprocess.Popen[bytes] | None = None

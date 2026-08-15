@@ -25,6 +25,7 @@ from lubko.lifecycle import (
     ValidationReport,
     WorkerMeta,
 )
+from tests import _process_guard as guard
 
 MARKER: Final = "test-marker"
 STALE_MARKER: Final = "stale"
@@ -39,6 +40,9 @@ TEST_PASSWORD: Final = "secret-value"  # ruff: ignore[hardcoded-password-string]
 def spawn_controlled(marker: str = MARKER) -> subprocess.Popen[bytes]:
     """Spawn a controlled long-lived session-leader process.
 
+    The process is registered with the shared process guard so teardown owns
+    and deterministically stops it even if an assertion fails mid-test.
+
     Args:
         marker: Lifecycle token to place in the process environment.
 
@@ -47,7 +51,7 @@ def spawn_controlled(marker: str = MARKER) -> subprocess.Popen[bytes]:
     """
     env = dict(os.environ)
     env[lifecycle.LIFECYCLE_MARKER_VAR] = marker
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [SLEEP_BIN, "300"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -56,6 +60,8 @@ def spawn_controlled(marker: str = MARKER) -> subprocess.Popen[bytes]:
         close_fds=True,
         env=env,
     )
+    guard.register(proc)
+    return proc
 
 
 def identity_of(proc: subprocess.Popen[bytes]) -> ProcessIdentity:
@@ -116,6 +122,7 @@ def kill_proc(proc: subprocess.Popen[bytes]) -> None:
         with suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
     proc.wait(timeout=5)
+    guard.unregister(proc)
 
 
 def kill_many(procs: list[subprocess.Popen[bytes]]) -> None:
@@ -217,6 +224,7 @@ def patch_deploy(
         env: dict[str, str],
     ) -> subprocess.Popen[bytes]:
         proc = original_spawn(repo, uv_path, log_path, env)
+        guard.register(proc)
         spawned.append(proc)
         return proc
 
@@ -434,6 +442,7 @@ def test_deploy_validates_before_replacing(
         ) -> subprocess.Popen[bytes]:
             order.append("spawn")
             proc = original_spawn(repo, uv_path, log_path, env)
+            guard.register(proc)
             spawned.append(proc)
             return proc
 
