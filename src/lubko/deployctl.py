@@ -57,6 +57,11 @@ from lubko.lifecycle import (
     worker_log_path,
     write_meta,
 )
+from lubko.readiness import (
+    candidate_supports_readiness,
+    readiness_proven,
+    remove_readiness_marker,
+)
 from lubko.state import rollback_state_path
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import JOB_ID_ENV
@@ -71,6 +76,7 @@ STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
 DEFAULT_CONFIRM_WINDOW_SECONDS: Final = 120.0
+DEFAULT_READINESS_WINDOW_SECONDS: Final = 30.0
 DEFAULT_STOP_GRACE_SECONDS: Final = 5.0
 DEFAULT_POSTGRES_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_LOCK_TIMEOUT_SECONDS: Final = 30.0
@@ -114,12 +120,13 @@ class Options:
     repo: Path
     uv_path: str
     confirm_window_seconds: float
-    stop_grace_seconds: float
-    postgres_timeout_seconds: float
-    lock_timeout_seconds: float
-    validation_timeout_seconds: float
-    git_timeout_seconds: float
-    cli_timeout_seconds: float
+    readiness_window_seconds: float = DEFAULT_READINESS_WINDOW_SECONDS
+    stop_grace_seconds: float = DEFAULT_STOP_GRACE_SECONDS
+    postgres_timeout_seconds: float = DEFAULT_POSTGRES_TIMEOUT_SECONDS
+    lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS
+    validation_timeout_seconds: float = DEFAULT_VALIDATION_TIMEOUT_SECONDS
+    git_timeout_seconds: float = DEFAULT_GIT_TIMEOUT_SECONDS
+    cli_timeout_seconds: float = DEFAULT_CLI_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,18 +463,60 @@ def _release_gate(gate_writer: int) -> None:
         _close_gate(gate_writer)
 
 
-def _wait_for_released_worker(meta: WorkerMeta) -> bool:
-    """Require the released candidate to survive a short stabilization period.
+def _wait_for_released_worker(options: Options, meta: WorkerMeta) -> bool:
+    """Require the released candidate to prove it reached the queue boundary.
 
-    The actual queue-health proof is the two confirmation requests themselves:
-    only the replacement worker is left consuming the queue, so inability to
-    consume prevents confirmation and the watchdog rolls back.
+    A candidate that implements the readiness protocol must write its
+    token-scoped marker (proving PostgreSQL connectivity and the canonical
+    schema invariant) within ``options.readiness_window_seconds`` after the
+    gate is released; an alive process that never reaches a functioning
+    queue-processing boundary is rejected and rolled back before the operator
+    confirmation timeout. Legacy candidates that predate the protocol keep the
+    previous short liveness check so rolling back to older known-good versions
+    stays possible.
+
+    Args:
+        options: Deployment options.
+        meta: Candidate metadata.
+
+    Returns:
+        ``True`` only when the candidate is proven ready (or is a legacy
+        candidate that survived the stability check).
+    """
+    if candidate_supports_readiness(options.repo):
+        return _wait_for_readiness(meta, options.readiness_window_seconds)
+    return _wait_for_stability(meta)
+
+
+def _wait_for_readiness(meta: WorkerMeta, window_seconds: float) -> bool:
+    """Wait for the exact candidate process and its matching readiness marker.
+
+    Args:
+        meta: Candidate metadata.
+        window_seconds: Maximum seconds to wait for the readiness proof.
+
+    Returns:
+        ``True`` only when the exact candidate stayed alive and its
+        token-scoped readiness marker appeared within the window.
+    """
+    deadline = time.monotonic() + window_seconds
+    while time.monotonic() < deadline:
+        if not worker_alive(meta):
+            return False
+        if meta.token is not None and readiness_proven(meta.token):
+            return True
+        time.sleep(IDENTITY_POLL_SECONDS)
+    return worker_alive(meta) and meta.token is not None and readiness_proven(meta.token)
+
+
+def _wait_for_stability(meta: WorkerMeta) -> bool:
+    """Require a legacy candidate to survive the previous short stability check.
 
     Args:
         meta: Candidate metadata.
 
     Returns:
-        ``True`` when the candidate remains alive.
+        ``True`` when the candidate remained alive throughout the window.
     """
     deadline = time.monotonic() + POST_RELEASE_STABILITY_SECONDS
     while time.monotonic() < deadline:
@@ -681,6 +730,8 @@ def _abort_mission(gated: GatedWorker, state: RollbackState) -> None:
         state.git_timeout_seconds,
         force=True,
     )
+    if state.new_meta.token is not None:
+        remove_readiness_marker(state.new_meta.token)
     cli.remove_cli_root(state.commit)
 
 
@@ -709,8 +760,8 @@ def _complete_handoff(options: Options, state: RollbackState, gated: GatedWorker
         if not stop_worker(state.previous_meta, options.stop_grace_seconds):
             raise DeployCtlError("could not stop the known-good worker")
         _release_gate(gated.gate_writer)
-        if not _wait_for_released_worker(gated.meta):
-            raise DeployCtlError("candidate worker exited immediately after release")
+        if not _wait_for_released_worker(options, gated.meta):
+            raise DeployCtlError("candidate worker did not prove readiness after release")
         live = replace(retiring, deadline=time.time() + options.confirm_window_seconds)
         _write_state(live)
         return live
@@ -796,6 +847,8 @@ def _rollback_locked(state: RollbackState) -> bool:
     if state.status != STATUS_PENDING:
         return True
     stop_worker(state.new_meta, state.stop_grace_seconds)
+    if state.new_meta.token is not None:
+        remove_readiness_marker(state.new_meta.token)
     repo = Path(state.repo)
     if not _checkout(repo, state.previous_commit, state.git_timeout_seconds, force=True):
         append_deploy_log("supervised rollback could not restore previous checkout")
@@ -1290,6 +1343,8 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
         raise DeployCtlError(msg) from exc
     write_meta(state.new_meta)
     _write_state(replace(state, status=STATUS_CONFIRMED))
+    if state.new_meta.token is not None:
+        remove_readiness_marker(state.new_meta.token)
     try:
         cli.set_current(state.commit)
     except cli.CliError as exc:
@@ -1436,6 +1491,13 @@ def build_parser() -> argparse.ArgumentParser:
             os.getenv("LUBKO_ROLLBACK_WINDOW_SECONDS", str(DEFAULT_CONFIRM_WINDOW_SECONDS))
         ),
     )
+    parser.add_argument(
+        "--readiness-window-seconds",
+        type=float,
+        default=float(
+            os.getenv("LUBKO_READINESS_WINDOW_SECONDS", str(DEFAULT_READINESS_WINDOW_SECONDS))
+        ),
+    )
     parser.add_argument("--grace-seconds", type=float, default=DEFAULT_STOP_GRACE_SECONDS)
     parser.add_argument("--db-timeout", type=float, default=DEFAULT_POSTGRES_TIMEOUT_SECONDS)
     parser.add_argument("--lock-timeout", type=float, default=DEFAULT_LOCK_TIMEOUT_SECONDS)
@@ -1502,6 +1564,7 @@ def main(argv: list[str] | None = None) -> int:
             repo=args.repo.resolve(),
             uv_path=uv_path,
             confirm_window_seconds=args.confirm_window_seconds,
+            readiness_window_seconds=args.readiness_window_seconds,
             stop_grace_seconds=args.grace_seconds,
             postgres_timeout_seconds=args.db_timeout,
             lock_timeout_seconds=args.lock_timeout,
@@ -1511,6 +1574,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if options.confirm_window_seconds <= 0:
             raise DeployCtlError("confirmation window must be positive")
+        if options.readiness_window_seconds <= 0:
+            raise DeployCtlError("readiness window must be positive")
         request = _parse_request(args.request)
         request_type = _request_type(request)
         response = _dispatch(options, request)

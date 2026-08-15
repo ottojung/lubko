@@ -967,7 +967,7 @@ def test_deploy_locked_persists_retirement_marker_before_stopping_previous(
     monkeypatch.setattr(dc, "stop_worker", record_stop)
     monkeypatch.setattr(dc, "_release_gate", lambda _writer: None)
     monkeypatch.setattr(dc, "_close_gate", lambda _writer: None)
-    monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _meta: True)
+    monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _options, _meta: True)
 
     def fake_gated(_options: dc.Options, _commit: str) -> dc.GatedWorker:
         nonlocal gated_proc

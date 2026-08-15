@@ -70,6 +70,7 @@ from lubko.protocol import (
     build_output_window_payload,
     parse_payload,
 )
+from lubko.readiness import LIFECYCLE_MARKER_VAR, write_readiness_marker
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -1878,6 +1879,29 @@ class Supervisor:
                 conn.close()
             raise
         self.conn = conn
+        self._write_readiness_marker()
+
+    @staticmethod
+    def _write_readiness_marker() -> None:
+        """Prove this worker reached the queue-processing boundary.
+
+        A token-scoped readiness marker is written only after PostgreSQL
+        connectivity and schema verification have both succeeded, so a
+        supervised checkout can reject a candidate that stays alive without
+        ever reaching a functioning queue-processing boundary. The write is
+        best-effort: a worker that cannot write the marker fails closed on the
+        controller side, which rolls back.
+        """
+        token = os.environ.get(LIFECYCLE_MARKER_VAR)
+        if token is None:
+            return
+        try:
+            write_readiness_marker(token)
+        except OSError:
+            LOGGER.warning(
+                "unable to write the readiness marker; supervised checkout "
+                "readiness proof will fail closed"
+            )
 
     def _enter_outage(self) -> None:
         """Transition into database outage handling, discarding the connection.

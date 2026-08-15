@@ -41,6 +41,7 @@ from psycopg.rows import tuple_row
 
 from lubko import cli
 from lubko.config import load_database_config
+from lubko.readiness import LIFECYCLE_MARKER_VAR as LIFECYCLE_MARKER_VAR
 from lubko.state import state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import group_has_members
@@ -56,8 +57,6 @@ SCHEMA_VERSION: Final = 1
 STATE_UNMANAGED: Final = "unmanaged"
 STATE_RUNNING: Final = "running"
 STATE_STOPPED: Final = "stopped"
-
-LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
 
 DEFAULT_STOP_GRACE_SECONDS: Final = 5.0
 DEFAULT_POSTGRES_TIMEOUT_SECONDS: Final = 5.0
