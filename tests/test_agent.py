@@ -7,12 +7,14 @@ import shutil
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final
 
 import pytest
 
 from lubko import agent
+from tests import _process_guard as guard
 
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
 MARKER_AID: Final = "a1b2c3d4"
@@ -37,6 +39,9 @@ REQUIRED_COMMANDS: Final = frozenset({
 def spawn_marked_process(aid: str) -> subprocess.Popen[bytes]:
     """Spawn a long-lived process carrying the agent marker in its environment.
 
+    The process is registered with the shared process guard so teardown owns
+    and deterministically stops it even if an assertion fails mid-test.
+
     Args:
         aid: Agent ID to place in the process environment.
 
@@ -45,7 +50,7 @@ def spawn_marked_process(aid: str) -> subprocess.Popen[bytes]:
     """
     env = dict(os.environ)
     env["LUBKO_AGENT_ID"] = aid
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [SLEEP_BIN, "300"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -54,6 +59,8 @@ def spawn_marked_process(aid: str) -> subprocess.Popen[bytes]:
         close_fds=True,
         env=env,
     )
+    guard.register(proc)
+    return proc
 
 
 def kill_proc(proc: subprocess.Popen[bytes]) -> None:
@@ -66,6 +73,7 @@ def kill_proc(proc: subprocess.Popen[bytes]) -> None:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
     proc.wait(timeout=5)
+    guard.unregister(proc)
 
 
 def meta_for_process(aid: str, proc: subprocess.Popen[bytes], cwd: str) -> agent.Meta:
@@ -556,3 +564,315 @@ def test_subcommands_present() -> None:
 def test_main_without_command_returns_usage() -> None:
     """Invoking the CLI without a command prints usage."""
     assert agent.main([]) == agent.EXIT_USAGE
+
+
+def spawn_marked_term_ignoring(aid: str) -> subprocess.Popen[bytes]:
+    """Spawn a marked process whose group ignores ``SIGTERM``.
+
+    The session-leader shell traps ``TERM`` while its ``sleep`` child keeps
+    the group alive, so graceful ``stop`` must escalate to ``SIGKILL`` to end
+    the whole exact group.
+
+    Args:
+        aid: Agent ID to place in the process environment.
+
+    Returns:
+        The spawned process.
+    """
+    env = dict(os.environ)
+    env["LUBKO_AGENT_ID"] = aid
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", "trap '' TERM; while :; do sleep 1; done"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    guard.register(proc)
+    return proc
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
+    """Poll until a predicate holds, raising if the deadline expires.
+
+    Args:
+        predicate: Condition to satisfy.
+        timeout: Maximum seconds to wait.
+
+    Raises:
+        AssertionError: If the condition is not met within the timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    msg = "condition not met within timeout"
+    raise AssertionError(msg)
+
+
+def test_is_alive_requires_exact_marker_entry() -> None:
+    """An ID that is a prefix of another marker is never an exact match."""
+    proc = spawn_marked_process(MARKER_AID)
+    try:
+        exact = meta_for_process(MARKER_AID, proc, "/workspace")
+        assert agent.is_alive(exact)
+        prefix = meta_for_process(MARKER_AID + "5", proc, "/workspace")
+        prefix["start_time"] = agent.proc_start_ticks(proc.pid)
+        assert not agent.is_alive(prefix)
+    finally:
+        kill_proc(proc)
+
+
+def test_spawn_runner_sets_exact_agent_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """spawn_runner overwrites a stale marker with the exact agent ID."""
+    monkeypatch.setenv("LUBKO_AGENT_ID", "stale-value")
+    captured: list[dict[str, str]] = []
+
+    def recording_popen(_argv: object, **kwargs: object) -> None:
+        env = kwargs.get("env")
+        assert isinstance(env, dict)
+        captured.append({str(key): str(value) for key, value in env.items()})
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    agent.spawn_runner("aaaaaaaa", "new")
+
+    assert len(captured) == 1
+    assert captured[0]["LUBKO_AGENT_ID"] == "aaaaaaaa"
+
+
+def test_runner_does_not_drop_concurrently_queued_prompt(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt queued between read and claim is never lost.
+
+    The runner clears ``pending_prompt`` under the metadata lock only when it
+    exactly matches the prompt being claimed; a continuation that landed in
+    the read-to-claim window must survive for the next invocation.
+    """
+    make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
+    agent.update_meta("aaaaaaaa", lambda m: m.update(pending_prompt="first"))
+
+    def racing_command(_meta: agent.Meta, _prompt: str, *, is_continue: bool) -> list[str]:
+        del is_continue
+        agent.update_meta("aaaaaaaa", lambda m: m.update(pending_prompt="second"))
+        return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
+
+    monkeypatch.setattr(agent, "build_agent_command", racing_command)
+    agent.runner("aaaaaaaa", "continue")
+    result = agent.read_meta("aaaaaaaa")
+    assert result is not None
+    assert result["state"] == "succeeded"
+    log = (agent.agents_dir() / "aaaaaaaa" / "output.log").read_text()
+    assert "first" in log
+    assert "second" in log
+
+
+def test_runner_runs_prompt_queued_during_invocation(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continuation queued while an invocation runs is executed next."""
+    make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
+    queued = {"done": False}
+
+    def queuing_command(_meta: agent.Meta, _prompt: str, *, is_continue: bool) -> list[str]:
+        del is_continue
+        if not queued["done"]:
+            queued["done"] = True
+            agent.update_meta("aaaaaaaa", lambda m: m.update(pending_prompt="second"))
+        return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
+
+    monkeypatch.setattr(agent, "build_agent_command", queuing_command)
+    agent.runner("aaaaaaaa", "new")
+    result = agent.read_meta("aaaaaaaa")
+    assert result is not None
+    assert result["state"] == "succeeded"
+    log = (agent.agents_dir() / "aaaaaaaa" / "output.log").read_text()
+    assert "initial prompt" in log
+    assert "second" in log
+
+
+def test_runner_reclaims_queued_steer_on_start(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replacement runner executes a steer queued before it started."""
+    meta = make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
+    meta["steer_queue"] = [{"seq": 1, "prompt": "queued", "queued_at": time.time()}]
+    meta["steer_seq"] = 1
+    agent.write_meta("aaaaaaaa", meta)
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    agent.runner("aaaaaaaa", "continue")
+    result = agent.read_meta("aaaaaaaa")
+    assert result is not None
+    assert result["state"] == "succeeded"
+    assert result["steer_queue"] == []
+    assert result["active_runner"] is False
+    log = (agent.agents_dir() / "aaaaaaaa" / "output.log").read_text()
+    assert "queued" in log
+
+
+def test_runner_abnormal_exit_kills_invocation_group(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected runner failure never orphans the invocation group."""
+    make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
+    monkeypatch.setattr(agent, "build_agent_command", lambda *_a, **_k: [SLEEP_BIN, "300"])
+
+    def boom(_proc: subprocess.Popen[bytes], _aid: str, *, is_continue: bool) -> int:
+        del is_continue
+        msg = "simulated runner failure"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(agent, "_wait_for_invocation_exit", boom)
+    with pytest.raises(RuntimeError, match="simulated"):
+        agent.runner("aaaaaaaa", "new")
+
+    result = agent.read_meta("aaaaaaaa")
+    assert result is not None
+    assert result["state"] == "failed"
+    assert result["active_runner"] is False
+    assert "aborted unexpectedly" in result["error"]
+    assert not agent.group_alive(result)
+
+
+def test_prompt_skips_duplicate_runner_when_live_runner_exists(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt does not spawn a second runner while one is live."""
+    runner_proc = spawn_marked_process("aaaaaaaa")
+    try:
+        meta = make_agent(
+            state_dir,
+            "aaaaaaaa",
+            state_value="succeeded",
+            native_session_id="sess-1",
+        )
+        meta["active_runner"] = True
+        meta["runner_pid"] = runner_proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(runner_proc.pid)
+        agent.write_meta("aaaaaaaa", meta)
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+        code = agent.main(["prompt", "aaaaaaaa", "--prompt", "more"])
+        assert code == agent.EXIT_OK
+        assert spawned == []
+        current = agent.read_meta("aaaaaaaa")
+        assert current is not None
+        assert current["pending_prompt"] == "more"
+    finally:
+        kill_proc(runner_proc)
+
+
+def test_cmd_stop_escalates_to_sigkill_when_group_survives(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A TERM-ignoring group is force-killed so no member is abandoned."""
+    proc = spawn_marked_term_ignoring("aaaaaaaa")
+    try:
+        monkeypatch.setattr(agent, "STOP_WAIT_SECONDS", 0.3)
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 2.0)
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, str(state_dir)))
+        code = agent.main(["stop", "aaaaaaaa"])
+        assert code == agent.EXIT_OK
+        assert "stopped" in capsys.readouterr().out
+        meta = agent.read_meta("aaaaaaaa")
+        assert meta is not None
+        assert meta["state"] == "stopped"
+        assert meta["exit_signal"] == signal.SIGKILL
+        wait_until(lambda: proc.poll() is not None)
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_kill_confirms_whole_group_gone(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Kill signals the exact group and waits for every member to leave."""
+    proc = spawn_marked_term_ignoring("aaaaaaaa")
+    try:
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 2.0)
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, str(state_dir)))
+        code = agent.main(["kill", "aaaaaaaa"])
+        assert code == agent.EXIT_OK
+        assert "killed" in capsys.readouterr().out
+        meta = agent.read_meta("aaaaaaaa")
+        assert meta is not None
+        assert meta["state"] == "killed"
+        assert meta["exit_signal"] == signal.SIGKILL
+        wait_until(lambda: proc.poll() is not None)
+        wait_until(lambda: not agent.group_alive(meta))
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_delete_force_kills_live_group(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Force-deleting a running agent kills its whole exact group first."""
+    proc = spawn_marked_term_ignoring("aaaaaaaa")
+    try:
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 2.0)
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, str(state_dir)))
+        code = agent.main(["delete", "aaaaaaaa", "--force"])
+        assert code == agent.EXIT_OK
+        assert "deleted" in capsys.readouterr().out
+        assert not (agent.agents_dir() / "aaaaaaaa").exists()
+        wait_until(lambda: proc.poll() is not None)
+    finally:
+        kill_proc(proc)
+
+
+def test_runner_alive_matches_exact_identity(state_dir: Path) -> None:
+    """A live runner with matching start time and marker is reported alive."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        meta = make_agent(state_dir, "aaaaaaaa", state_value="running")
+        meta["active_runner"] = True
+        meta["runner_pid"] = proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
+        assert agent.runner_alive(meta)
+    finally:
+        kill_proc(proc)
+
+
+def test_runner_alive_rejects_recycled_start_time(state_dir: Path) -> None:
+    """A runner whose recorded start time does not match is never alive."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        meta = make_agent(state_dir, "aaaaaaaa", state_value="running")
+        meta["active_runner"] = True
+        meta["runner_pid"] = proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
+        assert agent.runner_alive(meta)
+        meta["runner_start_time"] = (meta["runner_start_time"] or 0) + 1
+        assert not agent.runner_alive(meta)
+    finally:
+        kill_proc(proc)
+
+
+def test_runner_alive_requires_exact_marker(state_dir: Path) -> None:
+    """A process carrying another agent's marker is never our runner."""
+    proc = spawn_marked_process("bbbbbbbb")
+    try:
+        meta = make_agent(state_dir, "aaaaaaaa", state_value="running")
+        meta["active_runner"] = True
+        meta["runner_pid"] = proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
+        assert not agent.runner_alive(meta)
+    finally:
+        kill_proc(proc)

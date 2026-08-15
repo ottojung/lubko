@@ -70,6 +70,16 @@ Jobs run through `bash -lc` directly in the container, in the directory
 requested by each job. Each job is started as its own session and process
 group leader.
 
+### Container init (reaping PID 1)
+
+The Lubko container must run under a real reaping PID 1 that adopts and
+reaps orphaned children — for example Docker `--init` / Compose `init: true`
+(tini), or `dumb-init` — so that abandoned job/agent descendants never
+accumulate as zombies. Lubko intentionally ships **no process reaper of its
+own**: reaping adopted children is the container runtime's responsibility.
+Cancellation, stop, and kill operations in Lubko always signal only exact,
+recorded process groups (never `pkill`/`killall`/name matching).
+
 ## Two-column transport invariant
 
 The transport table `lubko.jobs` has **exactly two columns forever**:

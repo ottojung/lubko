@@ -33,6 +33,8 @@ from itertools import starmap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 
+from lubko.worker import group_has_members
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -257,6 +259,7 @@ def base_meta(aid: str, cwd: str, prompt: str, title: str | None, *, is_continue
         "pgid": None,
         "start_time": None,
         "runner_pid": None,
+        "runner_start_time": None,
         "started_at": now,
         "finished_at": None,
         "exit_code": None,
@@ -319,12 +322,25 @@ def proc_start_ticks(pid: int) -> int | None:
 
 
 def _env_has_marker(pid: int, aid: str) -> bool:
+    """Return whether a process environment carries the exact agent marker.
+
+    The marker is matched against whole NUL-separated environment entries so
+    an ID that is a prefix of another (for example ``a1b2c3d4`` inside
+    ``a1b2c3d45``) can never be mistaken for the exact session identity.
+
+    Args:
+        pid: Process whose environment to inspect.
+        aid: Exact agent ID the marker must match.
+
+    Returns:
+        ``True`` only when an exact ``LUBKO_AGENT_ID=<aid>`` entry is present.
+    """
     marker = f"LUBKO_AGENT_ID={aid}".encode()
     try:
         environ = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
         return False
-    return marker in environ
+    return marker in environ.split(b"\0")
 
 
 def is_alive(meta: Meta) -> bool:
@@ -368,22 +384,68 @@ def send_signal_group(meta: Meta, sig: int) -> None:
         os.killpg(pid, sig)  # the agent was launched as its own session leader
 
 
-def wait_dead(meta: Meta, timeout: float) -> bool:
-    """Wait until the recorded agent process is gone.
+def group_alive(meta: Meta) -> bool:
+    """Return whether any live process remains in the agent's process group.
+
+    Args:
+        meta: Agent metadata.
+
+    Returns:
+        ``True`` when the recorded process group still has live members.
+    """
+    pgid = meta.get("pgid")
+    return bool(pgid and group_has_members(int(pgid)))
+
+
+def wait_group_dead(meta: Meta, timeout: float) -> bool:
+    """Wait until the agent's exact process group has no live members.
+
+    The recorded leader PID alone is not enough: an agent run may leave a
+    member of its own process group behind (for example an OpenCode child
+    that ignored ``SIGTERM``), so stop/kill must confirm the whole exact
+    group is gone rather than only the tracked leader.
 
     Args:
         meta: Agent metadata.
         timeout: Maximum seconds to wait.
 
     Returns:
-        ``True`` when the process is gone within the timeout.
+        ``True`` when the process group is gone within the timeout.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not is_alive(meta):
+        if not group_alive(meta):
             return True
         time.sleep(0.2)
-    return not is_alive(meta)
+    return not group_alive(meta)
+
+
+def runner_alive(meta: Meta) -> bool:
+    """Return whether the recorded background runner is really our runner.
+
+    The runner PID is anchored by its start time and the per-agent
+    environment marker, exactly like the agent process itself, so a recycled
+    PID can never be mistaken for a live runner.
+
+    Args:
+        meta: Agent metadata.
+
+    Returns:
+        ``True`` only when a live process matches every recorded runner
+        identity field.
+    """
+    pid = meta.get("runner_pid")
+    if not pid:
+        return False
+    if proc_start_ticks(int(pid)) != meta.get("runner_start_time"):
+        return False
+    if not _env_has_marker(int(pid), meta.get("id", "")):
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -648,11 +710,50 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
 # ---------------------------------------------------------------------------
 
 
+def _clear_pending(meta: Meta, prompt: str) -> None:
+    """Clear the pending prompt only when it is the exact one being claimed.
+
+    A prompt queued concurrently (for example a continuation issued while
+    this invocation was already being claimed) must never be cleared: it is
+    owned by the next loop iteration.  Clearing only an exact match prevents
+    the prompt-loss race where a runner blindly pops a freshly queued prompt.
+
+    Args:
+        meta: Agent metadata under the metadata lock.
+        prompt: The exact prompt this invocation claimed.
+    """
+    if meta.get("pending_prompt") == prompt:
+        meta["pending_prompt"] = None
+
+
+def _runner_env(aid: str) -> dict[str, str]:
+    """Build the detached runner environment with the exact agent marker.
+
+    The runner's own environment must carry ``LUBKO_AGENT_ID=<aid>`` so the
+    runner's exact identity can be verified later (start time plus marker);
+    a stale marker inherited from the invoking environment is overwritten
+    with the exact current agent ID.  No other environment entry is altered.
+
+    Args:
+        aid: Agent ID the runner monitors.
+
+    Returns:
+        The environment with the exact agent marker.
+    """
+    env = dict(os.environ)
+    env["LUBKO_AGENT_ID"] = aid
+    return env
+
+
 def runner(aid: str, mode: str) -> None:
     """Detached monitor: run the current invocation, then any queued steers.
 
     Runs one invocation, records its result, then — if steer instructions
     are queued — immediately runs them in FIFO order until the queue drains.
+    A runner that finds no prompt re-checks under the metadata lock so a
+    prompt or steer that arrived concurrently is never skipped, and an
+    unexpected failure never leaves the agent stuck with a live invocation
+    and no monitor.
 
     Args:
         aid: Lubko agent ID.
@@ -668,11 +769,23 @@ def runner(aid: str, mode: str) -> None:
     env = dict(os.environ)
     env["LUBKO_AGENT_ID"] = aid
     ctx = _RunnerContext(aid=aid, log_path=log_path, cwd=cwd, env=env)
-    is_continue = mode == "continue"
-    first = True
+    try:
+        _runner_loop(ctx, is_continue=mode == "continue")
+    except BaseException:
+        _abort_runner(aid)
+        raise
 
+
+def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
+    """Run invocations and queued steers until the queue drains.
+
+    Args:
+        ctx: Shared runner context.
+        is_continue: Whether the first invocation continues an existing session.
+    """
+    first = True
     while True:
-        meta = read_meta(aid)
+        meta = read_meta(ctx.aid)
         if meta is None:
             return
         if first:
@@ -682,11 +795,62 @@ def runner(aid: str, mode: str) -> None:
             prompt = meta.get("pending_prompt")
             is_continue = True
         if not prompt:
-            update_meta(aid, lambda m: m.update(active_runner=False))
+            if _reclaim_prompt(ctx.aid):
+                continue
             return
-        next_prompt = _run_invocation(ctx, prompt, is_continue=is_continue)
-        if next_prompt is None:
+        if _run_invocation(ctx, prompt, is_continue=is_continue) is None:
             return
+
+
+def _reclaim_prompt(aid: str) -> bool:
+    """Keep a runner alive when a prompt or steer arrived concurrently.
+
+    The decision to go idle is re-checked under the metadata lock so a
+    ``prompt``/``steer`` that landed just after this runner read its state is
+    never stranded without a monitor.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when the runner should loop again, ``False`` when idle.
+    """
+    holder: dict[str, bool] = {"busy": False}
+
+    def apply(m: Meta) -> None:
+        if m.get("stop_reason") in STOP_REASONS:
+            m["active_runner"] = False
+            return
+        if m.get("pending_prompt") or (m.get("steer_queue") or []):
+            if (m.get("steer_queue") or []) and not m.get("pending_prompt"):
+                _pop_into_pending(m, time.time())
+            m["active_runner"] = True
+            holder["busy"] = True
+            return
+        m["active_runner"] = False
+
+    update_meta(aid, apply)
+    return holder["busy"]
+
+
+def _abort_runner(aid: str) -> None:
+    """Clean up an agent after an unexpected runner failure.
+
+    The exact recorded invocation process group is killed and the agent is
+    finalized, so an abnormal runner exit can never leave the invocation
+    running untracked with ``active_runner`` stuck true.
+
+    Args:
+        aid: Lubko agent ID.
+    """
+    meta = read_meta(aid)
+    if meta is None or meta.get("state") != "running":
+        return
+    pid = meta.get("pid")
+    if pid:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(int(pid), signal.SIGKILL)
+    update_meta(aid, _finalize_abort())
 
 
 @dataclass(frozen=True, slots=True)
@@ -729,6 +893,7 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
         )
         update_meta(aid, lambda m: m.update(active_runner=False))
         return None
+    update_meta(aid, lambda m: _clear_pending(m, prompt))
     try:
         log = ctx.log_path.open("ab")
     except OSError:
@@ -755,19 +920,47 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
         start = proc_start_ticks(proc.pid)
         update_meta(aid, _record_running(proc, start))
 
-        if not is_continue and not os.environ.get("LUBKO_AGENT_CMD"):
-            deadline = time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
-            while time.time() < deadline and proc.poll() is None:
-                sid = discover_session_id(aid)
-                if sid:
-                    update_meta(aid, _set_native_session(sid))
-                    break
-                time.sleep(SESSION_DISCOVER_POLL_SECONDS)
-
-        rc = proc.wait()
+        try:
+            rc = _wait_for_invocation_exit(proc, aid, is_continue=is_continue)
+        except BaseException:
+            # Abnormal runner exit: never leave the invocation process group
+            # running untracked, and never leave the agent stuck "running".
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(OSError):
+                proc.wait()
+            update_meta(aid, _finalize_abort())
+            raise
         update_meta(aid, _finalize_after(rc))
 
     return _drain_next(aid)
+
+
+def _wait_for_invocation_exit(
+    proc: subprocess.Popen[bytes],
+    aid: str,
+    *,
+    is_continue: bool,
+) -> int:
+    """Discover the native session if needed, then wait for the invocation.
+
+    Args:
+        proc: The spawned invocation process.
+        aid: Lubko agent ID.
+        is_continue: Whether this invocation continues an existing session.
+
+    Returns:
+        The invocation's return code.
+    """
+    if not is_continue and not os.environ.get("LUBKO_AGENT_CMD"):
+        deadline = time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
+        while time.time() < deadline and proc.poll() is None:
+            sid = discover_session_id(aid)
+            if sid:
+                update_meta(aid, _set_native_session(sid))
+                break
+            time.sleep(SESSION_DISCOVER_POLL_SECONDS)
+    return proc.wait()
 
 
 def _record_running(proc: subprocess.Popen[bytes], start: int | None) -> Callable[[Meta], None]:
@@ -786,6 +979,7 @@ def _record_running(proc: subprocess.Popen[bytes], start: int | None) -> Callabl
         m["pgid"] = proc.pid
         m["start_time"] = start
         m["runner_pid"] = os.getpid()
+        m["runner_start_time"] = proc_start_ticks(os.getpid())
         m["started_at"] = time.time()
         m["last_activity_at"] = time.time()
         m["state"] = "running"
@@ -860,6 +1054,12 @@ def _drain_next(aid: str) -> str | None:
         if m.get("stop_reason") in STOP_REASONS:
             m["active_runner"] = False
             return
+        if m.get("pending_prompt"):
+            # A new invocation was queued while this one was running; run it
+            # rather than going idle, so a second runner is never needed.
+            m["active_runner"] = True
+            holder["prompt"] = m["pending_prompt"]
+            return
         if not (m.get("steer_queue") or []):
             m["active_runner"] = False
             return
@@ -869,6 +1069,22 @@ def _drain_next(aid: str) -> str | None:
 
     update_meta(aid, drain)
     return holder["prompt"]
+
+
+def _finalize_abort() -> Callable[[Meta], None]:
+    """Return a metadata mutation that records an aborted runner invocation.
+
+    Returns:
+        The metadata mutation.
+    """
+
+    def finalize(m: Meta) -> None:
+        if m.get("state") != "running":
+            return  # already finalized (e.g. by stop/kill)
+        _finalize_terminal(m, None, None, "failed", "runner aborted unexpectedly")
+        m["active_runner"] = False
+
+    return finalize
 
 
 def _finalize_terminal(
@@ -1014,6 +1230,9 @@ def _err(message: str) -> None:
 def spawn_runner(aid: str, mode: str) -> None:
     """Detach a background runner monitor for an agent.
 
+    The runner is spawned with the exact agent marker set so its identity
+    can be verified later; no other environment entry is altered.
+
     Args:
         aid: Lubko agent ID.
         mode: Invocation mode (``new`` or ``continue``).
@@ -1026,6 +1245,7 @@ def spawn_runner(aid: str, mode: str) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
+        env=_runner_env(aid),
     )
 
 
@@ -1125,7 +1345,8 @@ def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> in
     now = time.time()
     update_meta(aid, lambda m: _begin_invocation(m, prompt, now))
     mark_last(aid)
-    spawn_runner(aid, "continue")
+    if not _runner_will_pick_up(aid):
+        spawn_runner(aid, "continue")
 
     if args.json:
         _out(json.dumps({"id": aid, "state": "running"}))
@@ -1137,6 +1358,29 @@ def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> in
         stream_log_until_terminal(aid)
         return exit_code_for(read_meta(aid))
     return EXIT_OK
+
+
+def _runner_will_pick_up(aid: str) -> bool:
+    """Return whether a live runner will pick up a just-queued invocation.
+
+    A replacement runner is only skipped when a runner whose exact identity
+    is still alive will observe the new prompt.  Because the runner re-checks
+    for a concurrently queued prompt under the metadata lock before going
+    idle, an alive runner is guaranteed to reclaim the prompt, so no second
+    runner is spawned (which would double-execute the queue).
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when no replacement runner should be spawned.
+    """
+    meta = read_meta(aid)
+    if meta is None:
+        return True  # deleted; nothing left to monitor
+    if not meta.get("active_runner"):
+        return False
+    return runner_alive(meta)
 
 
 def _wait_for_session(aid: str) -> str | None:
@@ -1206,6 +1450,10 @@ def _steer_busy(args: argparse.Namespace, prompt: str) -> int:
 def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
     """Mark an agent as starting a new invocation.
 
+    ``active_runner`` is deliberately left untouched: whether a live runner
+    will pick the prompt up (or a replacement must be spawned) is decided by
+    the caller after checking the runner's exact liveness.
+
     Args:
         meta: Agent metadata.
         prompt: Instruction to run.
@@ -1219,7 +1467,6 @@ def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
     meta["exit_signal"] = None
     meta["intent"] = None
     meta["stop_reason"] = None
-    meta["active_runner"] = True
     meta["pid"] = None
     meta["pgid"] = None
     meta["start_time"] = None
@@ -1802,6 +2049,11 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     """Gracefully stop a running agent.
 
+    Sends ``SIGTERM`` to the exact recorded process group, then — while any
+    member of that exact group remains — ``SIGKILL`` after the grace period,
+    mirroring the worker's cancellation contract so an agent run can never
+    leave abandoned OpenCode children behind.
+
     Args:
         args: Parsed command arguments.
 
@@ -1813,17 +2065,28 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    if not is_alive(meta):
+    if not is_alive(meta) and not group_alive(meta):
         _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
         return EXIT_OK
     update_meta(aid, lambda m: _begin_stop_like(m, "stop"))
     send_signal_group(meta, signal.SIGTERM)
-    if wait_dead(meta, STOP_WAIT_SECONDS):
+    if wait_group_dead(meta, STOP_WAIT_SECONDS):
         update_meta(
             aid,
             lambda m: _mark_terminal(m, -signal.SIGTERM, signal.SIGTERM, "stopped", "stop"),
         )
         _out(f"stopped agent {aid}")
+        return EXIT_OK
+    # The exact group still has live members; escalate so no child is
+    # abandoned, exactly like the worker's cancel grace period.
+    if group_alive(meta):
+        send_signal_group(meta, signal.SIGKILL)
+    if wait_group_dead(meta, KILL_WAIT_SECONDS):
+        update_meta(
+            aid,
+            lambda m: _mark_terminal(m, -signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
+        )
+        _out(f"stopped agent {aid} (force-killed group members)")
         return EXIT_OK
     update_meta(aid, lambda m: m.update(intent=None))
     _err(f"{PROG}: agent {aid} did not stop within {STOP_WAIT_SECONDS:.0f}s; use 'kill'")
@@ -1833,6 +2096,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def cmd_kill(args: argparse.Namespace) -> int:
     """Forcefully terminate a running agent.
 
+    The exact recorded process group is signalled and confirmed gone, so
+    ``SIGKILL`` to the leader alone can never leave group members behind.
+
     Args:
         args: Parsed command arguments.
 
@@ -1844,12 +2110,12 @@ def cmd_kill(args: argparse.Namespace) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    if not is_alive(meta):
+    if not is_alive(meta) and not group_alive(meta):
         _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
         return EXIT_OK
     update_meta(aid, lambda m: _begin_stop_like(m, "kill"))
     send_signal_group(meta, signal.SIGKILL)
-    if wait_dead(meta, KILL_WAIT_SECONDS):
+    if wait_group_dead(meta, KILL_WAIT_SECONDS):
         update_meta(
             aid,
             lambda m: _mark_terminal(m, -signal.SIGKILL, signal.SIGKILL, "killed", "kill"),
@@ -1875,13 +2141,13 @@ def cmd_delete(args: argparse.Namespace) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    if is_alive(meta):
+    if is_alive(meta) or group_alive(meta):
         if not args.force:
             _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
             return EXIT_ERROR
         update_meta(aid, lambda m: m.update(intent="kill", last_activity_at=time.time()))
         send_signal_group(meta, signal.SIGKILL)
-        wait_dead(meta, KILL_WAIT_SECONDS)
+        wait_group_dead(meta, KILL_WAIT_SECONDS)
     shutil.rmtree(agent_dir(aid), ignore_errors=True)
     _forget_last(aid)
     _out(f"deleted agent {aid}")

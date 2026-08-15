@@ -1029,6 +1029,16 @@ Per-user lifecycle state and logs live under
 `worker/.deploy.lock` serializing concurrent deployments, and
 `toolchain.json` recording the maintained `uv` executable.
 
+### Container init (reaping PID 1)
+
+The Lubko container must run under a real reaping PID 1 that adopts and
+reaps orphaned children — Docker `--init` / Compose `init: true` (tini),
+`dumb-init`, or equivalent. Lubko ships **no reaper or subreaper of its
+own**: reaping adopted children is the container runtime's responsibility,
+and Lubko never signals by process name. The repository test suite owns and
+deterministically stops every process it creates by exact identity, so
+repeated full runs never increase the live worker/watchdog or zombie count.
+
 `deploy` resolves the `uv` executable with this strict precedence:
 
 1. an explicit `--uv` argument, validated and never silently replaced;

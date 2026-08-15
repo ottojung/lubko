@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, nullcontext, suppress
 from pathlib import Path
 from typing import Final, Self, cast
 from uuid import UUID, uuid4
@@ -39,6 +39,7 @@ from lubko.worker import (
     spawn_job,
     truncate_output,
 )
+from tests import _process_guard as guard
 
 EXECUTION_ERROR_EXIT_CODE: Final = 127
 COMMAND_FAILURE_EXIT_CODE: Final = 7
@@ -239,9 +240,14 @@ def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
     shell = resolve_shell()
     assert shell is not None
     run = spawn_job(Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell)
-    assert group_has_members(run.pgid)
-    os.killpg(run.pgid, signal.SIGKILL)
-    run.proc.wait(timeout=10)
+    guard.register(run.proc)
+    try:
+        assert group_has_members(run.pgid)
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(run.pgid, signal.SIGKILL)
+        run.proc.wait(timeout=10)
+        guard.unregister(run.proc)
     wait_until(lambda: not group_has_members(run.pgid))
 
 
@@ -250,13 +256,16 @@ def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> Non
     shell = resolve_shell()
     assert shell is not None
     run = spawn_job(Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell)
+    guard.register(run.proc)
     try:
         assert run.pgid == run.pid
         assert os.getpgid(run.pid) == run.pid
         assert os.getsid(run.pid) == run.pid
     finally:
-        os.killpg(run.pgid, signal.SIGKILL)
+        with suppress(ProcessLookupError):
+            os.killpg(run.pgid, signal.SIGKILL)
         run.proc.wait(timeout=10)
+        guard.unregister(run.proc)
 
 
 def test_run_job_runs_directly_without_docker(
@@ -456,6 +465,7 @@ def test_cancellation_leaves_unrelated_process_group_untouched(
     sleep = shutil.which("sleep")
     assert sleep is not None
     unrelated = subprocess.Popen([sleep, "30"], start_new_session=True)
+    guard.register(unrelated)
     job = Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None)
     persisted_event, cancel_event, _ = install_cancel_harness(monkeypatch)
     result_box: list[JobResult] = []
@@ -479,6 +489,7 @@ def test_cancellation_leaves_unrelated_process_group_untouched(
         thread.join(timeout=5)
         unrelated.kill()
         unrelated.wait(timeout=10)
+        guard.unregister(unrelated)
 
 
 def test_cancellation_sigkills_term_ignoring_shell(
