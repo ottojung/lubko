@@ -1786,7 +1786,7 @@ def _tail_logical_lines_stream(fh: BinaryIO, end: int, count: int) -> list[str]:
     lines = trailing.decode("utf-8", errors="replace").split("\n")
     if lines and not lines[-1]:
         lines.pop()
-    if pos > 0 and not preceded_by_newline and any(lines[1:]):
+    if pos > 0 and not preceded_by_newline:
         lines = lines[1:]
     if len(lines) > count:
         lines = lines[-count:]

@@ -323,6 +323,18 @@ def test_tail_lines_drops_partial_line_at_backward_block_boundary(
     assert agent.tail_lines(log, 5) == ["l1", "l2", "l3", "l4"]
 
 
+def test_tail_lines_drops_partial_prefix_when_trailing_blank(
+    state_dir: Path,
+) -> None:
+    """A partial 64KiB-boundary prefix is dropped even when trailing lines are blank."""
+    log = state_dir / "out.log"
+    block = 64 * 1024
+    long_line = "A" * (block + 10)
+    log.write_text(f"{long_line}\n\n\n\n\n")
+    assert log.stat().st_size > block
+    assert agent.tail_lines(log, 5) == ["", "", "", ""]
+
+
 def test_tail_snapshot_folds_and_returns_raw_offset(state_dir: Path) -> None:
     """The follow snapshot shows folded display bytes and a raw byte offset."""
     log = state_dir / "out.log"
