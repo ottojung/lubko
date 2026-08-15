@@ -15,6 +15,7 @@ file used to serialize metadata updates.
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import fcntl
 import json
@@ -75,6 +76,7 @@ RUNNER_ARGV_LENGTH: Final = 3
 AGENT_META_VERSION: Final = 3
 
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_CSI_PREFIX_RE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*)?\Z")
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +771,7 @@ def runner(aid: str, mode: str) -> None:
     cwd = meta.get("cwd") or str(Path.cwd())
     env = dict(os.environ)
     env["LUBKO_AGENT_ID"] = aid
+    env["NO_COLOR"] = "1"
     ctx = _RunnerContext(aid=aid, log_path=log_path, cwd=cwd, env=env)
     try:
         _runner_loop(ctx, is_continue=mode == "continue")
@@ -1855,10 +1858,11 @@ def _folded_tail_stream(
 
 
 def tail_lines(path: Path, n: int) -> list[str]:
-    """Return the last ``n`` displayed lines of a log file (all when ``n <= 0``).
+    """Return the last ``n`` normalized displayed lines of a log file.
 
-    Each logical line is folded to ``FOLD_WIDTH`` characters and only the
-    newest ``n`` displayed lines are kept; there is no character limit.
+    Each logical line has ANSI escape sequences stripped and is folded to
+    ``FOLD_WIDTH`` characters; only the newest ``n`` displayed lines are kept,
+    and there is no character limit. The durable log is never modified.
 
     Args:
         path: Log file path.
@@ -1867,7 +1871,7 @@ def tail_lines(path: Path, n: int) -> list[str]:
     Returns:
         The displayed lines, newest last.
     """
-    return _folded_tail(path, n)
+    return _folded_tail(path, n, strip_ansi=True)
 
 
 def _file_ends_with_newline_stream(fh: BinaryIO, end: int) -> bool:
@@ -1887,12 +1891,13 @@ def _file_ends_with_newline_stream(fh: BinaryIO, end: int) -> bool:
 
 
 def _tail_snapshot_from(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, int]:
-    """Return (newest folded display bytes, byte offset) for the open snapshot.
+    """Return (newest normalized folded display bytes, byte offset) for a snapshot.
 
     The display and the continuation offset come from the single captured
-    ``end`` byte offset: the folded tail is read only up to ``end``, and
-    ``end`` is also the returned offset, so a later append is excluded from
-    the display and remains for the follow.
+    ``end`` byte offset: the folded, ANSI-stripped tail is read only up to
+    ``end``, and ``end`` is also the returned offset, so a later append is
+    excluded from the display and remains for the follow. The durable log is
+    never modified.
 
     Args:
         fh: Open binary stream positioned at ``end``.
@@ -1902,7 +1907,7 @@ def _tail_snapshot_from(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, 
     Returns:
         A ``(bytes, offset)`` tuple.
     """
-    display = _folded_tail_stream(fh, end, max_lines)
+    display = _folded_tail_stream(fh, end, max_lines, strip_ansi=True)
     if not display:
         return b"", end
     text = "\n".join(display)
@@ -1912,15 +1917,16 @@ def _tail_snapshot_from(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, 
 
 
 def tail_snapshot(path: Path, max_lines: int = STATUS_TAIL_LINES) -> tuple[bytes, int]:
-    """Return (newest folded display bytes, byte offset to continue following from).
+    """Return (newest normalized folded display bytes, byte offset to follow from).
 
-    The bytes cover at most ``max_lines`` folded display lines; folding is
-    presentation only and never touches the durable log. The displayed bytes
-    and the offset come from one consistent open-file snapshot: the file is
-    opened once, its EOF size is captured, and the tail is read only up to
-    that captured size. Bytes appended after the capture are excluded from
-    the snapshot and remain for the follow, so following resumes exactly
-    where the displayed output ends.
+    The bytes cover at most ``max_lines`` folded display lines with ANSI
+    escape sequences stripped; folding and normalization are presentation only
+    and never touch the durable log. The displayed bytes and the offset come
+    from one consistent open-file snapshot: the file is opened once, its EOF
+    size is captured, and the tail is read only up to that captured size.
+    Bytes appended after the capture are excluded from the snapshot and
+    remain for the follow, so following resumes exactly where the displayed
+    output ends.
 
     Args:
         path: Log file path.
@@ -1940,7 +1946,10 @@ def tail_snapshot(path: Path, max_lines: int = STATUS_TAIL_LINES) -> tuple[bytes
 
 
 def stream_log_until_terminal(aid: str, follow_lines: int = STATUS_TAIL_LINES) -> None:
-    """Print the recent folded tail, then stream new output until the agent is done.
+    """Print the recent normalized folded tail, then stream output until done.
+
+    Both the initial snapshot and every incremental chunk have ANSI CSI/SGR
+    sequences stripped before presentation; the durable raw log is untouched.
 
     Args:
         aid: Lubko agent ID.
@@ -1948,6 +1957,7 @@ def stream_log_until_terminal(aid: str, follow_lines: int = STATUS_TAIL_LINES) -
     """
     log_path = agent_dir(aid) / "output.log"
     offset = _print_snapshot(log_path, follow_lines)
+    normalizer = _LogNormalizer()
     handle: BinaryIO | None = None
     idle_since: float | None = None
     terminal_since: float | None = None
@@ -1960,17 +1970,17 @@ def stream_log_until_terminal(aid: str, follow_lines: int = STATUS_TAIL_LINES) -
                     return
                 time.sleep(0.3)
                 continue
-        if _consume_log(handle):
+        if _consume_log(handle, normalizer):
             idle_since = None
         stop, terminal_since = _stable_terminal(aid, terminal_since)
         if stop:
-            _drain_and_stop(handle)
+            _drain_and_stop(handle, normalizer)
             return
         if _stale_running(aid):
             if idle_since is None:
                 idle_since = time.time()
             elif time.time() - idle_since > IDLE_BREAK_SECONDS:
-                _drain_and_stop(handle)
+                _drain_and_stop(handle, normalizer)
                 return
         time.sleep(0.4)
 
@@ -2036,11 +2046,76 @@ def _open_log(log_path: Path, offset: int) -> BinaryIO | None:
     return handle
 
 
-def _consume_log(handle: BinaryIO) -> bool:
-    """Write any newly available log bytes to stdout.
+def _strip_ansi_keep_tail(text: str) -> tuple[str, str]:
+    r"""Strip complete ANSI CSI/SGR sequences, returning any trailing partial one.
+
+    A trailing fragment that could still become a complete CSI sequence (for
+    example ``\x1b[3``) is returned separately so a sequence split across two
+    reads is stripped once the rest arrives, without ever delaying ordinary
+    text.
+
+    Args:
+        text: Text to normalize.
+
+    Returns:
+        A ``(stripped, pending)`` pair where ``pending`` is a maximal trailing
+        fragment that may still form a complete CSI sequence.
+    """
+    stripped = _ANSI_CSI_RE.sub("", text)
+    esc = stripped.rfind("\x1b")
+    if esc >= 0 and _CSI_PREFIX_RE.fullmatch(stripped[esc:]):
+        return stripped[:esc], stripped[esc:]
+    return stripped, ""
+
+
+class _LogNormalizer:
+    """Incrementally strip ANSI CSI/SGR sequences from log bytes.
+
+    Decodes incrementally (UTF-8 with replacement for invalid bytes) so a
+    multi-byte character split across reads is preserved undamaged, and
+    carries any trailing partial escape sequence across reads so a sequence
+    split at a read boundary is still removed. Presentation only: the durable
+    log file is never modified.
+    """
+
+    def __init__(self) -> None:
+        self._decoder: codecs.IncrementalDecoder = codecs.getincrementaldecoder("utf-8")(
+            errors="replace"
+        )
+        self._pending = ""
+
+    def write(self, data: bytes) -> None:
+        """Normalize and write one chunk of log bytes to stdout.
+
+        Args:
+            data: Raw log bytes.
+        """
+        text = self._decoder.decode(data)
+        if not text and not self._pending:
+            return
+        text = self._pending + text
+        stripped, self._pending = _strip_ansi_keep_tail(text)
+        if stripped:
+            sys.stdout.buffer.write(stripped.encode("utf-8"))
+            sys.stdout.buffer.flush()
+
+    def close(self) -> None:
+        """Flush any buffered decoder state and partial sequence tail."""
+        text = self._decoder.decode(b"", final=True)
+        text = self._pending + text
+        self._pending = ""
+        stripped, _pending = _strip_ansi_keep_tail(text)
+        if stripped:
+            sys.stdout.buffer.write(stripped.encode("utf-8"))
+            sys.stdout.buffer.flush()
+
+
+def _consume_log(handle: BinaryIO, normalizer: _LogNormalizer) -> bool:
+    """Write any newly available log bytes to stdout, normalized.
 
     Args:
         handle: Open log stream.
+        normalizer: Incremental ANSI-stripping normalizer for the stream.
 
     Returns:
         ``True`` when new bytes were written.
@@ -2048,21 +2123,21 @@ def _consume_log(handle: BinaryIO) -> bool:
     data = handle.read()
     if not data:
         return False
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
+    normalizer.write(data)
     return True
 
 
-def _drain_and_stop(handle: BinaryIO) -> None:
-    """Write any remaining log bytes and stop streaming.
+def _drain_and_stop(handle: BinaryIO, normalizer: _LogNormalizer) -> None:
+    """Write any remaining log bytes (normalized) and stop streaming.
 
     Args:
         handle: Open log stream.
+        normalizer: Incremental ANSI-stripping normalizer for the stream.
     """
     data = handle.read()
     if data:
-        sys.stdout.buffer.write(data)
-        sys.stdout.buffer.flush()
+        normalizer.write(data)
+    normalizer.close()
 
 
 def _terminal_or_unknown(aid: str) -> bool:
