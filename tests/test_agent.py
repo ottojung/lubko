@@ -407,6 +407,7 @@ def test_cmd_prompt_continue_uses_existing_native_session(
         native_session_id="sess-1",
         prompt_count=1,
     )
+    monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
     spawned: list[str] = []
     monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
@@ -417,17 +418,81 @@ def test_cmd_prompt_continue_uses_existing_native_session(
     assert meta["pending_prompt"] == "more"
 
 
-def test_cmd_prompt_refuses_without_session(
+def test_cmd_prompt_refuses_when_recorded_session_disappeared(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Prompting a previously-prompted agent without a session is refused."""
-    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", prompt_count=1)
+    """Prompting is refused only when a recorded native session has disappeared."""
+    make_agent(
+        state_dir,
+        "aaaaaaaa",
+        state_value="succeeded",
+        native_session_id="sess-1",
+        prompt_count=1,
+    )
     monkeypatch.setattr(agent, "discover_session_id", lambda _aid: None)
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
     assert code == agent.EXIT_ERROR
     assert "session is not available" in capsys.readouterr().err
+
+
+def test_prompt_retries_failed_first_attempt_as_new_session(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed first prompt (no session ever created) may be retried as new."""
+    agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
+    runner_threads: list[threading.Thread] = []
+
+    def spawn_in_thread(_aid: str, mode: str) -> None:
+        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+        thread.start()
+        runner_threads.append(thread)
+
+    monkeypatch.setattr(agent, "spawn_runner", spawn_in_thread)
+
+    def failing_command(_meta: agent.Meta, _prompt: str, *, is_continue: bool) -> list[str]:
+        del is_continue
+        return ["/nonexistent/lubko-binary"]
+
+    monkeypatch.setattr(agent, "build_agent_command", failing_command)
+    first_code = agent.main(["prompt", "--id", "aaaaaaaa", "first task"])
+    for thread in runner_threads:
+        thread.join(timeout=10)
+    assert first_code != agent.EXIT_OK
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    assert meta["state"] == "failed"
+    assert meta["native_session_id"] is None
+
+    spawned: list[str] = []
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    retry_code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "retry task"])
+    assert retry_code == agent.EXIT_OK
+    assert spawned == ["new"]
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    assert meta["state"] == "running"
+    assert meta["pending_prompt"] == "retry task"
+
+
+def test_prompt_continue_with_agent_cmd_override_without_session(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LUBKO_AGENT_CMD continuation needs no native session and is never refused."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", prompt_count=1)
+    monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
+    spawned: list[str] = []
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
+    assert code == agent.EXIT_OK
+    assert spawned == ["new"]
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    assert meta["pending_prompt"] == "more"
 
 
 def test_cmd_prompt_attached_follows_and_propagates_exit_code(
@@ -486,6 +551,7 @@ def test_cmd_prompt_steer_is_plain_prompt_when_finished(
         native_session_id="sess-1",
         prompt_count=1,
     )
+    monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
     spawned: list[str] = []
     monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "task"])
@@ -667,6 +733,17 @@ def test_build_agent_command_honors_override(monkeypatch: pytest.MonkeyPatch) ->
         "-c",
         "opencode run --auto",
     ]
+
+
+def test_build_agent_command_override_used_for_continuation_without_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LUBKO_AGENT_CMD continuation needs no recorded native session."""
+    monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
+    meta = agent.base_meta("aaaaaaaa", "/workspace", "hi", None, is_continue=True)
+    meta["native_session_id"] = None
+    cmd = agent.build_agent_command(meta, "hi", is_continue=True)
+    assert cmd == ["/bin/sh", "-c", "opencode run --auto"]
 
 
 def test_build_agent_command_creates_session_on_first_prompt() -> None:
@@ -901,6 +978,7 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
         meta["runner_pid"] = runner_proc.pid
         meta["runner_start_time"] = agent.proc_start_ticks(runner_proc.pid)
         agent.write_meta("aaaaaaaa", meta)
+        monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
         spawned: list[str] = []
         monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
         code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])

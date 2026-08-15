@@ -1,5 +1,6 @@
 """Tests enforcing the two-column transport invariant and the protocol v2 migrations."""
 
+import contextlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -8,7 +9,15 @@ from typing import Final, Self, cast
 import psycopg
 import pytest
 
-from lubko.worker import JOBS_COLUMN_TYPES, SchemaInvariantError, verify_jobs_table_invariant
+from lubko.worker import (
+    CHUNK_ORDER_INDEX_NAME,
+    CHUNK_OWNER_INDEX_NAME,
+    JOBS_COLUMN_TYPES,
+    TYPE_AWARE_CONSTRAINT_NAME,
+    SchemaInvariantError,
+    verify_jobs_table_invariant,
+    verify_v2_schema,
+)
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR: Final = REPO_ROOT / "migrations"
@@ -60,6 +69,42 @@ class _FakeConnection:
     def transaction(self) -> Iterator[None]:
         self.transaction_count += 1
         yield
+
+
+class _QueuedCursor:
+    """A cursor returning one queued batch of rows per ``execute`` call."""
+
+    def __init__(self, batches: list[list[tuple[str, ...]]]) -> None:
+        self._batches = list(batches)
+
+    @staticmethod
+    def execute(sql: str, params: object | None = None) -> None:
+        del sql, params
+
+    def fetchall(self) -> list[tuple[str, ...]]:
+        if self._batches:
+            return self._batches.pop(0)
+        return []
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+
+class _QueuedConnection:
+    """A connection test double returning one batch of rows per query."""
+
+    def __init__(self, batches: list[list[tuple[str, ...]]]) -> None:
+        self._batches = batches
+
+    def cursor(self, **_kwargs: object) -> "_QueuedCursor":
+        return _QueuedCursor(self._batches)
+
+    @staticmethod
+    def transaction() -> contextlib.nullcontext[None]:
+        return contextlib.nullcontext()
 
 
 def as_connection(conn: _FakeConnection) -> psycopg.Connection[tuple[object, ...]]:
@@ -368,3 +413,66 @@ def test_payload_is_string_text_in_docs() -> None:
     assert "string containing a JSON object" in protocol_doc
     assert "`text`" in protocol_doc
     assert "stores `::text` back" in protocol_doc
+
+
+def as_v2_connection(conn: _QueuedConnection) -> psycopg.Connection[tuple[object, ...]]:
+    """Adapt a queued test double to the worker's connection type.
+
+    Args:
+        conn: Queued connection test double.
+
+    Returns:
+        The same object typed as a psycopg connection.
+    """
+    return cast("psycopg.Connection[tuple[object, ...]]", conn)
+
+
+def test_verify_v2_schema_accepts_migrated_shape() -> None:
+    """A migrated table with the type-aware constraint and chunk indexes passes."""
+    conn = as_v2_connection(
+        _QueuedConnection([
+            [(TYPE_AWARE_CONSTRAINT_NAME,), ("jobs_payload_is_json_object",)],
+            [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,), ("jobs_queue_idx",)],
+        ])
+    )
+
+    verify_v2_schema(conn)
+
+
+def test_verify_v2_schema_rejects_missing_type_aware_constraint() -> None:
+    """A table without the type-aware constraint is refused."""
+    conn = as_v2_connection(
+        _QueuedConnection([
+            [("jobs_payload_is_json_object",), ("jobs_payload_has_status",)],
+            [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,)],
+        ])
+    )
+
+    with pytest.raises(SchemaInvariantError, match=TYPE_AWARE_CONSTRAINT_NAME):
+        verify_v2_schema(conn)
+
+
+def test_verify_v2_schema_rejects_missing_chunk_indexes() -> None:
+    """A table without the chunk ownership/ordering indexes is refused."""
+    conn = as_v2_connection(
+        _QueuedConnection([
+            [(TYPE_AWARE_CONSTRAINT_NAME,)],
+            [("jobs_queue_idx",)],
+        ])
+    )
+
+    with pytest.raises(SchemaInvariantError, match="index jobs_chunk"):
+        verify_v2_schema(conn)
+
+
+def test_verify_v2_schema_rejects_old_v1_shape() -> None:
+    """The pre-0002 v1 schema is refused even though it has exactly two columns."""
+    conn = as_v2_connection(
+        _QueuedConnection([
+            [("jobs_payload_has_status",), ("jobs_payload_is_json_object",)],
+            [("jobs_queue_idx",)],
+        ])
+    )
+
+    with pytest.raises(SchemaInvariantError, match=r"0002_output_chunks\.sql"):
+        verify_v2_schema(conn)

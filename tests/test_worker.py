@@ -16,7 +16,7 @@ import psycopg
 import pytest
 
 from lubko import worker
-from lubko.protocol import OUTPUT_TAIL_MAX_CHARS, parse_chunk_payload, parse_payload
+from lubko.protocol import OUTPUT_TAIL_MAX_BYTES, parse_chunk_payload, parse_payload
 from lubko.worker import (
     DEFAULT_LEASE_DURATION_SECONDS,
     DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS,
@@ -41,6 +41,7 @@ from lubko.worker import (
     read_range,
     recover_stale_jobs,
     request_cancel,
+    request_group_reap,
     request_stop,
     resolve_shell,
     signal_kill,
@@ -322,11 +323,11 @@ def test_spawn_job_runs_command_and_cleanup_files(tmp_path: Path) -> None:
 def test_archive_target_never_reaches_the_live_tail() -> None:
     """The archive target always stays short of the newest tail window."""
     assert worker.archive_target(0) == 0
-    assert worker.archive_target(OUTPUT_TAIL_MAX_CHARS) == 0
-    size = OUTPUT_TAIL_MAX_CHARS * 3
+    assert worker.archive_target(OUTPUT_TAIL_MAX_BYTES) == 0
+    size = OUTPUT_TAIL_MAX_BYTES * 3
     target = worker.archive_target(size)
     assert target < size
-    assert target == size - OUTPUT_TAIL_MAX_CHARS + 2000
+    assert target == size - OUTPUT_TAIL_MAX_BYTES + 2000
 
 
 def test_claim_job_marks_job_running_and_only_command_rows() -> None:
@@ -620,7 +621,7 @@ def test_publish_output_archives_immutable_chunks(tmp_path: Path) -> None:
 
     publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
 
-    assert job.stdout.tail_text == "x" * OUTPUT_TAIL_MAX_CHARS
+    assert job.stdout.tail_text == "x" * OUTPUT_TAIL_MAX_BYTES
     assert job.stdout.tail_start == 5000
     assert job.stdout.tail_end == 9000
     assert job.stdout.sequence == 3
@@ -805,6 +806,82 @@ def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
         if proc.poll() is None:
             with suppress(ProcessLookupError):
                 os.killpg(pgid, signal.SIGKILL)
+            proc.wait(timeout=5)
+
+
+def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
+    """request_group_reap terminates the group without recording a stop reason."""
+    shell = resolve_shell()
+    assert shell is not None
+    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+        Job(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            command="sleep 30 & echo done",
+            args=None,
+        ),
+        shell,
+    )
+    guard.register(proc)
+    try:
+        proc.wait(timeout=10)
+        assert group_has_members(pgid)
+        job = ActiveJob(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            command="sleep 30 & echo done",
+            args=None,
+            proc=proc,
+            pid=proc.pid,
+            pgid=pgid,
+            started_mono=time.monotonic(),
+        )
+        job.completed = True
+        job.returncode = 0
+        request_group_reap(job)
+        assert job.term_sent
+        assert job.stop_reason is None
+        assert job.cancellation_note is None
+        wait_until(lambda: not group_has_members(pgid))
+        guard.unregister(proc)
+    finally:
+        if group_has_members(pgid):
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+
+
+def test_signal_kill_does_not_note_natural_reap(tmp_path: Path) -> None:
+    """signal_kill on a naturally reaped job leaves the note empty."""
+    proc = subprocess.Popen(
+        ["/bin/sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    try:
+        job = ActiveJob(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            command="sleep 300",
+            args=None,
+            proc=proc,
+            pid=proc.pid,
+            pgid=proc.pid,
+            started_mono=time.monotonic(),
+        )
+        job.completed = True
+        job.returncode = 0
+        request_group_reap(job)
+        signal_kill(job)
+        assert job.cancellation_note is None
+        proc.wait(timeout=10)
+        guard.unregister(proc)
+    finally:
+        if proc.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
 
 

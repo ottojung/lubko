@@ -12,8 +12,8 @@ from lubko.protocol import (
     JOB_TYPE_OUTPUT_CHUNK,
     KNOWN_JOB_TYPES,
     KNOWN_STATUSES,
-    OUTPUT_CHUNK_MAX_CHARS,
-    OUTPUT_TAIL_MAX_CHARS,
+    OUTPUT_CHUNK_MAX_BYTES,
+    OUTPUT_TAIL_MAX_BYTES,
     PROTOCOL_VERSION,
     STATUS_PENDING,
     TWO_COLUMN_INVARIANT,
@@ -96,9 +96,9 @@ def test_build_output_window_payload_rejects_oversized_tail() -> None:
     """A tail larger than the strict bound is rejected."""
     with pytest.raises(ProtocolError, match="at most"):
         build_output_window_payload(
-            tail="x" * (OUTPUT_TAIL_MAX_CHARS + 1),
+            tail="x" * (OUTPUT_TAIL_MAX_BYTES + 1),
             start=0,
-            end=OUTPUT_TAIL_MAX_CHARS + 1,
+            end=OUTPUT_TAIL_MAX_BYTES + 1,
             previous=None,
         )
 
@@ -158,8 +158,8 @@ def test_build_output_chunk_payload_rejects_oversized_value() -> None:
             stream="stderr",
             sequence=0,
             start=0,
-            end=OUTPUT_CHUNK_MAX_CHARS + 1,
-            value="x" * (OUTPUT_CHUNK_MAX_CHARS + 1),
+            end=OUTPUT_CHUNK_MAX_BYTES + 1,
+            value="x" * (OUTPUT_CHUNK_MAX_BYTES + 1),
             previous=None,
         )
 
@@ -214,14 +214,14 @@ def test_parse_payload_accepts_decoded_mapping() -> None:
 
 def test_parse_payload_accepts_bounded_output_and_result() -> None:
     """A root job with bounded live tails and a terminal result parses."""
-    tail = "x" * OUTPUT_TAIL_MAX_CHARS
+    tail = "x" * OUTPUT_TAIL_MAX_BYTES
     data: dict[str, Any] = {
         "v": PROTOCOL_VERSION,
         "type": JOB_TYPE_COMMAND,
         "request": {"cwd": "/x", "args": ["true"]},
         "state": {"status": "succeeded"},
         "output": {
-            "stdout": {"tail": tail, "start": 0, "end": OUTPUT_TAIL_MAX_CHARS, "previous": None},
+            "stdout": {"tail": tail, "start": 0, "end": OUTPUT_TAIL_MAX_BYTES, "previous": None},
             "stderr": {"tail": "", "start": 0, "end": 0, "previous": None},
         },
         "result": {
@@ -237,7 +237,7 @@ def test_parse_payload_accepts_bounded_output_and_result() -> None:
 
     assert parsed.output is not None
     assert parsed.output.stdout == OutputWindow(
-        tail=tail, start=0, end=OUTPUT_TAIL_MAX_CHARS, previous=None
+        tail=tail, start=0, end=OUTPUT_TAIL_MAX_BYTES, previous=None
     )
     assert parsed.output.stderr == OutputWindow(tail="", start=0, end=0, previous=None)
     assert parsed.result is not None
@@ -254,9 +254,9 @@ def test_parse_payload_rejects_oversized_tail() -> None:
             "state": {"status": "running"},
             "output": {
                 "stdout": {
-                    "tail": "x" * (OUTPUT_TAIL_MAX_CHARS + 1),
+                    "tail": "x" * (OUTPUT_TAIL_MAX_BYTES + 1),
                     "start": 0,
-                    "end": OUTPUT_TAIL_MAX_CHARS + 1,
+                    "end": OUTPUT_TAIL_MAX_BYTES + 1,
                     "previous": None,
                 }
             },
@@ -439,8 +439,8 @@ def test_parse_chunk_payload_rejects_oversized_value() -> None:
             "stream": "stdout",
             "sequence": 0,
             "start": 0,
-            "end": OUTPUT_CHUNK_MAX_CHARS + 1,
-            "value": "x" * (OUTPUT_CHUNK_MAX_CHARS + 1),
+            "end": OUTPUT_CHUNK_MAX_BYTES + 1,
+            "value": "x" * (OUTPUT_CHUNK_MAX_BYTES + 1),
         })
 
 

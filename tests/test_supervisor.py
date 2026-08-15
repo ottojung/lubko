@@ -20,14 +20,21 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID
 
 import psycopg
+import pytest
 
 from lubko.config import DatabaseConfig
 from lubko.worker import (
+    CHUNK_ORDER_INDEX_NAME,
+    CHUNK_OWNER_INDEX_NAME,
+    TYPE_AWARE_CONSTRAINT_NAME,
+    SchemaInvariantError,
     Settings,
     Supervisor,
     delete_job_and_chunks,
     group_has_members,
     request_cancel,
+    verify_jobs_table_invariant,
+    verify_v2_schema,
 )
 
 if TYPE_CHECKING:
@@ -35,8 +42,33 @@ if TYPE_CHECKING:
 
     from tests import _pg
 
-OUTPUT_TAIL_MAX_CHARS: Final = 4000
-CHUNK_MAX_CHARS: Final = 2000
+OUTPUT_TAIL_MAX_BYTES: Final = 4000
+CHUNK_MAX_BYTES: Final = 2000
+
+REPO_ROOT: Final = Path(__file__).resolve().parent.parent
+BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
+UPGRADE_MIGRATION: Final = REPO_ROOT / "migrations" / "0002_output_chunks.sql"
+
+#: The pre-0002 protocol v1 schema: two columns but no type-aware constraint
+#: and no output-chunk indexes, so a v2 worker must refuse to start on it.
+V1_SCHEMA_DDL: Final = """
+create table lubko.jobs (
+    id uuid primary key default gen_random_uuid(),
+    payload text not null
+        constraint jobs_payload_is_json_object check (
+            jsonb_typeof(payload::jsonb) = 'object'
+        )
+        constraint jobs_payload_has_version check ((payload::jsonb) ? 'v')
+        constraint jobs_payload_has_status check (
+            ((payload::jsonb)->'state'->>'status') is not null
+        )
+);
+create index if not exists jobs_queue_idx
+    on lubko.jobs (
+        ((payload::jsonb)->'state'->>'status'),
+        ((payload::jsonb)->'state'->>'created_at')
+    );
+"""
 
 
 def supervisor_settings(worker_id: str = "test-supervisor") -> Settings:
@@ -260,6 +292,102 @@ def wait_until(predicate: object, timeout: float = 30.0) -> None:
     raise AssertionError(msg)
 
 
+def test_v2_worker_refuses_to_start_on_v1_schema(jobs_db: str, pg_cluster: _pg.PgCluster) -> None:
+    """A pre-0002 v1 table is refused even though it has exactly two columns."""
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(V1_SCHEMA_DDL)
+    with psycopg.connect(jobs_db) as conn:
+        verify_jobs_table_invariant(conn)
+        with pytest.raises(SchemaInvariantError, match=r"0002_output_chunks\.sql"):
+            verify_v2_schema(conn)
+
+    with pytest.raises(SchemaInvariantError):
+        Supervisor(supervisor_settings(), make_database_config(pg_cluster)).run()
+
+
+def test_v2_worker_accepts_fresh_baseline_schema(jobs_db: str) -> None:
+    """A fresh install applying the current baseline alone is fully usable."""
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+    with psycopg.connect(jobs_db) as conn:
+        verify_jobs_table_invariant(conn)
+        verify_v2_schema(conn)
+        row = conn.execute(
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'lubko.jobs'::regclass AND contype = 'c'"
+        ).fetchall()
+        names = {item[0] for item in row}
+        assert TYPE_AWARE_CONSTRAINT_NAME in names
+        indexes = {
+            item[0]
+            for item in conn.execute(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = 'lubko' AND tablename = 'jobs'"
+            ).fetchall()
+        }
+        assert CHUNK_OWNER_INDEX_NAME in indexes
+        assert CHUNK_ORDER_INDEX_NAME in indexes
+
+
+def test_v2_worker_accepts_migrated_schema(jobs_db: str) -> None:
+    """Applying 0001 then 0002 leaves the table fully usable by a v2 worker."""
+    with psycopg.connect(jobs_db) as conn:
+        verify_jobs_table_invariant(conn)
+        verify_v2_schema(conn)
+
+
+def test_v1_worker_remains_binary_compatible_with_migrated_schema(
+    jobs_db: str, tmp_path: Path
+) -> None:
+    """A v1 worker can still operate on the migrated schema.
+
+    Migration 0002 only relaxes/adds the type-aware constraint and chunk
+    indexes; every command row a v1 worker writes still satisfies the new
+    shape, so a rollback to the v1 binary remains safe.
+    """
+    command_payload = json.dumps({
+        "v": 2,
+        "type": "command",
+        "request": {"cwd": str(tmp_path), "command": "echo hi"},
+        "state": {"status": "running"},
+    })
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s)",
+            (command_payload,),
+        )
+        row = conn.execute(
+            "SELECT count(*)::int FROM lubko.jobs WHERE id = (SELECT id FROM lubko.jobs LIMIT 1)"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 1
+
+
+def test_background_process_group_is_reaped_after_terminal_status(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A leftover exact PGID after the root exits is terminated before finalize.
+
+    ``sleep 30 & echo done``: the root shell exits successfully while a
+    background member of the same exact process group keeps running. The job
+    must not be finalized (or untracked) until that exact group is gone, and
+    its natural exit status must be preserved.
+    """
+    job_id = insert_job(jobs_db, str(tmp_path), "sleep 30 & echo done")
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+
+    payload = read_root(jobs_db, job_id)
+    pgid = int(payload["state"]["process_pgid"])
+    assert payload["state"]["status"] == "succeeded"
+    assert payload["result"]["exit_code"] == 0
+    assert payload["result"]["cancellation_note"] is None
+    assert not group_has_members(pgid)
+    assert not zombie_children()
+
+
 def zombie_children() -> list[int]:
     """Return the zombie children of the current process.
 
@@ -463,12 +591,12 @@ def test_output_tail_bounded_with_immutable_chunks(
     stdout = output["stdout"]
     tail = stdout["tail"]
     assert stdout["end"] == stdout["start"] + len(tail)
-    assert len(tail) == OUTPUT_TAIL_MAX_CHARS
+    assert len(tail) == OUTPUT_TAIL_MAX_BYTES
     assert tail.rstrip().endswith("line-7999")
     assert len(json.dumps(payload)) < 20_000
 
     assert len(seen_lengths) == 3
-    assert all(length <= OUTPUT_TAIL_MAX_CHARS for length in seen_lengths)
+    assert all(length <= OUTPUT_TAIL_MAX_BYTES for length in seen_lengths)
     for earlier, later in itertools.pairwise(seen_lengths):
         assert later >= earlier
 
@@ -481,7 +609,7 @@ def test_output_tail_bounded_with_immutable_chunks(
         assert chunk["thread"] == str(job_id)
         assert chunk["stream"] == "stdout"
         assert chunk["start"] == expected_start
-        assert chunk["end"] - chunk["start"] == CHUNK_MAX_CHARS
+        assert chunk["end"] - chunk["start"] == CHUNK_MAX_BYTES
         if previous_id is None:
             assert chunk["previous"] is None
         else:
@@ -680,7 +808,7 @@ def test_many_jobs_run_concurrently_without_an_application_limit(
     markers.mkdir()
     count = 40
     commands = [
-        (f"echo start > {markers}/job-{i}.start\nsleep 0.6\necho end > {markers}/job-{i}.end")
+        (f"echo start > {markers}/job-{i}.start\nsleep 2\necho end > {markers}/job-{i}.end")
         for i in range(count)
     ]
     job_ids = [insert_job(jobs_db, str(tmp_path), command) for command in commands]
@@ -690,9 +818,12 @@ def test_many_jobs_run_concurrently_without_an_application_limit(
             lambda: all((markers / f"job-{i}.start").exists() for i in range(count)),
             timeout=60.0,
         )
+        wait_until(
+            lambda: all(read_status(jobs_db, job_id) == "running" for job_id in job_ids),
+            timeout=60.0,
+        )
+        assert all(read_status(jobs_db, job_id) == "running" for job_id in job_ids)
         assert not any((markers / f"job-{i}.end").exists() for i in range(count))
-        for job_id in job_ids:
-            assert read_status(jobs_db, job_id) == "running"
         wait_until(
             lambda: all(read_status(jobs_db, j) == "succeeded" for j in job_ids),
             timeout=60.0,

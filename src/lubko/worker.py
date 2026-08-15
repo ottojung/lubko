@@ -34,7 +34,7 @@ allowed to become unowned according to the database lease protocol.
 
 Output capture is bounded and versioned. While a job runs, the root row's
 ``output`` section carries a rolling live tail of at most
-``OUTPUT_TAIL_MAX_CHARS`` characters per stream; older output is archived into
+``OUTPUT_TAIL_MAX_BYTES`` raw bytes per stream; older output is archived into
 immutable ``output_chunk`` rows whose insertion and the root ``previous``
 pointer update happen in one transaction. Archiving never shortens the live
 tail. See :mod:`lubko.protocol` and ``docs/protocol.md``.
@@ -62,8 +62,8 @@ from psycopg.rows import tuple_row
 
 from lubko.config import load_database_config
 from lubko.protocol import (
-    OUTPUT_CHUNK_MAX_CHARS,
-    OUTPUT_TAIL_MAX_CHARS,
+    OUTPUT_CHUNK_MAX_BYTES,
+    OUTPUT_TAIL_MAX_BYTES,
     TWO_COLUMN_INVARIANT,
     ProtocolError,
     build_output_chunk_payload,
@@ -100,6 +100,9 @@ EXECUTION_ERROR_EXIT_CODE: Final = 127
 JOBS_SCHEMA: Final = "lubko"
 JOBS_TABLE: Final = "jobs"
 JOBS_COLUMN_TYPES: Final = (("id", "uuid"), ("payload", "text"))
+TYPE_AWARE_CONSTRAINT_NAME: Final = "jobs_payload_type_shape"
+CHUNK_OWNER_INDEX_NAME: Final = "jobs_chunk_owner_idx"
+CHUNK_ORDER_INDEX_NAME: Final = "jobs_chunk_order_idx"
 UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
 UTC_ISO_SQL: Final = f"to_jsonb({UTC_ISO_TEXT_SQL})"
 LEASE_EXPIRES_AT_SQL: Final = (
@@ -476,9 +479,9 @@ def archive_target(size: int) -> int:
     Returns:
         The archive target offset.
     """
-    if size <= OUTPUT_TAIL_MAX_CHARS:
+    if size <= OUTPUT_TAIL_MAX_BYTES:
         return 0
-    return size - OUTPUT_TAIL_MAX_CHARS + ARCHIVE_MARGIN_CHARS
+    return size - OUTPUT_TAIL_MAX_BYTES + ARCHIVE_MARGIN_CHARS
 
 
 def publish_output(
@@ -497,7 +500,7 @@ def publish_output(
     history. In-memory publication state is only advanced after the transaction
     commits, so a failed transaction never leaves the registry pointing at
     chunks that were not inserted. The live tail itself is always recomputed as
-    the newest ``OUTPUT_TAIL_MAX_CHARS`` bytes of the capture file, so archiving
+    the newest ``OUTPUT_TAIL_MAX_BYTES`` bytes of the capture file, so archiving
     is observationally invisible to a normal root-row ``SELECT``.
 
     Args:
@@ -593,7 +596,7 @@ def _plan_streams(
             continue
         if not force and size == stream.published_size:
             continue
-        tail_text, tail_start, tail_end = output_window_text(stream.path, OUTPUT_TAIL_MAX_CHARS)
+        tail_text, tail_start, tail_end = output_window_text(stream.path, OUTPUT_TAIL_MAX_BYTES)
         chunks, archived_upto, last_chunk, sequence = _plan_chunks(job.id, name, stream, tail_end)
         plans[name] = _StreamPlan(
             size=size,
@@ -636,9 +639,9 @@ def _plan_chunks(
     last_chunk = stream.last_chunk
     sequence = stream.sequence
     target = archive_target(tail_end)
-    while target - archived_upto >= OUTPUT_CHUNK_MAX_CHARS:
+    while target - archived_upto >= OUTPUT_CHUNK_MAX_BYTES:
         chunk_start = archived_upto
-        chunk_end = chunk_start + OUTPUT_CHUNK_MAX_CHARS
+        chunk_end = chunk_start + OUTPUT_CHUNK_MAX_BYTES
         value = decode_range(stream.path, chunk_start, chunk_end)
         chunk_id = uuid4()
         chunk_payload = json.dumps(
@@ -1402,6 +1405,57 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
         raise SchemaInvariantError(msg)
 
 
+def verify_v2_schema(conn: JobsConnection) -> None:
+    """Assert that ``lubko.jobs`` carries the protocol v2 output-chunk shape.
+
+    The two-column invariant alone does not make a table usable by a v2
+    worker: immutable ``output_chunk`` publication requires the type-aware
+    ``jobs_payload_type_shape`` check constraint and the chunk
+    ownership/ordering indexes, which ``migrations/0002_output_chunks.sql``
+    installs (and which the current ``0001_two_column_protocol.sql`` baseline
+    already declares). The worker refuses to start on a pre-0002 v1 schema so
+    output publication can never fail at runtime on a table that cannot
+    represent immutable chunks.
+
+    Args:
+        conn: Open PostgreSQL connection.
+
+    Raises:
+        SchemaInvariantError: If the type-aware constraint or any required
+            output-chunk index is missing.
+    """
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT conname\n"
+            "FROM pg_constraint\n"
+            "WHERE conrelid = to_regclass(%s) AND contype = 'c'\n",
+            (f"{JOBS_SCHEMA}.{JOBS_TABLE}",),
+        )
+        constraints = {str(row[0]) for row in cursor.fetchall()}
+        cursor.execute(
+            "SELECT indexname\nFROM pg_indexes\nWHERE schemaname = %s AND tablename = %s\n",
+            (JOBS_SCHEMA, JOBS_TABLE),
+        )
+        indexes = {str(row[0]) for row in cursor.fetchall()}
+    missing: list[str] = []
+    if TYPE_AWARE_CONSTRAINT_NAME not in constraints:
+        missing.append(f"check constraint {TYPE_AWARE_CONSTRAINT_NAME}")
+    missing.extend(
+        f"index {name}"
+        for name in (CHUNK_OWNER_INDEX_NAME, CHUNK_ORDER_INDEX_NAME)
+        if name not in indexes
+    )
+    if missing:
+        detail = ", ".join(missing)
+        msg = (
+            f"lubko.jobs lacks the protocol v2 output-chunk schema shape required "
+            f"for immutable output publication: missing {detail}. Apply the "
+            f"idempotent migration migrations/0002_output_chunks.sql before "
+            f"starting a v2 worker. {TWO_COLUMN_INVARIANT}"
+        )
+        raise SchemaInvariantError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Supervisor
 # ---------------------------------------------------------------------------
@@ -1604,12 +1658,16 @@ class Supervisor:
                 publish_output(conn, job, changed, now)
 
     def _finalize_completed(self) -> None:
-        """Publish final output and finalize every job whose process has exited."""
+        """Publish final output and finalize every job whose process is fully gone."""
         conn = self.conn
         if conn is None:
             return
         for job in list(self.active.values()):
             if not (job.completed and not job.finalized):
+                continue
+            if group_has_members(job.pgid):
+                # Background members of the exact process group are still being
+                # reaped; finalizing (and untracking) now would leak them.
                 continue
             publish_output(conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True)
             if self._finalize_one(job):
@@ -1802,8 +1860,11 @@ class Supervisor:
             return
         try:
             verify_jobs_table_invariant(conn)
+            verify_v2_schema(conn)
         except SchemaInvariantError:
-            LOGGER.exception("refusing to run against a table violating the two-column invariant")
+            LOGGER.exception(
+                "refusing to run against a table that is not a migrated protocol v2 schema"
+            )
             with suppress(Exception):
                 conn.close()
             raise
@@ -1865,6 +1926,9 @@ class Supervisor:
         Polling reaps the child so concurrent execution never leaves zombies. A
         ``SIGTERM`` that already went out escalates to ``SIGKILL`` for the exact
         process group after the bounded grace period while any member remains.
+        When the root process exits while background members of its exact
+        process group are still alive, a group reap is started so the job is
+        not finalized (and untracked) until the whole exact group is gone.
 
         Args:
             job: The active job to observe.
@@ -1878,6 +1942,13 @@ class Supervisor:
             if returncode is not None:
                 job.completed = True
                 job.returncode = returncode
+        if job.completed and not job.term_sent and group_has_members(job.pgid):
+            LOGGER.info(
+                "reaping leftover process group %d of completed job %s",
+                job.pgid,
+                job.id,
+            )
+            request_group_reap(job)
         if job.term_sent and not job.kill_sent and job.stop_started is not None:
             grace_elapsed = now - job.stop_started >= self.settings.cancel_grace_seconds
             leader_alive = job.proc.poll() is None
@@ -2002,6 +2073,25 @@ def request_stop(job: ActiveJob, reason: str) -> None:
     _signal_group(job.pgid, signal.SIGTERM)
 
 
+def request_group_reap(job: ActiveJob) -> None:
+    """Terminate leftover members of the exact group of a naturally completed job.
+
+    The root process has already exited and produced its own exit status, but
+    background members of the same exact process group are still alive (for
+    example ``sleep 4 & echo done``). The job is not finalized until the group
+    is fully gone, and its natural exit status is preserved: no cancellation
+    reason is recorded.
+
+    Args:
+        job: The active job whose leftover group members must be terminated.
+    """
+    if job.term_sent:
+        return
+    job.term_sent = True
+    job.stop_started = time.monotonic()
+    _signal_group(job.pgid, signal.SIGTERM)
+
+
 def signal_kill(job: ActiveJob) -> None:
     """Send ``SIGKILL`` to an exact process group after the grace period.
 
@@ -2010,8 +2100,8 @@ def signal_kill(job: ActiveJob) -> None:
     """
     job.kill_sent = True
     _signal_group(job.pgid, signal.SIGKILL)
-    note = job.cancellation_note or ""
-    job.cancellation_note = f"{note}; grace period expired, sent SIGKILL".strip("; ")
+    if job.cancellation_note is not None:
+        job.cancellation_note = f"{job.cancellation_note}; grace period expired, sent SIGKILL"
 
 
 def cleanup_job(job: ActiveJob) -> None:

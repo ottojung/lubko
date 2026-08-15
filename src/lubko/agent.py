@@ -1337,7 +1337,10 @@ def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> in
 
     The first invocation of a fresh agent creates the underlying native session
     (mode ``new``); later prompts continue that exact native session (mode
-    ``continue``). By default the invocation is followed and its exit status is
+    ``continue``). A prompt is refused only when a native session was previously
+    established and has genuinely disappeared; an agent that never established a
+    native session may always retry as a new session, even after a failed first
+    attempt. By default the invocation is followed and its exit status is
     propagated; ``--detach`` returns immediately.
 
     Args:
@@ -1350,14 +1353,12 @@ def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> in
     """
     aid = args.id or args.agent_id
 
-    session_id = meta.get("native_session_id") or discover_session_id(aid)
-    if session_id is None:
-        if (meta.get("prompt_count") or 0) > 0:
-            _err(f"{PROG}: cannot continue agent {aid}: its underlying session is not available")
-            return EXIT_ERROR
-        mode = "new"
-    else:
-        mode = "continue"
+    recorded = meta.get("native_session_id")
+    discovered = discover_session_id(aid)
+    if recorded is not None and discovered is None:
+        _err(f"{PROG}: cannot continue agent {aid}: its underlying session is not available")
+        return EXIT_ERROR
+    mode = "continue" if (recorded or discovered) is not None else "new"
 
     now = time.time()
     update_meta(aid, lambda m: _begin_invocation(m, prompt, now))

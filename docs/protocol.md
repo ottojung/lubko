@@ -45,6 +45,19 @@ explicit ownership and offset shape. Chunk rows never carry fake command
 lifecycle state. Claim and lease-recovery queries operate only on
 `type = 'command'` rows.
 
+## Startup schema verification
+
+The v2 worker verifies more than the two-column invariant before starting. It
+also requires the type-aware `jobs_payload_type_shape` constraint and the chunk
+ownership/ordering indexes to be present, because immutable `output_chunk`
+publication is impossible without them. A table built from the pre-0002 v1
+baseline (which carries only a v1 status constraint and no chunk indexes) is
+refused at startup with a clear diagnostic pointing at the idempotent migration
+`migrations/0002_output_chunks.sql`. This keeps output publication from failing
+at runtime on a table that cannot represent immutable chunks, and it makes the
+safe upgrade order explicit: apply 0002 while the old v1 worker still runs,
+then start the v2 worker against the migrated schema.
+
 ## Physical schema
 
 ```sql
@@ -155,8 +168,8 @@ live output window:
 ```
 
 The live tail is **never shortened by archival rotation**: once a stream has at
-least 4000 characters of output, normal root-row reads continue to expose the
-latest 4000-character window, and archiving old output is observationally
+least 4000 raw bytes of output, normal root-row reads continue to expose the
+latest 4000-byte window, and archiving old output is observationally
 invisible to a normal `SELECT` of the root job. Overlap between the live tail
 and the latest immutable chunk is intentional and represented unambiguously by
 byte offsets.
@@ -205,7 +218,8 @@ gaps and intentional overlap mechanically detectable.
 #### `result` — terminal data
 
 Optional object, set when the job is terminal. `result.stdout`/`stderr` are
-bounded to at most 4000 characters (the final live tail text).
+bounded to the final live tail text, decoded from at most 4000 raw bytes
+(therefore at most 4000 characters).
 
 | Field                | Type   | Meaning                                     |
 | -------------------- | ------ | ------------------------------------------- |

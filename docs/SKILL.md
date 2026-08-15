@@ -136,8 +136,9 @@ payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
 
 Immutable historical output lives in separate `output_chunk` rows in the same
 two-column table, explicitly owned by a root job via `payload.thread`. Root
-live output tails are bounded rolling windows (the newest up to 4000
-characters per stream) and are never shortened by archival rotation.
+live output tails are bounded rolling windows of the newest up to 4000 raw
+bytes per stream (decoded to at most 4000 characters) and are never shortened
+by archival rotation.
 
 Never add a third column to `lubko.jobs`; evolve the protocol inside
 `payload` instead. SQL casts `payload::jsonb` only transiently for predicates
@@ -303,7 +304,8 @@ Interpret states as follows:
 For a running job, poll again rather than assuming failure.
 
 The root row's `payload.output.<stream>.tail` is a bounded rolling live window
-of the newest up to 4000 characters of stdout/stderr. Checking one root job by
+of the newest up to 4000 raw bytes of stdout/stderr (decoded to at most 4000
+characters). Checking one root job by
 ID is always safe and useful: the row always contains current lifecycle state
 plus a substantial recent rolling output window, independent of chunk
 rotation.
@@ -954,7 +956,8 @@ intentionally issue a huge query.
 
 Checking one root job by ID is safe and useful: the root row always contains
 current lifecycle state plus a substantial recent rolling output window
-(up to 4000 characters per stream), independent of chunk rotation.
+(the newest up to 4000 raw bytes per stream, decoded to at most 4000
+characters), independent of chunk rotation.
 
 ---
 

@@ -121,7 +121,7 @@ where id = '<job-id>';
 ```
 
 While a job runs, the root row carries a bounded rolling live output window in
-`payload.output` — the newest up to 4000 characters of stdout/stderr per
+`payload.output` — the newest up to 4000 raw bytes of stdout/stderr per
 stream, plus byte offsets and a `previous` pointer to the newest immutable
 chunk. Historical output is archived into immutable `output_chunk` rows in the
 same two-column table, keyed by explicit `thread` ownership. Archiving never
@@ -217,22 +217,46 @@ the container and its output is discarded.
 
 ## Database schema and migrations
 
-A fresh installation applies the single baseline migration
-`migrations/0001_two_column_protocol.sql`, which creates the canonical
-two-column `lubko.jobs` table, its checks, the queue index, the invariant
-comment, and the worker role grant. Schema changes live in `migrations/` as
-idempotent SQL files applied in filename order, for example with `psql`:
+Migrations live in `migrations/` as idempotent SQL files applied in **filename
+order** — a fresh installation applies both `0001_two_column_protocol.sql` and
+`0002_output_chunks.sql`:
 
 ```sh
 psql "$DATABASE_URL" -f migrations/0001_two_column_protocol.sql
+psql "$DATABASE_URL" -f migrations/0002_output_chunks.sql
 ```
 
-Each migration is safe to apply more than once. There is no legacy schema or
-rollback path: the two-column table is the only supported binding, and the
-worker refuses to start against any other shape. See `docs/protocol.md` for
-the authoritative binding.
+`0001` creates the canonical two-column `lubko.jobs` table with its type-aware
+checks, the queue index, the chunk ownership/ordering indexes, the invariant
+comment, and the worker role grant. `0002` upgrades an installation that ran an
+older v1 baseline: it replaces the v1 status-only constraint with the type-aware
+constraint and installs the chunk indexes. Each migration is safe to apply more
+than once. There is no legacy schema or rollback path: the two-column table is
+the only supported binding, and the worker refuses to start against any other
+shape. See `docs/protocol.md` for the authoritative binding.
 
-Run with:
+### Protocol v2 rollout order
+
+Upgrading a running v1 worker to protocol v2 follows a safe, non-downtime
+order:
+
+1. **Apply `0002_output_chunks.sql` while the old v1 worker is still running.**
+   The migration is idempotent and relaxes the payload constraint (command rows
+   a v1 worker writes still satisfy the new type-aware shape), so the old worker
+   keeps working against the migrated table.
+2. **Check out the exact v2 commit** (no git mutation) and deploy the
+   replacement v2 worker. On startup the v2 worker verifies the migrated schema
+   (the type-aware constraint and the chunk indexes) and refuses to start on a
+   still-unmigrated v1 table.
+3. **Run the v2 confirmation jobs**, which must traverse the replacement v2
+   worker, before treating the deployment as stable.
+
+Rollback to a v1 worker binary remains safe after the migration: a v1 worker
+only ever writes `command` rows, which continue to satisfy the type-aware
+`jobs_payload_type_shape` constraint, so reverting the binary to v1 is
+binary-compatible with the migrated schema.
+
+Run the worker with:
 
 ```sh
 uv run lubko-worker
