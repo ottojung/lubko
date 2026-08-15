@@ -69,7 +69,7 @@ KILL_WAIT_SECONDS: Final = 5.0
 IDLE_BREAK_SECONDS: Final = 5
 STABLE_TERMINAL_SECONDS: Final = 0.5
 STATUS_TAIL_LINES: Final = 50
-STATUS_TAIL_CHARS: Final = 2000
+FOLD_WIDTH: Final = 80
 DEFAULT_RETENTION_DAYS: Final = 14
 RUNNER_ARGV_LENGTH: Final = 3
 AGENT_META_VERSION: Final = 3
@@ -285,6 +285,38 @@ def proc_start_ticks(pid: int) -> int | None:
         return None
 
 
+def proc_cpu_seconds(pid: int | None) -> float | None:
+    """Return the total CPU time in seconds used by a process, or ``None``.
+
+    Reads the user and system CPU time of the process from Linux
+    ``/proc/<pid>/stat`` and converts clock ticks to seconds.
+
+    Args:
+        pid: Process ID to inspect, or ``None``.
+
+    Returns:
+        The total CPU time in seconds, or ``None`` when unavailable.
+    """
+    if not pid:
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rest = stat[stat.rfind(")") + 1 :].split()
+    try:
+        ticks = int(rest[11]) + int(rest[12])
+    except (ValueError, IndexError):
+        return None
+    try:
+        ticks_per_second = os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError):
+        return None
+    if not ticks_per_second:
+        return None
+    return ticks / ticks_per_second
+
+
 def _env_has_marker(pid: int, aid: str) -> bool:
     """Return whether a process environment carries the exact agent marker.
 
@@ -459,6 +491,25 @@ def _truncate(text: str, width: int) -> str:
     return text[: width - 1] + "~"
 
 
+def fold_line(line: str, width: int = FOLD_WIDTH) -> list[str]:
+    """Fold one logical line into display lines of at most ``width`` characters.
+
+    Folding is presentation only: the durable log is never rewritten, and a
+    logical line simply hard-wraps at every ``width``-th character. An empty
+    logical line yields one empty display line.
+
+    Args:
+        line: One logical line, without its trailing newline.
+        width: Maximum characters per displayed line.
+
+    Returns:
+        The folded display lines.
+    """
+    if not line:
+        return [""]
+    return [line[i : i + width] for i in range(0, len(line), width)]
+
+
 def fmt_time(epoch: float | None) -> str:
     """Format an epoch timestamp for display.
 
@@ -499,25 +550,42 @@ def fmt_age(epoch: float | None) -> str:
     return f"{hours // HOURS_PER_DAY}d{hours % HOURS_PER_DAY}h"
 
 
-def log_excerpt(
-    path: Path,
-    max_lines: int = STATUS_TAIL_LINES,
-    max_chars: int = STATUS_TAIL_CHARS,
-) -> list[str]:
+def fmt_cpu(cpu: float | None) -> str:
+    """Format total CPU time in seconds for display.
+
+    Args:
+        cpu: Total CPU seconds, or ``None`` when unavailable.
+
+    Returns:
+        A compact CPU time string, or ``-`` when unknown.
+    """
+    if cpu is None:
+        return "-"
+    if cpu < SECONDS_PER_MINUTE:
+        return f"{cpu:.1f}s"
+    minutes = int(cpu // SECONDS_PER_MINUTE)
+    if minutes < MINUTES_PER_HOUR:
+        return f"{minutes}m{cpu % SECONDS_PER_MINUTE:.0f}s"
+    hours = minutes // MINUTES_PER_HOUR
+    return f"{hours}h{minutes % MINUTES_PER_HOUR}m"
+
+
+def log_excerpt(path: Path, max_lines: int = STATUS_TAIL_LINES) -> list[str]:
     """Return a short plain-text tail of a log file for display.
 
-    Shows at most ``max_lines`` lines within the newest ``max_chars`` bytes,
-    with ANSI escape sequences stripped.
+    Logical lines have ANSI escape sequences stripped and are folded to
+    ``FOLD_WIDTH`` characters, then only the newest ``max_lines`` displayed
+    lines are kept. Folding is presentation only; the durable log is never
+    modified.
 
     Args:
         path: Log file path.
-        max_lines: Maximum number of lines.
-        max_chars: Maximum bytes to consider.
+        max_lines: Maximum displayed lines (``<= 0`` for every line).
 
     Returns:
-        The plain-text tail lines.
+        The plain-text displayed lines.
     """
-    return [_ANSI_CSI_RE.sub("", line) for line in tail_lines(path, max_lines, max_chars)]
+    return _folded_tail(path, max_lines, strip_ansi=True)
 
 
 def print_box(lines: list[str], max_width: int = 80) -> None:
@@ -1580,6 +1648,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     _out(f"agent:      {aid}")
     _out(f"state:      {state}")
     _out(f"alive:      {'yes' if alive else 'no'}")
+    _out(f"cpu:        {fmt_cpu(_status_cpu_seconds(meta, alive=alive))}")
     _out(f"cwd:        {meta.get('cwd') or '-'}")
     _out(f"created:    {fmt_time(meta.get('created_at'))}")
     _out(f"started:    {fmt_time(meta.get('started_at'))}")
@@ -1592,10 +1661,29 @@ def cmd_status(args: argparse.Namespace) -> int:
         _out(f"steers:     {len(steers)} queued: {_first_line(steers[0].get('prompt') or '')}")
     _out(f"title:      {meta.get('title') or '-'}")
     _out("tail(log):")
-    excerpt = log_excerpt(log_path, STATUS_TAIL_LINES, STATUS_TAIL_CHARS)
+    excerpt = log_excerpt(log_path, STATUS_TAIL_LINES)
     if excerpt:
-        print_box(excerpt)
+        print_box(excerpt, max_width=FOLD_WIDTH + 6)
     return EXIT_OK
+
+
+def _status_cpu_seconds(meta: Meta, *, alive: bool) -> float | None:
+    """Return the agent's CPU time, gated on the exact process identity.
+
+    CPU time is only meaningful when the recorded PID is verified to be the
+    exact live agent process. A stored PID that exists but was reused by an
+    unrelated process must never surface CPU time.
+
+    Args:
+        meta: Agent metadata.
+        alive: Whether the exact agent process is alive.
+
+    Returns:
+        The total CPU seconds, or ``None`` when not alive.
+    """
+    if not alive:
+        return None
+    return proc_cpu_seconds(meta.get("pid"))
 
 
 def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
@@ -1614,6 +1702,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "id": aid,
         "state": state,
         "alive": alive,
+        "cpu_seconds": _status_cpu_seconds(meta, alive=alive),
         "native_session_id": meta.get("native_session_id"),
         "pid": meta.get("pid"),
         "pgid": meta.get("pgid"),
@@ -1639,111 +1728,226 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
     }
 
 
-def _read_tail_window(path: Path, max_chars: int) -> tuple[bytes, int, bytes] | None:
-    """Read the newest bytes of a file plus the byte before the window.
+def _tail_logical_lines(path: Path, count: int) -> list[str]:
+    """Return the trailing ``count`` logical lines of a log file.
+
+    Reads backward from the end of the file so huge logs are never loaded
+    wholesale when only a short tail is requested.
 
     Args:
-        path: File path.
-        max_chars: Maximum bytes to read (``<= 0`` for the whole file).
+        path: Log file path.
+        count: Number of trailing logical lines (``<= 0`` for the whole file).
 
     Returns:
-        A ``(data, start, prev)`` tuple, or ``None`` when the file is empty.
+        The trailing logical lines, newest last, without trailing newlines.
     """
     with path.open("rb") as fh:
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
-        if size == 0:
-            return None
-        window = size if max_chars <= 0 else min(size, max_chars)
-        start = size - window
-        fh.seek(start)
-        data = fh.read(window)
-        prev = b"\n"
-        if start > 0:
-            fh.seek(start - 1)
-            prev = fh.read(1)
-        return data, start, prev
+        return _tail_logical_lines_stream(fh, size, count)
 
 
-def tail_lines(path: Path, n: int, max_chars: int = 0) -> list[str]:
-    """Return the last ``n`` lines of a file (all lines when ``n <= 0``).
+def _tail_logical_lines_stream(fh: BinaryIO, end: int, count: int) -> list[str]:
+    """Return the trailing ``count`` logical lines up to byte offset ``end``.
 
-    ``max_chars > 0`` limits the tail to the newest ``max_chars`` bytes; a
-    mid-line fragment at the start is dropped when fuller lines follow.
+    The tail is read only from the open stream's bytes in ``[0, end)``, so
+    the result stays consistent with the snapshot size that captured ``end``:
+    bytes appended to the file afterwards are excluded and remain for the
+    follow. Reads backward so huge logs are never loaded wholesale when only
+    a short tail is requested.
 
     Args:
-        path: File path.
-        n: Number of trailing lines.
-        max_chars: Maximum bytes to consider.
+        fh: Open binary stream positioned at ``end``.
+        end: Captured end byte offset of the file snapshot.
+        count: Number of trailing logical lines (``<= 0`` for the whole file).
 
     Returns:
-        The trailing lines.
+        The trailing logical lines, newest last, without trailing newlines.
     """
-    try:
-        window = _read_tail_window(path, max_chars)
-    except OSError:
-        return []
-    if window is None:
-        return []
-    data, start, prev = window
-    lines = data.decode("utf-8", errors="replace").split("\n")
-    if start > 0 and prev != b"\n" and any(lines[1:]):
-        lines = lines[1:]
-    while lines and not lines[-1]:
+    if count <= 0:
+        fh.seek(0)
+        data = fh.read(end)
+        lines = data.decode("utf-8", errors="replace").split("\n")
+        if lines and not lines[-1]:
+            lines.pop()
+        return lines
+    block = 64 * 1024
+    trailing = b""
+    preceded_by_newline = True
+    pos = end
+    while pos > 0 and trailing.count(b"\n") < count:
+        chunk = min(block, pos)
+        pos -= chunk
+        fh.seek(pos)
+        trailing = fh.read(chunk) + trailing
+    if pos > 0:
+        fh.seek(pos - 1)
+        preceded_by_newline = fh.read(1) == b"\n"
+    lines = trailing.decode("utf-8", errors="replace").split("\n")
+    if lines and not lines[-1]:
         lines.pop()
-    if n > 0:
-        lines = lines[-n:]
+    if pos > 0 and not preceded_by_newline:
+        lines = lines[1:]
+    if len(lines) > count:
+        lines = lines[-count:]
     return lines
 
 
-def tail_snapshot(path: Path, max_lines: int = 50, max_chars: int = 2000) -> tuple[bytes, int]:
-    """Return (newest output bytes, byte offset to continue following from).
+def _folded_tail(path: Path, lines: int, *, strip_ansi: bool = False) -> list[str]:
+    """Return the newest ``lines`` folded display lines of a log file.
 
-    The bytes cover at most ``max_lines`` lines within the newest
-    ``max_chars`` bytes.  The offset is the end of that snapshot, so following
-    from it neither reprints the shown output nor skips newly appended output.
+    This is the single shared fold-and-tail path for every user-visible log
+    view: logical lines are folded to ``FOLD_WIDTH`` characters (after
+    optionally stripping ANSI escapes), and only the number of folded display
+    lines limits the result. Folding is presentation only; the durable log is
+    never modified.
 
     Args:
-        path: File path.
-        max_lines: Maximum number of lines.
-        max_chars: Maximum bytes to consider.
+        path: Log file path.
+        lines: Maximum displayed lines (``<= 0`` for every line).
+        strip_ansi: Strip ANSI escape sequences from each logical line.
+
+    Returns:
+        The displayed lines, newest last.
+    """
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            return _folded_tail_stream(fh, size, lines, strip_ansi=strip_ansi)
+    except OSError:
+        return []
+
+
+def _folded_tail_stream(
+    fh: BinaryIO,
+    end: int,
+    lines: int,
+    *,
+    strip_ansi: bool = False,
+) -> list[str]:
+    """Return the newest ``lines`` folded display lines up to byte ``end``.
+
+    Logical lines are read only from the open stream's bytes in ``[0, end)``
+    and folded to ``FOLD_WIDTH`` characters, so the display never extends past
+    the snapshot size that captured ``end``: bytes appended afterwards stay
+    out of the snapshot and remain for the follow.
+
+    Args:
+        fh: Open binary stream positioned at ``end``.
+        end: Captured end byte offset of the file snapshot.
+        lines: Maximum displayed lines (``<= 0`` for every line).
+        strip_ansi: Strip ANSI escape sequences from each logical line.
+
+    Returns:
+        The displayed lines, newest last.
+    """
+    try:
+        logical = _tail_logical_lines_stream(fh, end, lines)
+    except OSError:
+        return []
+    folded: list[str] = []
+    for logical_line in logical:
+        folded.extend(fold_line(_ANSI_CSI_RE.sub("", logical_line) if strip_ansi else logical_line))
+    if lines > 0 and len(folded) > lines:
+        folded = folded[-lines:]
+    return folded
+
+
+def tail_lines(path: Path, n: int) -> list[str]:
+    """Return the last ``n`` displayed lines of a log file (all when ``n <= 0``).
+
+    Each logical line is folded to ``FOLD_WIDTH`` characters and only the
+    newest ``n`` displayed lines are kept; there is no character limit.
+
+    Args:
+        path: Log file path.
+        n: Number of displayed lines.
+
+    Returns:
+        The displayed lines, newest last.
+    """
+    return _folded_tail(path, n)
+
+
+def _file_ends_with_newline_stream(fh: BinaryIO, end: int) -> bool:
+    r"""Return whether the byte just before ``end`` is a newline.
+
+    Args:
+        fh: Open binary stream.
+        end: Captured end byte offset of the file snapshot.
+
+    Returns:
+        ``True`` when ``end > 0`` and byte ``end - 1`` is ``\n``.
+    """
+    if end <= 0:
+        return False
+    fh.seek(end - 1)
+    return fh.read(1) == b"\n"
+
+
+def _tail_snapshot_from(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, int]:
+    """Return (newest folded display bytes, byte offset) for the open snapshot.
+
+    The display and the continuation offset come from the single captured
+    ``end`` byte offset: the folded tail is read only up to ``end``, and
+    ``end`` is also the returned offset, so a later append is excluded from
+    the display and remains for the follow.
+
+    Args:
+        fh: Open binary stream positioned at ``end``.
+        end: Captured end byte offset of the file snapshot.
+        max_lines: Maximum displayed lines.
+
+    Returns:
+        A ``(bytes, offset)`` tuple.
+    """
+    display = _folded_tail_stream(fh, end, max_lines)
+    if not display:
+        return b"", end
+    text = "\n".join(display)
+    if _file_ends_with_newline_stream(fh, end):
+        text += "\n"
+    return text.encode("utf-8", errors="replace"), end
+
+
+def tail_snapshot(path: Path, max_lines: int = STATUS_TAIL_LINES) -> tuple[bytes, int]:
+    """Return (newest folded display bytes, byte offset to continue following from).
+
+    The bytes cover at most ``max_lines`` folded display lines; folding is
+    presentation only and never touches the durable log. The displayed bytes
+    and the offset come from one consistent open-file snapshot: the file is
+    opened once, its EOF size is captured, and the tail is read only up to
+    that captured size. Bytes appended after the capture are excluded from
+    the snapshot and remain for the follow, so following resumes exactly
+    where the displayed output ends.
+
+    Args:
+        path: Log file path.
+        max_lines: Maximum displayed lines.
 
     Returns:
         A ``(bytes, offset)`` tuple.
     """
     try:
-        window = _read_tail_window(path, max_chars)
+        fh = path.open("rb")
     except OSError:
         return b"", 0
-    if window is None:
-        return b"", 0
-    data, start, _prev = window
-    size = start + len(data)
-    lines = data.split(b"\n")
-    if max_lines > 0 and len(lines) > max_lines:
-        keep_lines = lines[-(max_lines + 1) :]
-        keep = b"\n".join(keep_lines)
-        if keep.startswith(b"\n"):
-            keep = keep[1:]
-    else:
-        keep = data
-    return keep, size
+    with fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        return _tail_snapshot_from(fh, size, max_lines)
 
 
-def stream_log_until_terminal(
-    aid: str,
-    follow_lines: int = STATUS_TAIL_LINES,
-    max_chars: int = STATUS_TAIL_CHARS,
-) -> None:
-    """Print the recent tail, then stream new output until the agent is done.
+def stream_log_until_terminal(aid: str, follow_lines: int = STATUS_TAIL_LINES) -> None:
+    """Print the recent folded tail, then stream new output until the agent is done.
 
     Args:
         aid: Lubko agent ID.
-        follow_lines: Number of recent lines to show first.
-        max_chars: Maximum bytes of the initial snapshot.
+        follow_lines: Number of recent folded display lines to show first.
     """
     log_path = agent_dir(aid) / "output.log"
-    offset = _print_snapshot(log_path, follow_lines, max_chars)
+    offset = _print_snapshot(log_path, follow_lines)
     handle: BinaryIO | None = None
     idle_since: float | None = None
     terminal_since: float | None = None
@@ -1795,20 +1999,19 @@ def _stable_terminal(aid: str, terminal_since: float | None) -> tuple[bool, floa
     return False, None
 
 
-def _print_snapshot(path: Path, follow_lines: int, max_chars: int) -> int:
-    """Print the recent tail snapshot and return its end offset.
+def _print_snapshot(path: Path, follow_lines: int) -> int:
+    """Print the recent folded tail snapshot and return its end offset.
 
     Args:
         path: Log file path.
-        follow_lines: Number of recent lines to show.
-        max_chars: Maximum bytes to consider.
+        follow_lines: Number of folded display lines to show.
 
     Returns:
         The byte offset to continue following from.
     """
     if not path.is_file():
         return 0
-    kept, offset = tail_snapshot(path, follow_lines, max_chars)
+    kept, offset = tail_snapshot(path, follow_lines)
     if kept:
         sys.stdout.buffer.write(kept)
         sys.stdout.buffer.flush()
@@ -1910,21 +2113,71 @@ def cmd_log(args: argparse.Namespace) -> int:
     log_path = agent_dir(aid) / "output.log"
     if not log_path.is_file():
         if args.follow:
-            # wait for the first output to appear
-            time.sleep(0.5)
-            if not log_path.is_file():
+            # wait for the first output to appear or a terminal state
+            if not _wait_for_first_output(aid, log_path) or not log_path.is_file():
                 _err("(no output yet)")
                 return EXIT_OK
         else:
             _err("(no output yet)")
             return EXIT_OK
-    max_chars = 0 if args.lines <= 0 else STATUS_TAIL_CHARS
     if args.follow:
-        stream_log_until_terminal(aid, follow_lines=args.lines, max_chars=max_chars)
+        stream_log_until_terminal(aid, follow_lines=args.lines)
     else:
-        for line in tail_lines(log_path, args.lines, max_chars):
+        for line in tail_lines(log_path, args.lines):
             _out(line)
     return EXIT_OK
+
+
+def _can_produce_output(aid: str) -> bool:
+    """Return whether the exact agent lifecycle can still write output.
+
+    The agent is genuinely capable of producing output only while its exact
+    recorded process is alive; in the brief running-before-pid window only the
+    exact recorded runner can still start an invocation. Anything else —
+    missing metadata, idle/terminal/unknown state, a recorded pid that is not
+    alive, or a runner that is gone — means no further output can arrive, so
+    waiting must stop promptly rather than poll forever.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` only while the exact recorded process (or, before the pid is
+        recorded, the exact runner) is alive and the state is ``running``.
+    """
+    meta = read_meta(aid)
+    if meta is None:
+        return False
+    if derive_state(meta) != "running":
+        return False
+    pid = meta.get("pid")
+    if pid:
+        return is_alive(meta)
+    return runner_alive(meta)
+
+
+def _wait_for_first_output(aid: str, log_path: Path) -> bool:
+    """Wait for an agent's first log output while its lifecycle can still produce it.
+
+    An agent marked running may not have created its output log yet when
+    ``log --follow`` starts. There is no wall-clock cutoff: this polls until
+    the log appears or the exact lifecycle proves it can no longer write
+    output, so following a live agent never returns prematurely and a dead or
+    idle one is never followed forever.
+
+    Args:
+        aid: Lubko agent ID.
+        log_path: The agent's output log path.
+
+    Returns:
+        ``True`` when the log exists or the agent can no longer produce output.
+    """
+    while True:
+        if log_path.is_file():
+            return True
+        if not _can_produce_output(aid):
+            return True
+        time.sleep(0.2)
 
 
 def cmd_wait(args: argparse.Namespace) -> int:

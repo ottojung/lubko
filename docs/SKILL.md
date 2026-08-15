@@ -67,7 +67,7 @@ Substantial queued work normally invokes **`lubko-agent`** rather than a long im
 - **Supabase is the transport.** Commands in and results out all go through `lubko.jobs`; never bypass the queue to touch the container directly.
 - **Use `lubko-agent` for substantial work.** Anything needing judgment, context, iteration, or more than a couple of obvious shell commands belongs in a managed agent.
 - **Use direct shell for tiny deterministic observations.** `pwd`, `git status --short`, reading one short file, printing a version, checking a path.
-- **Do not rush healthy agents.** If an agent seems slow, read `status` and a log tail; distinguish progress from stuck. Reserve `stop`/`kill` for abandoned work.
+- **Do not rush healthy agents, but do not assume a running agent is making progress.** Agents absolutely can get stuck. For any long-running agent, run a direct `lubko-agent status --id <ID>` health check at least every 5 minutes; use the CPU/process evidence and a focused log tail to distinguish *alive* from *usefully progressing*. Steer, stop, or kill genuinely stalled agents, but never nag an agent solely because time has elapsed.
 - **Use as many agents as useful.** There is no general agent-count limit; the constraints are exclusive write trees/branches and clear, non-conflicting responsibilities.
 - **Isolate write-capable agents in separate trees/branches.** Never point two writers at the same working tree.
 - **Poll grouped.** When several root jobs are outstanding, poll all outstanding root UUIDs together in one bounded `where id in (...)` query, never one at a time.
@@ -542,7 +542,7 @@ Show detailed state for one exact agent:
 lubko-agent status 8e064622
 ```
 
-The `--id` flag form is also supported. Status may include the Lubko agent ID, current state, whether its process is alive, PID and process-group information, working directory, creation/start/finish timestamps, exit code, prompt count, title, log path, and the internal native session identifier for diagnostics. Use `status` as the primary health check for an agent. If an agent appears to be taking longer than expected, inspect `status` and `log` rather than assuming it is stuck.
+The `--id` flag form is also supported. Status may include the Lubko agent ID, current state, whether its process is alive, total CPU time used by the agent process (from Linux `/proc` data), PID and process-group information, working directory, creation/start/finish timestamps, exit code, prompt count, title, log path, and the internal native session identifier for diagnostics. Use `status` as the primary health check for an agent. A live process is not the same as useful progress: a process can be alive and consuming CPU while looping on a failing action, or alive but idle while the task is genuinely finished. Judge useful progress by pairing `status` with a focused log tail and recent observable progress, not by CPU alone. For any long-running agent, run a direct `lubko-agent status --id <ID>` health check at least every 5 minutes.
 
 ---
 
@@ -556,7 +556,7 @@ lubko-agent log 8e064622 --lines 100
 lubko-agent log 8e064622 --follow
 ```
 
-`log --follow` attaches to an already-running agent and streams its output. Use logs for observability while the agent is working: seeing what the agent is currently doing, diagnosing a long-running task, understanding a failure, checking whether it is making progress, and deciding whether another prompt is needed. Do not dump enormous logs by default — prefer a useful tail such as 100 or 200 lines.
+`log --follow` attaches to an already-running agent and streams its output. `--lines N` counts **displayed lines**: long logical log lines are folded to 80 characters per displayed line, and only the requested number of displayed lines limits the tail, so `--lines N` shows exactly N folded lines (or fewer if the log is shorter). The durable log file is never rewritten; folding is presentation only. Use logs for observability while the agent is working: seeing what the agent is currently doing, diagnosing a long-running task, understanding a failure, checking whether it is making progress, and deciding whether another prompt is needed. Prefer a focused tail such as 100 or 200 lines over dumping an enormous log. `log --follow` on a just-started agent waits for its first output (or a terminal state) instead of giving up immediately.
 
 For an attached `prompt`, the invocation's current/final output is also exposed through the enclosing Lubko root job's bounded rolling output, so the normal progress/result view is the root job itself; `log` provides durable older output.
 
@@ -632,11 +632,17 @@ Use this for housekeeping, not as part of every development task. Running agents
 
 Agents that were stopped or killed because the orchestrator judged them "slow" had, in several cases, just spent that time on exactly the reasoning the task required — reading the real code before editing it. Stopping them forced the orchestrator to redo or re-verify the work later, and interrupted sessions were not resumable as-is: a fresh agent had to re-derive context the interrupted agent had already built.
 
+At the same time, agents are not immune to stalling: an agent can absolutely get stuck — looping on one failing action, waiting on a dead tool, or silently idle. Liveness and useful progress are different questions.
+
 Rules:
 
 - Do not impose deadlines on thinking.
-- When an agent appears to be taking long, first check its `status` and a log tail. Ask "is it making progress?" not "is it done yet?"
+- **Check liveness on a cadence, not by feel.** For any long-running agent, run a direct `lubko-agent status --id <ID>` health check at least every 5 minutes. Prefer `status --id <ID>` over `list` for the health check so the evidence is for the exact agent being monitored.
+- **Use CPU/process evidence as a health signal, not as proof of progress.** `status` reports whether the agent's process is alive and its total CPU time. Growing CPU time shows process activity, not health or progress: a stuck loop can burn CPU, and low CPU can be legitimate while an agent waits on a subprocess or a tool. Judge useful progress from a focused log tail and recent observable progress, not from CPU alone.
+- **Pair status with a focused log tail when ambiguous.** When state or CPU alone does not answer "is it making progress?", read a focused log tail such as `lubko-agent log <ID> --lines 100` and look at what the agent is currently doing. Ask "is it making progress?" not "is it done yet?"
 - An agent that is reading files, running tests, and converging is working; an agent that is looping on one failing action is stuck.
+- **Do not nag solely because time elapsed.** A quiet long-running agent that is still consuming CPU and converging is healthy; interrupting it on a schedule destroys the reasoning it is doing. Only intervene when the evidence shows a genuine stall or a concrete problem.
+- **Steer, stop, or kill genuinely stalled agents.** Once the evidence shows a real stall, do not keep waiting and polling forever: redirect it with a focused `--steer`, or if the task is abandoned, `stop` it and escalate to `kill` only when graceful stopping is insufficient.
 - Use a blocking `wait` only when you are confident no intermediate steering is useful — the timeout stops *waiting*, not the agent. For genuinely long or uncertain tasks, poll `status` and occasionally read the log instead of blocking.
 - Stopping is a decision that the task is no longer wanted, not a pause button. Prefer a steering prompt for course correction and reserve `stop`/`kill` for abandoned tasks.
 

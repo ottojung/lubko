@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Final
+from typing import BinaryIO, Final, cast
 
 import pytest
 
@@ -275,14 +275,456 @@ def test_tail_lines_returns_last_n(state_dir: Path) -> None:
     log.write_text("a\nb\nc\n")
     assert agent.tail_lines(log, 2) == ["b", "c"]
     assert agent.tail_lines(log, 0) == ["a", "b", "c"]
-    assert agent.tail_lines(log, 1, max_chars=4) == ["c"]
+    assert agent.tail_lines(log, 1) == ["c"]
 
 
 def test_log_excerpt_strips_ansi(state_dir: Path) -> None:
     """Log excerpts strip ANSI escape sequences."""
     log = state_dir / "out.log"
     log.write_text("\x1b[31mred\x1b[0m\nplain\n")
-    assert agent.log_excerpt(log, 5, 2000) == ["red", "plain"]
+    assert agent.log_excerpt(log, 5) == ["red", "plain"]
+
+
+def test_fold_line_wraps_at_width() -> None:
+    """fold_line hard-wraps logical lines at the fold width."""
+    assert agent.fold_line("") == [""]
+    assert agent.fold_line("x" * agent.FOLD_WIDTH) == ["x" * agent.FOLD_WIDTH]
+    assert agent.fold_line("x" * (agent.FOLD_WIDTH + 1)) == [
+        "x" * agent.FOLD_WIDTH,
+        "x",
+    ]
+    assert agent.fold_line("x" * (2 * agent.FOLD_WIDTH)) == [
+        "x" * agent.FOLD_WIDTH,
+        "x" * agent.FOLD_WIDTH,
+    ]
+
+
+def test_tail_lines_folds_long_lines_without_char_cap(state_dir: Path) -> None:
+    """Long logical lines fold to display lines; only line count limits."""
+    log = state_dir / "out.log"
+    logical = [f"{i:02d}-" + "x" * agent.FOLD_WIDTH for i in range(30)]
+    log.write_text("\n".join(logical) + "\n")
+    expected_all = [piece for line in logical for piece in agent.fold_line(line)]
+    assert agent.tail_lines(log, 0) == expected_all
+    assert agent.tail_lines(log, 60) == expected_all
+    assert agent.tail_lines(log, 4) == agent.fold_line(logical[-2]) + agent.fold_line(logical[-1])
+    assert len(agent.tail_lines(log, 1)) == 1
+
+
+def test_tail_lines_drops_partial_line_at_backward_block_boundary(
+    state_dir: Path,
+) -> None:
+    """A partial first line at the 64KiB backward-read boundary is not complete."""
+    log = state_dir / "out.log"
+    block = 64 * 1024
+    long_line = "A" * (block + 10)
+    log.write_text(f"{long_line}\nl1\nl2\nl3\nl4\n")
+    assert log.stat().st_size > block
+    assert agent.tail_lines(log, 5) == ["l1", "l2", "l3", "l4"]
+
+
+def test_tail_lines_drops_partial_prefix_when_trailing_blank(
+    state_dir: Path,
+) -> None:
+    """A partial 64KiB-boundary prefix is dropped even when trailing lines are blank."""
+    log = state_dir / "out.log"
+    block = 64 * 1024
+    long_line = "A" * (block + 10)
+    log.write_text(f"{long_line}\n\n\n\n\n")
+    assert log.stat().st_size > block
+    assert agent.tail_lines(log, 5) == ["", "", "", ""]
+
+
+def test_tail_snapshot_folds_and_returns_raw_offset(state_dir: Path) -> None:
+    """The follow snapshot shows folded display bytes and a raw byte offset."""
+    log = state_dir / "out.log"
+    logical = [f"{i:02d}" + "y" * agent.FOLD_WIDTH for i in range(10)]
+    log.write_text("\n".join(logical) + "\n")
+    kept, offset = agent.tail_snapshot(log, 3)
+    assert offset == log.stat().st_size
+    expected = agent.tail_lines(log, 3)
+    assert len(expected) == 3
+    assert kept == ("\n".join(expected) + "\n").encode()
+    all_kept, all_offset = agent.tail_snapshot(log, 100)
+    assert all_offset == log.stat().st_size
+    assert all_kept == ("\n".join(agent.tail_lines(log, 0)) + "\n").encode()
+
+
+def test_tail_snapshot_trailing_newline_reflects_file(state_dir: Path) -> None:
+    """The snapshot keeps a trailing newline only when the log has one."""
+    log = state_dir / "out.log"
+    log.write_text("line1\nline2")
+    kept, offset = agent.tail_snapshot(log, 5)
+    assert kept == b"line1\nline2"
+    assert offset == log.stat().st_size
+    log.write_text("line1\nline2\n")
+    kept_newline, _offset = agent.tail_snapshot(log, 5)
+    assert kept_newline == b"line1\nline2\n"
+
+
+def test_tail_snapshot_race_appends_after_size_capture(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public snapshot excludes bytes appended after its size capture."""
+    log = state_dir / "out.log"
+    initial = b"first\nsecond\n"
+    log.write_text(initial.decode())
+    snapshot_from = cast(
+        "Callable[[BinaryIO, int, int], tuple[bytes, int]]",
+        agent.__dict__["_tail_snapshot_from"],
+    )
+
+    def wrapped(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, int]:
+        with log.open("ab") as writer:
+            writer.write(b"third\n")
+        return snapshot_from(fh, end, max_lines)
+
+    monkeypatch.setattr(agent, "_tail_snapshot_from", wrapped)
+    kept, offset = agent.tail_snapshot(log, 10)
+    assert offset == len(initial)
+    assert kept == initial
+    assert b"third" not in kept
+    assert log.read_bytes().endswith(b"third\n")
+
+
+def test_log_excerpt_status_tail_is_line_count_based(state_dir: Path) -> None:
+    """The status tail folds long lines and is limited only by line count."""
+    log = state_dir / "out.log"
+    logical = [f"{i:02d}" + "z" * agent.FOLD_WIDTH for i in range(60)]
+    log.write_text("\n".join(logical) + "\n")
+    excerpt = agent.log_excerpt(log, agent.STATUS_TAIL_LINES)
+    assert len(excerpt) == agent.STATUS_TAIL_LINES
+    assert excerpt == agent.tail_lines(log, agent.STATUS_TAIL_LINES)
+    assert excerpt[-1] == "zz"
+
+
+def test_cmd_log_lines_is_authoritative_with_long_lines(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--lines N returns exactly N folded display lines with no char cap."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    logical = [f"{i:02d}" + "x" * agent.FOLD_WIDTH for i in range(40)]
+    log_path.write_text("\n".join(logical) + "\n")
+    assert agent.main(["log", "aaaaaaaa", "--lines", "10"]) == agent.EXIT_OK
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 10
+    assert lines == agent.tail_lines(log_path, 10)
+    assert agent.main(["log", "aaaaaaaa", "--lines", "0"]) == agent.EXIT_OK
+    assert len(capsys.readouterr().out.splitlines()) == len(agent.tail_lines(log_path, 0))
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    assert len(capsys.readouterr().out.splitlines()) == agent.STATUS_TAIL_LINES
+
+
+def test_cmd_log_lines_100_is_authoritative_over_old_byte_cap(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--lines 100 returns 100 folded lines even when output exceeds a byte cap."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_text(("l" * 200 + "\n") * 100)
+    assert agent.main(["log", "aaaaaaaa", "--lines", "100"]) == agent.EXIT_OK
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 100
+    assert all(len(line) <= agent.FOLD_WIDTH for line in lines)
+    assert lines[-1] == "l" * 40
+
+
+def test_cmd_log_without_follow_returns_no_output(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log without --follow reports no output immediately."""
+    make_agent(state_dir, "aaaaaaaa", state_value="running")
+    assert agent.main(["log", "aaaaaaaa"]) == agent.EXIT_OK
+    assert "(no output yet)" in capsys.readouterr().err
+
+
+def test_cmd_log_follow_returns_promptly_for_terminal_without_output(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow stops waiting once the agent is terminal with no output."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    assert agent.main(["log", "aaaaaaaa", "--follow"]) == agent.EXIT_OK
+    assert "(no output yet)" in capsys.readouterr().err
+
+
+def test_cmd_log_follow_live_pid_waits_past_old_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow keeps waiting for a live recorded pid past the old 30s cutoff."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
+        log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+        counter = {"sleep": 0}
+        streamed: list[tuple[str, int]] = []
+        monkeypatch.setattr(
+            agent,
+            "stream_log_until_terminal",
+            lambda aid, follow_lines: streamed.append((aid, follow_lines)),
+        )
+
+        def fake_sleep(_seconds: float) -> None:
+            counter["sleep"] += 1
+            if counter["sleep"] == 5:
+                log_path.write_text("first output\n")
+
+        def fake_monotonic() -> float:
+            return 10_000.0 + 10.0 * counter["sleep"]
+
+        monkeypatch.setattr(time, "sleep", fake_sleep)
+        monkeypatch.setattr(time, "monotonic", fake_monotonic)
+        assert agent.main(["log", "aaaaaaaa", "--follow", "--lines", "3"]) == agent.EXIT_OK
+        assert counter["sleep"] == 5
+        assert streamed == [("aaaaaaaa", 3)]
+        assert "(no output yet)" not in capsys.readouterr().err
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_log_follow_live_runner_pre_pid_waits_past_old_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow keeps waiting for a live pre-pid runner past the old cutoff."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+        meta["state"] = "running"
+        meta["started_at"] = time.time()
+        meta["pid"] = None
+        meta["runner_pid"] = proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
+        agent.write_meta("aaaaaaaa", meta)
+        log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+        counter = {"sleep": 0}
+        streamed: list[tuple[str, int]] = []
+        monkeypatch.setattr(
+            agent,
+            "stream_log_until_terminal",
+            lambda aid, follow_lines: streamed.append((aid, follow_lines)),
+        )
+
+        def fake_sleep(_seconds: float) -> None:
+            counter["sleep"] += 1
+            if counter["sleep"] == 5:
+                log_path.write_text("first output\n")
+
+        def fake_monotonic() -> float:
+            return 10_000.0 + 10.0 * counter["sleep"]
+
+        monkeypatch.setattr(time, "sleep", fake_sleep)
+        monkeypatch.setattr(time, "monotonic", fake_monotonic)
+        assert agent.main(["log", "aaaaaaaa", "--follow", "--lines", "3"]) == agent.EXIT_OK
+        assert counter["sleep"] == 5
+        assert streamed == [("aaaaaaaa", 3)]
+        assert "(no output yet)" not in capsys.readouterr().err
+    finally:
+        kill_proc(proc)
+
+
+@pytest.mark.parametrize("state_value", ["idle", "succeeded", "failed", "stopped", "killed"])
+def test_cmd_log_follow_idle_or_terminal_returns_promptly(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state_value: str,
+) -> None:
+    """Log --follow returns promptly with no output for idle and terminal agents."""
+    make_agent(state_dir, "aaaaaaaa", state_value=state_value)
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda _seconds: pytest.fail("should not sleep for idle/terminal"),
+    )
+    assert agent.main(["log", "aaaaaaaa", "--follow"]) == agent.EXIT_OK
+    assert "(no output yet)" in capsys.readouterr().err
+
+
+def test_cmd_log_follow_stale_pid_returns_promptly(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow returns promptly when the recorded pid is provably dead."""
+    make_agent(
+        state_dir,
+        "aaaaaaaa",
+        state_value="running",
+        pid=2**30,
+        start_time=1,
+        finished_at=time.time(),
+    )
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda _seconds: pytest.fail("should not sleep for a stale pid"),
+    )
+    assert agent.main(["log", "aaaaaaaa", "--follow"]) == agent.EXIT_OK
+    assert "(no output yet)" in capsys.readouterr().err
+
+
+def test_cmd_log_follow_dead_runner_returns_promptly(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow returns promptly when the pre-pid runner is dead."""
+    make_agent(
+        state_dir,
+        "aaaaaaaa",
+        state_value="running",
+        pid=None,
+        started_at=time.time(),
+        runner_pid=2**30,
+        runner_start_time=1,
+    )
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda _seconds: pytest.fail("should not sleep for a dead runner"),
+    )
+    assert agent.main(["log", "aaaaaaaa", "--follow"]) == agent.EXIT_OK
+    assert "(no output yet)" in capsys.readouterr().err
+
+
+def test_cmd_log_follow_waits_for_first_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow waits for first output instead of returning after a short sleep."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
+        called: list[tuple[str, int]] = []
+        monkeypatch.setattr(
+            agent,
+            "stream_log_until_terminal",
+            lambda aid, follow_lines: called.append((aid, follow_lines)),
+        )
+        log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+
+        def write_log_after_delay() -> None:
+            time.sleep(0.6)
+            log_path.write_text("first output\n")
+
+        writer = threading.Thread(target=write_log_after_delay, daemon=True)
+        writer.start()
+        started = time.monotonic()
+        code = agent.main(["log", "aaaaaaaa", "--follow", "--lines", "3"])
+        elapsed = time.monotonic() - started
+        assert code == agent.EXIT_OK
+        assert called == [("aaaaaaaa", 3)]
+        assert "(no output yet)" not in capsys.readouterr().err
+        assert elapsed >= 0.5
+        writer.join(timeout=5)
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_log_follow_snapshots_folded_tail_then_stops(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow prints a folded snapshot and stops for a terminal agent."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.write_text("hello\n" + "x" * (agent.FOLD_WIDTH + 10) + "\n")
+    assert agent.main(["log", "aaaaaaaa", "--follow", "--lines", "5"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert "hello" in out
+    assert "x" * agent.FOLD_WIDTH in out
+    assert "x" * (agent.FOLD_WIDTH + 10) not in out
+
+
+def test_cmd_status_tail_shows_folded_long_lines(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Status tail folds long lines and is not truncated at a byte cap."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    logical = [f"{i:02d}" + "w" * agent.FOLD_WIDTH for i in range(40)]
+    log_path.write_text("\n".join(logical) + "\n")
+    assert agent.main(["status", "aaaaaaaa"]) == agent.EXIT_OK
+    out = capsys.readouterr().out
+    rows = [line for line in out.splitlines() if line.startswith("| ")]
+    assert len(rows) == agent.STATUS_TAIL_LINES
+    assert all(len(line) <= agent.FOLD_WIDTH + 6 for line in rows)
+
+
+def test_proc_cpu_seconds_reads_linux_process_data() -> None:
+    """proc_cpu_seconds reads total CPU time from Linux /proc data."""
+    cpu = agent.proc_cpu_seconds(os.getpid())
+    assert isinstance(cpu, float)
+    assert cpu >= 0.0
+    assert agent.proc_cpu_seconds(None) is None
+    assert agent.proc_cpu_seconds(2**30) is None
+
+
+def test_fmt_cpu_compacts() -> None:
+    """fmt_cpu renders compact CPU time strings."""
+    assert agent.fmt_cpu(None) == "-"
+    assert agent.fmt_cpu(0.0) == "0.0s"
+    assert agent.fmt_cpu(12.34) == "12.3s"
+    assert agent.fmt_cpu(61.0) == "1m1s"
+    assert agent.fmt_cpu(3600.0) == "1h0m"
+
+
+def test_cmd_status_reports_cpu_usage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Status reports total CPU time for a live agent process."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
+        assert agent.main(["status", "--id", "aaaaaaaa", "--json"]) == agent.EXIT_OK
+        data = json.loads(capsys.readouterr().out)
+        assert "cpu_seconds" in data
+        assert isinstance(data["cpu_seconds"], (int, float))
+        assert data["cpu_seconds"] >= 0
+        assert agent.main(["status", "--id", "aaaaaaaa"]) == agent.EXIT_OK
+        assert "cpu:" in capsys.readouterr().out
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_status_cpu_is_unknown_without_live_process(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Status reports no CPU time when no live process exists."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    assert agent.main(["status", "aaaaaaaa", "--json"]) == agent.EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    assert data["cpu_seconds"] is None
+    assert agent.main(["status", "aaaaaaaa"]) == agent.EXIT_OK
+    assert "cpu:        -" in capsys.readouterr().out
+
+
+def test_cmd_status_hides_cpu_for_reused_pid(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Status hides CPU time when a stored PID belongs to another process."""
+    make_agent(state_dir, "aaaaaaaa", state_value="running", pid=os.getpid())
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    cpu = agent.proc_cpu_seconds(os.getpid())
+    assert cpu is not None
+    assert cpu > 0
+    assert agent.is_alive(meta) is False
+    assert agent.main(["status", "aaaaaaaa", "--json"]) == agent.EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    assert data["cpu_seconds"] is None
+    assert agent.main(["status", "aaaaaaaa"]) == agent.EXIT_OK
+    assert "cpu:        -" in capsys.readouterr().out
 
 
 def test_cmd_new_creates_idle_agent_with_supplied_id(
