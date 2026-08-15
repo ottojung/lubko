@@ -50,13 +50,11 @@ lifecycle state. Claim and lease-recovery queries operate only on
 The v2 worker verifies more than the two-column invariant before starting. It
 also requires the type-aware `jobs_payload_type_shape` constraint and the chunk
 ownership/ordering indexes to be present, because immutable `output_chunk`
-publication is impossible without them. A table built from the pre-0002 v1
-baseline (which carries only a v1 status constraint and no chunk indexes) is
-refused at startup with a clear diagnostic pointing at the idempotent migration
-`migrations/0002_output_chunks.sql`. This keeps output publication from failing
-at runtime on a table that cannot represent immutable chunks, and it makes the
-safe upgrade order explicit: apply 0002 while the old v1 worker still runs,
-then start the v2 worker against the migrated schema.
+publication is impossible without them. Any table lacking this canonical
+protocol v2 shape is refused at startup with a clear diagnostic pointing at
+the idempotent baseline `migrations/0001_two_column_protocol.sql`. This keeps
+output publication from failing at runtime on a table that cannot represent
+immutable chunks.
 
 ## Physical schema
 
@@ -85,15 +83,17 @@ create index jobs_chunk_order_idx
 ## Worker role access (part of the binding)
 
 `lubko_worker` is the stable role the worker connects as (see the README
-database configuration) and must hold the table privileges it needs to claim,
-cancel, poll, publish output, and finalize jobs:
+database configuration) and must hold the privileges it needs to claim, cancel,
+poll, publish output (including inserting immutable `output_chunk` rows), and
+finalize jobs:
 
 ```sql
-grant select, update on table lubko.jobs to lubko_worker;
+grant usage on schema lubko to lubko_worker;
+grant select, insert, update on table lubko.jobs to lubko_worker;
 ```
 
-The baseline migration `migrations/0001_two_column_protocol.sql` applies this
-`GRANT` (guarded by `to_regrole` so a fresh environment without the role does
+The baseline migration `migrations/0001_two_column_protocol.sql` applies these
+`GRANT`s (guarded by `to_regrole` so a fresh environment without the role does
 not fail). `GRANT` is idempotent, so re-applying the baseline repairs the
 access contract.
 
@@ -407,13 +407,14 @@ never lets it steal a live job.
 
 ## Fresh-install schema
 
-A fresh installation applies the migrations in filename order:
-`migrations/0001_two_column_protocol.sql` (baseline, type-aware) followed by
-`migrations/0002_output_chunks.sql` (upgrade for older tables, idempotent).
-Both are idempotent and safe to apply more than once. There is no legacy
-schema, no staging table, and no rollback path: the two-column table is the
-only supported binding, and the worker refuses to start against any other
-shape. After the table exists, submit jobs in protocol v2 JSON form:
+A fresh (purged) database applies the single canonical baseline
+`migrations/0001_two_column_protocol.sql`, which creates the type-aware
+two-column `lubko.jobs` table, its indexes, the worker role grants, and the
+invariant comment. The baseline is idempotent and safe to apply more than
+once. There is no older schema, no staging table, and no rollback path: the
+two-column table is the only supported binding, and the worker refuses to
+start against any other shape. After the table exists, submit jobs in protocol
+v2 JSON form:
 
 ```sql
 insert into lubko.jobs (payload)

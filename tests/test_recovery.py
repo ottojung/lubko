@@ -100,7 +100,7 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
 
 
 def insert_running_without_lease(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a running job that predates the lease protocol.
+    """Insert a running job that carries no lease deadline.
 
     Args:
         conninfo: PostgreSQL connection string.
@@ -116,8 +116,8 @@ def insert_running_without_lease(conninfo: str, cwd: str, command: str) -> UUID:
         "request": {"cwd": cwd, "command": command},
         "state": {
             "status": "running",
-            "worker_id": "legacy-worker",
-            "worker_incarnation": "legacy-incarnation",
+            "worker_id": "stale-worker",
+            "worker_incarnation": "stale-incarnation",
             "started_at": "2026-01-01T00:00:00.000000Z",
         },
     })
@@ -236,7 +236,7 @@ def test_running_job_without_lease_is_left_for_manual_repair(
     db: str,
     tmp_path: Path,
 ) -> None:
-    """A pre-lease running job is never auto-recovered (no compatibility path)."""
+    """A running job without a lease is never auto-recovered."""
     job_id = insert_running_without_lease(db, str(tmp_path), "sleep 30")
 
     with psycopg.connect(db) as conn:

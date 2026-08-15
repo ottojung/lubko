@@ -27,7 +27,6 @@ LOGGER = logging.getLogger(__name__)
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
-UPGRADE_MIGRATION: Final = REPO_ROOT / "migrations" / "0002_output_chunks.sql"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -102,7 +101,7 @@ def pg_cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_pg.PgClust
 
 @pytest.fixture
 def jobs_db(pg_cluster: _pg.PgCluster) -> str:
-    """Apply both migrations on a fresh ``lubko.jobs`` table.
+    """Apply the canonical baseline on a fresh ``lubko.jobs`` table.
 
     Args:
         pg_cluster: The running PostgreSQL cluster.
@@ -114,5 +113,4 @@ def jobs_db(pg_cluster: _pg.PgCluster) -> str:
         conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
         conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
         conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
-        conn.execute(UPGRADE_MIGRATION.read_text(encoding="utf-8"))
     return pg_cluster.conninfo()

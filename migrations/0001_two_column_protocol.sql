@@ -1,4 +1,4 @@
--- Lubko transport queue baseline: the two-column protocol.
+-- Lubko transport queue baseline: the canonical protocol v2 two-column schema.
 --
 -- THE INVARIANT
 --
@@ -15,7 +15,8 @@
 -- Protocol v2 distinguishes command rows from immutable output_chunk rows.
 -- Constraints are type-aware: command rows must carry a request object and a
 -- lifecycle state.status, while output_chunk rows must carry thread ownership
--- and offset/value shape. Claim/recovery queries operate only on command rows.
+-- and offset/value shape. Claim/recovery queries operate only on command rows,
+-- and the worker verifies this output-chunk shape at startup.
 --
 -- This file is the complete current schema for a fresh installation. It is
 -- idempotent: every statement is safe to run more than once. The two-column
@@ -45,14 +46,17 @@ create table if not exists lubko.jobs (
 );
 
 -- Worker role access is part of the binding: lubko_worker is the stable role
--- the worker connects as (see README configuration), and it needs SELECT and
--- UPDATE on the transport table to claim, cancel, poll, and finalize jobs.
--- GRANT is idempotent, and it is guarded by to_regrole so a fresh environment
--- where the role is not yet provisioned does not fail.
+-- the worker connects as (see README configuration). Protocol v2 requires the
+-- worker to read and claim jobs (SELECT, UPDATE), to finalize and publish
+-- output (UPDATE), and to insert immutable output_chunk rows (INSERT). It also
+-- needs USAGE on the lubko schema to reach the table. GRANT is idempotent, and
+-- it is guarded by to_regrole so a fresh environment where the role is not yet
+-- provisioned does not fail.
 do $$
 begin
     if to_regrole('lubko_worker') is not null then
-        execute 'grant select, update on table lubko.jobs to lubko_worker';
+        execute 'grant usage on schema lubko to lubko_worker';
+        execute 'grant select, insert, update on table lubko.jobs to lubko_worker';
     end if;
 end
 $$;

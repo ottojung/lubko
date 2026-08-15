@@ -1406,16 +1406,15 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
 
 
 def verify_v2_schema(conn: JobsConnection) -> None:
-    """Assert that ``lubko.jobs`` carries the protocol v2 output-chunk shape.
+    """Assert that ``lubko.jobs`` carries the canonical protocol v2 shape.
 
     The two-column invariant alone does not make a table usable by a v2
     worker: immutable ``output_chunk`` publication requires the type-aware
     ``jobs_payload_type_shape`` check constraint and the chunk
-    ownership/ordering indexes, which ``migrations/0002_output_chunks.sql``
-    installs (and which the current ``0001_two_column_protocol.sql`` baseline
-    already declares). The worker refuses to start on a pre-0002 v1 schema so
-    output publication can never fail at runtime on a table that cannot
-    represent immutable chunks.
+    ownership/ordering indexes, which the single canonical baseline
+    ``migrations/0001_two_column_protocol.sql`` declares. The worker refuses to
+    start against any table lacking this shape so output publication can never
+    fail at runtime on a table that cannot represent immutable chunks.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -1449,9 +1448,10 @@ def verify_v2_schema(conn: JobsConnection) -> None:
         detail = ", ".join(missing)
         msg = (
             f"lubko.jobs lacks the protocol v2 output-chunk schema shape required "
-            f"for immutable output publication: missing {detail}. Apply the "
-            f"idempotent migration migrations/0002_output_chunks.sql before "
-            f"starting a v2 worker. {TWO_COLUMN_INVARIANT}"
+            f"for immutable output publication: missing {detail}. Re-apply the "
+            f"canonical, idempotent baseline migration "
+            f"migrations/0001_two_column_protocol.sql before starting a v2 "
+            f"worker. {TWO_COLUMN_INVARIANT}"
         )
         raise SchemaInvariantError(msg)
 

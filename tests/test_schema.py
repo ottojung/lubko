@@ -22,7 +22,6 @@ from lubko.worker import (
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR: Final = REPO_ROOT / "migrations"
 BASELINE_MIGRATION: Final = MIGRATIONS_DIR / "0001_two_column_protocol.sql"
-UPGRADE_MIGRATION: Final = MIGRATIONS_DIR / "0002_output_chunks.sql"
 PROTOCOL_INVARIANT_PHRASE: Final = "exactly two columns forever"
 TWO_COLUMN_COUNT: Final = 2
 TYPE_AWARE_CONSTRAINT: Final = "jobs_payload_type_shape"
@@ -257,15 +256,6 @@ def _read_baseline_migration() -> str:
     return BASELINE_MIGRATION.read_text(encoding="utf-8")
 
 
-def _read_upgrade_migration() -> str:
-    """Read the upgrade migration SQL text.
-
-    Returns:
-        The upgrade migration file contents.
-    """
-    return UPGRADE_MIGRATION.read_text(encoding="utf-8")
-
-
 def test_baseline_migration_creates_exactly_two_columns() -> None:
     """The baseline migration creates exactly id uuid plus payload text."""
     columns = _create_table_columns(_read_baseline_migration(), "lubko.jobs")
@@ -291,10 +281,15 @@ def test_baseline_migration_declares_payload_as_text_with_type_aware_checks() ->
 
 
 def test_baseline_migration_grants_worker_access() -> None:
-    """The baseline grants the worker role SELECT and UPDATE on lubko.jobs."""
+    """The baseline grants schema usage and SELECT/INSERT/UPDATE on lubko.jobs.
+
+    Protocol v2 requires the worker role to insert immutable output_chunk rows
+    in addition to reading and claiming jobs.
+    """
     sql = _read_baseline_migration()
 
-    assert "grant select, update on table lubko.jobs to lubko_worker" in sql
+    assert "grant usage on schema lubko to lubko_worker" in sql
+    assert "grant select, insert, update on table lubko.jobs to lubko_worker" in sql
     assert "to_regrole('lubko_worker')" in sql
 
 
@@ -319,36 +314,6 @@ def test_baseline_migration_creates_chunk_indexes() -> None:
     assert "((payload::jsonb)->>'type') = 'output_chunk'" in sql
 
 
-def test_upgrade_migration_removes_v1_status_constraint() -> None:
-    """The upgrade drops the v1 status constraint before adding the type-aware one."""
-    sql = _read_upgrade_migration()
-
-    assert "drop constraint if exists jobs_payload_has_status" in sql
-    assert "drop constraint if exists jobs_payload_type_shape" in sql
-    assert f"add constraint {TYPE_AWARE_CONSTRAINT}" in sql
-
-
-def test_upgrade_migration_is_type_aware() -> None:
-    """The upgrade constrains command rows and output_chunk rows by type."""
-    sql = _read_upgrade_migration()
-
-    assert "when (payload::jsonb)->>'type' = 'command' then" in sql
-    assert "when (payload::jsonb)->>'type' = 'output_chunk' then" in sql
-    assert "jsonb_typeof((payload::jsonb)->'value') = 'string'" in sql
-    assert "(((payload::jsonb)->>'thread') is not null)" in sql
-    assert "(((payload::jsonb)->>'stream') in ('stdout', 'stderr'))" in sql
-    assert "(((payload::jsonb)->>'sequence') ~ '^[0-9]+$')" in sql
-
-
-def test_upgrade_migration_adds_chunk_indexes() -> None:
-    """The upgrade creates the chunk ownership and ordering indexes."""
-    sql = _read_upgrade_migration()
-
-    assert "drop index if exists jobs_queue_idx" in sql
-    assert "create index if not exists jobs_chunk_owner_idx" in sql
-    assert "create index if not exists jobs_chunk_order_idx" in sql
-
-
 def test_baseline_migration_is_idempotent() -> None:
     """Every baseline statement is safe to apply more than once."""
     sql = _read_baseline_migration()
@@ -356,15 +321,6 @@ def test_baseline_migration_is_idempotent() -> None:
     assert "create table if not exists" in sql
     assert "create index if not exists" in sql
     assert "to_regrole('lubko_worker')" in sql
-
-
-def test_upgrade_migration_is_idempotent() -> None:
-    """Every upgrade statement is safe to apply more than once."""
-    sql = _read_upgrade_migration()
-
-    assert "drop constraint if exists" in sql
-    assert "create index if not exists" in sql
-    assert "drop index if exists jobs_queue_idx" in sql
 
 
 def test_baseline_migration_documents_the_invariant() -> None:
@@ -388,7 +344,8 @@ def test_worker_role_access_is_part_of_the_binding() -> None:
     protocol_doc = (REPO_ROOT / "docs" / "protocol.md").read_text(encoding="utf-8")
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "grant select, update on table lubko.jobs to lubko_worker" in protocol_doc
+    assert "grant usage on schema lubko to lubko_worker" in protocol_doc
+    assert "grant select, insert, update on table lubko.jobs to lubko_worker" in protocol_doc
     assert "lubko_worker" in readme
 
 
@@ -465,8 +422,8 @@ def test_verify_v2_schema_rejects_missing_chunk_indexes() -> None:
         verify_v2_schema(conn)
 
 
-def test_verify_v2_schema_rejects_old_v1_shape() -> None:
-    """The pre-0002 v1 schema is refused even though it has exactly two columns."""
+def test_verify_v2_schema_rejects_pre_canonical_shape() -> None:
+    """A two-column table lacking the v2 output-chunk shape is refused."""
     conn = as_v2_connection(
         _QueuedConnection([
             [("jobs_payload_has_status",), ("jobs_payload_is_json_object",)],
@@ -474,5 +431,5 @@ def test_verify_v2_schema_rejects_old_v1_shape() -> None:
         ])
     )
 
-    with pytest.raises(SchemaInvariantError, match=r"0002_output_chunks\.sql"):
+    with pytest.raises(SchemaInvariantError, match=r"0001_two_column_protocol\.sql"):
         verify_v2_schema(conn)

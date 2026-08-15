@@ -17,7 +17,7 @@ import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -47,11 +47,10 @@ CHUNK_MAX_BYTES: Final = 2000
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
-UPGRADE_MIGRATION: Final = REPO_ROOT / "migrations" / "0002_output_chunks.sql"
 
-#: The pre-0002 protocol v1 schema: two columns but no type-aware constraint
-#: and no output-chunk indexes, so a v2 worker must refuse to start on it.
-V1_SCHEMA_DDL: Final = """
+#: A two-column table without the canonical v2 output-chunk shape (no
+#: type-aware constraint, no chunk indexes): the startup guard must refuse it.
+PRE_CANONICAL_SCHEMA_DDL: Final = """
 create table lubko.jobs (
     id uuid primary key default gen_random_uuid(),
     payload text not null
@@ -292,14 +291,14 @@ def wait_until(predicate: object, timeout: float = 30.0) -> None:
     raise AssertionError(msg)
 
 
-def test_v2_worker_refuses_to_start_on_v1_schema(jobs_db: str, pg_cluster: _pg.PgCluster) -> None:
-    """A pre-0002 v1 table is refused even though it has exactly two columns."""
+def test_v2_worker_refuses_pre_canonical_shape(jobs_db: str, pg_cluster: _pg.PgCluster) -> None:
+    """A two-column table lacking the v2 output-chunk shape is refused."""
     with psycopg.connect(jobs_db) as conn:
         conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
-        conn.execute(V1_SCHEMA_DDL)
+        conn.execute(PRE_CANONICAL_SCHEMA_DDL)
     with psycopg.connect(jobs_db) as conn:
         verify_jobs_table_invariant(conn)
-        with pytest.raises(SchemaInvariantError, match=r"0002_output_chunks\.sql"):
+        with pytest.raises(SchemaInvariantError, match=r"0001_two_column_protocol\.sql"):
             verify_v2_schema(conn)
 
     with pytest.raises(SchemaInvariantError):
@@ -307,7 +306,7 @@ def test_v2_worker_refuses_to_start_on_v1_schema(jobs_db: str, pg_cluster: _pg.P
 
 
 def test_v2_worker_accepts_fresh_baseline_schema(jobs_db: str) -> None:
-    """A fresh install applying the current baseline alone is fully usable."""
+    """A fresh install applying the canonical baseline alone is fully usable."""
     with psycopg.connect(jobs_db) as conn:
         conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
         conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
@@ -330,38 +329,102 @@ def test_v2_worker_accepts_fresh_baseline_schema(jobs_db: str) -> None:
         assert CHUNK_ORDER_INDEX_NAME in indexes
 
 
-def test_v2_worker_accepts_migrated_schema(jobs_db: str) -> None:
-    """Applying 0001 then 0002 leaves the table fully usable by a v2 worker."""
+def _worker_conninfo(cluster: _pg.PgCluster) -> str:
+    """Return a connection string for the ``lubko_worker`` role.
+
+    Args:
+        cluster: The running cluster.
+
+    Returns:
+        A libpq connection string using trust authentication.
+    """
+    return f"host={cluster.socket_dir} port={cluster.port} dbname=postgres user=lubko_worker"
+
+
+RESET_WORKER_ROLE_SQL: Final = """
+do $$
+begin
+    if to_regrole('lubko_worker') is not null then
+        execute 'drop owned by lubko_worker';
+        execute 'drop role lubko_worker';
+    end if;
+end
+$$;
+"""
+
+
+def test_worker_role_can_operate_on_a_fresh_install(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A non-superuser ``lubko_worker`` role can run a full v2 worker.
+
+    On a purged database the canonical baseline grants the worker role schema
+    usage plus SELECT/INSERT/UPDATE on ``lubko.jobs``. This test provisions a
+    real non-superuser ``lubko_worker`` role, applies the baseline while it
+    exists, and proves the role can verify the schema, insert an immutable
+    ``output_chunk`` row, and run a full supervisor that publishes chunks
+    end to end.
+    """
     with psycopg.connect(jobs_db) as conn:
+        conn.execute(RESET_WORKER_ROLE_SQL)
+        conn.execute("CREATE ROLE lubko_worker LOGIN")
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+
+    # Direct privilege checks: schema verification reads catalogs, and the
+    # worker role can insert an immutable output_chunk row.
+    with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
         verify_jobs_table_invariant(conn)
         verify_v2_schema(conn)
-
-
-def test_v1_worker_remains_binary_compatible_with_migrated_schema(
-    jobs_db: str, tmp_path: Path
-) -> None:
-    """A v1 worker can still operate on the migrated schema.
-
-    Migration 0002 only relaxes/adds the type-aware constraint and chunk
-    indexes; every command row a v1 worker writes still satisfies the new
-    shape, so a rollback to the v1 binary remains safe.
-    """
-    command_payload = json.dumps({
-        "v": 2,
-        "type": "command",
-        "request": {"cwd": str(tmp_path), "command": "echo hi"},
-        "state": {"status": "running"},
-    })
-    with psycopg.connect(jobs_db) as conn:
+        chunk_payload = json.dumps({
+            "v": 2,
+            "type": "output_chunk",
+            "thread": str(uuid4()),
+            "stream": "stdout",
+            "sequence": 0,
+            "start": 0,
+            "end": 5,
+            "value": "hello",
+            "previous": None,
+        })
         conn.execute(
-            "INSERT INTO lubko.jobs (payload) VALUES (%s)",
-            (command_payload,),
+            "INSERT INTO lubko.jobs (id, payload) VALUES (%s, %s)",
+            (uuid4(), chunk_payload),
         )
         row = conn.execute(
-            "SELECT count(*)::int FROM lubko.jobs WHERE id = (SELECT id FROM lubko.jobs LIMIT 1)"
+            "SELECT count(*)::int FROM lubko.jobs WHERE (payload::jsonb)->>'type' = 'output_chunk'"
         ).fetchone()
     assert row is not None
     assert row[0] == 1
+
+    # End to end: run a supervisor connected AS lubko_worker on a command that
+    # produces enough output to create immutable chunks.
+    command = "i=0; while [ $i -lt 8000 ]; do echo line-$i; i=$((i+1)); done"
+    job_id = insert_job(jobs_db, str(tmp_path), command)
+    database = DatabaseConfig(
+        host=str(pg_cluster.socket_dir),
+        port=pg_cluster.port,
+        dbname="postgres",
+        user="lubko_worker",
+        password="",
+    )
+    with supervisor_running(supervisor_settings(), database, jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+        wait_until(lambda: _has_chunks(jobs_db, job_id))
+
+    assert not zombie_children()
+    assert read_status(jobs_db, job_id) == "succeeded"
+    with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
+        row = conn.execute(
+            "SELECT count(*)::int FROM lubko.jobs "
+            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
+            "AND (payload::jsonb)->>'thread' = %s",
+            (str(job_id),),
+        ).fetchone()
+    assert row is not None
+    assert row[0] > 0
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute(RESET_WORKER_ROLE_SQL)
 
 
 def test_background_process_group_is_reaped_after_terminal_status(
