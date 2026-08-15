@@ -1741,9 +1741,32 @@ def _tail_logical_lines(path: Path, count: int) -> list[str]:
     Returns:
         The trailing logical lines, newest last, without trailing newlines.
     """
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        return _tail_logical_lines_stream(fh, size, count)
+
+
+def _tail_logical_lines_stream(fh: BinaryIO, end: int, count: int) -> list[str]:
+    """Return the trailing ``count`` logical lines up to byte offset ``end``.
+
+    The tail is read only from the open stream's bytes in ``[0, end)``, so
+    the result stays consistent with the snapshot size that captured ``end``:
+    bytes appended to the file afterwards are excluded and remain for the
+    follow. Reads backward so huge logs are never loaded wholesale when only
+    a short tail is requested.
+
+    Args:
+        fh: Open binary stream positioned at ``end``.
+        end: Captured end byte offset of the file snapshot.
+        count: Number of trailing logical lines (``<= 0`` for the whole file).
+
+    Returns:
+        The trailing logical lines, newest last, without trailing newlines.
+    """
     if count <= 0:
-        with path.open("rb") as fh:
-            data = fh.read()
+        fh.seek(0)
+        data = fh.read(end)
         lines = data.decode("utf-8", errors="replace").split("\n")
         if lines and not lines[-1]:
             lines.pop()
@@ -1751,18 +1774,15 @@ def _tail_logical_lines(path: Path, count: int) -> list[str]:
     block = 64 * 1024
     trailing = b""
     preceded_by_newline = True
-    with path.open("rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        pos = size
-        while pos > 0 and trailing.count(b"\n") < count:
-            chunk = min(block, pos)
-            pos -= chunk
-            fh.seek(pos)
-            trailing = fh.read(chunk) + trailing
-        if pos > 0:
-            fh.seek(pos - 1)
-            preceded_by_newline = fh.read(1) == b"\n"
+    pos = end
+    while pos > 0 and trailing.count(b"\n") < count:
+        chunk = min(block, pos)
+        pos -= chunk
+        fh.seek(pos)
+        trailing = fh.read(chunk) + trailing
+    if pos > 0:
+        fh.seek(pos - 1)
+        preceded_by_newline = fh.read(1) == b"\n"
     lines = trailing.decode("utf-8", errors="replace").split("\n")
     if lines and not lines[-1]:
         lines.pop()
@@ -1791,7 +1811,39 @@ def _folded_tail(path: Path, lines: int, *, strip_ansi: bool = False) -> list[st
         The displayed lines, newest last.
     """
     try:
-        logical = _tail_logical_lines(path, lines)
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            return _folded_tail_stream(fh, size, lines, strip_ansi=strip_ansi)
+    except OSError:
+        return []
+
+
+def _folded_tail_stream(
+    fh: BinaryIO,
+    end: int,
+    lines: int,
+    *,
+    strip_ansi: bool = False,
+) -> list[str]:
+    """Return the newest ``lines`` folded display lines up to byte ``end``.
+
+    Logical lines are read only from the open stream's bytes in ``[0, end)``
+    and folded to ``FOLD_WIDTH`` characters, so the display never extends past
+    the snapshot size that captured ``end``: bytes appended afterwards stay
+    out of the snapshot and remain for the follow.
+
+    Args:
+        fh: Open binary stream positioned at ``end``.
+        end: Captured end byte offset of the file snapshot.
+        lines: Maximum displayed lines (``<= 0`` for every line).
+        strip_ansi: Strip ANSI escape sequences from each logical line.
+
+    Returns:
+        The displayed lines, newest last.
+    """
+    try:
+        logical = _tail_logical_lines_stream(fh, end, lines)
     except OSError:
         return []
     folded: list[str] = []
@@ -1818,34 +1870,57 @@ def tail_lines(path: Path, n: int) -> list[str]:
     return _folded_tail(path, n)
 
 
-def _file_ends_with_newline(path: Path) -> bool:
-    r"""Return whether a file's last byte is a newline.
+def _file_ends_with_newline_stream(fh: BinaryIO, end: int) -> bool:
+    r"""Return whether the byte just before ``end`` is a newline.
 
     Args:
-        path: File path.
+        fh: Open binary stream.
+        end: Captured end byte offset of the file snapshot.
 
     Returns:
-        ``True`` when the file is non-empty and ends with ``\n``.
+        ``True`` when ``end > 0`` and byte ``end - 1`` is ``\n``.
     """
-    try:
-        with path.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            if size == 0:
-                return False
-            fh.seek(size - 1)
-            return fh.read(1) == b"\n"
-    except OSError:
+    if end <= 0:
         return False
+    fh.seek(end - 1)
+    return fh.read(1) == b"\n"
+
+
+def _tail_snapshot_from(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, int]:
+    """Return (newest folded display bytes, byte offset) for the open snapshot.
+
+    The display and the continuation offset come from the single captured
+    ``end`` byte offset: the folded tail is read only up to ``end``, and
+    ``end`` is also the returned offset, so a later append is excluded from
+    the display and remains for the follow.
+
+    Args:
+        fh: Open binary stream positioned at ``end``.
+        end: Captured end byte offset of the file snapshot.
+        max_lines: Maximum displayed lines.
+
+    Returns:
+        A ``(bytes, offset)`` tuple.
+    """
+    display = _folded_tail_stream(fh, end, max_lines)
+    if not display:
+        return b"", end
+    text = "\n".join(display)
+    if _file_ends_with_newline_stream(fh, end):
+        text += "\n"
+    return text.encode("utf-8", errors="replace"), end
 
 
 def tail_snapshot(path: Path, max_lines: int = STATUS_TAIL_LINES) -> tuple[bytes, int]:
     """Return (newest folded display bytes, byte offset to continue following from).
 
     The bytes cover at most ``max_lines`` folded display lines; folding is
-    presentation only and never touches the durable log. The offset is the
-    current end of the raw log file, so following from it neither reprints the
-    shown output nor skips newly appended output.
+    presentation only and never touches the durable log. The displayed bytes
+    and the offset come from one consistent open-file snapshot: the file is
+    opened once, its EOF size is captured, and the tail is read only up to
+    that captured size. Bytes appended after the capture are excluded from
+    the snapshot and remain for the follow, so following resumes exactly
+    where the displayed output ends.
 
     Args:
         path: Log file path.
@@ -1855,16 +1930,13 @@ def tail_snapshot(path: Path, max_lines: int = STATUS_TAIL_LINES) -> tuple[bytes
         A ``(bytes, offset)`` tuple.
     """
     try:
-        size = path.stat().st_size
+        fh = path.open("rb")
     except OSError:
         return b"", 0
-    display = _folded_tail(path, max_lines)
-    if not display:
-        return b"", size
-    text = "\n".join(display)
-    if _file_ends_with_newline(path):
-        text += "\n"
-    return text.encode("utf-8", errors="replace"), size
+    with fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        return _tail_snapshot_from(fh, size, max_lines)
 
 
 def stream_log_until_terminal(aid: str, follow_lines: int = STATUS_TAIL_LINES) -> None:

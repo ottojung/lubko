@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Final
+from typing import BinaryIO, Final, cast
 
 import pytest
 
@@ -348,6 +348,32 @@ def test_tail_snapshot_trailing_newline_reflects_file(state_dir: Path) -> None:
     log.write_text("line1\nline2\n")
     kept_newline, _offset = agent.tail_snapshot(log, 5)
     assert kept_newline == b"line1\nline2\n"
+
+
+def test_tail_snapshot_race_appends_after_size_capture(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public snapshot excludes bytes appended after its size capture."""
+    log = state_dir / "out.log"
+    initial = b"first\nsecond\n"
+    log.write_text(initial.decode())
+    snapshot_from = cast(
+        "Callable[[BinaryIO, int, int], tuple[bytes, int]]",
+        agent.__dict__["_tail_snapshot_from"],
+    )
+
+    def wrapped(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, int]:
+        with log.open("ab") as writer:
+            writer.write(b"third\n")
+        return snapshot_from(fh, end, max_lines)
+
+    monkeypatch.setattr(agent, "_tail_snapshot_from", wrapped)
+    kept, offset = agent.tail_snapshot(log, 10)
+    assert offset == len(initial)
+    assert kept == initial
+    assert b"third" not in kept
+    assert log.read_bytes().endswith(b"third\n")
 
 
 def test_log_excerpt_status_tail_is_line_count_based(state_dir: Path) -> None:
