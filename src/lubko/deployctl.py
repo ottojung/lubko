@@ -31,6 +31,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
+from uuid import UUID
 
 import psycopg
 from psycopg.rows import tuple_row
@@ -58,6 +59,7 @@ from lubko.lifecycle import (
 )
 from lubko.state import rollback_state_path
 from lubko.toolchain import UvResolutionError, resolve_uv
+from lubko.worker import JOB_ID_ENV
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -83,6 +85,7 @@ COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}")
 HANDOFF_POLL_SECONDS: Final = 0.1
 HANDOFF_RESPONSE_MAX_BYTES: Final = 1048576
 HELPER_ERROR_MAX_CHARS: Final = 8000
+HANDOFF_DURABLE_WAIT_SECONDS: Final = 60.0
 
 GATED_SHIM_SOURCE: Final = """
 import os
@@ -493,43 +496,58 @@ def _candidate_response(state: RollbackState) -> dict[str, object]:
 
 
 def _current_queue_job_id() -> tuple[object | None, bool]:
-    """Find the currently running queue job by its live process group.
+    """Identify the current queue job from the exact injected root job UUID.
 
-    Historical PGID reuse cannot collide because only ``running`` rows are
-    considered, and a live process group can belong to at most one Lubko job.
+    The owning worker injects the exact root job UUID as ``LUBKO_JOB_ID`` into
+    every spawned command environment before the child execs, so queue
+    detection never depends on the timing of ``process_pgid`` persistence: the
+    command is a queue job if and only if that exact injected value is present.
+    The matching row is then validated as needed: a missing row is a deleted
+    job and a cancellation marker is reported, so a queue-invoked checkout can
+    never silently fall back to the manual destructive path.
 
     Returns:
         ``(job_id, cancelled)`` when invoked from a queue job, otherwise
         ``(None, False)``.
 
     Raises:
-        DeployCtlError: If more than one running row claims the current group.
+        DeployCtlError: If the injected job cannot be validated.
     """
+    job_text = os.environ.get(JOB_ID_ENV)
+    if job_text is None:
+        return None, False
+    try:
+        job_id = UUID(job_text)
+    except ValueError:
+        msg = f"malformed {JOB_ID_ENV} in the command environment"
+        raise DeployCtlError(msg) from None
     try:
         database = load_database_config()
-    except (OSError, ValueError):
-        return None, False
-    pgid = os.getpgrp()
+    except (OSError, ValueError) as exc:
+        msg = f"cannot validate the injected queue job: {exc}"
+        raise DeployCtlError(msg) from exc
     try:
         with psycopg.connect(database.conninfo(), row_factory=tuple_row) as conn:
             with conn.transaction(), conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT id, (payload::jsonb)->'state'->>'cancel_requested_at' "
-                    "FROM lubko.jobs "
-                    "WHERE (payload::jsonb)->'state'->>'status' = 'running' "
-                    "AND ((payload::jsonb)->'state'->>'process_pgid')::bigint = %s "
-                    "FOR UPDATE",
-                    (pgid,),
+                    "SELECT (payload::jsonb)->'state'->>'status', "
+                    "(payload::jsonb)->'state'->>'cancel_requested_at' "
+                    "FROM lubko.jobs WHERE id = %s",
+                    (job_id,),
                 )
-                rows = cursor.fetchall()
+                row = cursor.fetchone()
     except psycopg.Error as exc:
-        msg = f"could not identify the current queue job: {exc.__class__.__name__}"
+        msg = f"could not validate the injected queue job: {exc.__class__.__name__}"
         raise DeployCtlError(msg) from exc
-    if len(rows) > 1:
-        raise DeployCtlError("multiple running jobs claim the current process group")
-    if not rows:
-        return None, False
-    return rows[0][0], rows[0][1] is not None
+    if row is None:
+        raise DeployCtlError("the current queue job row does not exist")
+    status = str(row[0])
+    if status == "cancelled":
+        return job_id, True
+    if status != "running":
+        msg = f"the current queue job is {status} rather than running"
+        raise DeployCtlError(msg)
+    return job_id, row[1] is not None
 
 
 def _send_helper_response(writer: int, response: dict[str, object]) -> None:
@@ -1020,10 +1038,16 @@ def _helper_locked(options: Options, commit: str, job_id: object, writer: int) -
     """Run one lock-held queue handoff mission in the detached helper.
 
     The candidate or error response is delivered to the parent before any
-    destructive step. The parent exits zero so the owning worker finalizes the
-    checkout row; the helper then waits for that exact row to be durably
-    succeeded before stopping the previous worker. Any failure before durable
-    success aborts the mission with the previous worker left running.
+    destructive step. The parent exits zero only for a genuine candidate
+    response so the owning worker finalizes the checkout row as durably
+    ``succeeded``; a helper error or helper death makes it exit non-zero so the
+    row is durably ``failed``. The helper then waits for that exact row to be
+    durably succeeded before stopping the previous worker. The durable-success
+    wait deadline is computed only after preparation returns (it is not the
+    confirmation deadline captured during preparation), so a long validation
+    phase can never expire the handoff wait before it starts. Any failure
+    before durable success aborts the mission with the previous worker left
+    running.
 
     Args:
         options: Deployment options.
@@ -1032,9 +1056,10 @@ def _helper_locked(options: Options, commit: str, job_id: object, writer: int) -
         writer: Write end of the response pipe to the parent.
     """
     state, gated = _prepare_locked(options, commit)
+    durable_deadline = time.time() + HANDOFF_DURABLE_WAIT_SECONDS
     _send_helper_response(writer, _candidate_response(state))
     try:
-        _wait_for_durable_success(job_id, state.deadline)
+        _wait_for_durable_success(job_id, durable_deadline)
     except DeployCtlError:
         _abort_mission(gated, state)
         append_deploy_log("queue checkout aborted before the destructive handoff")
@@ -1395,6 +1420,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _request_type(request: dict[str, object]) -> str:
+    """Return the protocol request type, or an empty string.
+
+    Args:
+        request: Decoded request object.
+
+    Returns:
+        The ``type`` field when it is a string, otherwise ``""``.
+    """
+    value = request.get("type")
+    return value if isinstance(value, str) else ""
+
+
+def _checkout_failure_exit_code(request_type: str, response: dict[str, object]) -> int:
+    """Return the process exit code for one controller response.
+
+    A failed ``checkout`` must exit non-zero: the owning queue worker then
+    records the row as ``failed``, so a helper death or a reported error can
+    never leave a falsely-successful checkout row. Every other protocol
+    rejection keeps returning zero so its structured JSON error reaches the
+    orchestrator.
+
+    Args:
+        request_type: Protocol request type.
+        response: The emitted response object.
+
+    Returns:
+        ``EXIT_ERROR`` for a failed checkout, ``EXIT_OK`` otherwise.
+    """
+    if request_type == "checkout" and response.get("ok") is not True:
+        return EXIT_ERROR
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one stable-wrapper protocol request.
 
@@ -1402,11 +1461,14 @@ def main(argv: list[str] | None = None) -> int:
         argv: CLI arguments, or ``None`` for ``sys.argv``.
 
     Returns:
-        Process exit code. Protocol-level rejections still return zero so queue
-        jobs can deliver their structured JSON error to the orchestrator.
+        Process exit code. A failed ``checkout`` exits non-zero so the owning
+        queue job is durably recorded as ``failed``; other protocol rejections
+        still return zero so queue jobs can deliver their structured JSON error
+        to the orchestrator.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+    request_type = ""
     try:
         uv_path = resolve_uv(args.uv)
         options = Options(
@@ -1422,15 +1484,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         if options.confirm_window_seconds <= 0:
             raise DeployCtlError("confirmation window must be positive")
-        response = _dispatch(options, _parse_request(args.request))
+        request = _parse_request(args.request)
+        request_type = _request_type(request)
+        response = _dispatch(options, request)
     except (DeployCtlError, UvResolutionError) as exc:
-        _emit({"ok": False, "error": str(exc)})
-        return EXIT_OK
+        response = {"ok": False, "error": str(exc)}
+        _emit(response)
+        return _checkout_failure_exit_code(request_type, response)
     except OSError as exc:
-        _emit({"ok": False, "error": f"operating-system error: {exc}"})
+        response = {"ok": False, "error": f"operating-system error: {exc}"}
+        _emit(response)
         return EXIT_ERROR
     _emit(response)
-    return EXIT_OK
+    return _checkout_failure_exit_code(request_type, response)
 
 
 if __name__ == "__main__":

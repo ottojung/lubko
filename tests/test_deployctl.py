@@ -26,7 +26,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
-from lubko import cli, lifecycle
+from lubko import cli, lifecycle, worker
 from lubko import deployctl as dc
 from lubko.lifecycle import (
     SCHEMA_VERSION,
@@ -1512,6 +1512,217 @@ def test_wait_for_durable_success_rejects_deadline(
         dc._wait_for_durable_success(job_id, time.time() + 0.2)
 
 
+def test_queue_detection_treats_missing_injection_as_manual(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without an injected root job UUID the invocation is a manual checkout."""
+    monkeypatch.delenv(worker.JOB_ID_ENV, raising=False)
+    assert dc._current_queue_job_id() == (None, False)
+
+
+def test_queue_detection_uses_injected_job_id_without_process_pgid(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queue detection relies on the injected UUID, never on process_pgid timing.
+
+    The row is forced to carry a process group that can never match the current
+    process group (the BLOCKER Q8 race: ``_persist_process`` has not committed
+    yet), yet the exact injected root job UUID still selects the queue path.
+    """
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    job_id = insert_running_job(jobs_db, str(tmp_path), "echo hi")
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = jsonb_set("
+            "payload::jsonb, '{state,process_pgid}', to_jsonb(2147483647::int))::text\n"
+            "WHERE id = %s",
+            (job_id,),
+        )
+    monkeypatch.setenv(worker.JOB_ID_ENV, str(job_id))
+
+    assert dc._current_queue_job_id() == (job_id, False)
+
+
+def test_queue_detection_reports_cancellation_marker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation marker on the injected row is reported as cancelled."""
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    job_id = insert_running_job(jobs_db, str(tmp_path), "echo hi")
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = jsonb_set("
+            "payload::jsonb, '{state,cancel_requested_at}', "
+            "to_jsonb('2026-01-01T00:00:00.000000Z'::text))::text\n"
+            "WHERE id = %s",
+            (job_id,),
+        )
+    monkeypatch.setenv(worker.JOB_ID_ENV, str(job_id))
+
+    assert dc._current_queue_job_id() == (job_id, True)
+
+
+def test_queue_detection_rejects_deleted_injected_row(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted injected row fails closed instead of taking the manual path."""
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    job_id = insert_running_job(jobs_db, str(tmp_path), "echo hi")
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute("DELETE FROM lubko.jobs WHERE id = %s", (job_id,))
+    monkeypatch.setenv(worker.JOB_ID_ENV, str(job_id))
+
+    with pytest.raises(dc.DeployCtlError, match="does not exist"):
+        dc._current_queue_job_id()
+
+
+def _controller_main_args(request: str, repo: Path) -> list[str]:
+    """Build the argv for one in-process controller invocation.
+
+    Args:
+        request: JSON request object.
+        repo: Deployment checkout.
+
+    Returns:
+        The controller argv with a resolved ``uv`` executable.
+    """
+    uv = shutil.which("uv")
+    assert uv is not None
+    return [request, "--repo", str(repo), "--uv", uv]
+
+
+def test_queue_checkout_success_response_exits_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A genuine candidate response keeps the checkout job exit code at zero."""
+    expected = {"type": "checkout", "ok": True, "phase": "pending"}
+
+    def fake_helper(_options: dc.Options, _commit: str, _job_id: object, writer: int) -> None:
+        del _options, _commit, _job_id
+        os.write(writer, (json.dumps(expected, sort_keys=True) + "\n").encode())
+        os._exit(0)
+
+    monkeypatch.setattr(dc, "_current_queue_job_id", lambda: (uuid4(), False))
+    monkeypatch.setattr(dc, "_run_helper", fake_helper)
+    commit = "2" * 40
+    code = dc.main(
+        _controller_main_args(json.dumps({"type": "checkout", "commit": commit}), tmp_path / "repo")
+    )
+
+    assert code == dc.EXIT_OK
+
+
+def test_queue_checkout_error_response_exits_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reported helper error fails the checkout job rather than faking success."""
+    error = {"ok": False, "error": "candidate validation failed"}
+
+    def fake_helper(_options: dc.Options, _commit: str, _job_id: object, writer: int) -> None:
+        del _options, _commit, _job_id
+        os.write(writer, (json.dumps(error, sort_keys=True) + "\n").encode())
+        os._exit(0)
+
+    monkeypatch.setattr(dc, "_current_queue_job_id", lambda: (uuid4(), False))
+    monkeypatch.setattr(dc, "_run_helper", fake_helper)
+    commit = "2" * 40
+    code = dc.main(
+        _controller_main_args(json.dumps({"type": "checkout", "commit": commit}), tmp_path / "repo")
+    )
+
+    assert code == dc.EXIT_ERROR
+
+
+def test_queue_checkout_helper_death_exits_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A helper that dies silently fails the checkout job, never faking success."""
+    monkeypatch.setattr(dc, "_current_queue_job_id", lambda: (uuid4(), False))
+    monkeypatch.setattr(dc, "_run_helper", lambda *_args: os._exit(0))
+    commit = "2" * 40
+    code = dc.main(
+        _controller_main_args(json.dumps({"type": "checkout", "commit": commit}), tmp_path / "repo")
+    )
+
+    assert code == dc.EXIT_ERROR
+
+
+def test_confirm_rejection_keeps_zero_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A confirm rejection still returns zero so its structured error is delivered."""
+    monkeypatch.setattr(
+        dc, "_handle_confirm", lambda _options, _request: {"ok": False, "error": "no"}
+    )
+    code = dc.main(
+        _controller_main_args(json.dumps({"type": "confirm", "commit": "2" * 40}), tmp_path)
+    )
+    assert code == dc.EXIT_OK
+
+
+def test_helper_uses_fresh_durable_success_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable-success wait deadline is computed after preparation.
+
+    A preparation that outlived the original confirmation window must not
+    expire the handoff wait before it even starts (the review nonblocker).
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    stale = replace(
+        pending_state(repo=str(repo), old=first, new=second),
+        deadline=time.time() - 1000.0,
+    )
+    gated_proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(gated_proc)
+    gated = dc.GatedWorker(proc=gated_proc, gate_writer=-1, meta=stale.new_meta)
+    captured: dict[str, float] = {}
+    monkeypatch.setattr(dc, "_prepare_locked", lambda _options, _commit: (stale, gated))
+    monkeypatch.setattr(dc, "_send_helper_response", lambda _writer, _response: None)
+    monkeypatch.setattr(dc, "_complete_handoff", lambda _options, _state, _gated: stale)
+
+    def capture_deadline(_job_id: object, deadline: float) -> None:
+        captured["deadline"] = deadline
+
+    monkeypatch.setattr(dc, "_wait_for_durable_success", capture_deadline)
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        dc._helper_locked(make_options(repo), second, uuid4(), writer)
+    finally:
+        os.close(writer)
+        kill_proc(gated_proc)
+
+    assert captured["deadline"] != stale.deadline
+    assert captured["deadline"] > time.time()
+
+
 # ---------------------------------------------------------------------------
 # End-to-end process tests
 # ---------------------------------------------------------------------------
@@ -1549,18 +1760,27 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 60.0) -> None:
     raise AssertionError(msg)
 
 
-def make_fake_uv(tmp_path: Path, python: str, *, bad_candidate_commit: str | None = None) -> Path:
+def make_fake_uv(
+    tmp_path: Path,
+    python: str,
+    *,
+    bad_candidate_commit: str | None = None,
+    fail_validation: bool = False,
+) -> Path:
     """Write a stub ``uv`` that validates instantly and runs the real worker.
 
     Every ``uv``-based validation step exits zero, while ``uv run
     lubko-worker`` (used to spawn candidates and restored workers) executes the
     real worker from the current project. When ``bad_candidate_commit`` is
     given, the candidate commit fails to start so the handoff cannot complete.
+    When ``fail_validation`` is given, every validation step fails so a queue
+    checkout reports an error to its owner.
 
     Args:
         tmp_path: Temporary directory for the script.
         python: Python interpreter that runs the real worker.
         bad_candidate_commit: Exact commit whose worker must fail to start.
+        fail_validation: Whether the validation steps must fail.
 
     Returns:
         The fake ``uv`` executable path.
@@ -1575,7 +1795,11 @@ def make_fake_uv(tmp_path: Path, python: str, *, bad_candidate_commit: str | Non
             "        exit 7",
             "    fi",
         ])
-    lines.extend([f"    exec {python} -m lubko.worker", "fi", "exit 0"])
+    lines.extend([f"    exec {python} -m lubko.worker", "fi"])
+    if fail_validation:
+        lines.append("exit 9")
+    else:
+        lines.append("exit 0")
     script.write_text("\n".join(lines) + "\n", encoding="utf-8")
     script.chmod(0o755)
     return script
@@ -1596,17 +1820,22 @@ def worker_env_with(token: str) -> dict[str, str]:
     return env
 
 
-def spawn_maintained_worker(env: dict[str, str]) -> subprocess.Popen[bytes]:
+def spawn_maintained_worker(
+    env: dict[str, str],
+    argv: list[str] | None = None,
+) -> subprocess.Popen[bytes]:
     """Spawn a real maintained worker process registered with the guard.
 
     Args:
         env: Worker environment.
+        argv: Worker command, or the canonical ``lubko.worker`` invocation.
 
     Returns:
         The spawned worker process.
     """
+    command = argv or [sys.executable, "-m", "lubko.worker"]
     proc = subprocess.Popen(
-        [sys.executable, "-m", "lubko.worker"],
+        command,
         cwd=REPO_ROOT,
         env=env,
         stdin=subprocess.DEVNULL,
@@ -1617,6 +1846,29 @@ def spawn_maintained_worker(env: dict[str, str]) -> subprocess.Popen[bytes]:
     )
     guard.register(proc)
     return proc
+
+
+def worker_without_persist_command(tmp_path: Path) -> list[str]:
+    """Return the argv of a worker whose ``process_pgid`` is never persisted.
+
+    The worker runs through a wrapper that disables ``_persist_process``, so
+    every claimed job keeps no ``process_pgid`` in PostgreSQL: queue detection
+    can only work through the injected root job UUID, never the database.
+
+    Args:
+        tmp_path: Temporary directory for the wrapper script.
+
+    Returns:
+        The worker argv running through the no-persist wrapper.
+    """
+    wrapper = tmp_path / "worker_no_persist.py"
+    wrapper.write_text(
+        "from lubko import worker\n"
+        "worker._persist_process = lambda _conn, _job_id, _pid, _pgid: None\n"
+        "worker.main()\n",
+        encoding="utf-8",
+    )
+    return [sys.executable, str(wrapper)]
 
 
 def insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
@@ -1743,8 +1995,8 @@ def kill_recorded_workers() -> None:
     state = dc._read_state()
     if state is not None:
         recorded.append(state.new_meta)
-    for worker in recorded:
-        pgid = worker.pgid or worker.pid
+    for recorded_worker in recorded:
+        pgid = recorded_worker.pgid or recorded_worker.pid
         if pgid is None:
             continue
         if group_has_members(pgid):
@@ -1789,6 +2041,7 @@ def _prepare_e2e(
     pg_cluster: _pg.PgCluster,
     *,
     bad_candidate: bool = False,
+    worker_command: list[str] | None = None,
 ) -> tuple[Path, str, str, Path, subprocess.Popen[bytes], WorkerMeta, Path]:
     """Build the shared end-to-end deployment environment.
 
@@ -1797,6 +2050,7 @@ def _prepare_e2e(
         monkeypatch: Pytest monkeypatch fixture.
         pg_cluster: The running cluster.
         bad_candidate: Whether the candidate worker must fail to start.
+        worker_command: Worker argv, or the canonical ``lubko.worker``.
 
     Returns:
         The repo, commits, database config, old worker process, old worker
@@ -1810,7 +2064,7 @@ def _prepare_e2e(
     cli.build_cli_root(repo, second, "uv", 60.0)
     token = secrets.token_hex(16)
     env = worker_env_with(token)
-    old = spawn_maintained_worker(env)
+    old = spawn_maintained_worker(env, worker_command)
     old_meta = real_meta(old, repo, first, token)
     write_meta(old_meta)
     bad_commit = second if bad_candidate else None
@@ -2064,6 +2318,110 @@ def test_end_to_end_cancelled_checkout_leaves_previous_worker_running(
         assert meta.git_commit == first
         assert meta.pid == old_meta.pid
         assert not group_has_members(rolled.new_meta.pgid or rolled.new_meta.pid or 0)
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()
+
+
+def test_end_to_end_queue_checkout_withholds_process_pgid(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queue detection never depends on process_pgid persistence timing.
+
+    The owning worker disables ``_persist_process`` entirely, so no checkout
+    row ever carries a ``process_pgid``; the control job must still recognize
+    its own queue row through the exact injected ``LUBKO_JOB_ID`` (the BLOCKER
+    Q8 race). The row reaches durable ``succeeded`` with exit code zero before
+    the old worker dies and the replacement worker confirms both confirmation
+    jobs, exactly like the production queue handoff.
+    """
+    repo, second, old_meta, fake_uv = _prepare_e2e_parts(
+        _prepare_e2e(
+            tmp_path,
+            monkeypatch,
+            pg_cluster,
+            worker_command=worker_without_persist_command(tmp_path),
+        )
+    )
+    try:
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
+        )
+        _wait_for_checkout_success_and_old_death(jobs_db, checkout_id, old_meta)
+
+        checkout = read_job(jobs_db, checkout_id)
+        assert checkout["state"]["status"] == "succeeded"
+        assert "process_pgid" not in (checkout["state"] or {})
+        result = checkout["result"]
+        assert isinstance(result, dict)
+        assert result["exit_code"] == 0
+        response = json.loads(str(result["stdout"]))
+        assert response["ok"] is True
+        assert response["commit"] == second
+
+        wait_until(_live_handoff_done, timeout=30.0)
+        _run_confirmation_handshake(jobs_db, repo, fake_uv, second)
+
+        final_state = dc._read_state()
+        assert final_state is not None
+        assert final_state.status == dc.STATUS_CONFIRMED
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == second
+        assert cli.current_commit() == second
+        assert not group_has_members(old_meta.pgid or old_meta.pid or 0)
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()
+
+
+def test_end_to_end_queue_checkout_error_leaves_failed_row(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed queue checkout is durably failed, never falsely succeeded.
+
+    Candidate validation fails, so the handoff helper reports an error, the
+    controller parent exits non-zero, and the owning worker records the row as
+    ``failed``: a helper-death/error outcome can never leave a successful row.
+    The previous worker stays running and the previous checkout is restored.
+    """
+    repo, first, second, _conf, _old, old_meta, _uv = _prepare_e2e(
+        tmp_path, monkeypatch, pg_cluster
+    )
+    fake_uv = make_fake_uv(tmp_path, sys.executable, fail_validation=True)
+    try:
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
+        )
+        wait_until(
+            lambda: read_job(jobs_db, checkout_id)["state"]["status"] == "failed",
+            timeout=60.0,
+        )
+
+        checkout = read_job(jobs_db, checkout_id)
+        result = checkout["result"]
+        assert isinstance(result, dict)
+        assert result["exit_code"] != 0
+        response = json.loads(str(result["stdout"]))
+        assert response["ok"] is False
+        assert cli.git_commit(repo, 10.0) == first
+        assert worker_alive(old_meta)
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+        assert meta.pid == old_meta.pid
+        state = dc._read_state()
+        assert state is None or state.status in {dc.STATUS_CONFIRMED, dc.STATUS_ROLLED_BACK}
     finally:
         kill_recorded_workers()
         assert_no_lubko_leaks()
