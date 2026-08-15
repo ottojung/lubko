@@ -441,6 +441,147 @@ def test_cmd_log_follow_returns_promptly_for_terminal_without_output(
     assert "(no output yet)" in capsys.readouterr().err
 
 
+def test_cmd_log_follow_live_pid_waits_past_old_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow keeps waiting for a live recorded pid past the old 30s cutoff."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
+        log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+        counter = {"sleep": 0}
+        streamed: list[tuple[str, int]] = []
+        monkeypatch.setattr(
+            agent,
+            "stream_log_until_terminal",
+            lambda aid, follow_lines: streamed.append((aid, follow_lines)),
+        )
+
+        def fake_sleep(_seconds: float) -> None:
+            counter["sleep"] += 1
+            if counter["sleep"] == 5:
+                log_path.write_text("first output\n")
+
+        def fake_monotonic() -> float:
+            return 10_000.0 + 10.0 * counter["sleep"]
+
+        monkeypatch.setattr(time, "sleep", fake_sleep)
+        monkeypatch.setattr(time, "monotonic", fake_monotonic)
+        assert agent.main(["log", "aaaaaaaa", "--follow", "--lines", "3"]) == agent.EXIT_OK
+        assert counter["sleep"] == 5
+        assert streamed == [("aaaaaaaa", 3)]
+        assert "(no output yet)" not in capsys.readouterr().err
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_log_follow_live_runner_pre_pid_waits_past_old_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow keeps waiting for a live pre-pid runner past the old cutoff."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+        meta["state"] = "running"
+        meta["started_at"] = time.time()
+        meta["pid"] = None
+        meta["runner_pid"] = proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
+        agent.write_meta("aaaaaaaa", meta)
+        log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+        counter = {"sleep": 0}
+        streamed: list[tuple[str, int]] = []
+        monkeypatch.setattr(
+            agent,
+            "stream_log_until_terminal",
+            lambda aid, follow_lines: streamed.append((aid, follow_lines)),
+        )
+
+        def fake_sleep(_seconds: float) -> None:
+            counter["sleep"] += 1
+            if counter["sleep"] == 5:
+                log_path.write_text("first output\n")
+
+        def fake_monotonic() -> float:
+            return 10_000.0 + 10.0 * counter["sleep"]
+
+        monkeypatch.setattr(time, "sleep", fake_sleep)
+        monkeypatch.setattr(time, "monotonic", fake_monotonic)
+        assert agent.main(["log", "aaaaaaaa", "--follow", "--lines", "3"]) == agent.EXIT_OK
+        assert counter["sleep"] == 5
+        assert streamed == [("aaaaaaaa", 3)]
+        assert "(no output yet)" not in capsys.readouterr().err
+    finally:
+        kill_proc(proc)
+
+
+@pytest.mark.parametrize("state_value", ["idle", "succeeded", "failed", "stopped", "killed"])
+def test_cmd_log_follow_idle_or_terminal_returns_promptly(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    state_value: str,
+) -> None:
+    """Log --follow returns promptly with no output for idle and terminal agents."""
+    make_agent(state_dir, "aaaaaaaa", state_value=state_value)
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda _seconds: pytest.fail("should not sleep for idle/terminal"),
+    )
+    assert agent.main(["log", "aaaaaaaa", "--follow"]) == agent.EXIT_OK
+    assert "(no output yet)" in capsys.readouterr().err
+
+
+def test_cmd_log_follow_stale_pid_returns_promptly(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow returns promptly when the recorded pid is provably dead."""
+    make_agent(
+        state_dir,
+        "aaaaaaaa",
+        state_value="running",
+        pid=2**30,
+        start_time=1,
+        finished_at=time.time(),
+    )
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda _seconds: pytest.fail("should not sleep for a stale pid"),
+    )
+    assert agent.main(["log", "aaaaaaaa", "--follow"]) == agent.EXIT_OK
+    assert "(no output yet)" in capsys.readouterr().err
+
+
+def test_cmd_log_follow_dead_runner_returns_promptly(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Log --follow returns promptly when the pre-pid runner is dead."""
+    make_agent(
+        state_dir,
+        "aaaaaaaa",
+        state_value="running",
+        pid=None,
+        started_at=time.time(),
+        runner_pid=2**30,
+        runner_start_time=1,
+    )
+    monkeypatch.setattr(
+        time,
+        "sleep",
+        lambda _seconds: pytest.fail("should not sleep for a dead runner"),
+    )
+    assert agent.main(["log", "aaaaaaaa", "--follow"]) == agent.EXIT_OK
+    assert "(no output yet)" in capsys.readouterr().err
+
+
 def test_cmd_log_follow_waits_for_first_output(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

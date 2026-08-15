@@ -2128,30 +2128,56 @@ def cmd_log(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _wait_for_first_output(aid: str, log_path: Path, timeout: float = 30.0) -> bool:
-    """Wait for an agent's first log output or a terminal state.
+def _can_produce_output(aid: str) -> bool:
+    """Return whether the exact agent lifecycle can still write output.
+
+    The agent is genuinely capable of producing output only while its exact
+    recorded process is alive; in the brief running-before-pid window only the
+    exact recorded runner can still start an invocation. Anything else —
+    missing metadata, idle/terminal/unknown state, a recorded pid that is not
+    alive, or a runner that is gone — means no further output can arrive, so
+    waiting must stop promptly rather than poll forever.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` only while the exact recorded process (or, before the pid is
+        recorded, the exact runner) is alive and the state is ``running``.
+    """
+    meta = read_meta(aid)
+    if meta is None:
+        return False
+    if derive_state(meta) != "running":
+        return False
+    pid = meta.get("pid")
+    if pid:
+        return is_alive(meta)
+    return runner_alive(meta)
+
+
+def _wait_for_first_output(aid: str, log_path: Path) -> bool:
+    """Wait for an agent's first log output while its lifecycle can still produce it.
 
     An agent marked running may not have created its output log yet when
-    ``log --follow`` starts; a fixed short sleep would give up on it. This
-    polls until the log appears or the agent reaches a terminal (or unknown)
-    state, so following a live agent never returns prematurely.
+    ``log --follow`` starts. There is no wall-clock cutoff: this polls until
+    the log appears or the exact lifecycle proves it can no longer write
+    output, so following a live agent never returns prematurely and a dead or
+    idle one is never followed forever.
 
     Args:
         aid: Lubko agent ID.
         log_path: The agent's output log path.
-        timeout: Maximum seconds to wait.
 
     Returns:
-        ``True`` when the log exists or the agent is no longer running.
+        ``True`` when the log exists or the agent can no longer produce output.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         if log_path.is_file():
             return True
-        if _terminal_or_unknown(aid):
+        if not _can_produce_output(aid):
             return True
         time.sleep(0.2)
-    return False
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
