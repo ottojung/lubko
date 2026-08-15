@@ -71,6 +71,8 @@ Substantial queued work normally invokes **`lubko-agent`** rather than a long im
 - **Use as many agents as useful.** There is no general agent-count limit; the constraints are exclusive write trees/branches and clear, non-conflicting responsibilities.
 - **Isolate write-capable agents in separate trees/branches.** Never point two writers at the same working tree.
 - **Poll grouped.** When several root jobs are outstanding, poll all outstanding root UUIDs together in one bounded `where id in (...)` query, never one at a time.
+- **Never passively wait.** Outstanding work requires another bounded observation/polling step in the current turn; a single outstanding root job still needs polling, never a passive pause.
+- **Do not end early.** If the requested workflow is incomplete and nonterminal root jobs remain, another bounded observation step is required; stop early only for a genuine blocker surfaced explicitly.
 - **Push work branches early and keep them pushed; open draft PRs early** so the human owner can watch progress and correct course cheaply.
 - **Review independently.** Read the resulting diff and trace important execution paths yourself instead of relaying an agent's summary.
 - **Tests are evidence, not proof.** Green checks do not imply invariants were preserved.
@@ -97,7 +99,8 @@ ChatGPT is responsible for:
 8. using the preassigned Lubko agent ID for `prompt`/`status`/`log`;
 9. observing and steering that agent through `lubko-agent` commands;
 10. independently verifying important repository results where appropriate;
-11. iterating until the requested task is actually complete.
+11. iterating until the requested task is actually complete;
+12. never ending the turn while work remains outstanding: every unfinished future-dependent state must have an executable next observation step, and normal completion is illegal while the requested workflow is incomplete and root jobs are non-terminal.
 
 Keep the orchestrator role disciplined: decide *what* should happen, specify *constraints*, delegate the *how*, then verify the *result* independently. Do not ask the user to manually execute commands or inspect output when Lubko can perform them itself. Do not stop merely because a task requires several steps; use an agent when the work benefits from reasoning, continuity, iteration, or multiple commands.
 
@@ -265,6 +268,117 @@ Cancellation is only accepted while the job is `pending` or `running`; already t
 When a running job is cancelled, the worker uses the job's recorded `payload.state.process_pgid` and signals only that exact process group: `SIGTERM`, then `SIGKILL` after a bounded grace period while members remain. It never uses `pkill`, `killall`, or process-name matching, and it never signals a process group after the tracked process is known to be fully gone. Cancelling or failing one job never affects unrelated jobs.
 
 The worker-side helper `lubko.worker.request_cancel` implements this contract and returns the resulting status: `cancelled` (pending job cancelled immediately), `running` (marker set; the worker will terminate the process group), or an existing terminal status (job already finished, left unchanged). After cancelling, keep polling the job until it reaches a terminal state.
+
+---
+
+# Orchestrator liveness and completion invariants
+
+This section is the most important operational material in the manual. It exists because an orchestration run once *failed while the work was still progressing*: the orchestrator knew jobs were outstanding, decided to "wait," made no further tool call, and the turn silently ended in an intermediate state.
+
+## The orchestrator cannot passively wait
+
+There is **no background execution loop** that will wake the orchestrator later; an orchestration turn does not resume by itself.
+
+> **If work is still outstanding, "wait" must mean another bounded observation/polling step in the current turn.**
+
+Whenever the orchestrator is about to say or think "I'm waiting for X", it must identify the exact next tool call that will observe X. If there is no such call, the orchestration is about to lose liveness.
+
+## Maintain an explicit outstanding-root-job set
+
+Whenever a root Lubko job is submitted, record its returned UUID immediately. Maintain conceptually:
+
+```text
+outstanding = {JOB_A, JOB_B, ...}
+```
+
+Only remove a UUID after observing that **exact root row** in a terminal state. When several root jobs are outstanding, poll all outstanding UUIDs together in one bounded query ([Grouped polling of outstanding jobs](#grouped-polling-of-outstanding-jobs)), dropping terminal UUIDs from subsequent polls. The liveness rule also applies when exactly one job is outstanding: a single outstanding UUID still requires another observation step, never a passive pause.
+
+## Normal completion is illegal while outstanding work exists
+
+> **If the requested workflow is incomplete and the outstanding root-job set is non-empty, the orchestrator must not end the turn merely to "wait". It must continue with another bounded observation step.**
+
+```text
+if outstanding_root_jobs != ∅ and workflow incomplete:
+    the orchestration may not terminate normally
+```
+
+The only acceptable reasons to stop before completion are **genuine blockers** that prevent further progress, surfaced explicitly to the user — never a silent end in an intermediate state.
+
+## Convert waiting into an active observation loop
+
+The canonical loop is:
+
+```text
+submit work
+record root UUIDs
+
+while not DONE:
+    poll all outstanding root UUIDs together
+    consume terminal results
+    remove terminal UUIDs
+    add any newly submitted root UUIDs
+
+    if unfinished work is progressing:
+        continue polling/observing
+
+    if unfinished work appears stalled:
+        inspect the relevant managed-agent status/log or other bounded diagnostic
+        then continue the loop or identify a real blocker
+```
+
+There is no passive or background waiting state.
+
+- When work is **progressing** (a managed agent is reading files, running tests, converging), keep observing. Do not impose deadlines on thinking.
+- When work appears **stalled** (a loop on one failing action, no movement across polls), inspect the exact managed agent's `status` and a focused `log` tail, or the relevant root job's output, and diagnose before continuing. Do not replace polling with prose.
+- If inspection reveals a real blocker (a violated invariant, an impossible requirement, an environmental failure with no remedy), surface it to the user explicitly and stop only then.
+
+## Keep a root-job provenance ledger
+
+A historical job that *resembles* the current operation must never be retroactively adopted as evidence that the current operation happened. Track provenance mechanically, not conversationally. Maintain a small ledger with at least these columns:
+
+```text
+UUID | purpose | agent ID | submitted-at/step | expected operation | state
+```
+
+Rules:
+
+- only a UUID recorded for the current orchestration step can satisfy that step;
+- check timestamps and creation ordering when historical rows could be confused with newly submitted work;
+- do not infer "our job succeeded" from a matching-looking older command row;
+- distinguish root jobs from output-chunk rows (output chunks are immutable historical output owned by a root job via `payload.thread`);
+- distinguish Supabase root UUIDs from Lubko agent IDs (below).
+
+## Separate managed-agent state from transport-job state
+
+```text
+managed agent ID != Supabase root job UUID
+```
+
+A Lubko managed agent and the Supabase root jobs used to invoke it are **different state machines**, and one managed agent may be invoked by multiple root jobs over its lifetime. See [Agent IDs versus Supabase job UUIDs](#agent-ids-versus-supabase-job-uuids).
+
+Default behavior:
+
+- keep one **active attached prompt transport job per managed agent**;
+- before creating another prompt/steer transport job for an already-active agent, inspect the existing agent/job status and understand why another root job is needed;
+- use `--steer` only when there is a concrete reason to redirect an already-running invocation;
+- when overlapping control is intentional, track both root jobs explicitly rather than treating "the agent" as one job.
+
+## Define a completion predicate before complex workflows
+
+For multi-step work, decide up front what evidence constitutes completion. Intermediate success signals — an agent saying "done", a command exiting zero, one transitional state succeeding, one deployment phase succeeding, one reviewer reporting success — are evidence used by the workflow, not substitutes for its completion predicate.
+
+Use a generic form such as:
+
+```text
+DONE := requested final condition verified
+        AND no workflow-owned root jobs remain non-terminal
+```
+
+The completion predicate must include whatever independent verification the user's request requires (for example reading the diff, running the full validation, confirming an exact deployed commit).
+
+## Narration must correspond to an operation
+
+Narration such as "waiting for the worker transition" can sound like active orchestration even when nothing is scheduled. "I'll wait for this to finish", "waiting for the transition", or "I'll check again after the agent is done" are **not operations**. They are only valid when immediately followed by an actual polling or status call in the same turn. Whenever the orchestrator is about to say or think "I'm waiting for X", it must identify the exact next tool call that will observe X; if there is no such call, the orchestration is about to lose liveness.
 
 ---
 
@@ -1162,6 +1276,7 @@ Do not use broad process-killing shell commands when the agent-management interf
 
 Each of these has happened. Name the failure mode when you see it forming.
 
+- **Passive waiting** — deciding to "wait" for an outstanding job without scheduling another polling/status call, so the orchestration turn ends in an intermediate state. Avoid: apply the [liveness invariants](#orchestrator-liveness-and-completion-invariants); every unfinished future-dependent state needs an executable next observation step.
 - **Two write agents on a shared tree** — one agent's `git checkout`, `git reset --hard`, or broad edit destroyed another agent's in-flight work. Avoid: always give writers separate clones and branches; before launching any agent, know which trees are exclusively owned by whom.
 - **Rushing or stopping active agents** — agents stopped because they seemed slow had often been doing exactly the right reading, and repeatedly prompting a healthy agent pushed it toward premature completion. Avoid: inspect status and the log before touching an agent; distinguish progress from stuck; prefer a steering prompt with acceptance criteria; reserve stop/kill for abandoned work.
 - **Self-referential tests** — acceptance tests written from the implementation encoded its assumptions and passed while behavior violated the contract. Avoid: write tests from the contract, not the code.
@@ -1255,7 +1370,7 @@ Lubko represents stdout/stderr as bounded rolling live tails; older output is av
 
 Lubko exists to make ChatGPT an effective development orchestrator.
 
-Be proactive. Use Supabase as transport. Use `lubko-agent` as the preferred abstraction for substantial work. Generate agent IDs up front and keep them explicit. Inspect status and logs yourself. Let agents think — do not rush them. Steer agents with explicit follow-up prompts. Verify important results yourself. Use direct shell commands for small observations and deterministic checks. Use as many agents as useful, with exclusive write trees/branches and non-conflicting responsibilities. Poll all outstanding root jobs together in one bounded query. Reconcile branches deliberately on a fresh integration branch. Make code review a first-class step before merge. Treat PRs as the human-visible activity log, and open them early. Capture non-critical findings as issues; fix blockers before merge. Iterate until the task is actually complete.
+Be proactive. Use Supabase as transport. Use `lubko-agent` as the preferred abstraction for substantial work. Generate agent IDs up front and keep them explicit. Inspect status and logs yourself. Let agents think — do not rush them. Steer agents with explicit follow-up prompts. Verify important results yourself. Use direct shell commands for small observations and deterministic checks. Use as many agents as useful, with exclusive write trees/branches and non-conflicting responsibilities. Poll all outstanding root jobs together in one bounded query. Never end a turn while requested work is still outstanding; every unfinished future-dependent state needs an executable next observation step. Reconcile branches deliberately on a fresh integration branch. Make code review a first-class step before merge. Treat PRs as the human-visible activity log, and open them early. Capture non-critical findings as issues; fix blockers before merge. Iterate until the task is actually complete.
 
 Do not turn routine development operations back into instructions for the user when Lubko can perform them directly. The development container is intentionally disposable and highly permissive; the host server is protected by the Lubko isolation boundary. Within that boundary, make full use of managed agents and the development environment.
 
@@ -1271,6 +1386,8 @@ Do not turn routine development operations back into instructions for the user w
 | Course correction | a steering prompt with acceptance criteria | frequent steering |
 | Parallel work | separate clones/worktrees + branches + mandates; use as many agents as useful | two writers in one tree, or an arbitrary agent cap |
 | Several outstanding jobs | poll all outstanding root UUIDs together in one bounded query | polling parallel jobs one-by-one |
+| Work is still outstanding | make another bounded observation/polling step in the current turn | ending the turn to "wait" passively |
+| Stalled work | inspect the exact agent/job status and log, then continue or report a blocker | replacing polling with prose such as "waiting for it to finish" |
 | Acceptance | contract-based tests, independent agent | tests derived from the implementation |
 | Verification | read the diff, review invariants, full checks | trusting a report of green |
 | Code review | run a read-only review pass before merge; see `docs/skills/review.md` | merging unreviewed work |
