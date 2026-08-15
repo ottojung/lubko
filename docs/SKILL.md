@@ -1956,6 +1956,31 @@ Examples include:
 
 This means the database request itself failed.
 
+## Transient SQL/database errors
+
+PostgreSQL and Supabase operations can also fail for transient, infrastructure-level reasons that have nothing to do with Lubko's correctness or the worker's health—for example, momentary network interruptions, connection pool exhaustion, or a brief Supabase hiccup.
+
+**A single failed SQL command is not evidence that Lubko is broken, the worker is unavailable, or a deployment failed.**
+
+### Retry policy
+
+When an SQL read, write, or status check fails unexpectedly:
+
+1. **Retry the same operation a small, bounded number of times** (for example, up to three attempts) before drawing any conclusion about Lubko state.
+2. **Use short delays or exponential back-off between retries** (for example, 1 s, 2 s, 4 s) to allow transient conditions to clear.
+3. **Only diagnose Lubko/worker/deployment failure after repeated SQL failures**, or after independent evidence (such as a known deployment event or an unresponsive container) supports that conclusion.
+
+### Safety of retries
+
+Not all operations are equally safe to retry:
+
+- **Reads and status checks** (SELECT, polling for job status, reading agent state) are inherently idempotent and safe to retry without restriction.
+- **Writes and mutations** (INSERT, UPDATE) must be retried with care. Before retrying a write, verify that the intended state change was not already applied by the previous attempt. Use idempotency keys, conditional WHERE clauses, or state checks to avoid duplicating mutations.
+
+### Attribution rule
+
+SQL transport or database failure is evidence about *that SQL attempt*—not automatically evidence about Lubko itself. Do not blame Lubko for one transient SQL failure. Exhaust bounded retries and gather independent corroborating evidence before concluding that Lubko, the worker, or a deployment is faulty.
+
 ## Lubko shell-job failure
 
 The row was inserted successfully, the worker claimed it, and the queued shell command returned a non-zero exit code.
