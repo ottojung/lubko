@@ -87,7 +87,8 @@ def meta_for_process(aid: str, proc: subprocess.Popen[bytes], cwd: str) -> agent
     Returns:
         Running metadata for the process.
     """
-    meta = agent.base_meta(aid, cwd, "initial prompt", None, is_continue=False)
+    meta = agent.idle_meta(aid, cwd, None)
+    meta["state"] = "running"
     meta["pid"] = proc.pid
     meta["pgid"] = proc.pid
     deadline = time.monotonic() + 2.0
@@ -119,8 +120,9 @@ def make_agent(
     Returns:
         The persisted metadata.
     """
-    meta = agent.base_meta(aid, str(state_dir), "initial prompt", None, is_continue=False)
+    meta = agent.idle_meta(aid, str(state_dir), None)
     meta["state"] = state_value
+    meta["pending_prompt"] = "initial prompt"
     meta.update(overrides)
     agent.write_meta(aid, meta)
     return meta
@@ -177,7 +179,7 @@ def test_normalize_agent_id_rejects_malformed() -> None:
 
 def test_write_and_read_meta_roundtrip() -> None:
     """Metadata survives a write/read round trip."""
-    meta = agent.base_meta("abc12345", "/workspace", "hello", None, is_continue=False)
+    meta = agent.idle_meta("abc12345", "/workspace", None)
     agent.write_meta("abc12345", meta)
     assert agent.read_meta("abc12345") == meta
     assert agent.read_meta("missing") is None
@@ -209,6 +211,19 @@ def test_derive_state_returns_idle_for_never_prompted(state_dir: Path) -> None:
     meta = agent.idle_meta("abc12345", str(state_dir), None)
     agent.write_meta("abc12345", meta)
     assert agent.derive_state(agent.read_meta("abc12345")) == "idle"
+
+
+def test_idle_meta_is_the_single_current_schema() -> None:
+    """Fresh idle metadata uses the one current agent metadata version."""
+    meta = agent.idle_meta("abc12345", "/workspace", None)
+    assert meta["agent_version"] == agent.AGENT_META_VERSION
+    assert "initial_prompt" not in meta
+    assert "pending_prompt" not in meta
+
+
+def test_legacy_base_meta_machinery_is_removed() -> None:
+    """The obsolete base_meta builder no longer exists."""
+    assert not hasattr(agent, "base_meta")
 
 
 def test_derive_state_running_before_pid_recorded(state_dir: Path) -> None:
@@ -727,7 +742,7 @@ def test_runner_fails_without_continuation_session(
 def test_build_agent_command_honors_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """LUBKO_AGENT_CMD overrides the underlying agent command."""
     monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
-    meta = agent.base_meta("aaaaaaaa", "/workspace", "hi", None, is_continue=False)
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
     assert agent.build_agent_command(meta, "hi", is_continue=False) == [
         "/bin/sh",
         "-c",
@@ -740,7 +755,7 @@ def test_build_agent_command_override_used_for_continuation_without_session(
 ) -> None:
     """LUBKO_AGENT_CMD continuation needs no recorded native session."""
     monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
-    meta = agent.base_meta("aaaaaaaa", "/workspace", "hi", None, is_continue=True)
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
     meta["native_session_id"] = None
     cmd = agent.build_agent_command(meta, "hi", is_continue=True)
     assert cmd == ["/bin/sh", "-c", "opencode run --auto"]
@@ -758,10 +773,10 @@ def test_build_agent_command_creates_session_on_first_prompt() -> None:
 def test_exit_code_for_maps_states() -> None:
     """Exit codes follow the agent state."""
     assert agent.exit_code_for(None) == 1
-    succeeded = agent.base_meta("a", "/", "p", None, is_continue=False)
+    succeeded = agent.idle_meta("a", "/", None)
     succeeded["state"] = "succeeded"
     assert agent.exit_code_for(succeeded) == 0
-    failed = agent.base_meta("b", "/", "p", None, is_continue=False)
+    failed = agent.idle_meta("b", "/", None)
     failed["state"] = "failed"
     failed["exit_code"] = FAILURE_EXIT_CODE
     assert agent.exit_code_for(failed) == FAILURE_EXIT_CODE

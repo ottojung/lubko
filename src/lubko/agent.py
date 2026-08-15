@@ -72,6 +72,7 @@ STATUS_TAIL_LINES: Final = 50
 STATUS_TAIL_CHARS: Final = 2000
 DEFAULT_RETENTION_DAYS: Final = 14
 RUNNER_ARGV_LENGTH: Final = 3
+AGENT_META_VERSION: Final = 3
 
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
@@ -214,54 +215,6 @@ def update_meta(aid: str, fn: Callable[[Meta], None]) -> None:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def base_meta(aid: str, cwd: str, prompt: str, title: str | None, *, is_continue: bool) -> Meta:
-    """Build the initial metadata mapping for a new agent.
-
-    Args:
-        aid: New Lubko agent ID.
-        cwd: Working directory for the agent.
-        prompt: Initial instruction.
-        title: Optional display title.
-        is_continue: Whether this is a continuation invocation.
-
-    Returns:
-        The initial metadata mapping.
-    """
-    now = time.time()
-    meta: Meta = {
-        "id": aid,
-        "created_at": now,
-        "last_activity_at": now,
-        "state": "running",
-        "cwd": cwd,
-        "title": title or _first_line(prompt),
-        "model": os.environ.get("LUBKO_MODEL", DEFAULT_MODEL),
-        "variant": os.environ.get("LUBKO_VARIANT", DEFAULT_VARIANT),
-        "native_session_id": None,
-        "pid": None,
-        "pgid": None,
-        "start_time": None,
-        "runner_pid": None,
-        "runner_start_time": None,
-        "started_at": now,
-        "finished_at": None,
-        "exit_code": None,
-        "exit_signal": None,
-        "intent": None,
-        "stop_reason": None,
-        "active_runner": True,
-        "steer_queue": [],
-        "steer_seq": 0,
-        "prompt_count": 0,
-        "agent_version": 2,
-    }
-    if is_continue:
-        meta["pending_prompt"] = prompt
-    else:
-        meta["initial_prompt"] = prompt
-    return meta
-
-
 def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
     """Build the metadata mapping of a freshly created, never-prompted agent.
 
@@ -303,7 +256,7 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "steer_queue": [],
         "steer_seq": 0,
         "prompt_count": 0,
-        "agent_version": 3,
+        "agent_version": AGENT_META_VERSION,
     }
 
 
@@ -759,30 +712,25 @@ def runner(aid: str, mode: str) -> None:
 def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
     """Run invocations and queued steers until the queue drains.
 
+    Every invocation is sourced from ``pending_prompt``; the first one uses the
+    caller-supplied mode, later ones continue the exact native session.
+
     Args:
         ctx: Shared runner context.
         is_continue: Whether the first invocation continues an existing session.
     """
-    first = True
     while True:
         meta = read_meta(ctx.aid)
         if meta is None:
             return
-        if first:
-            # The first invocation always comes from pending_prompt; a freshly
-            # created agent carries no initial_prompt (``new`` never accepts a
-            # prompt). The initial_prompt fallback only supports legacy state.
-            prompt = meta.get("pending_prompt") or meta.get("initial_prompt")
-            first = False
-        else:
-            prompt = meta.get("pending_prompt")
-            is_continue = True
+        prompt = meta.get("pending_prompt")
         if not prompt:
             if _reclaim_prompt(ctx.aid):
                 continue
             return
         if _run_invocation(ctx, prompt, is_continue=is_continue) is None:
             return
+        is_continue = True
 
 
 def _reclaim_prompt(aid: str) -> bool:
