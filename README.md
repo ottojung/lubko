@@ -288,21 +288,28 @@ resolved executable is used to run validation (`uv sync`, `ruff`, `mypy`,
 `lubko-deploy deploy`:
 
 1. acquires an exclusive deployment lock so two deploys cannot race;
-2. validates the checkout by running `uv sync` followed by
+2. requires a clean checkout (`git status --porcelain` empty). The worker runs
+   from the checkout and the maintained CLIs are built from the committed
+   HEAD, so a dirty tree would make the worker execute working-tree code while
+   the CLIs come from HEAD; deployment is refused until the tree is clean;
+3. validates the checkout by running `uv sync` followed by
    `ruff format --check`, `ruff check`, `mypy`, and `pytest`. If any command
    fails, deployment is refused and the current worker is left untouched;
-3. reads the git commit of the checkout — it never pulls, resets, stashes, or
+4. reads the git commit of the checkout — it never pulls, resets, stashes, or
    otherwise mutates git state;
-4. starts the replacement worker detached from the invoking shell as its own
+5. prepares the maintained CLI environment for that exact commit, refusing the
+   deployment if it cannot be built so the global CLIs never go stale;
+6. starts the replacement worker detached from the invoking shell as its own
    session and process-group leader, appending its output to `worker.log`;
-5. verifies the replacement is alive with an exact identity match and can reach
+7. verifies the replacement is alive with an exact identity match and can reach
    PostgreSQL with a bounded timeout, rather than merely spawning it. On
    verification failure the replacement is stopped and the previous worker is
    left untouched;
-6. stops the previous maintained worker using its recorded PID/process-group/
+8. stops the previous maintained worker using its recorded PID/process-group/
    session identity: `SIGTERM`, then a bounded `SIGKILL` while members remain;
-7. atomically records the new worker's identity and the deployed commit, and
-   reports the deployed git commit.
+9. atomically records the new worker's identity and the deployed commit, then
+   activates the maintained CLI environment for that commit, and reports the
+   deployed git commit.
 
 `lubko-deploy stop` terminates the maintained worker with the same precise
 identity validation; it never signals a process that no longer matches the
@@ -373,18 +380,12 @@ reused.
 
 ## Installing the maintained commands
 
-The maintained entry points (`lubko-agent`, `lubko-worker`, `lubko-deploy`)
-are versioned in `pyproject.toml`. In a checkout they are available through the
-project virtualenv (`uv sync`); to make them available on PATH in every login
-and interactive shell without a hand-maintained copy, install them into the
-user bin directory with:
-
-```sh
-uv tool install --force --from /path/to/lubko lubko
-```
-
-This is wrapped by the maintained `lubko-install` command, which also verifies
-that every command resolves on PATH:
+The maintained entry points (`lubko-agent`, `lubko-worker`, `lubko-deploy`,
+`lubko-deploy-ctl`, `lubko-install`, `my-lubko-agent`) are versioned in
+`pyproject.toml`. In a checkout they are available through the project
+virtualenv (`uv sync`); to make them available on PATH in every login and
+interactive shell without a hand-maintained copy, install them into the user
+bin directory with the maintained installer:
 
 ```sh
 lubko-install --repo /path/to/lubko
@@ -392,9 +393,20 @@ lubko-install --repo /path/to/lubko --dry-run
 ```
 
 `lubko-install` targets `$XDG_BIN_HOME` or `~/.local/bin`, which is already
-prepended to PATH for login and interactive shells. Rebuilding or reinstalling
-the Lubko checkout recreates the commands reproducibly; no shell aliases or
-`~/.local/bin` copies need to be maintained by hand.
+prepended to PATH for login and interactive shells. Every maintained entry
+point becomes a small **stable launcher** script that resolves one `current`
+symlink under `$XDG_STATE_HOME/lubko/cli/` and executes the matching entry
+point from the immutable per-commit CLI environment (a `git archive` extraction
+of one exact commit plus its `uv sync` virtualenv). Deployments never rewrite
+the launchers; they only switch the `current` symlink, so the global CLIs stay
+coherent with the confirmed maintained worker commit.
+
+`lubko-deploy deploy` (including `--bootstrap`) builds the CLI environment and
+activates it as part of the deployment, and the supervised
+`lubko-deploy-ctl` protocol does the same for the confirmed candidate: a
+provisional candidate never moves the CLIs, and a rollback restores the prior
+confirmed CLI version by construction. See
+`docs/issue21-deploy-protocol.md`.
 
 The exact `uv` executable a successful install used is recorded, with a schema
 version, in `$XDG_STATE_HOME/lubko/toolchain.json` (default
@@ -406,3 +418,8 @@ path when `uv` is unavailable on PATH:
 ```sh
 lubko-install --repo /path/to/lubko --uv /absolute/path/to/uv
 ```
+
+Until a maintained CLI environment exists (a fresh system before the first
+`lubko-install` or deployment), invoke the commands through a checkout's own
+virtualenv, for example `uv run --project /path/to/lubko lubko-deploy
+deploy --bootstrap`.

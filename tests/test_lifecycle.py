@@ -16,7 +16,7 @@ from unittest import mock
 import psycopg
 import pytest
 
-from lubko import lifecycle, toolchain
+from lubko import cli, lifecycle, toolchain
 from lubko.config import DatabaseConfig
 from lubko.lifecycle import (
     EXIT_ERROR,
@@ -26,6 +26,7 @@ from lubko.lifecycle import (
     WorkerMeta,
 )
 from tests import _process_guard as guard
+from tests.test_cli import fake_uv_sync, make_repo
 
 MARKER: Final = "test-marker"
 STALE_MARKER: Final = "stale"
@@ -125,6 +126,19 @@ def kill_proc(proc: subprocess.Popen[bytes]) -> None:
     guard.unregister(proc)
 
 
+def _run_lifecycle_launcher(path: Path) -> str:
+    """Run a launcher script and return its trimmed stdout.
+
+    Args:
+        path: Launcher path.
+
+    Returns:
+        The launcher's standard output.
+    """
+    proc = subprocess.run([str(path)], capture_output=True, text=True, check=True)
+    return proc.stdout.strip()
+
+
 def kill_many(procs: list[subprocess.Popen[bytes]]) -> None:
     """Force-kill a list of controlled processes.
 
@@ -173,6 +187,7 @@ def make_options(repo: Path, *, bootstrap: bool) -> lifecycle.DeployOptions:
         lock_timeout_seconds=1.0,
         validation_timeout_seconds=5.0,
         git_timeout_seconds=5.0,
+        cli_timeout_seconds=5.0,
     )
 
 
@@ -209,6 +224,18 @@ def patch_deploy(
     monkeypatch.setattr(lifecycle, "run_validation", fake_validation)
     monkeypatch.setattr(lifecycle, "check_postgres", fake_postgres)
     monkeypatch.setattr(lifecycle, "git_commit", fake_commit)
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
+
+    def fake_cli_build(
+        _repo: Path,
+        commit: str,
+        _uv: str,
+        _timeout: float,
+    ) -> Path:
+        cli.cli_commit_dir(commit).mkdir(parents=True, exist_ok=True)
+        return cli.cli_commit_dir(commit)
+
+    monkeypatch.setattr(cli, "build_cli_root", fake_cli_build)
 
     spawned: list[subprocess.Popen[bytes]] = []
 
@@ -295,6 +322,7 @@ def make_deploy_args(tmp_path: Path, *, uv: str | None) -> argparse.Namespace:
         lock_timeout=1.0,
         validation_timeout=5.0,
         git_timeout=5.0,
+        cli_timeout=5.0,
     )
 
 
@@ -432,6 +460,8 @@ def test_deploy_validates_before_replacing(
         monkeypatch.setattr(lifecycle, "run_validation", recording_validation)
         monkeypatch.setattr(lifecycle, "check_postgres", lambda _timeout: True)
         monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: GIT_SHA)
+        monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
+        monkeypatch.setattr(cli, "build_cli_root", lambda *_args, **_kwargs: Path())
         original_spawn = lifecycle.spawn_worker
 
         def recording_spawn(
@@ -454,6 +484,130 @@ def test_deploy_validates_before_replacing(
         assert order == ["validation", "spawn"]
     finally:
         kill_proc(old)
+        kill_many(spawned)
+
+
+def test_deploy_refuses_dirty_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A dirty checkout is refused so the worker and CLIs run the same commit."""
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    (repo / "marker.txt").write_text("uncommitted change\n", encoding="utf-8")
+    real_require_clean = lifecycle.require_clean_checkout
+    spawned = patch_deploy(monkeypatch)
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", real_require_clean)
+    try:
+        code = lifecycle.deploy(make_options(repo, bootstrap=True))
+        assert code == EXIT_ERROR
+        assert not spawned
+        assert lifecycle.read_meta() is None
+        assert "dirty" in capsys.readouterr().err
+    finally:
+        kill_many(spawned)
+
+
+def test_bootstrap_deploy_activates_coherent_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bootstrap deploy leaves the maintained CLIs coherent with the worker."""
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(
+        lifecycle,
+        "run_validation",
+        lambda _repo, _uv, _timeout: ValidationReport(ok=True, detail=""),
+    )
+    monkeypatch.setattr(lifecycle, "check_postgres", lambda _timeout: True)
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
+    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: second)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    spawned: list[subprocess.Popen[bytes]] = []
+    original_spawn = lifecycle.spawn_worker
+
+    def tracking_spawn(
+        repo: Path,
+        uv_path: str,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> subprocess.Popen[bytes]:
+        proc = original_spawn(repo, uv_path, log_path, env)
+        guard.register(proc)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(lifecycle, "_worker_command", lambda _uv: [SLEEP_BIN, "300"])
+    monkeypatch.setattr(lifecycle, "spawn_worker", tracking_spawn)
+    try:
+        code = lifecycle.deploy(make_options(repo, bootstrap=True))
+        assert code == EXIT_OK
+        assert len(spawned) == 1
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.git_commit == second
+        assert cli.current_commit() == second
+        assert cli.cli_entry_executable(second, "lubko-deploy-ctl") is not None
+    finally:
+        kill_many(spawned)
+
+
+def test_deploy_activation_failure_preserves_coherent_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed CLI switch leaves the prior CLI usable and is not silent."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    bin_dir = tmp_path / "bin"
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.install_launchers(bin_dir)
+    cli.set_current(first)
+
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
+    monkeypatch.setattr(
+        lifecycle,
+        "run_validation",
+        lambda _repo, _uv, _timeout: ValidationReport(ok=True, detail=""),
+    )
+    monkeypatch.setattr(lifecycle, "check_postgres", lambda _timeout: True)
+    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: second)
+    spawned: list[subprocess.Popen[bytes]] = []
+    original_spawn = lifecycle.spawn_worker
+
+    def tracking_spawn(
+        repo: Path,
+        uv_path: str,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> subprocess.Popen[bytes]:
+        proc = original_spawn(repo, uv_path, log_path, env)
+        guard.register(proc)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(lifecycle, "_worker_command", lambda _uv: [SLEEP_BIN, "300"])
+    monkeypatch.setattr(lifecycle, "spawn_worker", tracking_spawn)
+
+    def broken_set_current(_commit: str) -> None:
+        msg = "switch boom"
+        raise cli.CliError(msg)
+
+    monkeypatch.setattr(cli, "set_current", broken_set_current)
+    try:
+        code = lifecycle.deploy(make_options(repo, bootstrap=True))
+        assert code == EXIT_ERROR
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.git_commit == second
+        assert cli.current_commit() == first
+        assert cli.cli_commit_dir(first).is_dir()
+        assert _run_lifecycle_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+        err = capsys.readouterr().err
+        assert "activation failed" in err
+        assert "previous CLI commit remains active" in err
+    finally:
         kill_many(spawned)
 
 

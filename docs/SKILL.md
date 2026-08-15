@@ -1466,20 +1466,27 @@ discovery.
 
 ### Keeping the maintained commands on PATH
 
-The maintained commands (`lubko-agent`, `lubko-worker`, `lubko-deploy`) are
-installed reproducibly into the user's bin directory
-(`$XDG_BIN_HOME` or `~/.local/bin`, which is already on PATH for login and
-interactive shells) by:
+The maintained commands (`lubko-agent`, `lubko-worker`, `lubko-deploy`,
+`lubko-deploy-ctl`, `lubko-install`, `my-lubko-agent`) are installed
+reproducibly into the user's bin directory (`$XDG_BIN_HOME` or `~/.local/bin`,
+which is already on PATH for login and interactive shells) by:
 
 ```sh
-lubko-install --repo /workspace/Lubko
+lubko-install --repo /workspace/.lubko-deployment
 ```
 
-`lubko-install` uses `uv tool install` against the checkout and then verifies
-that every maintained command resolves on PATH. Rebuilding or reinstalling the
-Lubko checkout recreates the commands without any hand-maintained copy.
-`my-lubko-agent` remains available as a transition alias for the same
-`lubko-agent` interface.
+`lubko-install` writes a small stable **launcher** for each maintained command
+and activates the per-commit CLI environment of the given checkout, so every
+global command resolves to exactly the maintained commit. The global commands
+never become stale after a version-changing deployment: `lubko-deploy deploy`
+and the supervised `lubko-deploy-ctl` protocol build and activate the CLI
+environment for the confirmed commit themselves, switching only an atomic
+`current` pointer and never rewriting the launchers. `lubko-deploy-ctl status`/`checkout` also reconcile a stale pointer
+idempotently on each invocation, so a process crash between durable
+confirmation and the pointer switch cannot leave a confirmed worker with stale
+CLIs past the next status/checkout (and never points the CLIs at a provisional
+candidate). `my-lubko-agent` remains available as a transition alias for the
+same `lubko-agent` interface.
 
 The exact `uv` executable a successful install used is recorded in
 `$XDG_STATE_HOME/lubko/toolchain.json`, so `lubko-deploy deploy` keeps working
@@ -1487,8 +1494,17 @@ even when `uv` is no longer on PATH. To reinstall when `uv` is off PATH, pass
 the known working path explicitly:
 
 ```sh
-lubko-install --repo /workspace/Lubko --uv /absolute/path/to/uv
+lubko-install --repo /workspace/.lubko-deployment --uv /absolute/path/to/uv
 ```
+
+Install from a *clean, exact-commit* deployment checkout (for example
+`/workspace/.lubko-deployment`), never from the dirty development checkout
+(`/workspace/Lubko`): deployments keep the CLIs coherent with the confirmed
+worker commit, and installing from a dirty dev checkout would re-point them at
+unconfirmed code. On a fresh system before the first maintained CLI
+environment exists, run the commands through a checkout's own virtualenv (for
+example `uv run --project /workspace/.lubko-deployment lubko-deploy
+deploy --bootstrap`).
 
 ## Verify a deployment with a real round trip
 

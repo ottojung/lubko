@@ -36,3 +36,15 @@ def rollback_state_path() -> Path:
         The rollback state file path.
     """
     return worker_state_dir() / "rollback.json"
+
+
+def cli_root_dir() -> Path:
+    """Return the stable directory holding per-commit CLI environments.
+
+    Each confirmed commit owns an immutable CLI environment under this root;
+    ``cli/current`` is a symlink selecting the active commit.
+
+    Returns:
+        The per-commit CLI root directory.
+    """
+    return state_root() / "cli"

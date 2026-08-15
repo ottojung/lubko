@@ -1,12 +1,29 @@
 """Tests for the Lubko command line tool installer."""
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from lubko import install, toolchain
+from lubko import cli, install, toolchain
+from tests.test_cli import fake_uv_sync, git, make_repo
 
-REQUIRED_ENTRY_POINTS: frozenset[str] = frozenset(install.ENTRY_POINTS)
+REQUIRED_ENTRY_POINTS: frozenset[str] = frozenset(cli.ENTRY_POINTS)
+
+
+def patch_path(monkeypatch: pytest.MonkeyPatch, *directories: Path | str) -> None:
+    """Prepend directories to PATH, preserving the rest of the environment.
+
+    ``git`` lives outside ``/usr/bin`` on this host, so replacing PATH would
+    break the installer's read-only git calls.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        directories: Directories to prepend to PATH.
+    """
+    prefixes = tuple(str(directory) for directory in directories)
+    monkeypatch.setenv("PATH", os.pathsep.join((*prefixes, os.environ.get("PATH", ""))))
 
 
 def write_uv_executable(directory: Path, *, name: str = "uv") -> str:
@@ -26,22 +43,32 @@ def write_uv_executable(directory: Path, *, name: str = "uv") -> str:
 
 
 def make_installed_bin(bin_dir: Path) -> None:
-    """Populate a bin directory with every maintained entry point.
+    """Populate a bin directory with every maintained launcher.
 
     Args:
         bin_dir: Directory to populate.
     """
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    for entry in install.ENTRY_POINTS:
-        script = bin_dir / entry
-        script.write_text("#!/bin/sh\n")
-        script.chmod(0o755)
+    cli.install_launchers(bin_dir)
 
 
 @pytest.fixture(autouse=True)
 def toolchain_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Isolate the toolchain state from the real user state."""
+    """Isolate the toolchain and CLI state from the real user state."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
+@pytest.fixture
+def repo_with_commit(tmp_path: Path) -> Path:
+    """Return a real Lubko-checkout-shaped git repository.
+
+    Returns:
+        The repository path.
+    """
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    (repo / "pyproject.toml").write_text('[project]\nname = "lubko"\n', encoding="utf-8")
+    git("add", "pyproject.toml", cwd=repo)
+    git("commit", "-q", "-m", "add pyproject", cwd=repo)
+    return repo
 
 
 def test_bin_home_uses_xdg_bin_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -63,7 +90,7 @@ def test_bin_home_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
-    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin")
+    patch_path(monkeypatch, bin_dir)
     assert install.bin_home_on_path()
     monkeypatch.setenv("PATH", "/usr/bin")
     assert not install.bin_home_on_path()
@@ -92,50 +119,80 @@ def test_main_rejects_non_repo(
 
 def test_main_dry_run_reports_installed(
     monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A dry run verifies the installation state without invoking uv."""
-    repo = Path(__file__).resolve().parents[1]
+    """A dry run verifies a coherent installation without invoking uv."""
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for entry in install.ENTRY_POINTS:
-        script = bin_dir / entry
-        script.write_text("#!/bin/sh\n")
-        script.chmod(0o755)
     monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
-    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin")
-    code = install.main(["--repo", str(repo), "--dry-run"])
+    patch_path(monkeypatch, bin_dir)
+    commit = cli.git_commit(repo_with_commit, 10.0)
+    assert commit is not None
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo_with_commit, commit, "uv", 60.0)
+    make_installed_bin(bin_dir)
+    cli.set_current(commit)
+    code = install.main(["--repo", str(repo_with_commit), "--dry-run"])
     assert code == install.EXIT_OK
     out = capsys.readouterr().out
     assert "Lubko tools installed and resolvable on PATH" in out
-    for entry in install.ENTRY_POINTS:
+    for entry in cli.ENTRY_POINTS:
         assert entry in out
+
+
+def test_main_installs_launchers_and_activates_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
+    tmp_path: Path,
+) -> None:
+    """A successful install installs launchers and activates the repo commit."""
+    bin_dir = tmp_path / "bin"
+    uv_dir = tmp_path / "uv-dir"
+    uv_dir.mkdir()
+    uv_path = write_uv_executable(uv_dir)
+    monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
+    patch_path(monkeypatch, uv_dir, bin_dir)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+
+    commit = cli.git_commit(repo_with_commit, 10.0)
+    assert commit is not None
+    code = install.main(["--repo", str(repo_with_commit)])
+    assert code == install.EXIT_OK
+    assert cli.current_commit() == commit
+    assert (bin_dir / "lubko-agent").is_file()
+    assert (bin_dir / "lubko-deploy-ctl").is_file()
+    assert (bin_dir / "lubko-install").is_file()
+    assert (bin_dir / "my-lubko-agent").is_file()
+    meta = toolchain.read_toolchain()
+    assert meta is not None
+    assert meta.uv_path == uv_path
 
 
 def test_main_persists_resolved_uv(
     monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
     tmp_path: Path,
 ) -> None:
     """A successful install records the exact resolved uv executable used."""
-    repo = Path(__file__).resolve().parents[1]
     bin_dir = tmp_path / "bin"
     make_installed_bin(bin_dir)
     uv_dir = tmp_path / "uv-dir"
     uv_dir.mkdir()
     uv_path = write_uv_executable(uv_dir)
     monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
-    monkeypatch.setenv("PATH", f"{uv_dir}:{bin_dir}:/usr/bin")
+    patch_path(monkeypatch, uv_dir, bin_dir)
 
     recorded: list[str] = []
 
-    def fake_tool_install(_repo: Path, uv_path_arg: str) -> int:
+    def recording_build(_repo: Path, commit: str, uv_path_arg: str, timeout: float) -> Path:
         recorded.append(uv_path_arg)
-        return 0
+        fake_uv_sync(uv_path_arg, cli.cli_commit_dir(commit), timeout)
+        return cli.cli_commit_dir(commit)
 
-    monkeypatch.setattr(install, "tool_install", fake_tool_install)
+    monkeypatch.setattr(cli, "build_cli_root", recording_build)
 
-    code = install.main(["--repo", str(repo)])
+    code = install.main(["--repo", str(repo_with_commit)])
     assert code == install.EXIT_OK
     assert recorded == [uv_path]
     meta = toolchain.read_toolchain()
@@ -145,21 +202,25 @@ def test_main_persists_resolved_uv(
 
 def test_main_persists_exact_resolved_explicit_uv(
     monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
     tmp_path: Path,
 ) -> None:
     """A bare --uv name is persisted as its resolved absolute path."""
-    repo = Path(__file__).resolve().parents[1]
     bin_dir = tmp_path / "bin"
     make_installed_bin(bin_dir)
     uv_dir = tmp_path / "uv-dir"
     uv_dir.mkdir()
     uv_path = write_uv_executable(uv_dir)
     monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
-    monkeypatch.setenv("PATH", f"{uv_dir}:{bin_dir}:/usr/bin")
+    patch_path(monkeypatch, uv_dir, bin_dir)
 
-    monkeypatch.setattr(install, "tool_install", lambda _repo, _uv: 0)
+    def recording_build(_repo: Path, commit: str, uv_path_arg: str, timeout: float) -> Path:
+        fake_uv_sync(uv_path_arg, cli.cli_commit_dir(commit), timeout)
+        return cli.cli_commit_dir(commit)
 
-    code = install.main(["--repo", str(repo), "--uv", "uv"])
+    monkeypatch.setattr(cli, "build_cli_root", recording_build)
+
+    code = install.main(["--repo", str(repo_with_commit), "--uv", "uv"])
     assert code == install.EXIT_OK
     meta = toolchain.read_toolchain()
     assert meta is not None
@@ -168,38 +229,42 @@ def test_main_persists_exact_resolved_explicit_uv(
 
 def test_main_does_not_persist_on_failed_install(
     monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
     tmp_path: Path,
 ) -> None:
-    """A failed uv tool install leaves the toolchain state untouched."""
-    repo = Path(__file__).resolve().parents[1]
+    """A failed CLI environment build leaves the toolchain state untouched."""
     bin_dir = tmp_path / "bin"
     make_installed_bin(bin_dir)
     uv_dir = tmp_path / "uv-dir"
     uv_dir.mkdir()
     write_uv_executable(uv_dir)
     monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
-    monkeypatch.setenv("PATH", f"{uv_dir}:{bin_dir}:/usr/bin")
+    patch_path(monkeypatch, uv_dir, bin_dir)
 
-    monkeypatch.setattr(install, "tool_install", lambda _repo, _uv: 3)
+    def broken_build(_repo: Path, _commit: str, _uv_path_arg: str, _timeout: float) -> Path:
+        msg = "build boom"
+        raise cli.CliError(msg)
 
-    code = install.main(["--repo", str(repo)])
+    monkeypatch.setattr(cli, "build_cli_root", broken_build)
+
+    code = install.main(["--repo", str(repo_with_commit)])
     assert code == install.EXIT_ERROR
     assert toolchain.read_toolchain() is None
 
 
 def test_main_fails_when_uv_unresolvable(
     monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Without uv on PATH or a recorded toolchain, the installer fails clearly."""
-    repo = Path(__file__).resolve().parents[1]
     bin_dir = tmp_path / "bin"
     make_installed_bin(bin_dir)
     monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
     monkeypatch.setenv("PATH", "/nonexistent")
 
-    code = install.main(["--repo", str(repo)])
+    code = install.main(["--repo", str(repo_with_commit)])
     assert code == install.EXIT_ERROR
     assert "uv" in capsys.readouterr().err
     assert toolchain.read_toolchain() is None
@@ -207,19 +272,60 @@ def test_main_fails_when_uv_unresolvable(
 
 def test_main_fails_on_broken_explicit_uv(
     monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A broken explicit --uv is refused even when uv is on PATH."""
-    repo = Path(__file__).resolve().parents[1]
     bin_dir = tmp_path / "bin"
     make_installed_bin(bin_dir)
     uv_dir = tmp_path / "uv-dir"
     uv_dir.mkdir()
     write_uv_executable(uv_dir)
     monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
-    monkeypatch.setenv("PATH", f"{uv_dir}:{bin_dir}:/usr/bin")
+    patch_path(monkeypatch, uv_dir, bin_dir)
 
-    code = install.main(["--repo", str(repo), "--uv", str(tmp_path / "missing-uv")])
+    code = install.main(["--repo", str(repo_with_commit), "--uv", str(tmp_path / "missing-uv")])
     assert code == install.EXIT_ERROR
     assert "explicit uv executable" in capsys.readouterr().err
+
+
+def test_main_activation_failure_preserves_prior_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    repo_with_commit: Path,
+    tmp_path: Path,
+) -> None:
+    """A failed CLI switch keeps the previous environment intact and usable."""
+    old_commit = cli.git_commit(repo_with_commit, 10.0)
+    assert old_commit is not None
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    bin_dir = tmp_path / "bin"
+    cli.build_cli_root(repo_with_commit, old_commit, "uv", 60.0)
+    cli.install_launchers(bin_dir)
+    cli.set_current(old_commit)
+
+    uv_dir = tmp_path / "uv-dir"
+    uv_dir.mkdir()
+    write_uv_executable(uv_dir)
+    monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
+    patch_path(monkeypatch, uv_dir, bin_dir)
+
+    def broken_set_current(_commit: str) -> None:
+        msg = "switch boom"
+        raise cli.CliError(msg)
+
+    monkeypatch.setattr(cli, "set_current", broken_set_current)
+
+    code = install.main(["--repo", str(repo_with_commit)])
+    assert code == install.EXIT_ERROR
+    assert cli.current_commit() == old_commit
+    assert cli.cli_commit_dir(old_commit).is_dir()
+    assert toolchain.read_toolchain() is None
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-agent")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == f"lubko-agent@{old_commit}"
