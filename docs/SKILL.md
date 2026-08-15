@@ -1040,7 +1040,7 @@ Give each write agent an exclusive working tree. For independent parallel work u
 
 ## Start from a known base commit
 
-Cut every branch from a known, clean, tested base commit SHA, and record the base in the agent prompt and in your own state. When branches were cut from a drifted tree, cherry-picks double-applied or lost changes.
+Follow [Clean working trees and known base commits](#clean-working-trees-and-known-base-commits): cut every branch from a known, clean, tested base commit SHA, and record that base in the agent prompt and in your own state.
 
 ## Commit incrementally
 
@@ -1064,7 +1064,7 @@ Do not fold acceptance tests and documentation into the implementation branch by
 
 ## Reconcile into an integration branch
 
-When several branches contribute to one change, reconcile them deliberately on a dedicated integration branch: apply the trusted components one at a time, run the full checks after each step, and only then propose the integrated result for merge — via a PR, never as a direct push to the default branch.
+Follow the [Reconciliation and integration branches](#reconciliation-and-integration-branches) procedure when several branches contribute to one change. The Git-specific part: propose the integrated result for merge **via a PR, never as a direct push to the default branch**.
 
 ## Cherry-pick vs merge vs rebase
 
@@ -1078,7 +1078,7 @@ Respond to review comments by pushing new commits to the same PR branch, not by 
 
 ## Resolve conflicts semantically
 
-Resolve merge conflicts by reading both sides and deciding what the merged result *should* be — never with a blind `git checkout --ours`/`--theirs` or a forced overwrite. After resolving, rerun the full checks on the merged state.
+Resolve conflicts according to the canonical rule in [Reconciliation and integration branches](#reconciliation-and-integration-branches). After resolving, rerun the full checks on the merged state.
 
 ## Review before merge
 
