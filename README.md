@@ -374,11 +374,12 @@ implementation details. `my-lubko-agent` is kept as a transition alias for the
 same interface.
 
 `log` normalizes what it presents: ANSI CSI/SGR color and control escape
-sequences are stripped before display, in both the non-follow tail and the
-`--follow` stream, so output consumed non-interactively through Lubko/Supabase
-is clean and parseable. The durable `output.log` is never rewritten and always
-retains the raw underlying output for debugging; the normalized view and the
-raw log are therefore clearly separated.
+sequences (including OSC sequences such as hyperlinks) are stripped before
+display, in both the non-follow tail and the `--follow` stream, so output
+consumed non-interactively through Lubko/Supabase is clean and parseable. The
+durable `output.log` is never rewritten and always retains the raw underlying
+output for debugging; the normalized view and the raw log are therefore
+clearly separated.
 
 Per-agent state lives under `$XDG_STATE_HOME/lubko/agents/<id>/` (default
 `~/.local/state/lubko/agents/<id>/`) with `meta.json`, `output.log`, and a

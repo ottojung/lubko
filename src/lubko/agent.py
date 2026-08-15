@@ -75,8 +75,11 @@ DEFAULT_RETENTION_DAYS: Final = 14
 RUNNER_ARGV_LENGTH: Final = 3
 AGENT_META_VERSION: Final = 3
 
-_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-_CSI_PREFIX_RE = re.compile(r"\x1b(?:\[[0-9;?]*[ -/]*)?\Z")
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9:;<=>?]*[ -/]*[@-~]")
+_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b\n]*(?:\x07|\x1b\\)")
+_ANSI_RE = re.compile(_ANSI_CSI_RE.pattern + "|" + _ANSI_OSC_RE.pattern)
+_ANSI_CSI_PREFIX_RE = re.compile(r"\x1b(?:\[[0-9:;<=>?]*[ -/]*)?\Z")
+_ANSI_OSC_PREFIX_RE = re.compile(r"\x1b\][^\x07\x1b\n]*(?:\x1b)?\Z")
 
 
 # ---------------------------------------------------------------------------
@@ -1851,10 +1854,35 @@ def _folded_tail_stream(
         return []
     folded: list[str] = []
     for logical_line in logical:
-        folded.extend(fold_line(_ANSI_CSI_RE.sub("", logical_line) if strip_ansi else logical_line))
+        folded.extend(fold_line(_ANSI_RE.sub("", logical_line) if strip_ansi else logical_line))
     if lines > 0 and len(folded) > lines:
         folded = folded[-lines:]
     return folded
+
+
+def _drop_dangling_fragment(lines: list[str]) -> list[str]:
+    r"""Remove a trailing incomplete escape fragment from the last display line.
+
+    A log may end in the middle of an ANSI CSI/OSC sequence (for example
+    ``\x1b[3``). Such a fragment is not ordinary text and is never shown;
+    when it is the only content of the final line that line is dropped too.
+
+    Args:
+        lines: Display lines to normalize.
+
+    Returns:
+        The display lines without any trailing dangling fragment.
+    """
+    if not lines:
+        return lines
+    stripped, pending = _strip_ansi_keep_tail(lines[-1])
+    if not pending:
+        return lines
+    if stripped:
+        lines[-1] = stripped
+    else:
+        lines.pop()
+    return lines
 
 
 def tail_lines(path: Path, n: int) -> list[str]:
@@ -1862,7 +1890,8 @@ def tail_lines(path: Path, n: int) -> list[str]:
 
     Each logical line has ANSI escape sequences stripped and is folded to
     ``FOLD_WIDTH`` characters; only the newest ``n`` displayed lines are kept,
-    and there is no character limit. The durable log is never modified.
+    and there is no character limit. An incomplete trailing escape fragment is
+    never shown. The durable log is never modified.
 
     Args:
         path: Log file path.
@@ -1871,7 +1900,7 @@ def tail_lines(path: Path, n: int) -> list[str]:
     Returns:
         The displayed lines, newest last.
     """
-    return _folded_tail(path, n, strip_ansi=True)
+    return _drop_dangling_fragment(_folded_tail(path, n, strip_ansi=True))
 
 
 def _file_ends_with_newline_stream(fh: BinaryIO, end: int) -> bool:
@@ -1890,14 +1919,32 @@ def _file_ends_with_newline_stream(fh: BinaryIO, end: int) -> bool:
     return fh.read(1) == b"\n"
 
 
-def _tail_snapshot_from(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, int]:
-    """Return (newest normalized folded display bytes, byte offset) for a snapshot.
+@dataclass(frozen=True, slots=True)
+class LogSnapshot:
+    """One consistent normalized log snapshot plus the follow handoff state.
+
+    Attributes:
+        display: Normalized display bytes, covering only ``[0, offset)``.
+        offset: Raw byte offset to continue following from (the captured EOF).
+        pending: Trailing incomplete escape fragment held back from the
+            display so a sequence split across the snapshot/follow boundary is
+            still stripped once its continuation arrives.
+    """
+
+    display: bytes
+    offset: int
+    pending: str
+
+
+def _tail_snapshot_from(fh: BinaryIO, end: int, max_lines: int) -> LogSnapshot:
+    """Return a normalized snapshot (display, offset, pending fragment).
 
     The display and the continuation offset come from the single captured
     ``end`` byte offset: the folded, ANSI-stripped tail is read only up to
     ``end``, and ``end`` is also the returned offset, so a later append is
-    excluded from the display and remains for the follow. The durable log is
-    never modified.
+    excluded from the display and remains for the follow. Any trailing
+    incomplete escape fragment is held back into ``pending`` instead of
+    leaking into the display. The durable log is never modified.
 
     Args:
         fh: Open binary stream positioned at ``end``.
@@ -1905,40 +1952,41 @@ def _tail_snapshot_from(fh: BinaryIO, end: int, max_lines: int) -> tuple[bytes, 
         max_lines: Maximum displayed lines.
 
     Returns:
-        A ``(bytes, offset)`` tuple.
+        The normalized snapshot.
     """
     display = _folded_tail_stream(fh, end, max_lines, strip_ansi=True)
     if not display:
-        return b"", end
+        return LogSnapshot(b"", end, "")
     text = "\n".join(display)
+    stripped, pending = _strip_ansi_keep_tail(text)
     if _file_ends_with_newline_stream(fh, end):
-        text += "\n"
-    return text.encode("utf-8", errors="replace"), end
+        stripped += "\n"
+    return LogSnapshot(stripped.encode("utf-8", errors="replace"), end, pending)
 
 
-def tail_snapshot(path: Path, max_lines: int = STATUS_TAIL_LINES) -> tuple[bytes, int]:
-    """Return (newest normalized folded display bytes, byte offset to follow from).
+def tail_snapshot(path: Path, max_lines: int = STATUS_TAIL_LINES) -> LogSnapshot:
+    """Return a normalized display snapshot with the raw offset to follow from.
 
-    The bytes cover at most ``max_lines`` folded display lines with ANSI
-    escape sequences stripped; folding and normalization are presentation only
-    and never touch the durable log. The displayed bytes and the offset come
-    from one consistent open-file snapshot: the file is opened once, its EOF
-    size is captured, and the tail is read only up to that captured size.
-    Bytes appended after the capture are excluded from the snapshot and
-    remain for the follow, so following resumes exactly where the displayed
-    output ends.
+    The display bytes cover at most ``max_lines`` folded display lines with
+    ANSI escape sequences stripped and no dangling fragment leaked; folding
+    and normalization are presentation only and never touch the durable log.
+    The display and the offset come from one consistent open-file snapshot:
+    the file is opened once, its EOF size is captured, and the tail is read
+    only up to that captured size. Bytes appended after the capture are
+    excluded from the snapshot and remain for the follow, so following resumes
+    exactly where the displayed output ends.
 
     Args:
         path: Log file path.
         max_lines: Maximum displayed lines.
 
     Returns:
-        A ``(bytes, offset)`` tuple.
+        The normalized snapshot.
     """
     try:
         fh = path.open("rb")
     except OSError:
-        return b"", 0
+        return LogSnapshot(b"", 0, "")
     with fh:
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
@@ -1956,8 +2004,8 @@ def stream_log_until_terminal(aid: str, follow_lines: int = STATUS_TAIL_LINES) -
         follow_lines: Number of recent folded display lines to show first.
     """
     log_path = agent_dir(aid) / "output.log"
-    offset = _print_snapshot(log_path, follow_lines)
-    normalizer = _LogNormalizer()
+    offset, pending = _print_snapshot(log_path, follow_lines)
+    normalizer = _LogNormalizer(pending=pending)
     handle: BinaryIO | None = None
     idle_since: float | None = None
     terminal_since: float | None = None
@@ -2009,23 +2057,25 @@ def _stable_terminal(aid: str, terminal_since: float | None) -> tuple[bool, floa
     return False, None
 
 
-def _print_snapshot(path: Path, follow_lines: int) -> int:
-    """Print the recent folded tail snapshot and return its end offset.
+def _print_snapshot(path: Path, follow_lines: int) -> tuple[int, str]:
+    """Print the recent normalized snapshot and return the follow handoff state.
 
     Args:
         path: Log file path.
         follow_lines: Number of folded display lines to show.
 
     Returns:
-        The byte offset to continue following from.
+        A ``(offset, pending)`` pair: the raw byte offset to continue
+        following from, and any trailing incomplete escape fragment that the
+        follow normalizer must keep to complete stripping at the boundary.
     """
     if not path.is_file():
-        return 0
-    kept, offset = tail_snapshot(path, follow_lines)
-    if kept:
-        sys.stdout.buffer.write(kept)
+        return 0, ""
+    snapshot = tail_snapshot(path, follow_lines)
+    if snapshot.display:
+        sys.stdout.buffer.write(snapshot.display)
         sys.stdout.buffer.flush()
-    return offset
+    return snapshot.offset, snapshot.pending
 
 
 def _open_log(log_path: Path, offset: int) -> BinaryIO | None:
@@ -2047,24 +2097,31 @@ def _open_log(log_path: Path, offset: int) -> BinaryIO | None:
 
 
 def _strip_ansi_keep_tail(text: str) -> tuple[str, str]:
-    r"""Strip complete ANSI CSI/SGR sequences, returning any trailing partial one.
+    r"""Strip complete ANSI CSI/OSC sequences, returning any trailing partial one.
 
-    A trailing fragment that could still become a complete CSI sequence (for
-    example ``\x1b[3``) is returned separately so a sequence split across two
-    reads is stripped once the rest arrives, without ever delaying ordinary
-    text.
+    A trailing fragment that could still become a complete CSI or OSC sequence
+    (for example ``\x1b[3``) is returned separately so a sequence split across
+    two reads is stripped once the rest arrives, without ever delaying
+    ordinary text. A CSI prefix holds one ``\x1b`` and an OSC prefix holds at
+    most two (its ``\x1b]`` start and the ``\x1b`` of a split ``\x1b\\``
+    terminator), so only the last two ``\x1b`` positions are considered.
 
     Args:
         text: Text to normalize.
 
     Returns:
         A ``(stripped, pending)`` pair where ``pending`` is a maximal trailing
-        fragment that may still form a complete CSI sequence.
+        fragment that may still form a complete ANSI control sequence.
     """
-    stripped = _ANSI_CSI_RE.sub("", text)
-    esc = stripped.rfind("\x1b")
-    if esc >= 0 and _CSI_PREFIX_RE.fullmatch(stripped[esc:]):
-        return stripped[:esc], stripped[esc:]
+    stripped = _ANSI_RE.sub("", text)
+    positions: list[int] = []
+    for index, char in enumerate(stripped):
+        if char == "\x1b":
+            positions.append(index)
+    for esc in positions[-2:]:
+        tail = stripped[esc:]
+        if _ANSI_CSI_PREFIX_RE.fullmatch(tail) or _ANSI_OSC_PREFIX_RE.fullmatch(tail):
+            return stripped[:esc], tail
     return stripped, ""
 
 
@@ -2078,11 +2135,11 @@ class _LogNormalizer:
     log file is never modified.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pending: str = "") -> None:
         self._decoder: codecs.IncrementalDecoder = codecs.getincrementaldecoder("utf-8")(
             errors="replace"
         )
-        self._pending = ""
+        self._pending = pending
 
     def write(self, data: bytes) -> None:
         """Normalize and write one chunk of log bytes to stdout.
