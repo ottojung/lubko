@@ -1,4 +1,4 @@
-"""Tests enforcing the two-column transport invariant and the baseline migration."""
+"""Tests enforcing the two-column transport invariant and the protocol v2 migrations."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -13,8 +13,10 @@ from lubko.worker import JOBS_COLUMN_TYPES, SchemaInvariantError, verify_jobs_ta
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR: Final = REPO_ROOT / "migrations"
 BASELINE_MIGRATION: Final = MIGRATIONS_DIR / "0001_two_column_protocol.sql"
+UPGRADE_MIGRATION: Final = MIGRATIONS_DIR / "0002_output_chunks.sql"
 PROTOCOL_INVARIANT_PHRASE: Final = "exactly two columns forever"
 TWO_COLUMN_COUNT: Final = 2
+TYPE_AWARE_CONSTRAINT: Final = "jobs_payload_type_shape"
 FORBIDDEN_LEGACY_PHRASES: Final = (
     "jobs_v2",
     "jobs_legacy",
@@ -210,6 +212,15 @@ def _read_baseline_migration() -> str:
     return BASELINE_MIGRATION.read_text(encoding="utf-8")
 
 
+def _read_upgrade_migration() -> str:
+    """Read the upgrade migration SQL text.
+
+    Returns:
+        The upgrade migration file contents.
+    """
+    return UPGRADE_MIGRATION.read_text(encoding="utf-8")
+
+
 def test_baseline_migration_creates_exactly_two_columns() -> None:
     """The baseline migration creates exactly id uuid plus payload text."""
     columns = _create_table_columns(_read_baseline_migration(), "lubko.jobs")
@@ -219,14 +230,19 @@ def test_baseline_migration_creates_exactly_two_columns() -> None:
     assert columns[1].startswith("payload text")
 
 
-def test_baseline_migration_declares_payload_as_text_with_checks() -> None:
+def test_baseline_migration_declares_payload_as_text_with_type_aware_checks() -> None:
     """The baseline declares payload as text with the JSON-object checks."""
     sql = _read_baseline_migration()
 
     assert "payload text not null" in sql
     assert "jsonb_typeof(payload::jsonb) = 'object'" in sql
     assert "(payload::jsonb) ? 'v'" in sql
-    assert "((payload::jsonb)->'state'->>'status') is not null" in sql
+    assert TYPE_AWARE_CONSTRAINT in sql
+    assert "'command'" in sql
+    assert "'output_chunk'" in sql
+    assert "'stdout'" in sql
+    assert "'stderr'" in sql
+    assert "(((payload::jsonb)->'state'->>'status') is not null)" in sql
 
 
 def test_baseline_migration_grants_worker_access() -> None:
@@ -237,13 +253,55 @@ def test_baseline_migration_grants_worker_access() -> None:
     assert "to_regrole('lubko_worker')" in sql
 
 
-def test_baseline_migration_creates_queue_index() -> None:
-    """The baseline creates the queue expression index on the two columns."""
+def test_baseline_migration_creates_command_queue_index() -> None:
+    """The baseline queue index covers only command rows."""
     sql = _read_baseline_migration()
 
     assert "create index if not exists jobs_queue_idx" in sql
     assert "((payload::jsonb)->'state'->>'status')" in sql
     assert "((payload::jsonb)->'state'->>'created_at')" in sql
+    assert "((payload::jsonb)->>'type') = 'command'" in sql
+
+
+def test_baseline_migration_creates_chunk_indexes() -> None:
+    """The baseline indexes chunk ownership and deterministic ordering."""
+    sql = _read_baseline_migration()
+
+    assert "create index if not exists jobs_chunk_owner_idx" in sql
+    assert "create index if not exists jobs_chunk_order_idx" in sql
+    assert "((payload::jsonb)->>'thread')" in sql
+    assert "((payload::jsonb)->'sequence')::bigint" in sql
+    assert "((payload::jsonb)->>'type') = 'output_chunk'" in sql
+
+
+def test_upgrade_migration_removes_v1_status_constraint() -> None:
+    """The upgrade drops the v1 status constraint before adding the type-aware one."""
+    sql = _read_upgrade_migration()
+
+    assert "drop constraint if exists jobs_payload_has_status" in sql
+    assert "drop constraint if exists jobs_payload_type_shape" in sql
+    assert f"add constraint {TYPE_AWARE_CONSTRAINT}" in sql
+
+
+def test_upgrade_migration_is_type_aware() -> None:
+    """The upgrade constrains command rows and output_chunk rows by type."""
+    sql = _read_upgrade_migration()
+
+    assert "when (payload::jsonb)->>'type' = 'command' then" in sql
+    assert "when (payload::jsonb)->>'type' = 'output_chunk' then" in sql
+    assert "jsonb_typeof((payload::jsonb)->'value') = 'string'" in sql
+    assert "(((payload::jsonb)->>'thread') is not null)" in sql
+    assert "(((payload::jsonb)->>'stream') in ('stdout', 'stderr'))" in sql
+    assert "(((payload::jsonb)->>'sequence') ~ '^[0-9]+$')" in sql
+
+
+def test_upgrade_migration_adds_chunk_indexes() -> None:
+    """The upgrade creates the chunk ownership and ordering indexes."""
+    sql = _read_upgrade_migration()
+
+    assert "drop index if exists jobs_queue_idx" in sql
+    assert "create index if not exists jobs_chunk_owner_idx" in sql
+    assert "create index if not exists jobs_chunk_order_idx" in sql
 
 
 def test_baseline_migration_is_idempotent() -> None:
@@ -253,6 +311,15 @@ def test_baseline_migration_is_idempotent() -> None:
     assert "create table if not exists" in sql
     assert "create index if not exists" in sql
     assert "to_regrole('lubko_worker')" in sql
+
+
+def test_upgrade_migration_is_idempotent() -> None:
+    """Every upgrade statement is safe to apply more than once."""
+    sql = _read_upgrade_migration()
+
+    assert "drop constraint if exists" in sql
+    assert "create index if not exists" in sql
+    assert "drop index if exists jobs_queue_idx" in sql
 
 
 def test_baseline_migration_documents_the_invariant() -> None:

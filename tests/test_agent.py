@@ -6,6 +6,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -26,14 +27,13 @@ REQUIRED_COMMANDS: Final = frozenset({
     "status",
     "prompt",
     "log",
-    "result",
     "wait",
     "stop",
     "kill",
     "delete",
     "clean",
-    "last",
 })
+REMOVED_COMMANDS: Final = frozenset({"last", "result"})
 
 
 def spawn_marked_process(aid: str) -> subprocess.Popen[bytes]:
@@ -160,12 +160,19 @@ def test_state_root_uses_xdg_state_home(state_dir: Path) -> None:
     assert agent.agents_dir() == state_dir / "lubko" / "agents"
 
 
-def test_new_agent_id_avoids_collisions(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A colliding generated ID is skipped."""
-    (agent.agents_dir() / "abcdef01").mkdir(parents=True)
-    values = iter(["abcdef01", "12345678"])
-    monkeypatch.setattr("lubko.agent.secrets.token_hex", lambda _n: next(values))
-    assert agent.new_agent_id() == "12345678"
+def test_normalize_agent_id_lowercases_hex() -> None:
+    """A caller-supplied base-16 ID is normalized to lowercase hex digits."""
+    assert agent.normalize_agent_id("A13F09C2") == "a13f09c2"
+    assert agent.normalize_agent_id("  a13f09c2  ") == "a13f09c2"
+
+
+def test_normalize_agent_id_rejects_malformed() -> None:
+    """Malformed agent IDs are rejected clearly."""
+    assert agent.normalize_agent_id(None) is None
+    assert agent.normalize_agent_id("") is None
+    assert agent.normalize_agent_id("not-hex!") is None
+    assert agent.normalize_agent_id("../etc/passwd") is None
+    assert agent.normalize_agent_id("a13f09c2z") is None
 
 
 def test_write_and_read_meta_roundtrip() -> None:
@@ -191,41 +198,23 @@ def test_update_meta_deleted_agent_is_noop() -> None:
     assert agent.read_meta("missing") is None
 
 
-def test_cmd_last_prints_recent_agent(state_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """The last command prints the most recently used agent ID."""
-    make_agent(state_dir, "abc12345", state_value="succeeded")
-    agent.mark_last("abc12345")
-    assert agent.main(["last"]) == agent.EXIT_OK
-    assert capsys.readouterr().out.strip() == "abc12345"
-
-
-def test_cmd_last_no_previous(capsys: pytest.CaptureFixture[str]) -> None:
-    """The last command reports when no previous agent exists."""
-    assert agent.main(["last"]) == agent.EXIT_NOT_FOUND
-    assert "no previous agent" in capsys.readouterr().err
-
-
 def test_derive_state_returns_terminal_state(state_dir: Path) -> None:
     """A non-running recorded state is returned directly."""
     meta = make_agent(state_dir, "abc12345", state_value="succeeded")
     assert agent.derive_state(meta) == "succeeded"
 
 
+def test_derive_state_returns_idle_for_never_prompted(state_dir: Path) -> None:
+    """A freshly created, never-prompted agent is idle, not running."""
+    meta = agent.idle_meta("abc12345", str(state_dir), None)
+    agent.write_meta("abc12345", meta)
+    assert agent.derive_state(agent.read_meta("abc12345")) == "idle"
+
+
 def test_derive_state_running_before_pid_recorded(state_dir: Path) -> None:
     """A freshly launched agent without a PID is reported running."""
     meta = make_agent(state_dir, "abc12345", state_value="running")
     assert agent.derive_state(meta) == "running"
-
-
-def test_derive_state_unknown_for_stale_unrecorded(state_dir: Path) -> None:
-    """A launched-but-unrecorded agent becomes unknown after the start window."""
-    meta = make_agent(
-        state_dir,
-        "abc12345",
-        state_value="running",
-        started_at=time.time() - 120,
-    )
-    assert agent.derive_state(meta) == "unknown"
 
 
 def test_is_alive_matches_marked_process() -> None:
@@ -274,13 +263,6 @@ def test_tail_lines_returns_last_n(state_dir: Path) -> None:
     assert agent.tail_lines(log, 1, max_chars=4) == ["c"]
 
 
-def test_tail_lines_drops_mid_line_fragment(state_dir: Path) -> None:
-    """A mid-line fragment at the window start is dropped."""
-    log = state_dir / "out.log"
-    log.write_text("a\nb\nc\n")
-    assert agent.tail_lines(log, 0, max_chars=3) == ["c"]
-
-
 def test_log_excerpt_strips_ansi(state_dir: Path) -> None:
     """Log excerpts strip ANSI escape sequences."""
     log = state_dir / "out.log"
@@ -288,37 +270,69 @@ def test_log_excerpt_strips_ansi(state_dir: Path) -> None:
     assert agent.log_excerpt(log, 5, 2000) == ["red", "plain"]
 
 
-def test_cmd_new_creates_agent(
+def test_cmd_new_creates_idle_agent_with_supplied_id(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The new command creates an agent with stable state and the last marker."""
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, _mode: None)
+    """New creates only an idle record with the caller-supplied ID."""
+    spawned: list[str] = []
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
     cwd = str(state_dir)
-    code = agent.main(["new", "--cwd", cwd, "--prompt", "do work", "--json"])
+    code = agent.main(["new", "--id", "A13F09C2", "--cwd", cwd, "--json"])
     assert code == agent.EXIT_OK
     out = json.loads(capsys.readouterr().out)
-    aid = out["id"]
-    meta = agent.read_meta(aid)
+    assert out["id"] == "a13f09c2"
+    assert out["state"] == "idle"
+    meta = agent.read_meta("a13f09c2")
     assert meta is not None
+    assert meta["state"] == "idle"
     assert meta["cwd"] == cwd
-    assert meta["initial_prompt"] == "do work"
-    assert meta["prompt_count"] == 1
-    assert agent.last_file().read_text().strip() == aid
+    assert meta["prompt_count"] == 0
+    assert "initial_prompt" not in meta
+    assert "pending_prompt" not in meta
+    assert spawned == []
 
 
-def test_cmd_new_requires_prompt(capsys: pytest.CaptureFixture[str]) -> None:
-    """The new command requires a prompt."""
+def test_cmd_new_requires_id(capsys: pytest.CaptureFixture[str]) -> None:
+    """New without --id is rejected."""
     assert agent.main(["new"]) == agent.EXIT_USAGE
-    assert "prompt is required" in capsys.readouterr().err
+    assert "--id" in capsys.readouterr().err
+    assert agent.agents_dir().exists() is False or list(agent.agents_dir().iterdir()) == []
+
+
+def test_cmd_new_rejects_malformed_id(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """New rejects a malformed caller-supplied ID."""
+    code = agent.main(["new", "--id", "zzzz", "--cwd", str(tmp_path)])
+    assert code == agent.EXIT_USAGE
+    assert "base-16" in capsys.readouterr().err
+
+
+def test_cmd_new_rejects_collision(state_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """New rejects an ID that already exists rather than reusing it."""
+    make_agent(state_dir, "a13f09c2", state_value="idle")
+    code = agent.main(["new", "--id", "a13f09c2", "--cwd", str(state_dir)])
+    assert code == agent.EXIT_ERROR
+    assert "already exists" in capsys.readouterr().err
 
 
 def test_cmd_new_rejects_missing_cwd(capsys: pytest.CaptureFixture[str]) -> None:
-    """The new command rejects a missing working directory."""
-    code = agent.main(["new", "--cwd", "/nonexistent", "--prompt", "hi"])
+    """New rejects a missing working directory."""
+    code = agent.main(["new", "--id", "a13f09c2", "--cwd", "/nonexistent"])
     assert code == agent.EXIT_ERROR
     assert "does not exist" in capsys.readouterr().err
+
+
+def test_cmd_new_rejects_prompt_and_sync_options() -> None:
+    """New accepts no --prompt, positional prompt, --sync, or --detach."""
+    for argv in (
+        ["new", "--id", "a13f09c2", "--prompt", "hi"],
+        ["new", "--id", "a13f09c2", "hi"],
+        ["new", "--id", "a13f09c2", "--sync"],
+        ["new", "--id", "a13f09c2", "--detach"],
+    ):
+        with pytest.raises(SystemExit):
+            agent.main(argv)
 
 
 def test_cmd_list_json_and_filters(
@@ -347,26 +361,59 @@ def test_cmd_status_json(state_dir: Path, capsys: pytest.CaptureFixture[str]) ->
     assert data["exit_code"] == 0
 
 
+def test_cmd_status_accepts_id_flag(state_dir: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Status --id <ID> is a supported form."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", exit_code=0)
+    assert agent.main(["status", "--id", "aaaaaaaa", "--json"]) == agent.EXIT_OK
+    data = json.loads(capsys.readouterr().out)
+    assert data["id"] == "aaaaaaaa"
+
+
 def test_cmd_status_unknown_agent(capsys: pytest.CaptureFixture[str]) -> None:
     """Status on an unknown agent returns not-found."""
     assert agent.main(["status", "deadbeef"]) == agent.EXIT_NOT_FOUND
     assert "unknown agent" in capsys.readouterr().err
 
 
-def test_cmd_prompt_continues_terminal_agent(
+def test_cmd_prompt_first_prompt_creates_native_session(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prompting a finished agent starts a continuation invocation."""
-    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", native_session_id="sess-1")
+    """The first prompt of a fresh agent starts a new native session.
+
+    New agents are idle; the first prompt creates the underlying session.
+    """
+    agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
     spawned: list[str] = []
     monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
-    code = agent.main(["prompt", "aaaaaaaa", "--prompt", "more"])
+    code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "do work"])
+    assert code == agent.EXIT_OK
+    assert spawned == ["new"]
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    assert meta["state"] == "running"
+    assert meta["pending_prompt"] == "do work"
+
+
+def test_cmd_prompt_continue_uses_existing_native_session(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Later prompts continue the exact native session."""
+    make_agent(
+        state_dir,
+        "aaaaaaaa",
+        state_value="succeeded",
+        native_session_id="sess-1",
+        prompt_count=1,
+    )
+    spawned: list[str] = []
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
     assert code == agent.EXIT_OK
     assert spawned == ["continue"]
     meta = agent.read_meta("aaaaaaaa")
     assert meta is not None
-    assert meta["state"] == "running"
     assert meta["pending_prompt"] == "more"
 
 
@@ -375,12 +422,95 @@ def test_cmd_prompt_refuses_without_session(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Prompting refuses when the underlying session is unavailable."""
-    make_agent(state_dir, "aaaaaaaa", state_value="succeeded")
-    monkeypatch.setattr(agent, "_wait_for_session", lambda _aid: None)
-    code = agent.main(["prompt", "aaaaaaaa", "--prompt", "more"])
+    """Prompting a previously-prompted agent without a session is refused."""
+    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", prompt_count=1)
+    monkeypatch.setattr(agent, "discover_session_id", lambda _aid: None)
+    code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
     assert code == agent.EXIT_ERROR
     assert "session is not available" in capsys.readouterr().err
+
+
+def test_cmd_prompt_attached_follows_and_propagates_exit_code(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Attached prompt streams the invocation and propagates its exit status."""
+    agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    runner_threads: list[threading.Thread] = []
+
+    def spawn_in_thread(_aid: str, mode: str) -> None:
+        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+        thread.start()
+        runner_threads.append(thread)
+
+    monkeypatch.setattr(agent, "spawn_runner", spawn_in_thread)
+    code = agent.main(["prompt", "--id", "aaaaaaaa", "do work"])
+    assert code == agent.EXIT_OK
+    output = capsys.readouterr().out
+    assert "do work" in output
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    assert meta["state"] == "succeeded"
+    for thread in runner_threads:
+        thread.join(timeout=10)
+
+
+def test_cmd_prompt_steer_is_plain_prompt_when_idle(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--steer on an idle agent is exactly equivalent to an ordinary prompt."""
+    agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
+    spawned: list[str] = []
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "task"])
+    assert code == agent.EXIT_OK
+    assert spawned == ["new"]
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    assert meta["pending_prompt"] == "task"
+    assert not meta["steer_queue"]
+
+
+def test_cmd_prompt_steer_is_plain_prompt_when_finished(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--steer on a finished agent is exactly equivalent to an ordinary prompt."""
+    make_agent(
+        state_dir,
+        "aaaaaaaa",
+        state_value="succeeded",
+        native_session_id="sess-1",
+        prompt_count=1,
+    )
+    spawned: list[str] = []
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "task"])
+    assert code == agent.EXIT_OK
+    assert spawned == ["continue"]
+    meta = agent.read_meta("aaaaaaaa")
+    assert meta is not None
+    assert meta["pending_prompt"] == "task"
+    assert not meta["steer_queue"]
+
+
+def test_cmd_prompt_refuses_without_steer_when_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Prompting a busy agent without --steer is refused."""
+    proc = spawn_marked_process("aaaaaaaa")
+    try:
+        agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, _mode: None)
+        code = agent.main(["prompt", "--id", "aaaaaaaa", "task"])
+        assert code == agent.EXIT_ERROR
+        assert "--steer" in capsys.readouterr().err
+    finally:
+        kill_proc(proc)
 
 
 def test_cmd_prompt_steer_queues_for_busy_agent(
@@ -392,7 +522,7 @@ def test_cmd_prompt_steer_queues_for_busy_agent(
         agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
         spawned: list[str] = []
         monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
-        code = agent.main(["prompt", "aaaaaaaa", "--steer", "--prompt", "redirect"])
+        code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "redirect"])
         assert code == agent.EXIT_OK
         assert spawned == []
         current = agent.read_meta("aaaaaaaa")
@@ -404,12 +534,10 @@ def test_cmd_prompt_steer_queues_for_busy_agent(
 
 
 def test_cmd_delete_terminal_agent(state_dir: Path) -> None:
-    """Deleting a terminal agent removes its state and the last marker."""
+    """Deleting a terminal agent removes its state."""
     make_agent(state_dir, "aaaaaaaa", state_value="succeeded")
-    agent.mark_last("aaaaaaaa")
     assert agent.main(["delete", "aaaaaaaa"]) == agent.EXIT_OK
     assert not (agent.agents_dir() / "aaaaaaaa").exists()
-    assert not agent.last_file().exists()
 
 
 def test_cmd_delete_refuses_running_without_force() -> None:
@@ -541,6 +669,15 @@ def test_build_agent_command_honors_override(monkeypatch: pytest.MonkeyPatch) ->
     ]
 
 
+def test_build_agent_command_creates_session_on_first_prompt() -> None:
+    """The first invocation creates a native session with the agent title."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    cmd = agent.build_agent_command(meta, "first task", is_continue=False)
+    assert cmd is not None
+    assert "--title" in cmd
+    assert "lubko-aaaaaaaa" in cmd
+
+
 def test_exit_code_for_maps_states() -> None:
     """Exit codes follow the agent state."""
     assert agent.exit_code_for(None) == 1
@@ -556,9 +693,17 @@ def test_exit_code_for_maps_states() -> None:
 
 
 def test_subcommands_present() -> None:
-    """Every documented management command is exposed."""
+    """Every documented management command is exposed; removed ones are gone."""
     names = {spec.name for spec in agent.SUBCOMMANDS}
     assert names == REQUIRED_COMMANDS
+    assert REMOVED_COMMANDS.isdisjoint(names)
+
+
+def test_removed_subcommands_are_not_parsed() -> None:
+    """Last and result no longer exist as subcommands."""
+    for argv in (["last"], ["result", "aaaaaaaa"]):
+        with pytest.raises(SystemExit):
+            agent.main(argv)
 
 
 def test_main_without_command_returns_usage() -> None:
@@ -649,12 +794,7 @@ def test_runner_does_not_drop_concurrently_queued_prompt(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A prompt queued between read and claim is never lost.
-
-    The runner clears ``pending_prompt`` under the metadata lock only when it
-    exactly matches the prompt being claimed; a continuation that landed in
-    the read-to-claim window must survive for the next invocation.
-    """
+    """A prompt queued between read and claim is never lost."""
     make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
     agent.update_meta("aaaaaaaa", lambda m: m.update(pending_prompt="first"))
 
@@ -755,6 +895,7 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
             "aaaaaaaa",
             state_value="succeeded",
             native_session_id="sess-1",
+            prompt_count=1,
         )
         meta["active_runner"] = True
         meta["runner_pid"] = runner_proc.pid
@@ -762,7 +903,7 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
         agent.write_meta("aaaaaaaa", meta)
         spawned: list[str] = []
         monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
-        code = agent.main(["prompt", "aaaaaaaa", "--prompt", "more"])
+        code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
         assert code == agent.EXIT_OK
         assert spawned == []
         current = agent.read_meta("aaaaaaaa")

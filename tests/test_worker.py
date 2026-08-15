@@ -1,50 +1,60 @@
-"""Tests for the Lubko worker."""
+"""Tests for the Lubko worker supervisor and its database operations."""
 
 import json
 import os
 import shutil
 import signal
 import subprocess
-import threading
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext, suppress
 from pathlib import Path
-from typing import Final, Self, cast
-from uuid import UUID, uuid4
+from typing import TYPE_CHECKING, Final, Self, cast, override
+from uuid import uuid4
 
+import psycopg
 import pytest
 
-from lubko.protocol import parse_payload
+from lubko import worker
+from lubko.protocol import OUTPUT_TAIL_MAX_CHARS, parse_chunk_payload, parse_payload
 from lubko.worker import (
     DEFAULT_LEASE_DURATION_SECONDS,
     DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS,
     DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS,
-    PROTOCOL_ERROR_EXIT_CODE,
+    OUTPUT_STREAM_STDOUT,
     TRUNCATION_MARKER,
+    ActiveJob,
     Job,
     JobResult,
     JobsConnection,
+    OutputStream,
     Settings,
-    claim_and_process_one,
+    bulk_refresh_leases,
     claim_job,
+    claim_jobs,
+    delete_job_and_chunks,
+    discover_cancellations,
     finish_job,
     group_has_members,
-    process_jobs,
+    publish_output,
     read_output,
+    read_range,
     recover_stale_jobs,
     request_cancel,
+    request_stop,
     resolve_shell,
-    run_job,
+    signal_kill,
     spawn_job,
+    stream_size,
     truncate_output,
 )
 from tests import _process_guard as guard
 
+if TYPE_CHECKING:
+    from uuid import UUID
+
 EXECUTION_ERROR_EXIT_CODE: Final = 127
 COMMAND_FAILURE_EXIT_CODE: Final = 7
-CANCEL_UPDATE_STATEMENTS: Final = 2
-CLAIM_AND_FINISH_UPDATE_STATEMENTS: Final = 2
 MIN_LEASE_HEARTBEATS: Final = 2
 
 
@@ -94,6 +104,31 @@ class _RecordingConnection:
         return nullcontext()
 
 
+class _FailingConnection(_RecordingConnection):
+    """A recording connection whose statements fail on demand."""
+
+    def __init__(self, fail_on: Callable[[str], bool]) -> None:
+        super().__init__()
+        self.fail_on = fail_on
+
+    @override
+    def cursor(self, **_kwargs: object) -> "_RecordingCursor":
+        return _FailingCursor(self)
+
+
+class _FailingCursor(_RecordingCursor):
+    """A recording cursor that raises on matching statements."""
+
+    @override
+    def execute(self, sql: str, params: object | None = None) -> None:
+        assert isinstance(self._conn, _FailingConnection)
+        if self._conn.fail_on(sql):
+            self._conn.executions.append((sql, params))
+            msg = "simulated database failure"
+            raise psycopg.OperationalError(msg)
+        super().execute(sql, params)
+
+
 def as_db(conn: _RecordingConnection) -> JobsConnection:
     """Adapt the recording test double to the worker's connection type.
 
@@ -106,13 +141,16 @@ def as_db(conn: _RecordingConnection) -> JobsConnection:
     return cast("JobsConnection", conn)
 
 
-def make_settings(
+def make_settings(  # ruff: ignore[too-many-arguments]
     *,
     process_poll_interval_seconds: float = 0.02,
     cancel_grace_seconds: float = 1.0,
     lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS,
     lease_refresh_interval_seconds: float = DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS,
     lease_recovery_interval_seconds: float = DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS,
+    output_publication_interval_seconds: float = 0.1,
+    claim_batch_limit: int = 8,
+    lease_safety_margin_seconds: float = 5.0,
 ) -> Settings:
     """Build worker settings for tests.
 
@@ -124,10 +162,12 @@ def make_settings(
         poll_interval_seconds=1.0,
         process_poll_interval_seconds=process_poll_interval_seconds,
         cancel_grace_seconds=cancel_grace_seconds,
-        max_output_bytes=256 * 1024,
         lease_duration_seconds=lease_duration_seconds,
         lease_refresh_interval_seconds=lease_refresh_interval_seconds,
         lease_recovery_interval_seconds=lease_recovery_interval_seconds,
+        output_publication_interval_seconds=output_publication_interval_seconds,
+        claim_batch_limit=claim_batch_limit,
+        lease_safety_margin_seconds=lease_safety_margin_seconds,
     )
 
 
@@ -150,59 +190,37 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
     raise AssertionError(msg)
 
 
-def pid_alive(pid: int) -> bool:
-    """Return whether a process is alive, ignoring unreaped zombies.
+def make_active_job(tmp_path: Path, *, command: str = "echo hi") -> ActiveJob:
+    """Build an active job with capture files under ``tmp_path``.
 
     Args:
-        pid: Process ID to probe.
+        tmp_path: Temporary directory for the capture files.
+        command: Command recorded on the job.
 
     Returns:
-        ``True`` when a running process with that ID exists.
+        A registered active job with empty capture files.
     """
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    try:
-        content = Path(f"/proc/{pid}/stat").read_bytes()
-    except OSError:
-        return True
-    close_paren = content.rfind(b")")
-    if close_paren == -1:
-        return True
-    fields = content[close_paren + 2 :].split()
-    if not fields:
-        return True
-    return fields[0] != b"Z"
-
-
-def install_cancel_harness(
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[threading.Event, threading.Event, list[tuple[UUID, int, int]]]:
-    """Patch the worker's database hooks for cancellation tests.
-
-    Args:
-        monkeypatch: Pytest monkeypatch fixture.
-
-    Returns:
-        An event set once the process identity is recorded, an event that
-        toggles the observed cancellation request, and the recorded
-        (job id, pid, pgid) tuples.
-    """
-    persisted_event = threading.Event()
-    cancel_event = threading.Event()
-    persisted: list[tuple[UUID, int, int]] = []
-
-    def fake_persist(_conn: object, job_id: UUID, pid: int, pgid: int) -> None:
-        persisted.append((job_id, pid, pgid))
-        persisted_event.set()
-
-    def fake_cancel_check(_conn: object, _job_id: UUID) -> bool:
-        return cancel_event.is_set()
-
-    monkeypatch.setattr("lubko.worker._persist_process", fake_persist)
-    monkeypatch.setattr("lubko.worker._is_cancel_requested", fake_cancel_check)
-    return persisted_event, cancel_event, persisted
+    proc = subprocess.Popen(
+        ["/bin/true"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    job = ActiveJob(
+        id=uuid4(),
+        cwd=str(tmp_path),
+        command=command,
+        args=None,
+        proc=proc,
+        pid=proc.pid,
+        pgid=proc.pid,
+        started_mono=time.monotonic(),
+    )
+    job.stdout = OutputStream(path=tmp_path / "stdout.cap")
+    job.stderr = OutputStream(path=tmp_path / "stderr.cap")
+    return job
 
 
 def test_truncate_output_preserves_short_output() -> None:
@@ -229,6 +247,15 @@ def test_read_output_returns_captured_bytes(tmp_path: Path) -> None:
     assert read_output(target) == b"captured output"
 
 
+def test_stream_size_and_read_range(tmp_path: Path) -> None:
+    """stream_size and read_range inspect capture files by byte offset."""
+    target = tmp_path / "out"
+    target.write_bytes(b"0123456789")
+
+    assert stream_size(target) == 10
+    assert read_range(target, 2, 5) == b"234"
+
+
 def test_resolve_shell_finds_bash() -> None:
     """resolve_shell locates an installed bash executable."""
     assert resolve_shell() == shutil.which("bash")
@@ -239,292 +266,129 @@ def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
     """The exact process group is reported while alive and gone after death."""
     shell = resolve_shell()
     assert shell is not None
-    run = spawn_job(Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell)
-    guard.register(run.proc)
+    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+        Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell
+    )
+    guard.register(proc)
     try:
-        assert group_has_members(run.pgid)
+        assert group_has_members(pgid)
     finally:
         with suppress(ProcessLookupError):
-            os.killpg(run.pgid, signal.SIGKILL)
-        run.proc.wait(timeout=10)
-        guard.unregister(run.proc)
-    wait_until(lambda: not group_has_members(run.pgid))
+            os.killpg(pgid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        guard.unregister(proc)
+    wait_until(lambda: not group_has_members(pgid))
 
 
 def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> None:
     """A spawned job is a session leader whose group ID equals its PID."""
     shell = resolve_shell()
     assert shell is not None
-    run = spawn_job(Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell)
-    guard.register(run.proc)
+    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+        Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell
+    )
+    guard.register(proc)
     try:
-        assert run.pgid == run.pid
-        assert os.getpgid(run.pid) == run.pid
-        assert os.getsid(run.pid) == run.pid
+        assert pgid == proc.pid
+        assert os.getpgid(proc.pid) == proc.pid
+        assert os.getsid(proc.pid) == proc.pid
     finally:
         with suppress(ProcessLookupError):
-            os.killpg(run.pgid, signal.SIGKILL)
-        run.proc.wait(timeout=10)
-        guard.unregister(run.proc)
+            os.killpg(pgid, signal.SIGKILL)
+        proc.wait(timeout=10)
+        guard.unregister(proc)
 
 
-def test_run_job_runs_directly_without_docker(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A job executes directly without any Docker executable or lookup."""
-    original_which = shutil.which
-    monkeypatch.setattr(
-        shutil,
-        "which",
-        lambda name: original_which(name) if name != "docker" else None,
+def test_spawn_job_runs_command_and_cleanup_files(tmp_path: Path) -> None:
+    """A command job writes its output into the capture files."""
+    shell = resolve_shell()
+    assert shell is not None
+    proc, stdout_path, stderr_path, _pgid = spawn_job(
+        Job(id=uuid4(), cwd=str(tmp_path), command="echo hi", args=None), shell
     )
-
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo direct", args=None)
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.status == "succeeded"
-    assert result.exit_code == 0
-    assert result.stdout.strip() == "direct"
-    assert not result.stderr
-
-
-def test_run_job_honors_cwd(tmp_path: Path) -> None:
-    """A job runs from the requested working directory."""
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="pwd", args=None)
-
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.exit_code == 0
-    assert result.stdout.strip() == os.path.realpath(str(tmp_path))
-    assert not result.stderr
+    guard.register(proc)
+    try:
+        proc.wait(timeout=10)
+        assert read_output(stdout_path) == b"hi\n"
+        assert stdout_path.is_file()
+        assert stderr_path.is_file()
+    finally:
+        guard.unregister(proc)
+        proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
 
 
-def test_run_job_success(tmp_path: Path) -> None:
-    """A successful job reports a zero exit code and its stdout."""
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hello world", args=None)
-
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.exit_code == 0
-    assert result.stdout.strip() == "hello world"
-    assert not result.stderr
-
-
-def test_run_job_executes_args_directly(tmp_path: Path) -> None:
-    """An argv-style job runs directly without a shell."""
-    args = [shutil.which("pwd") or "pwd"]
-    job = Job(id=uuid4(), cwd=str(tmp_path), command=None, args=tuple(args))
-
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.status == "succeeded"
-    assert result.exit_code == 0
-    assert result.stdout.strip() == os.path.realpath(str(tmp_path))
-    assert not result.stderr
+def test_archive_target_never_reaches_the_live_tail() -> None:
+    """The archive target always stays short of the newest tail window."""
+    assert worker.archive_target(0) == 0
+    assert worker.archive_target(OUTPUT_TAIL_MAX_CHARS) == 0
+    size = OUTPUT_TAIL_MAX_CHARS * 3
+    target = worker.archive_target(size)
+    assert target < size
+    assert target == size - OUTPUT_TAIL_MAX_CHARS + 2000
 
 
-def test_run_job_rejects_request_without_command_or_args(tmp_path: Path) -> None:
-    """A job request with neither command nor args fails with a clear error."""
-    job = Job(id=uuid4(), cwd=str(tmp_path), command=None, args=None)
-
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.status == "failed"
-    assert result.exit_code == EXECUTION_ERROR_EXIT_CODE
-    assert "neither command nor args" in result.stderr
-
-
-def test_run_job_reports_command_failure(tmp_path: Path) -> None:
-    """A failing command preserves its exit code and output."""
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo oops >&2; exit 7", args=None)
-
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.status == "failed"
-    assert result.exit_code == COMMAND_FAILURE_EXIT_CODE
-    assert not result.stdout
-    assert "oops" in result.stderr
-
-
-def test_run_job_reports_missing_cwd(tmp_path: Path) -> None:
-    """A missing working directory produces a useful error."""
-    missing = tmp_path / "missing"
-    job = Job(id=uuid4(), cwd=str(missing), command="echo hi", args=None)
-
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.status == "failed"
-    assert result.exit_code == EXECUTION_ERROR_EXIT_CODE
-    assert not result.stdout
-    assert "working directory" in result.stderr
-
-
-def test_run_job_reports_non_directory_cwd(tmp_path: Path) -> None:
-    """A working directory that is a regular file produces a useful error."""
-    target = tmp_path / "file"
-    target.write_text("not a directory")
-    job = Job(id=uuid4(), cwd=str(target), command="echo hi", args=None)
-
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.status == "failed"
-    assert result.exit_code == EXECUTION_ERROR_EXIT_CODE
-    assert not result.stdout
-    assert "working directory" in result.stderr
-
-
-def test_run_job_reports_missing_shell(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A missing shell executable produces a useful error."""
-    original_which = shutil.which
-    monkeypatch.setattr(
-        shutil,
-        "which",
-        lambda name: original_which(name) if name != "bash" else None,
-    )
-
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hi", args=None)
-
-    result = run_job(as_db(_RecordingConnection()), job, make_settings())
-
-    assert result.status == "failed"
-    assert result.exit_code == EXECUTION_ERROR_EXIT_CODE
-    assert not result.stdout
-    assert "shell" in result.stderr
-
-
-def test_run_job_persists_process_identity(tmp_path: Path) -> None:
-    """The worker records the exact PID and PGID of the spawned shell."""
+def test_claim_job_marks_job_running_and_only_command_rows() -> None:
+    """claim_jobs marks command rows running and never touches chunk rows."""
     conn = _RecordingConnection()
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="echo hi", args=None)
+    job_id = uuid4()
+    claimed_payload = json.dumps({
+        "v": 2,
+        "type": "command",
+        "request": {"cwd": "/workspace", "command": "echo hi"},
+        "state": {"status": "running"},
+    })
+    conn.rows = [(job_id, claimed_payload)]
+    settings = make_settings()
 
-    run_job(as_db(conn), job, make_settings())
+    claimed = claim_job(as_db(conn), settings)
 
-    persist_sqls = [(sql, params) for sql, params in conn.executions if "process_pgid" in sql]
-    assert len(persist_sqls) == 1
-    sql, params = persist_sqls[0]
-    assert "{state,process_pid}" in sql
-    assert "{state,process_pgid}" in sql
+    assert claimed is not None
+    assert claimed.id == job_id
+    parsed = parse_payload(claimed.payload)
+    assert parsed.request.command == "echo hi"
+    assert parsed.status == "running"
+    sql, params = conn.executions[0]
+    assert "{state,status}" in sql
+    assert "'running'" in sql
+    assert "'pending'" in sql
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "(payload::jsonb)->>'type' = 'command'" in sql
     assert "payload::jsonb" in sql
     assert "::text" in sql
-    assert isinstance(params, tuple)
-    pid, pgid, recorded_job_id = params
-    assert recorded_job_id == job.id
-    assert pid == pgid
+    assert "{state,worker_incarnation}" in sql
+    assert "{state,lease_expires_at}" in sql
+    assert "make_interval" in sql
+    assert isinstance(params, dict)
+    assert params["worker_id"] == settings.worker_id
+    assert params["worker_incarnation"] == settings.worker_incarnation
+    assert params["lease_duration_seconds"] == settings.lease_duration_seconds
+    assert params["limit"] == 1
 
 
-def test_cancellation_kills_shell_and_spawned_child(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cancellation terminates the shell and its spawned child process."""
-    child_pid_path = tmp_path / "child.pid"
-    command = f"sleep 30 & child=$!; echo $child > {child_pid_path}; wait"
-    job = Job(id=uuid4(), cwd=str(tmp_path), command=command, args=None)
-    persisted_event, cancel_event, persisted = install_cancel_harness(monkeypatch)
-    result_box: list[JobResult] = []
+def test_claim_jobs_returns_nothing_on_empty_queue() -> None:
+    """An empty queue yields no claims and no writes beyond the claim query."""
+    conn = _RecordingConnection()
 
-    def run_in_thread() -> None:
-        result_box.append(run_job(as_db(_RecordingConnection()), job, make_settings()))
+    claimed = claim_jobs(as_db(conn), make_settings(), 8)
 
-    thread = threading.Thread(target=run_in_thread)
-    thread.start()
-    try:
-        assert persisted_event.wait(timeout=10)
-        recorded_job_id, pid, pgid = persisted[0]
-        assert recorded_job_id == job.id
-        assert pgid == pid
-
-        wait_until(child_pid_path.exists)
-        child_pid = int(child_pid_path.read_text().strip())
-
-        cancel_event.set()
-        thread.join(timeout=15)
-        assert not thread.is_alive()
-
-        result = result_box[0]
-        assert result.status == "cancelled"
-        assert result.exit_code < 0
-        assert "SIGTERM" in (result.cancellation_note or "")
-
-        wait_until(lambda: not pid_alive(pid))
-        wait_until(lambda: not pid_alive(child_pid))
-    finally:
-        cancel_event.set()
-        thread.join(timeout=5)
+    assert claimed == []
+    assert len(conn.executions) == 1
+    assert "RETURNING job.id" in conn.executions[0][0]
 
 
-def test_cancellation_leaves_unrelated_process_group_untouched(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cancellation never signals processes outside the tracked process group."""
-    sleep = shutil.which("sleep")
-    assert sleep is not None
-    unrelated = subprocess.Popen([sleep, "30"], start_new_session=True)
-    guard.register(unrelated)
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None)
-    persisted_event, cancel_event, _ = install_cancel_harness(monkeypatch)
-    result_box: list[JobResult] = []
+def test_claim_jobs_batch_limit_is_a_fairness_bound() -> None:
+    """The claim batch limit is passed as a SQL limit, not a concurrency cap."""
+    conn = _RecordingConnection()
+    conn.rows = []
 
-    def run_in_thread() -> None:
-        result_box.append(run_job(as_db(_RecordingConnection()), job, make_settings()))
+    claim_jobs(as_db(conn), make_settings(claim_batch_limit=3), 3)
 
-    thread = threading.Thread(target=run_in_thread)
-    thread.start()
-    try:
-        assert persisted_event.wait(timeout=10)
-        cancel_event.set()
-        thread.join(timeout=15)
-        assert not thread.is_alive()
-
-        result = result_box[0]
-        assert result.status == "cancelled"
-        assert unrelated.poll() is None
-    finally:
-        cancel_event.set()
-        thread.join(timeout=5)
-        unrelated.kill()
-        unrelated.wait(timeout=10)
-        guard.unregister(unrelated)
-
-
-def test_cancellation_sigkills_term_ignoring_shell(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A shell that ignores SIGTERM is force-killed after the grace period."""
-    ready_path = tmp_path / "ready"
-    command = f"trap '' TERM; echo ready > {ready_path}; while true; do sleep 1; done"
-    job = Job(id=uuid4(), cwd=str(tmp_path), command=command, args=None)
-    persisted_event, cancel_event, persisted = install_cancel_harness(monkeypatch)
-    settings = make_settings(process_poll_interval_seconds=0.02, cancel_grace_seconds=0.3)
-    result_box: list[JobResult] = []
-
-    def run_in_thread() -> None:
-        result_box.append(run_job(as_db(_RecordingConnection()), job, settings))
-
-    thread = threading.Thread(target=run_in_thread)
-    thread.start()
-    try:
-        assert persisted_event.wait(timeout=10)
-        pid = persisted[0][1]
-        wait_until(ready_path.exists)
-        cancel_event.set()
-        thread.join(timeout=20)
-        assert not thread.is_alive()
-
-        result = result_box[0]
-        assert result.status == "cancelled"
-        assert result.exit_code == -signal.SIGKILL
-        assert "SIGKILL" in (result.cancellation_note or "")
-        wait_until(lambda: not pid_alive(pid))
-    finally:
-        cancel_event.set()
-        thread.join(timeout=5)
+    sql, params = conn.executions[0]
+    assert isinstance(params, dict)
+    assert params["limit"] == 3
+    assert "LIMIT %(limit)s" in sql
 
 
 def test_request_cancel_cancels_pending_job_without_spawning() -> None:
@@ -558,7 +422,6 @@ def test_request_cancel_marks_running_job() -> None:
     sql, params = conn.executions[1]
     assert "cancel_requested_at" in sql
     assert "'running'" in sql
-    assert "payload::jsonb" in sql
     assert params == (job_id,)
 
 
@@ -572,56 +435,55 @@ def test_request_cancel_leaves_terminal_job_unchanged() -> None:
 
     assert status == "succeeded"
     updates = [sql for sql, _ in conn.executions if "UPDATE" in sql]
-    assert len(updates) == CANCEL_UPDATE_STATEMENTS
-    assert "'pending'" in updates[0]
-    assert "'running'" in updates[1]
+    assert len(updates) == 2
 
 
-def test_claim_job_marks_job_running() -> None:
-    """claim_job marks the job running and returns it for execution."""
+def test_bulk_refresh_leases_refreshes_owned_running_rows() -> None:
+    """One statement refreshes every owned running command row."""
     conn = _RecordingConnection()
-    job_id = uuid4()
-    claimed_payload = json.dumps({
-        "v": 1,
-        "type": "command",
-        "request": {"cwd": "/workspace", "command": "echo hi"},
-        "state": {"status": "running"},
-    })
-    conn.rows = [(job_id, claimed_payload)]
+    job_ids = [uuid4(), uuid4()]
+    conn.rows = [(job_ids[0],), (job_ids[1],)]
     settings = make_settings()
 
-    claimed = claim_job(as_db(conn), settings)
+    refreshed = bulk_refresh_leases(as_db(conn), settings)
 
-    assert claimed is not None
-    assert claimed.id == job_id
-    assert isinstance(claimed.payload, str)
-    parsed = parse_payload(claimed.payload)
-    assert parsed.request.cwd == "/workspace"
-    assert parsed.request.command == "echo hi"
-    assert parsed.status == "running"
+    assert refreshed == job_ids
     sql, params = conn.executions[0]
-    assert "{state,status}" in sql
-    assert "'running'" in sql
-    assert "'pending'" in sql
-    assert "FOR UPDATE SKIP LOCKED" in sql
-    assert "payload::jsonb" in sql
-    assert "::text" in sql
-    assert "{state,worker_incarnation}" in sql
-    assert "{state,lease_expires_at}" in sql
+    assert "lease_expires_at" in sql
     assert "make_interval" in sql
-    assert params == (
-        settings.worker_id,
-        settings.worker_incarnation,
-        settings.lease_duration_seconds,
-    )
+    assert "(payload::jsonb)->>'type' = 'command'" in sql
+    assert "status' = 'running'" in sql
+    assert "worker_id" in sql
+    assert "worker_incarnation" in sql
+    assert isinstance(params, dict)
+    assert params["lease_duration_seconds"] == settings.lease_duration_seconds
+    assert params["worker_id"] == settings.worker_id
+
+
+def test_discover_cancellations_queries_owned_running_markers() -> None:
+    """Cancellation discovery reads owned running jobs in a bounded batch."""
+    conn = _RecordingConnection()
+    job_id = uuid4()
+    conn.rows = [(job_id,)]
+    settings = make_settings()
+
+    found = discover_cancellations(as_db(conn), settings)
+
+    assert found == [job_id]
+    sql, params = conn.executions[0]
+    assert "cancel_requested_at" in sql
+    assert "(payload::jsonb)->>'type' = 'command'" in sql
+    assert "LIMIT %(limit)s" in sql
+    assert isinstance(params, dict)
+    assert params["limit"] == 100
 
 
 def test_recover_stale_jobs_marks_failed_with_diagnostic() -> None:
-    """recover_stale_jobs atomically fails expired-lease running jobs."""
+    """recover_stale_jobs atomically fails expired-lease running command rows."""
     conn = _RecordingConnection()
     job_id = uuid4()
     recovered_payload = json.dumps({
-        "v": 1,
+        "v": 2,
         "type": "command",
         "request": {"cwd": "/workspace", "command": "sleep 30"},
         "state": {
@@ -638,14 +500,13 @@ def test_recover_stale_jobs_marks_failed_with_diagnostic() -> None:
     assert recovered == [(job_id, recovered_payload)]
     sql, params = conn.executions[0]
     assert "WITH stale AS" in sql
+    assert "(payload::jsonb)->>'type' = 'command'" in sql
     assert "'running'" in sql
     assert "lease_expires_at" in sql
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "'failed'" in sql
     assert "{state,recovered_at}" in sql
     assert "recovery_note" in sql
-    assert "payload::jsonb" in sql
-    assert "::text" in sql
     assert params == {"limit": 100}
 
 
@@ -657,120 +518,6 @@ def test_recover_stale_jobs_returns_empty_when_none_stale() -> None:
 
     assert recovered == []
     assert len(conn.executions) == 1
-
-
-def test_process_jobs_runs_recovery_pass(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The processing loop runs a recovery pass before claiming."""
-    conn = _RecordingConnection()
-    calls: list[str] = []
-
-    def recording_recover(_conn: object) -> list[object]:
-        calls.append("recover")
-        return []
-
-    def stop(_conn: object, _settings: Settings) -> bool:
-        calls.append("claim")
-        raise SystemExit(0)
-
-    monkeypatch.setattr("lubko.worker.recover_stale_jobs", recording_recover)
-    monkeypatch.setattr("lubko.worker.claim_and_process_one", stop)
-
-    with pytest.raises(SystemExit):
-        process_jobs(as_db(conn), make_settings(lease_recovery_interval_seconds=1.0))
-
-    assert calls == ["recover", "claim"]
-
-
-def test_settings_reads_lease_environment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The lease timing is configurable through environment variables."""
-    monkeypatch.setenv("LUBKO_LEASE_DURATION_SECONDS", "12.5")
-    monkeypatch.setenv("LUBKO_LEASE_REFRESH_INTERVAL_SECONDS", "2.5")
-    monkeypatch.setenv("LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS", "4.5")
-
-    settings = Settings.from_environment()
-
-    assert settings.lease_duration_seconds == pytest.approx(12.5)
-    assert settings.lease_refresh_interval_seconds == pytest.approx(2.5)
-    assert settings.lease_recovery_interval_seconds == pytest.approx(4.5)
-
-
-def test_settings_defaults_and_unique_incarnation() -> None:
-    """Settings default to the documented lease values and unique incarnations."""
-    first = Settings.from_environment()
-    second = Settings.from_environment()
-
-    assert first.lease_duration_seconds == DEFAULT_LEASE_DURATION_SECONDS
-    assert first.lease_refresh_interval_seconds == DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
-    assert first.lease_recovery_interval_seconds == DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
-    assert first.worker_incarnation
-    assert first.worker_incarnation != second.worker_incarnation
-
-
-def test_settings_rejects_refresh_at_least_lease() -> None:
-    """A refresh interval at or above the lease duration is refused."""
-    with pytest.raises(ValueError, match="smaller than"):
-        Settings(
-            worker_id="w",
-            poll_interval_seconds=1.0,
-            process_poll_interval_seconds=0.1,
-            cancel_grace_seconds=5.0,
-            max_output_bytes=1024,
-            lease_duration_seconds=5.0,
-            lease_refresh_interval_seconds=5.0,
-            lease_recovery_interval_seconds=1.0,
-        )
-
-
-def test_running_job_refreshes_its_lease(tmp_path: Path) -> None:
-    """A running job heartbeats its lease until it finishes."""
-    conn = _RecordingConnection()
-    job = Job(id=uuid4(), cwd=str(tmp_path), command="sleep 0.5", args=None)
-    settings = make_settings(
-        process_poll_interval_seconds=0.02,
-        lease_refresh_interval_seconds=0.05,
-    )
-
-    result = run_job(as_db(conn), job, settings)
-
-    assert result.status == "succeeded"
-    lease_updates = [(sql, params) for sql, params in conn.executions if "lease_expires_at" in sql]
-    assert len(lease_updates) >= MIN_LEASE_HEARTBEATS
-    for sql, params in lease_updates:
-        assert "make_interval" in sql
-        assert params == (settings.lease_duration_seconds, job.id)
-
-
-def test_claim_and_process_one_fails_unparseable_payload() -> None:
-    """A claimed job with an invalid payload is failed without executing it."""
-    conn = _RecordingConnection()
-    job_id = uuid4()
-    conn.rows = [(job_id, "{not json"), ("failed",)]
-
-    processed = claim_and_process_one(as_db(conn), make_settings())
-
-    assert processed is True
-    updates = [(sql, params) for sql, params in conn.executions if "UPDATE" in sql]
-    assert len(updates) == CLAIM_AND_FINISH_UPDATE_STATEMENTS
-    finish_params = updates[1][1]
-    assert isinstance(finish_params, dict)
-    assert finish_params["status"] == "failed"
-    assert finish_params["exit_code"] == PROTOCOL_ERROR_EXIT_CODE
-    assert "invalid job payload" in finish_params["stderr"]
-
-
-def test_claim_and_process_one_returns_false_when_queue_empty() -> None:
-    """An empty queue is reported without any writes past the claim query."""
-    conn = _RecordingConnection()
-
-    processed = claim_and_process_one(as_db(conn), make_settings())
-
-    assert processed is False
-    assert len(conn.executions) == 1
-    assert "RETURNING job.id" in conn.executions[0][0]
 
 
 def test_finish_job_persists_success_result() -> None:
@@ -793,14 +540,11 @@ def test_finish_job_persists_success_result() -> None:
     assert "CASE" in sql
     assert "jsonb_build_object" in sql
     assert "'running'" in sql
-    assert "payload::jsonb" in sql
     assert "::text" in sql
     assert isinstance(params, dict)
     assert params["status"] == "succeeded"
     assert params["stdout"] == "hi\n"
-    assert not params["stderr"]
     assert params["exit_code"] == 0
-    assert params["cancellation_note"] is None
 
 
 def test_finish_job_persists_cancellation_result() -> None:
@@ -813,7 +557,7 @@ def test_finish_job_persists_cancellation_result() -> None:
         exit_code=-signal.SIGTERM,
         stdout="",
         stderr="",
-        cancellation_note="cancelled: sent SIGTERM to process group",
+        cancellation_note="cancelled by request",
     )
 
     status = finish_job(as_db(conn), job_id, result)
@@ -821,48 +565,280 @@ def test_finish_job_persists_cancellation_result() -> None:
     assert status == "cancelled"
     sql, params = conn.executions[0]
     assert "CASE" in sql
-    assert "jsonb_build_object" in sql
-    assert "payload::jsonb" in sql
-    assert "::text" in sql
     assert isinstance(params, dict)
     assert params["status"] == "cancelled"
-    assert params["exit_code"] == -signal.SIGTERM
-    assert params["cancellation_note"] == "cancelled: sent SIGTERM to process group"
+    assert params["cancellation_note"] == "cancelled by request"
 
 
-def test_finish_job_builds_result_atomically_as_json_object() -> None:
-    """finish_job assembles the whole result in one jsonb_build_object.
-
-    A per-field jsonb_set path ending in ``to_jsonb(NULL)`` would make the
-    whole update SQL NULL and violate the payload NOT NULL constraint. The
-    result parent must also be created when absent, so only the ``{result}``
-    path is written.
-    """
+def test_delete_job_and_chunks_uses_explicit_ownership() -> None:
+    """Cleanup deletes the root and every explicitly owned chunk by thread."""
     conn = _RecordingConnection()
-    conn.rows = [("succeeded",)]
     job_id = uuid4()
-    result = JobResult(
-        status="succeeded",
-        exit_code=0,
-        stdout="out\n",
-        stderr="err\n",
-        cancellation_note=None,
-    )
 
-    finish_job(as_db(conn), job_id, result)
+    delete_job_and_chunks(as_db(conn), job_id)
 
-    result_path = "'{" + "result" + "}'"
-    field_paths = [
-        "'{" + "result,stdout" + "}'",
-        "'{" + "result,stderr" + "}'",
-        "'{" + "result,exit_code" + "}'",
-        "'{" + "result,cancellation_note" + "}'",
-    ]
     sql, params = conn.executions[0]
-    assert "jsonb_build_object" in sql
-    assert result_path in sql
-    for path in field_paths:
-        assert path not in sql
-    assert "::text" in sql
+    assert "output_chunk" in sql
+    assert "thread" in sql
     assert isinstance(params, dict)
-    assert params["cancellation_note"] is None
+    assert params["job_id"] == job_id
+    assert params["thread"] == str(job_id)
+
+
+def test_publish_output_writes_bounded_tail_for_short_output(
+    tmp_path: Path,
+) -> None:
+    """Short output produces a full tail and no immutable chunks."""
+    job = make_active_job(tmp_path)
+    job.stdout.path.write_bytes(b"hello world")
+    conn = _RecordingConnection()
+
+    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    assert job.stdout.tail_text == "hello world"
+    assert job.stdout.tail_start == 0
+    assert job.stdout.tail_end == 11
+    assert job.stdout.archived_upto == 0
+    inserts = [sql for sql, _ in conn.executions if sql.startswith("INSERT")]
+    updates = [(sql, params) for sql, params in conn.executions if "UPDATE" in sql]
+    assert inserts == []
+    assert len(updates) == 1
+    _, params = updates[0]
+    assert isinstance(params, dict)
+    window = json.loads(cast("str", params["output"]))["stdout"]
+    assert window["tail"] == "hello world"
+    assert window["start"] == 0
+    assert window["end"] == 11
+    assert window["previous"] is None
+
+
+def test_publish_output_archives_immutable_chunks(tmp_path: Path) -> None:
+    """Large output creates contiguous chunks and a 4000-character live tail."""
+    job = make_active_job(tmp_path)
+    job.stdout.path.write_bytes(b"x" * 9000)
+    conn = _RecordingConnection()
+
+    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    assert job.stdout.tail_text == "x" * OUTPUT_TAIL_MAX_CHARS
+    assert job.stdout.tail_start == 5000
+    assert job.stdout.tail_end == 9000
+    assert job.stdout.sequence == 3
+    inserts = [sql for sql, _ in conn.executions if sql.startswith("INSERT")]
+    assert len(inserts) == 3
+    offsets: list[tuple[int, int, int]] = []
+    previous: UUID | None = None
+    for sql, params in conn.executions:
+        if not sql.startswith("INSERT"):
+            continue
+        assert isinstance(params, tuple)
+        chunk = parse_chunk_payload(params[1])
+        offsets.append((chunk.sequence, chunk.start, chunk.end))
+        if chunk.previous is not None:
+            assert chunk.previous == previous
+        previous = cast("UUID", params[0])
+    assert offsets == [(0, 0, 2000), (1, 2000, 4000), (2, 4000, 6000)]
+    updates = [(sql, params) for sql, params in conn.executions if "UPDATE" in sql]
+    assert len(updates) == 1
+    _, params = updates[0]
+    assert isinstance(params, dict)
+    window = json.loads(cast("str", params["output"]))["stdout"]
+    assert window["previous"] == str(previous)
+
+
+def test_publish_output_rotation_never_shortens_the_live_tail(
+    tmp_path: Path,
+) -> None:
+    """Archival rotation never shortens the live tail across publications."""
+    job = make_active_job(tmp_path)
+    conn = _RecordingConnection()
+    observed_lengths: list[int] = []
+
+    def write_and_publish(size: int) -> None:
+        job.stdout.path.write_bytes(b"y" * size)
+        publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+        observed_lengths.append(len(job.stdout.tail_text))
+        assert job.stdout.tail_end == size
+
+    write_and_publish(2000)
+    write_and_publish(6000)
+    write_and_publish(10000)
+    write_and_publish(14000)
+
+    assert observed_lengths == [2000, 4000, 4000, 4000]
+    assert job.stdout.tail_start == 10000
+    assert job.stdout.tail_end == 14000
+    inserts = [sql for sql, _ in conn.executions if sql.startswith("INSERT")]
+    assert len(inserts) == 6
+    sequences = [
+        parse_chunk_payload(cast("tuple[object, object]", params)[1]).sequence
+        for sql, params in conn.executions
+        if sql.startswith("INSERT")
+    ]
+    assert sequences == [0, 1, 2, 3, 4, 5]
+
+
+def test_publish_output_failed_transaction_does_not_advance_state(
+    tmp_path: Path,
+) -> None:
+    """A failed transaction never advances in-memory publication state."""
+    job = make_active_job(tmp_path)
+    job.stdout.path.write_bytes(b"z" * 9000)
+    failing = _FailingConnection(lambda sql: sql.startswith("UPDATE"))
+
+    with pytest.raises(psycopg.Error):
+        publish_output(as_db(failing), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    assert job.stdout.published_size == 0
+    assert not job.stdout.tail_text
+    assert job.stdout.sequence == 0
+    assert job.stdout.archived_upto == 0
+    assert job.stdout.last_chunk is None
+
+    conn = _RecordingConnection()
+    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+    assert job.stdout.tail_end == 9000
+    assert job.stdout.sequence == 3
+
+
+def test_settings_reads_lease_and_output_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lease, publication, and fairness settings come from the environment."""
+    monkeypatch.setenv("LUBKO_LEASE_DURATION_SECONDS", "12.5")
+    monkeypatch.setenv("LUBKO_LEASE_REFRESH_INTERVAL_SECONDS", "2.5")
+    monkeypatch.setenv("LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS", "4.5")
+    monkeypatch.setenv("LUBKO_OUTPUT_PUBLICATION_INTERVAL_SECONDS", "0.7")
+    monkeypatch.setenv("LUBKO_CLAIM_BATCH_LIMIT", "16")
+    monkeypatch.setenv("LUBKO_LEASE_SAFETY_MARGIN_SECONDS", "3.5")
+    monkeypatch.setenv("LUBKO_DB_OPERATION_TIMEOUT_SECONDS", "8.5")
+
+    settings = Settings.from_environment()
+
+    assert settings.lease_duration_seconds == pytest.approx(12.5)
+    assert settings.lease_refresh_interval_seconds == pytest.approx(2.5)
+    assert settings.lease_recovery_interval_seconds == pytest.approx(4.5)
+    assert settings.output_publication_interval_seconds == pytest.approx(0.7)
+    assert settings.claim_batch_limit == 16
+    assert settings.lease_safety_margin_seconds == pytest.approx(3.5)
+    assert settings.db_operation_timeout_seconds == pytest.approx(8.5)
+
+
+def test_settings_defaults_and_unique_incarnation() -> None:
+    """Settings default to the documented values and unique incarnations."""
+    first = Settings.from_environment()
+    second = Settings.from_environment()
+
+    assert first.lease_duration_seconds == DEFAULT_LEASE_DURATION_SECONDS
+    assert first.lease_refresh_interval_seconds == DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
+    assert first.lease_recovery_interval_seconds == DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
+    assert first.worker_incarnation
+    assert first.worker_incarnation != second.worker_incarnation
+
+
+def test_settings_rejects_refresh_at_least_lease() -> None:
+    """A refresh interval at or above the lease duration is refused."""
+    with pytest.raises(ValueError, match="smaller than"):
+        Settings(
+            worker_id="w",
+            poll_interval_seconds=1.0,
+            process_poll_interval_seconds=0.1,
+            cancel_grace_seconds=5.0,
+            lease_duration_seconds=5.0,
+            lease_refresh_interval_seconds=5.0,
+            lease_recovery_interval_seconds=1.0,
+        )
+
+
+def test_settings_rejects_unsafe_lease_margin() -> None:
+    """A lease safety margin at or above the lease duration is refused."""
+    with pytest.raises(ValueError, match="LEASE_SAFETY_MARGIN"):
+        Settings(
+            worker_id="w",
+            poll_interval_seconds=1.0,
+            process_poll_interval_seconds=0.1,
+            cancel_grace_seconds=5.0,
+            lease_duration_seconds=5.0,
+            lease_refresh_interval_seconds=1.0,
+            lease_recovery_interval_seconds=1.0,
+            lease_safety_margin_seconds=5.0,
+        )
+
+
+def test_settings_rejects_claim_batch_limit_zero() -> None:
+    """A zero claim batch limit is refused."""
+    with pytest.raises(ValueError, match="CLAIM_BATCH_LIMIT"):
+        Settings(
+            worker_id="w",
+            poll_interval_seconds=1.0,
+            process_poll_interval_seconds=0.1,
+            cancel_grace_seconds=5.0,
+            claim_batch_limit=0,
+        )
+
+
+def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
+    """request_stop terminates the exact recorded process group once."""
+    shell = resolve_shell()
+    assert shell is not None
+    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+        Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell
+    )
+    guard.register(proc)
+    try:
+        job = ActiveJob(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            command="sleep 30",
+            args=None,
+            proc=proc,
+            pid=proc.pid,
+            pgid=pgid,
+            started_mono=time.monotonic(),
+        )
+        request_stop(job, "cancel")
+        assert job.term_sent
+        assert job.stop_started is not None
+        proc.wait(timeout=10)
+        guard.unregister(proc)
+    finally:
+        if proc.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            proc.wait(timeout=5)
+
+
+def test_signal_kill_appends_diagnostic(tmp_path: Path) -> None:
+    """signal_kill records the SIGKILL escalation in the cancellation note."""
+    proc = subprocess.Popen(
+        ["/bin/sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    try:
+        job = ActiveJob(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            command="sleep 300",
+            args=None,
+            proc=proc,
+            pid=proc.pid,
+            pgid=proc.pid,
+            started_mono=time.monotonic(),
+        )
+        request_stop(job, "cancel")
+        note_before = job.cancellation_note
+        signal_kill(job)
+        assert "SIGTERM" in (note_before or "")
+        assert job.kill_sent
+        assert "SIGKILL" in (job.cancellation_note or "")
+        proc.wait(timeout=10)
+        guard.unregister(proc)
+    finally:
+        if proc.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)

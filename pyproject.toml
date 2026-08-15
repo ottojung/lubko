@@ -83,6 +83,7 @@ convention = "google"
 ]
 "tests/**/*.py" = [
     "assert",
+    "magic-value-comparison",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
