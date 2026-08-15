@@ -322,16 +322,7 @@ where id in ('<JOB A UUID>', '<JOB B UUID>');
 ```
 
 Each row remains bounded and contains a useful recent live tail. When many
-parallel jobs exist, poll them in bounded batches of IDs rather than one
-unbounded `select`.
-
-A Supabase job that launches an asynchronous Lubko agent may finish quickly while the agent itself continues running. In that case, use the returned **Lubko agent ID** for subsequent observation and control.
-
-This distinction is important:
-
-```text
-Supabase job lifecycle != Lubko agent lifecycle
-```
+parallel jobs exist, this is very useful.
 
 ---
 
