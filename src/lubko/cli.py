@@ -297,6 +297,31 @@ def set_current(commit: str) -> None:
         raise CliError(msg) from exc
 
 
+def reconcile_pointer(commit: str) -> bool:
+    """Idempotently repair the active pointer so it selects one commit.
+
+    The switch happens only when the commit's environment is already usable, so
+    a repair never activates an incomplete root and never touches a provisional
+    candidate that is not yet the confirmed commit.
+
+    Args:
+        commit: Exact commit hash the pointer should select.
+
+    Returns:
+        ``True`` when the pointer now selects the commit (already did, or was
+        repaired), ``False`` when the environment is missing or unusable.
+    """
+    if current_commit() == commit:
+        return True
+    if not _root_is_usable(commit):
+        return False
+    try:
+        set_current(commit)
+    except CliError:
+        return False
+    return True
+
+
 def remove_cli_root(commit: str) -> None:
     """Remove one commit's CLI environment if it is not the active one.
 

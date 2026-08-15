@@ -288,22 +288,26 @@ resolved executable is used to run validation (`uv sync`, `ruff`, `mypy`,
 `lubko-deploy deploy`:
 
 1. acquires an exclusive deployment lock so two deploys cannot race;
-2. validates the checkout by running `uv sync` followed by
+2. requires a clean checkout (`git status --porcelain` empty). The worker runs
+   from the checkout and the maintained CLIs are built from the committed
+   HEAD, so a dirty tree would make the worker execute working-tree code while
+   the CLIs come from HEAD; deployment is refused until the tree is clean;
+3. validates the checkout by running `uv sync` followed by
    `ruff format --check`, `ruff check`, `mypy`, and `pytest`. If any command
    fails, deployment is refused and the current worker is left untouched;
-3. reads the git commit of the checkout — it never pulls, resets, stashes, or
+4. reads the git commit of the checkout — it never pulls, resets, stashes, or
    otherwise mutates git state;
-4. prepares the maintained CLI environment for that exact commit, refusing the
+5. prepares the maintained CLI environment for that exact commit, refusing the
    deployment if it cannot be built so the global CLIs never go stale;
-5. starts the replacement worker detached from the invoking shell as its own
+6. starts the replacement worker detached from the invoking shell as its own
    session and process-group leader, appending its output to `worker.log`;
-6. verifies the replacement is alive with an exact identity match and can reach
+7. verifies the replacement is alive with an exact identity match and can reach
    PostgreSQL with a bounded timeout, rather than merely spawning it. On
    verification failure the replacement is stopped and the previous worker is
    left untouched;
-7. stops the previous maintained worker using its recorded PID/process-group/
+8. stops the previous maintained worker using its recorded PID/process-group/
    session identity: `SIGTERM`, then a bounded `SIGKILL` while members remain;
-8. atomically records the new worker's identity and the deployed commit, then
+9. atomically records the new worker's identity and the deployed commit, then
    activates the maintained CLI environment for that commit, and reports the
    deployed git commit.
 

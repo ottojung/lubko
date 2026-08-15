@@ -639,6 +639,33 @@ def git_commit(repo: Path, timeout_seconds: float) -> str | None:
     return commit or None
 
 
+def require_clean_checkout(repo: Path, timeout_seconds: float) -> bool:
+    """Return whether a checkout has no uncommitted working-tree changes.
+
+    ``lubko-deploy deploy`` runs the worker from the checkout and builds the
+    maintained CLIs from the committed HEAD, so the checkout must be clean for
+    the worker and the CLIs to really run the same exact code. Any tracked
+    modification, staged change, or untracked file (outside ``.gitignore``)
+    counts as dirty.
+
+    Args:
+        repo: Repository checkout to inspect.
+        timeout_seconds: Bounded timeout.
+
+    Returns:
+        ``True`` when the checkout is clean, ``False`` when dirty or unreadable.
+    """
+    try:
+        proc = _run_capture(
+            repo, ("git", "status", "--porcelain"), dict(os.environ), timeout_seconds
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    return not proc.stdout
+
+
 # ---------------------------------------------------------------------------
 # PostgreSQL readiness
 # ---------------------------------------------------------------------------
@@ -889,6 +916,12 @@ def _validate_and_prepare(options: DeployOptions) -> str:
     Raises:
         DeployAbortedError: If the checkout is not deployable.
     """
+    if not require_clean_checkout(options.repo, options.git_timeout_seconds):
+        _err(
+            "deployment checkout is dirty; the worker and the maintained CLIs must run the exact "
+            "committed code, so commit or discard working-tree changes first"
+        )
+        raise DeployAbortedError from None
     _out("validating checkout ...")
     report = run_validation(options.repo, options.uv_path, options.validation_timeout_seconds)
     if not report.ok:
@@ -1073,6 +1106,13 @@ def status_cmd() -> int:
     if meta.stopped_at is not None:
         stopped = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(meta.stopped_at))
         _out(f"stopped at: {stopped}")
+    if meta.git_commit is not None:
+        active = cli.current_commit()
+        if active != meta.git_commit:
+            _err(
+                f"warning: maintained CLIs resolve to {active or 'nothing'}, not the maintained "
+                f"worker commit {meta.git_commit}; run lubko-deploy-ctl status to reconcile"
+            )
     return EXIT_OK
 
 

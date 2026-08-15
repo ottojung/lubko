@@ -813,6 +813,7 @@ def _handle_checkout(options: Options, request: dict[str, object]) -> dict[str, 
         raise DeployCtlError("checkout request requires string field 'commit'")
     try:
         with deploy_lock(options.lock_timeout_seconds):
+            _reconcile_cli(_read_state())
             state = _deploy_locked(options, commit)
             response = _candidate_response(state)
             try:
@@ -840,6 +841,49 @@ def _challenge_digest(challenge: str) -> str:
         Hex SHA-256 digest.
     """
     return hashlib.sha256(challenge.encode()).hexdigest()
+
+
+def _cli_target_commit(state: RollbackState | None) -> str | None:
+    """Return the commit the global CLIs must resolve to right now.
+
+    A pending mission is deliberately ignored: while a candidate is
+    provisional the pointer must stay on the previous confirmed commit, so a
+    repair never activates candidate code before confirmation.
+
+    Args:
+        state: Current supervised-deployment state, or ``None``.
+
+    Returns:
+        The exact commit the CLI pointer should select, or ``None``.
+    """
+    if state is None:
+        meta = read_meta()
+        return None if meta is None else meta.git_commit
+    if state.status == STATUS_PENDING:
+        return state.previous_commit
+    if state.status == STATUS_CONFIRMED:
+        return state.commit
+    return state.previous_commit
+
+
+def _reconcile_cli(state: RollbackState | None) -> None:
+    """Idempotently repair a stale maintained CLI pointer.
+
+    A crash after durable ``confirmed`` state is written but before the CLI
+    pointer is switched leaves a permanently confirmed worker with stale CLIs.
+    Every controller invocation that observes deployment state runs this
+    repair: the pointer is moved to the confirmed commit only when that
+    commit's environment is already usable, and never towards a provisional
+    candidate.
+
+    Args:
+        state: Current supervised-deployment state, or ``None``.
+    """
+    target = _cli_target_commit(state)
+    if target is None:
+        return
+    if cli.reconcile_pointer(target):
+        append_deploy_log(f"reconciled maintained CLI pointer to commit {target}")
 
 
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
@@ -937,6 +981,7 @@ def _handle_status(options: Options) -> dict[str, object]:
                     _rollback_locked(state)
                     state = _read_state()
             meta = read_meta()
+            _reconcile_cli(state)
     except LockTimeoutError as exc:
         raise DeployCtlError("timed out waiting for the deployment lock") from exc
     if state is None:

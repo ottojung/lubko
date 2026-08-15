@@ -458,3 +458,98 @@ def test_checkout_aborts_and_restores_when_candidate_cli_build_fails(
     preserved_meta = read_meta()
     assert preserved_meta is not None
     assert preserved_meta.git_commit == first
+
+
+def test_status_reconciles_stale_confirmed_pointer(
+    coherent_environment: tuple[Path, str, str, Path],
+) -> None:
+    """A crash after confirmed state but before the CLI switch is repaired."""
+    repo, first, second, bin_dir = coherent_environment
+    confirmed = replace(
+        pending_state(repo=str(repo), old=first, new=second),
+        status=dc.STATUS_CONFIRMED,
+    )
+    dc._write_state(confirmed)
+    write_meta(worker_meta(second, pid=200, repo=str(repo)))
+
+    assert cli.current_commit() == first
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+
+    result = dc._handle_status(make_options(repo))
+
+    assert result["phase"] == "idle"
+    assert cli.current_commit() == second
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{second}"
+    repaired = dc._read_state()
+    assert repaired is not None
+    assert repaired.status == dc.STATUS_CONFIRMED
+
+
+def test_status_reconciles_plain_deploy_crash(
+    coherent_environment: tuple[Path, str, str, Path],
+) -> None:
+    """A plain-deploy crash (meta ahead of the CLI pointer) is repaired."""
+    repo, first, second, bin_dir = coherent_environment
+    write_meta(worker_meta(second, pid=200, repo=str(repo)))
+
+    assert cli.current_commit() == first
+    dc._handle_status(make_options(repo))
+
+    assert cli.current_commit() == second
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{second}"
+
+
+def test_status_never_reconciles_to_a_pending_candidate(
+    coherent_environment: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While a mission is pending the pointer stays on the previous commit."""
+    repo, first, second, bin_dir = coherent_environment
+    state = pending_state(repo=str(repo), old=first, new=second)
+    dc._write_state(state)
+    write_meta(worker_meta(first, pid=100, repo=str(repo)))
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    cli.set_current(second)
+
+    dc._handle_status(make_options(repo))
+
+    assert cli.current_commit() == first
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+
+
+def test_rollback_keeps_previous_root_and_drops_candidate_root(
+    coherent_environment: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback retains the previous environment and removes the candidate's."""
+    repo, first, second, bin_dir = coherent_environment
+    state = pending_state(repo=str(repo), old=first, new=second)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+    patch_rollback_dependencies(monkeypatch)
+
+    assert dc._rollback_locked(state) is True
+
+    assert cli.current_commit() == first
+    assert cli.cli_commit_dir(first).is_dir()
+    assert not cli.cli_commit_dir(second).exists()
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+
+
+def test_rollback_without_staged_candidate_root_succeeds(
+    coherent_environment: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old watchdog that never staged a candidate root still rolls back."""
+    repo, first, second, bin_dir = coherent_environment
+    cli.remove_cli_root(second)
+    state = pending_state(repo=str(repo), old=first, new=second)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+    patch_rollback_dependencies(monkeypatch)
+
+    assert dc._rollback_locked(state) is True
+
+    assert cli.current_commit() == first
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+    rolled_back = dc._read_state()
+    assert rolled_back is not None
+    assert rolled_back.status == dc.STATUS_ROLLED_BACK

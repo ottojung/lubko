@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from typing import TYPE_CHECKING, Final
+import tomllib
+from pathlib import Path
+from typing import Final
 
 import pytest
 
 from lubko import cli
 from lubko.state import cli_root_dir, state_root
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 GIT_AUTHOR: Final = "lubko-test"
 GIT_EMAIL: Final = "lubko-test@example.com"
@@ -124,6 +123,15 @@ def two_commit_repo(tmp_path: Path) -> tuple[Path, str, str]:
 def test_current_commit_is_none_without_link() -> None:
     """No active commit is reported before any pointer exists."""
     assert cli.current_commit() is None
+
+
+def test_entry_points_match_pyproject() -> None:
+    """Every pyproject console script is a maintained entry point."""
+    project_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
+    scripts = set(pyproject["project"]["scripts"])
+    assert scripts == set(cli.ENTRY_POINTS)
+    assert "lubko-deploy-ctl" in cli.ENTRY_POINTS
 
 
 def test_set_current_switches_atomically() -> None:
@@ -258,6 +266,37 @@ def test_remove_cli_root_skips_the_active_commit(
     assert cli.cli_commit_dir(first).is_dir()
     cli.remove_cli_root(second)
     assert not cli.cli_commit_dir(second).exists()
+
+
+def test_reconcile_pointer_repairs_a_stale_pointer(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reconcile_pointer idempotently repairs the active pointer."""
+    repo, first, second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    cli.set_current(first)
+
+    assert cli.reconcile_pointer(second) is True
+    assert cli.current_commit() == second
+    assert cli.reconcile_pointer(second) is True
+    assert cli.current_commit() == second
+
+
+def test_reconcile_pointer_refuses_missing_root(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reconcile_pointer never activates a commit without a usable root."""
+    repo, first, second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.set_current(first)
+
+    assert cli.reconcile_pointer(second) is False
+    assert cli.current_commit() == first
 
 
 def test_launcher_source_embeds_state_root() -> None:

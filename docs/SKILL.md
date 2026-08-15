@@ -1481,8 +1481,12 @@ global command resolves to exactly the maintained commit. The global commands
 never become stale after a version-changing deployment: `lubko-deploy deploy`
 and the supervised `lubko-deploy-ctl` protocol build and activate the CLI
 environment for the confirmed commit themselves, switching only an atomic
-`current` pointer and never rewriting the launchers. `my-lubko-agent` remains
-available as a transition alias for the same `lubko-agent` interface.
+`current` pointer and never rewriting the launchers. `lubko-deploy-ctl
+status`/`checkout` also reconcile a stale pointer idempotently, so a process
+crash between durable confirmation and the pointer switch can never leave a
+confirmed worker with stale CLIs (and never points the CLIs at a provisional
+candidate). `my-lubko-agent` remains available as a transition alias for the
+same `lubko-agent` interface.
 
 The exact `uv` executable a successful install used is recorded in
 `$XDG_STATE_HOME/lubko/toolchain.json`, so `lubko-deploy deploy` keeps working
