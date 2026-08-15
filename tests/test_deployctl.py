@@ -9,14 +9,19 @@ rollback/failure path preserves the prior confirmed CLI version.
 from __future__ import annotations
 
 import os
+import shutil
+import signal
 import subprocess
+import sys
 import time
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from lubko import cli
+from lubko import cli, lifecycle
 from lubko import deployctl as dc
 from lubko.lifecycle import (
     SCHEMA_VERSION,
@@ -24,9 +29,21 @@ from lubko.lifecycle import (
     ValidationReport,
     WorkerMeta,
     read_meta,
+    worker_alive,
     write_meta,
 )
+from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
+
+if TYPE_CHECKING:
+    from lubko.lifecycle import ProcessIdentity
+
+SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
+LINGER_SOURCE: Final = (
+    "import signal,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(300)\n"
+)
+RETIRING_MARKER: Final = "retiring-worker"
+CANDIDATE_MARKER: Final = "candidate-worker"
 
 
 def worker_meta(commit: str, *, pid: int = 100, repo: str = "/workspace/Lubko") -> WorkerMeta:
@@ -62,6 +79,7 @@ def pending_state(
     repo: str = "/workspace/Lubko",
     old: str = "1" * 40,
     new: str = "2" * 40,
+    previous_retiring: bool = False,
 ) -> dc.RollbackState:
     """Return a live pending deployment state.
 
@@ -69,6 +87,7 @@ def pending_state(
         repo: Repository recorded in the state.
         old: Previous confirmed commit.
         new: Proposed candidate commit.
+        previous_retiring: Whether the previous worker's retirement has begun.
 
     Returns:
         A pending rollback state with distinct old/new commits.
@@ -84,6 +103,7 @@ def pending_state(
         uv_path="uv",
         stop_grace_seconds=1.0,
         git_timeout_seconds=5.0,
+        previous_retiring=previous_retiring,
         previous_meta=worker_meta(old, pid=100, repo=repo),
         new_meta=worker_meta(new, pid=200, repo=repo),
     )
@@ -122,6 +142,162 @@ def run_launcher(path: Path) -> str:
     """
     proc = subprocess.run([str(path)], capture_output=True, text=True, check=True)
     return proc.stdout.strip()
+
+
+def spawn_real_process(token: str) -> subprocess.Popen[bytes]:
+    """Spawn a real long-lived session-leader process owned by the guard.
+
+    Args:
+        token: Lifecycle token placed in the process environment.
+
+    Returns:
+        The spawned process, registered for deterministic teardown.
+    """
+    env = dict(os.environ)
+    env[lifecycle.LIFECYCLE_MARKER_VAR] = token
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    guard.register(proc)
+    return proc
+
+
+def spawn_lingering_previous() -> subprocess.Popen[bytes]:
+    """Spawn a real process that lingers through SIGTERM, simulating shutdown.
+
+    The process ignores SIGTERM so it stays alive through the graceful-stop
+    grace period: a previous worker that is in the middle of retiring but not
+    yet gone. It is registered with the process guard for deterministic
+    teardown.
+
+    Returns:
+        The lingering process.
+    """
+    env = dict(os.environ)
+    env[lifecycle.LIFECYCLE_MARKER_VAR] = RETIRING_MARKER
+    proc = subprocess.Popen(
+        [sys.executable, "-c", LINGER_SOURCE],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    guard.register(proc)
+    return proc
+
+
+def wait_identity(proc: subprocess.Popen[bytes]) -> ProcessIdentity:
+    """Wait for a real spawned process to establish its own session.
+
+    Args:
+        proc: The spawned process.
+
+    Returns:
+        The established exact identity.
+    """
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        identity = lifecycle.process_identity(proc.pid)
+        if identity is not None and identity.pgid == proc.pid and identity.sid == proc.pid:
+            return identity
+        time.sleep(0.01)
+    identity = lifecycle.process_identity(proc.pid)
+    assert identity is not None
+    return identity
+
+
+def real_meta(proc: subprocess.Popen[bytes], repo: Path, commit: str, token: str) -> WorkerMeta:
+    """Build running metadata from a real process identity.
+
+    Args:
+        proc: The real spawned process.
+        repo: Repository path to record.
+        commit: Exact commit the process represents.
+        token: Lifecycle token carried by the process.
+
+    Returns:
+        Running metadata anchored on the real PID and start time.
+    """
+    identity = wait_identity(proc)
+    return WorkerMeta(
+        schema_version=SCHEMA_VERSION,
+        state=STATE_RUNNING,
+        pid=identity.pid,
+        pgid=identity.pgid,
+        sid=identity.sid,
+        start_time_ticks=identity.start_time_ticks,
+        token=token,
+        repo=str(repo),
+        git_commit=commit,
+        worker_id="test-worker",
+        log_path=str(lifecycle.worker_log_path()),
+        started_at=time.time(),
+        stopped_at=None,
+    )
+
+
+def kill_proc(proc: subprocess.Popen[bytes]) -> None:
+    """Force-kill a real process by its dedicated group and reap it.
+
+    Args:
+        proc: The owned session-leader process.
+    """
+    if proc.poll() is None:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=5)
+    guard.unregister(proc)
+
+
+def kill_many(procs: list[subprocess.Popen[bytes]]) -> None:
+    """Force-kill and reap every owned session-leader process.
+
+    Args:
+        procs: The owned processes.
+    """
+    for proc in procs:
+        kill_proc(proc)
+
+
+def patch_fresh_worker_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    spawned: list[subprocess.Popen[bytes]],
+) -> None:
+    """Route fresh previous-worker spawns to a real owned process.
+
+    ``_restart_previous`` spawns the restored worker through
+    ``lifecycle.spawn_worker``; here its command is replaced with a real sleep
+    process that is registered with the guard, and the PostgreSQL liveness
+    check is satisfied without a real database.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        spawned: List receiving every fresh worker spawned.
+    """
+    monkeypatch.setattr(lifecycle, "_worker_command", lambda _uv: [SLEEP_BIN, "300"])
+    original_spawn = lifecycle.spawn_worker
+
+    def tracking_spawn(
+        repo: Path,
+        uv_path: str,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> subprocess.Popen[bytes]:
+        proc = original_spawn(repo, uv_path, log_path, env)
+        guard.register(proc)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(dc, "spawn_worker", tracking_spawn)
+    monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
 
 
 @pytest.fixture(autouse=True)
@@ -167,7 +343,7 @@ def patch_rollback_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_rollback_state_round_trip() -> None:
     """Persisted rollback state round-trips without losing process identity."""
-    state = pending_state()
+    state = replace(pending_state(), previous_retiring=True)
 
     dc._write_state(state)
 
@@ -616,3 +792,187 @@ def test_rollback_restores_pointer_off_a_provisional_candidate(
 
     assert cli.current_commit() == first
     assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+
+
+def test_restart_previous_reuses_healthy_previous_before_retirement(
+    tmp_path: Path,
+) -> None:
+    """A never-retired alive previous worker is reused under its exact identity."""
+    proc = spawn_real_process(RETIRING_MARKER)
+    try:
+        previous = real_meta(proc, tmp_path, "1" * 40, RETIRING_MARKER)
+        assert worker_alive(previous)
+        state = replace(
+            pending_state(repo=str(tmp_path)),
+            previous_meta=previous,
+        )
+
+        restored = dc._restart_previous(state)
+
+        assert restored == previous
+        assert restored.pid == previous.pid
+        assert restored.start_time_ticks == previous.start_time_ticks
+        assert proc.poll() is None
+    finally:
+        kill_proc(proc)
+
+
+def test_restart_previous_rejects_lingering_previous_after_retirement_begins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback never accepts a momentarily-alive retiring previous worker."""
+    repo, first, _second = make_repo(tmp_path / "repo")
+    lifecycle.worker_state_dir().mkdir(parents=True, exist_ok=True)
+    lingering = spawn_lingering_previous()
+    spawned: list[subprocess.Popen[bytes]] = []
+    try:
+        previous = real_meta(lingering, repo, first, RETIRING_MARKER)
+        assert worker_alive(previous)
+        state = replace(
+            pending_state(repo=str(repo), old=first, previous_retiring=True),
+            previous_meta=previous,
+            stop_grace_seconds=0.3,
+        )
+        patch_fresh_worker_spawn(monkeypatch, spawned)
+
+        restored = dc._restart_previous(state)
+
+        assert restored is not None
+        assert restored.pid != previous.pid
+        assert restored.git_commit == first
+        assert worker_alive(restored)
+        assert lingering.poll() is not None
+        assert not worker_alive(previous)
+    finally:
+        with suppress(Exception):
+            lingering.wait(timeout=5)
+        kill_many(spawned)
+
+
+def test_deploy_locked_persists_retirement_marker_before_stopping_previous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable retirement marker is written before the previous worker stops."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    previous = worker_meta(first, pid=100, repo=str(repo))
+    written: list[dc.RollbackState] = []
+    stopped: list[WorkerMeta] = []
+    gated_proc: subprocess.Popen[bytes] | None = None
+
+    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
+    monkeypatch.setattr(dc, "read_meta", lambda: previous)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(dc, "_require_exact_commit", lambda *_args: None)
+    monkeypatch.setattr(dc, "_require_clean_checkout", lambda *_args: None)
+
+    def checkout_ok(_repo: Path, _commit: str, _timeout: float, *, force: bool) -> bool:
+        assert not force
+        return True
+
+    monkeypatch.setattr(dc, "_checkout", checkout_ok)
+    monkeypatch.setattr(
+        dc,
+        "run_validation",
+        lambda _repo, _uv, _timeout: ValidationReport(ok=True, detail=""),
+    )
+    monkeypatch.setattr(cli, "build_cli_root", lambda *_args, **_kwargs: Path())
+    monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
+    monkeypatch.setattr(dc, "_fork_watchdog", lambda _timeout: None)
+    monkeypatch.setattr(dc, "_write_state", written.append)
+
+    def record_stop(meta: WorkerMeta, _grace: float) -> bool:
+        stopped.append(meta)
+        return True
+
+    monkeypatch.setattr(dc, "stop_worker", record_stop)
+    monkeypatch.setattr(dc, "_release_gate", lambda _writer: None)
+    monkeypatch.setattr(dc, "_close_gate", lambda _writer: None)
+    monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _meta: True)
+
+    def fake_gated(_options: dc.Options, _commit: str) -> dc.GatedWorker:
+        nonlocal gated_proc
+        gated_proc = subprocess.Popen(
+            [SLEEP_BIN, "300"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        guard.register(gated_proc)
+        return dc.GatedWorker(
+            proc=gated_proc,
+            gate_writer=0,
+            meta=worker_meta(second, pid=200, repo=str(repo)),
+        )
+
+    monkeypatch.setattr(dc, "_spawn_gated_candidate", fake_gated)
+
+    try:
+        result = dc._deploy_locked(make_options(repo), second)
+
+        assert len(written) == 3
+        assert written[0].previous_retiring is False
+        assert written[1].previous_retiring is True
+        assert written[2].previous_retiring is True
+        assert stopped == [previous]
+        assert result.previous_retiring is True
+    finally:
+        if gated_proc is not None:
+            kill_proc(gated_proc)
+
+
+def test_watchdog_rollback_bad_candidate_restores_maintained_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A watchdog rollback leaves previous commit, a live worker, and rolled_back."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+    cli.set_current(first)
+
+    previous_proc = spawn_lingering_previous()
+    candidate_proc = spawn_real_process(CANDIDATE_MARKER)
+    spawned: list[subprocess.Popen[bytes]] = []
+    try:
+        previous_meta = real_meta(previous_proc, repo, first, RETIRING_MARKER)
+        candidate_meta = real_meta(candidate_proc, repo, second, CANDIDATE_MARKER)
+        kill_proc(candidate_proc)
+        assert not worker_alive(candidate_meta)
+        state = replace(
+            pending_state(repo=str(repo), old=first, new=second, previous_retiring=True),
+            previous_meta=previous_meta,
+            new_meta=candidate_meta,
+            stop_grace_seconds=0.3,
+            deadline=time.time() - 1,
+        )
+        dc._write_state(state)
+        patch_fresh_worker_spawn(monkeypatch, spawned)
+
+        dc._watchdog_main(lock_timeout_seconds=1.0)
+
+        rolled = dc._read_state()
+        assert rolled is not None
+        assert rolled.status == dc.STATUS_ROLLED_BACK
+        assert cli.git_commit(repo, 5.0) == first
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+        assert meta.pid == spawned[0].pid
+        assert worker_alive(meta)
+        assert previous_proc.poll() is not None
+        assert cli.current_commit() == first
+        assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+        assert not cli.cli_commit_dir(second).exists()
+    finally:
+        with suppress(Exception):
+            previous_proc.wait(timeout=5)
+        with suppress(Exception):
+            candidate_proc.wait(timeout=5)
+        kill_many(spawned)

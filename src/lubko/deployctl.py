@@ -130,6 +130,7 @@ class RollbackState:
     uv_path: str
     stop_grace_seconds: float
     git_timeout_seconds: float
+    previous_retiring: bool
     previous_meta: WorkerMeta
     new_meta: WorkerMeta
 
@@ -150,6 +151,7 @@ class RollbackState:
             "uv_path": self.uv_path,
             "stop_grace_seconds": self.stop_grace_seconds,
             "git_timeout_seconds": self.git_timeout_seconds,
+            "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
             "new_meta": self.new_meta.to_dict(),
         }
@@ -183,6 +185,7 @@ class RollbackState:
                 uv_path=str(data["uv_path"]),
                 stop_grace_seconds=float(data["stop_grace_seconds"]),
                 git_timeout_seconds=float(data["git_timeout_seconds"]),
+                previous_retiring=data.get("previous_retiring", False) is True,
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
             )
@@ -575,17 +578,30 @@ def _self_finalize_checkout(response: dict[str, object]) -> None:
 def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     """Restore the previous known-good worker process.
 
+    A previous worker that was never told to retire and is still alive is
+    reused under its exact recorded identity (old watchdog behavior). Once the
+    controller has durably marked ``previous_retiring`` before stopping that
+    worker, a momentarily alive process is never trusted: retirement may have
+    begun, so the exact old identity is deterministically stopped and awaited
+    dead before a fresh previous-commit worker is spawned and verified. That
+    guarantees terminal ``rolled_back`` never means a worker that is about to
+    exit, so zero queue consumers cannot be the outcome of a completed
+    rollback.
+
     Args:
         state: Rollback mission.
 
     Returns:
         Restored worker metadata, or ``None`` on failure.
     """
-    if worker_alive(state.previous_meta):
-        return state.previous_meta
+    previous = state.previous_meta
+    if not state.previous_retiring and worker_alive(previous):
+        return previous
+    if worker_alive(previous) and not stop_worker(previous, state.stop_grace_seconds):
+        return None
     token = secrets.token_hex(16)
     env = worker_env(token)
-    worker_id = env.get("LUBKO_WORKER_ID") or state.previous_meta.worker_id or socket.gethostname()
+    worker_id = env.get("LUBKO_WORKER_ID") or previous.worker_id or socket.gethostname()
     try:
         proc = spawn_worker(
             Path(state.repo),
@@ -784,23 +800,27 @@ def _deploy_locked(options: Options, commit: str) -> RollbackState:
         uv_path=options.uv_path,
         stop_grace_seconds=options.stop_grace_seconds,
         git_timeout_seconds=options.git_timeout_seconds,
+        previous_retiring=False,
         previous_meta=previous,
         new_meta=gated.meta,
     )
     _write_state(state)
+    retiring = state
     try:
         _fork_watchdog(options.lock_timeout_seconds)
+        retiring = replace(state, previous_retiring=True)
+        _write_state(retiring)
         if not stop_worker(previous, options.stop_grace_seconds):
             raise DeployCtlError("could not stop the known-good worker")
         _release_gate(gated.gate_writer)
         if not _wait_for_released_worker(gated.meta):
             raise DeployCtlError("candidate worker exited immediately after release")
-        live = replace(state, deadline=time.time() + options.confirm_window_seconds)
+        live = replace(retiring, deadline=time.time() + options.confirm_window_seconds)
         _write_state(live)
         return live
     except DeployCtlError:
         _close_gate(gated.gate_writer)
-        _rollback_locked(state)
+        _rollback_locked(retiring)
         raise
 
 
