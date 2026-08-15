@@ -53,6 +53,23 @@ Use Lubko whenever work needs to be performed in the user's development environm
 - managing long-running development tasks;
 - inspecting files or processes inside the Lubko container.
 
+## How to use this skill
+
+This skill is the orchestrator's operating manual for driving development work
+through Lubko. It records what has empirically worked, what has empirically
+failed, and the working rules that follow.
+
+It is guidance for the **orchestrator**, not for repository agents. It
+complements, and is subordinate to, the repository's own operating instructions
+(for example `AGENTS.md`, `CONTRIBUTING.md`, and the project's design docs). Read
+and obey those first for any specific repository. Where this skill contradicts
+an earlier habit, this skill is the correction.
+
+Use the Lubko command and protocol reference (job transport, polling,
+cancellation, `lubko-agent` lifecycle) as the manual for the environment, and the
+orchestration rules (delegation, parallel agents, verification, Git/GitHub
+practice) as the way to operate inside it.
+
 ---
 
 # Security boundary
@@ -151,6 +168,9 @@ ChatGPT is responsible for:
 8. observing and steering that agent through `lubko-agent` commands;
 9. independently verifying important repository results where appropriate;
 10. iterating until the requested task is actually complete.
+
+Keep the orchestrator role disciplined: decide *what* should happen, specify
+*constraints*, delegate the *how*, then verify the *result* independently.
 
 Do not ask the user to manually execute commands that Lubko can execute itself.
 
@@ -389,6 +409,14 @@ Prefer it over manually composing long shell command sequences.
 - separation between the orchestrator and implementation details of the underlying agent runtime;
 - an agent with strong security and ethical policies while still being broadly empowered inside the isolated development container.
 
+Substantial multi-step work — implementing an issue, refactoring, investigating
+a test failure, writing a migration, reviewing a subsystem — reliably produces
+better results through a managed agent session than through the orchestrator
+composing long shell command chains by hand. The sharpest failures have come
+from work that needed reasoning but was executed as a series of short,
+stateless shell commands: each command re-inspects the world from zero,
+accumulates no context, and cannot iterate.
+
 The orchestrator should therefore favor an agent for tasks such as:
 
 ```text
@@ -596,6 +624,21 @@ Use follow-up prompts when:
 Prefer continuing an appropriate existing agent over starting from scratch when the work is clearly part of the same task.
 
 Do not accidentally prompt the wrong agent. Always use the recorded Lubko agent ID.
+
+### Inspect before you steer
+
+The most over-orchestrated agents are the ones whose orchestrator sent frequent
+prompts ("now do X", "are you done?") without first reading status or the log.
+Each such prompt interrupts the agent's reasoning and can push it to declare
+premature completion.
+
+Before any prompt, read the evidence: the agent's `status`, then a focused log
+tail when more detail is needed. Only prompt when the evidence shows a concrete
+problem or a new requirement.
+
+Steer with *constraints and acceptance criteria*, not with play-by-play
+instructions. One precise follow-up that says what is wrong and what "done"
+means is worth ten that say what to type next.
 
 ---
 
@@ -853,6 +896,32 @@ lubko-agent delete <id>
 
 ---
 
+# Let agents think without arbitrary time pressure
+
+Agents that were stopped or killed because the orchestrator judged them "slow"
+had, in several cases, just spent that time on exactly the reasoning the task
+required — reading the real code before editing it. Stopping them forced the
+orchestrator to redo or re-verify the work later, and interrupted sessions were
+not resumable as-is: a fresh agent had to re-derive context the interrupted
+agent had already built.
+
+Rules:
+
+- Do not impose deadlines on thinking.
+- When an agent appears to be taking long, first check its `status` and a log
+  tail. Ask "is it making progress?" not "is it done yet?"
+- An agent that is reading files, running tests, and converging is working; an
+  agent that is looping on one failing action is stuck.
+- Use a blocking `wait` only when you are confident no intermediate steering is
+  useful, and remember the timeout stops *waiting*, not the agent. For genuinely
+  long or uncertain tasks, poll `status` and occasionally read the log instead
+  of blocking.
+- Stopping is a decision that the task is no longer wanted, not a pause button.
+  Prefer a steering prompt for course correction and reserve `stop`/`kill` for
+  abandoned tasks.
+
+---
+
 # Parallel agents
 
 Multiple managed agents may exist at the same time.
@@ -863,6 +932,58 @@ This can be useful for genuinely independent work, for example:
 - separate agents working in separate repositories;
 - one agent analyzing a subsystem while another performs an independent review.
 
+## Isolation: separate clones/worktrees and branches
+
+The most productive work on this system ran **multiple agents in parallel, each
+in its own clone with its own branch**: an implementation branch at a dedicated
+clone path, a docs branch in a separate clone, an acceptance branch in a
+separate clone, an integration branch in a separate clone, plus a final
+read-only review agent. Each clone isolated the agents from each other's
+uncommitted changes and from the live checkout.
+
+The single most common source of cross-agent corruption is **two write-heavy
+agents in the same working tree**. One agent's `git checkout`, `git reset`, or
+uncommitted edit silently destroys or masks another's.
+
+Rules:
+
+- For parallel write work, always give each agent its own clone (`git clone` to
+  a distinct path) and its own branch. Never point two write-capable agents at
+  the same tree.
+- When agents share a repository checkout, use `git worktree add` so each branch
+  gets its own directory with the same isolation.
+- An independent reviewer may share the tree only if it is read-only and the
+  tree is committed first.
+- Treat each clone as disposable. The durable artifact is the branch you push
+  and reconcile; the working tree is scratch space.
+
+## Separate responsibilities
+
+Give independent agents separate responsibilities. The cleanest outcomes come
+from separating concerns across parallel agents:
+
+- one **implementation** agent that owns the production code change;
+- one **acceptance** agent that independently designs black-box tests against
+  the required contract, without reading the implementation;
+- one **docs/review** agent that updates documentation and/or performs a
+  read-only review focused on soundness;
+- the **orchestrator**, which reconciles branches and verifies invariants.
+
+Rules:
+
+- Assign disjoint filesystems and disjoint responsibilities. An acceptance
+  agent should not be told "verify the implementation"; it should be given the
+  *contract* and asked to test the *behavior*. A reviewer should be told to
+  review, not to fix — or told to fix only concrete bugs it finds, never to
+  "improve" freely.
+- Put every agent's mandate in the initial prompt, including what it must *not*
+  do. The cost of a wrong responsibility split is usually only discovered at
+  reconciliation, which is the most expensive time to find it.
+- The orchestrator keeps the map: which branch, which base commit, which
+  responsibility, which agent ID.
+
+## General parallel-agent rules
+
 When using multiple agents:
 
 - record every returned agent ID;
@@ -871,6 +992,28 @@ When using multiple agents:
 - avoid sending two write-heavy agents into the same files unless intentional;
 - use explicit IDs for every `status`, `prompt`, `log`, `wait`, `stop`, `kill`, `result`, and `delete` operation;
 - do not rely on `last`.
+
+---
+
+# Independent acceptance
+
+Acceptance tests written against the implementation agent's own branch have a
+systematic blind spot: they encode the same assumptions the implementation
+encoded. The acceptance agent that produced the best findings was explicitly
+told to independently design and implement black-box/acceptance tests without
+relying on another agent's implementation.
+
+Rules:
+
+- Contract tests must be written from the **contract** — the issue, the
+  protocol, the documented behavior — not from the implementation.
+- Give the acceptance agent its own clone, its own branch, the spec, and no
+  access to the implementation branch until the tests are written.
+- When you run the acceptance suite against the reconciled branch, treat
+  failures as first-class evidence about the implementation, not as a test bug
+  to suppress.
+- If a test encodes an assumption you actually want to reject, change the *test*
+  deliberately and document why — do not silently mark it to skip.
 
 ---
 
@@ -885,7 +1028,7 @@ A strong agent prompt usually contains:
 5. **Local instructions** — tell the agent to read and obey `AGENTS.md`, `CONTRIBUTING.md`, or equivalent repository guidance.
 6. **Validation** — tests, linters, type checking, builds, or other required checks.
 7. **Completion criteria** — what counts as done.
-8. **Non-goals** — for example, "do not deploy" or "do not push" when the user only asked for local changes.
+8. **Non-goals / negative requirements** — explicitly what the agent must not do: "do not deploy", "do not push", "do not expose credentials", "do not close the issue yourself", "do not touch unrelated files", "do not expand scope into a sibling issue", "do not edit a file another agent owns".
 
 Example:
 
@@ -906,6 +1049,23 @@ When done, summarize the implementation, files changed, and validation results.
 ```
 
 The agent is capable of investigating details itself. Do not over-specify low-level steps unless they are genuine requirements.
+
+The prompts that produce the best work are long on *constraint* and short on
+*how-to*.
+
+Additional rules:
+
+- Name the invariants the agent must preserve, drawn from the project's own
+  design docs: for example atomic, exactly-once state transitions; precise
+  process signaling; no credentials in logs, commits, or process environments;
+  and git state changed only on the agent's own branch.
+- Ask agents to report early, risky findings: *"If you find a blocker, a
+  violated invariant, or a changed understanding of the task, surface it now
+  rather than continuing to the end."* Do not require agents to finish before
+  communicating.
+- Ask agents to commit incrementally on their branch as they go, and to keep the
+  branch pushed. A branch with frequent, logical commits is far easier to
+  reconcile and salvage than one last-minute commit.
 
 ---
 
@@ -944,6 +1104,30 @@ find . -maxdepth 2 -type f | sort
 
 ---
 
+# Clean working trees and known base commits
+
+Reconciling parallel branches repeatedly turns on knowing the exact base commit
+each branch was cut from. When a branch was cut from a drifted tree,
+cherry-picks produced double-applied or missing changes that took more effort to
+untangle than the original work. Agents that started with a dirty tree wasted
+early effort stabilizing state the orchestrator should have guaranteed, and
+sometimes committed unrelated files.
+
+Rules:
+
+- Cut every branch from a known, clean, tested base — a real commit SHA, not
+  "whatever the tree looked like."
+- Before launching an implementation agent, ensure its clone is on a known
+  commit with a clean tree, and put the base commit in the prompt: *"Baseline is
+  <sha>, tests green; reconcile from there."* Record the base in your own state
+  so reconciliation can verify it.
+- After an agent finishes, verify `git status --short` shows only intended
+  changes, the intended commits exist on the branch, and the tree was not
+  force-reset or squashed without your knowledge. A clean, committed branch is
+  the contract your acceptance and review steps depend on.
+
+---
+
 # Verification after agent work
 
 The orchestrator remains responsible for the final answer to the user.
@@ -973,6 +1157,54 @@ The orchestrator may ask the agent to run these checks and may also run them dir
 
 Do not report a development change as complete when required checks are known to be failing unless the failure is explicitly explained.
 
+## Read the code and review invariants yourself
+
+The orchestrator has repeatedly found hard bugs that passing tests did not
+catch: concurrency races in job claiming, leasing, and recovery; wrong
+process-group handling; a "fixed" deadline race that the tests' timing happened
+to mask; and accidental test-only production knobs. In each case the finding
+came from *reading the code and the diff* against the system's stated
+invariants — not from running tests.
+
+Rules:
+
+- After an agent reports success, do not merely relay its summary. Read the
+  diff.
+- Check the invariants that matter to this codebase: atomic and exactly-once
+  state transitions, precise process signaling, no credentials in environments
+  or logs, and no destructive action before durable state exists.
+- Tests passing is necessary, not sufficient. Treat automated tests as
+  **evidence, not proof**. When you read the diff and find a discrepancy with an
+  invariant, that is a bug until proven otherwise — even if the tests pass.
+  Investigate to closure before reconciliation.
+- Read the project's own checklist that says what "done" means for the
+  subsystem.
+- For hard concurrency or lifecycle work, run a dedicated read-only review pass
+  before merging even when the implementation agent says everything is green.
+
+## Run the full checks
+
+Agents have repeatedly reported success on the subset of checks they happened to
+run, while the full suite failed. The complete set is fixed by the project's
+`AGENTS.md` / `CONTRIBUTING.md` and must not be shortened.
+
+Rules:
+
+- Put the exact full command list in every implementation and acceptance prompt.
+- Independently re-run the full suite after reconciliation, on the integrated
+  branch, before considering a merge. Do not trust a report of green you did not
+  observe.
+- When a check fails after reconciliation, attribute the failure to the most
+  recently integrated change and fix it there.
+
+## Code review is a first-class orchestrator step
+
+Review is not optional polish to add after the checks pass. It is a required
+orchestrator step before merging: do not merge a branch that has not been
+reviewed, even if the checks pass. Review is the cheapest place to catch the
+class of bugs tests miss. For the detailed code-review checklist, see
+`docs/skills/review.md`.
+
 ---
 
 # Do not deploy implicitly
@@ -991,6 +1223,36 @@ When the user asks to inspect changes before deployment:
 Deploy only when requested.
 
 Explicitly include `do not deploy` in an agent prompt when this distinction matters.
+
+## Commit, push, and deploy are distinct, ordered steps
+
+These three operations have different blast radius and different authorities,
+and conflating them has caused real incidents: a change committed and pushed to
+the remote default branch was treated as "deployed", and an agent that was told
+to deploy performed its own push without the orchestrator reviewing the
+committed state first.
+
+Treat them as strictly ordered, separable steps:
+
+1. **Commit** — durable local history on a branch. Cheap, reversible, safe.
+2. **Push** — publishes commits to a remote. Visible to other collaborators;
+   only do this on an explicit instruction and after the committed state has
+   been reviewed.
+3. **Deploy** — replaces the running service/worker/daemon. Highest blast
+   radius; only via the project's managed deploy tool, only on explicit
+   instruction, and only from a reviewed, validated checkout at an exact commit.
+
+Publication (pushing a change) is not deployment. Pushing makes work visible for
+review; deploying replaces the running system. Name the target of each action in
+prompts. "Commit and push the change" is one instruction. "Deploy the
+already-pushed commit" is a different instruction — in practice it is given as a
+separate agent session whose sole job is to verify the checkout at the exact
+commit and run the managed deployment. Match that separation.
+
+The orchestrator must also not deploy implicitly. Deploying is its own explicit
+step, performed through the project's managed deploy tool (never through manual
+process-tree manipulation), from a checkout that passed the full validation, and
+after verifying the target commit is exactly the commit you intend to run.
 
 ---
 
@@ -1088,6 +1350,53 @@ the known working path explicitly:
 lubko-install --repo /workspace/Lubko --uv /absolute/path/to/uv
 ```
 
+## Verify a deployment with a real round trip
+
+The strongest end-to-end evidence comes from submitting a real job through the
+production execution path and watching it run in the live environment, then
+reading back its status and output. Simulated or mocked round trips have, more
+than once, passed while the real execution path failed — for example a runtime
+started with the wrong working directory, or a deployment that verified "the
+process started" but not that it could reach its database.
+
+For any change to the execution transport, the worker/runtime, or a deployment
+lifecycle, verify with a real round trip after deployment:
+
+1. Submit a job with a distinctive sentinel output.
+2. Poll the job to a terminal state.
+3. Assert success, exit code 0, exact expected stdout, and an executor
+   identity consistent with the newly deployed runtime.
+
+Remember that two lifecycles are distinct: the transport job that launched an
+agent may finish while the agent continues. Verify agent work through the
+**agent ID**, and verify runtime behavior through the **job**.
+
+---
+
+# Secret hygiene
+
+The runtime environment is deliberately scrubbed of credential-bearing
+variables; connection settings and credentials live in a permission-restricted
+file, and the deploy tool strips credential-bearing variables from the
+environment it hands to a deployed worker. This is a deliberate, tested design —
+not an accident.
+
+Agents that printed, echoed, or dumped environment variables while debugging
+have been a persistent risk. A secrets leak discovered in git history is
+near-permanent; treat it as the worst class of failure.
+
+Rules:
+
+- Never put credentials or server identifiers in this skill, in prompts, or in
+  commits. Design the system so that secrets are never needed in an instruction.
+- State the secret contract in prompts: no values in logs, no values in commit
+  content, no `echo $VAR`, no `env | ...`, no connection strings in output.
+- When debugging environment state, inspect variable *names*, permissions, and
+  counts only — never emit secret *values*.
+- Verify secret handling by checking *absence*: assert the live environment
+  contains no credential variable names (check names only), the config file mode
+  is correct, and git history contains no secret.
+
 ---
 
 # Direct shell commands versus managed agents
@@ -1124,6 +1433,254 @@ The agent interface is not merely a convenience wrapper. It is the preferred ope
 
 Do not recreate those capabilities manually with long shell scripts unless there is a concrete reason the managed agent interface cannot perform the task.
 
+If a shell command needs quoting, conditionals, loops, or coordination between
+several files, it is no longer an observation — delegate it to an agent.
+
+---
+
+# Reconciliation and integration branches
+
+Parallel branches do not merge themselves. Reconciliation is a separate,
+deliberate step, performed by the orchestrator through commits and branches —
+not by letting one agent operate in another's clone.
+
+The fastest path in practice is a **dedicated integration session on a dedicated
+integration branch** that cherry-picks the accepted work and runs the full
+checks — not an impatient `git merge` into the main branch.
+
+Reconcile in this order:
+
+1. Verify each contributing branch is committed and pushed, with a clean tree.
+2. Identify the known base commit shared by all branches.
+3. Build an integration branch from the most trusted component.
+4. Cherry-pick or merge the other components one at a time, running the full
+   checks after each addition so you can attribute any breakage.
+5. Resolve conflicts explicitly; never resolve with a blind `git checkout
+   --theirs` or a forced overwrite.
+6. Only after the integrated branch is green do you consider the main branch or
+   a merge.
+
+When you read the diff during reconciliation and find a discrepancy with an
+invariant, investigate it to closure before proceeding. A "fixed" conflict that
+reintroduces a bug is worse than no fix.
+
+---
+
+# Git and GitHub branch and PR management
+
+Parallel agent work only pays off if the Git history it produces is easy to
+reconcile, review, and share. GitHub pull requests are the primary
+observability tool for the human owner: every open, update, and merge of a PR is
+a durable, human-visible record of what happened. Use them by default for
+substantial changes; only trivial emergency fixes may skip the ceremony. GitHub
+issues are the complementary durable backlog for important-but-non-critical
+findings discovered along the way.
+
+## One task, one agent, one branch
+
+Give every task its own branch, and give each agent exactly one branch to own. A
+branch is a unit of accountability: its history should tell the story of one
+task. Name branches after the task (`fix/lease-recovery`,
+`feature/search-index`, `docs/orchestrator-guide`), not after the agent — a name
+that says what the branch is *for* stays meaningful after the agent is gone.
+
+## Isolate clones and worktrees
+
+Give each write agent an exclusive working tree. For independent parallel work
+use separate clones; when agents share a repository checkout, use
+`git worktree add` so each branch gets its own directory. Never let two writers
+into the same tree.
+
+## Start from a known base commit
+
+Cut every branch from a known, clean, tested base commit SHA, record the base in
+the agent prompt and in your own state. When branches were cut from a drifted
+tree, cherry-picks double-applied or lost changes.
+
+## Commit incrementally
+
+Ask agents to commit in small, logical, self-contained commits as they go, not
+in one lump at the end. Incremental commits make it possible to salvage partial
+work, to attribute breakage to a specific change, and to reorder history when
+reconciliation demands it.
+
+## Keep branches pushed
+
+Push the branch as soon as there is something to see, and keep it pushed as work
+proceeds. A pushed branch survives a lost or recycled clone; an unpushed branch
+exists only in one disposable working tree. Never treat the clone as the durable
+copy — the remote branch is the durable copy.
+
+## Open draft PRs early for observability
+
+Open a **draft PR** as soon as the branch exists, even if it is mostly empty.
+This makes the work visible to the human owner from day one: they can watch
+progress, object early to a wrong direction, and see which branches are active.
+A draft PR is cheap to update and costs nothing to leave open; discovering a
+wrong direction after two weeks of agent work is expensive.
+
+## PRs as the human-visible activity log
+
+Treat the PR as the human-visible record of the work. The commit history, the
+diff, and the comments on the PR are what the human owner (and any later
+collaborator) will read to understand what happened. Write PR descriptions that
+say what changed and why, keep discussion on the PR rather than in private agent
+state, and let the PR tell the story of the task.
+
+## Keep implementation, acceptance, and docs branches separate
+
+Do not fold acceptance tests and documentation into the implementation branch by
+default. Keep the implementation branch, the acceptance branch, and the docs
+branch separate, each opened as its own PR or combined into one integration PR,
+so each part is independently reviewable and mergeable.
+
+## Reconcile into an integration branch
+
+When several branches contribute to one change, reconcile them deliberately on a
+dedicated integration branch: apply the trusted components one at a time, run
+the full checks after each step, and only then propose the integrated result for
+merge — via a PR, never as a direct push to the default branch.
+
+## Cherry-pick vs merge vs rebase
+
+- Prefer **cherry-pick** when you are assembling a single coherent change from
+  multiple branches and you want only the accepted commits — for example layering
+  docs commits onto an implementation branch while leaving the docs branch
+  untouched.
+- Prefer **merge** when you want to preserve the full, branch-shaped history of
+  two long-lived lines of work.
+- Prefer **rebase** when the branch's history needs to be linearized onto a
+  newer base for review — but rebase rewrites history, so only do it on branches
+  that are not yet shared/reviewed (or via a PR's squash/rebase merge on GitHub).
+  Do not rebase a branch that other agents or the human owner are already
+  reading.
+
+## Updating PRs after review
+
+Respond to review comments by pushing new commits to the same PR branch, not by
+closing and reopening. Keep each review cycle as additional commits (amend only
+pre-review commits); this lets reviewers see exactly what changed in response to
+their feedback. Never force-push away the reviewed history while review is in
+flight.
+
+## Resolve conflicts semantically
+
+Resolve merge conflicts by reading both sides and deciding what the merged
+result *should* be — never with a blind `git checkout --ours`/`--theirs` or a
+forced overwrite. After resolving, rerun the full checks on the merged state.
+
+## Review before merge
+
+Do not merge a branch that has not been reviewed, even if the checks pass.
+Review is the cheapest place to catch the class of bugs tests miss. For hard
+concurrency/lifecycle/soundness work, run a dedicated read-only review pass — by
+a reviewer agent and, where possible, by the human owner — before merging.
+Code review is a first-class orchestrator step; the review checklist lives in
+`docs/skills/review.md`.
+
+## Merge regular changes
+
+Once a PR has been reviewed and the checks are green on the integrated branch,
+merge it — do not leave finished branches dangling forever. A merged PR closes
+the loop and is the cleanest possible record: "this change was reviewed and
+landed." Hiding a completed change in an unmerged branch buries it.
+
+## Keep experimental and "wisdom" PRs separate
+
+Keep experimental, exploratory, or "capture the lesson" changes in their own
+PRs, clearly labeled as such, and do not merge them into a delivery branch. Label
+experimental PRs as drafts and close them when the experiment is over.
+
+## Delete stale branches and clones after merge
+
+After a PR is merged, delete the branch on the remote and locally, and clean up
+the disposable clones/worktrees. Stale branches and clones are how two writers
+later collide in one tree and how the human owner loses track of what is live.
+Keep nothing around that is not either active work or a preserved record.
+
+## Never casually force-push
+
+The reviewed PR history is the record both the human owner and later reviewers
+depend on. Never force-push over it — rewriting or deleting commits that
+reviewers (or the human owner) have already seen silently invalidates their
+review and corrupts the activity log. Force-push only in the rare, genuinely
+necessary cases: fixing a branch that leaked a secret, or rewinding an accidental
+push to the wrong branch — and always say so on the PR first. When the default
+branch is protected (it should be), a force-push is not even possible; rely on
+the PR's normal merge instead.
+
+## Opening and merging PRs is the default
+
+Opening and merging GitHub PRs is the default for substantial changes because it
+is the observability mechanism the human owner relies on: every open, push,
+review comment, and merge is durable and human-visible, and nothing real happens
+to the repository history outside a PR. Trivial emergency fixes — a one-line
+hotfix to a breaking typo, a reverted bad merge — may go directly to the default
+branch when speed matters more than ceremony. Everything else flows through a
+PR. If a change is substantial enough that it could go wrong, it is substantial
+enough for a PR.
+
+---
+
+# Blockers vs deferred findings
+
+Every finding must be triaged into one of two classes:
+
+- **Blockers and correctness bugs** — a real bug that makes the current change
+  unsound, a violated invariant, or anything that must be resolved before this PR
+  merges. Fix these now, before merge. Do not merge known-correctness bugs.
+- **Important but non-critical findings** — real but safe to postpone: a bug in
+  an unrelated code path, a worth-doing refactor, an open design question. These
+  do not block the current merge; capture them in an issue and deliberately
+  postpone them instead of expanding the current scope.
+
+GitHub issues are the durable backlog for important-but-non-critical findings:
+high-effort non-critical bugs, architecture questions or open decisions,
+refactors, and improvements spotted while working on something else. When an
+agent or the orchestrator discovers a real finding that does not block the
+current change, record it in an issue and deliberately postpone it rather than
+letting it derail the current task or expand the current branch.
+
+A useful issue carries enough context to act on later without relying on the
+session that produced it:
+
+- What was found and where — file/function references, not just "something was
+  wrong."
+- Why it matters — the rationale and the impact if left unaddressed.
+- Reproduction or evidence — a failing test, a log excerpt, a traceback, a
+  snippet.
+- Acceptance criteria, or the open questions that still need answering.
+- A link to the PR or commit where it was discovered, so the issue traces back
+  to the work that surfaced it.
+
+Create the issue as soon as the finding appears, mid-task if that is when it
+shows up. Creating issues early is what makes them durable: a finding left only
+in an agent log or a chat is lost when the session ends, while an issue survives
+the branch, the clone, and the session as a visible item in the backlog. The
+human owner sees the future work accumulating and can schedule and prioritize it
+deliberately, later, with the full backlog in view.
+
+---
+
+# Share partial findings early
+
+The most useful findings arrive *before* the task completes: a reviewer flagging
+a soundness concern while the implementation was still in flight, an acceptance
+agent reporting a contract ambiguity mid-way, an orchestrator noticing a
+base-commit mismatch between branches while both were still running. Early
+findings changed direction cheaply.
+
+Rules:
+
+- Ask agents to report early, risky findings in their prompt: *"If you find a
+  blocker, a violated invariant, or a changed understanding of the task, surface
+  it now rather than continuing to the end."*
+- When the orchestrator spots something mid-flight, share it immediately with
+  the affected agent via a steering prompt, even if it means the agent re-plans.
+  A stopped-wrong task is cheaper than a finished-wrong task.
+- Keep partial progress durable: ask agents to commit incrementally on their
+  branch, not only at the end.
+
 ---
 
 # Failure handling
@@ -1158,6 +1715,50 @@ Prefer continuing the same agent when it retains useful task context.
 6. use `kill` only if graceful stopping is inadequate.
 
 Do not use broad process-killing shell commands when the agent-management interface can target the exact session.
+
+## Common failure modes observed
+
+Each of these has happened. Name the failure mode when you see it forming.
+
+- **Two write agents on a shared tree** — one agent's `git checkout`, `git
+  reset --hard`, or broad edit destroyed another agent's in-flight work. Avoid:
+  always give writers separate clones and branches; before launching any agent,
+  know which trees are exclusively owned by whom.
+- **Rushing or stopping active agents** — agents stopped because they seemed
+  slow had often been doing exactly the right reading, and repeatedly prompting
+  a healthy agent pushed it toward premature completion. Avoid: inspect status
+  and the log before touching an agent; distinguish progress from stuck; prefer
+  a steering prompt with acceptance criteria; reserve stop/kill for abandoned
+  work.
+- **Self-referential tests** — acceptance tests written from the implementation
+  encoded its assumptions and passed while behavior violated the contract. Avoid:
+  write tests from the contract, not the code.
+- **Test-only production knobs** — sub-second timing, fake output paths, and
+  confirmation timeouts have crept into production code as environment variables
+  "for the tests." Avoid: in review, ask whether every knob and branch is
+  reachable and meaningful in production.
+- **Stale docs** — documentation drifted from behavior after refactors, and an
+  agent then built on the stale text. Avoid: treat docs as a deliverable in the
+  same change that changes behavior; update them in the same reconciliation
+  pass; when docs and code disagree, code is not automatically right — resolve
+  the discrepancy deliberately.
+- **Multiple deployment authorities** — more than one actor believing it can
+  deploy is a latent accident. Avoid: exactly one authority — the orchestrator —
+  decides to deploy, and only via the managed deploy tool from a validated
+  checkout. No agent deploys unless its prompt explicitly says so.
+- **Destructive actions before durable rollback state** — delete/stop/overwrite
+  first, then discover the replacement is broken with no recorded previous
+  state. Avoid: any destructive action (replacing a worker, deleting a branch,
+  resetting a tree, dropping schema) is only safe when durable rollback state
+  exists first and you can restore it. If you cannot say what will restore the
+  old state, do not destroy.
+- **Output bloat and truncated evidence** — full logs and full dumps were
+  truncated by an output limit, so conclusions were drawn from incomplete
+  output. Avoid: keep commands focused; prefer log tails and `git diff --stat`;
+  when output is truncated, run a narrower follow-up rather than guessing.
+- **Trusting a report of green** — "tests passed" has been reported for subsets,
+  for the wrong branch, or for stale trees. Avoid: independent re-run on the
+  reconciled branch is the only trustworthy green.
 
 ---
 
@@ -1243,11 +1844,21 @@ Use `lubko-agent` as the preferred abstraction for substantial work.
 
 Inspect status and logs yourself.
 
+Let agents think — do not rush them.
+
 Steer agents with explicit follow-up prompts.
 
 Verify important results yourself.
 
 Use direct shell commands for small observations and deterministic checks.
+
+Reconcile branches deliberately on a fresh integration branch.
+
+Make code review a first-class step before merge.
+
+Treat PRs as the human-visible activity log, and open them early.
+
+Capture non-critical findings as issues; fix blockers before merge.
 
 Iterate until the task is actually complete.
 
@@ -1258,3 +1869,26 @@ The development container is intentionally disposable and highly permissive.
 The host server is protected by the Lubko isolation boundary.
 
 Within that boundary, make full use of managed agents and the development environment.
+
+---
+
+# Quick reference
+
+| Situation | Do | Avoid |
+| --------- | -- | ----- |
+| Substantial work | launch an agent with a precise prompt | long improvised shell scripts |
+| Agent looks slow | check status, then a log tail | stopping or nagging it |
+| Course correction | a steering prompt with acceptance criteria | frequent steering |
+| Parallel work | separate clones/worktrees + branches + mandates | two writers in one tree |
+| Acceptance | contract-based tests, independent agent | tests derived from the implementation |
+| Verification | read the diff, review invariants, full checks | trusting a report of green |
+| Code review | run a read-only review pass before merge; see `docs/skills/review.md` | merging unreviewed work |
+| Reconcile | deliberate integration branch, checks after each step | blind merge, forced resolves |
+| Branches/PRs | one branch per task, draft PR early, review before merge, merge when green | unmerged dangling branches, force-pushed review history |
+| Base commits | cut branches from a known, clean, tested SHA | cutting from a drifted tree |
+| Blockers/correctness bugs | fix before merge, on the current PR | merging known-correctness bugs |
+| Important non-critical findings | open an issue with context, rationale, evidence, and a link to the branch/commit; postpone | expanding the current task / losing the finding in logs or chat |
+| Commit/push/deploy | separate, explicit, in order | conflating any two |
+| Deployment | only when asked, via the managed tool, then a real smoke | implicit deploy, manual signals |
+| Secrets | design them out; verify by absence | printing/dumping values |
+| Destructive action | only after durable rollback state exists | delete-then-hope |
