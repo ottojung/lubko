@@ -27,7 +27,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
-from lubko import cli, lifecycle, worker
+from lubko import cli, lifecycle, readiness, worker
 from lubko import deployctl as dc
 from lubko.lifecycle import (
     SCHEMA_VERSION,
@@ -38,9 +38,10 @@ from lubko.lifecycle import (
     worker_alive,
     write_meta,
 )
+from lubko.readiness import LIFECYCLE_MARKER_VAR
 from lubko.worker import group_has_members
 from tests import _process_guard as guard
-from tests.test_cli import fake_uv_sync, make_repo
+from tests.test_cli import fake_uv_sync, git, make_repo
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -166,7 +167,7 @@ def spawn_real_process(token: str) -> subprocess.Popen[bytes]:
         The spawned process, registered for deterministic teardown.
     """
     env = dict(os.environ)
-    env[lifecycle.LIFECYCLE_MARKER_VAR] = token
+    env[LIFECYCLE_MARKER_VAR] = token
     proc = subprocess.Popen(
         [SLEEP_BIN, "300"],
         stdin=subprocess.DEVNULL,
@@ -192,7 +193,7 @@ def spawn_lingering_previous() -> subprocess.Popen[bytes]:
         The lingering process.
     """
     env = dict(os.environ)
-    env[lifecycle.LIFECYCLE_MARKER_VAR] = RETIRING_MARKER
+    env[LIFECYCLE_MARKER_VAR] = RETIRING_MARKER
     proc = subprocess.Popen(
         [sys.executable, "-c", LINGER_SOURCE],
         stdin=subprocess.DEVNULL,
@@ -1792,6 +1793,202 @@ def test_helper_uses_fresh_durable_success_deadline(
 
 
 # ---------------------------------------------------------------------------
+# Pre-confirm readiness proof
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_released_worker_requires_readiness_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A new candidate must prove readiness, not merely stay alive briefly."""
+    options = replace(make_options(tmp_path / "repo"), readiness_window_seconds=5.0)
+    meta = worker_meta("2" * 40, pid=200)
+    proven: list[str] = []
+    monkeypatch.setattr(dc, "candidate_supports_readiness", lambda _repo: True)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+
+    def flaky_proven(token: str) -> bool:
+        proven.append(token)
+        return len(proven) >= 3
+
+    monkeypatch.setattr(dc, "readiness_proven", flaky_proven)
+
+    assert dc._wait_for_released_worker(options, meta) is True
+    assert proven
+    assert all(token == meta.token for token in proven)
+
+
+def test_wait_for_released_worker_rejects_never_ready_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An alive candidate that never reaches the boundary is rejected."""
+    options = replace(make_options(tmp_path / "repo"), readiness_window_seconds=0.2)
+    meta = worker_meta("2" * 40, pid=200)
+    monkeypatch.setattr(dc, "candidate_supports_readiness", lambda _repo: True)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(dc, "readiness_proven", lambda _token: False)
+
+    assert dc._wait_for_released_worker(options, meta) is False
+
+
+def test_wait_for_released_worker_rejects_dead_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A candidate that dies after release is rejected before the window ends."""
+    options = replace(make_options(tmp_path / "repo"), readiness_window_seconds=5.0)
+    meta = worker_meta("2" * 40, pid=200)
+    monkeypatch.setattr(dc, "candidate_supports_readiness", lambda _repo: True)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+
+    start = time.monotonic()
+    assert dc._wait_for_released_worker(options, meta) is False
+    assert time.monotonic() - start < 2.0
+
+
+def test_wait_for_released_worker_legacy_candidate_keeps_stability_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Legacy candidates predate the protocol and never require a marker."""
+    options = make_options(tmp_path / "repo")
+    meta = worker_meta("2" * 40, pid=200)
+    monkeypatch.setattr(dc, "candidate_supports_readiness", lambda _repo: False)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    proven: list[str] = []
+
+    def record_proven(token: str) -> bool:
+        proven.append(token)
+        return True
+
+    monkeypatch.setattr(dc, "readiness_proven", record_proven)
+
+    assert dc._wait_for_released_worker(options, meta) is True
+    assert proven == []
+
+
+def test_complete_handoff_rolls_back_when_candidate_never_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed readiness proof rolls the deployment back immediately."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    state = pending_state(repo=str(repo), old=first, new=second)
+    gated_proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(gated_proc)
+    reader, writer = os.pipe()
+    os.close(reader)
+    gated = dc.GatedWorker(proc=gated_proc, gate_writer=writer, meta=state.new_meta)
+    rolled_back: list[dc.RollbackState] = []
+    monkeypatch.setattr(dc, "stop_worker", lambda _meta, _grace: True)
+    monkeypatch.setattr(dc, "_release_gate", lambda _writer: None)
+    monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _options, _meta: False)
+
+    def record_rollback(value: dc.RollbackState) -> bool:
+        rolled_back.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", record_rollback)
+    try:
+        with pytest.raises(dc.DeployCtlError, match="did not prove readiness"):
+            dc._complete_handoff(make_options(repo), state, gated)
+    finally:
+        with suppress(OSError):
+            os.close(writer)
+        kill_proc(gated_proc)
+
+    assert len(rolled_back) == 1
+    assert rolled_back[0].previous_retiring is True
+
+
+def test_rollback_removes_candidate_readiness_marker(
+    coherent_environment: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback cleans up the candidate's readiness marker."""
+    repo, first, second, _bin_dir = coherent_environment
+    state = pending_state(repo=str(repo), old=first, new=second)
+    token = state.new_meta.token
+    assert token is not None
+    readiness.write_readiness_marker(token)
+    assert readiness.readiness_proven(token)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+    patch_rollback_dependencies(monkeypatch)
+
+    assert dc._rollback_locked(state) is True
+
+    assert not readiness.readiness_proven(token)
+
+
+def test_abort_mission_removes_candidate_readiness_marker(tmp_path: Path) -> None:
+    """Aborting a prepared mission removes any candidate readiness marker."""
+    repo, first, second = make_repo(tmp_path / "repo")
+    state = pending_state(repo=str(repo), old=first, new=second)
+    token = state.new_meta.token
+    assert token is not None
+    readiness.write_readiness_marker(token)
+    assert readiness.readiness_proven(token)
+    dummy = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(dummy)
+    reader, writer = os.pipe()
+    os.close(reader)
+    try:
+        gated = dc.GatedWorker(proc=dummy, gate_writer=writer, meta=state.new_meta)
+        dc._abort_mission(gated, state)
+    finally:
+        with suppress(OSError):
+            os.close(writer)
+        kill_proc(dummy)
+
+    assert not readiness.readiness_proven(token)
+
+
+def test_confirmation_removes_candidate_readiness_marker(
+    coherent_environment: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal confirmation cleans up the candidate's readiness marker."""
+    repo, first, second, _bin_dir = coherent_environment
+    state = pending_state(repo=str(repo), old=first, new=second)
+    challenged = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
+    dc._write_state(challenged)
+    token = state.new_meta.token
+    assert token is not None
+    readiness.write_readiness_marker(token)
+    assert readiness.readiness_proven(token)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    options = make_options(repo)
+
+    response = dc._confirm_locked(
+        {
+            "type": "confirm",
+            "commit": second,
+            "challenge": "3fa91c0"[::-1],
+        },
+        options,
+    )
+
+    assert response["confirmed"] is True
+    assert not readiness.readiness_proven(token)
+
+
+# ---------------------------------------------------------------------------
 # End-to-end process tests
 # ---------------------------------------------------------------------------
 
@@ -1834,6 +2031,7 @@ def make_fake_uv(
     *,
     bad_candidate_commit: str | None = None,
     fail_validation: bool = False,
+    lingering_worker: bool = False,
 ) -> Path:
     """Write a stub ``uv`` that validates instantly and runs the real worker.
 
@@ -1842,13 +2040,17 @@ def make_fake_uv(
     real worker from the current project. When ``bad_candidate_commit`` is
     given, the candidate commit fails to start so the handoff cannot complete.
     When ``fail_validation`` is given, every validation step fails so a queue
-    checkout reports an error to its owner.
+    checkout reports an error to its owner. When ``lingering_worker`` is given,
+    the worker command stays alive without ever reaching the queue-processing
+    boundary, exercising the readiness-timeout rollback.
 
     Args:
         tmp_path: Temporary directory for the script.
         python: Python interpreter that runs the real worker.
         bad_candidate_commit: Exact commit whose worker must fail to start.
         fail_validation: Whether the validation steps must fail.
+        lingering_worker: Whether the worker command must linger without
+            proving readiness.
 
     Returns:
         The fake ``uv`` executable path.
@@ -1863,7 +2065,11 @@ def make_fake_uv(
             "        exit 7",
             "    fi",
         ])
-    lines.extend([f"    exec {python} -m lubko.worker", "fi"])
+    if lingering_worker:
+        lines.append(f"    exec {SLEEP_BIN} 300")
+    else:
+        lines.append(f"    exec {python} -m lubko.worker")
+    lines.extend(["fi"])
     if fail_validation:
         lines.append("exit 9")
     else:
@@ -2012,13 +2218,21 @@ def read_job(conninfo: str, job_id: object) -> dict[str, Any]:
     return parsed
 
 
-def deployctl_args(repo: Path, fake_uv: Path, request: str) -> list[str]:
+def deployctl_args(
+    repo: Path,
+    fake_uv: Path,
+    request: str,
+    *,
+    readiness_window: float = 30.0,
+) -> list[str]:
     """Build the argv of one supervised controller queue job.
 
     Args:
         repo: Deployment checkout.
         fake_uv: Stub ``uv`` executable.
         request: JSON request object.
+        readiness_window: Maximum seconds after gate release for the candidate
+            to prove readiness.
 
     Returns:
         The controller argv.
@@ -2034,6 +2248,8 @@ def deployctl_args(repo: Path, fake_uv: Path, request: str) -> list[str]:
         str(fake_uv),
         "--confirm-window-seconds",
         "120",
+        "--readiness-window-seconds",
+        str(readiness_window),
         "--grace-seconds",
         "1.0",
         "--db-timeout",
@@ -2491,6 +2707,174 @@ def test_end_to_end_queue_checkout_error_leaves_failed_row(
         assert meta.pid == old_meta.pid
         state = dc._read_state()
         assert state is None or state.status in {dc.STATUS_CONFIRMED, dc.STATUS_ROLLED_BACK}
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()
+
+
+def kill_worker_meta(meta: WorkerMeta) -> None:
+    """Force-kill one worker by its exact recorded process group.
+
+    Args:
+        meta: The worker metadata to stop.
+    """
+    pgid = meta.pgid or meta.pid
+    if pgid is None:
+        return
+    if group_has_members(pgid):
+        with suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and group_has_members(pgid):
+            time.sleep(0.02)
+
+
+def test_end_to_end_candidate_never_ready_rolls_back(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate alive but never ready is rejected before confirmation timeout.
+
+    The candidate worker stays alive after the gate is released but never
+    reaches a functioning queue-processing boundary, so the readiness proof
+    never appears and the deployment is rolled back within the bounded
+    readiness window — far before the operator confirmation window.
+    """
+    repo, first, second, _conf, _old, old_meta, _uv = _prepare_e2e(
+        tmp_path, monkeypatch, pg_cluster
+    )
+    fake_uv = make_fake_uv(tmp_path, sys.executable, lingering_worker=True)
+    try:
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(
+                repo,
+                fake_uv,
+                json.dumps({"type": "checkout", "commit": second}),
+                readiness_window=3.0,
+            ),
+        )
+        wait_until(
+            lambda: read_job(jobs_db, checkout_id)["state"]["status"] == "succeeded",
+            timeout=60.0,
+        )
+        wait_until(_rolled_back_state, timeout=60.0)
+
+        rolled = dc._read_state()
+        assert rolled is not None
+        assert rolled.status == dc.STATUS_ROLLED_BACK
+        assert cli.git_commit(repo, 10.0) == first
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+        assert worker_alive(meta)
+        assert not worker_alive(old_meta)
+        assert not group_has_members(rolled.new_meta.pgid or rolled.new_meta.pid or 0)
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()
+
+
+def test_end_to_end_candidate_death_after_readiness_rolls_back(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidate death after the readiness proof still rolls back.
+
+    The candidate proves readiness and the handoff completes, but the candidate
+    dies before either confirmation; the watchdog must still restore the
+    previous known-good commit and worker.
+    """
+    repo, first, second, _conf, _old, old_meta, fake_uv = _prepare_e2e(
+        tmp_path, monkeypatch, pg_cluster
+    )
+    try:
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
+        )
+        wait_until(
+            lambda: read_job(jobs_db, checkout_id)["state"]["status"] == "succeeded",
+            timeout=60.0,
+        )
+        wait_until(_live_handoff_done, timeout=30.0)
+        state = dc._read_state()
+        assert state is not None
+        assert state.status == dc.STATUS_PENDING
+        kill_worker_meta(state.new_meta)
+
+        wait_until(_rolled_back_state, timeout=60.0)
+
+        rolled = dc._read_state()
+        assert rolled is not None
+        assert rolled.status == dc.STATUS_ROLLED_BACK
+        assert cli.git_commit(repo, 10.0) == first
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+        assert worker_alive(meta)
+        assert not worker_alive(old_meta)
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()
+
+
+def test_end_to_end_legacy_candidate_checkout_still_succeeds(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy candidates that predate readiness still deploy and confirm.
+
+    A candidate whose commit predates the readiness protocol cannot write the
+    marker, so the controller keeps the previous post-release liveness check;
+    rolling back to (or deploying) older known-good versions stays possible.
+    """
+    repo, _first, second, _conf, _old, old_meta, fake_uv = _prepare_e2e(
+        tmp_path, monkeypatch, pg_cluster
+    )
+    # A genuine pre-feature candidate is a commit whose tree does not carry
+    # the readiness protocol module (the exact capability signal the
+    # controller inspects). The synthetic repo never contained the readiness
+    # worker-side import, so the tree is a coherent pre-feature snapshot
+    # rather than an impossible hybrid of current and legacy code.
+    readiness_module = repo / "src" / "lubko" / "readiness.py"
+    assert readiness_module.is_file()
+    readiness_module.unlink()
+    git("add", "-A", cwd=repo)
+    git("commit", "-q", "-m", "legacy candidate without readiness", cwd=repo)
+    legacy = git("rev-parse", "HEAD", cwd=repo)
+    assert legacy != second
+    assert not readiness.candidate_supports_readiness(repo)
+    # Pre-build the legacy candidate's CLI environment exactly like the
+    # maintained commits, so the controller's build_cli_root finds it usable.
+    cli.build_cli_root(repo, legacy, "uv", 60.0)
+    try:
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": legacy})),
+        )
+        _wait_for_checkout_success_and_old_death(jobs_db, checkout_id, old_meta)
+
+        wait_until(_live_handoff_done, timeout=30.0)
+        _run_confirmation_handshake(jobs_db, repo, fake_uv, legacy)
+
+        final_state = dc._read_state()
+        assert final_state is not None
+        assert final_state.status == dc.STATUS_CONFIRMED
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == legacy
+        assert cli.current_commit() == legacy
+        assert cli.git_commit(repo, 10.0) == legacy
     finally:
         kill_recorded_workers()
         assert_no_lubko_leaks()

@@ -8,6 +8,15 @@ confirmation containing that challenge reversed. Until both complete, a forked
 watchdog retains the known-good process image and restores the previous commit
 automatically on timeout or candidate failure.
 
+After the gate is released, checkout also requires an explicit pre-confirm
+readiness proof: the candidate writes a token-scoped marker only after it can
+reach PostgreSQL and the canonical schema invariant holds, so a candidate that
+stays alive without ever reaching a functioning queue-processing boundary is
+rejected and rolled back within the readiness window instead of at the
+operator confirmation timeout. Legacy candidates that predate the protocol
+keep the previous liveness check, so rolling back to older known-good versions
+stays possible.
+
 The global command line tools are kept coherent with the confirmed commit:
 the candidate CLI environment is built during the provisional phase, and the
 ``current`` pointer is switched only after durable ``confirmed`` state exists,

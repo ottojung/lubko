@@ -25,6 +25,7 @@ from lubko.lifecycle import (
     ValidationReport,
     WorkerMeta,
 )
+from lubko.readiness import LIFECYCLE_MARKER_VAR
 from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
 
@@ -51,7 +52,7 @@ def spawn_controlled(marker: str = MARKER) -> subprocess.Popen[bytes]:
         The spawned process.
     """
     env = dict(os.environ)
-    env[lifecycle.LIFECYCLE_MARKER_VAR] = marker
+    env[LIFECYCLE_MARKER_VAR] = marker
     proc = subprocess.Popen(
         [SLEEP_BIN, "300"],
         stdin=subprocess.DEVNULL,
@@ -892,7 +893,7 @@ def test_worker_env_removes_credentials(monkeypatch: pytest.MonkeyPatch) -> None
     assert "PGPASSWORD" not in env
     assert "DATABASE_URL" not in env
     assert "POSTGRES_PASSWORD" not in env
-    assert env[lifecycle.LIFECYCLE_MARKER_VAR] == MARKER
+    assert env[LIFECYCLE_MARKER_VAR] == MARKER
     assert env["LUBKO_WORKER_ID"] == "phoebe"
 
 

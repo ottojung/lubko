@@ -28,6 +28,33 @@ whether the previous worker may already be mid-shutdown.
 
 The checkout remains provisional. The watchdog restores the previous exact commit if the candidate dies or the confirmation deadline expires. The global CLIs are untouched during the provisional phase: the `current` symlink under `$XDG_STATE_HOME/lubko/cli/` still selects the previous confirmed commit, so a rollback can never strand them on candidate code. If the candidate CLI environment cannot be built, the checkout is aborted and the previous checkout is restored.
 
+### Pre-confirm readiness proof
+
+Checkout requires more than a released process that stays alive: a candidate
+that never reaches a functioning queue-processing boundary would otherwise
+wait until the operator confirmation timeout before rolling back. The
+candidate worker therefore proves readiness explicitly. Once it connects to
+PostgreSQL and passes `verify_jobs_table_invariant()` (plus the canonical v2
+output-chunk schema verification), it writes an atomic marker keyed by its
+`LUBKO_LIFECYCLE_TOKEN` — the fresh per-candidate deployment token — under the
+worker state directory. The controller waits for the exact candidate process
+identity together with that matching marker after the gate is released,
+bounded by a readiness window (`--readiness-window-seconds`, default 30) that
+is shorter than the confirmation window, so a candidate that stays alive
+without ever reaching the queue loop is rejected and rolled back immediately.
+
+The marker is token-scoped: a stale marker from an earlier candidate can never
+satisfy a later one, because every candidate carries a fresh token and the
+marker content must name the exact token.
+
+Rollback compatibility is staged. The marker is only *required* when the
+candidate commit itself implements the readiness protocol (its checked-out
+source tree carries the readiness module). Legacy candidates that predate the
+protocol keep the previous short post-release liveness check, so deploying or
+rolling back to older known-good versions remains possible, and rollback never
+requires the marker from a restored worker. Readiness markers are removed when
+a mission is rolled back, aborted, or confirmed.
+
 ### Queue-invoked checkout (the control job survives the old worker's shutdown)
 
 When checkout itself is submitted through the Lubko queue, the worker that claims it is the very worker about to be replaced. The worker's correct general shutdown invariant terminates every tracked active job group, including the group running the controller — so the controller must hand off before any destructive step. It does so without any worker-side special/exempt argv, process group, environment, or name: an ordinary job remains ordinary and is terminated/reaped like every other active job.
@@ -108,14 +135,16 @@ mission is `pending` the pointer stays on the previous confirmed commit.
 
 Rollback authority does not execute candidate code. The forked stable watchdog:
 
-1. stops the candidate by its recorded exact process identity;
+1. stops the candidate by its recorded exact process identity and removes its
+   readiness marker;
 2. force-checks out the exact previously maintained commit;
 3. restores the previous worker: if retirement had not yet begun and the
    recorded previous worker is still alive, its exact identity is reused;
    otherwise the old identity is deterministically stopped and awaited dead and
    a fresh previous-commit worker is spawned, so a worker that is merely in the
    middle of shutting down is never accepted as the restored consumer;
-4. verifies the restored worker and PostgreSQL connectivity;
+4. verifies the restored worker and PostgreSQL connectivity (never the new
+   readiness marker, so restoring older known-good versions stays possible);
 5. writes restored maintained-worker metadata;
 6. removes the provisional candidate CLI environment (the `current` symlink was never moved);
 7. records terminal `rolled_back` state.

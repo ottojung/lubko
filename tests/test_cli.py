@@ -61,6 +61,10 @@ def git(*args: str, cwd: Path) -> str:
 def make_repo(path: Path) -> tuple[Path, str, str]:
     """Create a small git repository with two commits.
 
+    The commits carry the readiness protocol module so supervised-checkout
+    tests exercise the pre-confirm readiness proof (issue #30); legacy-candidate
+    tests build a pre-feature commit by removing the module.
+
     Args:
         path: Directory to create the repository in.
 
@@ -72,7 +76,12 @@ def make_repo(path: Path) -> tuple[Path, str, str]:
     git("config", "user.name", GIT_AUTHOR, cwd=path)
     git("config", "user.email", GIT_EMAIL, cwd=path)
     (path / "marker.txt").write_text("commit-A\n", encoding="utf-8")
-    git("add", "marker.txt", cwd=path)
+    (path / "src" / "lubko").mkdir(parents=True)
+    (path / "src" / "lubko" / "readiness.py").write_text(
+        "# readiness protocol\n",
+        encoding="utf-8",
+    )
+    git("add", "marker.txt", "src", cwd=path)
     git("commit", "-q", "-m", "first", cwd=path)
     first = git("rev-parse", "HEAD", cwd=path)
     (path / "marker.txt").write_text("commit-B\n", encoding="utf-8")

@@ -41,7 +41,7 @@ from psycopg.rows import tuple_row
 
 from lubko import cli
 from lubko.config import load_database_config
-from lubko.readiness import LIFECYCLE_MARKER_VAR as LIFECYCLE_MARKER_VAR
+from lubko.readiness import LIFECYCLE_MARKER_VAR
 from lubko.state import state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import group_has_members

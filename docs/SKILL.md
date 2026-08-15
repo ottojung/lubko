@@ -1096,6 +1096,8 @@ confirm exact commit + reversed challenge
 
 Both confirmation requests must traverse the replacement worker. Do not consider a deployment stable merely because checkout returned successfully or the candidate process exists. Until the second confirmation succeeds, the watchdog may restore the previous exact maintained commit automatically.
 
+Checkout additionally requires an explicit pre-confirm readiness proof: the candidate worker writes an atomic, token-scoped marker (keyed by its `LUBKO_LIFECYCLE_TOKEN`) only after it can reach PostgreSQL and the canonical schema invariant holds, and the controller waits for the exact candidate identity plus that marker after the gate is released. A candidate that stays alive without ever reaching the queue loop is rolled back within the readiness window rather than waiting for the confirmation timeout. See `docs/issue21-deploy-protocol.md`.
+
 When checkout is submitted through the queue itself, the worker injects the exact root job UUID into the command environment (`LUBKO_JOB_ID`) so the controller recognizes its own queue row without any `process_pgid` race, then forks a detached handoff helper: the queue job returns its response and reaches durable `succeeded` before the old worker is stopped, so the control job is never killed by the old worker's own shutdown. A helper error or helper death makes the job exit non-zero and be durably recorded `failed` — never falsely `succeeded`. No ordinary job is ever exempted from shutdown cleanup.
 
 ## Verify a deployment with a real round trip

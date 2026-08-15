@@ -415,6 +415,19 @@ provisional candidate never moves the CLIs, and a rollback restores the prior
 confirmed CLI version by construction. See
 `docs/issue21-deploy-protocol.md`.
 
+The supervised checkout also requires an explicit pre-confirm readiness
+proof: the candidate worker writes an atomic, token-scoped readiness marker
+(keyed by its per-candidate `LUBKO_LIFECYCLE_TOKEN`) only after PostgreSQL
+connectivity and the canonical schema invariant verification succeed, and
+`lubko-deploy-ctl checkout` waits for the exact candidate process identity
+plus that matching marker after the gate is released (bounded by
+`--readiness-window-seconds`, default 30, below the confirmation window). A
+candidate that stays alive without ever reaching a functioning
+queue-processing boundary is rejected and rolled back before the operator
+confirmation timeout. Stale markers can never satisfy a later candidate, and
+the marker is only required when the candidate commit implements the protocol,
+so rolling back to older known-good versions stays possible.
+
 The exact `uv` executable a successful install used is recorded, with a schema
 version, in `$XDG_STATE_HOME/lubko/toolchain.json` (default
 `~/.local/state/lubko/toolchain.json`). `lubko-deploy deploy` then falls back
