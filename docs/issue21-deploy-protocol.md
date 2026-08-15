@@ -71,10 +71,11 @@ supervised protocol keeps that pointer coherent with the *confirmed* worker:
 A crash between recording `confirmed` state and switching the symlink leaves
 the CLIs stale (the previous confirmed version), never stranded on candidate
 code; no rollback can fire after `confirmed` is durable. That window is
-repaired idempotently: every `status` or `checkout` request reconciles the CLI
-pointer to the confirmed maintained commit (`$XDG_STATE_HOME/lubko/cli/current`
-is switched only when the confirmed commit's environment is already usable),
-so a crash can never leave a permanently confirmed worker with stale CLIs. The
+repaired idempotently on the next controller invocation: every `status` or
+`checkout` request reconciles the CLI pointer to the confirmed maintained
+commit (`$XDG_STATE_HOME/lubko/cli/current` is switched only when the confirmed
+commit's environment is already usable), so a permanently confirmed worker
+cannot remain with stale CLIs past the next status/checkout. The
 reconciliation never points the CLIs at a provisional candidate: while a
 mission is `pending` the pointer stays on the previous confirmed commit.
 `lubko-deploy status` reports the mismatch as a warning when it observes it.

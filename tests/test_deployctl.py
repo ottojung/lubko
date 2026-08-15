@@ -599,3 +599,20 @@ def test_rollback_without_staged_candidate_root_succeeds(
     rolled_back = dc._read_state()
     assert rolled_back is not None
     assert rolled_back.status == dc.STATUS_ROLLED_BACK
+
+
+def test_rollback_restores_pointer_off_a_provisional_candidate(
+    coherent_environment: tuple[Path, str, str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback pulls the pointer back even if it sits on the candidate."""
+    repo, first, second, bin_dir = coherent_environment
+    state = pending_state(repo=str(repo), old=first, new=second)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+    patch_rollback_dependencies(monkeypatch)
+    cli.set_current(second)
+
+    assert dc._rollback_locked(state) is True
+
+    assert cli.current_commit() == first
+    assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"

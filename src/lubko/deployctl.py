@@ -646,7 +646,13 @@ def _rollback_locked(state: RollbackState) -> bool:
     write_meta(restored)
     _write_state(replace(state, status=STATUS_ROLLED_BACK, challenge_hash=None))
     cli.remove_cli_root(state.commit)
-    append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
+    if cli.reconcile_pointer(state.previous_commit):
+        append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
+    else:
+        append_deploy_log(
+            f"supervised rollback restored commit {state.previous_commit} "
+            "but could not restore the maintained CLI pointer"
+        )
     return True
 
 
