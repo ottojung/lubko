@@ -1378,7 +1378,19 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
     Cleanup uses explicit ``thread`` ownership rather than trusting the
     ``previous`` pointer chain, so orphaned chunks whose chain became
     incomplete because of a crash or corruption are also removed. The root row
-    and its chunks are deleted in one transaction.
+    is deleted first and the owned chunks in a separate statement, all within
+    one transaction.
+
+    Deleting the root before the chunks serializes cleanup with concurrent
+    output publication, which retains the root ``command`` row with a row-level
+    lock before inserting new ``output_chunk`` rows. A single unordered
+    ``DELETE`` may scan and delete chunk rows before acquiring the root row
+    lock, so chunks committed by a concurrent publication after that statement
+    snapshot can survive the later root deletion as orphans. Deleting the root
+    first makes any concurrent publication either block on the root lock until
+    cleanup commits and then find no root (inserting nothing), or commit its
+    chunks before the chunk-cleanup statement starts, so that statement's fresh
+    snapshot removes them.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -1386,13 +1398,14 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
     """
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
+            "DELETE FROM lubko.jobs\nWHERE id = %(job_id)s\n",
+            {"job_id": job_id},
+        )
+        cursor.execute(
             "DELETE FROM lubko.jobs\n"
-            "WHERE id = %(job_id)s\n"
-            "    OR (\n"
-            "        (payload::jsonb)->>'type' = 'output_chunk'\n"
-            "        AND (payload::jsonb)->>'thread' = %(thread)s\n"
-            "    )\n",
-            {"job_id": job_id, "thread": str(job_id)},
+            "WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
+            "    AND (payload::jsonb)->>'thread' = %(thread)s\n",
+            {"thread": str(job_id)},
         )
 
 

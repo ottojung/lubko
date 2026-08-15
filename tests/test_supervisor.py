@@ -788,51 +788,102 @@ def _publish_on_connection(conninfo: str, job: ActiveJob, results: list[bool]) -
         conn.close()
 
 
-def test_publish_output_concurrent_root_deletion_leaves_no_orphan_chunks(
+def _delete_job_and_chunks_on_connection(conninfo: str, job_id: UUID) -> None:
+    """Delete one job and its chunks on a dedicated connection.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        job_id: Identifier of the root job to delete.
+    """
+    conn = psycopg.connect(conninfo)
+    try:
+        delete_job_and_chunks(conn, job_id)
+    finally:
+        conn.close()
+
+
+def _wait_for_blocked_jobs_locks(conninfo: str, count: int, timeout: float = 15.0) -> None:
+    """Wait until ``count`` other backends are queued on a locked ``lubko.jobs`` row.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        count: Number of blocked backends to wait for.
+        timeout: Maximum seconds to wait.
+
+    Raises:
+        AssertionError: If the expected blocked backends do not queue in time.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with psycopg.connect(conninfo) as conn:
+            row = conn.execute(
+                "SELECT count(DISTINCT pid)::int\n"
+                "FROM pg_locks\n"
+                "WHERE NOT granted AND pid <> pg_backend_pid()\n",
+            ).fetchone()
+        if row is not None and row[0] >= count:
+            return
+        time.sleep(0.02)
+    msg = f"timed out waiting for {count} backend(s) queued on a lubko.jobs row lock"
+    raise AssertionError(msg)
+
+
+def test_concurrent_delete_job_and_chunks_vs_publication_leaves_no_orphan_chunks(
     jobs_db: str,
     tmp_path: Path,
 ) -> None:
     """A root deleted while output publishes leaves no new chunk rows.
 
-    The issue #32 race is forced deterministically: the publication transaction
-    blocks on a row lock held by a second connection, and the root is deleted
-    and committed while publication is in flight. Publication first retains the
-    root ``command`` row with a row-level lock, so once the concurrent delete
-    has committed it observes no root, inserts no immutable ``output_chunk``
-    row, and does not advance its in-memory publication state.
+    Both operations run concurrently as their real implementations: a
+    ``publish_output`` and a ``delete_job_and_chunks`` on separate
+    connections. A helper connection holds the root ``command`` row lock so the
+    publication queues on it first (winning the root lock, inserting new
+    chunks), and the deletion queues behind it. Deleting the root before any
+    chunk cleanup makes the deletion's chunk statement run under a fresh
+    snapshot once publication releases the root, so the chunks publication just
+    committed are removed rather than surviving as orphans under the deletion's
+    stale statement snapshot.
     """
     job_id = insert_job(jobs_db, str(tmp_path), "sleep 30")
     job = _publish_job_for(job_id, str(tmp_path))
     job.stdout.path.write_bytes(b"x" * 9000)
 
     results: list[bool] = []
-    holder = psycopg.connect(jobs_db)
+    blocker = psycopg.connect(jobs_db)
     try:
-        with holder.transaction():
-            locked = holder.execute(
+        with blocker.transaction():
+            locked = blocker.execute(
                 "SELECT id FROM lubko.jobs WHERE id = %s FOR UPDATE",
                 (job_id,),
             ).fetchone()
             assert locked is not None
-            thread = threading.Thread(
+            publish_thread = threading.Thread(
                 target=_publish_on_connection,
                 args=(jobs_db, job, results),
                 daemon=True,
             )
-            thread.start()
-            time.sleep(0.2)
-            holder.execute("DELETE FROM lubko.jobs WHERE id = %s", (job_id,))
-        thread.join(timeout=30)
-        assert not thread.is_alive()
+            publish_thread.start()
+            _wait_for_blocked_jobs_locks(jobs_db, 1)
+            delete_thread = threading.Thread(
+                target=_delete_job_and_chunks_on_connection,
+                args=(jobs_db, job_id),
+                daemon=True,
+            )
+            delete_thread.start()
+            _wait_for_blocked_jobs_locks(jobs_db, 2)
+        publish_thread.join(timeout=30)
+        delete_thread.join(timeout=30)
+        assert not publish_thread.is_alive()
+        assert not delete_thread.is_alive()
     finally:
-        holder.close()
+        blocker.close()
 
-    assert results == [False]
+    assert results == [True]
     assert count_rows(jobs_db, job_id) == 0
     assert read_chunks(jobs_db, job_id) == []
-    assert job.stdout.archived_upto == 0
-    assert job.stdout.sequence == 0
-    assert job.stdout.tail_end == 0
+    assert job.stdout.archived_upto == 6000
+    assert job.stdout.sequence == 3
+    assert job.stdout.tail_end == 9000
 
 
 def test_database_outage_stops_claims_and_never_lets_a_child_outlive_its_lease(

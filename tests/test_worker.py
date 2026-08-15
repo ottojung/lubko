@@ -628,18 +628,23 @@ def test_finish_job_persists_cancellation_result() -> None:
 
 
 def test_delete_job_and_chunks_uses_explicit_ownership() -> None:
-    """Cleanup deletes the root and every explicitly owned chunk by thread."""
+    """Cleanup deletes the root first, then every owned chunk by thread."""
     conn = _RecordingConnection()
     job_id = uuid4()
 
     delete_job_and_chunks(as_db(conn), job_id)
 
-    sql, params = conn.executions[0]
-    assert "output_chunk" in sql
-    assert "thread" in sql
-    assert isinstance(params, dict)
-    assert params["job_id"] == job_id
-    assert params["thread"] == str(job_id)
+    root_sql, root_params = conn.executions[0]
+    assert root_sql.startswith("DELETE")
+    assert "output_chunk" not in root_sql
+    assert isinstance(root_params, dict)
+    assert root_params["job_id"] == job_id
+    chunk_sql, chunk_params = conn.executions[1]
+    assert chunk_sql.startswith("DELETE")
+    assert "output_chunk" in chunk_sql
+    assert "thread" in chunk_sql
+    assert isinstance(chunk_params, dict)
+    assert chunk_params["thread"] == str(job_id)
 
 
 def test_publish_output_writes_bounded_tail_for_short_output(

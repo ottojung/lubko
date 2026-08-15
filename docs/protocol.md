@@ -284,19 +284,26 @@ exact backwards traversal.
 #### Cleanup
 
 Cleaning up a root job must clean up every chunk belonging to it, using
-explicit ownership rather than recursively trusting the pointer chain:
+explicit ownership rather than recursively trusting the pointer chain. Delete
+the root first, then the owned chunks, in one transaction:
 
 ```sql
+delete from lubko.jobs where id = '<ROOT JOB UUID>';
+
 delete from lubko.jobs
-where id = '<ROOT JOB UUID>'
-   or (
-        (payload::jsonb)->>'type' = 'output_chunk'
-        and (payload::jsonb)->>'thread' = '<ROOT JOB UUID>'
-   );
+where (payload::jsonb)->>'type' = 'output_chunk'
+  and (payload::jsonb)->>'thread' = '<ROOT JOB UUID>';
 ```
 
-This also removes orphaned chunks whose `previous` chain became incomplete
-because of a crash or corruption.
+Deleting the root before the chunks serializes cleanup with output
+publication, which retains the root `command` row with a row-level lock before
+inserting new chunks. A single unordered `DELETE` may scan and delete chunk
+rows before acquiring the root lock, so chunks committed by a concurrent
+publication after that statement's snapshot could survive the later root
+deletion as orphans; the root-first ordering closes that window. The two
+statements still run in one transaction, so a crash rolls back the whole
+cleanup. This also removes orphaned chunks whose `previous` chain became
+incomplete because of a crash or corruption.
 
 ### Timestamps
 
