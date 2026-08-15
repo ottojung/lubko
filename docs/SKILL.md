@@ -312,8 +312,9 @@ rotation.
 
 ## Bounded multi-job polling
 
-To observe several jobs (for example several parallel attached agents) at
-once, poll them together with one bounded query:
+When several jobs are outstanding — for example several parallel attached
+agents — grouped polling is the preferred way to observe them, not an optional
+convenience. Poll them together with one bounded query:
 
 ```sql
 select id, payload
@@ -322,7 +323,9 @@ where id in ('<JOB A UUID>', '<JOB B UUID>');
 ```
 
 Each row remains bounded and contains a useful recent live tail. When many
-parallel jobs exist, this is very useful.
+parallel jobs exist, this is very useful. Once a job reaches a terminal state,
+drop its UUID from subsequent grouped polls and keep polling the remaining
+outstanding job UUIDs together.
 
 ---
 
@@ -881,36 +884,83 @@ Rules:
 Once daemon concurrency is available, parallel attached agent jobs are a
 first-class pattern.
 
-The orchestrator first generates distinct fresh hex IDs, for example `<ID1>`
-and `<ID2>`.
+The core contract for independent parallel work:
 
-Then submit independent Lubko root jobs containing commands such as:
+> **Whenever several parallel root jobs have been submitted and remain
+> outstanding, poll all outstanding root Supabase job UUIDs together in one
+> bounded query — never each one independently.**
 
-```sh
-lubko-agent new --id <ID1> --cwd /workspace/project-a &&
-lubko-agent prompt --id <ID1> 'Investigate and fix issue A. Run validation.'
-```
+The contract is about polling, not submission order: if more jobs are still
+being submitted while others are already outstanding, poll the outstanding
+ones together and fold each new root job UUID in as it is submitted.
 
-and:
+## Example: several agents, then group-poll together
 
-```sh
-lubko-agent new --id <ID2> --cwd /workspace/project-b &&
-lubko-agent prompt --id <ID2> 'Review subsystem B and fix the identified problem. Run validation.'
-```
+1. **Choose stable Lubko agent IDs up front.** Generate distinct fresh hex IDs
+   before submitting anything, for example `<AGENT_A>` and `<AGENT_B>`.
 
-Those two root jobs both run at the same time while their corresponding agents
-work.
+2. **Submit each agent invocation as its own Supabase root job.** Record the
+   **Supabase root job UUID** returned by each submission.
 
-Then observe them together with one bounded query:
+   Agent A:
 
-```sql
-select id, payload
-from lubko.jobs
-where id in ('<JOB A UUID>', '<JOB B UUID>');
-```
+   ```sh
+   lubko-agent new --id <AGENT_A> --cwd /workspace/project-a &&
+   lubko-agent prompt --id <AGENT_A> 'Investigate and fix issue A. Run validation.'
+   ```
 
-Each row remains bounded, contains a useful recent live tail, and becomes
-terminal when its corresponding attached prompt finishes.
+   and independently:
+
+   ```sh
+   lubko-agent new --id <AGENT_B> --cwd /workspace/project-b &&
+   lubko-agent prompt --id <AGENT_B> 'Review subsystem B and fix the identified problem. Run validation.'
+   ```
+
+   Those two root jobs both run at the same time while their corresponding
+   agents work.
+
+3. **Poll all outstanding root jobs together in one bounded query:**
+
+   ```sql
+   select id, payload
+   from lubko.jobs
+   where id in ('<JOB_A_UUID>', '<JOB_B_UUID>');
+   ```
+
+   Each row remains bounded, contains a useful recent live tail, and becomes
+   terminal when its corresponding attached prompt finishes.
+
+4. **Repeat grouped polling until every job is terminal.** When only a subset
+   has reached a terminal state, consume their results and keep polling the
+   remaining outstanding root job UUIDs together — drop the finished IDs from
+   the next `where id in (...)`.
+
+## Agent IDs versus Supabase job UUIDs
+
+Keep these distinct:
+
+- **Lubko agent IDs** such as `<AGENT_A>` — caller-chosen base-16 strings used
+  with `lubko-agent ... --id` for `new`, `prompt`, `status`, `log`, `wait`,
+  `stop`, `kill`, and `delete`;
+- **Supabase root job UUIDs** such as `<JOB_A_UUID>` — returned by job
+  submission and used for polling, including the grouped `where id in (...)`
+  query.
+
+Output-chunk rows are not the IDs to use for this polling loop; they are
+immutable historical output owned by a root job via `payload.thread`.
+
+## Avoid unbounded or one-at-a-time polling
+
+- Do not poll broadly: always bound the query to the recorded root job UUIDs
+  with `where id in (...)`. Never run unbounded reads such as
+  `select * from lubko.jobs` without the recorded UUID filter — the table holds
+  every historical row, so an unscoped read is unbounded.
+- Do not poll several outstanding parallel jobs one at a time. That multiplies
+  connector round trips and forfeits the concurrency the parallel submission
+  created.
+- Ordinary single-job polling stays valid: when exactly one job is
+  outstanding, the single `where id = '...'` query in
+  [Polling a Supabase job](#polling-a-supabase-job) is exactly right.
 
 The agent IDs are already known before submission, so there is no need to
 scrape them from output or consult global state.
