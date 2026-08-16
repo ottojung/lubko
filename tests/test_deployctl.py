@@ -38,12 +38,14 @@ from lubko.lifecycle import (
     worker_alive,
     write_meta,
 )
+from lubko.state import state_root
 from lubko.worker import group_has_members
+from tests import _isolation as isolation
 from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from typing import Any
 
     from lubko.lifecycle import ProcessIdentity
@@ -321,6 +323,26 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+
+@pytest.fixture(autouse=True)
+def _ambient_production_intact() -> Iterator[None]:
+    """Assert every test leaves the ambient production-like state untouched.
+
+    The ambient tree stands in for the live user state tree and the ambient
+    live worker for the real maintained worker. A deployment test that escaped
+    the XDG isolation would mutate the tree or signal the sentinel; both are
+    caught here after every test in this module.
+
+    Yields:
+        Nothing while one test runs.
+    """
+    tree = isolation.ambient_state_root()
+    before = isolation.snapshot_tree(tree)
+    yield
+    after = isolation.snapshot_tree(tree)
+    assert after == before, "test mutated the ambient production-like state tree"
+    assert isolation.ambient_sentinel_alive(), "test signalled the ambient live worker"
 
 
 @pytest.fixture
@@ -2054,8 +2076,11 @@ def kill_recorded_workers() -> None:
 
     The candidate/restored workers are spawned by the controller subprocess and
     therefore never appear in the process guard registry, so they are stopped
-    by exact recorded identity here.
+    by exact recorded identity here. This is deliberately destructive and
+    therefore fails closed: the recorded identities are only read from state
+    the current test owns, never from the live user state tree.
     """
+    isolation.assert_test_owned_state_root()
     recorded: list[WorkerMeta] = []
     meta = read_meta()
     if meta is not None:
@@ -2124,6 +2149,7 @@ def _prepare_e2e(
         The repo, commits, database config, old worker process, old worker
         metadata, and fake ``uv``.
     """
+    isolation.assert_test_owned_state_root()
     conf = write_database_config(tmp_path, pg_cluster)
     monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
@@ -2494,3 +2520,74 @@ def test_end_to_end_queue_checkout_error_leaves_failed_row(
     finally:
         kill_recorded_workers()
         assert_no_lubko_leaks()
+
+
+def read_proc_environ(pid: int) -> dict[str, str]:
+    """Read the exact environment of a live process from ``/proc``.
+
+    Args:
+        pid: Process to inspect.
+
+    Returns:
+        The process environment as a mapping.
+    """
+    raw = (Path("/proc") / str(pid) / "environ").read_bytes()
+    entries = (entry for entry in raw.split(b"\0") if b"=" in entry)
+    return {
+        str(entry.split(b"=", 1)[0], "utf-8"): str(entry.split(b"=", 1)[1], "utf-8")
+        for entry in entries
+    }
+
+
+def test_end_to_end_full_deployment_stays_hermetic(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full supervised deployment never escapes the test-owned state root.
+
+    Runs the real queue-driven deployment and confirmation handshake while a
+    live sentinel worker with ambient production-like state remains present.
+    The maintained worker subprocess must observe the same isolated
+    ``XDG_STATE_HOME`` as the test process, every lifecycle file the
+    deployment creates must land under the test root, the ambient tree must
+    stay byte-for-byte unchanged, and the sentinel process must never be
+    signalled.
+    """
+    isolation.assert_test_owned_state_root()
+    prepared = _prepare_e2e(tmp_path, monkeypatch, pg_cluster)
+    repo, second, old_meta, fake_uv = _prepare_e2e_parts(prepared)
+    ambient_before = isolation.snapshot_tree(isolation.ambient_state_root())
+    expected_state_home = os.environ["XDG_STATE_HOME"]
+    assert old_meta.pid is not None
+    worker_environ = read_proc_environ(old_meta.pid)
+    assert worker_environ.get("XDG_STATE_HOME") == expected_state_home
+    try:
+        checkout_id = insert_pending_args_job(
+            jobs_db,
+            str(repo),
+            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
+        )
+        _wait_for_checkout_success_and_old_death(jobs_db, checkout_id, old_meta)
+        wait_until(_live_handoff_done, timeout=30.0)
+        _run_confirmation_handshake(jobs_db, repo, fake_uv, second)
+
+        final_state = dc._read_state()
+        assert final_state is not None
+        assert final_state.status == dc.STATUS_CONFIRMED
+        meta = read_meta()
+        assert meta is not None
+        assert meta.git_commit == second
+        assert cli.current_commit() == second
+    finally:
+        kill_recorded_workers()
+        assert_no_lubko_leaks()
+
+    assert isolation.snapshot_tree(isolation.ambient_state_root()) == ambient_before
+    assert isolation.ambient_sentinel_alive()
+    test_tmp = isolation.CURRENT_TEST_TMP
+    assert test_tmp is not None
+    assert state_root().is_relative_to(test_tmp)
+    resolved_home = Path(os.environ["XDG_STATE_HOME"]).resolve()
+    assert resolved_home.is_relative_to(test_tmp)
