@@ -517,6 +517,13 @@ restarts worker processes:
   stop and liveness check uses the exact recorded process identity (PID,
   process group, session, start time, lifecycle token, and direct-parent
   check), so a recycled PID can never be signalled;
+- a process-level advisory `flock` on `.supervisor.lock` is held for the whole
+  daemon lifetime before any durable state is written or any worker lifecycle
+  is touched: near-simultaneous supervisor starts resolve to exactly one
+  owner and the loser exits before it can mutate state or spawn/restart a
+  worker, while a later supervisor always takes ownership after the owner
+  exits (even if it was crash-killed), because the kernel releases the lock at
+  process death;
 - `lubko-deploy deploy`, `lubko-deploy restart`, and the supervised
   `lubko-deploy-ctl` protocol communicate only through durable state: a
   monotonic generation space shared by the desired intent, the daemon's
@@ -596,7 +603,13 @@ Supervisor state lives under `$XDG_STATE_HOME/lubko/supervisor/`:
   identity, queue readiness, last worker exit, restart count, next retry time,
   and the supervised-deployment mission state;
 - `supervisor.pid` — the daemon's own exact identity, used only to detect that
-  a daemon is running and to refuse a second daemon.
+  a daemon is running and to refuse a second daemon;
+- `.supervisor.lock` — the process-level ownership lock: an advisory `flock`
+  the daemon holds for its whole lifetime. Two near-simultaneous
+  `lubko-supervisor` starts resolve to exactly one owner; the loser exits
+  fail-closed before it can mutate supervisor state or worker lifecycle, and
+  the kernel releases the lock when the owner exits (graceful, crash, or
+  SIGKILL), so ownership always transfers to a later start.
 
 ### Crash, backoff, and readiness
 

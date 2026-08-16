@@ -42,6 +42,12 @@ restarts worker processes:
   through the durable protocol in :mod:`lubko.supervise`, so planned
   replacements, candidate handoffs, confirmation, and rollback never race the
   supervisor;
+- a process-level advisory ``flock`` on the supervisor state's lock file is
+  held for the entire daemon lifetime before anything writes durable state or
+  touches worker lifecycle: two near-simultaneous ``lubko-supervisor`` starts
+  resolve to exactly one owner and the loser exits fail-closed, while the
+  kernel releases the lock at the owner's death (graceful, crash, or SIGKILL)
+  so a later supervisor can always take ownership afterwards;
 - during a supervised deployment the supervisor recognises the durable pending
   mission (``worker/rollback.json``) and holds: it never resurrects the
   intentionally retiring previous worker, and on container restart during a
@@ -77,6 +83,7 @@ from lubko.supervise import (
     LastExit,
     SupervisorStatus,
     WorkerChild,
+    acquire_supervisor_lock,
     proc_start_ticks,
     read_desired,
     read_state,
@@ -303,25 +310,36 @@ class SupervisorDaemon:
         self._started_at = time.time()
         self._next_db_check_at = 0.0
         self._message: str | None = None
+        self._ownership_fd: int | None = None
 
     def run(self) -> None:
         """Run the supervisor loop until a shutdown signal arrives.
 
+        The process-level ownership lock is acquired before anything writes
+        durable supervisor state or touches worker lifecycle, so a second
+        concurrent ``lubko-supervisor`` exits fail-closed here; the lock is
+        held for the whole run and released only on shutdown, and the kernel
+        revokes it automatically if this process ever dies without a clean
+        shutdown, so a later supervisor can always take ownership afterwards.
         The daemon never exits on its own: an unexpected worker exit is
         recorded and backed off, and the intended worker is restored.
         """
         LOGGER.info("lubko supervisor starting (pid %d)", os.getpid())
-        self._write_pidfile()
-        self._install_signal_handlers()
-        self._write_status("starting")
-        while not self._stopping:
-            try:
-                self._tick(time.monotonic())
-            except Exception:
-                LOGGER.exception("supervisor tick failed; continuing")
-            self._write_status()
-            time.sleep(self.settings.poll_interval_seconds)
-        self._shutdown()
+        self._acquire_ownership()
+        try:
+            self._write_pidfile()
+            self._install_signal_handlers()
+            self._write_status("starting")
+            while not self._stopping:
+                try:
+                    self._tick(time.monotonic())
+                except Exception:
+                    LOGGER.exception("supervisor tick failed; continuing")
+                self._write_status()
+                time.sleep(self.settings.poll_interval_seconds)
+            self._shutdown()
+        finally:
+            self._release_ownership()
 
     # ------------------------------------------------------------------
     # Tick / decision
@@ -966,6 +984,39 @@ class SupervisorDaemon:
         signal.signal(signal.SIGTERM, _handle_shutdown)
         signal.signal(signal.SIGINT, _handle_shutdown)
 
+    def _acquire_ownership(self) -> None:
+        """Fail closed if another live supervisor already owns the role.
+
+        The process-level flock is taken before anything writes durable
+        supervisor state or touches worker lifecycle, so a second concurrent
+        ``lubko-supervisor`` exits here: it never reaches the pidfile write,
+        the status write, a ``_tick`` decision, or a worker spawn, and it can
+        never oscillate the durable generations or duplicate a consumer.  The
+        descriptor stays open for the daemon's whole lifetime and is closed
+        only when the daemon shuts down; because the kernel drops the flock
+        when this process exits — even under SIGKILL or a crash — a later
+        supervisor can always take ownership afterwards.
+
+        Raises:
+            SystemExit: If another live supervisor holds the ownership lock.
+        """
+        try:
+            acquired = acquire_supervisor_lock()
+        except OSError:
+            LOGGER.exception(
+                "another lubko supervisor is already running; refusing to start a second one"
+            )
+            raise SystemExit(1) from None
+        self._ownership_fd = acquired
+        LOGGER.info("supervisor ownership lock acquired (fd %d)", acquired)
+
+    def _release_ownership(self) -> None:
+        """Release the process-level ownership lock held for the lifetime."""
+        if self._ownership_fd is not None:
+            with suppress(Exception):
+                os.close(self._ownership_fd)
+            self._ownership_fd = None
+
     def _shutdown(self) -> None:
         """Stop the worker child gracefully and persist a clean state."""
         LOGGER.info("supervisor shutting down")
@@ -978,6 +1029,11 @@ class SupervisorDaemon:
     @staticmethod
     def _write_pidfile() -> None:
         """Record our exact identity, refusing to double-run a live daemon.
+
+        The process-level ownership lock acquired in :meth:`run` already held
+        off any second flock-aware daemon, so the read/check/write here cannot
+        race a concurrent start.  The recorded-pid liveness check stays as
+        defense in depth against a legacy flock-less daemon instance.
 
         Raises:
             SystemExit: If another live supervisor daemon is already running.

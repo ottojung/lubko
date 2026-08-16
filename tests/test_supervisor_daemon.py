@@ -856,6 +856,156 @@ def test_supervisor_takeover_stops_orphan_worker_by_exact_identity(
 
 
 # ---------------------------------------------------------------------------
+# Acceptance: singleton ownership (#68)
+# ---------------------------------------------------------------------------
+
+#: Return code a second supervisor must exit with when it loses ownership.
+NON_OWNER_EXIT_CODE: Final = 1
+
+
+def wait_for_exit(proc: subprocess.Popen[bytes], timeout: float = 30.0) -> int:
+    """Wait until a process exits and return its exit code.
+
+    Args:
+        proc: Process to await.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        The process exit code.
+    """
+    wait_until(lambda: proc.poll() is not None, timeout=timeout)
+    return int(proc.poll() or 0)
+
+
+def test_second_supervisor_while_owner_running_exits_before_mutation(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A concurrent second supervisor exits before mutating any daemon state.
+
+    The process-level ownership lock is held for the entire daemon lifetime,
+    so a supervisor started while the owner is live must fail closed before it
+    can rewrite ``supervisor.pid``, ``state.json``, or the worker lifecycle:
+    the durable generation, the recorded pidfile identity, and the running
+    worker child must all stay exactly as the owner left them (no oscillation,
+    no second consumer), and the same state root must accept a fresh
+    supervisor again once the owner exits.
+    """
+    del pg_cluster
+    repo, first, _second = maintained_env
+    with running_supervisor(supervisor_env) as owner:
+        request_and_wait(first, repo)
+        worker = worker_pid()
+        assert worker is not None
+        status = supervise.read_status()
+        assert status is not None
+        applied = status.applied_generation
+        assert applied >= 1
+
+        intruder = start_supervisor(supervisor_env)
+        exit_code = wait_for_exit(intruder)
+        guard.unregister(intruder)
+        assert exit_code == NON_OWNER_EXIT_CODE
+        assert not process_alive(intruder.pid)
+
+        status = supervise.read_status()
+        assert status is not None
+        assert status.supervisor_pid == owner.pid
+        assert status.applied_generation == applied
+        assert status.child is not None
+        assert status.child.pid == worker
+        assert len(direct_children(owner.pid)) == 1
+        recorded = supervise.read_supervisor_pid()
+        assert recorded is not None
+        assert recorded[0] == owner.pid
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == worker
+        assert supervise.supervisor_running()
+
+        probe_id = insert_pending_job(jobs_db, str(tmp_path), "echo singleton-ok")
+        wait_until(lambda: read_status_of(jobs_db, probe_id) == "succeeded")
+        assert worker_pid() == worker
+
+    with running_supervisor(supervisor_env):
+        wait_until(lambda: worker_pid() is not None, timeout=30.0)
+        wait_until(status_ready, timeout=30.0)
+        resumed_pid = worker_pid()
+        assert resumed_pid is not None
+        assert resumed_pid != worker
+        status = supervise.read_status()
+        assert status is not None
+        assert status.supervisor_pid != owner.pid
+        assert len(direct_children(status.supervisor_pid)) == 1
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == resumed_pid
+
+
+def test_two_simultaneous_supervisors_resolve_to_single_owner(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """Two near-simultaneous supervisor starts resolve to exactly one owner.
+
+    Regression for the #68 singleton race: with no daemon yet running, two
+    ``lubko-supervisor`` processes are started back-to-back against a single
+    durable intent.  Exactly one of them must win the process-level ownership
+    lock, run the daemon loop, and own the sole worker child; the loser must
+    exit fail-closed with code 1 before it can write the pidfile, and the
+    durable generation must never oscillate or duplicate a consumer.
+    """
+    del pg_cluster
+    repo, first, _second = maintained_env
+    supervise.request_run(first, repo=str(repo), uv_path="uv", worker_id=TEST_WORKER_ID)
+    first_candidate = start_supervisor(supervisor_env)
+    second_candidate = start_supervisor(supervisor_env)
+    try:
+        wait_until(
+            lambda: first_candidate.poll() is not None or second_candidate.poll() is not None,
+            timeout=30.0,
+        )
+        winner = first_candidate if first_candidate.poll() is None else second_candidate
+        loser = second_candidate if first_candidate.poll() is None else first_candidate
+        assert winner.poll() is None
+        loser_exit = wait_for_exit(loser)
+        assert loser_exit == NON_OWNER_EXIT_CODE
+        assert not process_alive(loser.pid)
+
+        wait_until(status_ready, timeout=30.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.supervisor_pid == winner.pid
+        assert status.applied_generation == 1
+        assert status.child is not None
+        assert process_alive(status.child.pid)
+        assert status.child.pid in direct_children(winner.pid)
+        assert len(direct_children(winner.pid)) == 1
+        recorded = supervise.read_supervisor_pid()
+        assert recorded is not None
+        assert recorded[0] == winner.pid
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == status.child.pid
+
+        probe_id = insert_pending_job(jobs_db, str(tmp_path), "echo exactly-one")
+        wait_until(lambda: read_status_of(jobs_db, probe_id) == "succeeded")
+        assert worker_pid() == status.child.pid
+    finally:
+        for proc in (first_candidate, second_candidate):
+            if proc.poll() is None:
+                stop_supervisor(proc)
+            else:
+                guard.unregister(proc)
+
+
+# ---------------------------------------------------------------------------
 # Acceptance: fail-closed deployment state and supervised missions
 # ---------------------------------------------------------------------------
 

@@ -20,7 +20,13 @@ all coordination travels through small atomic JSON files under
   ``lubko-deploy status`` reports;
 - ``supervisor.pid`` — the daemon's own exact identity (PID and start time in
   clock ticks), used by the CLIs only to detect that a daemon is running;
-  nothing ever signals it through this file.
+  nothing ever signals it through this file;
+- ``.supervisor.lock`` — the process-level ownership lock: an advisory
+  ``flock`` held by the daemon for its whole lifetime, so a second concurrent
+  ``lubko-supervisor`` fails closed before it can mutate durable state or
+  touch worker lifecycle, while a later start always takes ownership after the
+  current owner (even a crash-killed one) exits, because the kernel releases
+  the lock at process death.
 
 The supervisor never infers intentional shutdown from process names, argv,
 timing guesses, or transient queue state: every intentional transition either
@@ -33,6 +39,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -422,6 +429,49 @@ def generation_lock() -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def supervisor_lock_path() -> Path:
+    """Return the path of the process-level supervisor ownership lock.
+
+    Returns:
+        The lock file path inside the supervisor state directory.
+    """
+    return supervisor_dir() / ".supervisor.lock"
+
+
+def acquire_supervisor_lock() -> int:
+    """Acquire the exclusive supervisor ownership lock non-blockingly.
+
+    The advisory flock is the singleton mechanism: at most one process can
+    hold the lock at a time and the kernel revokes it automatically whenever
+    the owning process exits, whether by graceful stop, crash, or SIGKILL,
+    so a later daemon can always take ownership after the current owner dies.
+    Because the caller keeps the returned descriptor open for the whole daemon
+    lifetime, the lock governs the entire run, not merely a pidfile write: a
+    second concurrent start fails closed before it can mutate supervisor state
+    or restart worker lifecycles.
+
+    Args:
+        None.
+
+    Returns:
+        The open file descriptor holding the lock.
+
+    Raises:
+        OSError: If another process already holds the lock and
+            ``EWOULDBLOCK`` is raised, meaning a live daemon is already
+            running.
+    """
+    path = supervisor_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
 
 
 # ---------------------------------------------------------------------------
