@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -18,7 +18,7 @@ import psycopg
 import pytest
 
 from lubko import cli, lifecycle, toolchain
-from lubko.config import DatabaseConfig
+from lubko.config import DatabaseConfig, load_database_config
 from lubko.lifecycle import (
     EXIT_ERROR,
     EXIT_OK,
@@ -27,6 +27,7 @@ from lubko.lifecycle import (
     WorkerMeta,
 )
 from lubko.state import rollback_state_path
+from lubko.worker import delete_job_and_chunks, request_cancel
 from tests import _pg
 from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
@@ -39,6 +40,7 @@ GIT_SHA: Final = "a" * 40
 GIT_SHA_LENGTH: Final = 40
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
+BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
 TEST_PASSWORD: Final = "secret-value"  # ruff: ignore[hardcoded-password-string] - test credential
 
 
@@ -1040,17 +1042,23 @@ REPAIR_TIMINGS: Final = {
 }
 
 
-def write_database_config(tmp_path: Path, cluster: _pg.PgCluster) -> Path:
+def write_database_config(
+    tmp_path: Path,
+    cluster: _pg.PgCluster,
+    *,
+    name: str = "database.conf",
+) -> Path:
     """Write a private database configuration file for the cluster.
 
     Args:
         tmp_path: Temporary directory for the configuration file.
         cluster: The running PostgreSQL cluster.
+        name: Configuration file name, allowing several clusters per test.
 
     Returns:
         The configuration file path.
     """
-    conf = tmp_path / "database.conf"
+    conf = tmp_path / name
     conf.write_text(
         f"host={cluster.socket_dir}\n"
         f"port={cluster.port}\n"
@@ -1063,18 +1071,23 @@ def write_database_config(tmp_path: Path, cluster: _pg.PgCluster) -> Path:
     return conf
 
 
-def spawn_real_worker(db_conf: Path) -> subprocess.Popen[bytes]:
+def spawn_real_worker(
+    db_conf: Path,
+    *,
+    worker_id: str = REPAIR_WORKER_ID,
+) -> subprocess.Popen[bytes]:
     """Spawn a real queue-consuming worker registered with the process guard.
 
     Args:
         db_conf: Database configuration file for the worker.
+        worker_id: Worker identifier the worker records on claims.
 
     Returns:
         The spawned worker process.
     """
     env = dict(os.environ)
     env["LUBKO_DATABASE_CONFIG"] = str(db_conf)
-    env["LUBKO_WORKER_ID"] = REPAIR_WORKER_ID
+    env["LUBKO_WORKER_ID"] = worker_id
     env.update(REPAIR_TIMINGS)
     proc = subprocess.Popen(
         [sys.executable, "-m", "lubko.worker"],
@@ -1140,6 +1153,111 @@ def stale_meta(pid: int, commit: str, repo: Path) -> WorkerMeta:
         started_at=1.0,
         stopped_at=None,
     )
+
+
+@pytest.fixture
+def second_pg_cluster(tmp_path: Path) -> Iterator[_pg.PgCluster]:
+    """Start a second isolated PostgreSQL cluster for two-worker tests.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Yields:
+        The second running cluster.
+    """
+    binaries = _pg.postgres_binaries()
+    if binaries is None:
+        pytest.skip("PostgreSQL server binaries not available on this host")
+    root = tmp_path / "pg-other"
+    data_dir = root / "data"
+    socket_dir = root / "sock"
+    socket_dir.mkdir(parents=True)
+    port = _pg.free_port()
+    subprocess.run(
+        [
+            binaries["initdb"],
+            "-D",
+            str(data_dir),
+            "-U",
+            "postgres",
+            "--auth=trust",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    current = _pg.PgCluster(binaries, data_dir, socket_dir, port, dict(os.environ))
+    current.start()
+    with psycopg.connect(current.conninfo()) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+    try:
+        yield current
+    finally:
+        current.stop()
+
+
+def test_spawned_by_recovery_worker_true_for_child_and_grandchild() -> None:
+    """The ancestor walk accepts direct children and deeper descendants.
+
+    A real grandchild mirrors the production recovery worker launched through
+    ``uv run lubko-worker``: the adopted PID (``uv``) is the grandparent of the
+    job command process, whose direct parent is the worker daemon child.
+    """
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)']); "
+                "print(p.pid, flush=True); "
+                "time.sleep(300)"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    guard.register(child)
+    grandchild_pid = int(child.stdout.readline().strip()) if child.stdout is not None else 0
+    try:
+        assert lifecycle._spawned_by_recovery_worker(child.pid, os.getppid())
+        assert lifecycle._spawned_by_recovery_worker(grandchild_pid, child.pid)
+        assert lifecycle._spawned_by_recovery_worker(grandchild_pid, os.getppid())
+    finally:
+        with suppress(ProcessLookupError):
+            os.kill(grandchild_pid, signal.SIGKILL)
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        guard.unregister(child)
+
+
+def test_spawned_by_recovery_worker_false_for_unrelated_pid() -> None:
+    """A process whose ancestor chain lacks the pid is never accepted."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        cwd=REPO_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    guard.register(child)
+    try:
+        assert not lifecycle._spawned_by_recovery_worker(child.pid, child.pid + 1)
+        assert not lifecycle._spawned_by_recovery_worker(999_999, os.getppid())
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        guard.unregister(child)
+
+
+def test_spawned_by_recovery_worker_false_for_dead_process() -> None:
+    """A gone process is never accepted, failing closed."""
+    assert not lifecycle._spawned_by_recovery_worker(999_999, os.getppid())
 
 
 def test_repair_adopts_recovery_worker(
@@ -1440,3 +1558,81 @@ def test_repair_refuses_live_pending_rollback_mission(
     finally:
         kill_proc(candidate)
         kill_proc(adopting_worker)
+
+
+def probe_claimed_by(
+    repo: Path,
+    worker_pid: int,
+    *,
+    expected_worker_id: str = REPAIR_WORKER_ID,
+    timeout_seconds: float = 30.0,
+) -> bool:
+    """Return whether the exact worker PID claims a fresh probe from the queue.
+
+    The repair-queue probe is inserted, then awaited with the same
+    exact-PID-bounded proof the repair uses: the persisted ``process_pid``
+    must be a descendant of ``worker_pid``. The probe is always cancelled,
+    awaited terminal, and removed.
+
+    Args:
+        repo: Working directory for the probe command.
+        worker_pid: Exact worker PID whose claim is being proven.
+        expected_worker_id: Worker identifier the probe claim must record.
+        timeout_seconds: Maximum seconds to wait for the claim.
+
+    Returns:
+        ``True`` only when the exact worker PID executed the probe.
+    """
+    conn = psycopg.connect(load_database_config().conninfo(), autocommit=True)
+    probe_id = lifecycle._insert_probe_job(conn, str(repo))
+    assert probe_id is not None
+    try:
+        outcome = lifecycle._wait_for_probe_claim(
+            conn, probe_id, expected_worker_id, worker_pid, timeout_seconds
+        )
+    finally:
+        request_cancel(conn, probe_id)
+        lifecycle._wait_for_probe_terminal(conn, probe_id, timeout_seconds)
+        delete_job_and_chunks(conn, probe_id)
+        conn.close()
+    return outcome
+
+
+def test_repair_refuses_when_same_id_other_worker_claims_probe(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    second_pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-worker-id twin that claims the probe must never be adopted.
+
+    Two real workers run simultaneously with the identical
+    ``LUBKO_WORKER_ID``. The operator supplies the PID of worker A, but the
+    probe is claimed and executed by worker B (the only consumer of the repair
+    queue). The claim proof is bound to the exact supplied PID through the
+    persisted ``process_pid`` descendant check, so the repair must refuse to
+    adopt A rather than accept B's consumption as evidence for A.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    other_conf = write_database_config(tmp_path, second_pg_cluster, name="other.conf")
+    supplied = spawn_real_worker(other_conf)
+    claiming = spawn_real_worker(conf)
+    try:
+        assert probe_claimed_by(repo, claiming.pid) is True
+        assert probe_claimed_by(repo, supplied.pid) is False
+
+        code = lifecycle.repair(make_repair_options(repo), supplied.pid)
+
+        assert code == EXIT_ERROR
+        assert lifecycle.read_meta() is None
+        assert supplied.poll() is None
+        assert claiming.poll() is None
+    finally:
+        kill_proc(supplied)
+        kill_proc(claiming)

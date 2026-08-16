@@ -78,6 +78,8 @@ UV_HTTP_TIMEOUT: Final = "30"
 STAT_MIN_FIELDS: Final = 20
 STAT_STARTTIME_FIELD_INDEX: Final = 19
 STAT_STATE_FIELD_INDEX: Final = 0
+STAT_PPID_FIELD_INDEX: Final = 1
+STAT_PPID_MIN_FIELDS: Final = 2
 
 VALIDATION_STEPS: Final = (
     ("sync",),
@@ -1229,31 +1231,97 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     return row[0] if row is not None else None
 
 
+def _read_ppid(pid: int) -> int | None:
+    """Read the exact parent process ID of a live process.
+
+    Args:
+        pid: Process whose parent to inspect.
+
+    Returns:
+        The parent PID, or ``None`` when the process is gone or unreadable.
+    """
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+    except OSError:
+        return None
+    close_paren = stat.rfind(b")")
+    if close_paren == -1:
+        return None
+    fields = stat[close_paren + 2 :].split()
+    if len(fields) < STAT_PPID_MIN_FIELDS:
+        return None
+    try:
+        return int(fields[STAT_PPID_FIELD_INDEX])
+    except ValueError:
+        return None
+
+
+def _spawned_by_recovery_worker(process_pid: int, recovery_worker_pid: int) -> bool:
+    """Return whether a process was spawned by the exact recovery worker.
+
+    The worker daemon directly ``Popen``-spawns every job process, so the
+    probe command process is an ancestor-chain descendant of the worker daemon
+    that claimed it (through the daemon, and through a ``uv run lubko-worker``
+    launcher when the daemon is the launcher's child). Walking the exact parent
+    chain binds the claim to the supplied recovery worker PID regardless of
+    whether the recorded ``worker_id`` is unique.
+
+    Args:
+        process_pid: Persisted process ID of the probe command process.
+        recovery_worker_pid: Exact PID of the worker being adopted.
+
+    Returns:
+        ``True`` only when the process's ancestor chain contains the exact
+        recovery worker PID.
+    """
+    current = process_pid
+    seen: set[int] = set()
+    while current not in seen and current > 0:
+        seen.add(current)
+        if current == recovery_worker_pid:
+            return True
+        parent = _read_ppid(current)
+        if parent is None:
+            return False
+        current = parent
+    return False
+
+
 def _wait_for_probe_claim(
     conn: JobsConnection,
     probe_id: UUID,
     expected_worker_id: str,
+    recovery_worker_pid: int,
     timeout_seconds: float,
 ) -> bool:
     """Wait until the exact recovery worker claims the probe job.
+
+    ``worker_id`` alone is not proof of identity: it defaults to the host name
+    and is shared by every worker on the machine. The claim is therefore bound
+    to the exact supplied recovery worker PID by waiting for the persisted
+    ``process_pid`` of the probe command and verifying, from ``/proc``, that
+    the command process is a descendant of the recovery worker. The worker_id
+    match is retained as an additional check.
 
     Args:
         conn: Open PostgreSQL connection.
         probe_id: Probe job identifier.
         expected_worker_id: Worker identifier the recovery worker records.
+        recovery_worker_pid: Exact PID of the worker being adopted.
         timeout_seconds: Maximum seconds to wait.
 
     Returns:
-        ``True`` only when a worker with the exact expected identifier claimed
-        the probe while it was running; ``False`` on timeout, terminal status,
-        or any other claiming worker (a one-consumer violation).
+        ``True`` only when the exact recovery worker claimed and executed the
+        probe; ``False`` on timeout, terminal status, a different worker_id,
+        or a claim whose process was not spawned by the recovery worker.
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
             cursor.execute(
                 "SELECT (payload::jsonb)->'state'->>'status', "
-                "(payload::jsonb)->'state'->>'worker_id' "
+                "(payload::jsonb)->'state'->>'worker_id', "
+                "(payload::jsonb)->'state'->>'process_pid' "
                 "FROM lubko.jobs WHERE id = %s",
                 (probe_id,),
             )
@@ -1263,7 +1331,16 @@ def _wait_for_probe_claim(
         status = str(row[0])
         owner = str(row[1]) if row[1] is not None else None
         if status == STATE_RUNNING:
-            return owner == expected_worker_id
+            if owner != expected_worker_id:
+                return False
+            if row[2] is None:
+                time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+                continue
+            try:
+                process_pid = int(str(row[2]))
+            except ValueError:
+                return False
+            return _spawned_by_recovery_worker(process_pid, recovery_worker_pid)
         if status in {"succeeded", "failed", "cancelled"}:
             return False
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
@@ -1301,18 +1378,26 @@ def _wait_for_probe_terminal(
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
 
 
-def _verify_queue_roundtrip(worker_id: str, cwd: str, timeout_seconds: float) -> bool:
+def _verify_queue_roundtrip(
+    worker_id: str,
+    cwd: str,
+    recovery_worker_pid: int,
+    timeout_seconds: float,
+) -> bool:
     """Verify the exact recovery worker really consumes the queue.
 
-    A probe job is inserted and must be claimed by a worker whose identifier
-    equals the recovery worker's own. If any other worker claims the probe,
-    one-consumer semantics are violated and the repair fails. The probe is
-    cancelled, awaited terminal, and removed in all cases, so the roundtrip
-    leaves no queue row and no process behind.
+    A probe job is inserted and must be claimed and executed by the exact
+    recovery worker: the claim is bound to the supplied PID through the
+    persisted ``process_pid`` descendant check, with ``worker_id`` as an
+    additional check. If any other worker claims the probe, one-consumer
+    semantics are violated and the repair fails. The probe is cancelled,
+    awaited terminal, and removed in all cases, so the roundtrip leaves no
+    queue row and no process behind.
 
     Args:
         worker_id: Worker identifier the recovery worker will record on claims.
         cwd: Working directory for the probe job.
+        recovery_worker_pid: Exact PID of the worker being adopted.
         timeout_seconds: Maximum seconds to wait for the probe to be claimed.
 
     Returns:
@@ -1332,7 +1417,9 @@ def _verify_queue_roundtrip(worker_id: str, cwd: str, timeout_seconds: float) ->
         if probe_id is None:
             return False
         try:
-            outcome = _wait_for_probe_claim(conn, probe_id, worker_id, timeout_seconds)
+            outcome = _wait_for_probe_claim(
+                conn, probe_id, worker_id, recovery_worker_pid, timeout_seconds
+            )
         finally:
             with suppress(psycopg.Error):
                 request_cancel(conn, probe_id)
@@ -1435,7 +1522,9 @@ def _adoption_candidate(
     worker_id = (
         _read_process_env(recovery_worker_pid).get("LUBKO_WORKER_ID") or socket.gethostname()
     )
-    if not _verify_queue_roundtrip(worker_id, str(options.repo), options.probe_timeout_seconds):
+    if not _verify_queue_roundtrip(
+        worker_id, str(options.repo), recovery_worker_pid, options.probe_timeout_seconds
+    ):
         msg = (
             f"recovery worker pid {recovery_worker_pid} did not consume the queue as "
             f"worker {worker_id!r}; refusing to adopt"
