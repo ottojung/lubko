@@ -124,7 +124,9 @@ While a job runs, the root row carries a bounded rolling live output window in
 `payload.output` — the newest up to 4000 raw bytes of stdout/stderr per
 stream, plus byte offsets and a `previous` pointer to the newest immutable
 chunk. Historical output is archived into immutable `output_chunk` rows in the
-same two-column table, keyed by explicit `thread` ownership. Archiving never
+same two-column table, keyed by explicit `thread` ownership. Publication
+retains the root `command` row with a row-level lock in the same transaction,
+so a root deleted concurrently leaves no new chunk rows. Archiving never
 shortens the live tail, and every payload Lubko writes is strictly bounded.
 See `docs/protocol.md` for reading history and cleaning up chunks.
 

@@ -284,19 +284,26 @@ exact backwards traversal.
 #### Cleanup
 
 Cleaning up a root job must clean up every chunk belonging to it, using
-explicit ownership rather than recursively trusting the pointer chain:
+explicit ownership rather than recursively trusting the pointer chain. Delete
+the root first, then the owned chunks, in one transaction:
 
 ```sql
+delete from lubko.jobs where id = '<ROOT JOB UUID>';
+
 delete from lubko.jobs
-where id = '<ROOT JOB UUID>'
-   or (
-        (payload::jsonb)->>'type' = 'output_chunk'
-        and (payload::jsonb)->>'thread' = '<ROOT JOB UUID>'
-   );
+where (payload::jsonb)->>'type' = 'output_chunk'
+  and (payload::jsonb)->>'thread' = '<ROOT JOB UUID>';
 ```
 
-This also removes orphaned chunks whose `previous` chain became incomplete
-because of a crash or corruption.
+Deleting the root before the chunks serializes cleanup with output
+publication, which retains the root `command` row with a row-level lock before
+inserting new chunks. A single unordered `DELETE` may scan and delete chunk
+rows before acquiring the root lock, so chunks committed by a concurrent
+publication after that statement's snapshot could survive the later root
+deletion as orphans; the root-first ordering closes that window. The two
+statements still run in one transaction, so a crash rolls back the whole
+cleanup. This also removes orphaned chunks whose `previous` chain became
+incomplete because of a crash or corruption.
 
 ### Timestamps
 
@@ -346,8 +353,11 @@ PostgreSQL compare-and-swap (CAS) predicates plus row locking:
   historical output exists, immutable chunks are inserted and the root row's
   `previous` pointer / live-window metadata is updated **in the same
   transaction**, so a crash can never leave the root pointing at nonexistent
-  history. Live tails are always recomputed as the newest 4000 bytes, so
-  archiving never shortens them.
+  history. The transaction first retains the root `command` row with a
+  row-level lock: once a concurrent root deletion has committed, publication
+  observes no root and inserts no chunk rows, so publication itself never
+  leaves an explicitly owned orphan chunk. Live tails are always recomputed as
+  the newest 4000 bytes, so archiving never shortens them.
 - **Finalizing:** a CAS update writes the `result` object and the terminal
   status guarded by `(payload::jsonb)->'state'->>'status' = 'running'`.
   Cancellation wins: if `state.cancel_requested_at` is set at finalization the

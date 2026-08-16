@@ -10,8 +10,8 @@ import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Self, cast, override
-from uuid import uuid4
+from typing import Final, Self, cast, override
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -51,9 +51,6 @@ from lubko.worker import (
     truncate_output,
 )
 from tests import _process_guard as guard
-
-if TYPE_CHECKING:
-    from uuid import UUID
 
 EXECUTION_ERROR_EXIT_CODE: Final = 127
 COMMAND_FAILURE_EXIT_CODE: Final = 7
@@ -141,6 +138,21 @@ def as_db(conn: _RecordingConnection) -> JobsConnection:
         The same object typed as a psycopg connection.
     """
     return cast("JobsConnection", conn)
+
+
+def _queue_root(conn: _RecordingConnection, job_id: UUID) -> None:
+    """Queue the root row so the publication root-retention guard sees it.
+
+    The publication transaction reads the root ``command`` row with
+    ``SELECT ... FOR UPDATE`` before inserting any chunk; the recording double
+    returns queued rows from ``fetchone``, so tests seed one row per
+    publication pass.
+
+    Args:
+        conn: Recording test double.
+        job_id: The root job identifier to report as retained.
+    """
+    conn.rows.append((str(job_id),))
 
 
 def make_settings(  # ruff: ignore[too-many-arguments]
@@ -616,18 +628,23 @@ def test_finish_job_persists_cancellation_result() -> None:
 
 
 def test_delete_job_and_chunks_uses_explicit_ownership() -> None:
-    """Cleanup deletes the root and every explicitly owned chunk by thread."""
+    """Cleanup deletes the root first, then every owned chunk by thread."""
     conn = _RecordingConnection()
     job_id = uuid4()
 
     delete_job_and_chunks(as_db(conn), job_id)
 
-    sql, params = conn.executions[0]
-    assert "output_chunk" in sql
-    assert "thread" in sql
-    assert isinstance(params, dict)
-    assert params["job_id"] == job_id
-    assert params["thread"] == str(job_id)
+    root_sql, root_params = conn.executions[0]
+    assert root_sql.startswith("DELETE")
+    assert "output_chunk" not in root_sql
+    assert isinstance(root_params, dict)
+    assert root_params["job_id"] == job_id
+    chunk_sql, chunk_params = conn.executions[1]
+    assert chunk_sql.startswith("DELETE")
+    assert "output_chunk" in chunk_sql
+    assert "thread" in chunk_sql
+    assert isinstance(chunk_params, dict)
+    assert chunk_params["thread"] == str(job_id)
 
 
 def test_publish_output_writes_bounded_tail_for_short_output(
@@ -637,6 +654,7 @@ def test_publish_output_writes_bounded_tail_for_short_output(
     job = make_active_job(tmp_path)
     job.stdout.path.write_bytes(b"hello world")
     conn = _RecordingConnection()
+    _queue_root(conn, job.id)
 
     publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
 
@@ -645,7 +663,7 @@ def test_publish_output_writes_bounded_tail_for_short_output(
     assert job.stdout.tail_end == 11
     assert job.stdout.archived_upto == 0
     inserts = [sql for sql, _ in conn.executions if sql.startswith("INSERT")]
-    updates = [(sql, params) for sql, params in conn.executions if "UPDATE" in sql]
+    updates = [(sql, params) for sql, params in conn.executions if sql.startswith("UPDATE")]
     assert inserts == []
     assert len(updates) == 1
     _, params = updates[0]
@@ -662,6 +680,7 @@ def test_publish_output_archives_immutable_chunks(tmp_path: Path) -> None:
     job = make_active_job(tmp_path)
     job.stdout.path.write_bytes(b"x" * 9000)
     conn = _RecordingConnection()
+    _queue_root(conn, job.id)
 
     publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
 
@@ -683,7 +702,7 @@ def test_publish_output_archives_immutable_chunks(tmp_path: Path) -> None:
             assert chunk.previous == previous
         previous = cast("UUID", params[0])
     assert offsets == [(0, 0, 2000), (1, 2000, 4000), (2, 4000, 6000)]
-    updates = [(sql, params) for sql, params in conn.executions if "UPDATE" in sql]
+    updates = [(sql, params) for sql, params in conn.executions if sql.startswith("UPDATE")]
     assert len(updates) == 1
     _, params = updates[0]
     assert isinstance(params, dict)
@@ -701,6 +720,7 @@ def test_publish_output_rotation_never_shortens_the_live_tail(
 
     def write_and_publish(size: int) -> None:
         job.stdout.path.write_bytes(b"y" * size)
+        _queue_root(conn, job.id)
         publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
         observed_lengths.append(len(job.stdout.tail_text))
         assert job.stdout.tail_end == size
@@ -730,6 +750,7 @@ def test_publish_output_failed_transaction_does_not_advance_state(
     job = make_active_job(tmp_path)
     job.stdout.path.write_bytes(b"z" * 9000)
     failing = _FailingConnection(lambda sql: sql.startswith("UPDATE"))
+    _queue_root(failing, job.id)
 
     with pytest.raises(psycopg.Error):
         publish_output(as_db(failing), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
@@ -741,9 +762,46 @@ def test_publish_output_failed_transaction_does_not_advance_state(
     assert job.stdout.last_chunk is None
 
     conn = _RecordingConnection()
+    _queue_root(conn, job.id)
     publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
     assert job.stdout.tail_end == 9000
     assert job.stdout.sequence == 3
+
+
+def test_publish_output_retains_root_before_any_chunk_insert(tmp_path: Path) -> None:
+    """Chunk publication locks the root command row before inserting chunks."""
+    job = make_active_job(tmp_path)
+    job.stdout.path.write_bytes(b"x" * 9000)
+    conn = _RecordingConnection()
+    _queue_root(conn, job.id)
+
+    result = publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    assert result is True
+    sqls = [sql for sql, _ in conn.executions]
+    guard, *rest = sqls
+    assert guard.startswith("SELECT")
+    assert "FOR UPDATE" in guard
+    inserts = [sql for sql in rest if sql.startswith("INSERT")]
+    assert len(inserts) == 3
+    assert sqls.index(inserts[0]) == 1
+
+
+def test_publish_output_skips_when_root_row_is_already_gone(tmp_path: Path) -> None:
+    """A root deleted before publication leaves no new chunk rows."""
+    job = make_active_job(tmp_path)
+    job.stdout.path.write_bytes(b"x" * 9000)
+    conn = _RecordingConnection()
+
+    result = publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    assert result is False
+    assert [sql for sql, _ in conn.executions if sql.startswith("INSERT")] == []
+    assert [sql for sql, _ in conn.executions if sql.startswith("UPDATE")] == []
+    assert job.stdout.archived_upto == 0
+    assert job.stdout.sequence == 0
+    assert not job.stdout.tail_text
+    assert job.stdout.last_chunk is None
 
 
 def test_settings_reads_lease_and_output_environment(
