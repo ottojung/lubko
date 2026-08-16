@@ -2605,19 +2605,29 @@ def any_lubko_processes() -> bool:
     Matches only the module invocation forms used by the deployment flow
     (``lubko.deployctl`` for controller/helper/watchdog, ``lubko.worker`` for
     maintained workers) so the host orchestrator's own ``lubko-worker`` daemon
-    is never mistaken for a leak.
+    is never mistaken for a leak. The scan is scoped to the current test's
+    owned processes: every process the deployment flow spawns (the maintained
+    worker, the controller job processes it starts, and the candidate/restored
+    workers they exec) inherits the worker environment carrying this test's
+    isolated ``XDG_STATE_HOME``, so a process is only a leak when it carries
+    that exact test-owned state root. Unrelated concurrent test sessions in
+    the same container run their own worker processes with different isolated
+    roots and are never mistaken for this test's leaks.
 
     Returns:
-        ``True`` when a stray controller/helper/worker process still exists.
+        ``True`` when a stray controller/helper/worker process that this test
+        owns still exists.
     """
+    marker = f"{isolation.STATE_HOME_ENV}={os.environ[isolation.STATE_HOME_ENV]}".encode()
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
             cmdline = (entry / "cmdline").read_bytes()
+            environ = (entry / "environ").read_bytes().split(b"\0")
         except OSError:
             continue
-        if b"lubko.deployctl" in cmdline or b"lubko.worker" in cmdline:
+        if (b"lubko.deployctl" in cmdline or b"lubko.worker" in cmdline) and marker in environ:
             return True
     return False
 

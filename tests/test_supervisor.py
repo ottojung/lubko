@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -1350,6 +1351,50 @@ def test_supervisor_listener_connection_uses_autocommit(
         _wait_until_listening(sup)
         assert sup.conn is not None
         assert sup.conn.autocommit is True
+
+
+def test_already_buffered_notification_drains_before_select_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-buffered notification wakes the event loop immediately.
+
+    A NOTIFY can arrive while the supervisor's own query is being serviced:
+    libpq consumes it off the socket into its input queue, so a fresh
+    ``select`` on the connection fd never reports readability and the wake
+    would otherwise be delayed until a timer. ``_wait_for_events`` must drain
+    already-buffered notifications before blocking. This unit pins that
+    control flow: the drain reports one buffered notification, so
+    ``_wait_for_events`` must return immediately — never reaching
+    ``select.select`` (poisoned here to fail loudly) — with the durable-scan
+    latch set for the next tick.
+    """
+    sup = Supervisor(
+        _quiet_recovery_settings(),
+        DatabaseConfig(host="localhost", port=0, dbname="postgres", user="postgres", password=""),
+    )
+    sup._install_wakeup_pipe()  # ruff: ignore[private-member-access] - the test drives the event loop directly
+    sup.conn = cast("JobsConnection", object())
+    try:
+
+        def _buffered_one(_conn: JobsConnection) -> int:
+            return 1
+
+        monkeypatch.setattr(worker_module, "drain_notifications", _buffered_one)
+
+        def _select_must_not_run(*_args: object, **_kwargs: object) -> object:
+            msg = "_wait_for_events blocked on select despite a buffered notification"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(select, "select", _select_must_not_run)
+
+        started = time.monotonic()
+        sup._wait_for_events(60.0)  # ruff: ignore[private-member-access] - the test drives the event loop directly
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.5
+        assert sup._durable_scan_pending  # ruff: ignore[private-member-access] - the test inspects the wake latch
+    finally:
+        sup._close_wakeup_pipe()  # ruff: ignore[private-member-access] - the test owns the wake pipe
 
 
 def _drain_wake_notifications(listener: psycopg.Connection[Any]) -> int:

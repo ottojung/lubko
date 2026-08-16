@@ -1697,19 +1697,33 @@ class Supervisor:
     def _wait_for_events(self, timeout: float) -> None:
         """Block until an event source is ready, draining what arrived.
 
-        Waits on the local wake pipe and, when connected, on the PostgreSQL
-        connection socket. PostgreSQL notifications are drained and request a
-        durable scan on the caller's next tick (they are only wakeups); child
-        exits and shutdown requests arrive on the local wake pipe. A broken
-        socket is treated as a database outage on the caller's next turn.
+        While connected, any notification already buffered inside libpq is
+        drained first: a notification can arrive while the previous turn's
+        query is being serviced, in which case libpq has already consumed it
+        off the socket and ``select`` alone would never report the socket
+        readable. After that, the loop waits on the local wake pipe and the
+        PostgreSQL connection socket. PostgreSQL notifications are drained and
+        request a durable scan on the caller's next tick (they are only
+        wakeups); child exits and shutdown requests arrive on the local wake
+        pipe. A broken socket is treated as a database outage on the caller's
+        next turn.
 
         Args:
             timeout: Maximum seconds to block (``0`` means poll once).
         """
         if self._wake_r is None:
             return
-        fds = [self._wake_r]
         conn = self.conn
+        if conn is not None:
+            try:
+                if drain_notifications(conn):
+                    self._durable_scan_pending = True
+                    return
+            except psycopg.Error:
+                LOGGER.exception("reading PostgreSQL notifications failed")
+                self._enter_outage()
+                return
+        fds = [self._wake_r]
         conn_fd: int | None = None
         if conn is not None:
             conn_fd = conn.fileno()
