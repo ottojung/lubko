@@ -43,7 +43,7 @@ from lubko import cli, supervise, toolchain
 from lubko.config import load_database_config
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
-from lubko.worker import delete_job_and_chunks, group_has_members, request_cancel
+from lubko.worker import JOB_ID_ENV, delete_job_and_chunks, group_has_members, request_cancel
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -71,6 +71,8 @@ DEFAULT_GIT_TIMEOUT_SECONDS: Final = 10.0
 DEFAULT_CLI_TIMEOUT_SECONDS: Final = cli.DEFAULT_BUILD_TIMEOUT_SECONDS
 DEFAULT_REPAIR_PROBE_TIMEOUT_SECONDS: Final = 60.0
 DEFAULT_RECOVER_PREFLIGHT_SECONDS: Final = 3.0
+CLI_ACTIVATION_ATTEMPTS: Final = 5
+CLI_ACTIVATION_RETRY_SECONDS: Final = 1.0
 LOCK_POLL_INTERVAL_SECONDS: Final = 0.1
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 5.0
 SESSION_WAIT_INTERVAL_SECONDS: Final = 0.01
@@ -878,6 +880,43 @@ def stop_worker(meta: WorkerMeta, grace_seconds: float) -> bool:
 def deploy(options: DeployOptions) -> int:
     """Validate a checkout and replace the running worker.
 
+    A deploy submitted through the Lubko queue itself is routed to a detached
+    handoff helper so the initiating root job reaches durable ``succeeded``
+    before the external supervisor retires the very worker running it: without
+    that handoff, the old worker's shutdown terminates the deploying job's own
+    process group and records it ``cancelled`` even though the deployment
+    converges (the production split-state regression). The helper performs all
+    reversible preparation, reports its outcome so the row is durably terminal,
+    waits for that durable success, and only then requests the supervisor
+    handoff and reconciles the maintained CLIs. A manual invocation retains the
+    synchronous locked safe path.
+
+    Args:
+        options: Deployment inputs.
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        job_id, cancelled = _current_queue_job()
+    except DeployAbortedError as exc:
+        _err(str(exc) or "deployment was refused")
+        return EXIT_ERROR
+    if job_id is None:
+        return _deploy_manual(options)
+    if cancelled:
+        _err("deploy job was cancelled during deployment")
+        return EXIT_ERROR
+    try:
+        return _queue_deploy(options, job_id)
+    except DeployAbortedError as exc:
+        _err(str(exc) or "deployment was refused")
+        return EXIT_ERROR
+
+
+def _deploy_manual(options: DeployOptions) -> int:
+    """Run the synchronous locked deploy path outside a queue job.
+
     Args:
         options: Deployment inputs.
 
@@ -892,6 +931,369 @@ def deploy(options: DeployOptions) -> int:
         return EXIT_ERROR
     except DeployAbortedError:
         return EXIT_ERROR
+
+
+def _current_queue_job() -> tuple[object | None, bool]:
+    """Identify whether this command runs inside a Lubko queue job.
+
+    The owning worker injects the exact root job UUID into the command
+    environment (``LUBKO_JOB_ID``), so queue detection never depends on the
+    timing of any later ``process_pgid`` persistence. A validation failure
+    fails closed: the deploy/restart never silently falls back to the manual
+    synchronous path, because that path retires the very worker executing the
+    job and would reproduce the killed-control-job regression.
+
+    Returns:
+        ``(job_id, cancelled)`` when queue-invoked, otherwise ``(None, False)``.
+
+    Raises:
+        DeployAbortedError: If an injected queue job cannot be validated.
+    """
+    if os.environ.get(JOB_ID_ENV) is None:
+        return None, False
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    try:
+        return deployctl.current_queue_job_id()
+    except deployctl.DeployCtlError as exc:
+        _err(str(exc))
+        raise DeployAbortedError from None
+
+
+def _close_inherited_descriptors(keep: set[int]) -> None:
+    """Close every inherited file descriptor except the explicitly kept ones.
+
+    The detached handoff helpers are forked from the queue job's controller, so
+    they inherit the parent's descriptor table. Any descriptor other than the
+    stable response pipe and the standard streams is closed so a long-lived
+    helper never pins a connection, lock, or capture file it does not own.
+
+    Args:
+        keep: Descriptor numbers that must stay open.
+    """
+    try:
+        entries = list(Path("/proc/self/fd").iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        fd = int(entry.name)
+        if fd in keep:
+            continue
+        with suppress(OSError):
+            os.close(fd)
+
+
+def _queue_prepared_response(commit: str) -> dict[str, object]:
+    """Build the successful helper response delivered before the handoff.
+
+    Args:
+        commit: Exact validated candidate commit.
+
+    Returns:
+        A JSON response object reporting that validation succeeded.
+    """
+    return {
+        "ok": True,
+        "type": "deploy",
+        "commit": commit,
+        "phase": "requested",
+    }
+
+
+def _queue_deploy(options: DeployOptions, job_id: object) -> int:
+    """Handle a queue-invoked deploy through a detached helper process.
+
+    The controller forks a helper into a separate session; the helper performs
+    all reversible preparation and reports its outcome, this parent delivers a
+    summary and exits zero so the owning worker finalizes the deploy row as
+    durably ``succeeded``, and only then does the helper cross the destructive
+    handoff and reconcile the CLIs. The parent never waits for the helper to
+    finish and never touches the terminal row itself.
+
+    Args:
+        options: Deployment inputs.
+        job_id: Captured deploy queue row identifier.
+
+    Returns:
+        A process exit code.
+
+    Raises:
+        DeployAbortedError: If the helper cannot be forked or never reports.
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    reader, writer = os.pipe()
+    try:
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            msg = f"could not fork the deployment handoff helper: {exc}"
+            raise DeployAbortedError(msg) from None
+        if pid == 0:
+            os.close(reader)
+            _run_deploy_helper(options, job_id, writer)
+        os.close(writer)
+        try:
+            raw = deployctl.read_pipe_line(reader)
+        finally:
+            os.close(reader)
+    finally:
+        with suppress(OSError):
+            os.close(reader)
+        with suppress(OSError):
+            os.close(writer)
+    if not raw:
+        msg = "deployment handoff helper exited before reporting an outcome"
+        raise DeployAbortedError(msg)
+    try:
+        response = json.loads(raw)
+    except ValueError as exc:
+        msg = "deployment handoff helper reported an invalid response"
+        raise DeployAbortedError(msg) from exc
+    if not isinstance(response, dict):
+        msg = "deployment handoff helper reported a non-object response"
+        raise DeployAbortedError(msg)
+    if response.get("ok") is not True:
+        detail = response.get("error")
+        message = "deployment was refused"
+        if isinstance(detail, str):
+            message = f"deployment was refused: {detail}"
+        raise DeployAbortedError(message)
+    commit = response.get("commit")
+    if isinstance(commit, str):
+        _out(f"validated exact commit {commit}; requesting the supervisor to run it")
+    _out(
+        "deployment requested; it converges detached from this job through the external "
+        "supervisor and the maintained CLIs"
+    )
+    return EXIT_OK
+
+
+def _run_deploy_helper(options: DeployOptions, job_id: object, writer: int) -> None:
+    """Run the detached queue-deploy handoff helper to completion in the child.
+
+    The child detaches into its own session immediately so the retiring
+    worker's group shutdown can never reach it; a failed detach fails closed
+    with an error response before any prepared/success outcome, because a
+    helper still attached to the job's session would be killed during the
+    retirement it is about to trigger. It then closes every inherited
+    descriptor except the response pipe and the standard streams, acquires the
+    deployment lock itself, performs all reversible preparation, delivers the
+    outcome to the parent, waits for the initiating row to be durably
+    ``succeeded``, and only then crosses the destructive handoff and reconciles
+    the maintained CLIs. This function never returns: it exits the child
+    process.
+
+    Args:
+        options: Deployment inputs.
+        job_id: Captured deploy queue row identifier.
+        writer: Write end of the response pipe to the parent.
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    try:
+        os.setsid()
+    except OSError as exc:
+        deployctl.send_helper_error(
+            writer, f"deployment handoff helper could not detach into its own session: {exc}"
+        )
+        with suppress(OSError):
+            os.close(writer)
+        os._exit(0)
+    _close_inherited_descriptors({0, 1, 2, writer})
+    try:
+        try:
+            with deploy_lock(options.lock_timeout_seconds):
+                _deploy_helper_locked(options, job_id, writer)
+        except LockTimeoutError as exc:
+            deployctl.send_helper_error(writer, f"timed out waiting for the deployment lock: {exc}")
+        except DeployAbortedError as exc:
+            deployctl.send_helper_error(writer, f"deployment was refused: {exc}")
+        except OSError as exc:
+            deployctl.send_helper_error(writer, f"operating-system error: {exc}")
+    finally:
+        with suppress(OSError):
+            os.close(writer)
+    os._exit(0)
+
+
+def _deploy_helper_locked(options: DeployOptions, job_id: object, writer: int) -> None:
+    """Run one lock-held queue deploy mission in the detached helper.
+
+    The response or error is delivered to the parent before any destructive
+    step, so the parent exits zero only for a genuine prepared response and the
+    owning worker finalizes the deploying row as durably ``succeeded``; a
+    helper error or helper death exits non-zero so the row is durably
+    ``failed`` and a dead helper can never leave a falsely-successful row. The
+    helper then waits for that exact row to be durably ``succeeded`` before
+    crossing the handoff, so the control job is never killed by the old
+    worker's own shutdown (the production split-state regression). Any failure
+    before durable success aborts with nothing destructive done: the previous
+    worker is left running, the provisional CLI root is removed, and the
+    deployment never silently falls back to the manual synchronous path.
+
+    Args:
+        options: Deployment inputs.
+        job_id: Captured deploy queue row identifier.
+        writer: Write end of the response pipe to the parent.
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    previous = read_meta()
+    state = worker_state(previous)
+    if options.bootstrap:
+        deployctl.send_helper_error(
+            writer,
+            "queue-invoked bootstrap is refused: the worker executing this job is a live queue "
+            "consumer, and the bootstrap path requires the legacy worker to be stopped manually "
+            "first so the replacement never starts alongside a live consumer",
+        )
+        return
+    if state == STATE_UNMANAGED:
+        deployctl.send_helper_error(writer, UNMANAGED_WORKER_MESSAGE)
+        return
+    if not supervise.supervisor_running():
+        deployctl.send_helper_error(
+            writer,
+            "no external supervisor is running; refusing to deploy the maintained worker without "
+            "automatic restart protection",
+        )
+        return
+    try:
+        commit = _validate_and_prepare(options)
+    except DeployAbortedError as exc:
+        deployctl.send_helper_error(writer, str(exc) or "deployment validation failed")
+        return
+    deployctl.send_helper_response(writer, _queue_prepared_response(commit))
+    durable_deadline = time.time() + deployctl.handoff_durable_wait_seconds
+    try:
+        deployctl.wait_for_durable_success(job_id, durable_deadline)
+    except deployctl.DeployCtlError as exc:
+        cli.remove_cli_root(commit)
+        append_deploy_log(f"queue deploy aborted before the destructive handoff: {exc}")
+        return
+    _finish_queue_deploy(options, commit, previous, state)
+
+
+def _finish_queue_deploy(
+    options: DeployOptions,
+    commit: str,
+    previous: WorkerMeta | None,
+    state: str,
+) -> None:
+    """Complete a queue deploy after durable success, converging to coherence.
+
+    The row is already durably ``succeeded``, so a handoff or CLI-activation
+    failure can no longer be reflected in it. A zero exit means the candidate
+    worker and the maintained CLIs both converged. Any other outcome — a raised
+    handoff error or a nonzero result (CLI activation exhausted its bounded
+    retries after the candidate went live) — restores the previous confirmed
+    commit through :func:`_restore_after_handoff_failure`, so the live worker,
+    the supervisor desired/applied state, and ``cli/current`` never diverge.
+
+    Args:
+        options: Deployment inputs.
+        commit: Exact candidate commit.
+        previous: Previously recorded worker metadata, or ``None``.
+        state: Effective state of the previous worker.
+    """
+    try:
+        exit_code = _complete_deploy_handoff(options, commit, previous, state)
+    except DeployAbortedError as exc:
+        append_deploy_log(f"queue deploy handoff failed after durable success: {exc}")
+        _restore_after_handoff_failure(options, commit, previous)
+        return
+    if exit_code == EXIT_OK:
+        append_deploy_log("queue deploy converged after durable success")
+        return
+    append_deploy_log(
+        "queue deploy converged after durable success but the maintained CLIs did not; "
+        "restoring the previous commit"
+    )
+    _restore_after_handoff_failure(options, commit, previous)
+
+
+def _restore_after_handoff_failure(
+    options: DeployOptions,
+    commit: str,
+    previous: WorkerMeta | None,
+) -> None:
+    """Restore service when a queue deploy fails after durable success.
+
+    The initiating row is already durably ``succeeded`` (the parent exited
+    before the handoff), so a later handoff or CLI-activation failure can no
+    longer be reflected in the row. Instead the detached helper converges the
+    environment to exactly one coherent state. A failure is only accepted as
+    harmless when the candidate commit is live, proven, *and* the maintained
+    CLIs already select it — that is a genuinely converged deployment (for
+    example the failure came from a transient readiness check after activation).
+    In every other case — including a live candidate whose CLI activation never
+    converged — the supervisor is settled back to the previous confirmed commit
+    at a strictly newer generation and the maintained CLI pointer is reconciled
+    to it, so the live worker, the supervisor desired/applied state, and
+    ``cli/current`` all select the same exact commit with no manual
+    reconciliation required.
+
+    Args:
+        options: Deployment inputs.
+        commit: Exact candidate commit whose deploy failed.
+        previous: Previously recorded worker metadata, or ``None``.
+    """
+    if not supervise.supervisor_running():
+        append_deploy_log(
+            "queue deploy failed after durable success without a live supervisor; nothing to "
+            "restore"
+        )
+        return
+    status = supervise.read_status()
+    if (
+        status is not None
+        and status.commit == commit
+        and status.child is not None
+        and status.ready
+        and cli.current_commit() == commit
+    ):
+        append_deploy_log(f"queue deploy fully converged on commit {commit}; nothing to restore")
+        return
+    if previous is None or previous.git_commit is None:
+        append_deploy_log("queue deploy failed after durable success with no known previous commit")
+        return
+    try:
+        settle = supervise.request_run(
+            previous.git_commit,
+            repo=str(options.repo),
+            uv_path=options.uv_path,
+            worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+        )
+    except OSError as exc:
+        append_deploy_log(
+            f"queue deploy failed after durable success and restoring the previous commit "
+            f"errored: {exc}"
+        )
+        return
+    restored = supervise.wait_for_generation(
+        settle, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS
+    ) and supervise.wait_until_ready(settle, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS)
+    if restored and cli.reconcile_pointer(previous.git_commit):
+        append_deploy_log(
+            "queue deploy failed after durable success; supervisor restored previous commit "
+            f"{previous.git_commit} and the maintained CLIs"
+        )
+    else:
+        append_deploy_log(
+            "queue deploy failed after durable success and the previous commit could not be fully "
+            "restored"
+        )
 
 
 def _verify_replacement(new_meta: WorkerMeta, options: DeployOptions) -> bool:
@@ -976,10 +1378,14 @@ def _prepare_maintained_cli(options: DeployOptions, commit: str) -> bool:
 def _activate_maintained_cli(commit: str) -> bool:
     """Activate the confirmed CLI commit, preserving the prior coherent CLI.
 
-    Activation happens only after the new worker metadata is durable. On
-    failure the previous CLI commit stays active and its environment is never
-    garbage-collected, so the global CLIs remain usable even though they are
-    temporarily behind the worker.
+    Activation happens only after the new worker metadata is durable. The
+    pointer switch is retried a bounded number of times so a transient
+    filesystem failure cannot leave a freshly live worker with a stale global
+    CLI that requires a manual ``lubko-deploy-ctl status`` reconciliation. On
+    final failure the previous CLI commit stays active and its environment is
+    never garbage-collected, so the global CLIs remain usable even though they
+    are temporarily behind the worker; the next status/checkout still repairs
+    the pointer idempotently.
 
     Args:
         commit: Exact commit to activate.
@@ -987,17 +1393,23 @@ def _activate_maintained_cli(commit: str) -> bool:
     Returns:
         ``True`` when the pointer now selects ``commit``, ``False`` otherwise.
     """
-    try:
-        cli.set_current(commit)
-    except cli.CliError as exc:
-        _err(f"error: maintained CLI activation failed: {exc}")
-        _err(
-            "the previous CLI commit remains active and usable; run 'lubko-deploy-ctl status' "
-            "or 'lubko-install' to repair the maintained CLIs"
-        )
-        return False
-    cli.gc_cli_roots((commit,))
-    return True
+    last_error: cli.CliError | None = None
+    for attempt in range(CLI_ACTIVATION_ATTEMPTS):
+        try:
+            cli.set_current(commit)
+        except cli.CliError as exc:
+            last_error = exc
+            if attempt < CLI_ACTIVATION_ATTEMPTS - 1:
+                time.sleep(CLI_ACTIVATION_RETRY_SECONDS)
+            continue
+        cli.gc_cli_roots((commit,))
+        return True
+    _err(f"error: maintained CLI activation failed: {last_error}")
+    _err(
+        "the previous CLI commit remains active and usable; run 'lubko-deploy-ctl status' "
+        "or 'lubko-install' to repair the maintained CLIs"
+    )
+    return False
 
 
 def _deploy_through_supervisor(options: DeployOptions, commit: str) -> WorkerMeta:
@@ -1152,7 +1564,36 @@ def _deploy_locked(options: DeployOptions) -> int:
         _out("bootstrap: no maintained worker metadata; assuming the legacy worker was stopped")
 
     commit = _validate_and_prepare(options)
+    return _complete_deploy_handoff(options, commit, previous, state)
 
+
+def _complete_deploy_handoff(
+    options: DeployOptions,
+    commit: str,
+    previous: WorkerMeta | None,
+    state: str,
+) -> int:
+    """Cross the destructive handoff for one validated commit.
+
+    The external supervisor is the single authority that owns the maintained
+    worker; the worker is handed to the daemon and never directly replaced when
+    the daemon is present. The maintained CLI environment is activated only
+    after the worker handoff so the global commands stay coherent with the
+    confirmed commit, even when the caller is the detached queue handoff helper
+    that must converge after its root job is already durably ``succeeded``.
+
+    Args:
+        options: Deployment inputs.
+        commit: Exact validated commit to deploy.
+        previous: Previously recorded worker metadata, or ``None``.
+        state: Effective state of the previous worker.
+
+    Returns:
+        A process exit code.
+
+    Raises:
+        DeployAbortedError: If the worker handoff cannot complete.
+    """
     log_file = worker_log_path()
     if supervise.supervisor_running():
         new_meta = _deploy_through_supervisor(options, commit)
@@ -2030,8 +2471,42 @@ def restart_cmd(_args: argparse.Namespace) -> int:
     command waits until the supervisor proves the replacement consumes the
     queue. The deployed version never changes.
 
+    A restart submitted through the Lubko queue itself is routed to a detached
+    handoff helper, exactly like a queue-invoked deploy: the supervisor retires
+    the very worker executing the restart command during the handoff, so without
+    the helper the initiating root row would be cancelled by its own old worker.
+    The helper validates the restart, reports the outcome so the row is durably
+    terminal, waits for that durable success, and only then requests the
+    supervisor process replacement.
+
     Args:
         _args: Parsed command line arguments (unused).
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        job_id, cancelled = _current_queue_job()
+    except DeployAbortedError as exc:
+        _err(str(exc) or "restart was refused")
+        return EXIT_ERROR
+    if job_id is not None:
+        if cancelled:
+            _err("restart job was cancelled during deployment")
+            return EXIT_ERROR
+        try:
+            return _queue_restart(job_id)
+        except DeployAbortedError as exc:
+            _err(str(exc) or "restart was refused")
+            return EXIT_ERROR
+    return _restart_manual()
+
+
+def _restart_manual() -> int:
+    """Restart the confirmed commit synchronously outside a queue job.
+
+    Args:
+        None.
 
     Returns:
         A process exit code.
@@ -2083,6 +2558,232 @@ def restart_cmd(_args: argparse.Namespace) -> int:
         return EXIT_ERROR
     _out(f"restart complete: fresh worker pid={current_pid}")
     return EXIT_OK
+
+
+def _restart_prepared_response(commit: str) -> dict[str, object]:
+    """Build the successful restart helper response delivered before the handoff.
+
+    Args:
+        commit: Exact confirmed commit being restarted.
+
+    Returns:
+        A JSON response object reporting that the restart validated.
+    """
+    return {
+        "ok": True,
+        "type": "restart",
+        "commit": commit,
+        "phase": "requested",
+    }
+
+
+def _queue_restart(job_id: object) -> int:
+    """Handle a queue-invoked restart through a detached helper process.
+
+    The controller forks a helper into a separate session; the helper validates
+    the restart and reports its outcome, this parent delivers a summary and
+    exits zero so the owning worker finalizes the restart row as durably
+    ``succeeded``, and only then does the helper request the supervisor process
+    replacement. The parent never waits for the helper to finish and never
+    touches the terminal row itself.
+
+    Args:
+        job_id: Captured restart queue row identifier.
+
+    Returns:
+        A process exit code.
+
+    Raises:
+        DeployAbortedError: If the helper cannot be forked or never reports.
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    reader, writer = os.pipe()
+    try:
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            msg = f"could not fork the restart handoff helper: {exc}"
+            raise DeployAbortedError(msg) from None
+        if pid == 0:
+            os.close(reader)
+            _run_restart_helper(job_id, writer)
+        os.close(writer)
+        try:
+            raw = deployctl.read_pipe_line(reader)
+        finally:
+            os.close(reader)
+    finally:
+        with suppress(OSError):
+            os.close(reader)
+        with suppress(OSError):
+            os.close(writer)
+    if not raw:
+        msg = "restart handoff helper exited before reporting an outcome"
+        raise DeployAbortedError(msg)
+    try:
+        response = json.loads(raw)
+    except ValueError as exc:
+        msg = "restart handoff helper reported an invalid response"
+        raise DeployAbortedError(msg) from exc
+    if not isinstance(response, dict):
+        msg = "restart handoff helper reported a non-object response"
+        raise DeployAbortedError(msg)
+    if response.get("ok") is not True:
+        detail = response.get("error")
+        message = "restart was refused"
+        if isinstance(detail, str):
+            message = f"restart was refused: {detail}"
+        raise DeployAbortedError(message)
+    commit = response.get("commit")
+    if isinstance(commit, str):
+        _out(f"validated exact commit {commit}; requesting a supervised restart")
+    _out("restart requested; it completes detached from this job through the external supervisor")
+    return EXIT_OK
+
+
+def _run_restart_helper(job_id: object, writer: int) -> None:
+    """Run the detached queue-restart handoff helper to completion in the child.
+
+    The child detaches into its own session immediately so the retiring
+    worker's group shutdown can never reach it; a failed detach fails closed
+    with an error response before any prepared/success outcome. It then closes
+    every inherited descriptor except the response pipe and the standard
+    streams, validates the restart, delivers the outcome to the parent, waits
+    for the initiating row to be durably ``succeeded``, and only then requests
+    the supervisor process replacement. This function never returns: it exits
+    the child process.
+
+    Args:
+        job_id: Captured restart queue row identifier.
+        writer: Write end of the response pipe to the parent.
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    try:
+        os.setsid()
+    except OSError as exc:
+        deployctl.send_helper_error(
+            writer, f"restart handoff helper could not detach into its own session: {exc}"
+        )
+        with suppress(OSError):
+            os.close(writer)
+        os._exit(0)
+    _close_inherited_descriptors({0, 1, 2, writer})
+    try:
+        try:
+            _restart_helper_locked(job_id, writer)
+        except DeployAbortedError as exc:
+            deployctl.send_helper_error(writer, f"restart was refused: {exc}")
+        except OSError as exc:
+            deployctl.send_helper_error(writer, f"operating-system error: {exc}")
+    finally:
+        with suppress(OSError):
+            os.close(writer)
+    os._exit(0)
+
+
+def _restart_helper_locked(job_id: object, writer: int) -> None:
+    """Run one queue restart mission in the detached helper.
+
+    The response or error is delivered to the parent before any destructive
+    step, so the parent exits zero only for a genuine prepared response and the
+    owning worker finalizes the restarting row as durably ``succeeded``; a
+    helper error or helper death exits non-zero so the row is durably
+    ``failed``. The helper then waits for that exact row to be durably
+    ``succeeded`` before requesting the supervisor process replacement, so the
+    control job is never killed by the old worker's own shutdown.
+
+    Args:
+        job_id: Captured restart queue row identifier.
+        writer: Write end of the response pipe to the parent.
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    if not supervise.supervisor_running():
+        deployctl.send_helper_error(
+            writer,
+            "no external supervisor is running; a supervised restart is not possible",
+        )
+        return
+    state = supervise.read_state()
+    commit = state.commit
+    if commit is None or not cli.runtime_is_usable(commit):
+        deployctl.send_helper_error(
+            writer,
+            "no usable sealed runtime to restart"
+            if commit is None
+            else (
+                f"the exact sealed runtime for commit {commit} is missing, corrupt, "
+                "incomplete, or not sealed; refusing to restart"
+            ),
+        )
+        return
+    deployctl.send_helper_response(writer, _restart_prepared_response(commit))
+    durable_deadline = time.time() + deployctl.handoff_durable_wait_seconds
+    try:
+        deployctl.wait_for_durable_success(job_id, durable_deadline)
+    except deployctl.DeployCtlError as exc:
+        append_deploy_log(f"queue restart aborted before the destructive handoff: {exc}")
+        return
+    try:
+        _complete_restart_handoff()
+    except DeployAbortedError as exc:
+        append_deploy_log(f"queue restart handoff failed after durable success: {exc}")
+        return
+    append_deploy_log("queue restart converged after durable success")
+
+
+def _complete_restart_handoff() -> None:
+    """Request and await the supervised same-commit process replacement.
+
+    The supervisor is the single process-lifecycle authority: deployctl/lifecycle
+    only record the restart intent at a strictly newer generation and wait until
+    the daemon proves a fresh worker consumes the queue. A worker process that
+    was not actually replaced is reported as a failure.
+
+    Raises:
+        DeployAbortedError: If the supervisor did not apply or prove the
+            replacement, or the worker process was not replaced.
+    """
+    state = supervise.read_state()
+    commit = state.commit
+    if commit is None:
+        msg = "no confirmed commit to restart"
+        raise DeployAbortedError(msg)
+    previous = supervise.read_status()
+    previous_pid = (
+        previous.child.pid if previous is not None and previous.child is not None else None
+    )
+    desired = supervise.read_desired()
+    generation = supervise.request_restart(
+        commit,
+        repo=desired.repo if desired is not None else "",
+        uv_path=desired.uv_path if desired is not None else "",
+        worker_id=(
+            desired.worker_id
+            if desired is not None
+            else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
+        ),
+    )
+    if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        msg = "the external supervisor did not apply the restart"
+        raise DeployAbortedError(msg)
+    if not supervise.wait_until_ready(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        msg = "the external supervisor did not prove the fresh worker consumes the queue"
+        raise DeployAbortedError(msg)
+    current = supervise.read_status()
+    current_pid = current.child.pid if current is not None and current.child is not None else None
+    if previous_pid is not None and current_pid == previous_pid:
+        msg = "the worker process was not replaced by a fresh process"
+        raise DeployAbortedError(msg)
+    _out(f"restart complete: fresh worker pid={current_pid}")
 
 
 def migrate_cmd(args: argparse.Namespace) -> int:

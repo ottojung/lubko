@@ -45,6 +45,26 @@ The queue-invoked controller forks a detached handoff helper (its own session an
 
 The initiating checkout row is therefore durably terminal `succeeded` before the destructive previous-worker retirement begins, with no transient `cancelled` row along the way.
 
+The same detached-handoff protection covers a queue-invoked plain
+`lubko-deploy deploy` (a protocol-v3 root job that runs the deploy command
+itself) and a queue-invoked `lubko-deploy restart`. The command recognizes its
+own queue row from the exact injected `LUBKO_JOB_ID`, forks a detached handoff
+helper, and reports the validated outcome so the initiating row reaches durable
+`succeeded` (or `failed` on a helper error/death) before the supervisor retires
+the very worker executing it. Only after that durable terminal state does the
+helper request the supervisor handoff at a strictly newer generation and
+activate the maintained CLI environment, so the CLI pointer, the supervisor
+desired+applied state, and the new worker commit converge without a later manual
+status reconciliation. If a deploy then fails and the environment is not exactly
+coherent — the candidate not proven, or proven but its CLI activation never
+converged — the helper settles the supervisor back to the previous confirmed
+commit and reconciles the maintained CLIs to it, so the live worker, the
+supervisor desired/applied commit, and `cli/current` all select the same exact
+commit. A failed helper detachment (an unsuccessful `setsid`) fails closed so
+the row can never be falsely `succeeded`, and a queue-invoked `--bootstrap` is
+refused because a queue job is executed by a live worker. See the README
+"Queue-invoked self-deploy survives the old worker's shutdown" section.
+
 A manual (non-queue) invocation retains the synchronous safe path: preparation is immediately followed by the destructive handoff under the deployment lock.
 
 ## Confirmation handshake

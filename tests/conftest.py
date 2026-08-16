@@ -89,6 +89,12 @@ def _isolated_lubko_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(root / "config"))
     monkeypatch.setenv("XDG_BIN_HOME", str(root / "bin"))
+    # The suite can legitimately run from inside a Lubko job whose ambient
+    # environment carries LUBKO_JOB_ID. Queue-ownership detection (deployctl
+    # checkout, queue-invoked deploy) keys off that exact injected variable, so
+    # the ambient job identity is cleared: a test is only queue-invoked when it
+    # deliberately sets the variable itself.
+    monkeypatch.delenv("LUBKO_JOB_ID", raising=False)
     return root
 
 

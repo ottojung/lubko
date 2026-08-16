@@ -1,6 +1,7 @@
 """Tests for Lubko worker lifecycle management."""
 
 import argparse
+import json
 import os
 import shutil
 import signal
@@ -13,11 +14,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Final
 from unittest import mock
+from uuid import uuid4
 
 import psycopg
 import pytest
 
 from lubko import cli, lifecycle, supervise, toolchain
+from lubko import deployctl as dc
 from lubko.config import DatabaseConfig, load_database_config
 from lubko.lifecycle import (
     EXIT_ERROR,
@@ -27,7 +30,7 @@ from lubko.lifecycle import (
     WorkerMeta,
 )
 from lubko.state import rollback_state_path
-from lubko.worker import delete_job_and_chunks, request_cancel
+from lubko.worker import JOB_ID_ENV, delete_job_and_chunks, request_cancel
 from tests import _pg
 from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
@@ -759,6 +762,829 @@ def test_deploy_replaces_stale_worker(
         assert meta.pid == spawned[0].pid
     finally:
         kill_many(spawned)
+
+
+# ---------------------------------------------------------------------------
+# Queue-invoked deploy (#68)
+# ---------------------------------------------------------------------------
+
+
+def dead_worker_meta(commit: str, repo: Path) -> WorkerMeta:
+    """Build dead (non-live) maintained-worker metadata.
+
+    Args:
+        commit: Exact commit the metadata claims.
+        repo: Repository path recorded in the metadata.
+
+    Returns:
+        Metadata whose process is never alive.
+    """
+    return WorkerMeta(
+        schema_version=1,
+        state=lifecycle.STATE_STOPPED,
+        pid=999_999,
+        pgid=999_999,
+        sid=999_999,
+        start_time_ticks=1,
+        token=STALE_MARKER,
+        repo=str(repo),
+        git_commit=commit,
+        worker_id="old",
+        log_path="",
+        started_at=1.0,
+        stopped_at=1.0,
+    )
+
+
+def test_deploy_queue_owned_routes_to_detached_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deploy running inside a Lubko job routes to the detached helper."""
+    job_id = uuid4()
+    captured: list[object] = []
+    monkeypatch.setattr(lifecycle, "_current_queue_job", lambda: (job_id, False))
+
+    def fake_queue(_options: lifecycle.DeployOptions, received: object) -> int:
+        captured.append(received)
+        return EXIT_OK
+
+    monkeypatch.setattr(lifecycle, "_queue_deploy", fake_queue)
+    assert lifecycle.deploy(make_options(tmp_path, bootstrap=False)) == EXIT_OK
+    assert captured == [job_id]
+
+
+def test_deploy_queue_owned_cancelled_refuses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A cancelled deploy queue owner refuses before any helper work."""
+    monkeypatch.setattr(lifecycle, "_current_queue_job", lambda: (uuid4(), True))
+    assert lifecycle.deploy(make_options(tmp_path, bootstrap=False)) == EXIT_ERROR
+    assert "cancelled" in capsys.readouterr().err
+
+
+def test_deploy_queue_owned_helper_error_returns_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A queue-deploy helper error fails the deploy, never the manual path."""
+    monkeypatch.setattr(lifecycle, "_current_queue_job", lambda: (uuid4(), False))
+
+    def failing_queue(_options: lifecycle.DeployOptions, _job_id: object) -> int:
+        msg = "deployment handoff helper exited before reporting an outcome"
+        raise lifecycle.DeployAbortedError(msg)
+
+    monkeypatch.setattr(lifecycle, "_queue_deploy", failing_queue)
+    assert lifecycle.deploy(make_options(tmp_path, bootstrap=False)) == EXIT_ERROR
+    assert "exited before reporting" in capsys.readouterr().err
+
+
+def test_deploy_queue_owned_detection_failure_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A queue-ownership validation failure fails closed, never the manual path."""
+    monkeypatch.setenv(JOB_ID_ENV, str(uuid4()))
+
+    def fail_detection() -> tuple[object | None, bool]:
+        msg = "cannot validate the injected queue job"
+        raise lifecycle.DeployAbortedError(msg)
+
+    monkeypatch.setattr(lifecycle, "_current_queue_job", fail_detection)
+    assert lifecycle.deploy(make_options(tmp_path, bootstrap=False)) == EXIT_ERROR
+    assert "cannot validate" in capsys.readouterr().err
+
+
+def test_deploy_without_job_injection_keeps_manual_locked_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual deploy retains the synchronous locked safe path."""
+    monkeypatch.setattr(lifecycle, "_current_queue_job", lambda: (None, False))
+    acquired: list[bool] = []
+
+    class FakeLock:
+        """Minimal deployment-lock context for the manual path."""
+
+        def __enter__(self) -> None:
+            acquired.append(True)
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(lifecycle, "deploy_lock", lambda _timeout: FakeLock())
+    monkeypatch.setattr(lifecycle, "_deploy_locked", lambda _options: EXIT_OK)
+    assert lifecycle.deploy(make_options(tmp_path, bootstrap=False)) == EXIT_OK
+    assert acquired == [True]
+
+
+def test_queue_deploy_parent_reports_prepared_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The queue-deploy parent reports the prepared response and exits ok."""
+    response = {"ok": True, "type": "deploy", "commit": GIT_SHA, "phase": "requested"}
+
+    def fake_helper(_options: lifecycle.DeployOptions, _job_id: object, writer: int) -> None:
+        os.write(writer, (json.dumps(response, sort_keys=True) + "\n").encode())
+        os._exit(0)
+
+    monkeypatch.setattr(lifecycle, "_run_deploy_helper", fake_helper)
+    code = lifecycle._queue_deploy(make_options(tmp_path, bootstrap=False), uuid4())
+    assert code == EXIT_OK
+    assert GIT_SHA in capsys.readouterr().out
+
+
+def test_queue_deploy_parent_fails_when_helper_dies_silently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A helper that dies before reporting fails the deploy job."""
+    monkeypatch.setattr(lifecycle, "_run_deploy_helper", lambda *_args: os._exit(0))
+    with pytest.raises(lifecycle.DeployAbortedError, match="exited before reporting"):
+        lifecycle._queue_deploy(make_options(tmp_path, bootstrap=False), uuid4())
+
+
+def test_queue_deploy_parent_fails_on_helper_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reported helper error fails the deploy job rather than faking success."""
+    error = {"ok": False, "error": "candidate validation failed"}
+
+    def fake_helper(_options: lifecycle.DeployOptions, _job_id: object, writer: int) -> None:
+        os.write(writer, (json.dumps(error, sort_keys=True) + "\n").encode())
+        os._exit(0)
+
+    monkeypatch.setattr(lifecycle, "_run_deploy_helper", fake_helper)
+    with pytest.raises(lifecycle.DeployAbortedError, match="candidate validation failed"):
+        lifecycle._queue_deploy(make_options(tmp_path, bootstrap=False), uuid4())
+
+
+def test_deploy_helper_locked_prepares_reports_waits_then_handoffs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The helper prepares, reports, waits for durable success, then handoffs.
+
+    This is the ordering that protects the initiating deploy job: the response
+    is delivered before the destructive handoff, and the handoff runs only
+    after the row is durably terminal.
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    previous = dead_worker_meta(first, repo)
+    order: list[object] = []
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: previous)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(lifecycle, "_validate_and_prepare", lambda _options: second)
+    monkeypatch.setattr(
+        dc, "send_helper_response", lambda _writer, _response: order.append("response")
+    )
+    monkeypatch.setattr(
+        dc, "wait_for_durable_success", lambda _job_id, _deadline: order.append("durable")
+    )
+
+    def record_handoff(
+        _options: lifecycle.DeployOptions,
+        commit: str,
+        _previous: WorkerMeta,
+        _state: str,
+    ) -> int:
+        order.append(("handoff", commit))
+        return EXIT_OK
+
+    monkeypatch.setattr(lifecycle, "_complete_deploy_handoff", record_handoff)
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._deploy_helper_locked(make_options(repo, bootstrap=False), uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert order == ["response", "durable", ("handoff", second)]
+
+
+def test_deploy_helper_locked_aborts_before_handoff_when_not_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row that never becomes durably succeeded aborts before the handoff.
+
+    Nothing destructive happens: the previous worker is left running, the
+    provisional CLI root is removed, and the deployment never silently falls
+    back to the manual synchronous path.
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    previous = dead_worker_meta(first, repo)
+    removed: list[str] = []
+    handoffs: list[object] = []
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: previous)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(lifecycle, "_validate_and_prepare", lambda _options: second)
+    monkeypatch.setattr(dc, "send_helper_response", lambda _writer, _response: None)
+
+    def fail_wait(_job_id: object, _deadline: float) -> None:
+        msg = "checkout queue job reached cancelled before durable success"
+        raise dc.DeployCtlError(msg)
+
+    monkeypatch.setattr(dc, "wait_for_durable_success", fail_wait)
+    monkeypatch.setattr(cli, "remove_cli_root", removed.append)
+    monkeypatch.setattr(
+        lifecycle, "_complete_deploy_handoff", lambda *_args, **_kwargs: handoffs.append(1)
+    )
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._deploy_helper_locked(make_options(repo, bootstrap=False), uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert removed == [second]
+    assert handoffs == []
+
+
+def test_deploy_helper_locked_reports_unmanaged_without_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unmanaged baseline refuses a queue deploy without the bootstrap flag."""
+    errors: list[str] = []
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(dc, "send_helper_error", lambda _writer, message: errors.append(message))
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._deploy_helper_locked(make_options(tmp_path, bootstrap=False), uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert errors
+    assert "unmanaged" in errors[0]
+
+
+def test_deploy_helper_locked_reports_validation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A validation failure is reported so the row is durably failed."""
+    repo, first, _second = make_repo(tmp_path / "repo")
+    errors: list[str] = []
+
+    def fail_validate(_options: lifecycle.DeployOptions) -> str:
+        msg = "validation failed; the current worker is left untouched"
+        raise lifecycle.DeployAbortedError(msg)
+
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: dead_worker_meta(first, repo))
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(lifecycle, "_validate_and_prepare", fail_validate)
+    monkeypatch.setattr(dc, "send_helper_error", lambda _writer, message: errors.append(message))
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._deploy_helper_locked(make_options(repo, bootstrap=False), uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert errors
+    assert "validation failed" in errors[0]
+
+
+def test_restore_after_handoff_failure_rolls_back_when_supervisor_holds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-durable handoff failure settles back to the previous commit.
+
+    When the supervisor never proved the candidate, the detached helper asks
+    the supervisor to restore the previous confirmed commit at a strictly newer
+    generation so the queue keeps exactly one known-good consumer.
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "read_status", lambda: None)
+    requested: list[tuple[str, str, str]] = []
+
+    def request_run(
+        commit: str,
+        *,
+        repo: str,
+        uv_path: str,
+        worker_id: str | None,
+        restart: bool = False,
+    ) -> int:
+        del worker_id, restart
+        requested.append((commit, repo, uv_path))
+        return 42
+
+    monkeypatch.setattr(supervise, "request_run", request_run)
+    monkeypatch.setattr(supervise, "wait_for_generation", lambda _generation, _timeout: True)
+    monkeypatch.setattr(supervise, "wait_until_ready", lambda _generation, _timeout: True)
+    lifecycle._restore_after_handoff_failure(
+        make_options(repo, bootstrap=False), second, dead_worker_meta(first, repo)
+    )
+    assert requested
+    assert requested[0][0] == first
+
+
+def test_restore_after_handoff_failure_keeps_fully_converged_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fully converged candidate (live, ready, CLIs selected) is never rolled back.
+
+    The handoff error may come from a post-apply step (a transient readiness
+    check) after the maintained CLIs already selected the candidate; the
+    deployment is genuinely live and coherent, so the helper must not disturb
+    the sole consumer.
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    cli.set_current(second)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: supervise.SupervisorStatus(
+            schema_version=supervise.SCHEMA_VERSION,
+            supervisor_pid=1,
+            started_at=0.0,
+            applied_generation=2,
+            mode=supervise.MODE_RUN,
+            commit=second,
+            child=supervise.WorkerChild(
+                pid=123,
+                pgid=123,
+                sid=123,
+                start_time_ticks=1,
+                token=STALE_MARKER,
+                worker_id="w",
+                spawned_at=0.0,
+            ),
+            intent=supervise.INTENT_RUN,
+            restart_count=0,
+            next_attempt_at=None,
+            last_exit=None,
+            mission=None,
+            db_ready=True,
+            ready=True,
+            message=None,
+        ),
+    )
+    requested: list[object] = []
+    monkeypatch.setattr(supervise, "request_run", lambda *_args, **_kwargs: requested.append(1))
+    lifecycle._restore_after_handoff_failure(
+        make_options(repo, bootstrap=False), second, dead_worker_meta(first, repo)
+    )
+    assert requested == []
+
+
+def test_restore_after_handoff_failure_rolls_back_when_cli_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live candidate with a stale CLI pointer is rolled back to coherence.
+
+    The candidate worker is live and ready, but ``cli/current`` never selected
+    it, so worker and CLI would diverge. The helper must settle back to the
+    previous confirmed commit and reconcile the CLIs instead of leaving the
+    split state behind.
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    cli.set_current(first)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: supervise.SupervisorStatus(
+            schema_version=supervise.SCHEMA_VERSION,
+            supervisor_pid=1,
+            started_at=0.0,
+            applied_generation=2,
+            mode=supervise.MODE_RUN,
+            commit=second,
+            child=supervise.WorkerChild(
+                pid=123,
+                pgid=123,
+                sid=123,
+                start_time_ticks=1,
+                token=STALE_MARKER,
+                worker_id="w",
+                spawned_at=0.0,
+            ),
+            intent=supervise.INTENT_RUN,
+            restart_count=0,
+            next_attempt_at=None,
+            last_exit=None,
+            mission=None,
+            db_ready=True,
+            ready=True,
+            message=None,
+        ),
+    )
+    requested: list[tuple[str, str, str]] = []
+
+    def request_run(
+        commit: str,
+        *,
+        repo: str,
+        uv_path: str,
+        worker_id: str | None,
+        restart: bool = False,
+    ) -> int:
+        del worker_id, restart
+        requested.append((commit, repo, uv_path))
+        return 42
+
+    monkeypatch.setattr(supervise, "request_run", request_run)
+    monkeypatch.setattr(supervise, "wait_for_generation", lambda _generation, _timeout: True)
+    monkeypatch.setattr(supervise, "wait_until_ready", lambda _generation, _timeout: True)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    lifecycle._restore_after_handoff_failure(
+        make_options(repo, bootstrap=False), second, dead_worker_meta(first, repo)
+    )
+    assert requested
+    assert requested[0][0] == first
+    assert cli.current_commit() == first
+
+
+def test_queue_deploy_cli_activation_failure_rolls_back_and_converges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI activation failure after the candidate is live rolls back coherently.
+
+    The full queue helper path: the candidate handoff succeeds, every CLI
+    activation retry fails, and the helper settles the supervisor back to the
+    previous confirmed commit and reconciles the maintained CLIs — so the live
+    worker, the supervisor desired intent, and ``cli/current`` all select the
+    same previous commit with no manual ``status`` reconciliation.
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    previous = dead_worker_meta(first, repo)
+    responses: list[dict[str, object]] = []
+    requested: list[str] = []
+    real_set_current = cli.set_current
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: previous)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(lifecycle, "_validate_and_prepare", lambda _options: second)
+    monkeypatch.setattr(
+        dc, "send_helper_response", lambda _writer, response: responses.append(response)
+    )
+    monkeypatch.setattr(dc, "wait_for_durable_success", lambda _job_id, _deadline: None)
+
+    def fake_through_supervisor(_options: lifecycle.DeployOptions, commit: str) -> WorkerMeta:
+        return dead_worker_meta(commit, repo)
+
+    monkeypatch.setattr(lifecycle, "_deploy_through_supervisor", fake_through_supervisor)
+
+    def selective_set_current(commit: str) -> None:
+        if commit != first:
+            msg = f"activation boom for {commit}"
+            raise cli.CliError(msg)
+        real_set_current(commit)
+
+    monkeypatch.setattr(cli, "set_current", selective_set_current)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+
+    def request_run(
+        commit: str,
+        *,
+        repo: str,
+        uv_path: str,
+        worker_id: str | None,
+        restart: bool = False,
+    ) -> int:
+        del repo, uv_path, worker_id, restart
+        requested.append(commit)
+        return 42
+
+    monkeypatch.setattr(supervise, "request_run", request_run)
+    monkeypatch.setattr(supervise, "wait_for_generation", lambda _generation, _timeout: True)
+    monkeypatch.setattr(supervise, "wait_until_ready", lambda _generation, _timeout: True)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._deploy_helper_locked(make_options(repo, bootstrap=False), uuid4(), writer)
+    finally:
+        os.close(writer)
+
+    assert responses
+    assert responses[0]["ok"] is True
+    assert requested == [first]
+    assert cli.current_commit() == first
+
+
+def test_deploy_helper_locked_refuses_queue_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queue-invoked bootstrap is refused so no second consumer ever starts.
+
+    A queue job is executed by a live worker, so the bootstrap precondition —
+    the legacy worker was stopped manually first — is inherently unsatisfied.
+    Refusing makes the row durably ``failed`` instead of risking two consumers.
+    """
+    errors: list[str] = []
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(dc, "send_helper_error", lambda _writer, message: errors.append(message))
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._deploy_helper_locked(make_options(tmp_path, bootstrap=True), uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert errors
+    assert "bootstrap" in errors[0]
+
+
+def test_close_inherited_descriptors_closes_unintended_fds(tmp_path: Path) -> None:
+    """The helper closes every inherited descriptor except the kept set."""
+    stray = os.open(tmp_path / "stray", os.O_CREAT | os.O_RDWR)
+    kept = os.open(tmp_path / "kept", os.O_CREAT | os.O_RDWR)
+    reader, writer = os.pipe()
+    try:
+        pid = os.fork()
+        if pid == 0:
+            os.close(reader)
+            lifecycle._close_inherited_descriptors({0, 1, 2, kept, writer})
+            try:
+                os.fstat(stray)
+                result = b"open"
+            except OSError:
+                result = b"closed"
+            os.write(writer, result)
+            os.close(writer)
+            os._exit(0)
+        os.close(writer)
+        raw = os.read(reader, 64)
+        os.close(reader)
+        os.waitpid(pid, 0)
+        assert raw == b"closed"
+    finally:
+        with suppress(OSError):
+            os.close(stray)
+        with suppress(OSError):
+            os.close(kept)
+
+
+def test_run_deploy_helper_fails_closed_when_setsid_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deploy helper that cannot detach reports an error before any success.
+
+    A failed ``setsid`` would leave the helper inside the retiring worker's job
+    session, so it must fail closed instead of ever reporting a prepared
+    response that would durably ``succeed`` the row.
+    """
+    repo, _first, _second = make_repo(tmp_path / "repo")
+
+    def failing_setsid() -> None:
+        msg = "operation not permitted"
+        raise OSError(msg)
+
+    monkeypatch.setattr(os, "setsid", failing_setsid)
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(reader)
+        lifecycle._run_deploy_helper(make_options(repo, bootstrap=False), uuid4(), writer)
+    os.close(writer)
+    try:
+        raw = os.read(reader, 65536)
+    finally:
+        os.close(reader)
+    os.waitpid(pid, 0)
+    assert raw
+    response = json.loads(raw.decode())
+    assert response["ok"] is False
+    assert "detach" in str(response["error"])
+
+
+def test_run_restart_helper_fails_closed_when_setsid_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart helper that cannot detach reports an error before any success."""
+
+    def failing_setsid() -> None:
+        msg = "operation not permitted"
+        raise OSError(msg)
+
+    monkeypatch.setattr(os, "setsid", failing_setsid)
+    reader, writer = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(reader)
+        lifecycle._run_restart_helper(uuid4(), writer)
+    os.close(writer)
+    try:
+        raw = os.read(reader, 65536)
+    finally:
+        os.close(reader)
+    os.waitpid(pid, 0)
+    assert raw
+    response = json.loads(raw.decode())
+    assert response["ok"] is False
+    assert "detach" in str(response["error"])
+
+
+def test_activate_maintained_cli_retries_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient CLI activation failure is retried to convergence.
+
+    A freshly live candidate whose ``cli/current`` switch briefly fails must not
+    be left stale requiring a manual status reconciliation.
+    """
+    _repo, _first, second = make_repo(tmp_path / "repo")
+    real_set_current = cli.set_current
+    attempts = 0
+
+    def flaky(commit: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            msg = f"transient switch failure {attempts}"
+            raise cli.CliError(msg)
+        real_set_current(commit)
+
+    monkeypatch.setattr(cli, "set_current", flaky)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert lifecycle._activate_maintained_cli(second) is True
+    assert cli.current_commit() == second
+
+
+def test_activate_maintained_cli_fails_after_bounded_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A persistently failing CLI activation stops after the bounded retries."""
+    _repo, _first, second = make_repo(tmp_path / "repo")
+
+    def always_fail(_commit: str) -> None:
+        msg = "switch boom"
+        raise cli.CliError(msg)
+
+    monkeypatch.setattr(cli, "set_current", always_fail)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    assert lifecycle._activate_maintained_cli(second) is False
+    assert "activation failed" in capsys.readouterr().err
+
+
+def test_restart_cmd_queue_owned_routes_to_detached_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart running inside a Lubko job routes to the detached helper."""
+    job_id = uuid4()
+    captured: list[object] = []
+    monkeypatch.setattr(lifecycle, "_current_queue_job", lambda: (job_id, False))
+
+    def fake_queue(received: object) -> int:
+        captured.append(received)
+        return EXIT_OK
+
+    monkeypatch.setattr(lifecycle, "_queue_restart", fake_queue)
+    assert lifecycle.restart_cmd(argparse.Namespace()) == EXIT_OK
+    assert captured == [job_id]
+
+
+def test_restart_cmd_queue_owned_cancelled_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A cancelled restart queue owner refuses before any helper work."""
+    monkeypatch.setattr(lifecycle, "_current_queue_job", lambda: (uuid4(), True))
+    assert lifecycle.restart_cmd(argparse.Namespace()) == EXIT_ERROR
+    assert "cancelled" in capsys.readouterr().err
+
+
+def test_restart_cmd_without_job_keeps_manual_sync_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual restart retains the synchronous supervised path."""
+    called: list[bool] = []
+
+    def record_manual() -> int:
+        called.append(True)
+        return EXIT_OK
+
+    monkeypatch.setattr(lifecycle, "_current_queue_job", lambda: (None, False))
+    monkeypatch.setattr(lifecycle, "_restart_manual", record_manual)
+    assert lifecycle.restart_cmd(argparse.Namespace()) == EXIT_OK
+    assert called == [True]
+
+
+def test_queue_restart_parent_reports_prepared_response(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The queue-restart parent reports the prepared response and exits ok."""
+    response = {"ok": True, "type": "restart", "commit": GIT_SHA, "phase": "requested"}
+
+    def fake_helper(_job_id: object, writer: int) -> None:
+        os.write(writer, (json.dumps(response, sort_keys=True) + "\n").encode())
+        os._exit(0)
+
+    monkeypatch.setattr(lifecycle, "_run_restart_helper", fake_helper)
+    code = lifecycle._queue_restart(uuid4())
+    assert code == EXIT_OK
+    assert GIT_SHA in capsys.readouterr().out
+
+
+def test_queue_restart_parent_fails_when_helper_dies_silently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart helper that dies before reporting fails the restart job."""
+    monkeypatch.setattr(lifecycle, "_run_restart_helper", lambda *_args: os._exit(0))
+    with pytest.raises(lifecycle.DeployAbortedError, match="exited before reporting"):
+        lifecycle._queue_restart(uuid4())
+
+
+def test_restart_helper_locked_prepares_reports_waits_then_handoffs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restart helper reports, waits for durable success, then handoffs.
+
+    The response is delivered before the destructive process replacement, and
+    the replacement runs only after the row is durably terminal.
+    """
+    _repo, _first, second = make_repo(tmp_path / "repo")
+    order: list[object] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise, "read_state", lambda: replace(supervise.fresh_state(), commit=second)
+    )
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(
+        dc, "send_helper_response", lambda _writer, _response: order.append("response")
+    )
+    monkeypatch.setattr(
+        dc, "wait_for_durable_success", lambda _job_id, _deadline: order.append("durable")
+    )
+    monkeypatch.setattr(lifecycle, "_complete_restart_handoff", lambda: order.append("handoff"))
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._restart_helper_locked(uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert order == ["response", "durable", "handoff"]
+
+
+def test_restart_helper_locked_aborts_before_handoff_when_not_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart row that never becomes durably succeeded aborts before handoff."""
+    _repo, _first, second = make_repo(tmp_path / "repo")
+    handoffs: list[object] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise, "read_state", lambda: replace(supervise.fresh_state(), commit=second)
+    )
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(dc, "send_helper_response", lambda _writer, _response: None)
+
+    def fail_wait(_job_id: object, _deadline: float) -> None:
+        msg = "restart queue job reached cancelled before durable success"
+        raise dc.DeployCtlError(msg)
+
+    monkeypatch.setattr(dc, "wait_for_durable_success", fail_wait)
+    monkeypatch.setattr(lifecycle, "_complete_restart_handoff", lambda: handoffs.append(1))
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._restart_helper_locked(uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert handoffs == []
+
+
+def test_restart_helper_locked_reports_no_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart with no usable sealed runtime reports an error."""
+    _repo, _first, _second = make_repo(tmp_path / "repo")
+    errors: list[str] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise, "read_state", lambda: replace(supervise.fresh_state(), commit=None)
+    )
+    monkeypatch.setattr(dc, "send_helper_error", lambda _writer, message: errors.append(message))
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._restart_helper_locked(uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert errors
+    assert "no usable sealed runtime" in errors[0]
 
 
 def test_deploy_cli_has_no_stop_command(capsys: pytest.CaptureFixture[str]) -> None:

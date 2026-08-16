@@ -1122,6 +1122,18 @@ Both confirmation requests must traverse the replacement worker. Do not consider
 
 When checkout is submitted through the queue itself, the worker injects the exact root job UUID into the command environment (`LUBKO_JOB_ID`) so the controller recognizes its own queue row without any `process_pgid` race, then forks a detached handoff helper: the queue job returns its response and reaches durable `succeeded` before the old worker is stopped, so the control job is never killed by the old worker's own shutdown. A helper error or helper death makes the job exit non-zero and be durably recorded `failed` — never falsely `succeeded`. No ordinary job is ever exempted from shutdown cleanup.
 
+The same detached-handoff protection applies to a queue-invoked plain
+`lubko-deploy deploy` and to a queue-invoked `lubko-deploy restart`: the root
+job that runs the deploy/restart command itself is never killed merely because
+its own old worker is retired during the supervised handoff. The command
+reports the validated outcome so the row is durably `succeeded`/`failed` before
+the handoff, and the helper then drives the supervisor convergence and the
+maintained CLI activation, so the CLI pointer, the supervisor desired+applied
+state, and the new worker commit converge without a later manual status
+reconciliation (see the README "Queue-invoked self-deploy survives the old
+worker's shutdown" section). A queue-invoked `--bootstrap` is refused because a
+queue job is executed by a live worker.
+
 ## Verify a deployment with a real round trip
 
 The strongest end-to-end evidence comes from submitting a real job through the production execution path and watching it run in the live environment, then reading back its status and output. Simulated or mocked round trips have, more than once, passed while the real execution path failed — for example a runtime started with the wrong working directory, or a deployment that verified "the process started" but not that it could reach its database.

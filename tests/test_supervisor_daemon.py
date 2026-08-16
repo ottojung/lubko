@@ -32,16 +32,17 @@ import time
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import psycopg
 import pytest
 
 from lubko import cli, lifecycle, supervise
 from lubko import deployctl as dc
-from lubko.state import rollback_state_path
+from lubko.state import cli_root_dir, rollback_state_path
 from lubko.supervisor import Settings, SupervisorDaemon
 from lubko.supervisor import main as supervisor_main
+from lubko.worker import group_has_members
 from tests import _process_guard as guard
 from tests.test_cli import make_repo
 
@@ -1691,3 +1692,466 @@ def test_tick_derives_before_applying_stale_desired(
     daemon._tick(0.0)  # ruff: ignore[private-member-access]
     assert applied == []
     assert ensured == ["3" * 40]
+
+
+# ---------------------------------------------------------------------------
+# Queue-invoked plain ``lubko-deploy deploy`` (#68)
+# ---------------------------------------------------------------------------
+
+
+def write_fake_uv(tmp_path: Path, *, fail_validation: bool = False) -> Path:
+    """Write a stub ``uv`` that validates instantly and never spawns a worker.
+
+    The deploy's validation runs ``uv sync``/``uv run ...``; the stub exits zero
+    (or non-zero when ``fail_validation`` is set) so validation is instant. The
+    supervisor spawns the worker from the sealed per-commit runtime itself, so
+    the stub never needs a ``uv run lubko-worker`` arm.
+
+    Args:
+        tmp_path: Temporary directory for the script.
+        fail_validation: Whether every validation step must fail.
+
+    Returns:
+        The fake ``uv`` executable path.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "uv"
+    script.write_text("#!/bin/sh\nexit 9\n" if fail_validation else "#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    return script
+
+
+def deploy_deploy_args(repo: Path, fake_uv: Path) -> list[str]:
+    """Build the argv of one queue-invoked ``lubko-deploy deploy`` job.
+
+    Args:
+        repo: Deployment checkout pinned to the candidate commit.
+        fake_uv: Stub ``uv`` executable.
+
+    Returns:
+        The deploy argv running the real lifecycle CLI.
+    """
+    return [
+        sys.executable,
+        "-m",
+        "lubko.lifecycle",
+        "deploy",
+        "--repo",
+        str(repo),
+        "--uv",
+        str(fake_uv),
+        "--grace-seconds",
+        "0.5",
+        "--db-timeout",
+        "5",
+        "--lock-timeout",
+        "15",
+        "--validation-timeout",
+        "30",
+        "--git-timeout",
+        "10",
+        "--cli-timeout",
+        "60",
+    ]
+
+
+def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> UUID:
+    """Insert a protocol v3 pending command job executing argv directly.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        cwd: Working directory for the job.
+        process: Non-empty argv array to execute directly.
+
+    Returns:
+        The job identifier.
+    """
+    payload = json.dumps({
+        "v": 3,
+        "type": "command",
+        "request": {"cwd": cwd, "process": process},
+        "state": {"status": "pending"},
+    })
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (payload,),
+        ).fetchone()
+    assert row is not None
+    return cast("UUID", row[0])
+
+
+def _wait_for_queue_success_and_old_death(
+    jobs_db: str, queue_id: UUID, old_meta: lifecycle.WorkerMeta
+) -> None:
+    """Wait for durable queue success and prove the old worker dies after.
+
+    The deploying/restarting root row must reach durable ``succeeded`` before
+    the old worker is stopped. In the production split-state regression the
+    supervisor retired the old worker while the initiating job was still
+    running, so the old worker's shutdown cancelled the row; here the row is
+    terminal first and the old worker's death must come strictly after that.
+
+    Args:
+        jobs_db: Connection string.
+        queue_id: The initiating root job.
+        old_meta: The old worker metadata.
+    """
+    dead_at: float | None = None
+    succeeded_at: float | None = None
+    deadline = time.monotonic() + 90.0
+    while time.monotonic() < deadline:
+        status = read_status_of(jobs_db, queue_id)
+        if succeeded_at is None and status == "succeeded":
+            succeeded_at = time.monotonic()
+        if dead_at is None and not lifecycle.worker_alive(old_meta):
+            dead_at = time.monotonic()
+        if succeeded_at is not None and dead_at is not None:
+            break
+        time.sleep(0.02)
+    assert succeeded_at is not None, "queue row never reached succeeded"
+    assert dead_at is not None, "old worker never died"
+    assert dead_at >= succeeded_at, "old worker died before durable queue success"
+
+
+def payload_state(payload: dict[str, object]) -> dict[str, Any]:
+    """Return the ``state`` sub-object of a decoded job payload.
+
+    Args:
+        payload: Decoded job payload.
+
+    Returns:
+        The state mapping.
+    """
+    state = payload["state"]
+    assert isinstance(state, dict)
+    return state
+
+
+def _deploy_converged(applied: int, commit: str, old_pid: int) -> Callable[[], bool]:
+    """Return a predicate asserting the exact supervisor convergence.
+
+    The deploy row reaches durable success *before* the supervisor retires the
+    old worker, so ``status.json`` may still carry the pre-handoff snapshot
+    (``ready=true`` for the old worker) for a moment. Waiting on this exact
+    convergence — a strictly newer applied generation, the exact candidate
+    commit, a fresh live child, proof it consumes the queue, and the maintained
+    CLI pointer moved to the candidate — is what proves the handoff actually
+    completed and converged rather than matching the stale pre-handoff snapshot.
+
+    Args:
+        applied: The generation applied before the deploy.
+        commit: The exact deployed commit.
+        old_pid: The pre-deploy worker PID that must have been replaced.
+
+    Returns:
+        A predicate usable with :func:`wait_until`.
+    """
+
+    def check() -> bool:
+        status = supervise.read_status()
+        return bool(
+            status is not None
+            and status.applied_generation > applied
+            and status.commit == commit
+            and status.child is not None
+            and status.child.pid != old_pid
+            and status.ready
+            and cli.current_commit() == commit
+        )
+
+    return check
+
+
+def test_queue_deploy_survives_old_worker_shutdown_and_converges(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A queue-invoked ``lubko-deploy deploy`` survives its own old worker.
+
+    The production defect: a root job executes ``lubko-deploy deploy`` from a
+    worker-owned process group, the external supervisor retires that very
+    worker during the handoff, and the old worker's shutdown cancels the
+    initiating row even though the deployment converges. Here the deploy forks a
+    detached handoff helper, the root row reaches durable ``succeeded`` (never
+    ``cancelled``) before the old worker dies, the helper then drives the
+    supervisor handoff and activates the maintained CLIs so the CLI pointer,
+    the supervisor desired+applied state, and the new worker commit converge
+    without any later status reconciliation, and an unrelated active job is
+    still terminated by the old worker's shutdown rather than orphaned.
+    """
+    del pg_cluster
+    repo, first, second = maintained_env
+    fake_uv = write_fake_uv(tmp_path)
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        old_meta = lifecycle.read_meta()
+        assert old_meta is not None
+        assert old_meta.pid is not None
+
+        unrelated = insert_pending_job(jobs_db, str(repo), "sleep 30")
+        wait_until(lambda: read_status_of(jobs_db, unrelated) == "running", timeout=30.0)
+
+        deploy_id = insert_pending_process_job(
+            jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+        )
+        _wait_for_queue_success_and_old_death(jobs_db, deploy_id, old_meta)
+
+        deploy_payload = read_payload(jobs_db, deploy_id)
+        deploy_state = payload_state(deploy_payload)
+        assert deploy_state["status"] == "succeeded"
+        result = deploy_payload["result"]
+        assert isinstance(result, dict)
+        assert result["exit_code"] == 0
+        assert second in str(result["stdout"])
+        assert "converges detached" in str(result["stdout"])
+
+        wait_until(
+            lambda: read_status_of(jobs_db, unrelated) in {"cancelled", "failed"},
+            timeout=30.0,
+        )
+        unrelated_state = payload_state(read_payload(jobs_db, unrelated))
+        assert unrelated_state["status"] == "cancelled"
+        pgid = unrelated_state.get("process_pgid")
+        assert pgid is not None
+        assert not group_has_members(int(str(pgid)))
+
+        wait_until(_deploy_converged(applied, second, old_meta.pid), timeout=60.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == second
+        assert status.applied_generation > applied
+        assert status.child is not None
+        assert status.child.pid != old_meta.pid
+        assert status.child.pid in direct_children(status.supervisor_pid)
+        assert len(direct_children(status.supervisor_pid)) == 1
+
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.git_commit == second
+        assert lifecycle.worker_alive(meta)
+        assert cli.current_commit() == second
+
+
+def test_queue_deploy_validation_failure_leaves_failed_row_and_old_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A queue deploy that fails validation is durably failed, never succeeded.
+
+    The detached helper reports the error, the controller exits non-zero, and
+    the owning worker records the root row as ``failed``; the previous worker
+    keeps running and the supervisor never retires it. This mirrors the failure
+    contract of a supervised checkout: a dead/erroring helper can never leave a
+    falsely-successful row.
+    """
+    del pg_cluster
+    repo, first, _second = maintained_env
+    fake_uv = write_fake_uv(tmp_path, fail_validation=True)
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        old_pid = worker_pid()
+        assert old_pid is not None
+        old_meta = lifecycle.read_meta()
+        assert old_meta is not None
+
+        deploy_id = insert_pending_process_job(
+            jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+        )
+        wait_until(lambda: read_status_of(jobs_db, deploy_id) == "failed", timeout=60.0)
+        payload = read_payload(jobs_db, deploy_id)
+        result = payload["result"]
+        assert isinstance(result, dict)
+        assert result["exit_code"] != 0
+
+        assert lifecycle.worker_alive(old_meta)
+        assert worker_pid() == old_pid
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == first
+        assert status.applied_generation == applied
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+
+
+def restart_args() -> list[str]:
+    """Build the argv of one queue-invoked ``lubko-deploy restart`` job.
+
+    Returns:
+        The restart argv running the real lifecycle CLI.
+    """
+    return [sys.executable, "-m", "lubko.lifecycle", "restart"]
+
+
+def _restart_converged(applied: int, commit: str, old_pid: int) -> Callable[[], bool]:
+    """Return a predicate asserting the exact restart convergence.
+
+    A restart replaces the process running the *same* confirmed commit, so the
+    convergence is a strictly newer applied generation, the same commit, a
+    fresh child PID, and proof it consumes the queue — never the stale
+    pre-handoff snapshot that still shows ``ready`` for the old worker.
+
+    Args:
+        applied: The generation applied before the restart.
+        commit: The exact confirmed commit being restarted.
+        old_pid: The pre-restart worker PID that must have been replaced.
+
+    Returns:
+        A predicate usable with :func:`wait_until`.
+    """
+
+    def check() -> bool:
+        status = supervise.read_status()
+        return bool(
+            status is not None
+            and status.applied_generation > applied
+            and status.commit == commit
+            and status.child is not None
+            and status.child.pid != old_pid
+            and status.ready
+        )
+
+    return check
+
+
+def test_queue_restart_survives_old_worker_shutdown_and_replaces_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A queue-invoked ``lubko-deploy restart`` survives its own old worker.
+
+    Without the detached-handoff protection the supervisor would retire the
+    very worker executing the restart command, cancelling its own root row. Here
+    the root row reaches durable ``succeeded`` before the old worker dies, and
+    the detached helper then drives the supervised process replacement so a
+    fresh same-commit worker becomes the sole ready consumer.
+    """
+    del pg_cluster
+    repo, first, _second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        old_meta = lifecycle.read_meta()
+        assert old_meta is not None
+        assert old_meta.pid is not None
+
+        restart_id = insert_pending_process_job(jobs_db, str(repo), restart_args())
+        _wait_for_queue_success_and_old_death(jobs_db, restart_id, old_meta)
+
+        restart_payload = read_payload(jobs_db, restart_id)
+        restart_state = payload_state(restart_payload)
+        assert restart_state["status"] == "succeeded"
+        result = restart_payload["result"]
+        assert isinstance(result, dict)
+        assert result["exit_code"] == 0
+        assert "completes detached" in str(result["stdout"])
+
+        wait_until(_restart_converged(applied, first, old_meta.pid), timeout=60.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == first
+        assert status.applied_generation > applied
+        assert status.child is not None
+        assert status.child.pid != old_meta.pid
+        assert status.child.pid in direct_children(status.supervisor_pid)
+        assert len(direct_children(status.supervisor_pid)) == 1
+
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+        assert lifecycle.worker_alive(meta)
+
+
+def _deploy_rollback_converged(applied: int, commit: str) -> Callable[[], bool]:
+    """Return a predicate asserting the exact post-rollback coherence.
+
+    After a queue deploy whose CLI activation failed, the helper settles the
+    supervisor back to the previous confirmed commit and the maintained CLIs
+    keep selecting it, so the live worker, the supervisor desired/applied
+    commit, and ``cli/current`` all match.
+
+    Args:
+        applied: The generation applied before the deploy.
+        commit: The exact previous confirmed commit to restore.
+
+    Returns:
+        A predicate usable with :func:`wait_until`.
+    """
+
+    def check() -> bool:
+        status = supervise.read_status()
+        return bool(
+            status is not None
+            and status.applied_generation > applied
+            and status.commit == commit
+            and status.child is not None
+            and status.ready
+            and cli.current_commit() == commit
+        )
+
+    return check
+
+
+def test_queue_deploy_cli_activation_failure_rolls_back_and_converges(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A queue deploy whose CLI activation fails rolls back to full coherence.
+
+    The candidate becomes live and ready through the real supervisor handoff,
+    but every maintained-CLI activation retry fails (the atomic pointer switch
+    is blocked). The detached helper must not leave the candidate worker on the
+    new commit with a stale ``cli/current``: it settles the supervisor back to
+    the previous confirmed commit so the live worker, the supervisor
+    desired/applied commit, and ``cli/current`` all match — with no manual
+    ``lubko-deploy-ctl status`` reconciliation.
+    """
+    del pg_cluster
+    repo, first, second = maintained_env
+    fake_uv = write_fake_uv(tmp_path)
+    cli.set_current(first)
+    (cli_root_dir() / cli.CURRENT_TMP_NAME).mkdir()
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        old_meta = lifecycle.read_meta()
+        assert old_meta is not None
+        assert old_meta.pid is not None
+
+        deploy_id = insert_pending_process_job(
+            jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+        )
+        wait_until(lambda: read_status_of(jobs_db, deploy_id) == "succeeded", timeout=90.0)
+        wait_until(_deploy_rollback_converged(applied, first), timeout=90.0)
+
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == first
+        assert status.applied_generation > applied
+        assert status.child is not None
+        assert status.child.pid != old_meta.pid
+        assert len(direct_children(status.supervisor_pid)) == 1
+        assert cli.current_commit() == first
+
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+        assert lifecycle.worker_alive(meta)
+
+        payload = read_payload(jobs_db, deploy_id)
+        assert payload_state(payload)["status"] == "succeeded"
+        result = payload["result"]
+        assert isinstance(result, dict)
+        assert result["exit_code"] == 0
+        assert second in str(result["stdout"])
