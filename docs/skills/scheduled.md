@@ -36,7 +36,7 @@ The issue status comment is the canonical coordination signal between orchestrat
 
 1. Read <https://github.com/ottojung/lubko/blob/main/docs/skills/scheduled.md>.
 2. Read <https://github.com/ottojung/lubko/blob/main/docs/SKILL.md> and obey it for normal Lubko operation.
-3. Identify the configured target repository from the scheduled-task prompt (its URL; see [Minimal scheduled-task description](#minimal-scheduled-task-description)).
+3. Identify the configured target repository from the scheduled-task prompt.
 4. Inspect the target repository's open issues and their orchestrator status comments before choosing work.
 5. Treat a `working` status whose GitHub comment `updated_at` is less than 10 minutes old as actively owned by another orchestrator; do not intentionally work on that issue.
 6. Treat a `working` status whose GitHub comment `updated_at` is at least 10 minutes old as abandoned and inheritable. Prefer inheriting abandoned target-project work over selecting a new issue.
@@ -216,11 +216,6 @@ Do not interpret "no Lubko work is active" as permission to modify the Lubko cod
 Prefer a deterministic, understandable selection policy when useful, but do not over-engineer issue selection. Immediately after choosing an issue, claim it through its orchestrator status comment before starting substantial work, then re-read the canonical comment to make sure the claim still belongs to this invocation.
 
 ## Minimal scheduled-task description
-
-The actual ChatGPT scheduled-task prompt/description must contain only the minimum bootstrap information needed to locate the target and the instructions. Broadly, it should contain only:
-
-1. the **target repository URL**;
-2. the absolute URL of this scheduled skill file.
 
 For example:
 
