@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager, suppress
@@ -185,6 +186,32 @@ def insert_job(conninfo: str, cwd: str, command: str) -> UUID:
         "v": 2,
         "type": "command",
         "request": {"cwd": cwd, "command": command},
+        "state": {"status": "pending"},
+    })
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (payload,),
+        ).fetchone()
+    assert row is not None
+    return cast("UUID", row[0])
+
+
+def insert_args_job(conninfo: str, cwd: str, args: list[str]) -> UUID:
+    """Insert a protocol v2 pending argv-style command job.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        cwd: Working directory for the job.
+        args: argv-style command to execute directly.
+
+    Returns:
+        The job identifier.
+    """
+    payload = json.dumps({
+        "v": 2,
+        "type": "command",
+        "request": {"cwd": cwd, "args": args},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -602,6 +629,81 @@ def test_one_job_failure_isolation(jobs_db: str, pg_cluster: _pg.PgCluster, tmp_
         assert "boom" in failed_payload["result"]["stderr"]
 
     assert read_status(jobs_db, healthy) in {"cancelled", "failed"}
+
+
+def test_job_runs_in_declared_working_directory(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A shell and an argv job actually execute inside their declared cwd."""
+    work_dir = tmp_path / "runner"
+    work_dir.mkdir()
+    shell_id = insert_job(jobs_db, str(work_dir), "pwd")
+    argv_id = insert_args_job(
+        jobs_db,
+        str(work_dir),
+        [sys.executable, "-c", "import os; print(os.getcwd())"],
+    )
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, shell_id) == "succeeded")
+        wait_until(lambda: read_status(jobs_db, argv_id) == "succeeded")
+
+    for job_id in (shell_id, argv_id):
+        payload = read_root(jobs_db, job_id)
+        assert payload["state"]["status"] == "succeeded"
+        assert payload["result"]["exit_code"] == 0
+        assert payload["result"]["stdout"].strip() == str(work_dir)
+
+
+def test_preflight_rejects_nonexistent_working_directory(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A command whose cwd does not exist fails cleanly without harming others."""
+    missing = tmp_path / "does-not-exist"
+    bad_id = insert_job(jobs_db, str(missing), "echo never")
+    healthy = insert_job(jobs_db, str(tmp_path), "echo healthy; sleep 0.3")
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, healthy) == "succeeded")
+        wait_until(lambda: read_status(jobs_db, bad_id) == "failed")
+
+    payload = read_root(jobs_db, bad_id)
+    assert payload["state"]["status"] == "failed"
+    assert payload["result"]["exit_code"] == 127
+    assert "unable to enter working directory" in payload["result"]["stderr"]
+    assert read_status(jobs_db, healthy) == "succeeded"
+
+
+def test_preflight_rejects_request_with_neither_command_nor_args(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A parseable request with no command or args fails without harming others."""
+    bad_payload = json.dumps({
+        "v": 2,
+        "type": "command",
+        "request": {"cwd": str(tmp_path)},
+        "state": {"status": "pending"},
+    })
+    with psycopg.connect(jobs_db) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (bad_payload,),
+        ).fetchone()
+    assert row is not None
+    bad_id = cast("UUID", row[0])
+    healthy = insert_job(jobs_db, str(tmp_path), "echo healthy; sleep 0.3")
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, healthy) == "succeeded")
+        wait_until(lambda: read_status(jobs_db, bad_id) == "failed")
+        subsequent = insert_job(jobs_db, str(tmp_path), "echo after")
+        wait_until(lambda: read_status(jobs_db, subsequent) == "succeeded")
+
+    payload = read_root(jobs_db, bad_id)
+    assert payload["state"]["status"] == "failed"
+    assert payload["result"]["exit_code"] == 127
+    assert "request has neither command nor args" in payload["result"]["stderr"]
+    assert read_status(jobs_db, healthy) == "succeeded"
 
 
 def test_lease_heartbeats_across_multiple_active_jobs(

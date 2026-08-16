@@ -376,6 +376,49 @@ def test_spawn_job_injects_exact_root_job_uuid_into_args_environment(
         stderr_path.unlink(missing_ok=True)
 
 
+def test_spawn_job_runs_command_in_declared_cwd(tmp_path: Path) -> None:
+    """A shell command job executes inside its declared working directory."""
+    shell = resolve_shell()
+    assert shell is not None
+    work_dir = tmp_path / "runner"
+    work_dir.mkdir()
+    proc, stdout_path, stderr_path, _pgid = spawn_job(
+        Job(id=uuid4(), cwd=str(work_dir), command="pwd", args=None), shell
+    )
+    guard.register(proc)
+    try:
+        proc.wait(timeout=10)
+        assert read_output(stdout_path) == str(work_dir).encode() + b"\n"
+        assert read_output(stderr_path) == b""
+    finally:
+        guard.unregister(proc)
+        proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
+def test_spawn_job_runs_args_in_declared_cwd(tmp_path: Path) -> None:
+    """An argv job (direct exec) runs inside its declared working directory."""
+    shell = resolve_shell()
+    assert shell is not None
+    work_dir = tmp_path / "argv-runner"
+    work_dir.mkdir()
+    probe = "import os; print(os.getcwd())"
+    proc, stdout_path, stderr_path, _pgid = spawn_job(
+        Job(id=uuid4(), cwd=str(work_dir), command=None, args=(sys.executable, "-c", probe)),
+        shell,
+    )
+    guard.register(proc)
+    try:
+        proc.wait(timeout=10)
+        assert read_output(stdout_path) == str(work_dir).encode() + b"\n"
+    finally:
+        guard.unregister(proc)
+        proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
 def test_archive_target_never_reaches_the_live_tail() -> None:
     """The archive target always stays short of the newest tail window."""
     assert worker.archive_target(0) == 0
