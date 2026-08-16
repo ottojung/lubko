@@ -1684,7 +1684,7 @@ def _handle_status(options: Options) -> dict[str, object]:
         with deploy_lock(options.lock_timeout_seconds):
             state = _read_state()
             if state is not None and state.status == STATUS_PENDING:
-                if time.time() >= state.deadline or not worker_alive(state.new_meta):
+                if time.time() >= state.deadline or not _mission_candidate_alive(state):
                     _rollback_locked(state)
                     state = _read_state()
             meta = read_meta()

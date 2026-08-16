@@ -1005,6 +1005,112 @@ def test_supervised_bad_candidate_rollback_converges_to_previous(
         )
 
 
+def _status_options(repo: Path) -> dc.Options:
+    """Build controller options for a status query against a live supervisor.
+
+    Args:
+        repo: Maintained checkout.
+
+    Returns:
+        Runtime options for the controller.
+    """
+    return dc.Options(
+        repo=repo,
+        uv_path="uv",
+        confirm_window_seconds=120,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=5,
+        lock_timeout_seconds=5,
+        validation_timeout_seconds=30,
+        git_timeout_seconds=10,
+        cli_timeout_seconds=60,
+    )
+
+
+def test_status_keeps_live_supervised_pending_mission(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A status query keeps a healthy supervisor-owned pending mission live.
+
+    The durable pending mission carries the never-alive placeholder candidate
+    identity, so real candidate liveness comes only from the supervisor's own
+    child state. A supported ``lubko-deploy-ctl status`` during a healthy
+    supervised deployment must report the pending phase and must never roll the
+    candidate back.
+    """
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        write_rollback(mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)))
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+        candidate_pid = worker_pid()
+        assert candidate_pid is not None
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == second
+
+        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
+
+        assert result["phase"] == "await-confirmation"
+        assert result["proposed_commit"] == second
+        assert result["previous_commit"] == first
+        after = dc._read_state()  # ruff: ignore[private-member-access]
+        assert after is not None
+        assert after.status == dc.STATUS_PENDING
+        assert worker_pid() == candidate_pid
+
+
+def test_status_rolls_back_supervised_mission_with_lapsed_deadline(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A status query enforces the lapsed deadline on a supervisor-owned mission.
+
+    The supervisor drives candidates purely by generation and keeps running the
+    candidate past the confirmation deadline, so the status path is the
+    deadline enforcer: a lapsed pending mission must settle back to the
+    previous commit even while its candidate is still live.
+    """
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        lapsed = mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo))
+        write_rollback(replace(lapsed, deadline=time.time() - 1))
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+        candidate_pid = worker_pid()
+        assert candidate_pid is not None
+
+        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
+
+        assert result["phase"] == "idle"
+        assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
+        final = dc._read_state()  # ruff: ignore[private-member-access]
+        assert final is not None
+        assert final.status == dc.STATUS_ROLLED_BACK
+        wait_until(status_commit_is(first), timeout=30.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == first
+        assert status.applied_generation > applied + 1
+        assert status.child is not None
+        assert status.child.pid != candidate_pid
+
+
 def test_supervisor_restart_resumes_pending_mission_candidate(
     jobs_db: str,
     pg_cluster: _pg.PgCluster,

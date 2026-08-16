@@ -148,6 +148,45 @@ def make_options(repo: Path) -> dc.Options:
     )
 
 
+class _NoopDeployLock:
+    """Minimal deployment-lock context that never blocks or fails."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def _supervisor_child_state(commit: str, generation: int) -> supervise.SupervisorState:
+    """Build supervisor durable state running ``commit`` under ``generation``.
+
+    Args:
+        commit: Exact commit the daemon runs.
+        generation: Generation the daemon applied.
+
+    Returns:
+        A run-mode supervisor state owning a live candidate child.
+    """
+    return replace(
+        supervise.fresh_state(),
+        mode=supervise.MODE_RUN,
+        commit=commit,
+        applied_generation=generation,
+        child=supervise.WorkerChild(
+            pid=4242,
+            pgid=4242,
+            sid=4242,
+            start_time_ticks=42_424_242,
+            token=f"token-{generation}",
+            worker_id="test-supervised-worker",
+            spawned_at=1.0,
+        ),
+        intent=supervise.INTENT_RUN,
+        ready=True,
+    )
+
+
 def run_launcher(path: Path) -> str:
     """Run a stable launcher and return its trimmed stdout.
 
@@ -652,6 +691,164 @@ def test_watchdog_rollback_condition_uses_deadline_or_candidate_death(
     assert calls == [state]
     assert result["phase"] == "idle"
     assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
+
+
+def test_status_keeps_live_supervised_pending_mission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A status query never rolls back a healthy supervisor-owned pending mission.
+
+    The candidate identity is the never-alive supervisor placeholder, so the
+    supervisor's durable child state is the only genuine liveness signal: the
+    status path must use ``_mission_candidate_alive`` and report the pending
+    phase instead of rolling the live deployment back.
+    """
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+    current: list[dc.RollbackState] = [state]
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: _supervisor_child_state(state.commit, state.generation),
+    )
+    monkeypatch.setattr(dc, "_read_state", lambda: current[0])
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == []
+    assert result["phase"] == "await-confirmation"
+    assert result["proposed_commit"] == state.commit
+    assert result["previous_commit"] == state.previous_commit
+    assert result["deadline"] == state.deadline
+
+    current[0] = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == []
+    assert result["phase"] == "await-reversal"
+    assert result["proposed_commit"] == state.commit
+    assert result["previous_commit"] == state.previous_commit
+
+
+def test_status_rolls_back_supervised_mission_when_candidate_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A status query rolls back a supervised candidate the daemon no longer tracks."""
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+    states = iter((state, rolled_back))
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == [state]
+    assert result["phase"] == "idle"
+    assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
+
+
+def test_status_rolls_back_supervised_mission_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A status query rolls back a supervised mission whose window lapsed.
+
+    Even a still-active candidate cannot keep a mission alive past its
+    confirmation deadline: the deadline semantics alone must require rollback.
+    """
+    base = pending_state()
+    state = replace(
+        base,
+        new_meta=dc._placeholder_meta(base.commit, base.repo),
+        deadline=time.time() - 1,
+    )
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+    states = iter((state, rolled_back))
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: _supervisor_child_state(state.commit, state.generation),
+    )
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == [state]
+    assert result["phase"] == "idle"
+    assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
+
+
+def test_status_keeps_live_legacy_pending_mission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without a supervisor, a live recorded candidate survives status."""
+    state = pending_state()
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == []
+    assert result["phase"] == "await-confirmation"
+    assert result["proposed_commit"] == state.commit
+    assert result["previous_commit"] == state.previous_commit
 
 
 def test_watchdog_child_drops_inherited_file_descriptors(tmp_path: Path) -> None:
