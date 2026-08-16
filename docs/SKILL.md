@@ -1251,7 +1251,7 @@ The most useful findings arrive *before* the task completes: a reviewer flagging
 
 Rules:
 
-- Ask agents to report early, risky findings in their prompt: *"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end."* Do not require agents to finish before communicating.
+- Ask agents to report early, risky findings in their prompt: *"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end."*
 - When the orchestrator spots something mid-flight, share it immediately with the affected agent via a steering prompt, even if it means the agent re-plans. A stopped-wrong task is cheaper than a finished-wrong task.
 - Keep partial progress durable: ask agents to commit incrementally on their branch, not only at the end.
 
