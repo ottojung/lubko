@@ -1,8 +1,8 @@
 # Lubko
 
-Lubko is a small worker that claims shell jobs from PostgreSQL and executes them
-directly inside the Lubko container, honoring each job's requested working
-directory.
+Lubko is a small worker that claims process-argv jobs from PostgreSQL and
+executes them directly inside the Lubko container, honoring each job's requested
+working directory, with no shell.
 
 ## Development
 
@@ -99,9 +99,10 @@ refuses to start with an invalid combination.
 credential-bearing variables from the environment it hands to a deployed
 worker, so credentials are never carried in the worker process environment.
 
-Jobs run through `bash -lc` directly in the container, in the directory
-requested by each job. Each job is started as its own session and process
-group leader.
+Jobs execute the `request.process` argv directly as a new session and process
+group leader, in the directory requested by each job, with **no shell**: shell
+metacharacters, expansions, and redirections are never interpreted. Each job
+carries a non-empty array of non-empty strings exec'd as argv.
 
 ### Container init (reaping PID 1)
 
@@ -125,17 +126,20 @@ payload text not null
 `payload` is one string containing a JSON object; all evolving job/request/
 result/state/cancellation/process-identity/output data lives inside it.
 **Never add a third column.** See `docs/protocol.md` for the versioned binding:
-the payload carries a protocol version `v` (currently `2`) with `command` rows
+the payload carries a protocol version `v` (currently `3`) with `command` rows
 (`request`, `state`, optional terminal `result`, and bounded live `output`
-tails) and immutable `output_chunk` rows. SQL casts `payload::jsonb` only
-transiently for predicates and atomic updates and stores `::text` back. The
-worker refuses to start against a table that violates this invariant.
+tails) and immutable `output_chunk` rows. A v3 `request` carries `cwd` plus the
+sole executable field `process` (a non-empty array of non-empty strings exec'd
+directly as argv with no shell); the v2 `request.command` / `request.args`
+fields do not exist and v2 payloads are rejected. SQL casts `payload::jsonb`
+only transiently for predicates and atomic updates and stores `::text` back.
+The worker refuses to start against a table that violates this invariant.
 
-Submit a job in protocol v2 form:
+Submit a job in protocol v3 form:
 
 ```sql
 insert into lubko.jobs (payload)
-values ('{"v":2,"type":"command","request":{"cwd":"/workspace/project","command":"git status --short"},"state":{"status":"pending"}}')
+values ('{"v":3,"type":"command","request":{"cwd":"/workspace/project","process":["git","status","--short"]},"state":{"status":"pending"}}')
 returning id;
 ```
 
@@ -160,7 +164,7 @@ See `docs/protocol.md` for reading history and cleaning up chunks.
 ## Concurrent jobs
 
 The worker is a single nonblocking supervisor. It holds one PostgreSQL
-connection and an in-memory registry of active jobs; each shell command runs as
+connection and an in-memory registry of active jobs; each job process runs as
 its own OS process/session/process group, and the daemon never allocates a
 thread or a connection per job and never synchronously waits for any one child.
 There is **no application-level concurrency limit**: 2, 20, or 200 independent
@@ -258,11 +262,20 @@ canonical two-column `lubko.jobs` table with its type-aware checks, the
 command queue index, the output-chunk ownership/ordering indexes, the
 invariant comment, and the worker role grant. There is no older schema and no
 rollback path: the two-column table is the only supported binding, and the
-worker verifies the protocol v2 output-chunk shape at startup, refusing to
+worker verifies the protocol v3 output-chunk shape at startup, refusing to
 run against any other table. See `docs/protocol.md` for the authoritative
 binding.
 
-The baseline grants the `lubko_worker` role everything protocol v2 needs:
+The v2 → v3 production cutover is **destructive but schema-free**: the
+protocol breaking change is parser/worker-level only, so no physical schema
+migration is required (the two-column table and its generic type-aware
+constraint are unchanged and never reference `request.process`). Because a v3
+worker is authoritative and preserves no v2 data, stop the v2 consumers, then
+purge all existing `lubko.jobs` rows (`TRUNCATE lubko.jobs` — root jobs,
+history, and output chunks), then start the v3 worker. v2 payloads are
+rejected by the parser, not migrated.
+
+The baseline grants the `lubko_worker` role everything protocol v3 needs:
 `USAGE` on the `lubko` schema and `SELECT`, `INSERT`, `UPDATE` on
 `lubko.jobs` (INSERT is required to publish immutable `output_chunk` rows).
 The grant is guarded by `to_regrole`, so applying the baseline before the role

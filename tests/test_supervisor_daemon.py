@@ -376,20 +376,23 @@ def status_has_no_child() -> bool:
 
 
 def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v2 pending command job.
+    """Insert a protocol v3 pending command job.
+
+    The worker never invokes a shell itself, so the command string is wrapped
+    in an explicit ``["bash", "-lc", command]`` argv chosen by the test.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        command: Shell command wrapped in a ``bash -lc`` argv.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": ["bash", "-lc", command]},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:

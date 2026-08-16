@@ -6,7 +6,7 @@ This is the operating guide for a **recurring, scheduled ChatGPT invocation** th
 
 Two things are deliberately kept distinct throughout this document:
 
-- **Lubko** — the execution/orchestration platform: the server that runs queued shell jobs and managed `lubko-agent` sessions, plus its transport (`lubko.jobs`), agent state, worktrees/checkouts, and execution state.
+- **Lubko** — the execution/orchestration platform: the server that runs queued process-argv jobs (protocol v3, exec'd with no shell) and managed `lubko-agent` sessions, plus its transport (`lubko.jobs`), agent state, worktrees/checkouts, and execution state.
 - **Target repository (or target project)** — the GitHub repository the scheduled orchestrator is configured to maintain: its issues, branches, PRs, CI, and git history.
 
 A scheduled run operates on the Lubko repository only when the scheduled task explicitly names it as the target repository. Do not assume the target is `ottojung/lubko`, and never treat Lubko's own checkout as the worktree being modified for target-project work.

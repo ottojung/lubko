@@ -1,4 +1,4 @@
--- Lubko transport queue baseline: the canonical protocol v2 two-column schema.
+-- Lubko transport queue baseline: the two-column protocol schema.
 --
 -- THE INVARIANT
 --
@@ -12,7 +12,13 @@
 -- by the top-level "v" field. SQL casts payload::jsonb only transiently for
 -- predicates and atomic jsonb_set updates; every stored value is ::text.
 --
--- Protocol v2 distinguishes command rows from immutable output_chunk rows.
+-- The schema is deliberately version-agnostic: the type-aware constraint below
+-- does NOT reference request.process (nor the removed v2 request.command /
+-- request.args). Command-row and process validity is enforced by the parser
+-- against the versioned binding, so a protocol breaking change -- including
+-- the current protocol v3 process-only binding -- requires NO physical schema
+-- migration, and this one baseline serves every protocol generation.
+--
 -- Constraints are type-aware: command rows must carry a request object and a
 -- lifecycle state.status, while output_chunk rows must carry thread ownership
 -- and offset/value shape. Claim/recovery queries operate only on command rows,
@@ -46,12 +52,12 @@ create table if not exists lubko.jobs (
 );
 
 -- Worker role access is part of the binding: lubko_worker is the stable role
--- the worker connects as (see README configuration). Protocol v2 requires the
--- worker to read and claim jobs (SELECT, UPDATE), to finalize and publish
--- output (UPDATE), and to insert immutable output_chunk rows (INSERT). It also
--- needs USAGE on the lubko schema to reach the table. GRANT is idempotent, and
--- it is guarded by to_regrole so a fresh environment where the role is not yet
--- provisioned does not fail.
+-- the worker connects as (see README configuration). The current protocol v3
+-- requires the worker to read and claim jobs (SELECT, UPDATE), to finalize
+-- and publish output (UPDATE), and to insert immutable output_chunk rows
+-- (INSERT). It also needs USAGE on the lubko schema to reach the table. GRANT
+-- is idempotent, and it is guarded by to_regrole so a fresh environment where
+-- the role is not yet provisioned does not fail.
 do $$
 begin
     if to_regrole('lubko_worker') is not null then

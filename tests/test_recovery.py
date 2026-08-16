@@ -73,21 +73,21 @@ def db(jobs_db: str) -> str:
     return jobs_db
 
 
-def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v2 pending command job.
+def insert_pending_job(conninfo: str, cwd: str, process: list[str]) -> UUID:
+    """Insert a protocol v3 pending process job.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        process: argv-style command to run directly.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -99,21 +99,21 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
     return cast("UUID", row[0])
 
 
-def insert_running_without_lease(conninfo: str, cwd: str, command: str) -> UUID:
+def insert_running_without_lease(conninfo: str, cwd: str, process: list[str]) -> UUID:
     """Insert a running job that carries no lease deadline.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        process: argv-style command to run directly.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": process},
         "state": {
             "status": "running",
             "worker_id": "stale-worker",
@@ -195,7 +195,7 @@ def test_stale_job_is_recovered_after_worker_disappears(
     tmp_path: Path,
 ) -> None:
     """A job whose worker disappeared is recovered and marked failed."""
-    job_id = insert_pending_job(db, str(tmp_path), "echo hi")
+    job_id = insert_pending_job(db, str(tmp_path), ["echo", "hi"])
     with psycopg.connect(db) as conn:
         claimed = claim_job(conn, make_settings())
     assert claimed is not None
@@ -219,7 +219,7 @@ def test_stale_job_is_recovered_after_worker_disappears(
 
 def test_non_stale_running_job_is_not_recovered(db: str, tmp_path: Path) -> None:
     """A genuinely live job with a fresh lease is never touched."""
-    job_id = insert_pending_job(db, str(tmp_path), "sleep 30")
+    job_id = insert_pending_job(db, str(tmp_path), ["sleep", "30"])
     with psycopg.connect(db) as conn:
         claimed = claim_job(conn, make_settings())
     assert claimed is not None
@@ -237,7 +237,7 @@ def test_running_job_without_lease_is_left_for_manual_repair(
     tmp_path: Path,
 ) -> None:
     """A running job without a lease is never auto-recovered."""
-    job_id = insert_running_without_lease(db, str(tmp_path), "sleep 30")
+    job_id = insert_running_without_lease(db, str(tmp_path), ["sleep", "30"])
 
     with psycopg.connect(db) as conn:
         recovered = recover_stale_jobs(conn)
@@ -251,7 +251,7 @@ def test_recovery_is_atomic_across_concurrent_workers(
     tmp_path: Path,
 ) -> None:
     """Concurrent recovery passes recover each stale job exactly once."""
-    jobs = [insert_pending_job(db, str(tmp_path), "echo hi") for _ in range(3)]
+    jobs = [insert_pending_job(db, str(tmp_path), ["echo", "hi"]) for _ in range(3)]
     for job_id in jobs:
         with psycopg.connect(db) as conn:
             claim_job(conn, make_settings(worker_id=f"worker-{job_id}"))
@@ -326,7 +326,7 @@ def test_worker_crash_is_recovered_by_replacement_worker(
     """An end-to-end worker crash is recovered without duplicate execution."""
     marker = tmp_path / "runs"
     command = f"echo ran >> {marker}; sleep 30"
-    job_id = insert_pending_job(db, str(tmp_path), command)
+    job_id = insert_pending_job(db, str(tmp_path), ["bash", "-lc", command])
 
     conf = tmp_path / "database.conf"
     conf.write_text(
@@ -381,7 +381,7 @@ def test_claim_records_lease_and_incarnation_into_the_future(
     tmp_path: Path,
 ) -> None:
     """Claiming writes a future lease and the worker incarnation."""
-    job_id = insert_pending_job(db, str(tmp_path), "sleep 30")
+    job_id = insert_pending_job(db, str(tmp_path), ["sleep", "30"])
     with psycopg.connect(db) as conn:
         claimed = claim_job(conn, make_settings())
     assert claimed is not None

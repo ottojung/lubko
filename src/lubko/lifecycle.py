@@ -1327,9 +1327,9 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
         The probe job identifier, or ``None`` if the insert failed.
     """
     probe_payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": "sleep 60"},
+        "request": {"cwd": cwd, "process": ["sleep", "60"]},
         "state": {"status": "pending"},
     })
     with conn.cursor() as cursor:

@@ -8,7 +8,7 @@ inside ``payload`` using the versioned binding in :mod:`lubko.protocol` (see
 violates the two-column invariant.
 
 The daemon is a single nonblocking supervisor. It holds one PostgreSQL
-connection and an in-memory registry of active jobs; each shell command runs
+connection and an in-memory registry of active jobs; each job process runs
 as its own OS process/session/process group, but the Python daemon never
 synchronously waits for any one child and never allocates a thread or a
 connection per job. The supervisor loop repeatedly does small non-blocking
@@ -47,7 +47,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import signal
 import socket
 import subprocess
@@ -149,16 +148,15 @@ def _jsonb_set_chain(base: str, updates: list[tuple[str, str]]) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Job:
-    """A claimed shell job.
+    """A claimed process-only job.
 
-    A job carries either a shell ``command`` (run through ``bash -lc``) or an
-    argv-style ``args`` list (executed directly), never both.
+    The mandatory ``process`` argv list is exec'd directly with no shell;
+    protocol v3 has no ``request.command`` or ``request.args``.
     """
 
     id: UUID
     cwd: str
-    command: str | None
-    args: tuple[str, ...] | None
+    process: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,8 +203,7 @@ class ActiveJob:
 
     id: UUID
     cwd: str
-    command: str | None
-    args: tuple[str, ...] | None
+    process: tuple[str, ...]
     proc: subprocess.Popen[bytes]
     pid: int
     pgid: int
@@ -739,15 +736,6 @@ def _output_update_params(job_id: UUID, output: dict[str, dict[str, Any]]) -> di
 # ---------------------------------------------------------------------------
 
 
-def resolve_shell() -> str | None:
-    """Locate the shell executable used to run jobs.
-
-    Returns:
-        Absolute path to the shell, or ``None`` if it is not installed.
-    """
-    return shutil.which("bash")
-
-
 def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) -> None:
     """Persist the exact process identity of a running job.
 
@@ -870,12 +858,13 @@ def _cleanup_output_files(stdout_path: Path, stderr_path: Path) -> None:
     stderr_path.unlink(missing_ok=True)
 
 
-def spawn_job(job: Job, shell: str) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
+def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
     """Start a job as a new session and process group leader.
 
-    A shell ``command`` job runs through ``bash -lc``; an ``args`` job is
-    executed directly. Both are started as a new session so cancellation can
-    signal the exact process group.
+    The job's ``process`` argv is exec'd directly with no shell, so shell
+    metacharacters, expansions, and redirections are never interpreted and
+    every argv element is passed literally. The process is started as a new
+    session so cancellation can signal the exact process group.
 
     The exact root job UUID is injected into the child environment as
     ``LUBKO_JOB_ID`` before the child execs, so every process of the job can
@@ -884,23 +873,14 @@ def spawn_job(job: Job, shell: str) -> tuple[subprocess.Popen[bytes], Path, Path
 
     Args:
         job: Claimed job to execute.
-        shell: Absolute path to the shell executable, used for ``command``
-            jobs and ignored for ``args`` jobs.
 
     Returns:
         The running process, its capture file paths, and its process group ID.
 
     Raises:
         OSError: If the command cannot be started.
-        ValueError: If the job request has neither ``command`` nor ``args``.
     """
-    if job.command is not None:
-        argv = [shell, "-lc", job.command]
-    elif job.args:
-        argv = list(job.args)
-    else:
-        msg = "job request must provide command or args"
-        raise ValueError(msg)
+    argv = list(job.process)
     env = dict(os.environ)
     env[JOB_ID_ENV] = str(job.id)
     stdout_fd, stdout_name = tempfile.mkstemp()
@@ -1448,10 +1428,10 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
         raise SchemaInvariantError(msg)
 
 
-def verify_v2_schema(conn: JobsConnection) -> None:
-    """Assert that ``lubko.jobs`` carries the canonical protocol v2 shape.
+def verify_v3_schema(conn: JobsConnection) -> None:
+    """Assert that ``lubko.jobs`` carries the canonical protocol v3 shape.
 
-    The two-column invariant alone does not make a table usable by a v2
+    The two-column invariant alone does not make a table usable by a v3
     worker: immutable ``output_chunk`` publication requires the type-aware
     ``jobs_payload_type_shape`` check constraint and the chunk
     ownership/ordering indexes, which the single canonical baseline
@@ -1490,10 +1470,10 @@ def verify_v2_schema(conn: JobsConnection) -> None:
     if missing:
         detail = ", ".join(missing)
         msg = (
-            f"lubko.jobs lacks the protocol v2 output-chunk schema shape required "
+            f"lubko.jobs lacks the protocol v3 output-chunk schema shape required "
             f"for immutable output publication: missing {detail}. Re-apply the "
             f"canonical, idempotent baseline migration "
-            f"migrations/0001_two_column_protocol.sql before starting a v2 "
+            f"migrations/0001_two_column_protocol.sql before starting a v3 "
             f"worker. {TWO_COLUMN_INVARIANT}"
         )
         raise SchemaInvariantError(msg)
@@ -1813,15 +1793,14 @@ class Supervisor:
         job_spec = Job(
             id=claimed.id,
             cwd=payload.request.cwd,
-            command=payload.request.command,
-            args=payload.request.args,
+            process=payload.request.process,
         )
         failure = _preflight_failure(job_spec)
         if failure is not None:
             self._finalize_immediate(claimed.id, failure)
             return
         try:
-            proc, stdout_path, stderr_path, pgid = spawn_job(job_spec, _shell_for(job_spec))
+            proc, stdout_path, stderr_path, pgid = spawn_job(job_spec)
         except (OSError, ValueError) as exc:
             LOGGER.warning("unable to start job %s: %s", claimed.id, exc)
             self._finalize_immediate(
@@ -1839,8 +1818,7 @@ class Supervisor:
         job = ActiveJob(
             id=claimed.id,
             cwd=job_spec.cwd,
-            command=job_spec.command,
-            args=job_spec.args,
+            process=job_spec.process,
             proc=proc,
             pid=proc.pid,
             pgid=pgid,
@@ -1920,10 +1898,10 @@ class Supervisor:
             return
         try:
             verify_jobs_table_invariant(conn)
-            verify_v2_schema(conn)
+            verify_v3_schema(conn)
         except SchemaInvariantError:
             LOGGER.exception(
-                "refusing to run against a table that is not a migrated protocol v2 schema"
+                "refusing to run against a table that is not a migrated protocol v3 schema"
             )
             with suppress(Exception):
                 conn.close()
@@ -2053,28 +2031,15 @@ class Supervisor:
 def _preflight_failure(job: Job) -> JobResult | None:
     """Return the immediate failure result for a job that cannot be spawned.
 
+    A parsed protocol v3 job always carries a non-empty ``process`` argv, so
+    the only remaining preflight check is the working directory.
+
     Args:
         job: The claimed job.
 
     Returns:
         A failure result, or ``None`` when the job may be spawned.
     """
-    if job.command is not None and resolve_shell() is None:
-        return JobResult(
-            status="failed",
-            exit_code=EXECUTION_ERROR_EXIT_CODE,
-            stdout="",
-            stderr="unable to execute job: shell executable not found",
-            cancellation_note=None,
-        )
-    if job.command is None and not job.args:
-        return JobResult(
-            status="failed",
-            exit_code=EXECUTION_ERROR_EXIT_CODE,
-            stdout="",
-            stderr="unable to execute job: request has neither command nor args",
-            cancellation_note=None,
-        )
     if not Path(job.cwd).is_dir():
         return JobResult(
             status="failed",
@@ -2084,22 +2049,6 @@ def _preflight_failure(job: Job) -> JobResult | None:
             cancellation_note=None,
         )
     return None
-
-
-def _shell_for(job: Job) -> str:
-    """Return the shell executable used to spawn a job.
-
-    Args:
-        job: The claimed job.
-
-    Returns:
-        The shell path for ``command`` jobs, or an empty string for ``args``
-        jobs (ignored by :func:`spawn_job`). A missing shell falls back to an
-        empty string so spawning fails gracefully with a clear diagnostic.
-    """
-    if job.command is not None:
-        return resolve_shell() or ""
-    return ""
 
 
 def _finalize_status(job: ActiveJob) -> str:

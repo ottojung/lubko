@@ -12,7 +12,7 @@ Lubko is a remote development execution environment. ChatGPT acts as the **orche
 The flow, in one line:
 
 ```text
-ChatGPT -> connected Supabase connector -> INSERT protocol-v2 command row in lubko.jobs -> worker claims and executes that row -> poll the same root row
+ChatGPT -> connected Supabase connector -> INSERT protocol-v3 process row in lubko.jobs -> worker claims and executes that row -> poll the same root row
 ```
 
 In more detail:
@@ -37,15 +37,20 @@ Supabase / PostgreSQL
 ChatGPT
 ```
 
-A basic protocol-v2 command submission (remember the returned UUID):
+A basic protocol-v3 process submission (remember the returned UUID):
 
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":2,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
+    '{"v":3,"type":"command","request":{"cwd":"/workspace/Lubko","process":["git","status","--short"]},"state":{"status":"pending"}}'
 )
 returning id;
 ```
+
+`request.process` is executed directly as argv with no shell: shell
+metacharacters, `$VAR` expansions, and `;`, `&&`, pipes, and redirections are
+never interpreted. To run shell-built-in-style logic, pass the command through
+an explicit argv such as `["bash", "-lc", "..."]` or `["sh", "-c", "..."]`.
 
 Poll the **same root row** until it reaches a terminal state:
 
@@ -127,14 +132,13 @@ id      uuid primary key default gen_random_uuid()
 payload text not null
 ```
 
-`payload` is one string containing a JSON object (protocol v2, documented in `docs/protocol.md`). Every evolving job/request/result/state/cancellation/process-identity/output field lives inside it:
+`payload` is one string containing a JSON object (protocol v3, documented in `docs/protocol.md`). Every evolving job/request/result/state/cancellation/process-identity/output field lives inside it:
 
 ```text
-payload.v                  protocol version (currently 2)
+payload.v                  protocol version (currently 3)
 payload.type               job kind: "command" or "output_chunk"
 payload.request.cwd        working directory
-payload.request.command    shell command, or
-payload.request.args       argv list (exactly one of the two)
+payload.request.process    argv array executed directly, with no shell
 payload.state.status       pending | running | succeeded | failed | cancelled
 payload.state.created_at / updated_at / started_at / finished_at
 payload.state.worker_id
@@ -145,6 +149,10 @@ payload.state.cancel_requested_at
 payload.output.<stream>.tail / start / end / previous   bounded live output window
 payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
 ```
+
+Protocol v2 (the former `request.command` / `request.args` fields) is rejected;
+the v2 → v3 cutover is destructive, so all old `lubko.jobs` rows are deleted,
+not preserved or migrated.
 
 Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware: `command` rows need a `request` object and `state.status`, while `output_chunk` rows need explicit `thread` ownership and value/offset shape.
 
@@ -160,12 +168,12 @@ One worker is a single nonblocking supervisor and runs arbitrarily many jobs con
 
 Use the connected Supabase application and its SQL execution capability.
 
-A basic protocol-v2 job insertion:
+A basic protocol-v3 job insertion:
 
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":2,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
+    '{"v":3,"type":"command","request":{"cwd":"/workspace/Lubko","process":["git","status","--short"]},"state":{"status":"pending"}}'
 )
 returning id;
 ```
@@ -176,7 +184,7 @@ Example result:
 id: 12345678-1234-1234-1234-123456789abc
 ```
 
-Always retain the returned UUID. `payload.request.cwd` is the shell working directory for the queued command, and `payload.state.status` must be `"pending"` for the worker to claim it. The command may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
+Always retain the returned UUID. `payload.request.cwd` is the working directory for the queued process, and `payload.state.status` must be `"pending"` for the worker to claim it. The process may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
 
 Poll by ID:
 
@@ -198,8 +206,8 @@ Interpret states as follows:
 
 - `pending`: the job has not yet been claimed;
 - `running`: a Lubko worker is currently executing it;
-- `succeeded`: the shell command completed with exit code 0;
-- `failed`: the shell command completed unsuccessfully;
+- `succeeded`: the process completed with exit code 0;
+- `failed`: the process completed unsuccessfully;
 - `cancelled`: the job was intentionally abandoned.
 
 For a running job, poll again rather than assuming failure. Checking one root job by ID is always safe and useful: the row always contains current lifecycle state plus a substantial recent rolling output window, independent of chunk rotation.
@@ -1273,7 +1281,7 @@ Rules:
 
 ## Supabase job failure
 
-If the shell job used to invoke a Lubko command fails: inspect stdout and stderr, determine whether the command syntax, environment, or Lubko tool failed, and submit a corrective job. Do not assume the agent itself failed merely because a surrounding shell invocation failed.
+If the job used to invoke a Lubko command fails: inspect stdout and stderr, determine whether the argv, environment, or Lubko tool failed, and submit a corrective job. Do not assume the agent itself failed merely because a surrounding job invocation failed.
 
 ## Agent failure
 
@@ -1350,9 +1358,9 @@ Not all operations are equally safe to retry:
 - **Reads and status checks** (SELECT, polling for job status, reading agent state) are inherently idempotent and safe to retry without restriction.
 - **Writes and mutations** (INSERT, UPDATE) must be retried with care. Before retrying a write, verify that the intended state change was not already applied by the previous attempt. Use idempotency keys, conditional WHERE clauses, or state checks to avoid duplicating mutations.
 
-## Lubko shell-job failure
+## Lubko process-job failure
 
-The row was inserted successfully, the worker claimed it, and the queued shell command returned a non-zero exit code. This is a Lubko command-execution result.
+The row was inserted successfully, the worker claimed it, and the queued process returned a non-zero exit code. This is a Lubko execution-result outcome.
 
 ## Managed-agent failure
 

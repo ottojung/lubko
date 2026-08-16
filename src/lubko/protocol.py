@@ -11,12 +11,17 @@ third column; protocol evolution happens by adding fields within the current
 version or by bumping ``v``. See ``docs/protocol.md`` for the authoritative
 human-readable specification.
 
-Protocol v2 distinguishes two payload kinds:
+Protocol v3 distinguishes two payload kinds:
 
 - ``command`` — a runnable root job with ``request``, ``state``, optional
   terminal ``result``, and optional bounded live output tails (``output``);
 - ``output_chunk`` — an immutable, explicitly owned historical output chunk
   belonging to exactly one root ``command`` job (via ``thread``).
+
+A v3 ``command`` request is process-only: ``request.process`` is the sole
+executable field, a non-empty array of non-empty strings exec'd directly as
+argv with no shell. The former v2 ``request.command`` / ``request.args``
+fields are gone; v2 payloads are rejected.
 
 Every payload Lubko writes is strictly bounded: root live tails are the
 newest at most ``OUTPUT_TAIL_MAX_BYTES`` raw bytes per stream and output
@@ -31,7 +36,12 @@ from dataclasses import dataclass
 from typing import Any, Final
 from uuid import UUID
 
-PROTOCOL_VERSION: Final = 2
+PROTOCOL_VERSION: Final = 3
+
+#: The last protocol generation before the process-only binding. It is
+#: referenced only to produce a clear rejection diagnostic; v2 is never
+#: accepted and no v2 data is preserved.
+LEGACY_PROTOCOL_V2: Final = 2
 
 JOB_TYPE_COMMAND: Final = "command"
 JOB_TYPE_OUTPUT_CHUNK: Final = "output_chunk"
@@ -80,8 +90,7 @@ class JobRequest:
     """The immutable submission carried by a job payload."""
 
     cwd: str
-    command: str | None
-    args: tuple[str, ...] | None
+    process: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +124,7 @@ class ResultView:
 
 @dataclass(frozen=True, slots=True)
 class JobPayload:
-    """A parsed and validated protocol v2 ``command`` job payload."""
+    """A parsed and validated protocol v3 ``command`` job payload."""
 
     version: int
     type: str
@@ -127,7 +136,7 @@ class JobPayload:
 
 @dataclass(frozen=True, slots=True)
 class OutputChunk:
-    """A parsed and validated protocol v2 ``output_chunk`` payload."""
+    """A parsed and validated protocol v3 ``output_chunk`` payload."""
 
     thread: UUID
     stream: str
@@ -162,18 +171,45 @@ def _parse_uuid(value: object) -> UUID | None:
         raise ProtocolError(msg) from None
 
 
-def build_payload(
-    *, cwd: str, command: str | None = None, args: list[str] | None = None
-) -> dict[str, Any]:
-    """Build a protocol v2 ``command`` job payload ready for submission.
+def _process_tuple(process: object) -> tuple[str, ...]:
+    """Validate and return a ``request.process`` argv as a string tuple.
 
-    Exactly one of ``command`` (a shell command string) or ``args`` (an
-    argv-style list) must be provided.
+    ``request.process`` must be a non-empty array of non-empty strings. The
+    check is performed at runtime even when a caller's static type already
+    promises strings, so a genuine process-only binding can never tolerate a
+    malformed argv.
+
+    Args:
+        process: The raw ``request.process`` value.
+
+    Returns:
+        The validated argv tuple.
+
+    Raises:
+        ProtocolError: If the value violates the binding.
+    """
+    if (
+        not isinstance(process, list)
+        or not process
+        or not all(isinstance(arg, str) and arg for arg in process)
+    ):
+        msg = "request.process must be a non-empty array of non-empty strings"
+        raise ProtocolError(msg)
+    return tuple(process)
+
+
+def build_payload(*, cwd: str, process: list[str]) -> dict[str, Any]:
+    """Build a protocol v3 ``command`` job payload ready for submission.
+
+    ``process`` is always required: a non-empty argv-style array of non-empty
+    strings that the worker exec's directly with no shell. The former v2
+    ``request.command`` / ``request.args`` fields do not exist in v3.
 
     Args:
         cwd: Absolute working directory for the job.
-        command: Shell command to run through ``bash -lc``, or ``None``.
-        args: argv-style command to run directly, or ``None``.
+        process: Non-empty argv-style array of non-empty strings to exec
+            directly with no shell. Every element is runtime-checked to be a
+            non-empty string.
 
     Returns:
         The versioned payload dict.
@@ -182,22 +218,8 @@ def build_payload(
         ProtocolError: If the request violates the binding.
     """
     request: dict[str, object] = {"cwd": cwd}
-    if command is not None and args is not None:
-        msg = "request may provide command or args, not both"
-        raise ProtocolError(msg)
-    if command is not None:
-        if not command:
-            msg = "request.command must be a non-empty string"
-            raise ProtocolError(msg)
-        request["command"] = command
-    elif args:
-        if not args or not all(args):
-            msg = "request.args must be a non-empty array of strings"
-            raise ProtocolError(msg)
-        request["args"] = list(args)
-    else:
-        msg = "request must provide command or args"
-        raise ProtocolError(msg)
+    validated = _process_tuple(list(process))
+    request["process"] = list(validated)
     if not cwd:
         msg = "request.cwd must be a non-empty string"
         raise ProtocolError(msg)
@@ -342,24 +364,22 @@ def _parse_request(raw_request: object) -> JobRequest:
     if not isinstance(raw_request, dict):
         msg = "payload must contain a request object"
         raise ProtocolError(msg)
+    legacy_keys = ["command", "args"]
+    if any(key in raw_request for key in legacy_keys):
+        msg = (
+            "request must provide only process; the v2 request.command/request.args "
+            "fields are not accepted in protocol v3"
+        )
+        raise ProtocolError(msg)
     cwd = raw_request.get("cwd")
     if not isinstance(cwd, str) or not cwd:
         msg = "request.cwd must be a non-empty string"
         raise ProtocolError(msg)
-    command = raw_request.get("command")
-    args = raw_request.get("args")
-    if command is not None and args is not None:
-        msg = "request may provide command or args, not both"
+    process = raw_request.get("process")
+    if process is None:
+        msg = "request.process is required; the v2 request.command/request.args fields are gone"
         raise ProtocolError(msg)
-    if command is not None and (not isinstance(command, str) or not command):
-        msg = "request.command must be a non-empty string"
-        raise ProtocolError(msg)
-    if args is not None and (
-        not isinstance(args, list) or not args or not all(isinstance(a, str) and a for a in args)
-    ):
-        msg = "request.args must be a non-empty array of strings"
-        raise ProtocolError(msg)
-    return JobRequest(cwd=cwd, command=command, args=tuple(args) if args is not None else None)
+    return JobRequest(cwd=cwd, process=_process_tuple(process))
 
 
 def _parse_status(raw_state: object) -> str:
@@ -523,6 +543,12 @@ def _parse_version_and_type(data: dict[str, Any]) -> tuple[int, str]:
     """
     version = data.get("v")
     if version != PROTOCOL_VERSION:
+        if version == LEGACY_PROTOCOL_V2:
+            msg = (
+                "unsupported protocol version: v2 payloads are no longer accepted; "
+                "submit protocol v3 process payloads instead"
+            )
+            raise ProtocolError(msg)
         msg = f"unsupported protocol version: {version!r} (expected {PROTOCOL_VERSION})"
         raise ProtocolError(msg)
     job_type = data.get("type")

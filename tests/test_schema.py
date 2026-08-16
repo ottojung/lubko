@@ -1,4 +1,4 @@
-"""Tests enforcing the two-column transport invariant and the protocol v2 migrations."""
+"""Tests enforcing the two-column transport invariant and the protocol v3 migrations."""
 
 import contextlib
 from collections.abc import Iterator
@@ -16,7 +16,7 @@ from lubko.worker import (
     TYPE_AWARE_CONSTRAINT_NAME,
     SchemaInvariantError,
     verify_jobs_table_invariant,
-    verify_v2_schema,
+    verify_v3_schema,
 )
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
@@ -283,7 +283,7 @@ def test_baseline_migration_declares_payload_as_text_with_type_aware_checks() ->
 def test_baseline_migration_grants_worker_access() -> None:
     """The baseline grants schema usage and SELECT/INSERT/UPDATE on lubko.jobs.
 
-    Protocol v2 requires the worker role to insert immutable output_chunk rows
+    Protocol v3 requires the worker role to insert immutable output_chunk rows
     in addition to reading and claiming jobs.
     """
     sql = _read_baseline_migration()
@@ -372,7 +372,7 @@ def test_payload_is_string_text_in_docs() -> None:
     assert "stores `::text` back" in protocol_doc
 
 
-def as_v2_connection(conn: _QueuedConnection) -> psycopg.Connection[tuple[object, ...]]:
+def as_v3_connection(conn: _QueuedConnection) -> psycopg.Connection[tuple[object, ...]]:
     """Adapt a queued test double to the worker's connection type.
 
     Args:
@@ -384,21 +384,21 @@ def as_v2_connection(conn: _QueuedConnection) -> psycopg.Connection[tuple[object
     return cast("psycopg.Connection[tuple[object, ...]]", conn)
 
 
-def test_verify_v2_schema_accepts_migrated_shape() -> None:
+def test_verify_v3_schema_accepts_migrated_shape() -> None:
     """A migrated table with the type-aware constraint and chunk indexes passes."""
-    conn = as_v2_connection(
+    conn = as_v3_connection(
         _QueuedConnection([
             [(TYPE_AWARE_CONSTRAINT_NAME,), ("jobs_payload_is_json_object",)],
             [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,), ("jobs_queue_idx",)],
         ])
     )
 
-    verify_v2_schema(conn)
+    verify_v3_schema(conn)
 
 
-def test_verify_v2_schema_rejects_missing_type_aware_constraint() -> None:
+def test_verify_v3_schema_rejects_missing_type_aware_constraint() -> None:
     """A table without the type-aware constraint is refused."""
-    conn = as_v2_connection(
+    conn = as_v3_connection(
         _QueuedConnection([
             [("jobs_payload_is_json_object",), ("jobs_payload_has_status",)],
             [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,)],
@@ -406,12 +406,12 @@ def test_verify_v2_schema_rejects_missing_type_aware_constraint() -> None:
     )
 
     with pytest.raises(SchemaInvariantError, match=TYPE_AWARE_CONSTRAINT_NAME):
-        verify_v2_schema(conn)
+        verify_v3_schema(conn)
 
 
-def test_verify_v2_schema_rejects_missing_chunk_indexes() -> None:
+def test_verify_v3_schema_rejects_missing_chunk_indexes() -> None:
     """A table without the chunk ownership/ordering indexes is refused."""
-    conn = as_v2_connection(
+    conn = as_v3_connection(
         _QueuedConnection([
             [(TYPE_AWARE_CONSTRAINT_NAME,)],
             [("jobs_queue_idx",)],
@@ -419,12 +419,12 @@ def test_verify_v2_schema_rejects_missing_chunk_indexes() -> None:
     )
 
     with pytest.raises(SchemaInvariantError, match="index jobs_chunk"):
-        verify_v2_schema(conn)
+        verify_v3_schema(conn)
 
 
-def test_verify_v2_schema_rejects_pre_canonical_shape() -> None:
-    """A two-column table lacking the v2 output-chunk shape is refused."""
-    conn = as_v2_connection(
+def test_verify_v3_schema_rejects_pre_canonical_shape() -> None:
+    """A two-column table lacking the v3 output-chunk shape is refused."""
+    conn = as_v3_connection(
         _QueuedConnection([
             [("jobs_payload_has_status",), ("jobs_payload_is_json_object",)],
             [("jobs_queue_idx",)],
@@ -432,4 +432,4 @@ def test_verify_v2_schema_rejects_pre_canonical_shape() -> None:
     )
 
     with pytest.raises(SchemaInvariantError, match=r"0001_two_column_protocol\.sql"):
-        verify_v2_schema(conn)
+        verify_v3_schema(conn)

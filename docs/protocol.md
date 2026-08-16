@@ -1,6 +1,6 @@
 # Lubko transport protocol and database binding specification
 
-Status: authoritative for protocol v2.
+Status: authoritative for protocol v3.
 
 ## The two-column invariant
 
@@ -45,13 +45,20 @@ explicit ownership and offset shape. Chunk rows never carry fake command
 lifecycle state. Claim and lease-recovery queries operate only on
 `type = 'command'` rows.
 
+The constraint is deliberately **generic and version-agnostic**: it does not
+reference `request.process` (or the removed `request.command` / `request.args`),
+so a protocol breaking change — including the v3 process-only binding — never
+requires a physical schema migration. `request` validity is enforced by the
+parser against the versioned binding ([Section `request`](#request--immutable-submission)),
+and the same baseline migration serves every protocol generation.
+
 ## Startup schema verification
 
-The v2 worker verifies more than the two-column invariant before starting. It
+The v3 worker verifies more than the two-column invariant before starting. It
 also requires the type-aware `jobs_payload_type_shape` constraint and the chunk
 ownership/ordering indexes to be present, because immutable `output_chunk`
 publication is impossible without them. Any table lacking this canonical
-protocol v2 shape is refused at startup with a clear diagnostic pointing at
+protocol v3 shape is refused at startup with a clear diagnostic pointing at
 the idempotent baseline `migrations/0001_two_column_protocol.sql`. This keeps
 output publication from failing at runtime on a table that cannot represent
 immutable chunks.
@@ -100,11 +107,38 @@ access contract.
 ## Versioning
 
 - `payload.v` is a required integer protocol version.
-- Version `2` is the current binding. Within a version, fields may be added
+- Version `3` is the current binding. Within a version, fields may be added
   additively. Breaking changes (renaming or removing fields, changing types or
   semantics) require a new version and a new worker generation.
 - A worker rejects any payload whose version it does not understand; the job is
-  failed with a diagnostic instead of being stuck in the queue.
+  failed with a diagnostic instead of being stuck in the queue. Protocol v2
+  payloads are specifically rejected with a clear "v2 no longer accepted"
+  diagnostic so an old submitter learns the cutover immediately rather than
+  through a generic version error.
+
+## Production cutover from v2
+
+A v3 worker is authoritative for the queue and executes only v3 `process`
+payloads; it provides **no v2 compatibility and preserves no v2 data**. The
+protocol breaking change is entirely at the parser/worker level: it requires
+**no physical schema migration**, because the two-column table and its generic
+type-aware `jobs_payload_type_shape` constraint are identical in v2 and v3 —
+the SQL constraint is deliberately **not coupled** to `request.process`; v3
+`process` validation and the explicit rejection of `request.command` /
+`request.args` happen in the parser, not in the database.
+
+The cutover is deliberately **destructive**. Before the first v3 worker
+becomes the authoritative consumer:
+
+1. stop all v2 consumers/workers;
+2. purge every existing `lubko.jobs` row (`TRUNCATE lubko.jobs` or
+   `delete from lubko.jobs`) — root jobs, terminal history, and immutable
+   `output_chunk` rows alike;
+3. start the v3 worker.
+
+v2 history is not replayed, converted, or archived by Lubko. Any v2 row that
+survives into a v3 worker's queue is unclaimable and fails with the clear
+v2-rejected diagnostic; output chunks are not carried over.
 
 ## Context-safety contract
 
@@ -116,9 +150,9 @@ output window, independent of chunk rotation. Literally arbitrary SQL is not
 bounded; the guarantee covers Lubko's row representation and documented
 workflows.
 
-## Protocol v2 payload kinds
+## Protocol v3 payload kinds
 
-Version 2 defines exactly two kinds:
+Version 3 defines exactly two kinds:
 
 - `command` — a runnable root job;
 - `output_chunk` — an immutable, explicitly owned historical output chunk.
@@ -129,11 +163,11 @@ A `command` payload is a JSON object:
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "type": "command",
   "request": {
     "cwd": "/workspace/project",
-    "command": "git status --short"
+    "process": ["git", "status", "--short"]
   },
   "state": {
     "status": "pending"
@@ -146,9 +180,9 @@ live output window:
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "type": "command",
-  "request": { "cwd": "/workspace/project", "args": ["ls", "/etc"] },
+  "request": { "cwd": "/workspace/project", "process": ["ls", "/etc"] },
   "state": { "status": "running", "...": "..." },
   "output": {
     "stdout": {
@@ -181,8 +215,14 @@ Required object.
 | Field     | Type            | Required | Meaning                                |
 | --------- | --------------- | -------- | -------------------------------------- |
 | `cwd`     | string          | yes      | absolute working directory for the job |
-| `command` | non-empty string | exactly one of `command`/`args` | shell command to run through `bash -lc` |
-| `args`    | non-empty array of strings | exactly one of `command`/`args` | argv-style command to exec directly |
+| `process` | non-empty array of non-empty strings | yes | argv-style command to exec directly, with no shell |
+
+`process` is the **sole** executable field in protocol v3. Every element is a
+non-empty string; the worker execs the array directly as argv (never through a
+shell), so shell metacharacters, expansions, `$VAR` interpolation, and
+redirections are never interpreted and each element is passed literally. The
+former v2 `request.command` (shell string) and `request.args` fields no longer
+exist; a v2 payload is rejected.
 
 #### `state` — mutable lifecycle
 
@@ -236,7 +276,7 @@ table:
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "type": "output_chunk",
   "thread": "<ROOT JOB UUID>",
   "stream": "stdout",
@@ -368,7 +408,7 @@ PostgreSQL compare-and-swap (CAS) predicates plus row locking:
 The daemon is one nonblocking supervisor holding a single PostgreSQL connection
 and an unbounded in-memory registry of active jobs. There is **no
 application-level concurrency limit** and no thread or connection per job; each
-shell command runs as its own OS process/session/process group and the daemon
+job process runs as its own OS process/session/process group and the daemon
 observes it with `Popen.poll()`-style checks. The supervisor loop services
 running jobs (observe exits, escalate cancellations, publish output, finalize),
 refreshes leases, runs recovery, and claims a bounded batch of new pending
@@ -424,9 +464,9 @@ invariant comment. The baseline is idempotent and safe to apply more than
 once. There is no older schema, no staging table, and no rollback path: the
 two-column table is the only supported binding, and the worker refuses to
 start against any other shape. After the table exists, submit jobs in protocol
-v2 JSON form:
+v3 JSON form:
 
 ```sql
 insert into lubko.jobs (payload)
-values ('{"v":2,"type":"command","request":{"cwd":"...","command":"..."},"state":{"status":"pending"}}');
+values ('{"v":3,"type":"command","request":{"cwd":"...","process":["git","status","--short"]},"state":{"status":"pending"}}');
 ```

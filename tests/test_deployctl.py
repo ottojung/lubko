@@ -1370,20 +1370,23 @@ def write_database_config(tmp_path: Path, cluster: _pg.PgCluster) -> Path:
 
 
 def insert_running_job(conninfo: str, cwd: str, command: str) -> object:
-    """Insert a protocol v2 running command job and return its id.
+    """Insert a protocol v3 running command job and return its id.
+
+    The worker never invokes a shell itself, so the command string is wrapped
+    in an explicit ``["bash", "-lc", command]`` argv chosen by the test.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        command: Shell command wrapped in a ``bash -lc`` argv.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": ["bash", "-lc", command]},
         "state": {"status": "running"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -2231,20 +2234,23 @@ def worker_without_persist_command(tmp_path: Path) -> list[str]:
 
 
 def insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
-    """Insert a protocol v2 pending command job.
+    """Insert a protocol v3 pending command job.
+
+    The worker never invokes a shell itself, so the command string is wrapped
+    in an explicit ``["bash", "-lc", command]`` argv chosen by the test.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        command: Shell command wrapped in a ``bash -lc`` argv.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": ["bash", "-lc", command]},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -2256,21 +2262,21 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
     return row[0]
 
 
-def insert_pending_args_job(conninfo: str, cwd: str, args: list[str]) -> object:
-    """Insert a protocol v2 pending argv-style command job.
+def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> object:
+    """Insert a protocol v3 pending process-argv job.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        args: Executable arguments.
+        process: argv-style command to exec directly, with no shell.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "args": args},
+        "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -2506,7 +2512,7 @@ def _run_confirmation_handshake(jobs_db: str, repo: Path, fake_uv: Path, commit:
         fake_uv: Stub ``uv`` executable.
         commit: Exact proposed commit.
     """
-    confirm1_id = insert_pending_args_job(
+    confirm1_id = insert_pending_process_job(
         jobs_db,
         str(repo),
         deployctl_args(repo, fake_uv, json.dumps({"type": "confirm", "commit": commit})),
@@ -2521,7 +2527,7 @@ def _run_confirmation_handshake(jobs_db: str, repo: Path, fake_uv: Path, commit:
     assert CHALLENGE_RE.fullmatch(challenge) is not None
     assert len(challenge) == 7
 
-    confirm2_id = insert_pending_args_job(
+    confirm2_id = insert_pending_process_job(
         jobs_db,
         str(repo),
         deployctl_args(
@@ -2555,7 +2561,7 @@ def test_end_to_end_queue_checkout_survives_old_worker_shutdown(
     repo, second, old_meta, fake_uv = _prepare_e2e_parts(prepared)
     try:
         unrelated = insert_pending_job(jobs_db, str(repo), "sleep 30")
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2612,7 +2618,7 @@ def test_end_to_end_bad_candidate_rolls_back(
         tmp_path, monkeypatch, pg_cluster, bad_candidate=True
     )
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2649,7 +2655,7 @@ def test_end_to_end_cancelled_checkout_leaves_previous_worker_running(
         tmp_path, monkeypatch, pg_cluster
     )
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2711,7 +2717,7 @@ def test_end_to_end_queue_checkout_withholds_process_pgid(
         )
     )
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2762,7 +2768,7 @@ def test_end_to_end_queue_checkout_error_leaves_failed_row(
     )
     fake_uv = make_fake_uv(tmp_path, sys.executable, fail_validation=True)
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2833,7 +2839,7 @@ def test_end_to_end_full_deployment_stays_hermetic(
     worker_environ = read_proc_environ(old_meta.pid)
     assert worker_environ.get("XDG_STATE_HOME") == expected_state_home
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
