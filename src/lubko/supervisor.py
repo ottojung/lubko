@@ -39,8 +39,9 @@ restarts worker processes:
   (PID, process group, session, start time, lifecycle token), so a recycled
   PID can never be signalled;
 - ``lubko-deploy`` and ``lubko-deploy-ctl`` change the desired commit only
-  through the durable protocol in :mod:`lubko.supervise`, so planned stops,
-  candidate handoffs, confirmation, and rollback never race the supervisor;
+  through the durable protocol in :mod:`lubko.supervise`, so planned
+  replacements, candidate handoffs, confirmation, and rollback never race the
+  supervisor;
 - during a supervised deployment the supervisor recognises the durable pending
   mission (``worker/rollback.json``) and holds: it never resurrects the
   intentionally retiring previous worker, and on container restart during a
@@ -72,7 +73,6 @@ from lubko import cli, deployctl, lifecycle, supervise
 from lubko.supervise import (
     INTENT_RUN,
     MODE_RUN,
-    MODE_STOPPED,
     SCHEMA_VERSION,
     LastExit,
     SupervisorStatus,
@@ -244,12 +244,29 @@ def _process_ppid(pid: int) -> int | None:
         return None
 
 
+def _runtime_dir(commit: str | None) -> str:
+    """Return the commit-addressed sealed runtime path for metadata/probes.
+
+    Ordinary worker identity and probe bookkeeping never depend on a mutable
+    checkout: the recorded repo value and probe working directory are the
+    exact per-commit runtime root, so a supervisor restart or crash probe
+    stays functional even when the source checkout is deleted or modified.
+
+    Args:
+        commit: Exact commit whose runtime is used, or ``None``.
+
+    Returns:
+        The sealed runtime directory, or ``""`` when no commit is known.
+    """
+    return str(cli.cli_commit_dir(commit)) if commit else ""
+
+
 def _child_to_meta(child: WorkerChild, repo: str) -> WorkerMeta:
     """Build maintained-worker metadata describing a supervisor child.
 
     Args:
         child: The exact worker child identity.
-        repo: Maintained checkout recorded in the metadata.
+        repo: Runtime root recorded in the metadata (never the mutable checkout).
 
     Returns:
         Running metadata for the child.
@@ -318,7 +335,13 @@ class SupervisorDaemon:
         """
         desired = read_desired()
         state = read_state()
-        if desired is not None and desired.generation > state.applied_generation:
+        action, commit = self._derive_action(state)
+        if (
+            desired is not None
+            and action == "run"
+            and commit == desired.commit
+            and desired.generation > state.applied_generation
+        ):
             self._apply_desired(desired)
             return
         if state.child is not None and not self._child_alive(state):
@@ -330,12 +353,8 @@ class SupervisorDaemon:
                     return
         else:
             self._maybe_reset_backoff(state, now)
-        action, commit = self._derive_action(state)
         if action == "hold":
             self._ensure_held()
-            return
-        if action == "rollback":
-            deployctl.resolve_abandoned_mission(self.settings.lock_timeout_seconds)
             return
         if self._in_backoff(now):
             return
@@ -343,97 +362,198 @@ class SupervisorDaemon:
             self._message = "run action without an exact commit; holding"
             return
         self._ensure_worker(commit)
+        self._record_mission_progress(commit)
         self._probe_readiness(now)
 
-    def _derive_action(self, state: supervise.SupervisorState) -> tuple[str, str | None]:
-        """Decide the intended worker state from durable authorities.
+    def _record_mission_progress(self, commit: str) -> None:
+        """Advance the applied generation once a mission candidate is running.
 
-        A pending supervised mission always takes precedence over the daemon's
-        own recorded mode: the candidate is the intended consumer and the
-        daemon must hold.  Corrupt mission metadata fails closed into a hold so
-        a worker is never started during an unknown handoff.
+        A pending deployment mission is an active intent even though it never
+        travels through ``desired.json``: once its exact candidate commit is
+        the live worker, the mission generation is recorded as applied so a
+        waiting deployctl observes convergence and a supervisor restart
+        reconstructs deterministically.
+
+        Args:
+            commit: The candidate commit that is now the maintained worker.
+        """
+        desired = read_desired()
+        desired_gen = desired.generation if desired is not None else 0
+        try:
+            mission = deployctl.read_rollback_state()
+        except deployctl.DeployCtlError:
+            return
+        if (
+            mission is None
+            or mission.status != deployctl.STATUS_PENDING
+            or mission.commit != commit
+            or mission.generation < desired_gen
+        ):
+            return
+        current = read_state()
+        if (
+            current.child is not None
+            and current.commit == commit
+            and mission.generation > current.applied_generation
+            and self._child_alive(current)
+        ):
+            write_state(replace(current, applied_generation=mission.generation))
+
+    def _derive_action(self, state: supervise.SupervisorState) -> tuple[str, str | None]:
+        """Decide the intended worker from durable mission/desired generations.
+
+        Only the newest intent may choose a worker commit. A supervised mission
+        and the desired run intent share one monotonic generation space, and
+        precedence is purely generation-based:
+
+        - a corrupt/unreadable mission fails closed into a hold;
+        - a mission older than the desired intent is stale history and cannot
+          override the desired commit, whatever its status;
+        - a newer pending mission is the active candidate intent and is run;
+        - a pending mission at the desired generation only runs when it selects
+          the same commit, otherwise the contradiction holds;
+        - a terminal mission at the desired generation or newer is an
+          unsettled/incomplete settlement and holds: terminal status alone
+          never chooses a commit (this removes the stale-terminal override).
 
         Args:
             state: Current daemon state.
 
         Returns:
-            An ``(action, commit)`` pair where ``action`` is ``run``, ``hold``,
-            or ``rollback``.
+            An ``(action, commit)`` pair where ``action`` is ``run`` or
+            ``hold``.
         """
+        desired = read_desired()
+        desired_gen = desired.generation if desired is not None else 0
+        desired_commit = desired.commit if desired is not None else None
         try:
-            rollback = deployctl.read_rollback_state()
+            mission = deployctl.read_rollback_state()
         except deployctl.DeployCtlError:
             self._message = "corrupt supervised-deployment state; holding without a worker"
             LOGGER.exception("corrupt supervised-deployment state; holding without a worker")
             return "hold", None
-        action: str
-        commit: str | None
-        if rollback is not None and rollback.status == deployctl.STATUS_PENDING:
-            candidate_alive = lifecycle.worker_alive(rollback.new_meta)
-            if candidate_alive and time.time() < rollback.deadline:
-                action, commit = "hold", None
+        if mission is None:
+            return self._derive_without_mission(state, desired_commit)
+        return self._derive_with_mission(mission, desired_gen, desired_commit)
+
+    @staticmethod
+    def _derive_without_mission(
+        state: supervise.SupervisorState,
+        desired_commit: str | None,
+    ) -> tuple[str, str | None]:
+        """Derive the intended worker when no supervised mission exists.
+
+        Only a live intent may choose a worker commit. Without a mission, the
+        desired run intent is the sole live intent; a stale state/meta record
+        alone never selects a worker (fail closed). A legacy metadata record is
+        therefore never trusted to launch a worker here — the explicit
+        ``lubko-deploy migrate`` command establishes the durable desired intent
+        for pre-supervisor state.
+
+        Args:
+            state: Current daemon state (kept for callers' consistency).
+            desired_commit: Exact commit the latest desired intent selects.
+
+        Returns:
+            An ``(action, commit)`` pair.
+        """
+        del state
+        if desired_commit is not None:
+            return "run", desired_commit
+        return "hold", None
+
+    def _derive_with_mission(
+        self,
+        mission: deployctl.RollbackState,
+        desired_gen: int,
+        desired_commit: str | None,
+    ) -> tuple[str, str | None]:
+        """Derive the intended worker with generation-based mission precedence.
+
+        Args:
+            mission: Current supervised-deployment mission.
+            desired_gen: Generation of the latest desired intent.
+            desired_commit: Commit the latest desired intent selects.
+
+        Returns:
+            An ``(action, commit)`` pair.
+        """
+        action: str = "hold"
+        commit: str | None = None
+        if mission.generation < desired_gen:
+            if desired_commit is not None:
+                action, commit = "run", desired_commit
+        elif mission.generation > desired_gen:
+            if mission.status == deployctl.STATUS_PENDING:
+                action, commit = "run", mission.commit
             else:
-                action, commit = "rollback", None
-        elif rollback is not None and rollback.status == deployctl.STATUS_CONFIRMED:
-            action, commit = "run", rollback.commit
-        elif rollback is not None and rollback.status == deployctl.STATUS_ROLLED_BACK:
-            action, commit = "run", rollback.previous_commit
-        elif state.mode == MODE_STOPPED:
-            action, commit = "hold", None
-        elif state.mode == MODE_RUN and state.commit is not None:
-            action, commit = "run", state.commit
+                self._unsettled_terminal_message(mission)
+        elif mission.status == deployctl.STATUS_PENDING:
+            if desired_commit is not None and mission.commit == desired_commit:
+                action, commit = "run", mission.commit
+            else:
+                self._contradiction_message(mission)
         else:
-            meta = lifecycle.read_meta()
-            if (
-                meta is not None
-                and meta.git_commit is not None
-                and meta.state != lifecycle.STATE_STOPPED
-            ):
-                action, commit = "run", meta.git_commit
-            else:
-                action, commit = "hold", None
+            self._unsettled_terminal_message(mission)
         return action, commit
+
+    def _unsettled_terminal_message(self, mission: deployctl.RollbackState) -> None:
+        """Record the diagnostic for an unsettled terminal mission.
+
+        Args:
+            mission: The terminal mission that never received a newer settle.
+        """
+        self._message = (
+            "terminal supervised-deployment state at generation "
+            f"{mission.generation} has no newer settled intent; holding without a worker"
+        )
+        LOGGER.error(
+            "terminal supervised mission at generation %d is unsettled; holding",
+            mission.generation,
+        )
+
+    def _contradiction_message(self, mission: deployctl.RollbackState) -> None:
+        """Record the diagnostic for a same-generation mission contradiction.
+
+        Args:
+            mission: The pending mission contradicting the desired intent.
+        """
+        self._message = "contradictory same-generation supervised intent; holding without a worker"
+        LOGGER.error(
+            "pending mission at generation %d contradicts the desired intent; holding",
+            mission.generation,
+        )
 
     # ------------------------------------------------------------------
     # Explicit desired intent
     # ------------------------------------------------------------------
 
     def _apply_desired(self, desired: supervise.SupervisorDesired) -> None:
-        """Apply one explicit desired intent from the deployment CLIs.
+        """Apply one explicit run intent from the deployment CLIs.
+
+        A ``restart`` intent force-replaces the current child with a fresh
+        process from the same commit-addressed runtime. A plain run intent for
+        an already-running commit is a durable settlement (confirmation or
+        rollback convergence): it only records the newer generation and never
+        disturbs the live worker, so settlement can never kill the very worker
+        that is executing the confirmation protocol.
 
         Args:
             desired: The intent to apply.
         """
-        if desired.mode == MODE_STOPPED:
-            current = read_state()
-            was_live = current.child is not None and self._child_alive(current)
-            self._retire_child()
-            state = replace(
-                read_state(),
-                applied_generation=desired.generation,
-                mode=MODE_STOPPED,
-                commit=None,
-                intent=INTENT_RUN,
-                restart_count=0,
-                next_attempt_at=None,
-                ready=False,
-                next_readiness_at=None,
-            )
-            write_state(state)
-            if was_live:
-                meta = lifecycle.read_meta()
-                if meta is not None:
-                    lifecycle.write_meta(
-                        replace(meta, state=lifecycle.STATE_STOPPED, stopped_at=time.time())
-                    )
-                lifecycle.append_deploy_log("supervisor stopped the maintained worker")
-            LOGGER.info("applied supervisor stop (generation %d)", desired.generation)
-            return
-        if desired.commit is None:
+        if not desired.commit:
             self._message = "refusing a run intent without an exact commit"
             LOGGER.error("refusing a run intent without an exact commit")
             return
-        self._retire_child()
+        state = read_state()
+        already_running = (
+            not desired.restart
+            and state.commit == desired.commit
+            and state.child is not None
+            and self._child_alive(state)
+        )
+        if not already_running:
+            self._retire_child()
         state = replace(
             read_state(),
             applied_generation=desired.generation,
@@ -446,7 +566,8 @@ class SupervisorDaemon:
             next_readiness_at=None,
         )
         write_state(state)
-        self._ensure_worker(desired.commit)
+        if not already_running:
+            self._ensure_worker(desired.commit)
         LOGGER.info("applied supervisor run intent (generation %d)", desired.generation)
 
     # ------------------------------------------------------------------
@@ -528,8 +649,7 @@ class SupervisorDaemon:
             next_readiness_at=now + self.settings.readiness_interval_seconds,
         )
         write_state(state)
-        repo = _desired_repo()
-        meta = replace(_child_to_meta(child, repo), git_commit=commit)
+        meta = replace(_child_to_meta(child, _runtime_dir(commit)), git_commit=commit)
         lifecycle.write_meta(meta)
         lifecycle.append_deploy_log(
             f"supervisor started worker pid={child.pid} commit={commit} "
@@ -556,7 +676,7 @@ class SupervisorDaemon:
             return
         if state.next_readiness_at is not None and now < state.next_readiness_at:
             return
-        probe_cwd = _desired_repo() or str(cli.cli_commit_dir(state.commit or ""))
+        probe_cwd = _runtime_dir(state.commit)
         if lifecycle.verify_worker_consumes_queue(
             child.worker_id, probe_cwd, child.pid, self.settings.probe_timeout_seconds
         ):
@@ -589,7 +709,7 @@ class SupervisorDaemon:
         if child is None:
             return
         if self._child_alive(state):
-            meta = _child_to_meta(child, _desired_repo())
+            meta = _child_to_meta(child, _runtime_dir(state.commit))
             lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
         if self.proc is not None:
             with suppress(Exception):
@@ -627,7 +747,7 @@ class SupervisorDaemon:
         child = state.child
         if child is None:
             return False
-        meta = _child_to_meta(child, _desired_repo())
+        meta = _child_to_meta(child, _runtime_dir(state.commit))
         if not lifecycle.worker_alive(meta):
             return False
         return _process_ppid(child.pid) == os.getpid()
@@ -713,18 +833,31 @@ class SupervisorDaemon:
     # ------------------------------------------------------------------
 
     def _spawn_worker(self, commit: str) -> WorkerChild | None:
-        """Spawn the worker for ``commit`` as a direct child from the immutable env.
+        """Spawn the worker for ``commit`` as a direct child from the sealed runtime.
 
         Args:
-            commit: Exact commit whose immutable maintained environment runs
-                the worker.
+            commit: Exact commit whose sealed per-commit runtime runs the worker.
 
         Returns:
             The exact child identity, or ``None`` if the worker could not be
             started or did not establish a session.
         """
+        if not cli.runtime_is_usable(commit):
+            self._message = (
+                f"maintained runtime for commit {commit} is missing, corrupt, incomplete, "
+                "or not sealed; holding without a worker"
+            )
+            LOGGER.error(
+                "maintained runtime for commit %s is missing/corrupt/unsealed; refusing to "
+                "launch a worker",
+                commit,
+            )
+            return None
         executable = cli.cli_entry_executable(commit, "lubko-worker")
         if executable is None:
+            self._message = (
+                f"maintained runtime for commit {commit} is incomplete; holding without a worker"
+            )
             LOGGER.error(
                 "no maintained CLI environment for commit %s; refusing to launch an arbitrary "
                 "worker",
@@ -901,16 +1034,6 @@ class SupervisorDaemon:
                 message=self._message if message is None else message,
             )
         )
-
-
-def _desired_repo() -> str:
-    """Return the maintained checkout recorded in the latest desired intent.
-
-    Returns:
-        The recorded checkout path, or ``""`` when no intent exists.
-    """
-    desired = read_desired()
-    return desired.repo if desired is not None else ""
 
 
 def _status_cmd() -> int:

@@ -295,14 +295,22 @@ Per-user lifecycle state follows XDG conventions under
 ```sh
 lubko-deploy status
 lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
+lubko-deploy restart
+lubko-deploy migrate --commit <sha> [--repo DIR] [--uv PATH]
 lubko-deploy recover [--repo DIR] [--uv PATH] [--probe-timeout N]
 lubko-deploy repair --repo DIR --recovery-worker-pid PID [--uv PATH] [--probe-timeout N]
-lubko-deploy stop [--grace-seconds N]
 lubko-deploy log [--lines N]
 ```
 
 `lubko-deploy status` reports the current worker state, its PID/process-group/
 session identity, the deployed git commit, and the log path.
+
+Lubko is an **always-on supervised service**: while its virtual/container
+environment is running, Lubko is always intended to be running. There is no
+supported in-environment stopped state and no `lubko-deploy stop`. The only
+supported way to fully stop Lubko is to stop the virtual/container environment
+that runs it. The supervisor owns the maintained worker and restores it after
+any unexpected exit, planned restart, or container restart.
 
 `lubko-deploy deploy` resolves the `uv` executable with this strict
 precedence:
@@ -338,13 +346,27 @@ resolved executable is used to run validation (`uv sync`, `ruff`, `mypy`,
    left untouched;
 8. stops the previous maintained worker using its recorded PID/process-group/
    session identity: `SIGTERM`, then a bounded `SIGKILL` while members remain;
-9. atomically records the new worker's identity and the deployed commit, then
-   activates the maintained CLI environment for that commit, and reports the
-   deployed git commit.
+ 9. atomically records the new worker's identity and the deployed commit, then
+    activates the maintained CLI environment for that commit, and reports the
+    deployed git commit.
 
-`lubko-deploy stop` terminates the maintained worker with the same precise
-identity validation; it never signals a process that no longer matches the
-recorded identity.
+`lubko-deploy restart` replaces the current worker process with a fresh process
+of the **same exact confirmed deployed commit**, through the external
+supervisor, and waits until the replacement is proven queue-ready. A restart
+never uses Git, the network, or the mutable source checkout: the exact commit
+is read from the supervisor's durable state and the fresh worker runs from that
+commit's already-sealed runtime. A restart is a new desired intent at a strictly
+newer generation, so any older deployment/mission record automatically becomes
+stale history that can never override it.
+
+`lubko-deploy migrate` is the explicit, supported bootstrap/repair path for
+production state that predates the external supervisor (stale or legacy
+`supervisor/desired.json`, `supervisor/state.json`, or `worker/rollback.json`).
+It runs only when no supervisor is live: it verifies an exact commit's sealed
+runtime and writes a strictly newer desired intent for it, replacing corrupt or
+legacy mission state, so the next supervisor start reconstructs that verified
+commit deterministically instead of failing closed. Normal startup remains
+fail-closed; never hand-edit these JSON files.
 
 ### Repairing corrupted lifecycle state
 
@@ -418,8 +440,8 @@ only ever signals the exact recorded process group.
 ### Bootstrap from an unmanaged legacy worker
 
 Before the first managed deployment, the worker is an unmanaged legacy daemon
-with no lifecycle metadata. `lubko-deploy status` reports this, and both
-`deploy` and `stop` refuse to claim they can stop it by identity.
+with no lifecycle metadata. `lubko-deploy status` reports this, and `deploy`
+refuses to claim it can stop it by identity.
 
 The one-time migration is a single manual stop of the legacy worker, after
 which the first managed deployment is started with:
@@ -429,6 +451,10 @@ lubko-deploy deploy --bootstrap
 ```
 
 Subsequent upgrades replace maintained workers with no manual PID discovery.
+Pre-supervisor production state that is stale or corrupt (including legacy
+`supervisor/desired.json`, `supervisor/state.json`, or `worker/rollback.json`)
+is migrated explicitly with `lubko-deploy migrate --commit <sha>` as described
+above; normal startup stays fail-closed rather than trusting hand-edited JSON.
 
 ## External worker supervision
 
@@ -442,66 +468,119 @@ worker death.
 ### Container startup contract
 
 The supervisor is designed to be the container's **main long-lived process**.
-The production container currently runs `tini-static -- sleep infinity`; the
-supported startup contract replaces the `sleep infinity` child of Tini with the
-supervisor:
+The production container runs `tini-static -- sleep infinity` as PID 1 today;
+the supported startup contract replaces the `sleep infinity` child of Tini with
+the supervisor:
 
 ```sh
 tini-static -- lubko-supervisor
 ```
 
-This is a real startup artifact: on every container start Tini launches the
-supervisor, which reconstructs the intended maintained worker deterministically
-from durable state and restores service without any human terminal. The exact
-runtime requirement (switching the container command from `sleep infinity` to
-`lubko-supervisor`) is configured in the container image, which lives outside
-this repository; all repository-side pieces required by that contract are
-implemented here (`lubko-supervisor`, its durable protocol, and its startup
-reconstruction). Until the container command is switched, the supervisor is not
-restarted by the runtime and must be started by other means — the acceptance
-criterion that automatic startup survives container restart therefore depends
-on that one image configuration change.
+This is the **external startup boundary**: there is no Docker/containerd/Podman
+socket or CLI, no systemd, no cron, and no server-management integration
+available inside the container, so a profile/autostart hack cannot be part of
+the supported recovery path. The repository-side pieces required by the
+contract are fully implemented here (`lubko-supervisor`, its durable protocol,
+sealed per-commit runtimes, and deterministic startup reconstruction), and the
+repository-owned `lubko-install` machinery installs the stable launcher for
+`lubko-supervisor` into `$XDG_BIN_HOME`/`~/.local/bin`. The image-level CMD
+change is the single external step needed for full environment-restart
+recovery: on every container start Tini launches the supervisor, which
+reconstructs the intended maintained worker deterministically from durable
+state and restores service without any human terminal. Until that one image
+command is switched, the supervisor must be started by other means and
+container-restart recovery is not yet automatic; that is a genuine external
+boundary, not a repository gap.
+
+For the launcher to be found at container start, use a **stable absolute
+maintained launcher path** (for example
+`$XDG_BIN_HOME/lubko-supervisor`, resolved to an absolute path at image build
+time) rather than relying on a login-shell PATH that may not be set for PID 1.
 
 A fresh system bootstraps the maintained worker once with
-`lubko-deploy deploy --bootstrap` (which builds the immutable per-commit CLI
-environment and activates the maintained commands), then the container command
-above is installed. From then on the supervisor owns and restarts the worker
-across every crash and every container restart.
+`lubko-deploy deploy --bootstrap` (which builds the sealed per-commit runtime
+and activates the maintained commands), then the container command above is
+installed. From then on the supervisor owns and restarts the worker across
+every crash and every container restart.
 
 ### Ownership model
 
 The supervisor is the stable authority that actually starts, stops, and
 restarts worker processes:
 
-- it spawns the worker as its **direct child** from the immutable per-commit
-  maintained environment (`$XDG_STATE_HOME/lubko/cli/<commit>/`), never from a
+- it spawns the worker as its **direct child** from the **sealed** per-commit
+  runtime (`$XDG_STATE_HOME/lubko/cli/<full-commit-sha>/`), never from a
   mutable working tree, so a crash never launches arbitrary checkout contents
-  and ordinary restarts never run repository validation or mutate Git;
+  and ordinary restarts never run repository validation, use Git, or touch the
+  source checkout at all;
 - it never uses `pkill`/`killall`/argv matching/process-name discovery: every
   stop and liveness check uses the exact recorded process identity (PID,
   process group, session, start time, lifecycle token, and direct-parent
   check), so a recycled PID can never be signalled;
-- `lubko-deploy deploy` hands the exact confirmed commit to the supervisor
-  through a durable desired-intent protocol and waits until the supervisor
-  proves its worker consumes the queue. A normal maintained install **refuses**
-  to fall back to direct spawning when the supervisor is absent; only the
+- `lubko-deploy deploy`, `lubko-deploy restart`, and the supervised
+  `lubko-deploy-ctl` protocol communicate only through durable state: a
+  monotonic generation space shared by the desired intent, the daemon's
+  applied state, and the deployment mission. The supervisor is the **single
+  process-lifecycle authority** for maintained workers, including deployment
+  candidates: deployctl may own confirmation/rollback decisions and durable
+  mission metadata, but it never directly spawns, stops, or replaces a worker
+  while the supervisor is active. A normal maintained install **refuses** to
+  fall back to direct spawning when the supervisor is absent; only the
   one-time `--bootstrap` path and the explicit emergency `recover`/`repair`
   commands start workers without it;
-- `lubko-deploy stop` asks the supervisor to stop and hold, so an intentionally
-  stopped worker is never resurrected;
-- during a supervised deployment the supervisor recognises the durable pending
-  mission (`worker/rollback.json`) and holds: it never resurrects the
-  intentionally retiring previous worker, and on container restart during a
-  pending mission it resolves the abandoned mission before restoring a worker,
-  so exactly one maintained consumer exists after every crash/deploy/restart.
+- a pending supervised deployment mission at a newer generation is itself an
+  active intent: the supervisor retires the previous worker and starts the
+  candidate from its sealed runtime as its own direct child, then proves queue
+  readiness. Confirmation settles the desired intent onto the candidate
+  commit, and rollback settles it onto the previous commit, each at a strictly
+  newer generation, so terminal `confirmed`/`rolled_back` records are history
+  that can never override a newer restart/deploy;
+- there is no durable stopped mode and no `lubko-deploy stop`. A healthy
+  supervisor with a confirmed deployment always wants its worker running; the
+  only supported way to fully stop Lubko is to stop the environment that runs
+  the supervisor.
+
+### Sealed per-commit runtimes
+
+Every deployed commit runs from a separate runtime materialized under
+`$XDG_STATE_HOME/lubko/cli/<full-commit-sha>/` (a `git archive` extraction of
+the exact full commit plus its `uv sync` virtualenv). After successful
+preparation the runtime is **sealed read-only** and bound to the exact commit
+by a small manifest; normal worker execution sets `PYTHONDONTWRITEBYTECODE=1`
+and never writes into the runtime (logs and state stay under XDG worker
+paths). Ordinary crash/restart/probe use only this sealed runtime and remain
+functional even if the source checkout is modified, moved, or deleted.
+Verification rejects an unsealed, incomplete, wrong-commit, or corrupt runtime
+(fail closed) rather than falling back to the mutable checkout or Git.
+Explicit unseal/removal exists only for GC/rebuild (`gc_cli_roots`,
+`remove_cli_root`, and rebuild paths); never unseal during normal operation.
+
+### Generation precedence
+
+The desired intent, the supervisor applied state, and the deployment mission
+share **one monotonic generation space**. Only the newest generation may
+influence the desired worker:
+
+- a mission older than the desired intent is stale history and is ignored
+  whatever its status (`pending`, `confirmed`, or `rolled_back`);
+- a newer pending mission is the active candidate intent and is run;
+- a pending mission at the desired generation only runs when it selects the
+  same commit, otherwise the contradiction holds;
+- a terminal mission at the desired generation or newer is an unsettled,
+  incomplete settlement and holds: terminal status alone never chooses a
+  commit, which eliminates the PR #66 stale-terminal-override bug;
+- corrupt/contradictory state fails closed into a hold with a diagnostic;
+- a supervisor restart at any point reconstructs exactly one worker from
+  desired/mission generations.
 
 ### Durable protocol state
 
 Supervisor state lives under `$XDG_STATE_HOME/lubko/supervisor/`:
 
-- `desired.json` — the explicit intent written by `lubko-deploy deploy` /
-  `lubko-deploy stop`; a monotonic `generation` makes concurrent writers
-  last-writer-wins and lets the daemon recognise every new intent exactly once;
+- `desired.json` — the explicit run intent written by `lubko-deploy deploy`
+  and `lubko-deploy restart`; a monotonic `generation` makes concurrent writers
+  last-writer-wins and lets the daemon recognise every new intent exactly once,
+  and a newer same-commit intent is a process replacement, never a no-op;
 - `state.json` — the daemon's durable record of the generation it applied, the
   worker child it owns, and its crash-loop backoff, so a supervisor restart
   reconstructs deterministically without duplicating the worker;
@@ -525,7 +604,9 @@ outage backs off until readiness is possible again.
 
 Corrupt or contradictory supervised-deployment metadata fails closed: the
 supervisor holds without a worker rather than launching an arbitrary process
-during an unknown handoff.
+during an unknown handoff. Missing, corrupt, inconsistent, or unsealed exact
+runtimes also fail closed with a diagnostic; the supervisor never falls back
+to the mutable checkout or to Git during restart or crash recovery.
 
 ## Agent management CLI
 

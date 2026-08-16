@@ -135,22 +135,27 @@ Status reports one of the externally relevant states: idle, awaiting the first c
 
 ## External supervisor integration
 
-The external supervisor (`lubko-supervisor`) is the stable authority that owns
-and restarts the maintained worker process. It recognises the durable mission
-state written here:
+The external supervisor (`lubko-supervisor`) is the single process-lifecycle
+authority for maintained workers, including deployment candidates. The desired
+run intent, the daemon's applied state, and the mission share one monotonic
+generation space, and only the newest generation may choose a worker commit:
 
-- while a mission is `pending` with a live candidate inside its confirmation
-  window, the supervisor holds: it retires its own previous worker child and
-  never spawns, so the candidate is the only intended consumer;
-- when the mission reaches terminal `confirmed`, the supervisor adopts the
-  candidate commit and takes over process ownership of the maintained worker
-  (stopping the deployctl-owned candidate process by its exact identity first);
-- when the mission reaches terminal `rolled_back`, the supervisor restores the
-  previous commit worker;
+- a mission older than the desired intent is stale history and is ignored
+  whatever its status (`pending`, `confirmed`, or `rolled_back`);
+- a newer `pending` mission is the active candidate intent: the supervisor
+  retires its own previous worker child and starts the candidate from its
+  sealed per-commit runtime as its own direct child, then proves queue
+  readiness. deployctl never spawns, stops, or replaces a worker while the
+  supervisor is active;
+- a pending mission at the desired generation only runs when it selects the
+  same commit, otherwise the contradiction holds;
+- terminal `confirmed`/`rolled_back` status alone never selects a commit: the
+  settlement (confirmation or rollback convergence) writes a strictly newer
+  desired intent, which is what the supervisor applies;
 - after a container restart during a `pending` mission (controller and
-  watchdog gone), the supervisor resolves the abandoned mission through
-  `deployctl.resolve_abandoned_mission()` before restoring a worker, so the
-  queue is never left with no consumer and no two-consumer race is created.
+  watchdog gone), the supervisor reconstructs the pending candidate directly
+  from the durable mission record, so the queue is never left with no consumer
+  and no two-consumer race is created.
 
 Corrupt mission metadata fails closed: the supervisor holds without a worker
 rather than trusting ambiguous state and launching an arbitrary process.

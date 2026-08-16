@@ -6,10 +6,12 @@ commands must be able to hand the worker to that daemon without racing it, so
 all coordination travels through small atomic JSON files under
 ``$XDG_STATE_HOME/lubko/supervisor/``:
 
-- ``desired.json`` — the explicit intent written by ``lubko-deploy`` /
-  ``lubko-deploy`` ``stop`` when they want the daemon to run or stop a worker.
-  A monotonically increasing ``generation`` makes concurrent writers
-  last-writer-wins and lets the daemon recognise every new intent exactly once;
+- ``desired.json`` — the explicit run intent written by ``lubko-deploy`` when
+  it wants the daemon to run the exact confirmed commit. A restart is the same
+  run intent issued again with a newer ``generation``. A monotonically
+  increasing ``generation`` makes concurrent writers last-writer-wins and lets
+  the daemon recognise every new intent exactly once; a newer intent for the
+  same commit is a process replacement, never a no-op;
 - ``state.json`` — the daemon's own durable record of the generation it has
   applied, the worker child it owns, and its crash-loop backoff state, so a
   supervisor restart reconstructs deterministically without duplicating the
@@ -29,13 +31,18 @@ worker identity.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
-from lubko.state import state_root
+from lubko.state import rollback_state_path, state_root
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 SCHEMA_VERSION: Final = 1
 
@@ -44,12 +51,10 @@ STAT_STARTTIME_FIELD_INDEX: Final = 19
 STAT_STATE_FIELD_INDEX: Final = 0
 
 MODE_RUN: Final = "run"
-MODE_STOPPED: Final = "stopped"
 MODE_IDLE: Final = "idle"
 
 INTENT_RUN: Final = "run"
 INTENT_RETIRING: Final = "retiring"
-INTENT_STOPPED: Final = "stopped"
 
 #: How long a live worker child must survive before its restart count resets.
 DEFAULT_STABLE_WINDOW_SECONDS: Final = 30.0
@@ -74,16 +79,27 @@ class WorkerChild:
 
 @dataclass(frozen=True, slots=True)
 class SupervisorDesired:
-    """Explicit intent the CLIs hand to the supervisor daemon."""
+    """Explicit run intent the CLIs hand to the supervisor daemon.
+
+    The intent always names the exact commit the daemon must run: a
+    deployment requests a new commit, a restart requests the already
+    confirmed commit again at a newer generation. There is no durable
+    stopped intent.
+
+    ``restart`` distinguishes an explicit process replacement from a
+    same-commit settlement (confirmation/rollback): only a restart force-
+    replaces the running child; durable mission settlement that already has
+    the exact commit running only records the newer generation.
+    """
 
     schema_version: int
     generation: int
-    mode: str
-    commit: str | None
+    commit: str
     repo: str
     uv_path: str
     worker_id: str | None
-    requested_at: float
+    restart: bool = False
+    requested_at: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the desired intent for storage.
@@ -94,11 +110,11 @@ class SupervisorDesired:
         return {
             "schema_version": self.schema_version,
             "generation": self.generation,
-            "mode": self.mode,
             "commit": self.commit,
             "repo": self.repo,
             "uv_path": self.uv_path,
             "worker_id": self.worker_id,
+            "restart": self.restart,
             "requested_at": self.requested_at,
         }
 
@@ -117,18 +133,19 @@ class SupervisorDesired:
         """
         schema_version = _optional_int(data.get("schema_version"))
         generation = _optional_int(data.get("generation"))
-        if schema_version is None or generation is None:
+        commit = _optional_string(data.get("commit"))
+        if schema_version is None or generation is None or commit is None:
             msg = "supervisor desired state is malformed"
             raise ValueError(msg)
         try:
             return cls(
                 schema_version=schema_version,
                 generation=generation,
-                mode=str(data.get("mode") or ""),
-                commit=_optional_string(data.get("commit")),
+                commit=commit,
                 repo=str(data.get("repo") or ""),
                 uv_path=str(data.get("uv_path") or ""),
                 worker_id=_optional_string(data.get("worker_id")),
+                restart=data.get("restart", False) is True,
                 requested_at=_optional_float(data.get("requested_at")) or 0.0,
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -384,6 +401,29 @@ def supervisor_log_path() -> Path:
     return supervisor_dir() / "supervisor.log"
 
 
+@contextmanager
+def generation_lock() -> Iterator[None]:
+    """Serialize generation allocation and desired-intent writes.
+
+    The generation space is shared by the supervisor applied state, the
+    desired run intent, and the durable supervised mission. Allocating and
+    writing a generation must be atomic so concurrent restarts/deploys can
+    never observe or reuse an equal, reordered, or already-applied generation.
+    Lock ordering is always deployment lock first, then this generation lock.
+
+    Yields:
+        Nothing while the lock is held.
+    """
+    path = supervisor_dir() / ".generation.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 # ---------------------------------------------------------------------------
 # Atomic storage
 # ---------------------------------------------------------------------------
@@ -556,12 +596,43 @@ def read_supervisor_pid() -> tuple[int, int] | None:
 # ---------------------------------------------------------------------------
 
 
+def _mission_generation() -> int:
+    """Return the durable supervised-mission generation, or 0 when absent.
+
+    The mission is deployctl-owned and lives under the worker state; only the
+    ``generation`` field is observed here so generation allocation can never
+    be outranked by an open mission without forming an import cycle with
+    :mod:`lubko.deployctl`. A corrupt, absent, or legacy mission contributes
+    0.
+
+    Returns:
+        The mission's generation, or ``0`` when none is usable.
+    """
+    try:
+        data = json.loads(rollback_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if isinstance(data, dict):
+        value = data.get("generation")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    return 0
+
+
 def next_generation() -> int:
     """Return the next generation for a new desired intent.
 
-    The generation is one greater than every generation seen so far, so a
-    writer that lost a read-modify-write race never reuses a generation the
-    daemon has already applied.
+    The generation is one greater than every generation seen so far: the
+    supervisor applied generation, the desired intent, and the durable
+    supervised-mission generation. A writer that lost a read-modify-write race
+    never reuses a generation the daemon has already applied, and a restart or
+    deploy issued against an open mission can never be outranked by that older
+    mission.
 
     Returns:
         The next monotonic generation.
@@ -569,7 +640,7 @@ def next_generation() -> int:
     applied = read_state().applied_generation
     desired = read_desired()
     desired_generation = desired.generation if desired is not None else 0
-    return max(applied, desired_generation) + 1
+    return max(applied, desired_generation, _mission_generation()) + 1
 
 
 def request_run(
@@ -578,6 +649,7 @@ def request_run(
     repo: str,
     uv_path: str,
     worker_id: str | None,
+    restart: bool = False,
 ) -> int:
     """Request the daemon to run the exact confirmed worker commit.
 
@@ -586,46 +658,60 @@ def request_run(
         repo: Maintained checkout the commit belongs to.
         uv_path: Resolved ``uv`` executable (recorded for coherence).
         worker_id: Worker identifier to hand to the worker.
+        restart: Whether this intent force-replaces a process already running
+            ``commit`` (restart) or may merely record the settlement if the
+            exact commit is already the live worker (confirmation/rollback).
 
     Returns:
         The generation of the written intent.
     """
-    generation = next_generation()
-    write_desired(
-        SupervisorDesired(
-            schema_version=SCHEMA_VERSION,
-            generation=generation,
-            mode=MODE_RUN,
-            commit=commit,
-            repo=repo,
-            uv_path=uv_path,
-            worker_id=worker_id,
-            requested_at=time.time(),
+    with generation_lock():
+        generation = next_generation()
+        write_desired(
+            SupervisorDesired(
+                schema_version=SCHEMA_VERSION,
+                generation=generation,
+                commit=commit,
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id,
+                restart=restart,
+                requested_at=time.time(),
+            )
         )
-    )
     return generation
 
 
-def request_stop() -> int:
-    """Request the daemon to stop and hold the maintained worker.
+def request_restart(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+) -> int:
+    """Request the daemon to replace the process running ``commit`` with a fresh one.
+
+    A restart is a new run intent for the already confirmed commit at a newer
+    generation. The daemon treats a ``restart`` intent for the same commit as
+    a process replacement (retire the current child, start a fresh worker from
+    the same commit-addressed runtime) rather than a no-op.
+
+    Args:
+        commit: Exact commit currently confirmed; the worker must run it again.
+        repo: Maintained checkout the commit belongs to.
+        uv_path: Resolved ``uv`` executable (recorded for coherence).
+        worker_id: Worker identifier to hand to the worker.
 
     Returns:
         The generation of the written intent.
     """
-    generation = next_generation()
-    write_desired(
-        SupervisorDesired(
-            schema_version=SCHEMA_VERSION,
-            generation=generation,
-            mode=MODE_STOPPED,
-            commit=None,
-            repo="",
-            uv_path="",
-            worker_id=None,
-            requested_at=time.time(),
-        )
+    return request_run(
+        commit,
+        repo=repo,
+        uv_path=uv_path,
+        worker_id=worker_id,
+        restart=True,
     )
-    return generation
 
 
 def wait_for_generation(generation: int, timeout_seconds: float) -> bool:

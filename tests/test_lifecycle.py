@@ -17,7 +17,7 @@ from unittest import mock
 import psycopg
 import pytest
 
-from lubko import cli, lifecycle, toolchain
+from lubko import cli, lifecycle, supervise, toolchain
 from lubko.config import DatabaseConfig, load_database_config
 from lubko.lifecycle import (
     EXIT_ERROR,
@@ -761,32 +761,67 @@ def test_deploy_replaces_stale_worker(
         kill_many(spawned)
 
 
-def test_stop_cmd_stops_maintained_worker(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The stop command terminates the maintained worker by identity."""
-    proc = spawn_controlled()
-    try:
-        lifecycle.write_meta(meta_for_process(proc, tmp_path))
-        code = lifecycle.stop_cmd(0.5)
-        assert code == EXIT_OK
-        wait_until(lambda: proc.poll() is not None)
-        meta = lifecycle.read_meta()
-        assert meta is not None
-        assert meta.state == lifecycle.STATE_STOPPED
-        assert "stopped" in capsys.readouterr().out
-    finally:
-        kill_proc(proc)
+def test_deploy_cli_has_no_stop_command(capsys: pytest.CaptureFixture[str]) -> None:
+    """The deploy CLI must not offer an administrative stop subcommand."""
+    parser = lifecycle.build_parser()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["stop"])
+    assert exc.value.code != 0
+    assert "invalid choice" in capsys.readouterr().err
 
 
-def test_stop_cmd_refuses_unmanaged(
+def test_restart_fails_closed_without_supervisor(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The stop command refuses to claim it can stop a legacy worker."""
-    code = lifecycle.stop_cmd(0.5)
+    """A supervised restart is refused when no supervisor is running."""
+    code = lifecycle.restart_cmd(argparse.Namespace())
     assert code == EXIT_ERROR
-    assert "unmanaged" in capsys.readouterr().err
+    assert "no external supervisor" in capsys.readouterr().err
+
+
+def test_restart_fails_closed_without_confirmed_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A restart with no confirmed commit fails closed."""
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+    code = lifecycle.restart_cmd(argparse.Namespace())
+    assert code == EXIT_ERROR
+    assert "no usable sealed runtime" in capsys.readouterr().err
+
+
+def test_migrate_cmd_writes_verified_desired_and_replaces_stale_mission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Migration replaces stale/corrupt state with a verified exact commit."""
+    repo, first, _second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text("{not json\n", encoding="utf-8")
+
+    args = argparse.Namespace(commit=first, repo=repo, uv="uv", lock_timeout=5.0)
+    code = lifecycle.migrate_cmd(args)
+    assert code == EXIT_OK
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.commit == first
+    assert desired.generation >= 1
+    assert not rollback_state_path().exists()
+
+
+def test_migrate_cmd_refuses_unverified_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Migration fails closed without a verified sealed runtime."""
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    args = argparse.Namespace(commit="b" * 40, repo=Path.cwd(), uv="uv", lock_timeout=5.0)
+    code = lifecycle.migrate_cmd(args)
+    assert code == EXIT_ERROR
+    assert "no verified sealed runtime" in capsys.readouterr().err
 
 
 def test_stop_worker_kills_exact_group_only(

@@ -1036,7 +1036,9 @@ When the user asks to upgrade or redeploy the Lubko worker, use the deterministi
 ```sh
 lubko-deploy status
 lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
-lubko-deploy stop [--grace-seconds N]
+lubko-deploy restart
+lubko-deploy migrate --commit <sha> [--repo DIR] [--uv PATH]
+lubko-deploy recover [--repo DIR] [--uv PATH] [--probe-timeout N]
 lubko-deploy log [--lines N]
 lubko-supervisor --status
 ```
@@ -1063,7 +1065,7 @@ Per-user lifecycle state and logs live under `$XDG_STATE_HOME/lubko` (default `~
 
 ## Bootstrap and the unmanaged legacy worker
 
-Before the first managed deployment the running worker is an unmanaged legacy daemon with no recorded identity. `lubko-deploy status` reports `unmanaged`, and `deploy`/`stop` refuse to claim they can stop it by identity. The one-time migration is a single manual stop of the legacy worker followed by:
+Before the first managed deployment the running worker is an unmanaged legacy daemon with no recorded identity. `lubko-deploy status` reports `unmanaged`, and `deploy` refuses to claim it can stop it by identity. The one-time migration is a single manual stop of the legacy worker followed by:
 
 ```sh
 lubko-deploy deploy --bootstrap
@@ -1384,21 +1386,18 @@ Lubko represents stdout/stderr as bounded rolling live tails; older output is av
 
 # GitHub issue status coordination
 
-Every orchestrator that works on a GitHub issue must maintain **one editable orchestrator status comment on that issue** for the duration of the work.
+The issue-ownership protocol is part of **core startup and orchestration rules**, not optional guidance: every orchestrator that does GitHub issue work must, **before any substantive work on an issue**, read the canonical status comment, determine ownership, claim it, and keep it refreshed.
 
-For issue work:
+For every GitHub issue an orchestrator will work on:
 
-- create or inherit the issue's orchestrator status comment before substantial work;
-- while the status is `working`, update the same comment at least every 5 minutes;
-- use the comment's GitHub `updated_at` as the authoritative activity time;
-- treat a `working` comment whose `updated_at` is at least 10 minutes old as abandoned and inheritable;
-- before every refresh, re-read the canonical status comment and stop orchestrating the issue if its owner has changed;
-- list the resources currently owned by the orchestrator according to its own judgment. This should include Lubko work directories and managed agents when they exist, and may include branches, PRs, root job UUIDs, temporary clones, or other useful recovery handles;
-- mark the comment `completed` when the issue workflow is actually complete.
-
-Use one machine-recognizable marker, `<!-- lubko-orchestrator-status -->`, so later orchestrators can locate the comment reliably. If a race creates more than one marked comment, the most recently updated marked comment is canonical.
-
-Do not infer issue ownership or abandonment from agent silence, CPU activity, lack of new commits, or lack of newly submitted Lubko commands. The issue status comment is the ownership record.
+1. **Read the canonical status comment first.** Locate the `<!-- lubko-orchestrator-status -->` marker comment (if several marked comments exist, the most recently updated one is canonical). Before any checkout, commit, PR, or other substantive work, load that comment's raw content and its GitHub `updated_at`.
+2. **Determine whether `working` ownership is active or abandoned by freshness.** A `working` marker whose `updated_at` is under 10 minutes old is active and owned. A `working` marker whose `updated_at` is at least 10 minutes old is abandoned and inheritable. A `completed` marker, or no marker at all, is unowned.
+3. **Only proceed when the issue is unowned or abandoned.** If another orchestrator actively owns the issue, do not start work on it: pick another issue or report back, and do not mutate the issue.
+4. **Claim the issue before substantive work.** Write (or update) the canonical status comment with a fresh owner identity, the current time, the resources currently owned (Lubko work directories and managed agents when they exist, plus branches, PRs, root job UUIDs, temporary clones, or other recovery handles), and status `working`.
+5. **Immediately re-read and yield if the race was lost.** After claiming, re-read the canonical comment; if the owner changed to a different orchestrator (or the most recently updated marked comment is no longer yours), yield: stop orchestrating this issue, do not continue, and record that you lost the race.
+6. **Keep the claim refreshed at the documented cadence.** While status is `working`, update the same comment at least every 5 minutes, re-reading the canonical comment before every refresh and stopping if ownership changed.
+7. Use the comment's GitHub `updated_at` as the authoritative activity time; never infer ownership or abandonment from agent silence, CPU activity, lack of commits, or lack of newly submitted Lubko commands. The issue status comment is the ownership record.
+8. Mark the comment `completed` only when the issue workflow is actually complete.
 
 Recurring scheduled orchestrators must additionally follow [`docs/skills/scheduled.md`](skills/scheduled.md) for startup, inheritance, issue selection, recovery, and release-branch behavior.
 

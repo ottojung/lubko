@@ -27,7 +27,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
-from lubko import cli, lifecycle, worker
+from lubko import cli, lifecycle, supervise, worker
 from lubko import deployctl as dc
 from lubko.lifecycle import (
     SCHEMA_VERSION,
@@ -38,7 +38,7 @@ from lubko.lifecycle import (
     worker_alive,
     write_meta,
 )
-from lubko.state import state_root
+from lubko.state import rollback_state_path, state_root
 from lubko.worker import group_has_members
 from tests import _isolation as isolation
 from tests import _process_guard as guard
@@ -94,6 +94,7 @@ def pending_state(
     old: str = "1" * 40,
     new: str = "2" * 40,
     previous_retiring: bool = False,
+    generation: int = 1,
 ) -> dc.RollbackState:
     """Return a live pending deployment state.
 
@@ -102,12 +103,14 @@ def pending_state(
         old: Previous confirmed commit.
         new: Proposed candidate commit.
         previous_retiring: Whether the previous worker's retirement has begun.
+        generation: Monotonic mission generation.
 
     Returns:
         A pending rollback state with distinct old/new commits.
     """
     return dc.RollbackState(
         schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=generation,
         status=dc.STATUS_PENDING,
         commit=new,
         previous_commit=old,
@@ -382,6 +385,74 @@ def test_rollback_state_round_trip() -> None:
     dc._write_state(state)
 
     assert dc._read_state() == state
+
+
+def test_rollback_state_generation_round_trip() -> None:
+    """The monotonic mission generation survives serialization identically."""
+    state = replace(pending_state(), generation=7)
+
+    dc._write_state(state)
+
+    parsed = dc._read_state()
+    assert parsed is not None
+    assert parsed == state
+    assert parsed.to_dict()["generation"] == 7
+
+
+def test_rollback_state_rejects_missing_generation() -> None:
+    """A legacy mission without a generation fails closed, never inventing zero."""
+    data = pending_state(generation=3).to_dict()
+    del data["generation"]
+
+    with pytest.raises(dc.DeployCtlError, match="malformed"):
+        dc.RollbackState.from_dict(data)
+
+
+def test_read_state_rejects_legacy_mission_without_generation() -> None:
+    """A legacy state file lacking generation is untrustworthy and rejected."""
+    data = pending_state(generation=3).to_dict()
+    del data["generation"]
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(
+        json.dumps(data, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(dc.DeployCtlError, match="malformed"):
+        dc._read_state()
+
+
+def test_next_mission_generation_is_strictly_greater(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new mission generation outranks every durable recorded generation."""
+    existing = replace(pending_state(), generation=4)
+    monkeypatch.setattr(dc, "_read_state", lambda: existing)
+    supervise.write_desired(
+        supervise.SupervisorDesired(
+            schema_version=supervise.SCHEMA_VERSION,
+            generation=9,
+            commit="2" * 40,
+            repo="",
+            uv_path="uv",
+            worker_id=None,
+            requested_at=1.0,
+        )
+    )
+    supervise.write_state(replace(supervise.fresh_state(), applied_generation=12))
+
+    assert dc.next_mission_generation() == 13
+
+
+def test_next_mission_generation_defaults_to_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no recorded generations anywhere, the first mission is generation one."""
+    monkeypatch.setattr(dc, "_read_state", lambda: None)
+    monkeypatch.setattr(supervise, "read_desired", lambda: None)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+
+    assert dc.next_mission_generation() == 1
 
 
 def test_first_confirmation_returns_7_hex_challenge(
@@ -1329,8 +1400,9 @@ def test_prepare_locked_is_reversible_and_leaves_previous_running(
     monkeypatch.setattr(dc, "_spawn_gated_candidate", fake_gated)
 
     try:
-        state, gated = dc._prepare_locked(make_options(repo), second)
+        state, gated = dc._prepare_locked(make_options(repo), second, supervised=False)
 
+        assert gated is not None
         assert state.previous_retiring is False
         assert state.previous_meta == previous
         assert state.new_meta == gated.meta
@@ -1369,7 +1441,7 @@ def test_prepare_locked_restores_previous_on_validation_failure(
     monkeypatch.setattr(cli, "remove_cli_root", lambda _commit: None)
 
     with pytest.raises(dc.DeployCtlError, match="validation failed"):
-        dc._prepare_locked(make_options(repo), second)
+        dc._prepare_locked(make_options(repo), second, supervised=False)
 
     assert checkouts == [(second, False), (first, True)]
 
@@ -1439,7 +1511,7 @@ def test_prepare_locked_rolls_back_when_watchdog_fork_fails(
 
     try:
         with pytest.raises(dc.DeployCtlError, match="fork boom"):
-            dc._prepare_locked(make_options(repo), second)
+            dc._prepare_locked(make_options(repo), second, supervised=False)
 
         assert len(written) == 1
         assert written[0].previous_retiring is False
@@ -1793,7 +1865,7 @@ def test_helper_uses_fresh_durable_success_deadline(
     guard.register(gated_proc)
     gated = dc.GatedWorker(proc=gated_proc, gate_writer=-1, meta=stale.new_meta)
     captured: dict[str, float] = {}
-    monkeypatch.setattr(dc, "_prepare_locked", lambda _options, _commit: (stale, gated))
+    monkeypatch.setattr(dc, "_prepare_locked", lambda _options, _commit, **_kwargs: (stale, gated))
     monkeypatch.setattr(dc, "_send_helper_response", lambda _writer, _response: None)
     monkeypatch.setattr(dc, "_complete_handoff", lambda _options, _state, _gated: stale)
 

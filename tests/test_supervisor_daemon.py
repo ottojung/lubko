@@ -21,6 +21,7 @@ real process ownership:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager, suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
@@ -53,8 +55,6 @@ REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
 TEST_WORKER_ID: Final = "test-supervisor-worker"
-MARKER: Final = "candidate-token"
-SUPERVISOR_MARKER: Final = "supervisor-token"
 LEGACY_MARKER: Final = "legacy-token"
 
 
@@ -348,6 +348,23 @@ def status_ready() -> bool:
     return bool(status is not None and status.ready)
 
 
+def status_commit_is(commit: str) -> Callable[[], bool]:
+    """Return a predicate asserting the supervisor currently runs ``commit``.
+
+    Args:
+        commit: Exact commit the worker must be running.
+
+    Returns:
+        A predicate usable with :func:`wait_until`.
+    """
+
+    def check() -> bool:
+        status = supervise.read_status()
+        return status is not None and status.commit == commit
+
+    return check
+
+
 def status_has_no_child() -> bool:
     """Return whether the supervisor currently owns no worker child.
 
@@ -424,66 +441,6 @@ def read_payload(conninfo: str, job_id: UUID) -> dict[str, object]:
     return data
 
 
-def controlled_process(token: str) -> subprocess.Popen[bytes]:
-    """Spawn a controlled session-leader process carrying a lifecycle token.
-
-    Args:
-        token: Lifecycle token placed in the process environment.
-
-    Returns:
-        The spawned process.
-    """
-    env = dict(os.environ)
-    env[lifecycle.LIFECYCLE_MARKER_VAR] = token
-    proc = subprocess.Popen(
-        [SLEEP_BIN, "300"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-        env=env,
-    )
-    guard.register(proc)
-    return proc
-
-
-def meta_for_pid(pid: int, commit: str, token: str) -> lifecycle.WorkerMeta:
-    """Build running metadata for a live PID with exact identity.
-
-    Args:
-        pid: Live process ID.
-        commit: Commit the process is recorded as running.
-        token: Lifecycle token the process carries.
-
-    Returns:
-        Running metadata for the process.
-    """
-    deadline = time.monotonic() + 5.0
-    identity = None
-    while time.monotonic() < deadline:
-        identity = lifecycle.process_identity(pid)
-        if identity is not None and identity.pgid == pid and identity.sid == pid:
-            break
-        time.sleep(0.01)
-    assert identity is not None
-    return lifecycle.WorkerMeta(
-        schema_version=1,
-        state=lifecycle.STATE_RUNNING,
-        pid=identity.pid,
-        pgid=identity.pgid,
-        sid=identity.sid,
-        start_time_ticks=identity.start_time_ticks,
-        token=token,
-        repo="",
-        git_commit=commit,
-        worker_id="candidate-worker",
-        log_path="",
-        started_at=time.time(),
-        stopped_at=None,
-    )
-
-
 def write_rollback(state: dc.RollbackState) -> None:
     """Persist durable supervised-deployment state atomically.
 
@@ -495,6 +452,72 @@ def write_rollback(state: dc.RollbackState) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(state.to_dict(), sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def mission_state(
+    generation: int,
+    status: str,
+    commit: str,
+    previous_commit: str,
+    *,
+    repo: str = "",
+) -> dc.RollbackState:
+    """Build a durable supervised-deployment mission for the override tests.
+
+    Args:
+        generation: Monotonic mission generation.
+        status: ``pending``, ``confirmed``, or ``rolled_back``.
+        commit: Candidate commit.
+        previous_commit: Previously confirmed commit.
+        repo: Maintained checkout, defaults to ``""``.
+
+    Returns:
+        A minimal but valid :class:`dc.RollbackState`.
+    """
+    return dc.RollbackState(
+        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=generation,
+        status=status,
+        commit=commit,
+        previous_commit=previous_commit,
+        challenge_hash=None,
+        deadline=time.time() + 60,
+        repo=repo,
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=5.0,
+        previous_retiring=False,
+        previous_meta=lifecycle.WorkerMeta(
+            schema_version=1,
+            state=lifecycle.STATE_RUNNING,
+            pid=999_999,
+            pgid=999_999,
+            sid=999_999,
+            start_time_ticks=1,
+            token=LEGACY_MARKER,
+            repo="",
+            git_commit=previous_commit,
+            worker_id="w",
+            log_path="",
+            started_at=1.0,
+            stopped_at=None,
+        ),
+        new_meta=lifecycle.WorkerMeta(
+            schema_version=1,
+            state=lifecycle.STATE_RUNNING,
+            pid=999_998,
+            pgid=999_998,
+            sid=999_998,
+            start_time_ticks=1,
+            token=LEGACY_MARKER,
+            repo="",
+            git_commit=commit,
+            worker_id="w",
+            log_path="",
+            started_at=1.0,
+            stopped_at=None,
+        ),
+    )
 
 
 def kill_job_group_if_any(conninfo: str, job_id: UUID) -> None:
@@ -541,6 +564,93 @@ def test_worker_is_restarted_after_unexpected_kill(
         assert status is not None
         assert status.last_exit is not None
         assert len(direct_children(status.supervisor_pid)) == 1
+
+
+def test_same_commit_restart_replaces_worker_process(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A newer generation for the same commit replaces the worker process."""
+    del jobs_db, pg_cluster
+    repo, first, _second = maintained_env
+    with running_supervisor(supervisor_env):
+        generation = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        restart = supervise.request_restart(
+            first,
+            repo=str(repo),
+            uv_path="uv",
+            worker_id=TEST_WORKER_ID,
+        )
+        assert restart > generation
+        assert supervise.wait_until_ready(restart, 30.0)
+        wait_for_replacement(original_pid)
+        replacement_pid = worker_pid()
+        assert replacement_pid is not None
+        assert replacement_pid != original_pid
+        assert process_alive(replacement_pid)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.applied_generation == restart
+        assert status.commit == first
+        assert len(direct_children(status.supervisor_pid)) == 1
+
+
+def test_restart_works_after_source_checkout_deleted(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A restarted worker runs from the sealed runtime after checkout deletion."""
+    del jobs_db, pg_cluster
+    repo, first, _second = maintained_env
+    with running_supervisor(supervisor_env):
+        request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        shutil.rmtree(repo)
+        os.killpg(original_pid, signal.SIGKILL)
+
+        wait_for_replacement(original_pid)
+        replacement_pid = worker_pid()
+        assert replacement_pid is not None
+        assert process_alive(replacement_pid)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == first
+        assert len(direct_children(status.supervisor_pid)) == 1
+
+
+def test_corrupt_runtime_fails_closed_holding(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A missing/corrupt runtime makes the supervisor hold without a worker."""
+    del jobs_db, pg_cluster
+    repo, first, _second = maintained_env
+    with running_supervisor(supervisor_env):
+        request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        cli.unseal_runtime(first)
+        shutil.rmtree(cli.cli_commit_dir(first))
+        os.killpg(original_pid, signal.SIGKILL)
+
+        wait_until(status_has_no_child, timeout=30.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.child is None
+        assert status.ready is not True
+        assert len(direct_children(status.supervisor_pid)) == 0
 
 
 def test_crash_recovery_recovers_stale_job_without_reexecution(
@@ -776,72 +886,255 @@ def test_corrupt_rollback_state_fails_closed_into_hold(
         assert len(direct_children(status.supervisor_pid)) == 0
 
 
-def test_pending_mission_holds_and_confirmation_resumes(
+def test_pending_mission_drives_candidate_and_settlement_converges(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
-    """A pending supervised mission holds the daemon; confirmation resumes it."""
+    """A newer pending mission drives the candidate; settle keeps one worker."""
+    del jobs_db, pg_cluster
     repo, first, second = maintained_env
     with running_supervisor(supervisor_env):
-        request_and_wait(first, repo)
+        applied = request_and_wait(first, repo)
         original_pid = worker_pid()
         assert original_pid is not None
-        original_meta = meta_for_pid(original_pid, first, SUPERVISOR_MARKER)
 
-        candidate = controlled_process(MARKER)
-        try:
-            candidate_meta = meta_for_pid(candidate.pid, second, MARKER)
-            write_rollback(
-                dc.RollbackState(
-                    schema_version=dc.ROLLBACK_SCHEMA_VERSION,
-                    status=dc.STATUS_PENDING,
-                    commit=second,
-                    previous_commit=first,
-                    challenge_hash=None,
-                    deadline=time.time() + 60,
-                    repo=str(repo),
-                    uv_path="uv",
-                    stop_grace_seconds=1.0,
-                    git_timeout_seconds=5.0,
-                    previous_retiring=False,
-                    previous_meta=original_meta,
-                    new_meta=candidate_meta,
-                )
-            )
-            wait_until(status_has_no_child, timeout=30.0)
-            assert not process_alive(original_pid)
-            time.sleep(1.0)
-            assert status_has_no_child()
+        write_rollback(mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)))
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+        candidate_pid = worker_pid()
+        assert candidate_pid is not None
+        assert candidate_pid != original_pid
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == second
+        assert status.applied_generation == applied + 1
+        assert len(direct_children(status.supervisor_pid)) == 1
 
-            write_rollback(
-                dc.RollbackState(
-                    schema_version=dc.ROLLBACK_SCHEMA_VERSION,
-                    status=dc.STATUS_CONFIRMED,
-                    commit=second,
-                    previous_commit=first,
-                    challenge_hash=None,
-                    deadline=time.time() + 60,
-                    repo=str(repo),
-                    uv_path="uv",
-                    stop_grace_seconds=1.0,
-                    git_timeout_seconds=5.0,
-                    previous_retiring=False,
-                    previous_meta=original_meta,
-                    new_meta=candidate_meta,
-                )
-            )
-            wait_until(lambda: worker_pid() is not None, timeout=30.0)
-            resumed_pid = worker_pid()
-            assert resumed_pid is not None
-            wait_until(status_ready, timeout=30.0)
-            meta = lifecycle.read_meta()
-            assert meta is not None
-            assert meta.git_commit == second
-            status = supervise.read_status()
-            assert status is not None
-            assert len(direct_children(status.supervisor_pid)) == 1
-        finally:
-            guard.teardown_tracked(fail_on_leak=False)
+        settle = supervise.request_run(
+            second,
+            repo=str(repo),
+            uv_path="uv",
+            worker_id=TEST_WORKER_ID,
+        )
+        assert settle > applied + 1
+        assert supervise.wait_until_ready(settle, 30.0)
+        assert worker_pid() is not None
+        final_status = supervise.read_status()
+        assert final_status is not None
+        assert len(direct_children(final_status.supervisor_pid)) == 1
+        assert final_status.commit == second
+
+
+def test_supervised_deploy_candidate_is_direct_supervisor_child(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A pending-mission candidate is started by the supervisor as a direct child."""
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        dc.publish_mission(
+            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            lock_timeout_seconds=5.0,
+        )
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+        candidate_pid = worker_pid()
+        assert candidate_pid is not None
+        status = supervise.read_status()
+        assert status is not None
+        assert candidate_pid in direct_children(status.supervisor_pid)
+        assert status.commit == second
+        assert len(direct_children(status.supervisor_pid)) == 1
+
+        settle = dc.settle_desired(second, str(repo), "uv")
+        assert settle > applied + 1
+        wait_until(status_ready, timeout=30.0)
+        final_status = supervise.read_status()
+        assert final_status is not None
+        assert final_status.commit == second
+        assert len(direct_children(final_status.supervisor_pid)) == 1
+        write_rollback(
+            mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+        )
+
+
+def test_supervised_bad_candidate_rollback_converges_to_previous(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """An unconfirmed candidate settles back to the previous commit, one worker."""
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        dc.publish_mission(
+            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            lock_timeout_seconds=5.0,
+        )
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+        candidate_pid = worker_pid()
+        assert candidate_pid is not None
+
+        settle = dc.settle_desired(first, str(repo), "uv")
+        assert settle > applied + 1
+        wait_until(status_ready, timeout=30.0)
+        final_pid = worker_pid()
+        assert final_pid is not None
+        assert final_pid != candidate_pid
+        final_status = supervise.read_status()
+        assert final_status is not None
+        assert final_status.commit == first
+        assert len(direct_children(final_status.supervisor_pid)) == 1
+        write_rollback(
+            mission_state(applied + 1, dc.STATUS_ROLLED_BACK, second, first, repo=str(repo))
+        )
+
+
+def test_supervisor_restart_resumes_pending_mission_candidate(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A supervisor restart during a pending mission resumes the candidate."""
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+        dc.publish_mission(
+            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            lock_timeout_seconds=5.0,
+        )
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+        first_candidate = worker_pid()
+        assert first_candidate is not None
+
+    with running_supervisor(supervisor_env):
+        wait_until(lambda: worker_pid() is not None, timeout=30.0)
+        wait_until(status_ready, timeout=30.0)
+        resumed_pid = worker_pid()
+        assert resumed_pid is not None
+        assert resumed_pid != first_candidate
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == second
+        assert len(direct_children(status.supervisor_pid)) == 1
+        write_rollback(
+            mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+        )
+
+
+def test_deploy_and_restart_generations_strictly_increase(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """Deploy/restart/mission/settle generations strictly increase, one worker."""
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+
+        restart_gen = supervise.request_restart(
+            first,
+            repo=str(repo),
+            uv_path="uv",
+            worker_id=TEST_WORKER_ID,
+        )
+        assert restart_gen > applied
+        assert supervise.wait_until_ready(restart_gen, 30.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert len(direct_children(status.supervisor_pid)) == 1
+
+        mission_gen = dc.next_mission_generation()
+        assert mission_gen > restart_gen
+        dc.publish_mission(
+            mission_state(mission_gen, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            lock_timeout_seconds=5.0,
+        )
+        wait_until(status_commit_is(second), timeout=30.0)
+        wait_until(status_ready, timeout=30.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == second
+        assert len(direct_children(status.supervisor_pid)) == 1
+
+        settle_gen = dc.settle_desired(second, str(repo), "uv")
+        assert settle_gen > mission_gen
+        wait_until(status_ready, timeout=30.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == second
+        assert len(direct_children(status.supervisor_pid)) == 1
+        assert status.applied_generation == settle_gen
+        write_rollback(
+            mission_state(mission_gen, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+        )
+
+
+def test_migrate_from_stale_fake_state_then_supervisor_reconstructs(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """Explicit migration replaces stale fake state; the supervisor converges."""
+    del pg_cluster
+    repo, first, _second = maintained_env
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text("{stale\n", encoding="utf-8")
+    stale_desired = {
+        "schema_version": 1,
+        "generation": 99,
+        "mode": "run",
+        "commit": "0" * 40,
+        "repo": "",
+        "uv_path": "",
+        "worker_id": None,
+        "requested_at": 0.0,
+    }
+    supervise.desired_path().parent.mkdir(parents=True, exist_ok=True)
+    supervise.desired_path().write_text(
+        json.dumps(stale_desired, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    args = argparse.Namespace(commit=first, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.commit == first
+    assert desired.generation > 99
+
+    with running_supervisor(supervisor_env):
+        wait_until(lambda: worker_pid() is not None, timeout=30.0)
+        wait_until(status_ready, timeout=30.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == first
+        assert len(direct_children(status.supervisor_pid)) == 1
+        probe_id = insert_pending_job(jobs_db, str(tmp_path), "echo migrated")
+        wait_until(lambda: read_status_of(jobs_db, probe_id) == "succeeded", timeout=60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -877,155 +1170,134 @@ def test_derive_action_fails_closed_on_corrupt_rollback(tmp_path: Path) -> None:
     assert commit is None
 
 
-def test_derive_action_pending_live_candidate_holds(tmp_path: Path) -> None:
-    """A live pending candidate is the consumer; the daemon must hold."""
-    del tmp_path
-    candidate = controlled_process(MARKER)
-    try:
-        candidate_meta = meta_for_pid(candidate.pid, "2" * 40, MARKER)
-        write_rollback(
-            dc.RollbackState(
-                schema_version=dc.ROLLBACK_SCHEMA_VERSION,
-                status=dc.STATUS_PENDING,
-                commit="2" * 40,
-                previous_commit="1" * 40,
-                challenge_hash=None,
-                deadline=time.time() + 60,
-                repo="",
-                uv_path="uv",
-                stop_grace_seconds=1.0,
-                git_timeout_seconds=5.0,
-                previous_retiring=False,
-                previous_meta=lifecycle.WorkerMeta(
-                    schema_version=1,
-                    state=lifecycle.STATE_RUNNING,
-                    pid=1,
-                    pgid=1,
-                    sid=1,
-                    start_time_ticks=1,
-                    token=LEGACY_MARKER,
-                    repo="",
-                    git_commit="1" * 40,
-                    worker_id="w",
-                    log_path="",
-                    started_at=1.0,
-                    stopped_at=None,
-                ),
-                new_meta=candidate_meta,
-            )
-        )
-        daemon = SupervisorDaemon(Settings())
-        action, _commit = daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
-        assert action == "hold"
-    finally:
-        guard.teardown_tracked(fail_on_leak=False)
+def _derive_action() -> tuple[str, str | None]:
+    """Derive the supervisor's intended action from the current durable state.
 
-
-def test_derive_action_pending_dead_candidate_rolls_back(tmp_path: Path) -> None:
-    """A pending mission with a dead candidate must roll back."""
-    del tmp_path
-    write_rollback(
-        dc.RollbackState(
-            schema_version=dc.ROLLBACK_SCHEMA_VERSION,
-            status=dc.STATUS_PENDING,
-            commit="2" * 40,
-            previous_commit="1" * 40,
-            challenge_hash=None,
-            deadline=time.time() - 1,
-            repo="",
-            uv_path="uv",
-            stop_grace_seconds=1.0,
-            git_timeout_seconds=5.0,
-            previous_retiring=False,
-            previous_meta=lifecycle.WorkerMeta(
-                schema_version=1,
-                state=lifecycle.STATE_RUNNING,
-                pid=999_999,
-                pgid=999_999,
-                sid=999_999,
-                start_time_ticks=1,
-                token=LEGACY_MARKER,
-                repo="",
-                git_commit="1" * 40,
-                worker_id="w",
-                log_path="",
-                started_at=1.0,
-                stopped_at=None,
-            ),
-            new_meta=lifecycle.WorkerMeta(
-                schema_version=1,
-                state=lifecycle.STATE_RUNNING,
-                pid=999_998,
-                pgid=999_998,
-                sid=999_998,
-                start_time_ticks=1,
-                token=LEGACY_MARKER,
-                repo="",
-                git_commit="2" * 40,
-                worker_id="w",
-                log_path="",
-                started_at=1.0,
-                stopped_at=None,
-            ),
-        )
-    )
+    Returns:
+        The ``(action, commit)`` pair.
+    """
     daemon = SupervisorDaemon(Settings())
-    action, _commit = daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
-    assert action == "rollback"
+    return daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
 
 
-def test_derive_action_confirmed_returns_candidate_commit(tmp_path: Path) -> None:
-    """A confirmed mission makes the candidate commit the desired worker."""
+def test_derive_action_pending_newer_than_desired_selects_candidate(
+    tmp_path: Path,
+) -> None:
+    """A pending mission at a newer generation is the active candidate intent."""
     del tmp_path
-    write_rollback(
-        dc.RollbackState(
-            schema_version=dc.ROLLBACK_SCHEMA_VERSION,
-            status=dc.STATUS_CONFIRMED,
-            commit="2" * 40,
-            previous_commit="1" * 40,
-            challenge_hash=None,
-            deadline=time.time() + 60,
-            repo="",
-            uv_path="uv",
-            stop_grace_seconds=1.0,
-            git_timeout_seconds=5.0,
-            previous_retiring=False,
-            previous_meta=lifecycle.WorkerMeta(
-                schema_version=1,
-                state=lifecycle.STATE_RUNNING,
-                pid=1,
-                pgid=1,
-                sid=1,
-                start_time_ticks=1,
-                token=LEGACY_MARKER,
-                repo="",
-                git_commit="1" * 40,
-                worker_id="w",
-                log_path="",
-                started_at=1.0,
-                stopped_at=None,
-            ),
-            new_meta=lifecycle.WorkerMeta(
-                schema_version=1,
-                state=lifecycle.STATE_RUNNING,
-                pid=2,
-                pgid=2,
-                sid=2,
-                start_time_ticks=2,
-                token=LEGACY_MARKER,
-                repo="",
-                git_commit="2" * 40,
-                worker_id="w",
-                log_path="",
-                started_at=1.0,
-                stopped_at=None,
-            ),
-        )
-    )
-    daemon = SupervisorDaemon(Settings())
-    action, commit = daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
+    supervise.request_run("1" * 40, repo="", uv_path="uv", worker_id="w")
+    write_rollback(mission_state(2, dc.STATUS_PENDING, "2" * 40, "1" * 40))
+    action, commit = _derive_action()
     assert action == "run"
     assert commit == "2" * 40
+
+
+def test_derive_action_pending_equal_desired_same_commit_runs(tmp_path: Path) -> None:
+    """A pending mission at the desired generation selecting the same commit runs."""
+    del tmp_path
+    supervise.request_run("2" * 40, repo="", uv_path="uv", worker_id="w")
+    write_rollback(mission_state(1, dc.STATUS_PENDING, "2" * 40, "1" * 40))
+    action, commit = _derive_action()
+    assert action == "run"
+    assert commit == "2" * 40
+
+
+def test_derive_action_pending_equal_desired_mismatch_holds(tmp_path: Path) -> None:
+    """A pending mission contradicting the desired generation must hold."""
+    del tmp_path
+    supervise.request_run("1" * 40, repo="", uv_path="uv", worker_id="w")
+    write_rollback(mission_state(1, dc.STATUS_PENDING, "2" * 40, "1" * 40))
+    action, commit = _derive_action()
+    assert action == "hold"
+    assert commit is None
+
+
+def test_derive_action_stale_pending_ignored_for_newer_desired(tmp_path: Path) -> None:
+    """A stale pending mission older than the desired intent is ignored."""
+    del tmp_path
+    write_rollback(mission_state(1, dc.STATUS_PENDING, "2" * 40, "1" * 40))
+    supervise.request_run("3" * 40, repo="", uv_path="uv", worker_id="w")
+    action, commit = _derive_action()
+    assert action == "run"
+    assert commit == "3" * 40
+
+
+def test_derive_action_stale_confirmed_cannot_override_newer_restart(
+    tmp_path: Path,
+) -> None:
+    """A terminal confirmed mission older than a newer restart is history."""
+    del tmp_path
+    write_rollback(mission_state(1, dc.STATUS_CONFIRMED, "2" * 40, "1" * 40))
+    supervise.request_restart("3" * 40, repo="", uv_path="uv", worker_id="w")
+    action, commit = _derive_action()
+    assert action == "run"
+    assert commit == "3" * 40
+
+
+def test_derive_action_stale_rolled_back_cannot_override_newer_deploy(
+    tmp_path: Path,
+) -> None:
+    """A terminal rolled_back mission older than a newer deploy is history."""
+    del tmp_path
+    write_rollback(mission_state(1, dc.STATUS_ROLLED_BACK, "2" * 40, "1" * 40))
+    supervise.request_run("3" * 40, repo="", uv_path="uv", worker_id="w")
+    action, commit = _derive_action()
+    assert action == "run"
+    assert commit == "3" * 40
+
+
+def test_derive_action_terminal_mission_at_or_newer_holds(tmp_path: Path) -> None:
+    """A terminal mission without a newer settled intent is unsettled: hold."""
+    del tmp_path
+    supervise.request_run("2" * 40, repo="", uv_path="uv", worker_id="w")
+    write_rollback(mission_state(2, dc.STATUS_CONFIRMED, "2" * 40, "1" * 40))
+    action, commit = _derive_action()
+    assert action == "hold"
+    assert commit is None
+    write_rollback(mission_state(1, dc.STATUS_ROLLED_BACK, "2" * 40, "1" * 40))
+    action, commit = _derive_action()
+    assert action == "hold"
+    assert commit is None
+    write_rollback(mission_state(1, dc.STATUS_CONFIRMED, "2" * 40, "1" * 40))
+    action, commit = _derive_action()
+    assert action == "hold"
+    assert commit is None
+
+
+def test_derive_action_legacy_mission_without_generation_holds(tmp_path: Path) -> None:
+    """Legacy schema-1 mission state without a generation fails closed."""
+    del tmp_path
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    legacy = mission_state(1, dc.STATUS_PENDING, "2" * 40, "1" * 40).to_dict()
+    del legacy["generation"]
+    legacy["schema_version"] = 1
+    rollback_state_path().write_text(json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8")
+    action, commit = _derive_action()
+    assert action == "hold"
+    assert commit is None
+
+
+def test_derive_action_no_desired_selects_newer_pending_candidate(
+    tmp_path: Path,
+) -> None:
+    """Supervisor restart with no desired intent resumes the pending candidate."""
+    del tmp_path
+    assert supervise.read_desired() is None
+    write_rollback(mission_state(5, dc.STATUS_PENDING, "2" * 40, "1" * 40))
+    action, commit = _derive_action()
+    assert action == "run"
+    assert commit == "2" * 40
+
+
+def test_next_generation_surpasses_open_mission(tmp_path: Path) -> None:
+    """Generation allocation always outranks an open mission."""
+    del tmp_path
+    write_rollback(mission_state(7, dc.STATUS_PENDING, "2" * 40, "1" * 40))
+    generation = supervise.request_run("9" * 40, repo="", uv_path="uv", worker_id="w")
+    assert generation > 7
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.generation == generation
 
 
 def test_wait_for_identity_rejects_non_leader_on_timeout() -> None:
@@ -1057,16 +1329,22 @@ def test_supervise_desired_roundtrip(tmp_path: Path) -> None:
     assert second > first
 
 
-def test_supervise_request_stop_and_detection(tmp_path: Path) -> None:
-    """A stop intent is recorded, and no daemon is detected when absent."""
+def test_supervise_restart_uses_newer_generation_same_commit(tmp_path: Path) -> None:
+    """A restart request bumps the generation while keeping the exact commit."""
     del tmp_path
     assert not supervise.supervisor_running()
-    generation = supervise.request_stop()
+    first = supervise.request_run("a" * 40, repo="/repo", uv_path="uv", worker_id="w")
     desired = supervise.read_desired()
     assert desired is not None
-    assert desired.mode == supervise.MODE_STOPPED
-    assert desired.generation == generation
-    assert not supervise.wait_until_ready(generation, 0.2)
+    assert desired.commit == "a" * 40
+    assert desired.generation == first
+    restart = supervise.request_restart("a" * 40, repo="/repo", uv_path="uv", worker_id="w")
+    assert restart > first
+    after = supervise.read_desired()
+    assert after is not None
+    assert after.commit == "a" * 40
+    assert after.generation == restart
+    assert not supervise.wait_until_ready(restart, 0.2)
 
 
 def test_supervisor_status_command_without_daemon(
@@ -1075,3 +1353,73 @@ def test_supervisor_status_command_without_daemon(
     """The ``--status`` command reports when no daemon is running."""
     assert supervisor_main(["--status"]) == 1
     assert "not running" in capsys.readouterr().out
+
+
+def test_derive_action_stale_state_commit_without_intent_holds(
+    tmp_path: Path,
+) -> None:
+    """A stale state/meta commit never selects a worker without a live intent."""
+    del tmp_path
+    assert supervise.read_desired() is None
+    supervise.write_state(
+        replace(
+            supervise.read_state(),
+            mode=supervise.MODE_RUN,
+            commit="1" * 40,
+            applied_generation=1,
+        )
+    )
+    lifecycle.write_meta(
+        lifecycle.WorkerMeta(
+            schema_version=1,
+            state=lifecycle.STATE_RUNNING,
+            pid=123_458,
+            pgid=123_458,
+            sid=123_458,
+            start_time_ticks=99,
+            token=LEGACY_MARKER,
+            repo="",
+            git_commit="1" * 40,
+            worker_id="w",
+            log_path="",
+            started_at=1.0,
+            stopped_at=None,
+        )
+    )
+    action, commit = _derive_action()
+    assert action == "hold"
+    assert commit is None
+
+
+def test_tick_derives_before_applying_stale_desired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer mission candidate wins before a stale desired intent applies."""
+    del tmp_path
+    supervise.write_state(replace(supervise.read_state(), applied_generation=1))
+    supervise.write_desired(
+        supervise.SupervisorDesired(
+            schema_version=supervise.SCHEMA_VERSION,
+            generation=2,
+            commit="2" * 40,
+            repo="",
+            uv_path="uv",
+            worker_id="w",
+        )
+    )
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.generation == 2
+    assert desired.commit == "2" * 40
+    daemon = SupervisorDaemon(Settings())
+    applied: list[supervise.SupervisorDesired] = []
+    ensured: list[str] = []
+    monkeypatch.setattr(daemon, "_derive_action", lambda _state: ("run", "3" * 40))
+    monkeypatch.setattr(daemon, "_apply_desired", applied.append)
+    monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    daemon._tick(0.0)  # ruff: ignore[private-member-access]
+    assert applied == []
+    assert ensured == ["3" * 40]

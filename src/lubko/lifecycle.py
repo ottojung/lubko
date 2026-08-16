@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -800,6 +800,7 @@ def worker_env(token: str) -> dict[str, str]:
         if not _credential_environment_variable(name)
     }
     env[LIFECYCLE_MARKER_VAR] = token
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 
@@ -1158,6 +1159,12 @@ def _deploy_locked(options: DeployOptions) -> int:
         _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     elif options.bootstrap or options.direct_spawn:
         new_meta = _deploy_direct(options, previous, state, commit, log_file)
+        supervise.request_run(
+            commit,
+            repo=str(options.repo),
+            uv_path=options.uv_path,
+            worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+        )
         _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     else:
         _err(
@@ -2014,55 +2021,156 @@ def status_cmd() -> int:
     return EXIT_OK
 
 
-def stop_cmd(grace_seconds: float) -> int:
-    """Stop the maintained worker by its exact recorded identity.
+def restart_cmd(_args: argparse.Namespace) -> int:
+    """Restart the currently confirmed commit through the external supervisor.
 
-    When the external supervisor is running, the stop is handed to the daemon
-    through the durable protocol so it never resurrects an intentionally
-    stopped worker; otherwise the worker is stopped directly.
+    A restart never uses Git, the network, or the mutable source checkout: the
+    exact commit is read from the supervisor's durable state, a fresh worker
+    process is requested for that same commit at a newer generation, and the
+    command waits until the supervisor proves the replacement consumes the
+    queue. The deployed version never changes.
 
     Args:
-        grace_seconds: Grace period before force-killing.
+        _args: Parsed command line arguments (unused).
 
     Returns:
         A process exit code.
     """
-    meta = read_meta()
-    if meta is None:
-        _err(UNMANAGED_WORKER_MESSAGE)
-        _err("stop the legacy worker manually once; see README 'Bootstrap'")
+    if not supervise.supervisor_running():
+        _err(
+            "no external supervisor is running; a supervised restart is not possible "
+            "(the only supported way to stop Lubko is to stop its environment)"
+        )
         return EXIT_ERROR
-    if supervise.supervisor_running():
-        return _stop_through_supervisor()
-    if not worker_alive(meta):
-        _out("no maintained worker is running")
-        return EXIT_OK
-    _out(f"stopping maintained worker pid {meta.pid} (pgid {meta.pgid}) ...")
-    if not stop_worker(meta, grace_seconds):
-        _err(f"could not stop worker pid {meta.pid}")
+    state = supervise.read_state()
+    commit = state.commit
+    if commit is None or not cli.runtime_is_usable(commit):
+        _err(
+            "no usable sealed runtime to restart"
+            if commit is None
+            else (
+                f"the exact sealed runtime for commit {commit} is missing, corrupt, "
+                "incomplete, or not sealed; refusing to restart"
+            )
+        )
         return EXIT_ERROR
-    write_meta(replace(meta, state=STATE_STOPPED, stopped_at=time.time()))
-    append_deploy_log(f"stopped worker pid={meta.pid}")
-    _out("stopped")
+    previous = supervise.read_status()
+    previous_pid = (
+        previous.child.pid if previous is not None and previous.child is not None else None
+    )
+    _out(f"requesting a supervised restart of confirmed commit {commit} ...")
+    desired = supervise.read_desired()
+    generation = supervise.request_restart(
+        commit,
+        repo=desired.repo if desired is not None else "",
+        uv_path=desired.uv_path if desired is not None else "",
+        worker_id=(
+            desired.worker_id
+            if desired is not None
+            else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
+        ),
+    )
+    if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        _err("the external supervisor did not apply the restart")
+        return EXIT_ERROR
+    if not supervise.wait_until_ready(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        _err("the external supervisor did not prove the fresh worker consumes the queue")
+        return EXIT_ERROR
+    current = supervise.read_status()
+    current_pid = current.child.pid if current is not None and current.child is not None else None
+    if previous_pid is not None and current_pid == previous_pid:
+        _err("the worker process was not replaced by a fresh process")
+        return EXIT_ERROR
+    _out(f"restart complete: fresh worker pid={current_pid}")
     return EXIT_OK
 
 
-def _stop_through_supervisor() -> int:
-    """Ask the external supervisor to stop and hold the maintained worker.
+def migrate_cmd(args: argparse.Namespace) -> int:
+    """Replace stale/corrupt pre-supervisor state with a verified exact commit.
+
+    With no live supervisor this is the explicit, supported migration for
+    production state that predates the external supervisor (stale or legacy
+    ``supervisor/desired.json``, ``supervisor/state.json``, or
+    ``worker/rollback.json``). The operator names an exact commit whose sealed
+    runtime is verified; a strictly newer desired intent is written for it, and
+    corrupt/legacy or stale-pending mission state is replaced (removed or
+    archived terminal), so the next supervisor start reconstructs that exact
+    commit deterministically instead of failing closed. Normal startup without
+    this command stays fail-closed.
+
+    Args:
+        args: Parsed command line arguments.
 
     Returns:
         A process exit code.
     """
-    _out("requesting the external supervisor to stop the maintained worker ...")
-    generation = supervise.request_stop()
-    if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
-        _err("the external supervisor did not apply the stop request")
+    if supervise.supervisor_running():
+        _err("the external supervisor is running; no state migration is needed")
         return EXIT_ERROR
-    current = read_meta()
-    if current is not None and worker_alive(current):
-        _err(f"could not stop worker pid {current.pid}")
+    commit = args.commit
+    if not cli.runtime_is_usable(commit):
+        _err(
+            f"no verified sealed runtime for exact commit {commit}; build or deploy it first "
+            "(refusing to trust mutable state)"
+        )
         return EXIT_ERROR
-    _out("stopped")
+    try:
+        uv_path = resolve_uv(args.uv)
+    except UvResolutionError as exc:
+        _err(str(exc))
+        return EXIT_ERROR
+    try:
+        with deploy_lock(args.lock_timeout):
+            return _migrate_locked(commit, args.repo, uv_path)
+    except LockTimeoutError:
+        _err("another deployment is running; refusing to race")
+        return EXIT_ERROR
+
+
+def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
+    """Write the verified desired intent and replace stale mission state.
+
+    Args:
+        commit: Exact verified commit to run.
+        repo: Maintained checkout the commit belongs to.
+        uv_path: Resolved ``uv`` executable.
+
+    Returns:
+        A process exit code.
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    try:
+        mission = deployctl.read_rollback_state()
+    except deployctl.DeployCtlError:
+        mission = None
+    with supervise.generation_lock():
+        generation = supervise.next_generation()
+        supervise.write_desired(
+            supervise.SupervisorDesired(
+                schema_version=supervise.SCHEMA_VERSION,
+                generation=generation,
+                commit=commit,
+                repo=str(repo),
+                uv_path=uv_path,
+                worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+                restart=False,
+                requested_at=time.time(),
+            )
+        )
+    if mission is None:
+        rollback_state_path().unlink(missing_ok=True)
+        append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
+    elif mission.status == deployctl.STATUS_PENDING and mission.generation < generation:
+        deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)
+        append_deploy_log(
+            f"migration archived stale pending mission generation {mission.generation}"
+        )
+    append_deploy_log(f"migrated lifecycle state to verified exact commit {commit}")
+    _out(f"lifecycle state migrated to verified exact commit {commit}")
+    _out("start the external supervisor (lubko-supervisor) to reconstruct the worker")
     return EXIT_OK
 
 
@@ -2248,15 +2356,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="maintained CLI environment build timeout in seconds (default: 600)",
     )
 
-    stop_parser = subparsers.add_parser(
-        "stop",
-        help="stop the maintained worker by exact identity",
+    subparsers.add_parser(
+        "restart",
+        help="restart the confirmed exact commit through the external supervisor",
     )
-    stop_parser.add_argument(
-        "--grace-seconds",
+
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="replace stale/corrupt pre-supervisor state with a verified exact commit",
+    )
+    migrate_parser.add_argument(
+        "--commit",
+        required=True,
+        help="exact 40-hex commit whose sealed runtime is verified",
+    )
+    migrate_parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="repository checkout the commit belongs to (default: current directory)",
+    )
+    migrate_parser.add_argument(
+        "--uv",
+        default=None,
+        help="uv executable (default: uv on PATH, then the recorded Lubko toolchain path)",
+    )
+    migrate_parser.add_argument(
+        "--lock-timeout",
         type=float,
-        default=DEFAULT_STOP_GRACE_SECONDS,
-        help="grace period before SIGKILL (default: 5)",
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="deploy lock wait timeout in seconds (default: 30)",
     )
 
     repair_parser = subparsers.add_parser(
@@ -2387,7 +2516,8 @@ def main(argv: list[str] | None = None) -> int:
     handlers: dict[str, Callable[[argparse.Namespace], int]] = {
         "status": lambda _namespace: status_cmd(),
         "deploy": deploy_cmd,
-        "stop": lambda namespace: stop_cmd(namespace.grace_seconds),
+        "restart": restart_cmd,
+        "migrate": migrate_cmd,
         "repair": repair_cmd,
         "recover": recover_cmd,
         "log": lambda namespace: log_cmd(namespace.lines),
