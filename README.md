@@ -14,6 +14,33 @@ uv run mypy .
 uv run pytest
 ```
 
+### Testing safety invariant
+
+The full validation suite must be safe to run from the same Unix user and
+container as the live Lubko worker, without changing any live Lubko
+lifecycle/CLI/deploy state and without signalling any live worker process.
+
+This is enforced by default, not by opt-in:
+
+- every test runs with all XDG-backed Lubko state roots (`XDG_STATE_HOME`,
+  `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_BIN_HOME`)
+  redirected to a pytest-owned temporary directory before any lifecycle path
+  can resolve it, and the redirect is inherited by every subprocess the tests
+  spawn;
+- destructive lifecycle helpers (for example the deployment E2E cleanup that
+  stops recorded worker identities) fail closed unless the resolved state root
+  is under the current test's pytest-owned temporary directory, so ambient
+  per-user metadata can never be read or signalled by a test;
+- teardown only signals processes owned by the current test execution through
+  the explicit process-guard registry; lifecycle-state cleanup supplements it
+  only inside the verified test root;
+- an ambient "production-like" sentinel state tree and live worker process are
+  created for the session, and the suite fails if the tree is ever mutated or
+  the sentinel is ever signalled.
+
+Do not relax the isolation in a test; never point `XDG_STATE_HOME` (or another
+XDG home variable) at a real user path from a test.
+
 ## Runtime
 
 The worker reads its PostgreSQL connection settings from a single
@@ -268,6 +295,7 @@ Per-user lifecycle state follows XDG conventions under
 ```sh
 lubko-deploy status
 lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
+lubko-deploy repair --repo DIR --recovery-worker-pid PID [--uv PATH] [--probe-timeout N]
 lubko-deploy stop [--grace-seconds N]
 lubko-deploy log [--lines N]
 ```
@@ -316,6 +344,46 @@ resolved executable is used to run validation (`uv sync`, `ruff`, `mypy`,
 `lubko-deploy stop` terminates the maintained worker with the same precise
 identity validation; it never signals a process that no longer matches the
 recorded identity.
+
+### Repairing corrupted lifecycle state
+
+If lifecycle state was ever corrupted (for example by a pre-isolation test run
+that wrote `test-worker` metadata and a synthetic commit into the live state
+tree), do not repair it by editing `meta.json` and do not run
+`lubko-deploy deploy` as the first action, because its validation executes the
+full test suite.
+
+`lubko-deploy repair` is the supported recovery path. It never trusts the
+stale metadata:
+
+```sh
+# First, start (or verify) a real recovery worker from the intended
+# maintained checkout, for example:
+#   cd /workspace/.lubko-deployment
+#   uv run lubko-worker
+# then adopt its exact, independently known PID:
+lubko-deploy repair --repo /workspace/.lubko-deployment --recovery-worker-pid <PID>
+```
+
+`lubko-deploy repair`:
+
+1. requires a clean checkout and reads its exact git commit;
+2. verifies the supplied PID is a live, session/process-group-leading process
+   whose command line is genuinely a Lubko worker;
+3. verifies PostgreSQL is reachable and that no other live maintained worker
+   or live supervised candidate/previous identity is recorded (a live pending
+   supervised mission blocks the repair);
+4. proves one-consumer queue semantics with a real roundtrip: a probe job must
+   be claimed by a worker carrying the recovery worker's own identifier, after
+   which the probe is cancelled, awaited terminal, and removed;
+5. only then rewrites the maintained metadata with the adopted exact identity,
+   reconciles the maintained CLI `current` pointer to the checkout commit,
+   removes stale readiness markers and CLI roots whose ownership is proven
+   stale, and rewrites an unusable `toolchain.json`.
+
+After a successful repair, verify with `lubko-deploy status` that the reported
+worker identity, worker id, git commit, and maintained CLI pointer are coherent
+again, and confirm a fresh queue roundtrip succeeds.
 
 ### Identity and PID reuse
 
