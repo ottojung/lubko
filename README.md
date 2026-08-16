@@ -295,6 +295,7 @@ Per-user lifecycle state follows XDG conventions under
 ```sh
 lubko-deploy status
 lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
+lubko-deploy recover [--repo DIR] [--uv PATH] [--probe-timeout N]
 lubko-deploy repair --repo DIR --recovery-worker-pid PID [--uv PATH] [--probe-timeout N]
 lubko-deploy stop [--grace-seconds N]
 lubko-deploy log [--lines N]
@@ -354,16 +355,33 @@ tree), do not repair it by editing `meta.json` and do not run
 full test suite.
 
 `lubko-deploy repair` is the supported recovery path. It never trusts the
-stale metadata:
+stale metadata. Start a recovery worker with the supported helper first, which
+deliberately starts a **detached** worker as its own session and
+process-group leader so its exact PID is a stable dedicated identity that
+`repair` can safely adopt later:
 
 ```sh
-# First, start (or verify) a real recovery worker from the intended
-# maintained checkout, for example:
-#   cd /workspace/.lubko-deployment
-#   uv run lubko-worker
-# then adopt its exact, independently known PID:
+# Start a detached recovery worker from the intended maintained checkout:
+lubko-deploy recover --repo /workspace/.lubko-deployment
+# ... then adopt its exact, independently reported PID:
 lubko-deploy repair --repo /workspace/.lubko-deployment --recovery-worker-pid <PID>
 ```
+
+Do **not** start the recovery worker in the foreground (for example
+`cd /workspace/.lubko-deployment && uv run lubko-worker` in a terminal): a
+foreground worker inherits the terminal's session and foreground process group,
+so it is not a session/group leader and `repair` correctly refuses to adopt it,
+because lifecycle stop/replace must never signal an ambient shell group.
+
+`lubko-deploy recover`:
+
+1. requires that no maintained worker is already live, that the checkout is
+   clean, and that PostgreSQL is reachable;
+2. refuses to start a second consumer when another worker is already consuming
+   the queue (adopt that existing worker instead);
+3. starts the recovery worker detached as its own session/process-group leader
+   (the same mechanism a deployment replacement uses) and reports its exact
+   PID, worker id, and commit, without writing any lifecycle metadata.
 
 `lubko-deploy repair`:
 
@@ -373,17 +391,21 @@ lubko-deploy repair --repo /workspace/.lubko-deployment --recovery-worker-pid <P
 3. verifies PostgreSQL is reachable and that no other live maintained worker
    or live supervised candidate/previous identity is recorded (a live pending
    supervised mission blocks the repair);
-4. proves one-consumer queue semantics with a real roundtrip: a probe job must
-   be claimed by a worker carrying the recovery worker's own identifier, after
+4. proves one-consumer queue semantics with a real roundtrip bound to the
+   exact supplied PID: a probe job must be claimed by the supplied worker (the
+   persisted `process_pid` of the probe command must be a descendant of the
+   supplied PID in `/proc`, with `worker_id` as an additional check), after
    which the probe is cancelled, awaited terminal, and removed;
-5. only then rewrites the maintained metadata with the adopted exact identity,
-   reconciles the maintained CLI `current` pointer to the checkout commit,
-   removes stale readiness markers and CLI roots whose ownership is proven
-   stale, and rewrites an unusable `toolchain.json`.
+5. only then rewrites the maintained metadata with the adopted exact identity
+   (recording the worker's real lifecycle token when present), reconciles the
+   maintained CLI `current` pointer to the checkout commit, removes stale
+   readiness markers and CLI roots whose ownership is proven stale, and
+   rewrites an unusable `toolchain.json`.
 
 After a successful repair, verify with `lubko-deploy status` that the reported
 worker identity, worker id, git commit, and maintained CLI pointer are coherent
-again, and confirm a fresh queue roundtrip succeeds.
+again, confirm a fresh queue roundtrip succeeds, and stop any leftover
+recovery/foreground/bridge worker whose identity was not adopted.
 
 ### Identity and PID reuse
 

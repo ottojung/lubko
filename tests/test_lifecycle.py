@@ -1636,3 +1636,176 @@ def test_repair_refuses_when_same_id_other_worker_claims_probe(
     finally:
         kill_proc(supplied)
         kill_proc(claiming)
+
+
+def test_recover_starts_an_adoptable_session_leader(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The supported recover command starts a dedicated adoptable leader.
+
+    The documented recovery flow is ``lubko-deploy recover`` (starts a
+    detached session/process-group-leader worker with a stable exact PID)
+    followed by ``lubko-deploy repair --recovery-worker-pid <PID>``. This
+    proves the flow end to end: the spawned worker is a dedicated leader and
+    repair adopts its exact PID, recording its real lifecycle token.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    spawned: list[subprocess.Popen[bytes]] = []
+    original_spawn = lifecycle.spawn_worker
+
+    def tracking_spawn(
+        repo: Path,
+        uv_path: str,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> subprocess.Popen[bytes]:
+        proc = original_spawn(repo, uv_path, log_path, env)
+        guard.register(proc)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(lifecycle, "spawn_worker", tracking_spawn)
+    monkeypatch.setattr(
+        lifecycle, "_worker_command", lambda _uv: [sys.executable, "-m", "lubko.worker"]
+    )
+    try:
+        code = lifecycle.recover(make_repair_options(repo, probe_timeout=1.0))
+        assert code == EXIT_OK
+        assert len(spawned) == 1
+        pid = spawned[0].pid
+        identity = lifecycle.process_identity(pid)
+        assert identity is not None
+        assert identity.pgid == pid
+        assert identity.sid == pid
+        assert lifecycle._is_lubko_worker_process(pid)
+        assert lifecycle.read_meta() is None
+
+        code = lifecycle.repair(make_repair_options(repo), pid)
+        assert code == EXIT_OK
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == pid
+        assert meta.git_commit == second
+        assert lifecycle.worker_alive(meta)
+    finally:
+        kill_many(spawned)
+
+
+def test_recover_refuses_when_any_worker_consumes(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recover refuses to start a second consumer when the queue is occupied."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    claiming = spawn_real_worker(conf)
+    try:
+        code = lifecycle.recover(make_repair_options(repo, probe_timeout=1.0))
+
+        assert code == EXIT_ERROR
+        assert "already consuming the queue" in capsys.readouterr().err
+        assert lifecycle.read_meta() is None
+        assert claiming.poll() is None
+    finally:
+        kill_proc(claiming)
+
+
+def test_recover_refuses_when_live_maintained_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recover refuses to start a worker while a maintained worker is live."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    worker = spawn_real_worker(conf)
+    try:
+        identity = lifecycle.process_identity(worker.pid)
+        assert identity is not None
+        recorded = WorkerMeta(
+            schema_version=1,
+            state=lifecycle.STATE_RUNNING,
+            pid=identity.pid,
+            pgid=identity.pgid,
+            sid=identity.sid,
+            start_time_ticks=identity.start_time_ticks,
+            token=None,
+            repo=str(repo),
+            git_commit=GIT_SHA,
+            worker_id=REPAIR_WORKER_ID,
+            log_path=str(lifecycle.worker_log_path()),
+            started_at=time.time(),
+            stopped_at=None,
+        )
+        lifecycle.write_meta(recorded)
+        code = lifecycle.recover(make_repair_options(repo, probe_timeout=1.0))
+
+        assert code == EXIT_ERROR
+        assert "live maintained worker" in capsys.readouterr().err
+        assert lifecycle.read_meta() is not None
+    finally:
+        kill_proc(worker)
+
+
+def test_repair_refuses_a_foreground_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreground worker inheriting the terminal group is never adopted.
+
+    A worker started in the foreground (for example ``uv run lubko-worker`` in
+    a terminal) inherits the terminal's session and foreground process group,
+    so it is not a dedicated session/group leader. Repair must refuse it
+    rather than adopt an identity whose group it could never safely signal, and
+    it must never signal the foreground worker or its shared group.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    env = dict(os.environ)
+    env["LUBKO_DATABASE_CONFIG"] = str(conf)
+    env["LUBKO_WORKER_ID"] = REPAIR_WORKER_ID
+    env.update(REPAIR_TIMINGS)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "lubko.worker"],
+        cwd=REPO_ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    guard.register(proc)
+    try:
+        time.sleep(0.3)
+        code = lifecycle.repair(make_repair_options(repo, probe_timeout=1.0), proc.pid)
+
+        assert code == EXIT_ERROR
+        assert lifecycle.read_meta() is None
+        assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        guard.unregister(proc)

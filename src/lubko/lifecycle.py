@@ -70,6 +70,7 @@ DEFAULT_VALIDATION_TIMEOUT_SECONDS: Final = 1200.0
 DEFAULT_GIT_TIMEOUT_SECONDS: Final = 10.0
 DEFAULT_CLI_TIMEOUT_SECONDS: Final = cli.DEFAULT_BUILD_TIMEOUT_SECONDS
 DEFAULT_REPAIR_PROBE_TIMEOUT_SECONDS: Final = 60.0
+DEFAULT_RECOVER_PREFLIGHT_SECONDS: Final = 3.0
 LOCK_POLL_INTERVAL_SECONDS: Final = 0.1
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 5.0
 SESSION_WAIT_INTERVAL_SECONDS: Final = 0.01
@@ -1519,9 +1520,8 @@ def _adoption_candidate(
 
     _repair_rollback_state(recovery_worker_pid)
 
-    worker_id = (
-        _read_process_env(recovery_worker_pid).get("LUBKO_WORKER_ID") or socket.gethostname()
-    )
+    process_env = _read_process_env(recovery_worker_pid)
+    worker_id = process_env.get("LUBKO_WORKER_ID") or socket.gethostname()
     if not _verify_queue_roundtrip(
         worker_id, str(options.repo), recovery_worker_pid, options.probe_timeout_seconds
     ):
@@ -1537,7 +1537,7 @@ def _adoption_candidate(
         pgid=identity.pgid,
         sid=identity.sid,
         start_time_ticks=identity.start_time_ticks,
-        token=None,
+        token=process_env.get(LIFECYCLE_MARKER_VAR),
         repo=str(options.repo),
         git_commit=commit,
         worker_id=worker_id,
@@ -1603,6 +1603,188 @@ def repair(options: DeployOptions, recovery_worker_pid: int) -> int:
     try:
         with deploy_lock(options.lock_timeout_seconds):
             return _repair_locked(options, recovery_worker_pid)
+    except LockTimeoutError:
+        _err("another deployment is already running; refusing to race")
+        return EXIT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Recover
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_any_claim(
+    conn: JobsConnection,
+    probe_id: UUID,
+    timeout_seconds: float,
+) -> bool:
+    """Wait until any worker claims the probe job.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        probe_id: Probe job identifier.
+        timeout_seconds: Maximum seconds to wait.
+
+    Returns:
+        ``True`` when any worker claims the probe while it runs.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        with conn.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(
+                "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
+                (probe_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return False
+        if str(row[0]) == STATE_RUNNING:
+            return True
+        if str(row[0]) in {"succeeded", "failed", "cancelled"}:
+            return False
+        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+    return False
+
+
+def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool:
+    """Return whether any worker is currently consuming the queue.
+
+    A probe job is inserted and must not be claimed by any worker: a claim
+    proves a live consumer already exists, which would make starting a second
+    recovery worker unsafe. The probe is cancelled, awaited terminal, and
+    removed in all cases.
+
+    Args:
+        cwd: Working directory for the probe command.
+        timeout_seconds: Maximum seconds to wait for a claim.
+
+    Returns:
+        ``True`` when some worker claimed the probe.
+    """
+    try:
+        database = load_database_config()
+    except (OSError, ValueError):
+        return False
+    try:
+        conn = psycopg.connect(database.conninfo(), row_factory=tuple_row)
+    except (psycopg.Error, OSError):
+        return False
+    conn.autocommit = True
+    try:
+        probe_id = _insert_probe_job(conn, cwd)
+        if probe_id is None:
+            return False
+        try:
+            return _wait_for_any_claim(conn, probe_id, timeout_seconds)
+        finally:
+            with suppress(psycopg.Error):
+                request_cancel(conn, probe_id)
+            _wait_for_probe_terminal(conn, probe_id, timeout_seconds)
+            with suppress(psycopg.Error):
+                delete_job_and_chunks(conn, probe_id)
+    finally:
+        conn.close()
+
+
+def _recover_preflight(options: DeployOptions) -> str:
+    """Return the recovery checkout commit after preflight safety checks.
+
+    A recovery worker may only be started when no maintained worker is live,
+    the checkout is clean, PostgreSQL is reachable, and no worker is already
+    consuming the queue; otherwise a second consumer would be created.
+
+    Args:
+        options: Deployment inputs.
+
+    Returns:
+        The exact checkout commit the recovery worker will run.
+
+    Raises:
+        _AdoptionError: If a recovery worker cannot safely be started.
+    """
+    previous = read_meta()
+    if previous is not None and worker_alive(previous):
+        msg = (
+            f"a live maintained worker pid {previous.pid} is already recorded; "
+            "no recovery worker is needed"
+        )
+        raise _AdoptionError(msg)
+    if not require_clean_checkout(options.repo, options.git_timeout_seconds):
+        msg = "recovery checkout is dirty; commit or discard working-tree changes first"
+        raise _AdoptionError(msg)
+    commit = git_commit(options.repo, options.git_timeout_seconds)
+    if commit is None:
+        msg = "could not read the git commit of the recovery checkout"
+        raise _AdoptionError(msg)
+    if not check_postgres(options.postgres_timeout_seconds):
+        msg = "cannot reach PostgreSQL; refusing to start a recovery worker"
+        raise _AdoptionError(msg)
+    if _queue_has_consumer(
+        str(options.repo), min(options.probe_timeout_seconds, DEFAULT_RECOVER_PREFLIGHT_SECONDS)
+    ):
+        msg = (
+            "a worker is already consuming the queue; adopt the existing worker with "
+            "'lubko-deploy repair --recovery-worker-pid <PID>' instead of starting a "
+            "second consumer"
+        )
+        raise _AdoptionError(msg)
+    return commit
+
+
+def _recover_locked(options: DeployOptions) -> int:
+    """Start a detached recovery worker and report its adoptable identity.
+
+    The worker is started with the same detached session/process-group-leader
+    mechanism a deployment replacement uses, so its exact PID is a stable
+    dedicated leader that ``lubko-deploy repair --recovery-worker-pid`` can
+    safely adopt later. No lifecycle metadata is written here.
+
+    Args:
+        options: Deployment inputs.
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        commit = _recover_preflight(options)
+    except _AdoptionError as exc:
+        _err(str(exc))
+        return EXIT_ERROR
+    token = secrets.token_hex(16)
+    env = worker_env(token)
+    worker_id = env.get("LUBKO_WORKER_ID") or socket.gethostname()
+    try:
+        proc = spawn_worker(options.repo, options.uv_path, worker_log_path(), env)
+    except OSError as exc:
+        _err(f"could not start the recovery worker: {exc}")
+        return EXIT_ERROR
+    identity = _wait_for_identity(proc.pid)
+    if identity is None or not (identity.pgid == proc.pid and identity.sid == proc.pid):
+        _err("recovery worker exited before establishing a dedicated session")
+        return EXIT_ERROR
+    append_deploy_log(f"recovery worker started pid={identity.pid} commit={commit}")
+    _out(f"recovery worker pid={identity.pid} pgid={identity.pgid} session={identity.sid}")
+    _out(f"worker id: {worker_id}")
+    _out(f"git commit: {commit}")
+    _out(
+        f"adopt it with: lubko-deploy repair --repo {options.repo} "
+        f"--recovery-worker-pid {identity.pid}"
+    )
+    return EXIT_OK
+
+
+def recover(options: DeployOptions) -> int:
+    """Start a detached recovery worker under the deploy lock.
+
+    Args:
+        options: Deployment inputs.
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        with deploy_lock(options.lock_timeout_seconds):
+            return _recover_locked(options)
     except LockTimeoutError:
         _err("another deployment is already running; refusing to race")
         return EXIT_ERROR
@@ -1776,6 +1958,35 @@ def repair_cmd(args: argparse.Namespace) -> int:
     return repair(options, args.recovery_worker_pid)
 
 
+def recover_cmd(args: argparse.Namespace) -> int:
+    """Run the recover subcommand.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        uv_path = resolve_uv(args.uv)
+    except UvResolutionError as exc:
+        _err(str(exc))
+        return EXIT_ERROR
+    options = DeployOptions(
+        repo=args.repo,
+        uv_path=uv_path,
+        bootstrap=False,
+        stop_grace_seconds=DEFAULT_STOP_GRACE_SECONDS,
+        postgres_timeout_seconds=args.db_timeout,
+        lock_timeout_seconds=args.lock_timeout,
+        validation_timeout_seconds=DEFAULT_VALIDATION_TIMEOUT_SECONDS,
+        git_timeout_seconds=args.git_timeout,
+        cli_timeout_seconds=DEFAULT_CLI_TIMEOUT_SECONDS,
+        probe_timeout_seconds=args.probe_timeout,
+    )
+    return recover(options)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``lubko-deploy`` command line parser.
 
@@ -1918,6 +2129,49 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="start a detached recovery worker and report its adoptable identity",
+    )
+    recover_parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="repository checkout the recovery worker runs (default: current directory)",
+    )
+    recover_parser.add_argument(
+        "--uv",
+        default=None,
+        help="uv executable (default: uv on PATH, then the recorded Lubko toolchain path)",
+    )
+    recover_parser.add_argument(
+        "--db-timeout",
+        type=float,
+        default=DEFAULT_POSTGRES_TIMEOUT_SECONDS,
+        help="PostgreSQL verification timeout in seconds (default: 5)",
+    )
+    recover_parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="deploy lock wait timeout in seconds (default: 30)",
+    )
+    recover_parser.add_argument(
+        "--git-timeout",
+        type=float,
+        default=DEFAULT_GIT_TIMEOUT_SECONDS,
+        help="git commit lookup timeout in seconds (default: 10)",
+    )
+    recover_parser.add_argument(
+        "--probe-timeout",
+        type=float,
+        default=DEFAULT_REPAIR_PROBE_TIMEOUT_SECONDS,
+        help=(
+            "maximum seconds to wait when detecting an existing queue consumer (default: 60, "
+            "capped at 3)"
+        ),
+    )
+
     log_parser = subparsers.add_parser("log", help="show the tail of the worker log")
     log_parser.add_argument(
         "--lines",
@@ -1945,6 +2199,7 @@ def main(argv: list[str] | None = None) -> int:
         "deploy": deploy_cmd,
         "stop": lambda namespace: stop_cmd(namespace.grace_seconds),
         "repair": repair_cmd,
+        "recover": recover_cmd,
         "log": lambda namespace: log_cmd(namespace.lines),
     }
     handler = handlers.get(args.command)
