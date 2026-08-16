@@ -1251,7 +1251,7 @@ The most useful findings arrive *before* the task completes: a reviewer flagging
 
 Rules:
 
-- Ask agents to report early, risky findings in their prompt: *"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end."*
+- Ask agents to report early, risky findings in their prompt: *"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end."* Do not require agents to finish before communicating.
 - When the orchestrator spots something mid-flight, share it immediately with the affected agent via a steering prompt, even if it means the agent re-plans. A stopped-wrong task is cheaper than a finished-wrong task.
 - Keep partial progress durable: ask agents to commit incrementally on their branch, not only at the end.
 
@@ -1372,20 +1372,25 @@ Lubko represents stdout/stderr as bounded rolling live tails; older output is av
 
 ---
 
-# Scheduled issue heartbeat coordination
+# GitHub issue status coordination
 
-Recurring scheduled orchestrators that work GitHub issues must additionally follow [`docs/skills/scheduled.md`](skills/scheduled.md). Their durable soft-ownership signal is **one editable status comment on the target issue**, not Lubko command traffic.
+Every orchestrator that works on a GitHub issue must maintain **one editable orchestrator status comment on that issue** for the duration of the work.
 
-For scheduled issue work:
+For issue work:
 
-- create or inherit the issue's scheduled-orchestrator status comment before substantial work;
-- while the status is `working`, refresh its heartbeat at least every 5 minutes;
-- treat a `working` heartbeat at least 10 minutes old as abandoned and inheritable;
-- before every heartbeat refresh, re-read the status comment and stop orchestrating the issue if its owner has changed;
-- keep concrete recovery handles in the comment — worktree/clone paths, branch, PR, Lubko agent IDs, root job UUIDs, and similar identifiers as applicable;
-- do not infer scheduled ownership or abandonment from agent silence, CPU activity, lack of new commits, or lack of newly submitted Lubko commands.
+- create or inherit the issue's orchestrator status comment before substantial work;
+- while the status is `working`, update the same comment at least every 5 minutes;
+- use the comment's GitHub `updated_at` as the authoritative activity time;
+- treat a `working` comment whose `updated_at` is at least 10 minutes old as abandoned and inheritable;
+- before every refresh, re-read the canonical status comment and stop orchestrating the issue if its owner has changed;
+- list the resources currently owned by the orchestrator according to its own judgment. This should include Lubko work directories and managed agents when they exist, and may include branches, PRs, root job UUIDs, temporary clones, or other useful recovery handles;
+- mark the comment `completed` when the issue workflow is actually complete.
 
-This coordination mechanism is deliberately **GitHub-layer only**. It does not add task IDs, owner IDs, lease keys, or other authorization fields to `lubko.jobs`, and `lubko-agent` remains unaware of scheduled-orchestrator ownership.
+Use one machine-recognizable marker, `<!-- lubko-orchestrator-status -->`, so later orchestrators can locate the comment reliably. If a race creates more than one marked comment, the most recently updated marked comment is canonical.
+
+Do not infer issue ownership or abandonment from agent silence, CPU activity, lack of new commits, or lack of newly submitted Lubko commands. The issue status comment is the ownership record.
+
+Recurring scheduled orchestrators must additionally follow [`docs/skills/scheduled.md`](skills/scheduled.md) for startup, inheritance, issue selection, recovery, and release-branch behavior.
 
 ---
 
@@ -1419,7 +1424,7 @@ Do not turn routine development operations back into instructions for the user w
 | Base commits | cut branches from a known, clean, tested SHA | cutting from a drifted tree |
 | Blockers/correctness bugs | fix before merge, on the current PR | merging known-correctness bugs |
 | Important non-critical findings | open an issue with context, rationale, evidence, and a link to the branch/commit; postpone | expanding the current task / losing the finding in logs or chat |
-| Scheduled issue ownership | one editable issue status comment; heartbeat at least every 5 minutes; inherit after 10 minutes stale | inferring ownership from Lubko command traffic or agent silence |
+| GitHub issue ownership | one editable status comment; update it at least every 5 minutes; use GitHub `updated_at`; inherit after 10 minutes stale | inferring ownership from agent or command activity |
 | Commit/push/deploy | separate, explicit, in order; push work branches early; direct push to the default branch only with established user intent | conflating any two |
 | Deployment | only when asked, via the managed tool, then a real smoke | implicit deploy, manual signals |
 | Secrets | design them out; verify by absence | printing/dumping values |
