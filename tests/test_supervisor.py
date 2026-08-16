@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -40,7 +41,7 @@ from lubko.worker import (
     publish_output,
     request_cancel,
     verify_jobs_table_invariant,
-    verify_v2_schema,
+    verify_protocol_schema,
 )
 from tests import _process_guard as guard
 
@@ -55,8 +56,8 @@ CHUNK_MAX_BYTES: Final = 2000
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
 
-#: A two-column table without the canonical v2 output-chunk shape (no
-#: type-aware constraint, no chunk indexes): the startup guard must refuse it.
+#: A two-column table without the canonical output-chunk shape (no type-aware
+#: constraint, no chunk indexes): the startup guard must refuse it.
 PRE_CANONICAL_SCHEMA_DDL: Final = """
 create table lubko.jobs (
     id uuid primary key default gen_random_uuid(),
@@ -171,47 +172,51 @@ def _kill_leftover_groups(db: str) -> None:
                 os.killpg(int(pgid), signal.SIGKILL)
 
 
+def shell_command_argv(command: str) -> list[str]:
+    """Wrap a shell snippet as an explicit process argv that execs ``sh``.
+
+    The v3 protocol executes ``request.process`` directly and never runs a
+    shell implicitly. Tests that need shell semantics therefore select the
+    shell interpreter themselves, exactly as a v3 orchestrator would.
+
+    Args:
+        command: Shell snippet to run through ``sh -c``.
+
+    Returns:
+        An argv array that execs the snippet through ``/bin/sh``.
+    """
+    return [shutil.which("sh") or "/bin/sh", "-c", command]
+
+
 def insert_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v2 pending command job.
+    """Insert a protocol v3 pending command job running a shell snippet.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        command: Shell snippet, executed by an explicit ``/bin/sh -c`` argv.
+
+    Returns:
+        The job identifier.
+    """
+    return insert_process_job(conninfo, cwd, shell_command_argv(command))
+
+
+def insert_process_job(conninfo: str, cwd: str, process: list[str]) -> UUID:
+    """Insert a protocol v3 pending command job executing argv directly.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        cwd: Working directory for the job.
+        process: Non-empty argv array to execute directly.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
-        "state": {"status": "pending"},
-    })
-    with psycopg.connect(conninfo) as conn:
-        row = conn.execute(
-            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
-            (payload,),
-        ).fetchone()
-    assert row is not None
-    return cast("UUID", row[0])
-
-
-def insert_args_job(conninfo: str, cwd: str, args: list[str]) -> UUID:
-    """Insert a protocol v2 pending argv-style command job.
-
-    Args:
-        conninfo: PostgreSQL connection string.
-        cwd: Working directory for the job.
-        args: argv-style command to execute directly.
-
-    Returns:
-        The job identifier.
-    """
-    payload = json.dumps({
-        "v": 2,
-        "type": "command",
-        "request": {"cwd": cwd, "args": args},
+        "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -324,28 +329,28 @@ def wait_until(predicate: object, timeout: float = 30.0) -> None:
     raise AssertionError(msg)
 
 
-def test_v2_worker_refuses_pre_canonical_shape(jobs_db: str, pg_cluster: _pg.PgCluster) -> None:
-    """A two-column table lacking the v2 output-chunk shape is refused."""
+def test_v3_worker_refuses_non_canonical_schema(jobs_db: str, pg_cluster: _pg.PgCluster) -> None:
+    """A two-column table lacking the canonical output-chunk shape is refused."""
     with psycopg.connect(jobs_db) as conn:
         conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
         conn.execute(PRE_CANONICAL_SCHEMA_DDL)
     with psycopg.connect(jobs_db) as conn:
         verify_jobs_table_invariant(conn)
         with pytest.raises(SchemaInvariantError, match=r"0001_two_column_protocol\.sql"):
-            verify_v2_schema(conn)
+            verify_protocol_schema(conn)
 
     with pytest.raises(SchemaInvariantError):
         Supervisor(supervisor_settings(), make_database_config(pg_cluster)).run()
 
 
-def test_v2_worker_accepts_fresh_baseline_schema(jobs_db: str) -> None:
+def test_v3_worker_accepts_fresh_baseline_schema(jobs_db: str) -> None:
     """A fresh install applying the canonical baseline alone is fully usable."""
     with psycopg.connect(jobs_db) as conn:
         conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
         conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
     with psycopg.connect(jobs_db) as conn:
         verify_jobs_table_invariant(conn)
-        verify_v2_schema(conn)
+        verify_protocol_schema(conn)
         row = conn.execute(
             "SELECT conname FROM pg_constraint "
             "WHERE conrelid = 'lubko.jobs'::regclass AND contype = 'c'"
@@ -389,7 +394,7 @@ $$;
 def test_worker_role_can_operate_on_a_fresh_install(
     jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
 ) -> None:
-    """A non-superuser ``lubko_worker`` role can run a full v2 worker.
+    """A non-superuser ``lubko_worker`` role can run a full v3 worker.
 
     On a purged database the canonical baseline grants the worker role schema
     usage plus SELECT/INSERT/UPDATE on ``lubko.jobs``. This test provisions a
@@ -408,9 +413,9 @@ def test_worker_role_can_operate_on_a_fresh_install(
     # worker role can insert an immutable output_chunk row.
     with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
         verify_jobs_table_invariant(conn)
-        verify_v2_schema(conn)
+        verify_protocol_schema(conn)
         chunk_payload = json.dumps({
-            "v": 2,
+            "v": 3,
             "type": "output_chunk",
             "thread": str(uuid4()),
             "stream": "stdout",
@@ -634,21 +639,21 @@ def test_one_job_failure_isolation(jobs_db: str, pg_cluster: _pg.PgCluster, tmp_
 def test_job_runs_in_declared_working_directory(
     jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
 ) -> None:
-    """A shell and an argv job actually execute inside their declared cwd."""
+    """v3 process argv (direct and via an explicit sh) executes in its declared cwd."""
     work_dir = tmp_path / "runner"
     work_dir.mkdir()
-    shell_id = insert_job(jobs_db, str(work_dir), "pwd")
-    argv_id = insert_args_job(
+    sh_id = insert_job(jobs_db, str(work_dir), "pwd")
+    process_id = insert_process_job(
         jobs_db,
         str(work_dir),
         [sys.executable, "-c", "import os; print(os.getcwd())"],
     )
 
     with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
-        wait_until(lambda: read_status(jobs_db, shell_id) == "succeeded")
-        wait_until(lambda: read_status(jobs_db, argv_id) == "succeeded")
+        wait_until(lambda: read_status(jobs_db, sh_id) == "succeeded")
+        wait_until(lambda: read_status(jobs_db, process_id) == "succeeded")
 
-    for job_id in (shell_id, argv_id):
+    for job_id in (sh_id, process_id):
         payload = read_root(jobs_db, job_id)
         assert payload["state"]["status"] == "succeeded"
         assert payload["result"]["exit_code"] == 0
@@ -674,12 +679,12 @@ def test_preflight_rejects_nonexistent_working_directory(
     assert read_status(jobs_db, healthy) == "succeeded"
 
 
-def test_preflight_rejects_request_with_neither_command_nor_args(
+def test_claim_rejects_request_without_process_without_harming_others(
     jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
 ) -> None:
-    """A parseable request with no command or args fails without harming others."""
+    """A v3 request missing request.process fails cleanly without harming others."""
     bad_payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
         "request": {"cwd": str(tmp_path)},
         "state": {"status": "pending"},
@@ -701,8 +706,61 @@ def test_preflight_rejects_request_with_neither_command_nor_args(
 
     payload = read_root(jobs_db, bad_id)
     assert payload["state"]["status"] == "failed"
-    assert payload["result"]["exit_code"] == 127
-    assert "request has neither command nor args" in payload["result"]["stderr"]
+    assert payload["result"]["exit_code"] == 2
+    assert "request.process" in payload["result"]["stderr"]
+    assert "invalid job payload" in payload["result"]["stderr"]
+    assert read_status(jobs_db, healthy) == "succeeded"
+
+
+def test_process_argv_passes_shell_metacharacters_literally(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """The v3 worker passes shell metacharacters literally, with no shell evaluation."""
+    literal = "a;b $HOME *.txt $(id)"
+    job_id = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [sys.executable, "-c", "import sys; print(sys.argv[1])", literal],
+    )
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+
+    payload = read_root(jobs_db, job_id)
+    assert payload["state"]["status"] == "succeeded"
+    assert payload["result"]["exit_code"] == 0
+    assert payload["result"]["stdout"].strip() == literal
+    assert not payload["result"]["stderr"]
+
+
+def test_legacy_v2_payloads_are_rejected_as_unsupported_version(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A v2 payload carrying request.command is rejected, not executed."""
+    v2_payload = json.dumps({
+        "v": 2,
+        "type": "command",
+        "request": {"cwd": str(tmp_path), "command": "echo v2-only"},
+        "state": {"status": "pending"},
+    })
+    with psycopg.connect(jobs_db) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (v2_payload,),
+        ).fetchone()
+    assert row is not None
+    job_id = cast("UUID", row[0])
+    healthy = insert_job(jobs_db, str(tmp_path), "echo healthy")
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, healthy) == "succeeded")
+        wait_until(lambda: read_status(jobs_db, job_id) == "failed")
+
+    payload = read_root(jobs_db, job_id)
+    assert payload["state"]["status"] == "failed"
+    assert payload["result"]["exit_code"] == 2
+    assert "unsupported protocol version" in payload["result"]["stderr"]
+    assert "invalid job payload" in payload["result"]["stderr"]
     assert read_status(jobs_db, healthy) == "succeeded"
 
 
@@ -818,7 +876,7 @@ def test_cleanup_deletes_root_and_all_owned_chunks(
 
     orphan_id = UUID("11111111-1111-1111-1111-111111111111")
     orphan_payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "output_chunk",
         "thread": str(job_id),
         "stream": "stderr",
@@ -861,8 +919,7 @@ def _publish_job_for(job_id: UUID, cwd: str) -> ActiveJob:
     job = ActiveJob(
         id=job_id,
         cwd=cwd,
-        command="sleep 30",
-        args=None,
+        process=(sys.executable, "-c", "import time; time.sleep(30)"),
         proc=proc,
         pid=proc.pid,
         pgid=proc.pid,
@@ -1190,7 +1247,7 @@ def test_claim_rejects_unparseable_job_without_affecting_others(
 ) -> None:
     """An unparseable claimed job fails cleanly while others keep running."""
     bad_payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
         "request": {"cwd": ""},
         "state": {"status": "pending"},

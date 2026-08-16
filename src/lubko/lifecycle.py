@@ -1321,15 +1321,15 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
 
     Args:
         conn: Open PostgreSQL connection.
-        cwd: Working directory for the probe command.
+        cwd: Working directory for the probe process.
 
     Returns:
         The probe job identifier, or ``None`` if the insert failed.
     """
     probe_payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": "sleep 60"},
+        "request": {"cwd": cwd, "process": [sys.executable, "-c", "import time; time.sleep(60)"]},
         "state": {"status": "pending"},
     })
     with conn.cursor() as cursor:

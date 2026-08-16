@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -73,21 +74,36 @@ def db(jobs_db: str) -> str:
     return jobs_db
 
 
+def shell_command_argv(command: str) -> list[str]:
+    """Wrap a shell snippet as an explicit process argv that execs ``sh``.
+
+    v3 executes request.process directly; tests that need shell semantics
+    select the shell interpreter explicitly, as a v3 orchestrator would.
+
+    Args:
+        command: Shell snippet to run through ``sh -c``.
+
+    Returns:
+        An argv array that execs the snippet through ``/bin/sh``.
+    """
+    return [shutil.which("sh") or "/bin/sh", "-c", command]
+
+
 def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v2 pending command job.
+    """Insert a protocol v3 pending command job running a shell snippet.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        command: Shell snippet, executed by an explicit ``/bin/sh -c`` argv.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -105,15 +121,15 @@ def insert_running_without_lease(conninfo: str, cwd: str, command: str) -> UUID:
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        command: Shell snippet, executed by an explicit ``/bin/sh -c`` argv.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {
             "status": "running",
             "worker_id": "stale-worker",

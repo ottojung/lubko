@@ -1,4 +1,4 @@
--- Lubko transport queue baseline: the canonical protocol v2 two-column schema.
+-- Lubko transport queue baseline: the canonical protocol v3 two-column schema.
 --
 -- THE INVARIANT
 --
@@ -12,16 +12,34 @@
 -- by the top-level "v" field. SQL casts payload::jsonb only transiently for
 -- predicates and atomic jsonb_set updates; every stored value is ::text.
 --
--- Protocol v2 distinguishes command rows from immutable output_chunk rows.
--- Constraints are type-aware: command rows must carry a request object and a
+-- Protocol v3 distinguishes command rows from immutable output_chunk rows.
+-- A command request carries exactly one executable field: request.process,
+-- but protocol shape is validated entirely in the payload parser
+-- (src/lubko/protocol.py): a command row must carry a request object plus a
 -- lifecycle state.status, while output_chunk rows must carry thread ownership
--- and offset/value shape. Claim/recovery queries operate only on command rows,
--- and the worker verifies this output-chunk shape at startup.
+-- and offset/value shape. The parser requires request.process to be a
+-- non-empty array of non-empty strings and rejects the legacy protocol v2
+-- request.command / request.args keys outright; none of that validation is
+-- encoded as SQL. Because the v2 -> v3 change is content-only, the physical
+-- two-column table does NOT change between versions. Claim/recovery queries
+-- operate only on command rows, and the worker verifies this output-chunk
+-- shape at startup.
 --
 -- This file is the complete current schema for a fresh installation. It is
 -- idempotent: every statement is safe to run more than once. The two-column
 -- table is the only supported binding: no staging table, no older schema, and
 -- no rollback path to maintain.
+--
+-- The v2 -> v3 cutover is DESTRUCTIVE and needs NO DDL upgrade. Protocol v3
+-- does not accept v2 rows and there is no protocol-data drain/migration or compatibility
+-- path; the physical schema is identical for v2 and v3. The cutover runs
+-- against the live queue: quiesce new submissions, let any in-flight v2 work
+-- become durably terminal, bring up and prove the v3 supervisor/worker, then
+-- `truncate lubko.jobs` while quiescent (dropping every old root command row
+-- and every output_chunk row), and prove a fresh v3 round trip. Truncating
+-- before the first v3 start is equally valid; only the end state matters, and
+-- that end state is an empty transport. No v2 row is transformed, migrated,
+-- or preserved, and no existing table is altered.
 
 create table if not exists lubko.jobs (
     id uuid primary key default gen_random_uuid(),
@@ -46,7 +64,7 @@ create table if not exists lubko.jobs (
 );
 
 -- Worker role access is part of the binding: lubko_worker is the stable role
--- the worker connects as (see README configuration). Protocol v2 requires the
+-- the worker connects as (see README configuration). Protocol v3 requires the
 -- worker to read and claim jobs (SELECT, UPDATE), to finalize and publish
 -- output (UPDATE), and to insert immutable output_chunk rows (INSERT). It also
 -- needs USAGE on the lubko schema to reach the table. GRANT is idempotent, and
