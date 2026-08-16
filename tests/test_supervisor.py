@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -25,10 +26,12 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 
+import lubko.worker as worker_module
 from lubko.config import DatabaseConfig
 from lubko.worker import (
     CHUNK_ORDER_INDEX_NAME,
     CHUNK_OWNER_INDEX_NAME,
+    JOBS_CHANGED_CHANNEL,
     OUTPUT_STREAM_STDOUT,
     TYPE_AWARE_CONSTRAINT_NAME,
     ActiveJob,
@@ -48,6 +51,7 @@ from tests import _process_guard as guard
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from lubko.worker import ClaimedJob, JobsConnection
     from tests import _pg
 
 OUTPUT_TAIL_MAX_BYTES: Final = 4000
@@ -1276,3 +1280,588 @@ def test_claim_rejects_unparseable_job_without_affecting_others(
     assert row is not None
     assert row[0] == "failed"
     assert "invalid job payload" in row[1]
+
+
+# ---------------------------------------------------------------------------
+# Event-driven wakeup regressions (issue #20)
+# ---------------------------------------------------------------------------
+
+
+def _quiet_recovery_settings(worker_id: str = "test-worker") -> Settings:
+    """Return settings that disable timer-driven idle polling.
+
+    The stale-lease-recovery deadline is pushed far out so an idle loop blocks
+    on the notification socket instead of turning on a timer: without a
+    notification or a real deadline, an idle worker must run no queue work for
+    ~60 seconds.
+
+    Args:
+        worker_id: Worker identifier to record.
+
+    Returns:
+        Settings with a far-future recovery deadline.
+    """
+    base = supervisor_settings()
+    return Settings(
+        worker_id=worker_id,
+        poll_interval_seconds=base.poll_interval_seconds,
+        process_poll_interval_seconds=base.process_poll_interval_seconds,
+        cancel_grace_seconds=base.cancel_grace_seconds,
+        worker_incarnation=base.worker_incarnation,
+        lease_duration_seconds=base.lease_duration_seconds,
+        lease_refresh_interval_seconds=base.lease_refresh_interval_seconds,
+        lease_recovery_interval_seconds=60.0,
+        output_publication_interval_seconds=base.output_publication_interval_seconds,
+        claim_batch_limit=base.claim_batch_limit,
+        lease_safety_margin_seconds=base.lease_safety_margin_seconds,
+        db_operation_timeout_seconds=base.db_operation_timeout_seconds,
+    )
+
+
+def _wait_until_listening(listener: Supervisor) -> None:
+    """Wait until LISTEN and the first durable scan have completed.
+
+    ``_listen_ready`` is a level-triggered readiness marker: it becomes true
+    only after LISTEN has committed and the immediate durable scan has returned
+    with no known backlog. Unlike the internal scan-pending latch, it cannot be
+    missed by this test thread between supervisor turns.
+
+    Args:
+        listener: The running supervisor.
+
+    Raises:
+        AssertionError: If startup readiness is not reached in time.
+    """
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        if listener._listen_ready:  # ruff: ignore[private-member-access] - test synchronization marker
+            return
+        time.sleep(0.01)
+    msg = "supervisor never completed LISTEN plus its first durable scan"
+    raise AssertionError(msg)
+
+
+def test_supervisor_listener_connection_uses_autocommit(
+    jobs_db: str, pg_cluster: _pg.PgCluster
+) -> None:
+    """The long-lived LISTEN connection must idle outside transactions."""
+    with supervisor_running(
+        _quiet_recovery_settings(), make_database_config(pg_cluster), jobs_db
+    ) as sup:
+        _wait_until_listening(sup)
+        assert sup.conn is not None
+        assert sup.conn.autocommit is True
+
+
+def test_already_buffered_notification_drains_before_select_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-buffered notification wakes the event loop immediately.
+
+    A NOTIFY can arrive while the supervisor's own query is being serviced:
+    libpq consumes it off the socket into its input queue, so a fresh
+    ``select`` on the connection fd never reports readability and the wake
+    would otherwise be delayed until a timer. ``_wait_for_events`` must drain
+    already-buffered notifications before blocking. This unit pins that
+    control flow: the drain reports one buffered notification, so
+    ``_wait_for_events`` must return immediately — never reaching
+    ``select.select`` (poisoned here to fail loudly) — with the durable-scan
+    latch set for the next tick.
+    """
+    sup = Supervisor(
+        _quiet_recovery_settings(),
+        DatabaseConfig(host="localhost", port=0, dbname="postgres", user="postgres", password=""),
+    )
+    sup._install_wakeup_pipe()  # ruff: ignore[private-member-access] - the test drives the event loop directly
+    sup.conn = cast("JobsConnection", object())
+    try:
+
+        def _buffered_one(_conn: JobsConnection) -> int:
+            return 1
+
+        monkeypatch.setattr(worker_module, "drain_notifications", _buffered_one)
+
+        def _select_must_not_run(*_args: object, **_kwargs: object) -> object:
+            msg = "_wait_for_events blocked on select despite a buffered notification"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(select, "select", _select_must_not_run)
+
+        started = time.monotonic()
+        sup._wait_for_events(60.0)  # ruff: ignore[private-member-access] - the test drives the event loop directly
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.5
+        assert sup._durable_scan_pending  # ruff: ignore[private-member-access] - the test inspects the wake latch
+    finally:
+        sup._close_wakeup_pipe()  # ruff: ignore[private-member-access] - the test owns the wake pipe
+
+
+def _drain_wake_notifications(listener: psycopg.Connection[Any]) -> int:
+    """Count and consume every job-channel notification on a connection.
+
+    psycopg keeps a received notification either in its own backlog or in the
+    libpq input queue depending on how it arrived, so both sources are drained.
+
+    Args:
+        listener: A PostgreSQL connection subscribed to the wakeup channel.
+
+    Returns:
+        The number of notifications waiting on the connection.
+    """
+    count = 0
+    for _ in listener.notifies(timeout=0):
+        count += 1
+    listener.pgconn.consume_input()
+    while listener.pgconn.notifies() is not None:
+        count += 1
+    return count
+
+
+def _expect_wake_notifications(
+    listener: psycopg.Connection[Any], expected: int, timeout: float = 3.0
+) -> None:
+    """Wait for exactly ``expected`` wakeup notifications, failing on any surplus.
+
+    PostgreSQL delivers notifications asynchronously, so the drain loop retries
+    until the expected count arrives; any surplus (a wakeup that should not
+    have fired) is caught and fails the assertion.
+
+    Args:
+        listener: A PostgreSQL connection subscribed to the wakeup channel.
+        expected: The exact number of notifications expected.
+        timeout: Maximum seconds to wait for the expected notifications.
+    """
+    time.sleep(0.05)
+    collected = 0
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and collected < expected:
+        collected += _drain_wake_notifications(listener)
+        time.sleep(0.02)
+    collected += _drain_wake_notifications(listener)
+    assert collected == expected
+
+
+def test_wakeup_trigger_notifies_only_actionable_command_changes(
+    jobs_db: str, tmp_path: Path
+) -> None:
+    """The baseline wakeup trigger is precise about what wakes an idle worker.
+
+    The canonical trigger must notify for a submitted/requeued pending command
+    and for a freshly introduced cancellation marker on a running command, and
+    stay silent for output_chunk rows and for the worker's own writes (claims,
+    lease heartbeats, output publication, finalization) so a busy worker is
+    never woken in a loop by its own activity.
+    """
+    with psycopg.connect(jobs_db, autocommit=True) as listener:
+        listener.execute(f"LISTEN {JOBS_CHANGED_CHANNEL}")
+        insert = "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id"
+        command_payload = json.dumps({
+            "v": 3,
+            "type": "command",
+            "request": {"cwd": str(tmp_path), "process": shell_command_argv("true")},
+            "state": {"status": "pending"},
+        })
+        with psycopg.connect(jobs_db, autocommit=True) as writer:
+            row = writer.execute(insert, (command_payload,)).fetchone()
+            assert row is not None
+            job_id = cast("UUID", row[0])
+
+        listener.execute("SELECT 1")
+        _expect_wake_notifications(listener, 1)
+
+        # A pending command claimed by the worker (pending -> running) must not
+        # notify: absorbing its own claim must not wake the worker.
+        with psycopg.connect(jobs_db, autocommit=True) as writer:
+            writer.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = jsonb_set("
+                "jsonb_set(payload::jsonb, '{state,status}', to_jsonb('running'::text)), "
+                "'{state,updated_at}', to_jsonb(now())\n"
+                ")::text\n"
+                "WHERE id = %s",
+                (job_id,),
+            )
+        listener.execute("SELECT 1")
+        _expect_wake_notifications(listener, 0)
+
+        # A lease heartbeat and an output publication (worker writes updating a
+        # still-running command row) must not notify.
+        with psycopg.connect(jobs_db, autocommit=True) as writer:
+            writer.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = jsonb_set("
+                "payload::jsonb, '{state,updated_at}', to_jsonb(now())\n"
+                ")::text\n"
+                "WHERE id = %s",
+                (job_id,),
+            )
+        listener.execute("SELECT 1")
+        _expect_wake_notifications(listener, 0)
+
+        # A freshly introduced cancellation marker on a running command is the
+        # exact durable change an idle worker must discover promptly.
+        with psycopg.connect(jobs_db, autocommit=True) as writer:
+            writer.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = jsonb_set("
+                "jsonb_set(payload::jsonb, '{state,cancel_requested_at}', to_jsonb(now())), "
+                "'{state,updated_at}', to_jsonb(now())\n"
+                ")::text\n"
+                "WHERE id = %s",
+                (job_id,),
+            )
+        listener.execute("SELECT 1")
+        _expect_wake_notifications(listener, 1)
+
+        # Finalizing the job (running -> succeeded) is a worker write and must
+        # not notify.
+        with psycopg.connect(jobs_db, autocommit=True) as writer:
+            writer.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = jsonb_set("
+                "jsonb_set(payload::jsonb, '{state,status}', to_jsonb('succeeded'::text)), "
+                "'{state,updated_at}', to_jsonb(now())\n"
+                ")::text\n"
+                "WHERE id = %s",
+                (job_id,),
+            )
+        listener.execute("SELECT 1")
+        _expect_wake_notifications(listener, 0)
+
+        # An external requeue (UPDATE into pending from a non-pending state)
+        # must notify, and an unchanged running heartbeat must remain silent.
+        with psycopg.connect(jobs_db, autocommit=True) as writer:
+            writer.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = jsonb_set("
+                "jsonb_set(payload::jsonb, '{state,status}', to_jsonb('pending'::text)), "
+                "'{state,updated_at}', to_jsonb(now())\n"
+                ")::text\n"
+                "WHERE id = %s",
+                (job_id,),
+            )
+        listener.execute("SELECT 1")
+        _expect_wake_notifications(listener, 1)
+
+        # Immutable output_chunk inserts are never wakeups.
+        chunk_payload = json.dumps({
+            "v": 3,
+            "type": "output_chunk",
+            "thread": str(uuid4()),
+            "stream": "stdout",
+            "sequence": 0,
+            "start": 0,
+            "end": 5,
+            "value": "hello",
+            "previous": None,
+        })
+        with psycopg.connect(jobs_db, autocommit=True) as writer:
+            writer.execute(insert, (chunk_payload,))
+        listener.execute("SELECT 1")
+        _expect_wake_notifications(listener, 0)
+
+
+def test_notification_wakes_idle_worker_promptly(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """An idle worker claims a newly inserted job on the notification, not a timer.
+
+    The recovery deadline is pushed to ~60s, so a timer turn cannot explain a
+    prompt claim: only the PostgreSQL wakeup notification can wake the blocked
+    loop. The measurement is well below the deadline and proves the worker is
+    not sleeping on a fixed idle tick.
+    """
+    with supervisor_running(
+        _quiet_recovery_settings(), make_database_config(pg_cluster), jobs_db
+    ) as sup:
+        _wait_until_listening(sup)
+        started = time.monotonic()
+        job_id = insert_job(jobs_db, str(tmp_path), "echo woke")
+        wait_until(lambda: read_status(jobs_db, job_id) != "pending", timeout=10.0)
+        elapsed = time.monotonic() - started
+        assert elapsed < 3.0
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded", timeout=10.0)
+
+    assert read_status(jobs_db, job_id) == "succeeded"
+
+
+def test_cancellation_notification_wakes_worker_promptly(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A running-job cancellation marker is discovered via the notification."""
+    job_id = insert_job(jobs_db, str(tmp_path), "sleep 30")
+
+    with supervisor_running(_quiet_recovery_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "running")
+        started = time.monotonic()
+        with psycopg.connect(jobs_db) as conn:
+            status = request_cancel(conn, job_id)
+        assert status == "running"
+        wait_until(lambda: read_status(jobs_db, job_id) == "cancelled", timeout=10.0)
+        elapsed = time.monotonic() - started
+        assert elapsed < 3.0
+
+    assert read_status(jobs_db, job_id) == "cancelled"
+
+
+def test_no_idle_timer_claim_or_cancel_polling(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle worker never polls the queue for claims or cancellations.
+
+    The claim and cancellation-discovery queries are counted. After the
+    initial LISTEN-and-scan the worker must perform zero additional queue
+    queries while idle for longer than any plausible 1s poller, and exactly
+    one scan when a notification wakes it.
+    """
+    calls: list[str] = []
+    count_claims = 0
+    count_discover = 0
+    real_claim_jobs = worker_module.claim_jobs
+    real_discover_cancellations = worker_module.discover_cancellations
+
+    def _counting_claim(conn: JobsConnection, settings: Settings, limit: int) -> list[ClaimedJob]:
+        nonlocal count_claims
+        count_claims += 1
+        calls.append("claim")
+        return real_claim_jobs(conn, settings, limit)
+
+    def _counting_discover(conn: JobsConnection, settings: Settings) -> list[UUID]:
+        nonlocal count_discover
+        count_discover += 1
+        calls.append("discover")
+        return real_discover_cancellations(conn, settings)
+
+    monkeypatch.setattr(worker_module, "claim_jobs", _counting_claim)
+    monkeypatch.setattr(worker_module, "discover_cancellations", _counting_discover)
+
+    with supervisor_running(
+        _quiet_recovery_settings(), make_database_config(pg_cluster), jobs_db
+    ) as sup:
+        wait_until(
+            lambda: "claim" in calls and not sup._durable_scan_pending,  # ruff: ignore[private-member-access] - test peers into the loop latch
+            timeout=15.0,
+        )
+        baseline_claims = count_claims
+        baseline_discover = count_discover
+        time.sleep(2.5)
+        assert count_claims == baseline_claims
+        assert count_discover == baseline_discover
+
+        job_id = insert_job(jobs_db, str(tmp_path), "echo once")
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded", timeout=10.0)
+        claimed_scans = count_claims - baseline_claims
+        assert claimed_scans == 1
+        assert count_discover == baseline_discover + 1
+        assert calls[-2:] == ["discover", "claim"]
+
+
+def test_self_writes_do_not_wake_worker(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A busy worker is not woken by its own writes.
+
+    While a job runs and the worker publishes output and refreshes leases, the
+    durable-scan latch must stay clear throughout: only external writers set
+    it. Any self-write notification would trip the latch and be observed by
+    this sampler.
+    """
+    job_id = insert_job(
+        jobs_db,
+        str(tmp_path),
+        "for i in $(seq 1 120); do echo tick-$i; sleep 0.02; done",
+    )
+
+    with supervisor_running(
+        _quiet_recovery_settings(), make_database_config(pg_cluster), jobs_db
+    ) as sup:
+        wait_until(lambda: read_status(jobs_db, job_id) == "running")
+        _wait_until_listening(sup)
+        saw_pending = False
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if sup._durable_scan_pending:  # ruff: ignore[private-member-access] - test peers into the loop latch
+                saw_pending = True
+                break
+            time.sleep(0.005)
+        assert not saw_pending
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded", timeout=15.0)
+
+    assert read_status(jobs_db, job_id) == "succeeded"
+
+
+def test_genuine_deadlines_execute_without_notifications(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Timer-driven work still runs while no notification ever fires.
+
+    While a long job emits output, the worker refreshes its lease and publishes
+    output on its genuine deadlines even though its own writes never wake it,
+    so the event-driven loop is not idle: the recovery/heartbeat/publication
+    timers still execute real database work.
+    """
+    job_id = insert_job(
+        jobs_db,
+        str(tmp_path),
+        "for i in $(seq 1 300); do echo tick-$i; sleep 0.05; done",
+    )
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "running")
+        first_lease = read_root(jobs_db, job_id)["state"]["lease_expires_at"]
+        assert isinstance(first_lease, str)
+        wait_until(
+            lambda: _root_stdout_tail(jobs_db, job_id).count("tick-") > 5,
+            timeout=15.0,
+        )
+
+        time.sleep(0.6)
+        refreshed_lease = read_root(jobs_db, job_id)["state"]["lease_expires_at"]
+        assert isinstance(refreshed_lease, str)
+        assert refreshed_lease > first_lease
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded", timeout=20.0)
+
+    assert read_status(jobs_db, job_id) == "succeeded"
+
+
+def test_reconnect_relistens_and_rescans_durably(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """Every reconnect re-subscribes and durably rescans the queue.
+
+    A job submitted while the worker is unreachable is claimed by the reconnect
+    durable scan, and a job submitted while the worker is reachable again is
+    claimed on the freshly re-issued ``LISTEN`` subscription.
+    """
+    first = insert_job(jobs_db, str(tmp_path), "sleep 300")
+    settings = supervisor_settings()
+    settings = Settings(
+        worker_id=settings.worker_id,
+        poll_interval_seconds=3.0,
+        process_poll_interval_seconds=settings.process_poll_interval_seconds,
+        cancel_grace_seconds=settings.cancel_grace_seconds,
+        worker_incarnation=settings.worker_incarnation,
+        lease_duration_seconds=settings.lease_duration_seconds,
+        lease_refresh_interval_seconds=settings.lease_refresh_interval_seconds,
+        lease_recovery_interval_seconds=60.0,
+        output_publication_interval_seconds=settings.output_publication_interval_seconds,
+        claim_batch_limit=settings.claim_batch_limit,
+        lease_safety_margin_seconds=settings.lease_safety_margin_seconds,
+        db_operation_timeout_seconds=settings.db_operation_timeout_seconds,
+    )
+
+    with supervisor_running(settings, make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, first) == "running")
+        pgid = int(read_root(jobs_db, first)["state"]["process_pgid"])
+
+        pg_cluster.stop()
+        wait_until(lambda: not group_has_members(pgid), timeout=15.0)
+
+        pg_cluster.start()
+        # Insert before the worker's three-second reconnect backoff elapses so
+        # the row can only surface through the reconnect durable scan; the
+        # original submission notification had no listener to hear it.
+        before_reconnect = insert_job(jobs_db, str(tmp_path), "sleep 5")
+        wait_until(lambda: read_status(jobs_db, before_reconnect) == "running", timeout=20.0)
+
+        # The re-issued LISTEN must still wake the worker for later inserts.
+        relistened = insert_job(jobs_db, str(tmp_path), "echo relistened")
+        wait_until(lambda: read_status(jobs_db, relistened) != "pending", timeout=20.0)
+        wait_until(lambda: read_status(jobs_db, relistened) == "succeeded", timeout=20.0)
+        wait_until(lambda: read_status(jobs_db, before_reconnect) == "succeeded", timeout=20.0)
+
+    assert read_status(jobs_db, before_reconnect) == "succeeded"
+    assert read_status(jobs_db, relistened) == "succeeded"
+    assert read_status(jobs_db, first) == "failed"
+
+
+def test_shutdown_wakes_blocked_idle_loop_promptly(jobs_db: str, pg_cluster: _pg.PgCluster) -> None:
+    """A graceful shutdown request wakes the blocked idle loop immediately."""
+    sup = Supervisor(_quiet_recovery_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=sup.run, name="supervisor", daemon=True)
+    thread.start()
+    try:
+        _wait_until_listening(sup)
+        started = time.monotonic()
+        sup.request_shutdown()
+        thread.join(timeout=10.0)
+        elapsed = time.monotonic() - started
+        assert not thread.is_alive()
+        assert elapsed < 3.0
+    finally:
+        if thread.is_alive():
+            sup.request_shutdown()
+            thread.join(timeout=30.0)
+        _kill_leftover_groups(jobs_db)
+
+
+def test_sigchld_wakes_worker_promptly(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A tracked child exit wakes the supervisor through SIGCHLD.
+
+    The supervisor runs on the main thread so the ``SIGCHLD`` handler is
+    installed, and the process-poll timer is slow enough that a child exit
+    could never be observed promptly without the signal-driven wake. The
+    completion is measured far below that deadline and the wake pipe is
+    confirmed to have fired.
+    """
+    settings = supervisor_settings("sigchld-wake")
+    settings = Settings(
+        worker_id=settings.worker_id,
+        poll_interval_seconds=settings.poll_interval_seconds,
+        process_poll_interval_seconds=30.0,
+        cancel_grace_seconds=settings.cancel_grace_seconds,
+        worker_incarnation=settings.worker_incarnation,
+        lease_duration_seconds=settings.lease_duration_seconds,
+        lease_refresh_interval_seconds=settings.lease_refresh_interval_seconds,
+        lease_recovery_interval_seconds=60.0,
+        output_publication_interval_seconds=settings.output_publication_interval_seconds,
+        claim_batch_limit=settings.claim_batch_limit,
+        lease_safety_margin_seconds=settings.lease_safety_margin_seconds,
+        db_operation_timeout_seconds=settings.db_operation_timeout_seconds,
+    )
+    sup = Supervisor(settings, make_database_config(pg_cluster))
+    wakes: list[float] = []
+    original_wake = sup._wake  # ruff: ignore[private-member-access] - test wires a wake counter
+
+    def _counting_wake() -> None:
+        wakes.append(time.monotonic())
+        original_wake()
+
+    sup._wake = _counting_wake  # type: ignore[method-assign]  # ruff: ignore[private-member-access] - test wires a wake counter
+    observed: list[str] = []
+    timings: list[float] = []
+
+    def _drive() -> None:
+        _wait_until_listening(sup)
+        started = time.monotonic()
+        job_id = insert_job(jobs_db, str(tmp_path), "sleep 0.3; echo done")
+        observed.append(str(job_id))
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and read_status(jobs_db, job_id) != "succeeded":
+            time.sleep(0.05)
+        timings.append(time.monotonic() - started)
+        sup.request_shutdown()
+
+    driver = threading.Thread(target=_drive, name="driver", daemon=True)
+    driver.start()
+    try:
+        sup.run()
+        driver.join(timeout=10.0)
+        assert observed
+        job_id = UUID(observed[0])
+        assert timings
+        assert timings[0] < 5.0
+        assert read_status(jobs_db, job_id) == "succeeded"
+        assert wakes
+    finally:
+        if driver.is_alive():
+            sup.request_shutdown()
+            driver.join(timeout=30.0)

@@ -14,6 +14,8 @@ from lubko.worker import (
     CHUNK_OWNER_INDEX_NAME,
     JOBS_COLUMN_TYPES,
     TYPE_AWARE_CONSTRAINT_NAME,
+    WAKEUP_FUNCTION_NAME,
+    WAKEUP_TRIGGER_NAME,
     SchemaInvariantError,
     verify_jobs_table_invariant,
     verify_protocol_schema,
@@ -327,6 +329,35 @@ def test_baseline_migration_creates_chunk_indexes() -> None:
     assert "((payload::jsonb)->>'type') = 'output_chunk'" in sql
 
 
+def test_baseline_migration_declares_event_driven_wakeup_objects() -> None:
+    """The baseline installs the wakeup NOTIFY function and trigger idempotently."""
+    sql = _read_baseline_migration()
+
+    assert "create or replace function lubko.notify_jobs_changed()" in sql
+    assert "pg_notify('lubko_jobs_changed'" in sql
+    assert "drop trigger if exists lubko_jobs_notify_wakeups" in sql
+    assert "create trigger lubko_jobs_notify_wakeups" in sql
+    assert "after insert or update on lubko.jobs" in sql
+
+
+def test_baseline_migration_wakeup_trigger_only_notifies_actionable_changes() -> None:
+    """Only pending entries and fresh cancellation markers notify, never worker writes.
+
+    The trigger must wake an idle worker for the durable changes that need a
+    supervisor turn (a submitted/requeued job, a cancellled running job) and
+    remain silent for the worker's own writes (claims, heartbeats, output
+    publication, finalization) and for immutable output_chunk rows, so a busy
+    worker is never woken in a loop by its own activity.
+    """
+    sql = _read_baseline_migration()
+
+    assert "(new.payload::jsonb)->'state'->>'status' = 'pending'" in sql
+    assert "(old.payload::jsonb)->'state'->>'status' <> 'pending'" in sql
+    assert "'cancel_requested_at' is null" in sql
+    assert "'cancel_requested_at' is not null" in sql
+    assert "(new.payload::jsonb)->>'type' <> 'command'" in sql
+
+
 def test_baseline_migration_is_idempotent() -> None:
     """Every baseline statement is safe to apply more than once."""
     sql = _read_baseline_migration()
@@ -334,6 +365,8 @@ def test_baseline_migration_is_idempotent() -> None:
     assert "create table if not exists" in sql
     assert "create index if not exists" in sql
     assert "to_regrole('lubko_worker')" in sql
+    assert "create or replace function lubko.notify_jobs_changed()" in sql
+    assert "drop trigger if exists lubko_jobs_notify_wakeups on lubko.jobs" in sql
 
 
 def test_baseline_migration_documents_the_invariant() -> None:
@@ -401,26 +434,37 @@ def as_protocol_connection(conn: _QueuedConnection) -> psycopg.Connection[tuple[
     return cast("psycopg.Connection[tuple[object, ...]]", conn)
 
 
+def _v3_catalog_batches() -> list[list[tuple[str, ...]]]:
+    """Return the catalog batches of a canonical migrated v3 schema.
+
+    ``verify_protocol_schema`` runs four catalog reads in a fixed order:
+    ``pg_constraint``, ``pg_indexes``, ``pg_proc`` (wakeup function), and
+    ``pg_trigger`` (wakeup trigger).
+
+    Returns:
+        One queued row batch per catalog query, each modeling the canonical
+        baseline applied by ``migrations/0001_two_column_protocol.sql``.
+    """
+    return [
+        [(TYPE_AWARE_CONSTRAINT_NAME,), ("jobs_payload_is_json_object",)],
+        [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,), ("jobs_queue_idx",)],
+        [(WAKEUP_FUNCTION_NAME,)],
+        [(WAKEUP_TRIGGER_NAME,)],
+    ]
+
+
 def test_verify_protocol_schema_accepts_migrated_shape() -> None:
-    """A table with the type-aware constraint and chunk indexes passes."""
-    conn = as_protocol_connection(
-        _QueuedConnection([
-            [(TYPE_AWARE_CONSTRAINT_NAME,), ("jobs_payload_is_json_object",)],
-            [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,), ("jobs_queue_idx",)],
-        ])
-    )
+    """A migrated table with the canonical v3 baseline shape passes verification."""
+    conn = as_protocol_connection(_QueuedConnection(_v3_catalog_batches()))
 
     verify_protocol_schema(conn)
 
 
 def test_verify_protocol_schema_rejects_missing_type_aware_constraint() -> None:
     """A table without the type-aware constraint is refused."""
-    conn = as_protocol_connection(
-        _QueuedConnection([
-            [("jobs_payload_is_json_object",), ("jobs_payload_has_status",)],
-            [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,)],
-        ])
-    )
+    batches = _v3_catalog_batches()
+    batches[0] = [("jobs_payload_is_json_object",), ("jobs_payload_has_status",)]
+    conn = as_protocol_connection(_QueuedConnection(batches))
 
     with pytest.raises(SchemaInvariantError, match=TYPE_AWARE_CONSTRAINT_NAME):
         verify_protocol_schema(conn)
@@ -428,23 +472,42 @@ def test_verify_protocol_schema_rejects_missing_type_aware_constraint() -> None:
 
 def test_verify_protocol_schema_rejects_missing_chunk_indexes() -> None:
     """A table without the chunk ownership/ordering indexes is refused."""
-    conn = as_protocol_connection(
-        _QueuedConnection([
-            [(TYPE_AWARE_CONSTRAINT_NAME,)],
-            [("jobs_queue_idx",)],
-        ])
-    )
+    batches = _v3_catalog_batches()
+    batches[1] = [("jobs_queue_idx",)]
+    conn = as_protocol_connection(_QueuedConnection(batches))
 
     with pytest.raises(SchemaInvariantError, match="index jobs_chunk"):
         verify_protocol_schema(conn)
 
 
+def test_verify_protocol_schema_rejects_missing_wakeup_function() -> None:
+    """A table without the wakeup NOTIFY function is refused."""
+    batches = _v3_catalog_batches()
+    batches[2] = []
+    conn = as_protocol_connection(_QueuedConnection(batches))
+
+    with pytest.raises(SchemaInvariantError, match="wakeup function"):
+        verify_protocol_schema(conn)
+
+
+def test_verify_protocol_schema_rejects_missing_wakeup_trigger() -> None:
+    """A table without the wakeup NOTIFY trigger is refused."""
+    batches = _v3_catalog_batches()
+    batches[3] = []
+    conn = as_protocol_connection(_QueuedConnection(batches))
+
+    with pytest.raises(SchemaInvariantError, match="wakeup trigger"):
+        verify_protocol_schema(conn)
+
+
 def test_verify_protocol_schema_rejects_non_canonical_shape() -> None:
-    """A two-column table lacking the canonical output-chunk shape is refused."""
+    """A two-column table lacking the canonical v3 output-chunk shape is refused."""
     conn = as_protocol_connection(
         _QueuedConnection([
             [("jobs_payload_has_status",), ("jobs_payload_is_json_object",)],
             [("jobs_queue_idx",)],
+            [(WAKEUP_FUNCTION_NAME,)],
+            [(WAKEUP_TRIGGER_NAME,)],
         ])
     )
 

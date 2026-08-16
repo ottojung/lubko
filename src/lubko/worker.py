@@ -8,17 +8,23 @@ inside ``payload`` using the versioned binding in :mod:`lubko.protocol` (see
 violates the two-column invariant.
 
 The daemon is a single nonblocking supervisor. It holds one PostgreSQL
-connection and an in-memory registry of active jobs; each job runs as its own
-OS process/session/process group, executed directly as the submitted argv
-(never through a shell), and the Python daemon never synchronously waits for
-any one child and never allocates a thread or a connection per job. The
-supervisor loop repeatedly does small non-blocking pieces of work: service
-running jobs (observe exits, escalate cancellations, publish changed output
-tails/chunks, finalize completed jobs), refresh leases and run recovery
-housekeeping, then claim and start more pending jobs. There is no
-application-level concurrency limit; the ``active`` registry is unbounded and
-only the number of claims performed in a single supervisor turn is bounded for
-fairness.
+connection (``LISTEN``-ing on the wakeup channel) and an in-memory registry of
+active jobs; each job runs as its own OS process/session/process group,
+executed directly as the submitted argv (never through a shell), and the Python
+daemon never synchronously waits for any one child and never allocates a thread
+or a connection per job. The supervisor loop blocks on its event sources and
+runs a small non-blocking turn whenever one fires: a PostgreSQL notification (a
+job was submitted or a running job was cancelled — wakeups only; the durable
+scans they trigger remain authoritative), a child exit, a graceful-shutdown
+request, or a genuine timer deadline (stale-lease recovery, lease refresh,
+output publication, child observation/escalation, reconnect). Claiming and
+cancellation discovery are wake-driven and never run on a fixed idle tick. Each
+turn services running jobs (observe exits, escalate cancellations, publish
+changed output tails/chunks, finalize completed jobs), refreshes leases and
+runs recovery housekeeping, then claims and starts more pending jobs. There is
+no application-level concurrency limit; the ``active`` registry is unbounded
+and only the number of claims performed in a single supervisor turn is bounded
+for fairness.
 
 Running jobs carry a lease: ``state.lease_expires_at`` is set at claim time and
 refreshed by a bulk heartbeat while the jobs run. When a lease truly expires
@@ -48,6 +54,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -105,6 +112,9 @@ JOBS_COLUMN_TYPES: Final = (("id", "uuid"), ("payload", "text"))
 TYPE_AWARE_CONSTRAINT_NAME: Final = "jobs_payload_type_shape"
 CHUNK_OWNER_INDEX_NAME: Final = "jobs_chunk_owner_idx"
 CHUNK_ORDER_INDEX_NAME: Final = "jobs_chunk_order_idx"
+JOBS_CHANGED_CHANNEL: Final = "lubko_jobs_changed"
+WAKEUP_FUNCTION_NAME: Final = "notify_jobs_changed"
+WAKEUP_TRIGGER_NAME: Final = "lubko_jobs_notify_wakeups"
 UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
 UTC_ISO_SQL: Final = f"to_jsonb({UTC_ISO_TEXT_SQL})"
 LEASE_EXPIRES_AT_SQL: Final = (
@@ -1434,18 +1444,20 @@ def verify_protocol_schema(conn: JobsConnection) -> None:
 
     The two-column invariant alone does not make a table usable by a v3
     worker: immutable ``output_chunk`` publication requires the type-aware
-    ``jobs_payload_type_shape`` check constraint and the chunk
-    ownership/ordering indexes, which the single canonical baseline
-    ``migrations/0001_two_column_protocol.sql`` declares. The worker refuses to
-    start against any table lacking this shape so output publication can never
-    fail at runtime on a table that cannot represent immutable chunks.
+    ``jobs_payload_type_shape`` check constraint, the chunk
+    ownership/ordering indexes, and the event-driven wakeup trigger that
+    ``migrations/0001_two_column_protocol.sql`` declares together. The worker
+    refuses to start against any table lacking this shape so output
+    publication can never fail at runtime on a table that cannot represent
+    immutable chunks, and no worker is ever deployed against a schema that
+    cannot wake it with PostgreSQL notifications.
 
     Args:
         conn: Open PostgreSQL connection.
 
     Raises:
-        SchemaInvariantError: If the type-aware constraint or any required
-            output-chunk index is missing.
+        SchemaInvariantError: If the type-aware constraint, any required
+            output-chunk index, or the wakeup function/trigger is missing.
     """
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
@@ -1460,6 +1472,20 @@ def verify_protocol_schema(conn: JobsConnection) -> None:
             (JOBS_SCHEMA, JOBS_TABLE),
         )
         indexes = {str(row[0]) for row in cursor.fetchall()}
+        cursor.execute(
+            "SELECT proname\n"
+            "FROM pg_proc\n"
+            "WHERE pronamespace = %s::regnamespace AND proname = %s\n",
+            (JOBS_SCHEMA, WAKEUP_FUNCTION_NAME),
+        )
+        functions = {str(row[0]) for row in cursor.fetchall()}
+        cursor.execute(
+            "SELECT tgname\n"
+            "FROM pg_trigger\n"
+            "WHERE tgrelid = %s::regclass AND tgname = %s AND NOT tgisinternal\n",
+            (f"{JOBS_SCHEMA}.{JOBS_TABLE}", WAKEUP_TRIGGER_NAME),
+        )
+        triggers = {str(row[0]) for row in cursor.fetchall()}
     missing: list[str] = []
     if TYPE_AWARE_CONSTRAINT_NAME not in constraints:
         missing.append(f"check constraint {TYPE_AWARE_CONSTRAINT_NAME}")
@@ -1468,17 +1494,67 @@ def verify_protocol_schema(conn: JobsConnection) -> None:
         for name in (CHUNK_OWNER_INDEX_NAME, CHUNK_ORDER_INDEX_NAME)
         if name not in indexes
     )
+    if WAKEUP_FUNCTION_NAME not in functions:
+        missing.append(f"wakeup function {JOBS_SCHEMA}.{WAKEUP_FUNCTION_NAME}")
+    if WAKEUP_TRIGGER_NAME not in triggers:
+        missing.append(f"wakeup trigger {WAKEUP_TRIGGER_NAME}")
     if missing:
         detail = ", ".join(missing)
         msg = (
-            f"lubko.jobs lacks the canonical output-chunk schema shape required "
-            f"for immutable output publication: missing {detail}. Apply the "
-            f"canonical, idempotent baseline migration "
-            f"migrations/0001_two_column_protocol.sql (any v2 -> v3 cutover needs "
-            f"no DDL: the two-column table is identical for both versions). "
-            f"{TWO_COLUMN_INVARIANT}"
+            f"lubko.jobs lacks the canonical output-chunk schema shape and "
+            f"event-driven worker wakeup objects required for immutable output "
+            f"publication: missing {detail}. Apply the canonical, idempotent "
+            f"baseline migration migrations/0001_two_column_protocol.sql (any "
+            f"v2 -> v3 cutover needs no DDL: the two-column table is identical "
+            f"for both versions). {TWO_COLUMN_INVARIANT}"
         )
         raise SchemaInvariantError(msg)
+
+
+def listen_for_wakeups(conn: JobsConnection) -> None:
+    """Subscribe this connection to the job-wakeup notification channel.
+
+    The ``LISTEN`` runs and commits in its own top-level transaction; by
+    PostgreSQL semantics the subscription becomes effective only when the
+    ``LISTEN`` transaction commits. The caller must therefore commit first and
+    then re-inspect durable table state (the supervisor always runs an
+    immediate tick after connecting), and must repeat ``LISTEN`` after every
+    reconnect. Every notification is only a wakeup: correctness comes from the
+    authoritative durable scans a wake triggers, never from the notification
+    payload.
+
+    Args:
+        conn: Open PostgreSQL connection.
+    """
+    with conn.transaction(), conn.cursor() as cursor:
+        cursor.execute(f"LISTEN {JOBS_CHANGED_CHANNEL}")
+
+
+def drain_notifications(conn: JobsConnection) -> int:
+    """Pull buffered job notifications off the connection.
+
+    Notifications are only wakeups: the payload is not durable state and is not
+    acted on directly. psycopg keeps a received notification either in its own
+    pending-notify backlog or in the libpq input queue depending on whether it
+    arrived while a query was being serviced, so both sources are drained here.
+    The caller requests a durable scan when at least one notification was
+    drained.
+
+    Args:
+        conn: Open PostgreSQL connection.
+
+    Returns:
+        The number of job notifications drained.
+    """
+    count = 0
+    for _ in conn.notifies(timeout=0):
+        count += 1
+    conn.pgconn.consume_input()
+    while conn.pgconn.notifies() is not None:
+        count += 1
+    if count:
+        LOGGER.debug("woke by %d PostgreSQL job notification(s)", count)
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -1490,12 +1566,38 @@ class Supervisor:
     """One nonblocking daemon supervising arbitrarily many concurrent jobs.
 
     The supervisor owns a single PostgreSQL connection and an unbounded
-    in-memory registry of active jobs. Every tick it services running jobs
-    (observes exits, escalates cancellations), refreshes leases, discovers
-    cancellation markers, publishes changed output tails/chunks, finalizes
-    completed jobs, and claims a bounded batch of new pending jobs. It never
-    allocates a thread or a connection per job and never synchronously waits
-    for any one child.
+    in-memory registry of active jobs. It sleeps only when there is nothing to
+    do: instead of re-running the claim query on a fixed sleep timer, it blocks
+    on the event sources that mean a supervisor turn is needed, and runs a
+    :meth:`_tick` whenever one fires:
+
+    - a PostgreSQL notification on ``lubko_jobs_changed`` (a job was
+      submitted, or a running job was cancelled) — wakeups only, never durable
+      state,
+    - a ``SIGCHLD`` wakeup (a tracked child exited) written into the local
+      wake pipe,
+    - a timer deadline for lease refresh, stale-job recovery, output
+      publication, child-process observation/escalation, or reconnect, or
+    - a graceful-shutdown request (writes the local wake pipe thread-safely).
+
+    Claiming and cancellation discovery are wake-driven, not timer-driven:
+    they run when a PostgreSQL notification signals a new pending job or a
+    running-job cancellation marker, and immediately after every connect and
+    reconnect (``LISTEN`` plus a durable scan), never on a fixed idle tick.
+
+    Correctness never depends on a notification being delivered: after every
+    connect/reconnect the supervisor first commits ``LISTEN`` and then an
+    immediate durable tick, and the recovery/cancellation/publish timers
+    guarantee a bounded worst-case latency even when a notification is missed
+    near a reconnect. During a database outage the PostgreSQL socket is not
+    waited on; only the local wake pipe and the safety/reconnect deadlines
+    drive the loop, so local process supervision never stalls.
+
+    Every tick services running jobs (observes exits, escalates cancellations),
+    refreshes leases, discovers cancellation markers, publishes changed output
+    tails/chunks, finalizes completed jobs, and claims a bounded batch of new
+    pending jobs. It never allocates a thread or a connection per job and never
+    synchronously waits for any one child.
     """
 
     def __init__(self, settings: Settings, database: DatabaseConfig) -> None:
@@ -1513,31 +1615,231 @@ class Supervisor:
         self._stopping = False
         self._next_recovery_at = 0.0
         self._next_lease_refresh_at = 0.0
-        self._next_cancel_scan_at = 0.0
         self._next_reconnect_at = 0.0
+        self._durable_scan_pending = False
+        self._listen_ready = False
+        self._wake_r: int | None = None
+        self._wake_w: int | None = None
 
     def request_shutdown(self) -> None:
         """Request a graceful shutdown from another thread or a signal handler.
 
         The supervisor stops claiming jobs and then terminates, reaps, and
-        finalizes every tracked active process group.
+        finalizes every tracked active process group. The local wake pipe is
+        written so an event-blocked loop wakes immediately.
         """
         self._stopping = True
+        self._wake()
+
+    def _install_wakeup_pipe(self) -> None:
+        """Create the non-blocking self-pipe that wakes an event-blocked loop.
+
+        The write end is marked non-inheritable so job children never hold it.
+        """
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        os.set_blocking(write_fd, False)
+        os.set_inheritable(write_fd, False)  # ruff: ignore[boolean-positional-value-in-call] - positional-only stdlib call
+        self._wake_r = read_fd
+        self._wake_w = write_fd
+
+    def _close_wakeup_pipe(self) -> None:
+        """Close the local wake pipe, ignoring descriptors already gone."""
+        if self._wake_r is not None:
+            with suppress(OSError):
+                os.close(self._wake_r)
+            self._wake_r = None
+        if self._wake_w is not None:
+            with suppress(OSError):
+                os.close(self._wake_w)
+            self._wake_w = None
+
+    def _wake(self) -> None:
+        """Write one byte into the wake pipe, ignoring a pipe that is full.
+
+        A full pipe already holds a pending wakeup, so dropping the byte is
+        safe. This is called from signal handlers and other threads and must
+        never block or raise.
+        """
+        if self._wake_w is None:
+            return
+        with suppress(OSError):
+            os.write(self._wake_w, b"\x00")
+
+    def _install_child_signal_handler(self) -> None:
+        """Wake the loop on a tracked child exit where signals are available.
+
+        Only the main thread can install signal handlers; when the supervisor
+        runs inside a thread (tests) the process-poll timer keeps child
+        observation bounded instead. The handler only writes the wake pipe, so
+        it stays async-signal-safe.
+        """
+        wake = self._wake
+
+        def _on_child_signal(_signum: int, _frame: object) -> None:
+            wake()
+
+        try:
+            signal.signal(signal.SIGCHLD, _on_child_signal)
+        except ValueError:
+            LOGGER.debug(
+                "not the main thread; child-completion wakeups rely on the process-poll timer"
+            )
+
+    def _drain_wakeup_pipe(self) -> None:
+        """Consume every pending wake byte so the pipe is empty before waiting."""
+        if self._wake_r is None:
+            return
+        with suppress(BlockingIOError):
+            while os.read(self._wake_r, 4096):
+                pass
+
+    def _wait_for_events(self, timeout: float) -> None:
+        """Block until an event source is ready, draining what arrived.
+
+        While connected, any notification already buffered inside libpq is
+        drained first: a notification can arrive while the previous turn's
+        query is being serviced, in which case libpq has already consumed it
+        off the socket and ``select`` alone would never report the socket
+        readable. After that, the loop waits on the local wake pipe and the
+        PostgreSQL connection socket. PostgreSQL notifications are drained and
+        request a durable scan on the caller's next tick (they are only
+        wakeups); child exits and shutdown requests arrive on the local wake
+        pipe. A broken socket is treated as a database outage on the caller's
+        next turn.
+
+        Args:
+            timeout: Maximum seconds to block (``0`` means poll once).
+        """
+        if self._wake_r is None:
+            return
+        conn = self.conn
+        if conn is not None:
+            try:
+                if drain_notifications(conn):
+                    self._durable_scan_pending = True
+                    return
+            except psycopg.Error:
+                LOGGER.exception("reading PostgreSQL notifications failed")
+                self._enter_outage()
+                return
+        fds = [self._wake_r]
+        conn_fd: int | None = None
+        if conn is not None:
+            conn_fd = conn.fileno()
+            fds.append(conn_fd)
+        try:
+            readable, _writable, _exceptional = select.select(fds, [], [], max(0.0, timeout))
+        except OSError:
+            LOGGER.exception("event wait failed; entering outage handling")
+            self._enter_outage()
+            return
+        if conn is not None and conn_fd in readable:
+            try:
+                if drain_notifications(conn):
+                    self._durable_scan_pending = True
+            except psycopg.Error:
+                LOGGER.exception("reading PostgreSQL notifications failed")
+                self._enter_outage()
+
+    def _next_wake_timeout(self) -> float:
+        """Return how long the loop may block before the next scheduled turn.
+
+        When the database is reachable and nothing is actively being
+        supervised, the stale-lease-recovery deadline is the only timer: the
+        loop otherwise blocks on the notification socket and the local wake
+        pipe, so there is no fixed idle polling of the queue. Active children
+        add the lease-refresh, earliest-output-publication, and process-poll
+        deadlines. During an outage the deadlines are the reconnect time and
+        every owned group's lease-safety deadline.
+
+        Returns:
+            Non-negative seconds to block.
+        """
+        if self._stopping:
+            return 0.0
+        now = time.monotonic()
+        deadlines: list[float] = []
+        if self.conn is None:
+            deadlines.append(self._next_reconnect_at)
+            safety = self.settings.lease_safety_margin_seconds
+            deadlines.extend(
+                job.last_heartbeat_at + self.settings.lease_duration_seconds - safety
+                for job in self.active.values()
+                if not job.completed and not job.term_sent
+            )
+        else:
+            deadlines.append(self._next_recovery_at)
+            if self.active:
+                deadlines.append(self._next_lease_refresh_at)
+                interval = self.settings.output_publication_interval_seconds
+                deadlines.append(
+                    min(
+                        min(job.stdout.published_at, job.stderr.published_at) + interval
+                        for job in self.active.values()
+                    )
+                )
+        if self.active:
+            deadlines.append(now + self.settings.process_poll_interval_seconds)
+        if not deadlines:
+            return max(0.0, DEFAULT_POLL_INTERVAL_SECONDS)
+        return max(0.0, min(deadlines) - now)
+
+    def _loop_once(self) -> None:
+        """Run one blocking event wait followed by one supervisor turn."""
+        self._wait_for_events(self._next_wake_timeout())
+        self._drain_wakeup_pipe()
+        if self._stopping:
+            return
+        try:
+            self._tick(time.monotonic())
+        except psycopg.Error:
+            self._enter_outage()
 
     def run(self) -> None:
-        """Run the supervisor loop until a graceful shutdown is requested.
+        """Run the supervisor until a graceful shutdown is requested.
 
-        The first connection is verified against the two-column transport
-        invariant; a violated invariant is fatal.
+        The loop is event-driven: it blocks on PostgreSQL notifications, child
+        exits, and timer deadlines instead of re-running the claim query on a
+        fixed sleep timer. After connecting it commits ``LISTEN`` and then
+        immediately inspects durable table state; that listen-and-inspect
+        sequence is repeated after every reconnect so no durable change that
+        raced the reconnect is ever missed. The first connection is verified
+        against the two-column transport and protocol shape invariants; a
+        violated invariant is fatal.
         """
+        self._install_wakeup_pipe()
+        self._install_child_signal_handler()
         self._connect()
+        if self.conn is not None:
+            self._listen()
         while not self._stopping:
-            try:
-                self._tick(time.monotonic())
-            except psycopg.Error:
-                self._enter_outage()
-            time.sleep(self.settings.process_poll_interval_seconds)
+            self._loop_once()
         self._shutdown()
+        self._close_wakeup_pipe()
+
+    def _listen(self) -> None:
+        """Subscribe to the job-wakeup channel on the current connection.
+
+        The ``LISTEN`` commits in its own transaction; a notification can only
+        reach a subscribing connection, so after every connect/reconnect the
+        subscription is repeated and an immediate durable scan is requested for
+        the next tick, covering any queue change that raced the reconnect. A
+        subscribe failure is an outage: the connection is discarded and
+        re-established on the reconnect timer.
+        """
+        conn = self.conn
+        if conn is None:
+            return
+        try:
+            listen_for_wakeups(conn)
+        except psycopg.Error:
+            LOGGER.exception("failed to listen for PostgreSQL job notifications")
+            self._enter_outage()
+            return
+        self._listen_ready = False
+        self._durable_scan_pending = True
+        LOGGER.debug("listening on %s", JOBS_CHANGED_CHANNEL)
 
     def _tick(self, now: float) -> None:
         """Run one supervisor turn: service processes, then database work.
@@ -1568,6 +1870,14 @@ class Supervisor:
     def _db_phase(self, now: float) -> None:
         """Run the database-backed supervision work of one turn.
 
+        Genuine time deadlines run first: stale-lease recovery, active-lease
+        refresh, throttled output publication, and completion finalization.
+        Claiming and cancellation discovery are driven by PostgreSQL
+        notifications and by the immediate durable scans that follow every
+        connect/reconnect, never by a fixed timer, so a deadline-only
+        recovery/heartbeat/publication turn never gratuitously polls the queue
+        for claims or cancellations.
+
         Args:
             now: Monotonic time at the start of the turn.
         """
@@ -1581,15 +1891,24 @@ class Supervisor:
             self._next_lease_refresh_at = (
                 time.monotonic() + self.settings.lease_refresh_interval_seconds
             )
-        if now >= self._next_cancel_scan_at:
-            self._discover_cancellations()
-            self._next_cancel_scan_at = time.monotonic() + max(
-                self.settings.poll_interval_seconds, 0.5
-            )
         self._publish_all(now)
         self._finalize_completed()
-        if not self._stopping:
-            self._claim_batch()
+        if self._durable_scan_pending and not self._stopping:
+            self._durable_scan_pending = False
+            cancellations = self._discover_cancellations()
+            claimed = self._claim_batch()
+            if (
+                len(cancellations) == CANCEL_DISCOVERY_LIMIT
+                or claimed == self.settings.claim_batch_limit
+            ):
+                # A full scan batch proves the queue is demonstrably non-empty;
+                # keep the durable-scan latch held (level-triggered) so the
+                # next turn drains more, and drop it as soon as a scan comes
+                # back with slack. This is bounded work on a known backlog,
+                # never a gratuitous idle timer poll.
+                self._durable_scan_pending = True
+            else:
+                self._listen_ready = True
 
     def _outage_phase(self) -> None:
         """Handle a database outage without losing ownership of active groups.
@@ -1603,6 +1922,7 @@ class Supervisor:
         if time.monotonic() >= self._next_reconnect_at:
             self._connect()
             if self.conn is not None:
+                self._listen()
                 LOGGER.info("database connection restored")
                 self._next_recovery_at = 0.0
                 self._next_lease_refresh_at = 0.0
@@ -1646,17 +1966,26 @@ class Supervisor:
                 job.row_lost = True
                 request_stop(job, STOP_REASON_ROW_LOST)
 
-    def _discover_cancellations(self) -> None:
-        """Terminate any owned running job whose cancellation marker was set."""
+    def _discover_cancellations(self) -> list[UUID]:
+        """Terminate any owned running job whose cancellation marker was set.
+
+        Returns:
+            The IDs of the jobs whose cancellation was discovered this turn; a
+            full discovery batch size signals a demonstrable backlog to the
+            caller.
+        """
         conn = self.conn
         if conn is None:
-            return
+            return []
+        cancelled: list[UUID] = []
         for job_id in discover_cancellations(conn, self.settings):
+            cancelled.append(job_id)
             job = self.active.get(job_id)
             if job is not None and not job.cancel_requested:
                 LOGGER.info("cancelling job %s by request", job_id)
                 job.cancel_requested = True
                 request_stop(job, STOP_REASON_CANCEL)
+        return cancelled
 
     def _publish_all(self, now: float) -> None:
         """Publish changed output tails/chunks of running jobs, throttled."""
@@ -1749,19 +2078,24 @@ class Supervisor:
         cleanup_job(job)
         return True
 
-    def _claim_batch(self) -> None:
+    def _claim_batch(self) -> int:
         """Claim a bounded batch of pending jobs and start their processes.
 
         The batch size is a fairness bound on the amount of claiming work done
         in one turn; it is never a cap on the number of simultaneously active
         jobs.
+
+        Returns:
+            How many jobs were claimed this turn (a full batch signals a
+            demonstrable queue backlog to the caller).
         """
         conn = self.conn
         if conn is None or self._stopping:
-            return
+            return 0
         claimed = claim_jobs(conn, self.settings, self.settings.claim_batch_limit)
         for claimed_job in claimed:
             self._start_job(claimed_job)
+        return len(claimed)
 
     def _start_job(self, claimed: ClaimedJob) -> None:
         """Start one claimed job as a process group and register it.
@@ -1888,6 +2222,7 @@ class Supervisor:
         try:
             conn = psycopg.connect(
                 self.database.conninfo(),
+                autocommit=True,
                 connect_timeout=max(1, min(5, int(self.settings.db_operation_timeout_seconds))),
                 row_factory=tuple_row,
                 options=(
@@ -1921,6 +2256,7 @@ class Supervisor:
             with suppress(Exception):
                 self.conn.close()
         self.conn = None
+        self._listen_ready = False
         self._next_reconnect_at = 0.0
 
     def _shutdown(self) -> None:
