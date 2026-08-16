@@ -28,7 +28,11 @@
 -- This file is the complete current schema for a fresh installation. It is
 -- idempotent: every statement is safe to run more than once. The two-column
 -- table is the only supported binding: no staging table, no older schema, and
--- no rollback path to maintain.
+-- no rollback path to maintain. The schema also installs one trigger (and its
+-- PL/pgSQL function) that emits a `lubko_jobs_changed` NOTIFY for the events
+-- an idle worker should wake for; see the trigger block at the end of this
+-- file. Notifications are only wakeups: the worker's durable scans remain
+-- authoritative.
 --
 -- The v2 -> v3 cutover is DESTRUCTIVE and needs NO DDL upgrade. Protocol v3
 -- does not accept v2 rows and there is no protocol-data drain/migration or compatibility
@@ -105,3 +109,65 @@ create index if not exists jobs_chunk_order_idx
         (((payload::jsonb)->'sequence')::bigint)
     )
     where ((payload::jsonb)->>'type') = 'output_chunk';
+
+-- Event-driven worker wakeups (issue #20): a trigger emits a PostgreSQL
+-- NOTIFY whenever durable queue state changes that an idle worker should act
+-- on promptly. Notifications are only wakeups: every notification wake simply
+-- makes the worker re-run its authoritative durable scans, and those scans
+-- remain the source of correctness, so a lost, reordered, or coalesced
+-- notification is never correctness-critical.
+--
+-- The trigger only notifies for events produced by the queue's *external*
+-- writers and never for the worker's own writes:
+--   * a command row inserted in state `pending` (a job was submitted),
+--   * an existing command row updated into state `pending` from any
+--     non-pending state (a job was requeued externally), and
+--   * a freshly introduced `cancel_requested_at` marker on a `running`
+--     `command` row (a running job was cancelled).
+-- Worker-generated claims (pending -> running), lease heartbeats, output
+-- publications, finalization, and `output_chunk` inserts never notify, so a
+-- busy worker is not woken in a loop by its own writes. An idle worker
+-- therefore blocks waiting for PostgreSQL notifications instead of re-running
+-- the claim query on a sleep timer; durable scans still bound worst-case
+-- latency when a notification is missed (for example around a reconnect).
+create or replace function lubko.notify_jobs_changed() returns trigger
+language plpgsql
+as $$
+begin
+    if (new.payload::jsonb)->>'type' <> 'command' then
+        return new;
+    end if;
+    if TG_OP = 'INSERT' then
+        if (new.payload::jsonb)->'state'->>'status' = 'pending' then
+            perform
+                pg_notify('lubko_jobs_changed', new.id::text);
+        end if;
+    elsif TG_OP = 'UPDATE' then
+        if (new.payload::jsonb)->'state'->>'status' = 'pending'
+            and (old.payload::jsonb)->'state'->>'status' <> 'pending' then
+            perform
+                pg_notify('lubko_jobs_changed', new.id::text);
+        elsif (new.payload::jsonb)->'state'->>'status' = 'running'
+            and (old.payload::jsonb)->'state'->>'cancel_requested_at' is null
+            and (new.payload::jsonb)->'state'->>'cancel_requested_at' is not null then
+            perform
+                pg_notify('lubko_jobs_changed', new.id::text);
+        end if;
+    end if;
+    return new;
+end
+$$;
+
+comment on function lubko.notify_jobs_changed() is
+    'Emit a lubko_jobs_changed NOTIFY wakeup for command rows that enter the '
+    'pending state (newly submitted or externally requeued) and for freshly '
+    'introduced running-job cancellation markers. Worker-generated claims, '
+    'lease heartbeats, output publications, finalization, and output_chunk '
+    'inserts never notify, so the worker is not woken by its own writes. '
+    'Notifications are wakeups only; durable scans remain authoritative.';
+
+drop trigger if exists lubko_jobs_notify_wakeups on lubko.jobs;
+create trigger lubko_jobs_notify_wakeups
+    after insert or update on lubko.jobs
+    for each row
+    execute function lubko.notify_jobs_changed();
