@@ -2,7 +2,6 @@
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -44,7 +43,6 @@ from lubko.worker import (
     request_cancel,
     request_group_reap,
     request_stop,
-    resolve_shell,
     signal_kill,
     spawn_job,
     stream_size,
@@ -55,6 +53,17 @@ from tests import _process_guard as guard
 EXECUTION_ERROR_EXIT_CODE: Final = 127
 COMMAND_FAILURE_EXIT_CODE: Final = 7
 MIN_LEASE_HEARTBEATS: Final = 2
+
+SLEEP_30: Final = (sys.executable, "-c", "import time; time.sleep(30)")
+SLEEP_300: Final = (sys.executable, "-c", "import time; time.sleep(300)")
+
+#: A python argv that forks a background member of the same process group,
+#: then exits zero — the direct-exec equivalent of ``sleep 30 & echo done``.
+LEFTOVER_GROUP_PROBE: Final = (
+    sys.executable,
+    "-c",
+    "import os, time\nif os.fork() == 0:\n    time.sleep(30)\nelse:\n    os._exit(0)\n",
+)
 
 
 class _RecordingCursor:
@@ -204,12 +213,12 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
     raise AssertionError(msg)
 
 
-def make_active_job(tmp_path: Path, *, command: str = "echo hi") -> ActiveJob:
+def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> ActiveJob:
     """Build an active job with capture files under ``tmp_path``.
 
     Args:
         tmp_path: Temporary directory for the capture files.
-        command: Command recorded on the job.
+        process: Process argv recorded on the job.
 
     Returns:
         A registered active job with empty capture files.
@@ -225,8 +234,7 @@ def make_active_job(tmp_path: Path, *, command: str = "echo hi") -> ActiveJob:
     job = ActiveJob(
         id=uuid4(),
         cwd=str(tmp_path),
-        command=command,
-        args=None,
+        process=process,
         proc=proc,
         pid=proc.pid,
         pgid=proc.pid,
@@ -270,18 +278,10 @@ def test_stream_size_and_read_range(tmp_path: Path) -> None:
     assert read_range(target, 2, 5) == b"234"
 
 
-def test_resolve_shell_finds_bash() -> None:
-    """resolve_shell locates an installed bash executable."""
-    assert resolve_shell() == shutil.which("bash")
-    assert resolve_shell() is not None
-
-
 def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
     """The exact process group is reported while alive and gone after death."""
-    shell = resolve_shell()
-    assert shell is not None
     proc, _stdout_path, _stderr_path, pgid = spawn_job(
-        Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell
+        Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
     try:
@@ -296,10 +296,8 @@ def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
 
 def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> None:
     """A spawned job is a session leader whose group ID equals its PID."""
-    shell = resolve_shell()
-    assert shell is not None
     proc, _stdout_path, _stderr_path, pgid = spawn_job(
-        Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell
+        Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
     try:
@@ -313,12 +311,10 @@ def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> Non
         guard.unregister(proc)
 
 
-def test_spawn_job_runs_command_and_cleanup_files(tmp_path: Path) -> None:
-    """A command job writes its output into the capture files."""
-    shell = resolve_shell()
-    assert shell is not None
+def test_spawn_job_runs_process_and_cleanup_files(tmp_path: Path) -> None:
+    """A process job writes its output into the capture files."""
     proc, stdout_path, stderr_path, _pgid = spawn_job(
-        Job(id=uuid4(), cwd=str(tmp_path), command="echo hi", args=None), shell
+        Job(id=uuid4(), cwd=str(tmp_path), process=(sys.executable, "-c", "print('hi')"))
     )
     guard.register(proc)
     try:
@@ -334,18 +330,16 @@ def test_spawn_job_runs_command_and_cleanup_files(tmp_path: Path) -> None:
 
 
 def test_spawn_job_injects_exact_root_job_uuid(tmp_path: Path) -> None:
-    """A shell command job inherits its exact root job UUID as LUBKO_JOB_ID."""
-    shell = resolve_shell()
-    assert shell is not None
+    """A process job inherits its exact root job UUID as LUBKO_JOB_ID."""
     job_id = uuid4()
+    probe = "import os; print(os.environ['LUBKO_JOB_ID'])"
     proc, stdout_path, stderr_path, _pgid = spawn_job(
-        Job(id=job_id, cwd=str(tmp_path), command='printf "%s" "$LUBKO_JOB_ID"', args=None),
-        shell,
+        Job(id=job_id, cwd=str(tmp_path), process=(sys.executable, "-c", probe))
     )
     guard.register(proc)
     try:
         proc.wait(timeout=10)
-        assert read_output(stdout_path) == str(job_id).encode()
+        assert read_output(stdout_path) == str(job_id).encode() + b"\n"
     finally:
         guard.unregister(proc)
         proc.wait(timeout=5)
@@ -353,22 +347,47 @@ def test_spawn_job_injects_exact_root_job_uuid(tmp_path: Path) -> None:
         stderr_path.unlink(missing_ok=True)
 
 
-def test_spawn_job_injects_exact_root_job_uuid_into_args_environment(
-    tmp_path: Path,
-) -> None:
-    """An argv job (direct exec) inherits its exact root job UUID as LUBKO_JOB_ID."""
-    shell = resolve_shell()
-    assert shell is not None
-    job_id = uuid4()
-    probe = "import os; print(os.environ['LUBKO_JOB_ID'])"
+def test_spawn_job_runs_process_in_declared_cwd(tmp_path: Path) -> None:
+    """A process job (direct exec) runs inside its declared working directory."""
+    work_dir = tmp_path / "runner"
+    work_dir.mkdir()
+    probe = "import os; print(os.getcwd())"
     proc, stdout_path, stderr_path, _pgid = spawn_job(
-        Job(id=job_id, cwd=str(tmp_path), command=None, args=(sys.executable, "-c", probe)),
-        shell,
+        Job(id=uuid4(), cwd=str(work_dir), process=(sys.executable, "-c", probe))
     )
     guard.register(proc)
     try:
         proc.wait(timeout=10)
-        assert read_output(stdout_path) == str(job_id).encode() + b"\n"
+        assert read_output(stdout_path) == str(work_dir).encode() + b"\n"
+        assert read_output(stderr_path) == b""
+    finally:
+        guard.unregister(proc)
+        proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
+def test_spawn_job_passes_shell_metacharacters_literally(tmp_path: Path) -> None:
+    """Shell metacharacters in argv are passed literally, never evaluated.
+
+    The sibling pattern ``a;b``, the expansion ``$HOME``, a glob ``*.txt``,
+    and a command substitution ``$(id)`` must reach the program unmodified
+    because the worker executes the argv directly without a shell.
+    """
+    literal = "a;b $HOME *.txt $(id)"
+    probe = "import sys; print(sys.argv[1])"
+    proc, stdout_path, stderr_path, _pgid = spawn_job(
+        Job(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            process=(sys.executable, "-c", probe, literal),
+        )
+    )
+    guard.register(proc)
+    try:
+        proc.wait(timeout=10)
+        assert read_output(stdout_path) == literal.encode() + b"\n"
+        assert read_output(stderr_path) == b""
     finally:
         guard.unregister(proc)
         proc.wait(timeout=5)
@@ -391,9 +410,9 @@ def test_claim_job_marks_job_running_and_only_command_rows() -> None:
     conn = _RecordingConnection()
     job_id = uuid4()
     claimed_payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": "/workspace", "command": "echo hi"},
+        "request": {"cwd": "/workspace", "process": ["echo", "hi"]},
         "state": {"status": "running"},
     })
     conn.rows = [(job_id, claimed_payload)]
@@ -404,7 +423,7 @@ def test_claim_job_marks_job_running_and_only_command_rows() -> None:
     assert claimed is not None
     assert claimed.id == job_id
     parsed = parse_payload(claimed.payload)
-    assert parsed.request.command == "echo hi"
+    assert parsed.request.process == ("echo", "hi")
     assert parsed.status == "running"
     sql, params = conn.executions[0]
     assert "{state,status}" in sql
@@ -540,9 +559,9 @@ def test_recover_stale_jobs_marks_failed_with_diagnostic() -> None:
     conn = _RecordingConnection()
     job_id = uuid4()
     recovered_payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": "/workspace", "command": "sleep 30"},
+        "request": {"cwd": "/workspace", "process": ["sleep", "30"]},
         "state": {
             "status": "failed",
             "worker_id": "old-worker",
@@ -882,18 +901,15 @@ def test_settings_rejects_claim_batch_limit_zero() -> None:
 
 def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
     """request_stop terminates the exact recorded process group once."""
-    shell = resolve_shell()
-    assert shell is not None
     proc, _stdout_path, _stderr_path, pgid = spawn_job(
-        Job(id=uuid4(), cwd=str(tmp_path), command="sleep 30", args=None), shell
+        Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
     try:
         job = ActiveJob(
             id=uuid4(),
             cwd=str(tmp_path),
-            command="sleep 30",
-            args=None,
+            process=SLEEP_30,
             proc=proc,
             pid=proc.pid,
             pgid=pgid,
@@ -913,16 +929,8 @@ def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
 
 def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
     """request_group_reap terminates the group without recording a stop reason."""
-    shell = resolve_shell()
-    assert shell is not None
     proc, _stdout_path, _stderr_path, pgid = spawn_job(
-        Job(
-            id=uuid4(),
-            cwd=str(tmp_path),
-            command="sleep 30 & echo done",
-            args=None,
-        ),
-        shell,
+        Job(id=uuid4(), cwd=str(tmp_path), process=LEFTOVER_GROUP_PROBE)
     )
     guard.register(proc)
     try:
@@ -931,8 +939,7 @@ def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
         job = ActiveJob(
             id=uuid4(),
             cwd=str(tmp_path),
-            command="sleep 30 & echo done",
-            args=None,
+            process=LEFTOVER_GROUP_PROBE,
             proc=proc,
             pid=proc.pid,
             pgid=pgid,
@@ -955,7 +962,7 @@ def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
 def test_signal_kill_does_not_note_natural_reap(tmp_path: Path) -> None:
     """signal_kill on a naturally reaped job leaves the note empty."""
     proc = subprocess.Popen(
-        ["/bin/sleep", "300"],
+        [sys.executable, "-c", "import time; time.sleep(300)"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -966,8 +973,7 @@ def test_signal_kill_does_not_note_natural_reap(tmp_path: Path) -> None:
         job = ActiveJob(
             id=uuid4(),
             cwd=str(tmp_path),
-            command="sleep 300",
-            args=None,
+            process=SLEEP_300,
             proc=proc,
             pid=proc.pid,
             pgid=proc.pid,
@@ -990,7 +996,7 @@ def test_signal_kill_does_not_note_natural_reap(tmp_path: Path) -> None:
 def test_signal_kill_appends_diagnostic(tmp_path: Path) -> None:
     """signal_kill records the SIGKILL escalation in the cancellation note."""
     proc = subprocess.Popen(
-        ["/bin/sleep", "300"],
+        [sys.executable, "-c", "import time; time.sleep(300)"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -1001,8 +1007,7 @@ def test_signal_kill_appends_diagnostic(tmp_path: Path) -> None:
         job = ActiveJob(
             id=uuid4(),
             cwd=str(tmp_path),
-            command="sleep 300",
-            args=None,
+            process=SLEEP_300,
             proc=proc,
             pid=proc.pid,
             pgid=proc.pid,

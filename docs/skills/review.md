@@ -311,3 +311,22 @@ So just save time and not consider them at all.
 - Current supported behaviour deserves regression protection; obsolete behaviour does not.
 - Clean design is the default. Legacy support must justify its existence explicitly.
 - A clean review with no findings is better than speculative feedback.
+
+## Lifecycle/supervisor state safety
+
+Lubko's committed test suite redirects every XDG-backed state root to pytest-owned
+temporary directories before any test runs, and asserts the whole session never
+touches ambient (production-like) state or processes. Reviews must preserve and
+rely on that isolation, and must treat any lifecycle/supervisor test or helper
+that could write ambient user state as an Error.
+
+The same rule applies to manual orchestration and review experiments: never
+mutate the ambient Lubko lifecycle/supervisor state tree. Durable
+state-mutating experiments against `lubko-deploy`, the `lubko-supervisor`
+daemon, `worker/meta.json`, `worker/rollback.json`, or `supervisor/*.json` must
+run with explicit temporary XDG roots (for example `XDG_STATE_HOME=$(mktemp -d)`
+or a dedicated scratch container), never against the live environment's state.
+Ordinary worker restarts and probes run from the sealed per-commit runtime and
+must remain functional even when the source checkout is modified or deleted;
+there is no supported in-environment stopped state, and the only supported way
+to fully stop Lubko is to stop its container/environment.

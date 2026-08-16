@@ -27,7 +27,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
-from lubko import cli, lifecycle, worker
+from lubko import cli, lifecycle, supervise, worker
 from lubko import deployctl as dc
 from lubko.lifecycle import (
     SCHEMA_VERSION,
@@ -38,7 +38,7 @@ from lubko.lifecycle import (
     worker_alive,
     write_meta,
 )
-from lubko.state import state_root
+from lubko.state import rollback_state_path, state_root
 from lubko.worker import group_has_members
 from tests import _isolation as isolation
 from tests import _process_guard as guard
@@ -58,6 +58,18 @@ LINGER_SOURCE: Final = (
 )
 RETIRING_MARKER: Final = "retiring-worker"
 CANDIDATE_MARKER: Final = "candidate-worker"
+
+
+def shell_command_argv(command: str) -> list[str]:
+    """Wrap a shell snippet as an explicit process argv that execs ``sh``.
+
+    Args:
+        command: Shell snippet to run through ``sh -c``.
+
+    Returns:
+        An argv array that execs the snippet through ``/bin/sh``.
+    """
+    return [shutil.which("sh") or "/bin/sh", "-c", command]
 
 
 def worker_meta(commit: str, *, pid: int = 100, repo: str = "/workspace/Lubko") -> WorkerMeta:
@@ -94,6 +106,7 @@ def pending_state(
     old: str = "1" * 40,
     new: str = "2" * 40,
     previous_retiring: bool = False,
+    generation: int = 1,
 ) -> dc.RollbackState:
     """Return a live pending deployment state.
 
@@ -102,12 +115,14 @@ def pending_state(
         old: Previous confirmed commit.
         new: Proposed candidate commit.
         previous_retiring: Whether the previous worker's retirement has begun.
+        generation: Monotonic mission generation.
 
     Returns:
         A pending rollback state with distinct old/new commits.
     """
     return dc.RollbackState(
         schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=generation,
         status=dc.STATUS_PENDING,
         commit=new,
         previous_commit=old,
@@ -142,6 +157,45 @@ def make_options(repo: Path) -> dc.Options:
         validation_timeout_seconds=5,
         git_timeout_seconds=5,
         cli_timeout_seconds=60,
+    )
+
+
+class _NoopDeployLock:
+    """Minimal deployment-lock context that never blocks or fails."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+def _supervisor_child_state(commit: str, generation: int) -> supervise.SupervisorState:
+    """Build supervisor durable state running ``commit`` under ``generation``.
+
+    Args:
+        commit: Exact commit the daemon runs.
+        generation: Generation the daemon applied.
+
+    Returns:
+        A run-mode supervisor state owning a live candidate child.
+    """
+    return replace(
+        supervise.fresh_state(),
+        mode=supervise.MODE_RUN,
+        commit=commit,
+        applied_generation=generation,
+        child=supervise.WorkerChild(
+            pid=4242,
+            pgid=4242,
+            sid=4242,
+            start_time_ticks=42_424_242,
+            token=f"token-{generation}",
+            worker_id="test-supervised-worker",
+            spawned_at=1.0,
+        ),
+        intent=supervise.INTENT_RUN,
+        ready=True,
     )
 
 
@@ -384,6 +438,74 @@ def test_rollback_state_round_trip() -> None:
     assert dc._read_state() == state
 
 
+def test_rollback_state_generation_round_trip() -> None:
+    """The monotonic mission generation survives serialization identically."""
+    state = replace(pending_state(), generation=7)
+
+    dc._write_state(state)
+
+    parsed = dc._read_state()
+    assert parsed is not None
+    assert parsed == state
+    assert parsed.to_dict()["generation"] == 7
+
+
+def test_rollback_state_rejects_missing_generation() -> None:
+    """A legacy mission without a generation fails closed, never inventing zero."""
+    data = pending_state(generation=3).to_dict()
+    del data["generation"]
+
+    with pytest.raises(dc.DeployCtlError, match="malformed"):
+        dc.RollbackState.from_dict(data)
+
+
+def test_read_state_rejects_legacy_mission_without_generation() -> None:
+    """A legacy state file lacking generation is untrustworthy and rejected."""
+    data = pending_state(generation=3).to_dict()
+    del data["generation"]
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(
+        json.dumps(data, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(dc.DeployCtlError, match="malformed"):
+        dc._read_state()
+
+
+def test_next_mission_generation_is_strictly_greater(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new mission generation outranks every durable recorded generation."""
+    existing = replace(pending_state(), generation=4)
+    monkeypatch.setattr(dc, "_read_state", lambda: existing)
+    supervise.write_desired(
+        supervise.SupervisorDesired(
+            schema_version=supervise.SCHEMA_VERSION,
+            generation=9,
+            commit="2" * 40,
+            repo="",
+            uv_path="uv",
+            worker_id=None,
+            requested_at=1.0,
+        )
+    )
+    supervise.write_state(replace(supervise.fresh_state(), applied_generation=12))
+
+    assert dc.next_mission_generation() == 13
+
+
+def test_next_mission_generation_defaults_to_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no recorded generations anywhere, the first mission is generation one."""
+    monkeypatch.setattr(dc, "_read_state", lambda: None)
+    monkeypatch.setattr(supervise, "read_desired", lambda: None)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+
+    assert dc.next_mission_generation() == 1
+
+
 def test_first_confirmation_returns_7_hex_challenge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -581,6 +703,164 @@ def test_watchdog_rollback_condition_uses_deadline_or_candidate_death(
     assert calls == [state]
     assert result["phase"] == "idle"
     assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
+
+
+def test_status_keeps_live_supervised_pending_mission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A status query never rolls back a healthy supervisor-owned pending mission.
+
+    The candidate identity is the never-alive supervisor placeholder, so the
+    supervisor's durable child state is the only genuine liveness signal: the
+    status path must use ``_mission_candidate_alive`` and report the pending
+    phase instead of rolling the live deployment back.
+    """
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+    current: list[dc.RollbackState] = [state]
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: _supervisor_child_state(state.commit, state.generation),
+    )
+    monkeypatch.setattr(dc, "_read_state", lambda: current[0])
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == []
+    assert result["phase"] == "await-confirmation"
+    assert result["proposed_commit"] == state.commit
+    assert result["previous_commit"] == state.previous_commit
+    assert result["deadline"] == state.deadline
+
+    current[0] = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == []
+    assert result["phase"] == "await-reversal"
+    assert result["proposed_commit"] == state.commit
+    assert result["previous_commit"] == state.previous_commit
+
+
+def test_status_rolls_back_supervised_mission_when_candidate_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A status query rolls back a supervised candidate the daemon no longer tracks."""
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+    states = iter((state, rolled_back))
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == [state]
+    assert result["phase"] == "idle"
+    assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
+
+
+def test_status_rolls_back_supervised_mission_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A status query rolls back a supervised mission whose window lapsed.
+
+    Even a still-active candidate cannot keep a mission alive past its
+    confirmation deadline: the deadline semantics alone must require rollback.
+    """
+    base = pending_state()
+    state = replace(
+        base,
+        new_meta=dc._placeholder_meta(base.commit, base.repo),
+        deadline=time.time() - 1,
+    )
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+    states = iter((state, rolled_back))
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: _supervisor_child_state(state.commit, state.generation),
+    )
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == [state]
+    assert result["phase"] == "idle"
+    assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
+
+
+def test_status_keeps_live_legacy_pending_mission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without a supervisor, a live recorded candidate survives status."""
+    state = pending_state()
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == []
+    assert result["phase"] == "await-confirmation"
+    assert result["proposed_commit"] == state.commit
+    assert result["previous_commit"] == state.previous_commit
 
 
 def test_watchdog_child_drops_inherited_file_descriptors(tmp_path: Path) -> None:
@@ -1102,20 +1382,20 @@ def write_database_config(tmp_path: Path, cluster: _pg.PgCluster) -> Path:
 
 
 def insert_running_job(conninfo: str, cwd: str, command: str) -> object:
-    """Insert a protocol v2 running command job and return its id.
+    """Insert a protocol v3 running command job and return its id.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        command: Shell snippet, executed by an explicit ``/bin/sh -c`` argv.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "running"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -1329,8 +1609,9 @@ def test_prepare_locked_is_reversible_and_leaves_previous_running(
     monkeypatch.setattr(dc, "_spawn_gated_candidate", fake_gated)
 
     try:
-        state, gated = dc._prepare_locked(make_options(repo), second)
+        state, gated = dc._prepare_locked(make_options(repo), second, supervised=False)
 
+        assert gated is not None
         assert state.previous_retiring is False
         assert state.previous_meta == previous
         assert state.new_meta == gated.meta
@@ -1369,7 +1650,7 @@ def test_prepare_locked_restores_previous_on_validation_failure(
     monkeypatch.setattr(cli, "remove_cli_root", lambda _commit: None)
 
     with pytest.raises(dc.DeployCtlError, match="validation failed"):
-        dc._prepare_locked(make_options(repo), second)
+        dc._prepare_locked(make_options(repo), second, supervised=False)
 
     assert checkouts == [(second, False), (first, True)]
 
@@ -1439,7 +1720,7 @@ def test_prepare_locked_rolls_back_when_watchdog_fork_fails(
 
     try:
         with pytest.raises(dc.DeployCtlError, match="fork boom"):
-            dc._prepare_locked(make_options(repo), second)
+            dc._prepare_locked(make_options(repo), second, supervised=False)
 
         assert len(written) == 1
         assert written[0].previous_retiring is False
@@ -1793,7 +2074,7 @@ def test_helper_uses_fresh_durable_success_deadline(
     guard.register(gated_proc)
     gated = dc.GatedWorker(proc=gated_proc, gate_writer=-1, meta=stale.new_meta)
     captured: dict[str, float] = {}
-    monkeypatch.setattr(dc, "_prepare_locked", lambda _options, _commit: (stale, gated))
+    monkeypatch.setattr(dc, "_prepare_locked", lambda _options, _commit, **_kwargs: (stale, gated))
     monkeypatch.setattr(dc, "_send_helper_response", lambda _writer, _response: None)
     monkeypatch.setattr(dc, "_complete_handoff", lambda _options, _state, _gated: stale)
 
@@ -1962,20 +2243,20 @@ def worker_without_persist_command(tmp_path: Path) -> list[str]:
 
 
 def insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
-    """Insert a protocol v2 pending command job.
+    """Insert a protocol v3 pending command job running a shell snippet.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        command: Shell command to run.
+        command: Shell snippet, executed by an explicit ``/bin/sh -c`` argv.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "command": command},
+        "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -1987,21 +2268,21 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
     return row[0]
 
 
-def insert_pending_args_job(conninfo: str, cwd: str, args: list[str]) -> object:
-    """Insert a protocol v2 pending argv-style command job.
+def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> object:
+    """Insert a protocol v3 pending command job executing argv directly.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
-        args: Executable arguments.
+        process: Non-empty argv array to execute directly.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 2,
+        "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "args": args},
+        "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })
     with psycopg.connect(conninfo) as conn:
@@ -2237,7 +2518,7 @@ def _run_confirmation_handshake(jobs_db: str, repo: Path, fake_uv: Path, commit:
         fake_uv: Stub ``uv`` executable.
         commit: Exact proposed commit.
     """
-    confirm1_id = insert_pending_args_job(
+    confirm1_id = insert_pending_process_job(
         jobs_db,
         str(repo),
         deployctl_args(repo, fake_uv, json.dumps({"type": "confirm", "commit": commit})),
@@ -2252,7 +2533,7 @@ def _run_confirmation_handshake(jobs_db: str, repo: Path, fake_uv: Path, commit:
     assert CHALLENGE_RE.fullmatch(challenge) is not None
     assert len(challenge) == 7
 
-    confirm2_id = insert_pending_args_job(
+    confirm2_id = insert_pending_process_job(
         jobs_db,
         str(repo),
         deployctl_args(
@@ -2286,7 +2567,7 @@ def test_end_to_end_queue_checkout_survives_old_worker_shutdown(
     repo, second, old_meta, fake_uv = _prepare_e2e_parts(prepared)
     try:
         unrelated = insert_pending_job(jobs_db, str(repo), "sleep 30")
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2343,7 +2624,7 @@ def test_end_to_end_bad_candidate_rolls_back(
         tmp_path, monkeypatch, pg_cluster, bad_candidate=True
     )
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2380,7 +2661,7 @@ def test_end_to_end_cancelled_checkout_leaves_previous_worker_running(
         tmp_path, monkeypatch, pg_cluster
     )
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2442,7 +2723,7 @@ def test_end_to_end_queue_checkout_withholds_process_pgid(
         )
     )
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2493,7 +2774,7 @@ def test_end_to_end_queue_checkout_error_leaves_failed_row(
     )
     fake_uv = make_fake_uv(tmp_path, sys.executable, fail_validation=True)
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
@@ -2564,7 +2845,7 @@ def test_end_to_end_full_deployment_stays_hermetic(
     worker_environ = read_proc_environ(old_meta.pid)
     assert worker_environ.get("XDG_STATE_HOME") == expected_state_home
     try:
-        checkout_id = insert_pending_args_job(
+        checkout_id = insert_pending_process_job(
             jobs_db,
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),

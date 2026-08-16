@@ -12,7 +12,7 @@ Lubko is a remote development execution environment. ChatGPT acts as the **orche
 The flow, in one line:
 
 ```text
-ChatGPT -> connected Supabase connector -> INSERT protocol-v2 command row in lubko.jobs -> worker claims and executes that row -> poll the same root row
+ChatGPT -> connected Supabase connector -> INSERT protocol-v3 command row in lubko.jobs -> worker claims and executes that row -> poll the same root row
 ```
 
 In more detail:
@@ -37,12 +37,12 @@ Supabase / PostgreSQL
 ChatGPT
 ```
 
-A basic protocol-v2 command submission (remember the returned UUID):
+A basic protocol-v3 command submission (remember the returned UUID):
 
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":2,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
+    '{"v":3,"type":"command","request":{"cwd":"/workspace/Lubko","process":["git","status","--short"]},"state":{"status":"pending"}}'
 )
 returning id;
 ```
@@ -127,14 +127,13 @@ id      uuid primary key default gen_random_uuid()
 payload text not null
 ```
 
-`payload` is one string containing a JSON object (protocol v2, documented in `docs/protocol.md`). Every evolving job/request/result/state/cancellation/process-identity/output field lives inside it:
+`payload` is one string containing a JSON object (protocol v3, documented in `docs/protocol.md`). Every evolving job/request/result/state/cancellation/process-identity/output field lives inside it:
 
 ```text
-payload.v                  protocol version (currently 2)
+payload.v                  protocol version (currently 3)
 payload.type               job kind: "command" or "output_chunk"
 payload.request.cwd        working directory
-payload.request.command    shell command, or
-payload.request.args       argv list (exactly one of the two)
+payload.request.process    argv array (required; executed directly, never through a shell)
 payload.state.status       pending | running | succeeded | failed | cancelled
 payload.state.created_at / updated_at / started_at / finished_at
 payload.state.worker_id
@@ -146,7 +145,7 @@ payload.output.<stream>.tail / start / end / previous   bounded live output wind
 payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
 ```
 
-Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware: `command` rows need a `request` object and `state.status`, while `output_chunk` rows need explicit `thread` ownership and value/offset shape.
+Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware but deliberately generic: `command` rows need a `request` object and `state.status`, while `output_chunk` rows need explicit `thread` ownership and value/offset shape. The payload parser (`protocol.py`) is what enforces that `request.process` is required — a non-empty array of non-empty strings — and that the legacy `request.command` / `request.args` keys are rejected; none of that is encoded in SQL, so a protocol-version change needs no DDL.
 
 Immutable historical output lives in separate `output_chunk` rows in the same two-column table, explicitly owned by a root job via `payload.thread`. Root live output tails are bounded rolling windows of the newest up to 4000 raw bytes per stream (decoded to at most 4000 characters), never shortened by archival rotation. Chunk insertion and the root `previous` pointer update are transactional, and the publication transaction first retains the root `command` row with a row-level lock so a root deleted concurrently leaves no new chunk rows.
 
@@ -154,18 +153,30 @@ The worker atomically claims pending `command` rows using PostgreSQL row locking
 
 One worker is a single nonblocking supervisor and runs arbitrarily many jobs concurrently; there is no application-level concurrency limit, so submitting several independent jobs lets them genuinely run at the same time.
 
+Protocol version upgrades are breaking and destructive. The v2 → v3 cutover
+**discards old transport contents rather than migrating them**: every existing
+root `command` row and its `output_chunk` history in `lubko.jobs` is purged,
+and no v2 row is transformed or preserved. There is no protocol-data drain or migration,
+and no compatibility path — v3 rejects all v2 payloads, including any still
+carrying `request.command` or `request.args`. Operationally, quiesce the
+live queue by stopping new submissions, let any in-flight v2 work become durably
+terminal, bring up and prove the v3 supervisor/worker, then `truncate
+lubko.jobs` while quiescent to purge the whole transport, and prove a fresh v3
+round trip. The end state is an empty `lubko.jobs` with no v2 or historical
+content left behind.
+
 ---
 
 # Creating and polling a Supabase job
 
 Use the connected Supabase application and its SQL execution capability.
 
-A basic protocol-v2 job insertion:
+A basic protocol-v3 job insertion:
 
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":2,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
+    '{"v":3,"type":"command","request":{"cwd":"/workspace/Lubko","process":["git","status","--short"]},"state":{"status":"pending"}}'
 )
 returning id;
 ```
@@ -176,7 +187,7 @@ Example result:
 id: 12345678-1234-1234-1234-123456789abc
 ```
 
-Always retain the returned UUID. `payload.request.cwd` is the shell working directory for the queued command, and `payload.state.status` must be `"pending"` for the worker to claim it. The command may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
+Always retain the returned UUID. `payload.request.cwd` is the working directory for the queued process, and `payload.state.status` must be `"pending"` for the worker to claim it. The submitted `request.process` argv is executed directly — never through a shell — so to run a shell snippet the orchestrator must select a shell interpreter explicitly, for example `"process": ["/bin/sh", "-c", "<snippet>"]`. The process may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
 
 Poll by ID:
 
@@ -198,8 +209,8 @@ Interpret states as follows:
 
 - `pending`: the job has not yet been claimed;
 - `running`: a Lubko worker is currently executing it;
-- `succeeded`: the shell command completed with exit code 0;
-- `failed`: the shell command completed unsuccessfully;
+- `succeeded`: the process completed with exit code 0;
+- `failed`: the process completed unsuccessfully;
 - `cancelled`: the job was intentionally abandoned.
 
 For a running job, poll again rather than assuming failure. Checking one root job by ID is always safe and useful: the row always contains current lifecycle state plus a substantial recent rolling output window, independent of chunk rotation.
@@ -1036,9 +1047,21 @@ When the user asks to upgrade or redeploy the Lubko worker, use the deterministi
 ```sh
 lubko-deploy status
 lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
-lubko-deploy stop [--grace-seconds N]
+lubko-deploy restart
+lubko-deploy migrate --commit <sha> [--repo DIR] [--uv PATH]
+lubko-deploy recover [--repo DIR] [--uv PATH] [--probe-timeout N]
 lubko-deploy log [--lines N]
+lubko-supervisor --status
 ```
+
+The maintained worker is owned by an external supervisor (`lubko-supervisor`,
+the container's main process, replacing the former `sleep infinity` child of
+Tini). `deploy` hands the exact confirmed commit to the supervisor, which owns
+the worker as its direct child and restarts it automatically after an
+unexpected exit, with bounded backoff and no manual intervention. A normal
+`deploy` refuses to fall back to direct spawning when the supervisor is not
+running; only the one-time `--bootstrap` path and the explicit emergency
+`recover`/`repair` commands start workers without it.
 
 `deploy` first validates the checkout by running `uv sync` and the repository-required checks (`ruff format --check`, `ruff check`, `mypy`, `pytest`). If validation fails, deployment is refused and the current worker is left untouched. Only a passing checkout is deployed.
 
@@ -1049,11 +1072,11 @@ Deployment behavior:
 - the previous maintained worker is stopped by its exact recorded PID/process-group/session identity — never by `pkill`, `killall`, or process-name matching;
 - the deployed git commit is reported, and git state is never mutated (no silent pull, reset, stash, or checkout).
 
-Per-user lifecycle state and logs live under `$XDG_STATE_HOME/lubko` (default `~/.local/state/lubko`), with `worker/meta.json`, `worker/worker.log`, `worker/deploy.log`, a `worker/.deploy.lock` serializing concurrent deployments, and `toolchain.json` recording the maintained `uv` executable.
+Per-user lifecycle state and logs live under `$XDG_STATE_HOME/lubko` (default `~/.local/state/lubko`), with `worker/meta.json`, `worker/worker.log`, `worker/deploy.log`, a `worker/.deploy.lock` serializing concurrent deployments, `supervisor/` holding the external supervisor's durable desired/state/status files, and `toolchain.json` recording the maintained `uv` executable.
 
 ## Bootstrap and the unmanaged legacy worker
 
-Before the first managed deployment the running worker is an unmanaged legacy daemon with no recorded identity. `lubko-deploy status` reports `unmanaged`, and `deploy`/`stop` refuse to claim they can stop it by identity. The one-time migration is a single manual stop of the legacy worker followed by:
+Before the first managed deployment the running worker is an unmanaged legacy daemon with no recorded identity. `lubko-deploy status` reports `unmanaged`, and `deploy` refuses to claim it can stop it by identity. The one-time migration is a single manual stop of the legacy worker followed by:
 
 ```sh
 lubko-deploy deploy --bootstrap
@@ -1261,7 +1284,7 @@ Rules:
 
 ## Supabase job failure
 
-If the shell job used to invoke a Lubko command fails: inspect stdout and stderr, determine whether the command syntax, environment, or Lubko tool failed, and submit a corrective job. Do not assume the agent itself failed merely because a surrounding shell invocation failed.
+If the job used to invoke a Lubko command fails: inspect stdout and stderr, determine whether the command syntax, environment, or Lubko tool failed, and submit a corrective job. Do not assume the agent itself failed merely because a surrounding invocation (for example a submitted argv that explicitly ran a shell) failed.
 
 ## Agent failure
 
@@ -1338,13 +1361,17 @@ Not all operations are equally safe to retry:
 - **Reads and status checks** (SELECT, polling for job status, reading agent state) are inherently idempotent and safe to retry without restriction.
 - **Writes and mutations** (INSERT, UPDATE) must be retried with care. Before retrying a write, verify that the intended state change was not already applied by the previous attempt. Use idempotency keys, conditional WHERE clauses, or state checks to avoid duplicating mutations.
 
-## Lubko shell-job failure
+## Lubko job failure
 
-The row was inserted successfully, the worker claimed it, and the queued shell command returned a non-zero exit code. This is a Lubko command-execution result.
+The row was inserted successfully, the worker claimed it, and the queued
+process argv returned a non-zero exit code. This is a Lubko job-execution
+result.
 
 ## Managed-agent failure
 
-The Supabase shell job may have succeeded in creating an agent, but the agent may later finish in a failed state. Use the **agent ID**, not the original Supabase job ID, to inspect that lifecycle.
+The Supabase job may have succeeded in creating an agent, but the agent may
+later finish in a failed state. Use the **agent ID**, not the original Supabase
+job ID, to inspect that lifecycle.
 
 ---
 
@@ -1374,21 +1401,18 @@ Lubko represents stdout/stderr as bounded rolling live tails; older output is av
 
 # GitHub issue status coordination
 
-Every orchestrator that works on a GitHub issue must maintain **one editable orchestrator status comment on that issue** for the duration of the work.
+The issue-ownership protocol is part of **core startup and orchestration rules**, not optional guidance: every orchestrator that does GitHub issue work must, **before any substantive work on an issue**, read the canonical status comment, determine ownership, claim it, and keep it refreshed.
 
-For issue work:
+For every GitHub issue an orchestrator will work on:
 
-- create or inherit the issue's orchestrator status comment before substantial work;
-- while the status is `working`, update the same comment at least every 5 minutes;
-- use the comment's GitHub `updated_at` as the authoritative activity time;
-- treat a `working` comment whose `updated_at` is at least 10 minutes old as abandoned and inheritable;
-- before every refresh, re-read the canonical status comment and stop orchestrating the issue if its owner has changed;
-- list the resources currently owned by the orchestrator according to its own judgment. This should include Lubko work directories and managed agents when they exist, and may include branches, PRs, root job UUIDs, temporary clones, or other useful recovery handles;
-- mark the comment `completed` when the issue workflow is actually complete.
-
-Use one machine-recognizable marker, `<!-- lubko-orchestrator-status -->`, so later orchestrators can locate the comment reliably. If a race creates more than one marked comment, the most recently updated marked comment is canonical.
-
-Do not infer issue ownership or abandonment from agent silence, CPU activity, lack of new commits, or lack of newly submitted Lubko commands. The issue status comment is the ownership record.
+1. **Read the canonical status comment first.** Locate the `<!-- lubko-orchestrator-status -->` marker comment (if several marked comments exist, the most recently updated one is canonical). Before any checkout, commit, PR, or other substantive work, load that comment's raw content and its GitHub `updated_at`.
+2. **Determine whether `working` ownership is active or abandoned by freshness.** A `working` marker whose `updated_at` is under 10 minutes old is active and owned. A `working` marker whose `updated_at` is at least 10 minutes old is abandoned and inheritable. A `completed` marker, or no marker at all, is unowned.
+3. **Only proceed when the issue is unowned or abandoned.** If another orchestrator actively owns the issue, do not start work on it: pick another issue or report back, and do not mutate the issue.
+4. **Claim the issue before substantive work.** Write (or update) the canonical status comment with a fresh owner identity, the current time, the resources currently owned (Lubko work directories and managed agents when they exist, plus branches, PRs, root job UUIDs, temporary clones, or other recovery handles), and status `working`.
+5. **Immediately re-read and yield if the race was lost.** After claiming, re-read the canonical comment; if the owner changed to a different orchestrator (or the most recently updated marked comment is no longer yours), yield: stop orchestrating this issue, do not continue, and record that you lost the race.
+6. **Keep the claim refreshed at the documented cadence.** While status is `working`, update the same comment at least every 5 minutes, re-reading the canonical comment before every refresh and stopping if ownership changed.
+7. Use the comment's GitHub `updated_at` as the authoritative activity time; never infer ownership or abandonment from agent silence, CPU activity, lack of commits, or lack of newly submitted Lubko commands. The issue status comment is the ownership record.
+8. Mark the comment `completed` only when the issue workflow is actually complete.
 
 Recurring scheduled orchestrators must additionally follow [`docs/skills/scheduled.md`](skills/scheduled.md) for startup, inheritance, issue selection, recovery, and release-branch behavior.
 

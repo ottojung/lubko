@@ -1,6 +1,6 @@
 # Lubko transport protocol and database binding specification
 
-Status: authoritative for protocol v2.
+Status: authoritative for protocol v3.
 
 ## The two-column invariant
 
@@ -40,6 +40,13 @@ constraint jobs_payload_type_shape      check (
 )
 ```
 
+The SQL constraint is deliberately generic; it does not encode `request.process`
+or the legacy-field prohibition. Those rules are enforced by the payload parser
+(`src/lubko/protocol.py`): a v3 `command` request must carry a process array,
+and carrying the legacy `command`/`args` keys is rejected. Because the v2 → v3
+breaking change is content-only, the physical two-column table does not change
+between versions.
+
 `command` rows carry a runnable lifecycle; immutable `output_chunk` rows carry
 explicit ownership and offset shape. Chunk rows never carry fake command
 lifecycle state. Claim and lease-recovery queries operate only on
@@ -47,11 +54,11 @@ lifecycle state. Claim and lease-recovery queries operate only on
 
 ## Startup schema verification
 
-The v2 worker verifies more than the two-column invariant before starting. It
+The v3 worker verifies more than the two-column invariant before starting. It
 also requires the type-aware `jobs_payload_type_shape` constraint and the chunk
 ownership/ordering indexes to be present, because immutable `output_chunk`
 publication is impossible without them. Any table lacking this canonical
-protocol v2 shape is refused at startup with a clear diagnostic pointing at
+protocol v3 shape is refused at startup with a clear diagnostic pointing at
 the idempotent baseline `migrations/0001_two_column_protocol.sql`. This keeps
 output publication from failing at runtime on a table that cannot represent
 immutable chunks.
@@ -100,11 +107,23 @@ access contract.
 ## Versioning
 
 - `payload.v` is a required integer protocol version.
-- Version `2` is the current binding. Within a version, fields may be added
+- Version `3` is the current binding. Within a version, fields may be added
   additively. Breaking changes (renaming or removing fields, changing types or
   semantics) require a new version and a new worker generation.
-- A worker rejects any payload whose version it does not understand; the job is
-  failed with a diagnostic instead of being stuck in the queue.
+- **The v2 → v3 cutover is destructive and requires no DDL.** Version `2` is
+  unsupported: its `request.command` shell-string and `request.args` argv forms
+  are not accepted by any v3 parser, builder, or worker, and there is **no
+  compatibility path and no migration**. Because the two-column transport
+  schema is identical for v2 and v3, the cutover runs entirely in place against
+  the live queue. A valid procedure is: quiesce new submissions, let any
+  in-flight v2 work become durably terminal, bring up and prove the v3
+  supervisor/worker, then `truncate lubko.jobs` while quiescent (discarding
+  every old root `command` row and its `output_chunk` history), and prove a
+  fresh v3 round trip. Truncating before the first v3 start is also valid; the
+  requirement is only that the end state is an empty transport. No v2 row is
+  transformed, migrated, or preserved, and no existing table is altered.
+- A v3 worker rejects any payload whose version it does not understand; the job
+  is failed with a diagnostic instead of being stuck in the queue.
 
 ## Context-safety contract
 
@@ -116,9 +135,9 @@ output window, independent of chunk rotation. Literally arbitrary SQL is not
 bounded; the guarantee covers Lubko's row representation and documented
 workflows.
 
-## Protocol v2 payload kinds
+## Protocol v3 payload kinds
 
-Version 2 defines exactly two kinds:
+Version 3 defines exactly two kinds:
 
 - `command` — a runnable root job;
 - `output_chunk` — an immutable, explicitly owned historical output chunk.
@@ -129,11 +148,11 @@ A `command` payload is a JSON object:
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "type": "command",
   "request": {
     "cwd": "/workspace/project",
-    "command": "git status --short"
+    "process": ["git", "status", "--short"]
   },
   "state": {
     "status": "pending"
@@ -146,9 +165,9 @@ live output window:
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "type": "command",
-  "request": { "cwd": "/workspace/project", "args": ["ls", "/etc"] },
+  "request": { "cwd": "/workspace/project", "process": ["ls", "/etc"] },
   "state": { "status": "running", "...": "..." },
   "output": {
     "stdout": {
@@ -181,8 +200,19 @@ Required object.
 | Field     | Type            | Required | Meaning                                |
 | --------- | --------------- | -------- | -------------------------------------- |
 | `cwd`     | string          | yes      | absolute working directory for the job |
-| `command` | non-empty string | exactly one of `command`/`args` | shell command to run through `bash -lc` |
-| `args`    | non-empty array of strings | exactly one of `command`/`args` | argv-style command to exec directly |
+| `process` | non-empty array of non-empty strings | yes | argv executed directly, never through a shell |
+
+`process` is the **only** executable field in protocol v3. The worker executes
+its elements verbatim as the child process argv in `cwd`; it never interprets
+them with a shell, so shell metacharacters are passed to the program literally.
+To obtain shell semantics the submitter must select a shell interpreter
+explicitly, for example `"process": ["/bin/sh", "-c", "<snippet>"]`.
+
+The legacy v2 request fields `command` and `args` are **forbidden** in v3. A v3
+payload carrying either key is rejected outright — even when a valid
+`request.process` is also present — never silently ignored. Other unknown
+additive fields may be retained additively within a version, but `command` and
+`args` are explicitly excluded as removed protocol fields.
 
 #### `state` — mutable lifecycle
 
@@ -236,7 +266,7 @@ table:
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "type": "output_chunk",
   "thread": "<ROOT JOB UUID>",
   "stream": "stdout",
@@ -368,7 +398,8 @@ PostgreSQL compare-and-swap (CAS) predicates plus row locking:
 The daemon is one nonblocking supervisor holding a single PostgreSQL connection
 and an unbounded in-memory registry of active jobs. There is **no
 application-level concurrency limit** and no thread or connection per job; each
-shell command runs as its own OS process/session/process group and the daemon
+job process runs as its own OS process/session/process group, executed directly
+from its `request.process` argv (never through a shell), and the daemon
 observes it with `Popen.poll()`-style checks. The supervisor loop services
 running jobs (observe exits, escalate cancellations, publish output, finalize),
 refreshes leases, runs recovery, and claims a bounded batch of new pending
@@ -424,9 +455,20 @@ invariant comment. The baseline is idempotent and safe to apply more than
 once. There is no older schema, no staging table, and no rollback path: the
 two-column table is the only supported binding, and the worker refuses to
 start against any other shape. After the table exists, submit jobs in protocol
-v2 JSON form:
+v3 JSON form:
 
 ```sql
 insert into lubko.jobs (payload)
-values ('{"v":2,"type":"command","request":{"cwd":"...","command":"..."},"state":{"status":"pending"}}');
+values ('{"v":3,"type":"command","request":{"cwd":"...","process":["git","status"]},"state":{"status":"pending"}}');
 ```
+
+Upgrading an existing transport from v2 is a destructive cutover that needs
+**no schema change**: the two-column table is identical in v2 and v3, and the
+v3 worker does not understand v2 rows. Run it against the live queue: quiesce
+new submissions, let any in-flight v2 work become durably terminal, bring up
+and prove the v3 supervisor/worker, then `truncate lubko.jobs` while quiescent
+(discarding every old root `command` row and `output_chunk` history), and prove
+a fresh v3 round trip. Truncating before the first v3 start is equally valid;
+only the end state matters. Old v2 contents are discarded; there is no protocol-data
+drain/migration path, and no v2 row is transformed or preserved. Only the payload protocol
+version changes; the physical schema stays the canonical two-column table.
