@@ -36,7 +36,7 @@ from uuid import UUID
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli
+from lubko import cli, supervise
 from lubko.config import load_database_config
 from lubko.lifecycle import (
     SCHEMA_VERSION,
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
-ROLLBACK_SCHEMA_VERSION: Final = 1
+ROLLBACK_SCHEMA_VERSION: Final = 2
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
@@ -127,6 +127,7 @@ class RollbackState:
     """Durable mission retained until a candidate is confirmed or restored."""
 
     schema_version: int
+    generation: int
     status: str
     commit: str
     previous_commit: str
@@ -148,6 +149,7 @@ class RollbackState:
         """
         return {
             "schema_version": self.schema_version,
+            "generation": self.generation,
             "status": self.status,
             "commit": self.commit,
             "previous_commit": self.previous_commit,
@@ -180,8 +182,12 @@ class RollbackState:
             replacement = data["new_meta"]
             if not isinstance(previous, dict) or not isinstance(replacement, dict):
                 raise TypeError
+            generation = int(data["generation"])
+            if generation < 1:
+                raise ValueError
             return cls(
                 schema_version=int(data["schema_version"]),
+                generation=generation,
                 status=str(data["status"]),
                 commit=str(data["commit"]),
                 previous_commit=str(data["previous_commit"]),
@@ -264,6 +270,183 @@ def _read_state() -> RollbackState | None:
         msg = f"unsupported supervised deployment state version {state.schema_version}"
         raise DeployCtlError(msg)
     return state
+
+
+def next_mission_generation() -> int:
+    """Allocate the next monotonic mission generation for a new checkout.
+
+    Must run while the deploy lock is held. The returned generation is
+    strictly greater than every durable generation observed so far: the
+    existing rollback mission, the supervisor desired intent, and the
+    supervisor applied state. A supervisor that compares generations can then
+    never mistake a freshly created mission for an older or already-applied
+    generation. Allocation is serialized with the desired-intent writes so a
+    concurrent restart can never reuse or reorder a generation.
+
+    Returns:
+        The next strictly greater positive generation.
+    """
+    with supervise.generation_lock():
+        return supervise.next_generation()
+
+
+def _placeholder_meta(commit: str, repo: str) -> WorkerMeta:
+    """Return an identity-less candidate record for a supervisor-owned mission.
+
+    When the external supervisor is live, the candidate process is spawned by
+    the daemon, not by deployctl, so deployctl never knows the candidate
+    identity at mission-publication time. The placeholder is recorded for
+    schema completeness and is deliberately never alive, so nothing in
+    deployctl can treat it as a real process; liveness is observed through the
+    supervisor's own durable state instead.
+
+    Args:
+        commit: Exact candidate commit.
+        repo: Maintained checkout the candidate belongs to.
+
+    Returns:
+        A non-alive worker metadata record for the mission file.
+    """
+    return WorkerMeta(
+        schema_version=SCHEMA_VERSION,
+        state=STATE_RUNNING,
+        pid=0,
+        pgid=0,
+        sid=0,
+        start_time_ticks=0,
+        token=None,
+        repo=repo,
+        git_commit=commit,
+        worker_id="",
+        log_path="",
+        started_at=None,
+        stopped_at=None,
+    )
+
+
+def _supervised_mission_active(state: RollbackState) -> bool:
+    """Return whether the supervisor is currently running the mission candidate.
+
+    In supervised mode the candidate identity lives in the supervisor's durable
+    state, so a mission is active exactly when the supervisor tracks that exact
+    candidate commit as its live child at or after the mission generation.
+
+    Args:
+        state: Pending supervised-deployment mission.
+
+    Returns:
+        ``True`` when the supervisor owns a live worker for ``state.commit``
+        that it began under this mission generation.
+    """
+    supervisor_state = supervise.read_state()
+    return (
+        supervisor_state.commit == state.commit
+        and supervisor_state.child is not None
+        and supervisor_state.applied_generation >= state.generation
+    )
+
+
+def _mission_candidate_alive(state: RollbackState) -> bool:
+    """Return whether the pending-mission candidate is genuinely live.
+
+    With a live external supervisor the candidate liveness is observed through
+    the daemon's durable child identity; otherwise the legacy recorded
+    candidate metadata is used (one-time bootstrap / emergency path).
+
+    Args:
+        state: Pending supervised-deployment mission.
+
+    Returns:
+        ``True`` when the candidate consumer is currently live.
+    """
+    if supervise.supervisor_running():
+        return _supervised_mission_active(state)
+    return worker_alive(state.new_meta)
+
+
+def settle_desired(commit: str, repo: str, uv_path: str) -> int:
+    """Write a desired run intent newer than any open mission and await it.
+
+    This is the durable settlement of a supervised deployment: confirmation
+    settles on the candidate commit, rollback settles on the previous commit,
+    each at a strictly newer generation than the mission, so the terminal
+    mission record can never override the resulting worker. The supervisor is
+    the only process-lifecycle authority; deployctl only records the intent.
+
+    Args:
+        commit: Exact commit the settlement must run.
+        repo: Maintained checkout the commit belongs to.
+        uv_path: Recorded ``uv`` executable.
+
+    Returns:
+        The written settlement generation.
+
+    Raises:
+        DeployCtlError: If the supervisor did not apply and prove the settled
+            worker.
+    """
+    generation = supervise.request_run(
+        commit,
+        repo=repo,
+        uv_path=uv_path,
+        worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+    )
+    if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        msg = "the external supervisor did not apply the settlement intent"
+        raise DeployCtlError(msg)
+    if not supervise.wait_until_ready(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        msg = "the external supervisor did not prove the settled worker consumes the queue"
+        raise DeployCtlError(msg)
+    return generation
+
+
+def publish_mission(state: RollbackState, lock_timeout_seconds: float) -> None:
+    """Durably publish a prepared pending mission and arm its watchdog.
+
+    Args:
+        state: Prepared pending mission (may already be durable; idempotent).
+        lock_timeout_seconds: Deployment-lock timeout for the watchdog.
+    """
+    _write_state(state)
+    try:
+        _fork_watchdog(lock_timeout_seconds)
+    except DeployCtlError:
+        _rollback_locked(state)
+        raise
+
+
+def _wait_for_supervisor_mission(
+    state: RollbackState, confirm_window_seconds: float
+) -> RollbackState:
+    """Wait for the supervisor to run the pending-mission candidate and prove it.
+
+    The supervisor owns the transition: it retires the previous worker and
+    starts the candidate from its sealed runtime as a direct child, then proves
+    queue readiness. deployctl waits for that convergence and refreshes the
+    confirmation deadline only once the candidate is genuinely live.
+
+    Args:
+        state: Published pending mission.
+        confirm_window_seconds: Confirmation window after candidate readiness.
+
+    Returns:
+        The live pending mission with a refreshed deadline.
+
+    Raises:
+        DeployCtlError: If the supervisor did not apply the mission or prove
+            the candidate.
+    """
+    if not supervise.wait_for_generation(
+        state.generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS
+    ):
+        msg = "the external supervisor did not apply the pending supervised mission"
+        raise DeployCtlError(msg)
+    if not supervise.wait_until_ready(state.generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        msg = "the external supervisor did not prove the candidate consumes the queue"
+        raise DeployCtlError(msg)
+    live = replace(state, deadline=time.time() + confirm_window_seconds)
+    _write_state(live)
+    return live
 
 
 def _run_git(repo: Path, args: Sequence[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -491,7 +674,7 @@ def _candidate_response(state: RollbackState) -> dict[str, object]:
         "ok": True,
         "phase": "pending",
         "commit": state.commit,
-        "worker_pid": state.new_meta.pid,
+        "worker_pid": None if (state.new_meta.pid or 0) <= 0 else state.new_meta.pid,
         "deadline": state.deadline,
     }
 
@@ -660,21 +843,23 @@ def _wait_for_durable_success(job_id: object, deadline: float) -> None:
             conn.close()
 
 
-def _abort_mission(gated: GatedWorker, state: RollbackState) -> None:
+def _abort_mission(gated: GatedWorker | None, state: RollbackState) -> None:
     """Undo a prepared mission without crossing the destructive boundary.
 
     The initiating checkout row failed, was cancelled, was deleted, or never
-    reached durable success. The gated candidate is closed (it exits on EOF),
-    the previous exact checkout is restored, and the previous worker is left
-    running; the armed watchdog completes the state transition to rolled_back.
+    reached durable success. In the legacy path the gated candidate is closed
+    (it exits on EOF); in supervised mode no candidate was ever spawned by
+    deployctl, so only the reversible preparation is undone. The previous
+    exact checkout is restored and the previous worker is left running.
     ``previous_retiring`` is never set, so rollback always reuses or restores
     the previous worker without treating retirement as begun.
 
     Args:
-        gated: The gated candidate process and identity.
+        gated: The gated candidate process, or ``None`` in supervised mode.
         state: The pending rollback mission.
     """
-    _close_gate(gated.gate_writer)
+    if gated is not None:
+        _close_gate(gated.gate_writer)
     _checkout(
         Path(state.repo),
         state.previous_commit,
@@ -684,25 +869,37 @@ def _abort_mission(gated: GatedWorker, state: RollbackState) -> None:
     cli.remove_cli_root(state.commit)
 
 
-def _complete_handoff(options: Options, state: RollbackState, gated: GatedWorker) -> RollbackState:
-    """Stop the old worker and release the candidate after durable success.
+def _complete_handoff(
+    options: Options,
+    state: RollbackState,
+    gated: GatedWorker | None,
+) -> RollbackState:
+    """Cross the destructive handoff for a prepared pending mission.
 
-    This is the destructive handoff: it may only run after the initiating
-    queue row is durably ``succeeded``. The durable ``previous_retiring``
-    marker is persisted before the previous worker is stopped so a forked
-    watchdog never accepts a momentarily-alive retiring identity after a crash.
+    With a live external supervisor the handoff is purely durable: the pending
+    mission is published so the daemon (the single process-lifecycle
+    authority) retires the previous worker and starts the candidate from its
+    sealed runtime as a direct child, and deployctl waits for the daemon to
+    prove candidate readiness. Without a supervisor (one-time bootstrap /
+    emergency path only) the legacy gate release runs.
 
     Args:
         options: Deployment options.
-        state: Pending rollback mission.
-        gated: The gated candidate process and identity.
+        state: Prepared pending mission.
+        gated: The gated candidate (legacy path), or ``None`` when supervised.
 
     Returns:
-        The live pending rollback state with an extended confirmation deadline.
+        The live pending rollback state.
 
     Raises:
         DeployCtlError: If the handoff cannot complete; rollback is attempted.
     """
+    if supervise.supervisor_running():
+        publish_mission(state, options.lock_timeout_seconds)
+        return _wait_for_supervisor_mission(state, options.confirm_window_seconds)
+    if gated is None:  # pragma: no cover - impossible without a supervisor
+        msg = "cannot hand off a supervisor-owned mission without a supervisor"
+        raise DeployCtlError(msg)
     retiring = replace(state, previous_retiring=True)
     _write_state(retiring)
     try:
@@ -783,9 +980,11 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
 def _rollback_locked(state: RollbackState) -> bool:
     """Restore the exact previous known-good commit and worker.
 
-    This path deliberately does not require the previous worker to implement
-    any new candidate-side readiness protocol. Rollback is controlled entirely
-    by the already-loaded stable wrapper process image.
+    With a live external supervisor the rollback is a durable settlement: a
+    newer desired generation selects the previous exact commit and the daemon
+    starts a fresh previous-commit worker from its sealed runtime; deployctl
+    then records the terminal ``rolled_back`` history. Without a supervisor
+    (one-time bootstrap / emergency path only) the legacy direct restore runs.
 
     Args:
         state: Pending rollback mission.
@@ -794,6 +993,22 @@ def _rollback_locked(state: RollbackState) -> bool:
         ``True`` only when checkout, worker, metadata, and state are restored.
     """
     if state.status != STATUS_PENDING:
+        return True
+    if supervise.supervisor_running():
+        try:
+            settle_desired(state.previous_commit, state.repo, state.uv_path)
+        except DeployCtlError:
+            append_deploy_log("supervised rollback could not settle the previous commit")
+            return False
+        _write_state(replace(state, status=STATUS_ROLLED_BACK, challenge_hash=None))
+        cli.remove_cli_root(state.commit)
+        if cli.reconcile_pointer(state.previous_commit):
+            append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
+        else:
+            append_deploy_log(
+                f"supervised rollback restored commit {state.previous_commit} "
+                "but could not restore the maintained CLI pointer"
+            )
         return True
     stop_worker(state.new_meta, state.stop_grace_seconds)
     repo = Path(state.repo)
@@ -820,6 +1035,11 @@ def _rollback_locked(state: RollbackState) -> bool:
 def _watchdog_main(lock_timeout_seconds: float) -> None:
     """Retain rollback authority until the mission reaches a terminal state.
 
+    With a live external supervisor the watchdog only rolls back after the
+    confirmation deadline has passed without the daemon keeping the candidate
+    consumer live, so it never fights the supervisor's own bounded restart of a
+    transiently crashed candidate.
+
     Args:
         lock_timeout_seconds: Deployment-lock timeout for rollback attempts.
     """
@@ -831,7 +1051,12 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             continue
         if state is None or state.status in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
             return
-        should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
+        if supervise.supervisor_running():
+            should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
+                state
+            )
+        else:
+            should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
         if should_rollback:
             try:
                 with deploy_lock(lock_timeout_seconds):
@@ -876,6 +1101,70 @@ def _fork_watchdog(lock_timeout_seconds: float) -> None:
         os._exit(0)
 
 
+def archive_mission(state: RollbackState, status: str) -> None:
+    """Archivially record a mission as terminal history.
+
+    This is the public writer used by lifecycle-state migration: a stale
+    pending mission that has already been superseded by a newer desired
+    generation is archived terminal (``confirmed`` or ``rolled_back``) so it
+    becomes inert history that can never influence the worker.
+
+    Args:
+        state: The mission to archive.
+        status: Terminal status (``confirmed`` or ``rolled_back``).
+
+    Raises:
+        DeployCtlError: If ``status`` is not a terminal mission status.
+    """
+    if status not in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
+        msg = f"cannot archive a mission as {status!r}"
+        raise DeployCtlError(msg)
+    _write_state(replace(state, status=status, challenge_hash=None))
+
+
+def read_rollback_state() -> RollbackState | None:
+    """Read the durable supervised-deployment state for external observers.
+
+    This is the public read used by the external supervisor.  A missing state
+    file is reported as ``None`` (no mission).  Corrupt or contradictory state
+    raises :class:`DeployCtlError` so the supervisor can fail closed into a
+    hold: it must never treat untrustworthy mission metadata as "no mission"
+    and run a worker during an unknown handoff.
+
+    Returns:
+        The parsed state, or ``None`` when no state file exists.
+
+    Raises:
+        DeployCtlError: If an existing state file is malformed, unsupported, or
+            unreadable.
+    """
+    path = rollback_state_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        msg = f"cannot read supervised deployment state: {exc}"
+        raise DeployCtlError(msg) from exc
+    try:
+        decoded = json.loads(raw)
+    except ValueError as exc:
+        msg = "supervised deployment state is not valid JSON"
+        raise DeployCtlError(msg) from exc
+    if not isinstance(decoded, dict):
+        msg = "supervised deployment state must be an object"
+        raise DeployCtlError(msg)
+    try:
+        state = RollbackState.from_dict(decoded)
+    except (KeyError, TypeError, ValueError) as exc:
+        msg = "supervised deployment state is malformed"
+        raise DeployCtlError(msg) from exc
+    if state.schema_version != ROLLBACK_SCHEMA_VERSION:
+        msg = f"unsupported supervised deployment state version {state.schema_version}"
+        raise DeployCtlError(msg)
+    return state
+
+
 def _cleanup_pending_locked() -> None:
     """Resolve an abandoned pending mission before accepting another checkout.
 
@@ -888,29 +1177,37 @@ def _cleanup_pending_locked() -> None:
         return
     if state.status != STATUS_PENDING:
         raise DeployCtlError(f"unknown supervised deployment status {state.status!r}")
-    if worker_alive(state.new_meta) and time.time() < state.deadline:
+    if _mission_candidate_alive(state) and time.time() < state.deadline:
         raise DeployCtlError("another supervised checkout is still pending confirmation")
     if not _rollback_locked(state):
         raise DeployCtlError("an unresolved rollback is still pending")
 
 
-def _prepare_locked(options: Options, commit: str) -> tuple[RollbackState, GatedWorker]:
+def _prepare_locked(
+    options: Options,
+    commit: str,
+    *,
+    supervised: bool,
+) -> tuple[RollbackState, GatedWorker | None]:
     """Prepare an exact candidate without crossing the destructive boundary.
 
     Performs only reversible preparation while holding the deploy lock: resolve
     any abandoned mission, validate the exact clean commits, check out the
-    candidate, validate it, build its provisional CLI environment, spawn the
-    gated candidate, verify PostgreSQL, persist the pending rollback mission
-    with ``previous_retiring=False``, and arm the watchdog. The previous worker
-    is never stopped here; the caller decides when the mission may cross into
-    the destructive handoff.
+    candidate, validate it, build its sealed provisional runtime, verify
+    PostgreSQL, and (in the legacy no-supervisor bootstrap path) spawn the
+    gated candidate and arm the watchdog. When the external supervisor is live
+    the mission is only *prepared* here and returned unwritten: publication
+    happens at handoff time so the pending mission can never retire the old
+    worker before the initiating checkout row is durably succeeded. The
+    previous worker is never stopped here.
 
     Args:
         options: Deployment options.
         commit: Exact candidate commit.
+        supervised: Whether the external supervisor owns worker processes.
 
     Returns:
-        The pending rollback state and its gated candidate.
+        The pending rollback state and (legacy path only) its gated candidate.
 
     Raises:
         DeployCtlError: On any unsafe or failed preparation; the previous
@@ -938,13 +1235,15 @@ def _prepare_locked(options: Options, commit: str) -> tuple[RollbackState, Gated
         _restore_previous_prep(options, previous_commit, commit)
         msg = f"candidate CLI environment could not be built: {exc}"
         raise DeployCtlError(msg) from exc
-    gated = _spawn_gated_candidate(options, commit)
+    gated, new_meta = _candidate_identity(options, commit, supervised=supervised)
     if not check_postgres(options.postgres_timeout_seconds):
-        _close_gate(gated.gate_writer)
+        if gated is not None:
+            _close_gate(gated.gate_writer)
         _restore_previous_prep(options, previous_commit, commit)
         raise DeployCtlError("stable wrapper cannot reach PostgreSQL before handoff")
     state = RollbackState(
         schema_version=ROLLBACK_SCHEMA_VERSION,
+        generation=next_mission_generation(),
         status=STATUS_PENDING,
         commit=commit,
         previous_commit=previous_commit,
@@ -956,16 +1255,62 @@ def _prepare_locked(options: Options, commit: str) -> tuple[RollbackState, Gated
         git_timeout_seconds=options.git_timeout_seconds,
         previous_retiring=False,
         previous_meta=previous,
-        new_meta=gated.meta,
+        new_meta=new_meta,
     )
+    if not supervised:
+        _publish_legacy_mission(state, gated, options.lock_timeout_seconds)
+    return state, gated
+
+
+def _candidate_identity(
+    options: Options,
+    commit: str,
+    *,
+    supervised: bool,
+) -> tuple[GatedWorker | None, WorkerMeta]:
+    """Produce the candidate identity record for a prepared mission.
+
+    With a live external supervisor the candidate is owned by the daemon, so a
+    never-alive placeholder is recorded; otherwise deployctl spawns the gated
+    candidate (one-time bootstrap / emergency path).
+
+    Args:
+        options: Deployment options.
+        commit: Exact candidate commit.
+        supervised: Whether the external supervisor owns worker processes.
+
+    Returns:
+        The ``(gated, new_meta)`` pair.
+    """
+    if supervised:
+        return None, _placeholder_meta(commit, str(options.repo))
+    gated = _spawn_gated_candidate(options, commit)
+    return gated, gated.meta
+
+
+def _publish_legacy_mission(
+    state: RollbackState,
+    gated: GatedWorker | None,
+    lock_timeout_seconds: float,
+) -> None:
+    """Persist a legacy pending mission and arm its watchdog.
+
+    Args:
+        state: Legacy pending mission.
+        gated: The gated candidate, or ``None``.
+        lock_timeout_seconds: Deployment-lock timeout for the watchdog.
+
+    Raises:
+        DeployCtlError: If the watchdog cannot be armed; rollback is attempted.
+    """
     _write_state(state)
     try:
-        _fork_watchdog(options.lock_timeout_seconds)
+        _fork_watchdog(lock_timeout_seconds)
     except DeployCtlError:
-        _close_gate(gated.gate_writer)
+        if gated is not None:
+            _close_gate(gated.gate_writer)
         _rollback_locked(state)
         raise
-    return state, gated
 
 
 def _restore_previous_prep(options: Options, previous_commit: str, candidate_commit: str) -> None:
@@ -988,16 +1333,20 @@ def _deploy_locked(options: Options, commit: str) -> RollbackState:
     """Prepare and hand off one exact candidate while holding the deploy lock.
 
     The synchronous path used by manual (non-queue) invocations: preparation is
-    immediately followed by the destructive handoff.
+    immediately followed by the handoff. With a live external supervisor the
+    handoff publishes the pending mission and waits for the daemon to own the
+    candidate transition; otherwise the legacy gated handoff runs (one-time
+    bootstrap/emergency path only).
 
     Args:
         options: Deployment options.
         commit: Exact candidate commit.
 
     Returns:
-        Pending rollback state.
+        Live pending rollback state.
     """
-    state, gated = _prepare_locked(options, commit)
+    supervised = supervise.supervisor_running()
+    state, gated = _prepare_locked(options, commit, supervised=supervised)
     return _complete_handoff(options, state, gated)
 
 
@@ -1043,12 +1392,14 @@ def _helper_locked(options: Options, commit: str, job_id: object, writer: int) -
     response so the owning worker finalizes the checkout row as durably
     ``succeeded``; a helper error or helper death makes it exit non-zero so the
     row is durably ``failed``. The helper then waits for that exact row to be
-    durably succeeded before stopping the previous worker. The durable-success
-    wait deadline is computed only after preparation returns (it is not the
-    confirmation deadline captured during preparation), so a long validation
-    phase can never expire the handoff wait before it starts. Any failure
-    before durable success aborts the mission with the previous worker left
-    running.
+    durably succeeded before crossing the handoff. With a live external
+    supervisor the handoff publishes the pending mission so the daemon owns the
+    worker transition; otherwise the legacy gated handoff runs (one-time
+    bootstrap/emergency path only). The durable-success wait deadline is
+    computed only after preparation returns (it is not the confirmation
+    deadline captured during preparation), so a long validation phase can never
+    expire the handoff wait before it starts. Any failure before durable
+    success aborts the mission with the previous worker left running.
 
     Args:
         options: Deployment options.
@@ -1056,7 +1407,8 @@ def _helper_locked(options: Options, commit: str, job_id: object, writer: int) -
         job_id: Captured checkout queue row identifier.
         writer: Write end of the response pipe to the parent.
     """
-    state, gated = _prepare_locked(options, commit)
+    supervised = supervise.supervisor_running()
+    state, gated = _prepare_locked(options, commit, supervised=supervised)
     durable_deadline = time.time() + HANDOFF_DURABLE_WAIT_SECONDS
     _send_helper_response(writer, _candidate_response(state))
     try:
@@ -1259,7 +1611,7 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     state = _read_state()
     if state is None or state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
-    if time.time() >= state.deadline or not worker_alive(state.new_meta):
+    if time.time() >= state.deadline or not _mission_candidate_alive(state):
         _rollback_locked(state)
         raise DeployCtlError("confirmation window lapsed; deployment was rolled back")
     commit = request.get("commit")
@@ -1277,18 +1629,21 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
             "challenge": challenge,
         }
     _verify_challenge(state, answer)
-    if time.time() >= state.deadline or not worker_alive(state.new_meta):
+    if time.time() >= state.deadline or not _mission_candidate_alive(state):
         _rollback_locked(state)
         raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
-    try:
-        cli.build_cli_root(
-            Path(state.repo), state.commit, state.uv_path, options.cli_timeout_seconds
-        )
-    except cli.CliError as exc:
-        _rollback_locked(state)
-        msg = f"confirmed CLI environment could not be prepared; deployment was rolled back: {exc}"
-        raise DeployCtlError(msg) from exc
-    write_meta(state.new_meta)
+    if supervise.supervisor_running():
+        settle_desired(state.commit, state.repo, state.uv_path)
+    else:
+        try:
+            cli.build_cli_root(
+                Path(state.repo), state.commit, state.uv_path, options.cli_timeout_seconds
+            )
+        except cli.CliError as exc:
+            _rollback_locked(state)
+            msg = f"confirmed CLI environment could not be prepared; deployment was rolled back: {exc}"
+            raise DeployCtlError(msg) from exc
+        write_meta(state.new_meta)
     _write_state(replace(state, status=STATUS_CONFIRMED))
     try:
         cli.set_current(state.commit)
@@ -1329,7 +1684,7 @@ def _handle_status(options: Options) -> dict[str, object]:
         with deploy_lock(options.lock_timeout_seconds):
             state = _read_state()
             if state is not None and state.status == STATUS_PENDING:
-                if time.time() >= state.deadline or not worker_alive(state.new_meta):
+                if time.time() >= state.deadline or not _mission_candidate_alive(state):
                     _rollback_locked(state)
                     state = _read_state()
             meta = read_meta()

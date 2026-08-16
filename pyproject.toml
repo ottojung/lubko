@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 lubko-worker = "lubko.worker:main"
+lubko-supervisor = "lubko.supervisor:main"
 lubko-deploy = "lubko.lifecycle:main"
 lubko-deploy-ctl = "lubko.deployctl:main"
 lubko-agent = "lubko.agent:main"
@@ -78,6 +79,12 @@ convention = "google"
     "suspicious-subprocess-import",
 ]
 "src/lubko/install.py" = [
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
+"src/lubko/supervisor.py" = [
+    "blind-except",
+    "raise-vanilla-args",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
