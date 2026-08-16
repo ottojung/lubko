@@ -14,10 +14,11 @@ rewriting an installed ``uv`` tool in place:
   ``lubko-install`` and never rewritten by a deployment;
 - each commit owns an immutable per-commit CLI environment under
   ``$XDG_STATE_HOME/lubko/cli/<commit>/``: a plain ``git archive`` extraction
-  of the exact commit tree plus the virtualenv ``uv sync`` creates there; once
-  fully materialized and verified it is ``sealed`` read-only and bound to the
-  exact full commit by a small manifest, so normal operation never writes to
-  it;
+  of the exact commit tree plus the virtualenv ``uv sync`` creates there; at
+  materialization it is bound to the exact full commit by a manifest carrying
+  a deterministic content digest, then ``sealed`` read-only — sealing never
+  rewrites that identity, so normal operation never writes to it and a
+  modified/re-sealed tree is never trusted;
 - ``$XDG_STATE_HOME/lubko/cli/current`` is a symlink selecting the active
   commit and is switched with a single atomic ``os.replace``.
 
@@ -33,6 +34,7 @@ start, restart, probe, or crash recovery.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -40,6 +42,7 @@ import shutil
 import stat
 import subprocess
 from contextlib import suppress
+from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -63,7 +66,7 @@ DEFAULT_BUILD_TIMEOUT_SECONDS: Final = 600.0
 UV_HTTP_TIMEOUT: Final = "30"
 
 RUNTIME_MANIFEST_NAME: Final = "lubko-runtime.json"
-RUNTIME_MANIFEST_SCHEMA: Final = 1
+RUNTIME_MANIFEST_SCHEMA: Final = 2
 COMMIT_PATH_RE: Final = re.compile(r"[0-9a-fA-F]{40}")
 
 _WRITE_BITS: Final = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
@@ -206,9 +209,10 @@ def _root_is_usable(commit: str) -> bool:
 def manifest_path(commit: str) -> Path:
     """Return the binding-manifest path of one commit runtime.
 
-    The manifest binds the materialized tree to the exact full commit and the
-    runtime schema so a stale, wrong-commit, or partially built tree can never
-    be mistaken for the exact deployed runtime.
+    The manifest binds the materialized tree to the exact full commit, the
+    runtime schema, and a deterministic content digest of the sealed tree so a
+    stale, wrong-commit, partially built, or tampered tree can never be
+    mistaken for the exact deployed runtime.
 
     Args:
         commit: Exact 40-character commit hash.
@@ -312,13 +316,118 @@ def _tree_is_read_only(root: Path) -> bool:
     return True
 
 
-def seal_runtime(commit: str) -> None:
-    """Seal one fully materialized commit runtime read-only.
+def _file_content_digest(path: Path) -> bytes:
+    """Return the raw SHA-256 of one regular file's contents.
 
-    The manifest recording the exact full commit and runtime schema is written
-    first, then every write bit below the runtime tree is removed. Normal
-    operation (start, restart, probe, crash recovery) must only ever use a
-    sealed runtime. Symlinks in the tree are never followed or chmodded.
+    Args:
+        path: Regular file to digest.
+
+    Returns:
+        The 32 raw digest bytes.
+    """
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                return hasher.digest()
+            hasher.update(chunk)
+
+
+def _runtime_content_digest(root: Path) -> bytes:
+    """Return the deterministic content digest of one runtime tree.
+
+    The digest binds every entry below ``root`` except the binding manifest
+    itself: regular files contribute their relative path, permission mode
+    (write bits masked so sealing order never matters), and a content digest;
+    symlinks contribute their relative path and exact link target without ever
+    following the link; directories and any other entry type contribute their
+    relative path (and mode where meaningful). Each contribution is
+    length-prefixed, so added, removed, renamed, or tampered entries always
+    change the digest.
+
+    Args:
+        root: Runtime tree to digest.
+
+    Returns:
+        The raw SHA-256 digest bytes over the canonical tree encoding.
+    """
+    entries: list[tuple[str, Path, os.stat_result]] = []
+
+    def collect(directory: Path) -> None:
+        with os.scandir(directory) as iterator:
+            for entry in iterator:
+                path = Path(entry.path)
+                rel = path.relative_to(root).as_posix()
+                if rel == RUNTIME_MANIFEST_NAME:
+                    continue
+                info = path.lstat()
+                entries.append((rel, path, info))
+                if stat.S_ISDIR(info.st_mode):
+                    collect(path)
+
+    collect(root)
+    hasher = hashlib.sha256()
+
+    def update(data: bytes) -> None:
+        hasher.update(len(data).to_bytes(8, "big"))
+        hasher.update(data)
+
+    for rel, path, info in sorted(entries, key=itemgetter(0)):
+        update(rel.encode("utf-8"))
+        if stat.S_ISREG(info.st_mode):
+            update(b"f")
+            update((info.st_mode & ~_WRITE_BITS & 0o777).to_bytes(2, "big"))
+            update(_file_content_digest(path))
+        elif stat.S_ISLNK(info.st_mode):
+            update(b"l")
+            update(os.fspath(path.readlink()).encode("utf-8"))
+        elif stat.S_ISDIR(info.st_mode):
+            update(b"d")
+        else:
+            update(b"o")
+            update((info.st_mode & ~_WRITE_BITS & 0o777).to_bytes(2, "big"))
+    return hasher.digest()
+
+
+def _write_runtime_manifest(commit: str) -> None:
+    """Bind one materialized runtime to its exact commit with a content digest.
+
+    The expected identity of a commit runtime is established exactly once, at
+    materialization time, from the tree just extracted from the exact commit
+    (``git archive`` plus ``uv sync``). Sealing later only changes permissions
+    and never rewrites this manifest, so a tree modified after materialization
+    can never be re-blessed while still claiming ``commit``.
+
+    Args:
+        commit: Exact 40-character commit hash.
+
+    Raises:
+        CliError: If the runtime tree cannot be digested.
+    """
+    root = cli_commit_dir(commit)
+    try:
+        content_digest = _runtime_content_digest(root).hex()
+    except OSError as exc:
+        msg = f"could not digest the runtime tree for commit {commit}: {exc}"
+        raise CliError(msg) from exc
+    manifest = {
+        "schema_version": RUNTIME_MANIFEST_SCHEMA,
+        "commit": commit,
+        "content_digest": content_digest,
+    }
+    manifest_path(commit).write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def seal_runtime(commit: str) -> None:
+    """Seal one materialized commit runtime read-only.
+
+    Only permission bits below the runtime tree are removed: the integrity
+    manifest is written at materialization time and is never rewritten here, so
+    a later unseal/reseal cannot redefine the commit-bound expected identity.
+    Normal operation (start, restart, probe, crash recovery) must only ever use
+    a sealed runtime whose manifest is verified. Symlinks in the tree are never
+    followed or chmodded.
 
     Args:
         commit: Exact 40-character commit hash to seal.
@@ -327,12 +436,6 @@ def seal_runtime(commit: str) -> None:
     root = cli_commit_dir(commit)
     if not root.is_dir():
         return
-    root.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "schema_version": RUNTIME_MANIFEST_SCHEMA,
-        "commit": commit,
-    }
-    manifest_path(commit).write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
     _seal_tree(root)
 
 
@@ -353,19 +456,49 @@ def unseal_runtime(commit: str) -> None:
         _unseal_tree(root)
 
 
+def _manifest_digest(data: object, commit: str) -> bytes | None:
+    """Return the tree digest recorded by a manifest when it binds ``commit``.
+
+    Args:
+        data: Parsed manifest document.
+        commit: Exact commit the manifest must bind.
+
+    Returns:
+        The recorded content-digest bytes, or ``None`` when the manifest does
+        not bind ``commit`` under the current schema or carries no valid digest.
+    """
+    if not (
+        isinstance(data, dict)
+        and data.get("schema_version") == RUNTIME_MANIFEST_SCHEMA
+        and data.get("commit") == commit
+    ):
+        return None
+    expected = data.get("content_digest")
+    if not isinstance(expected, str):
+        return None
+    try:
+        return bytes.fromhex(expected)
+    except ValueError:
+        return None
+
+
 def runtime_is_usable(commit: str) -> bool:
     """Return whether a commit runtime is complete, exactly bound, and sealed.
 
-    An unsealed, incomplete, wrong-commit, or corrupt tree is deliberately
-    reported unusable so callers fail closed instead of launching arbitrary
-    mutable code. An invalid commit name is never usable.
+    An unsealed, incomplete, wrong-commit, corrupt, or content-tampered tree is
+    deliberately reported unusable so callers fail closed instead of launching
+    arbitrary mutable code. The manifest's ``content_digest`` is recomputed over
+    the current tree on every call, so a runtime that was unsealed, modified,
+    and re-sealed without regenerating the manifest is rejected. An invalid
+    commit name is never usable.
 
     Args:
         commit: Exact 40-character commit hash.
 
     Returns:
         ``True`` only when every entry point exists, the manifest binds the
-        tree to ``commit`` under the current schema, and the tree is read-only.
+        tree to ``commit`` under the current schema, the tree is read-only, and
+        the recomputed tree digest matches the manifest.
     """
     if not is_valid_commit_name(commit) or not _root_is_usable(commit):
         return False
@@ -373,12 +506,16 @@ def runtime_is_usable(commit: str) -> bool:
         data = json.loads(manifest_path(commit).read_text())
     except (OSError, ValueError):
         return False
-    bound = (
-        isinstance(data, dict)
-        and data.get("schema_version") == RUNTIME_MANIFEST_SCHEMA
-        and data.get("commit") == commit
-    )
-    return bound and _tree_is_read_only(cli_commit_dir(commit))
+    expected = _manifest_digest(data, commit)
+    if expected is None:
+        return False
+    root = cli_commit_dir(commit)
+    if not _tree_is_read_only(root):
+        return False
+    try:
+        return _runtime_content_digest(root) == expected
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +643,7 @@ def build_cli_root(repo: Path, commit: str, uv_path: str, timeout_seconds: float
         shutil.rmtree(destination, ignore_errors=True)
         msg = f"CLI environment for commit {commit} is incomplete after build"
         raise CliError(msg)
+    _write_runtime_manifest(commit)
     seal_runtime(commit)
     if not runtime_is_usable(commit):
         unseal_runtime(commit)

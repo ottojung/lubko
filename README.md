@@ -544,16 +544,22 @@ restarts worker processes:
 
 Every deployed commit runs from a separate runtime materialized under
 `$XDG_STATE_HOME/lubko/cli/<full-commit-sha>/` (a `git archive` extraction of
-the exact full commit plus its `uv sync` virtualenv). After successful
-preparation the runtime is **sealed read-only** and bound to the exact commit
-by a small manifest; normal worker execution sets `PYTHONDONTWRITEBYTECODE=1`
-and never writes into the runtime (logs and state stay under XDG worker
-paths). Ordinary crash/restart/probe use only this sealed runtime and remain
-functional even if the source checkout is modified, moved, or deleted.
-Verification rejects an unsealed, incomplete, wrong-commit, or corrupt runtime
-(fail closed) rather than falling back to the mutable checkout or Git.
-Explicit unseal/removal exists only for GC/rebuild (`gc_cli_roots`,
-`remove_cli_root`, and rebuild paths); never unseal during normal operation.
+the exact full commit plus its `uv sync` virtualenv). At materialization the
+runtime's expected identity is bound to the exact commit by a manifest carrying
+a **deterministic content digest** of the whole tree (regular-file bytes,
+permissions, tree structure, and symlink identity, without following external
+symlink targets); sealing only removes write bits and **never rewrites that
+identity**, so a later unseal/reseal can never re-bless a modified tree while
+still claiming the exact commit. Normal worker execution sets
+`PYTHONDONTWRITEBYTECODE=1` and never writes into the runtime (logs and state
+stay under XDG worker paths). Ordinary crash/restart/probe use only this sealed
+runtime and remain functional even if the source checkout is modified, moved,
+or deleted. Verification recomputes the digest on every start/restart and
+rejects an unsealed, incomplete, wrong-commit, corrupt, or content-tampered
+runtime (fail closed) rather than falling back to the mutable checkout or Git;
+only a clean rebuild from the exact commit restores usability. Explicit
+unseal/removal exists only for GC/rebuild (`gc_cli_roots`, `remove_cli_root`,
+and rebuild paths); never unseal during normal operation.
 
 ### Generation precedence
 

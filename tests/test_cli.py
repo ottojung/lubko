@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tomllib
@@ -407,7 +408,7 @@ def test_sealing_never_follows_symlinks(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Sealing leaves an external symlink target's mode untouched."""
+    """Sealing never follows or chmods an external symlink target."""
     repo, first, _second = two_commit_repo
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     cli.build_cli_root(repo, first, "uv", 60.0)
@@ -421,8 +422,149 @@ def test_sealing_never_follows_symlinks(
     mode_before = external.stat().st_mode
     cli.seal_runtime(first)
     assert external.stat().st_mode == mode_before
+    cli.unseal_runtime(first)
+
+
+def test_runtime_manifest_records_content_digest(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A materialized runtime manifest binds the tree with a content digest."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    manifest = json.loads(cli.manifest_path(first).read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == cli.RUNTIME_MANIFEST_SCHEMA
+    assert manifest["commit"] == first
+    digest = manifest["content_digest"]
+    assert isinstance(digest, str)
+    assert len(digest) == 64
+    int(digest, 16)
+
+
+def test_runtime_tampered_content_rejected_after_reseal(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tampering and re-sealing through the public helper never re-blesses."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    root = cli.cli_commit_dir(first)
     assert cli.runtime_is_usable(first) is True
     cli.unseal_runtime(first)
+    source = root / "marker.txt"
+    source.write_text(source.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
+    cli.seal_runtime(first)
+    assert cli.runtime_is_usable(first) is False
+    cli.unseal_runtime(first)
+
+
+def test_runtime_deleted_file_rejected_after_reseal(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-sealed runtime with a deleted file is never usable."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    root = cli.cli_commit_dir(first)
+    cli.unseal_runtime(first)
+    (root / "marker.txt").unlink()
+    cli.seal_runtime(first)
+    assert cli.runtime_is_usable(first) is False
+    cli.unseal_runtime(first)
+
+
+def test_runtime_added_file_rejected_after_reseal(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-sealed runtime with an added file is never usable."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    root = cli.cli_commit_dir(first)
+    cli.unseal_runtime(first)
+    (root / "sneaky.txt").write_text("added\n", encoding="utf-8")
+    cli.seal_runtime(first)
+    assert cli.runtime_is_usable(first) is False
+    cli.unseal_runtime(first)
+
+
+def test_runtime_renamed_file_rejected_after_reseal(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-sealed runtime with a renamed file is never usable."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    root = cli.cli_commit_dir(first)
+    cli.unseal_runtime(first)
+    (root / "marker.txt").rename(root / "marker-moved.txt")
+    cli.seal_runtime(first)
+    assert cli.runtime_is_usable(first) is False
+    cli.unseal_runtime(first)
+
+
+def _make_symlink_commit(path: Path) -> tuple[Path, str]:
+    """Create a repository whose commit contains a relative symlink.
+
+    Args:
+        path: Directory to create the repository in.
+
+    Returns:
+        The repository path and its single commit hash.
+    """
+    path.mkdir()
+    git("init", "-q", cwd=path)
+    git("config", "user.name", GIT_AUTHOR, cwd=path)
+    git("config", "user.email", GIT_EMAIL, cwd=path)
+    (path / "target.txt").write_text("target\n", encoding="utf-8")
+    (path / "link.txt").symlink_to("target.txt")
+    git("add", ".", cwd=path)
+    git("commit", "-q", "-m", "symlink", cwd=path)
+    commit = git("rev-parse", "HEAD", cwd=path)
+    return path, commit
+
+
+def test_runtime_symlink_retarget_rejected_after_reseal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retargeting a materialized symlink without a rebuild is detected."""
+    repo, commit = _make_symlink_commit(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, commit, "uv", 60.0)
+    root = cli.cli_commit_dir(commit)
+    assert cli.runtime_is_usable(commit) is True
+    cli.unseal_runtime(commit)
+    link = root / "link.txt"
+    assert link.is_symlink()
+    link.unlink()
+    link.symlink_to("other.txt")
+    cli.seal_runtime(commit)
+    assert cli.runtime_is_usable(commit) is False
+    cli.unseal_runtime(commit)
+
+
+def test_runtime_clean_rebuild_restores_usability_after_tamper(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a clean rebuild from the exact commit restores usability."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    root = cli.cli_commit_dir(first)
+    cli.unseal_runtime(first)
+    source = root / "marker.txt"
+    source.write_text(source.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
+    cli.seal_runtime(first)
+    assert cli.runtime_is_usable(first) is False
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    assert cli.runtime_is_usable(first) is True
 
 
 def test_invalid_commit_names_fail_closed() -> None:
