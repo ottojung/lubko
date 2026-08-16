@@ -1050,6 +1050,7 @@ lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
 lubko-deploy restart
 lubko-deploy migrate --commit <sha> [--repo DIR] [--uv PATH]
 lubko-deploy recover [--repo DIR] [--uv PATH] [--probe-timeout N]
+lubko-deploy repair --repo DIR --recovery-worker-pid PID [--uv PATH] [--probe-timeout N]
 lubko-deploy log [--lines N]
 lubko-supervisor --status
 ```
@@ -1086,7 +1087,7 @@ Subsequent upgrades replace maintained workers without any manual PID discovery.
 
 ## Keeping the maintained commands on PATH
 
-The maintained commands (`lubko-agent`, `lubko-worker`, `lubko-deploy`, `lubko-deploy-ctl`, `lubko-install`, `my-lubko-agent`) are installed reproducibly into the user's bin directory (`$XDG_BIN_HOME` or `~/.local/bin`, which is already on PATH for login and interactive shells) by:
+The maintained commands (`lubko-agent`, `lubko-worker`, `lubko-supervisor`, `lubko-deploy`, `lubko-deploy-ctl`, `lubko-install`, `my-lubko-agent`) are installed reproducibly into the user's bin directory (`$XDG_BIN_HOME` or `~/.local/bin`, which is already on PATH for login and interactive shells) by:
 
 ```sh
 lubko-install --repo /workspace/.lubko-deployment
