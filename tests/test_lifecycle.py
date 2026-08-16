@@ -5,8 +5,9 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -17,7 +18,7 @@ import psycopg
 import pytest
 
 from lubko import cli, lifecycle, toolchain
-from lubko.config import DatabaseConfig
+from lubko.config import DatabaseConfig, load_database_config
 from lubko.lifecycle import (
     EXIT_ERROR,
     EXIT_OK,
@@ -25,6 +26,9 @@ from lubko.lifecycle import (
     ValidationReport,
     WorkerMeta,
 )
+from lubko.state import rollback_state_path
+from lubko.worker import delete_job_and_chunks, request_cancel
+from tests import _pg
 from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
 
@@ -35,6 +39,8 @@ SHORT_MARKER: Final = "tok"
 GIT_SHA: Final = "a" * 40
 GIT_SHA_LENGTH: Final = 40
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
+REPO_ROOT: Final = Path(__file__).resolve().parent.parent
+BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
 TEST_PASSWORD: Final = "secret-value"  # ruff: ignore[hardcoded-password-string] - test credential
 
 
@@ -1016,3 +1022,790 @@ def test_deploy_cmd_fails_on_stale_recorded_path(
     args = make_deploy_args(tmp_path, uv=None)
     assert lifecycle.deploy_cmd(args) == EXIT_ERROR
     assert "recorded" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Repair (supported recovery path for corrupted lifecycle state)
+# ---------------------------------------------------------------------------
+
+REPAIR_WORKER_ID: Final = "repair-worker"
+REPAIR_TIMINGS: Final = {
+    "LUBKO_POLL_INTERVAL_SECONDS": "0.05",
+    "LUBKO_PROCESS_POLL_INTERVAL_SECONDS": "0.01",
+    "LUBKO_CANCEL_GRACE_SECONDS": "0.5",
+    "LUBKO_LEASE_DURATION_SECONDS": "2.0",
+    "LUBKO_LEASE_REFRESH_INTERVAL_SECONDS": "0.15",
+    "LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS": "0.2",
+    "LUBKO_LEASE_SAFETY_MARGIN_SECONDS": "0.3",
+    "LUBKO_OUTPUT_PUBLICATION_INTERVAL_SECONDS": "0.1",
+    "LUBKO_CLAIM_BATCH_LIMIT": "16",
+}
+
+
+def write_database_config(
+    tmp_path: Path,
+    cluster: _pg.PgCluster,
+    *,
+    name: str = "database.conf",
+) -> Path:
+    """Write a private database configuration file for the cluster.
+
+    Args:
+        tmp_path: Temporary directory for the configuration file.
+        cluster: The running PostgreSQL cluster.
+        name: Configuration file name, allowing several clusters per test.
+
+    Returns:
+        The configuration file path.
+    """
+    conf = tmp_path / name
+    conf.write_text(
+        f"host={cluster.socket_dir}\n"
+        f"port={cluster.port}\n"
+        "dbname=postgres\n"
+        "user=postgres\n"
+        "password=local-trust\n",
+        encoding="utf-8",
+    )
+    conf.chmod(0o600)
+    return conf
+
+
+def spawn_real_worker(
+    db_conf: Path,
+    *,
+    worker_id: str = REPAIR_WORKER_ID,
+) -> subprocess.Popen[bytes]:
+    """Spawn a real queue-consuming worker registered with the process guard.
+
+    Args:
+        db_conf: Database configuration file for the worker.
+        worker_id: Worker identifier the worker records on claims.
+
+    Returns:
+        The spawned worker process.
+    """
+    env = dict(os.environ)
+    env["LUBKO_DATABASE_CONFIG"] = str(db_conf)
+    env["LUBKO_WORKER_ID"] = worker_id
+    env.update(REPAIR_TIMINGS)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "lubko.worker"],
+        cwd=REPO_ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(proc)
+    return proc
+
+
+def make_repair_options(repo: Path, *, probe_timeout: float = 30.0) -> lifecycle.DeployOptions:
+    """Build repair options for tests.
+
+    Args:
+        repo: Repository to repair against.
+        probe_timeout: Queue-probe timeout in seconds.
+
+    Returns:
+        Repair deployment options.
+    """
+    return lifecycle.DeployOptions(
+        repo=repo,
+        uv_path="uv",
+        bootstrap=False,
+        stop_grace_seconds=0.5,
+        postgres_timeout_seconds=5.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=5.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=5.0,
+        probe_timeout_seconds=probe_timeout,
+    )
+
+
+def stale_meta(pid: int, commit: str, repo: Path) -> WorkerMeta:
+    """Build the exact incident-corruption lifecycle metadata.
+
+    Args:
+        pid: Synthetic process identity.
+        commit: Synthetic commit.
+        repo: Repository recorded in the metadata.
+
+    Returns:
+        Corrupt ``test-worker`` metadata.
+    """
+    return WorkerMeta(
+        schema_version=1,
+        state=lifecycle.STATE_RUNNING,
+        pid=pid,
+        pgid=pid,
+        sid=pid,
+        start_time_ticks=pid * 10,
+        token=f"token-{pid}",
+        repo=str(repo),
+        git_commit=commit,
+        worker_id="test-worker",
+        log_path="corrupt-worker.log",
+        started_at=1.0,
+        stopped_at=None,
+    )
+
+
+@pytest.fixture
+def second_pg_cluster(tmp_path: Path) -> Iterator[_pg.PgCluster]:
+    """Start a second isolated PostgreSQL cluster for two-worker tests.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Yields:
+        The second running cluster.
+    """
+    binaries = _pg.postgres_binaries()
+    if binaries is None:
+        pytest.skip("PostgreSQL server binaries not available on this host")
+    root = tmp_path / "pg-other"
+    data_dir = root / "data"
+    socket_dir = root / "sock"
+    socket_dir.mkdir(parents=True)
+    port = _pg.free_port()
+    subprocess.run(
+        [
+            binaries["initdb"],
+            "-D",
+            str(data_dir),
+            "-U",
+            "postgres",
+            "--auth=trust",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    current = _pg.PgCluster(binaries, data_dir, socket_dir, port, dict(os.environ))
+    current.start()
+    with psycopg.connect(current.conninfo()) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+    try:
+        yield current
+    finally:
+        current.stop()
+
+
+def test_spawned_by_recovery_worker_true_for_child_and_grandchild() -> None:
+    """The ancestor walk accepts direct children and deeper descendants.
+
+    A real grandchild mirrors the production recovery worker launched through
+    ``uv run lubko-worker``: the adopted PID (``uv``) is the grandparent of the
+    job command process, whose direct parent is the worker daemon child.
+    """
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys, time; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)']); "
+                "print(p.pid, flush=True); "
+                "time.sleep(300)"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    guard.register(child)
+    grandchild_pid = int(child.stdout.readline().strip()) if child.stdout is not None else 0
+    try:
+        assert lifecycle._spawned_by_recovery_worker(child.pid, os.getppid())
+        assert lifecycle._spawned_by_recovery_worker(grandchild_pid, child.pid)
+        assert lifecycle._spawned_by_recovery_worker(grandchild_pid, os.getppid())
+    finally:
+        with suppress(ProcessLookupError):
+            os.kill(grandchild_pid, signal.SIGKILL)
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        guard.unregister(child)
+
+
+def test_spawned_by_recovery_worker_false_for_unrelated_pid() -> None:
+    """A process whose ancestor chain lacks the pid is never accepted."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        cwd=REPO_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    guard.register(child)
+    try:
+        assert not lifecycle._spawned_by_recovery_worker(child.pid, child.pid + 1)
+        assert not lifecycle._spawned_by_recovery_worker(999_999, os.getppid())
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        guard.unregister(child)
+
+
+def test_spawned_by_recovery_worker_false_for_dead_process() -> None:
+    """A gone process is never accepted, failing closed."""
+    assert not lifecycle._spawned_by_recovery_worker(999_999, os.getppid())
+
+
+def test_repair_adopts_recovery_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repair adopts a live recovery worker after real queue verification."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    worker = spawn_real_worker(conf)
+    try:
+        code = lifecycle.repair(make_repair_options(repo), worker.pid)
+
+        assert code == EXIT_OK
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == worker.pid
+        assert meta.pgid == worker.pid
+        assert meta.worker_id == REPAIR_WORKER_ID
+        assert meta.git_commit == second
+        assert meta.repo == str(repo)
+        assert lifecycle.worker_alive(meta)
+        assert cli.current_commit() == second
+    finally:
+        kill_proc(worker)
+
+
+def test_repair_rewrites_corrupt_test_worker_metadata(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repair replaces the incident corruption signature, never trusting it."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    lifecycle.write_meta(stale_meta(647_485, "deadbeef", repo))
+    worker = spawn_real_worker(conf)
+    try:
+        code = lifecycle.repair(make_repair_options(repo), worker.pid)
+
+        assert code == EXIT_OK
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == worker.pid
+        assert meta.worker_id == REPAIR_WORKER_ID
+        assert meta.worker_id != "test-worker"
+        assert meta.git_commit == second
+        assert lifecycle.worker_alive(meta)
+    finally:
+        kill_proc(worker)
+
+
+def test_repair_clears_stale_rollback_ready_and_toolchain_state(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repair removes stale test-produced state whose ownership is proven."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    worker = spawn_real_worker(conf)
+    try:
+        rollback = {
+            "schema_version": 1,
+            "status": "confirmed",
+            "commit": "2" * 40,
+            "previous_commit": "3" * 40,
+            "challenge_hash": "0" * 64,
+            "deadline": 1.0,
+            "repo": str(repo),
+            "uv_path": "uv",
+            "stop_grace_seconds": 5.0,
+            "git_timeout_seconds": 10.0,
+            "previous_retiring": True,
+            "previous_meta": stale_meta(434_468, "3" * 40, repo).to_dict(),
+            "new_meta": stale_meta(553_520, "2" * 40, repo).to_dict(),
+        }
+        rollback_path = rollback_state_path()
+        rollback_path.parent.mkdir(parents=True, exist_ok=True)
+        rollback_path.write_text(
+            __import__("json").dumps(rollback, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        worker_dir = lifecycle.worker_state_dir()
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        (worker_dir / "ready-stale.json").write_text(
+            '{"v": 1, "pid": 424242, "token": "stale"}\n', encoding="utf-8"
+        )
+        (worker_dir / "ready-garbage.json").write_text("not json\n", encoding="utf-8")
+        ready_kept = worker_dir / f"ready-{worker.pid}.json"
+        ready_kept.write_text(
+            f'{{"v": 1, "pid": {worker.pid}, "token": "fresh"}}\n', encoding="utf-8"
+        )
+        toolchain.write_toolchain("/nonexistent/uv")
+
+        code = lifecycle.repair(make_repair_options(repo), worker.pid)
+
+        assert code == EXIT_OK
+        assert not rollback_path.exists()
+        assert not (worker_dir / "ready-stale.json").exists()
+        assert not (worker_dir / "ready-garbage.json").exists()
+        assert ready_kept.exists()
+        recorded = toolchain.read_toolchain()
+        assert recorded is not None
+        assert recorded.uv_path == "uv"
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == worker.pid
+    finally:
+        kill_proc(worker)
+
+
+def test_repair_refuses_a_process_that_is_not_a_worker(
+    tmp_path: Path,
+) -> None:
+    """A live process whose command is not a Lubko worker is refused."""
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    proc = spawn_controlled()
+    try:
+        code = lifecycle.repair(make_repair_options(repo, probe_timeout=1.0), proc.pid)
+        assert code == EXIT_ERROR
+        assert lifecycle.read_meta() is None
+        assert proc.poll() is None
+    finally:
+        kill_proc(proc)
+
+
+def test_repair_refuses_a_non_leader_process(
+    tmp_path: Path,
+) -> None:
+    """A process that is not its own session/group leader is refused."""
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    env = dict(os.environ)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        cwd=REPO_ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    guard.register(proc)
+    try:
+        code = lifecycle.repair(make_repair_options(repo, probe_timeout=1.0), proc.pid)
+        assert code == EXIT_ERROR
+        assert lifecycle.read_meta() is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        guard.unregister(proc)
+
+
+def test_repair_refuses_conflicting_live_maintained_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repair never adopts a second worker over a live recorded one."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, first, _second = make_repo(tmp_path / "repo")
+    recorded_worker = spawn_real_worker(conf)
+    adopting_worker = spawn_real_worker(conf)
+    try:
+        identity = lifecycle.process_identity(recorded_worker.pid)
+        assert identity is not None
+        recorded_meta = WorkerMeta(
+            schema_version=1,
+            state=lifecycle.STATE_RUNNING,
+            pid=identity.pid,
+            pgid=identity.pgid,
+            sid=identity.sid,
+            start_time_ticks=identity.start_time_ticks,
+            token=None,
+            repo=str(repo),
+            git_commit=first,
+            worker_id=REPAIR_WORKER_ID,
+            log_path=str(lifecycle.worker_log_path()),
+            started_at=time.time(),
+            stopped_at=None,
+        )
+        lifecycle.write_meta(recorded_meta)
+        code = lifecycle.repair(make_repair_options(repo), adopting_worker.pid)
+        assert code == EXIT_ERROR
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == recorded_worker.pid
+    finally:
+        kill_proc(recorded_worker)
+        kill_proc(adopting_worker)
+
+
+def test_repair_refuses_when_recovery_worker_cannot_consume(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process that never consumes the queue is never adopted."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    fake_worker = tmp_path / "bin"
+    fake_worker.mkdir()
+    script = fake_worker / "lubko-worker"
+    script.write_text("#!/bin/sh\nsleep 300\n", encoding="utf-8")
+    script.chmod(0o755)
+    proc = subprocess.Popen(
+        [str(script)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(proc)
+    try:
+        code = lifecycle.repair(make_repair_options(repo, probe_timeout=1.0), proc.pid)
+        assert code == EXIT_ERROR
+        assert lifecycle.read_meta() is None
+    finally:
+        kill_proc(proc)
+
+
+def test_repair_refuses_live_pending_rollback_mission(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live pending supervised mission blocks adoption."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    candidate = spawn_real_worker(conf)
+    adopting_worker = spawn_real_worker(conf)
+    try:
+        identity = lifecycle.process_identity(candidate.pid)
+        assert identity is not None
+        pending = {
+            "schema_version": 1,
+            "status": "pending",
+            "commit": "2" * 40,
+            "previous_commit": "3" * 40,
+            "challenge_hash": None,
+            "deadline": time.time() + 60,
+            "repo": str(repo),
+            "uv_path": "uv",
+            "stop_grace_seconds": 5.0,
+            "git_timeout_seconds": 10.0,
+            "previous_retiring": False,
+            "previous_meta": stale_meta(434_468, "3" * 40, repo).to_dict(),
+            "new_meta": WorkerMeta(
+                schema_version=1,
+                state=lifecycle.STATE_RUNNING,
+                pid=identity.pid,
+                pgid=identity.pgid,
+                sid=identity.sid,
+                start_time_ticks=identity.start_time_ticks,
+                token=None,
+                repo=str(repo),
+                git_commit="2" * 40,
+                worker_id=REPAIR_WORKER_ID,
+                log_path=str(lifecycle.worker_log_path()),
+                started_at=time.time(),
+                stopped_at=None,
+            ).to_dict(),
+        }
+        rollback_path = rollback_state_path()
+        rollback_path.parent.mkdir(parents=True, exist_ok=True)
+        rollback_path.write_text(
+            __import__("json").dumps(pending, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        code = lifecycle.repair(make_repair_options(repo), adopting_worker.pid)
+        assert code == EXIT_ERROR
+        assert rollback_path.exists()
+        assert lifecycle.read_meta() is None
+    finally:
+        kill_proc(candidate)
+        kill_proc(adopting_worker)
+
+
+def probe_claimed_by(
+    repo: Path,
+    worker_pid: int,
+    *,
+    expected_worker_id: str = REPAIR_WORKER_ID,
+    timeout_seconds: float = 30.0,
+) -> bool:
+    """Return whether the exact worker PID claims a fresh probe from the queue.
+
+    The repair-queue probe is inserted, then awaited with the same
+    exact-PID-bounded proof the repair uses: the persisted ``process_pid``
+    must be a descendant of ``worker_pid``. The probe is always cancelled,
+    awaited terminal, and removed.
+
+    Args:
+        repo: Working directory for the probe command.
+        worker_pid: Exact worker PID whose claim is being proven.
+        expected_worker_id: Worker identifier the probe claim must record.
+        timeout_seconds: Maximum seconds to wait for the claim.
+
+    Returns:
+        ``True`` only when the exact worker PID executed the probe.
+    """
+    conn = psycopg.connect(load_database_config().conninfo(), autocommit=True)
+    probe_id = lifecycle._insert_probe_job(conn, str(repo))
+    assert probe_id is not None
+    try:
+        outcome = lifecycle._wait_for_probe_claim(
+            conn, probe_id, expected_worker_id, worker_pid, timeout_seconds
+        )
+    finally:
+        request_cancel(conn, probe_id)
+        lifecycle._wait_for_probe_terminal(conn, probe_id, timeout_seconds)
+        delete_job_and_chunks(conn, probe_id)
+        conn.close()
+    return outcome
+
+
+def test_repair_refuses_when_same_id_other_worker_claims_probe(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    second_pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-worker-id twin that claims the probe must never be adopted.
+
+    Two real workers run simultaneously with the identical
+    ``LUBKO_WORKER_ID``. The operator supplies the PID of worker A, but the
+    probe is claimed and executed by worker B (the only consumer of the repair
+    queue). The claim proof is bound to the exact supplied PID through the
+    persisted ``process_pid`` descendant check, so the repair must refuse to
+    adopt A rather than accept B's consumption as evidence for A.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    other_conf = write_database_config(tmp_path, second_pg_cluster, name="other.conf")
+    supplied = spawn_real_worker(other_conf)
+    claiming = spawn_real_worker(conf)
+    try:
+        assert probe_claimed_by(repo, claiming.pid) is True
+        assert probe_claimed_by(repo, supplied.pid) is False
+
+        code = lifecycle.repair(make_repair_options(repo), supplied.pid)
+
+        assert code == EXIT_ERROR
+        assert lifecycle.read_meta() is None
+        assert supplied.poll() is None
+        assert claiming.poll() is None
+    finally:
+        kill_proc(supplied)
+        kill_proc(claiming)
+
+
+def test_recover_starts_an_adoptable_session_leader(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The supported recover command starts a dedicated adoptable leader.
+
+    The documented recovery flow is ``lubko-deploy recover`` (starts a
+    detached session/process-group-leader worker with a stable exact PID)
+    followed by ``lubko-deploy repair --recovery-worker-pid <PID>``. This
+    proves the flow end to end: the spawned worker is a dedicated leader and
+    repair adopts its exact PID, recording its real lifecycle token.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    spawned: list[subprocess.Popen[bytes]] = []
+    original_spawn = lifecycle.spawn_worker
+
+    def tracking_spawn(
+        repo: Path,
+        uv_path: str,
+        log_path: Path,
+        env: dict[str, str],
+    ) -> subprocess.Popen[bytes]:
+        proc = original_spawn(repo, uv_path, log_path, env)
+        guard.register(proc)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(lifecycle, "spawn_worker", tracking_spawn)
+    monkeypatch.setattr(
+        lifecycle, "_worker_command", lambda _uv: [sys.executable, "-m", "lubko.worker"]
+    )
+    try:
+        code = lifecycle.recover(make_repair_options(repo, probe_timeout=1.0))
+        assert code == EXIT_OK
+        assert len(spawned) == 1
+        pid = spawned[0].pid
+        identity = lifecycle.process_identity(pid)
+        assert identity is not None
+        assert identity.pgid == pid
+        assert identity.sid == pid
+        assert lifecycle._is_lubko_worker_process(pid)
+        assert lifecycle.read_meta() is None
+
+        code = lifecycle.repair(make_repair_options(repo), pid)
+        assert code == EXIT_OK
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.pid == pid
+        assert meta.git_commit == second
+        assert lifecycle.worker_alive(meta)
+    finally:
+        kill_many(spawned)
+
+
+def test_recover_refuses_when_any_worker_consumes(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recover refuses to start a second consumer when the queue is occupied."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    claiming = spawn_real_worker(conf)
+    try:
+        code = lifecycle.recover(make_repair_options(repo, probe_timeout=1.0))
+
+        assert code == EXIT_ERROR
+        assert "already consuming the queue" in capsys.readouterr().err
+        assert lifecycle.read_meta() is None
+        assert claiming.poll() is None
+    finally:
+        kill_proc(claiming)
+
+
+def test_recover_refuses_when_live_maintained_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recover refuses to start a worker while a maintained worker is live."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, _second = make_repo(tmp_path / "repo")
+    worker = spawn_real_worker(conf)
+    try:
+        identity = lifecycle.process_identity(worker.pid)
+        assert identity is not None
+        recorded = WorkerMeta(
+            schema_version=1,
+            state=lifecycle.STATE_RUNNING,
+            pid=identity.pid,
+            pgid=identity.pgid,
+            sid=identity.sid,
+            start_time_ticks=identity.start_time_ticks,
+            token=None,
+            repo=str(repo),
+            git_commit=GIT_SHA,
+            worker_id=REPAIR_WORKER_ID,
+            log_path=str(lifecycle.worker_log_path()),
+            started_at=time.time(),
+            stopped_at=None,
+        )
+        lifecycle.write_meta(recorded)
+        code = lifecycle.recover(make_repair_options(repo, probe_timeout=1.0))
+
+        assert code == EXIT_ERROR
+        assert "live maintained worker" in capsys.readouterr().err
+        assert lifecycle.read_meta() is not None
+    finally:
+        kill_proc(worker)
+
+
+def test_repair_refuses_a_foreground_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreground worker inheriting the terminal group is never adopted.
+
+    A worker started in the foreground (for example ``uv run lubko-worker`` in
+    a terminal) inherits the terminal's session and foreground process group,
+    so it is not a dedicated session/group leader. Repair must refuse it
+    rather than adopt an identity whose group it could never safely signal, and
+    it must never signal the foreground worker or its shared group.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    env = dict(os.environ)
+    env["LUBKO_DATABASE_CONFIG"] = str(conf)
+    env["LUBKO_WORKER_ID"] = REPAIR_WORKER_ID
+    env.update(REPAIR_TIMINGS)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "lubko.worker"],
+        cwd=REPO_ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    guard.register(proc)
+    try:
+        time.sleep(0.3)
+        code = lifecycle.repair(make_repair_options(repo, probe_timeout=1.0), proc.pid)
+
+        assert code == EXIT_ERROR
+        assert lifecycle.read_meta() is None
+        assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        guard.unregister(proc)
