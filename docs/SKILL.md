@@ -12,7 +12,7 @@ Lubko is a remote development execution environment. ChatGPT acts as the **orche
 The flow, in one line:
 
 ```text
-ChatGPT -> connected Supabase connector -> INSERT protocol-v2 command row in lubko.jobs -> worker claims and executes that row -> poll the same root row
+ChatGPT -> connected Supabase connector -> INSERT protocol-v3 command row in lubko.jobs -> worker claims and executes that row -> poll the same root row
 ```
 
 In more detail:
@@ -37,12 +37,12 @@ Supabase / PostgreSQL
 ChatGPT
 ```
 
-A basic protocol-v2 command submission (remember the returned UUID):
+A basic protocol-v3 command submission (remember the returned UUID):
 
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":2,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
+    '{"v":3,"type":"command","request":{"cwd":"/workspace/Lubko","process":["git","status","--short"]},"state":{"status":"pending"}}'
 )
 returning id;
 ```
@@ -127,14 +127,13 @@ id      uuid primary key default gen_random_uuid()
 payload text not null
 ```
 
-`payload` is one string containing a JSON object (protocol v2, documented in `docs/protocol.md`). Every evolving job/request/result/state/cancellation/process-identity/output field lives inside it:
+`payload` is one string containing a JSON object (protocol v3, documented in `docs/protocol.md`). Every evolving job/request/result/state/cancellation/process-identity/output field lives inside it:
 
 ```text
-payload.v                  protocol version (currently 2)
+payload.v                  protocol version (currently 3)
 payload.type               job kind: "command" or "output_chunk"
 payload.request.cwd        working directory
-payload.request.command    shell command, or
-payload.request.args       argv list (exactly one of the two)
+payload.request.process    argv array (required; executed directly, never through a shell)
 payload.state.status       pending | running | succeeded | failed | cancelled
 payload.state.created_at / updated_at / started_at / finished_at
 payload.state.worker_id
@@ -146,7 +145,7 @@ payload.output.<stream>.tail / start / end / previous   bounded live output wind
 payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
 ```
 
-Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware: `command` rows need a `request` object and `state.status`, while `output_chunk` rows need explicit `thread` ownership and value/offset shape.
+Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware: `command` rows need a `request` object with a non-empty `request.process` argv array and `state.status`, while `output_chunk` rows need explicit `thread` ownership and value/offset shape.
 
 Immutable historical output lives in separate `output_chunk` rows in the same two-column table, explicitly owned by a root job via `payload.thread`. Root live output tails are bounded rolling windows of the newest up to 4000 raw bytes per stream (decoded to at most 4000 characters), never shortened by archival rotation. Chunk insertion and the root `previous` pointer update are transactional, and the publication transaction first retains the root `command` row with a row-level lock so a root deleted concurrently leaves no new chunk rows.
 
@@ -154,18 +153,26 @@ The worker atomically claims pending `command` rows using PostgreSQL row locking
 
 One worker is a single nonblocking supervisor and runs arbitrarily many jobs concurrently; there is no application-level concurrency limit, so submitting several independent jobs lets them genuinely run at the same time.
 
+Protocol version upgrades are breaking and destructive. The v2 → v3 cutover
+**discards old transport contents rather than migrating them**: every existing
+root `command` row and its `output_chunk` history in `lubko.jobs` is purged.
+The procedure is to stop every queue consumer, run `truncate lubko.jobs`, and
+only then start a v3 worker against the same two-column table. There is no
+drain, no migration, and no compatibility path — v3 rejects all v2 payloads,
+including any still carrying `request.command` or `request.args`.
+
 ---
 
 # Creating and polling a Supabase job
 
 Use the connected Supabase application and its SQL execution capability.
 
-A basic protocol-v2 job insertion:
+A basic protocol-v3 job insertion:
 
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":2,"type":"command","request":{"cwd":"/workspace/Lubko","command":"git status --short"},"state":{"status":"pending"}}'
+    '{"v":3,"type":"command","request":{"cwd":"/workspace/Lubko","process":["git","status","--short"]},"state":{"status":"pending"}}'
 )
 returning id;
 ```
@@ -176,7 +183,7 @@ Example result:
 id: 12345678-1234-1234-1234-123456789abc
 ```
 
-Always retain the returned UUID. `payload.request.cwd` is the shell working directory for the queued command, and `payload.state.status` must be `"pending"` for the worker to claim it. The command may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
+Always retain the returned UUID. `payload.request.cwd` is the working directory for the queued process, and `payload.state.status` must be `"pending"` for the worker to claim it. The submitted `request.process` argv is executed directly — never through a shell — so to run a shell snippet the orchestrator must select a shell interpreter explicitly, for example `"process": ["/bin/sh", "-c", "<snippet>"]`. The process may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
 
 Poll by ID:
 
@@ -198,8 +205,8 @@ Interpret states as follows:
 
 - `pending`: the job has not yet been claimed;
 - `running`: a Lubko worker is currently executing it;
-- `succeeded`: the shell command completed with exit code 0;
-- `failed`: the shell command completed unsuccessfully;
+- `succeeded`: the process completed with exit code 0;
+- `failed`: the process completed unsuccessfully;
 - `cancelled`: the job was intentionally abandoned.
 
 For a running job, poll again rather than assuming failure. Checking one root job by ID is always safe and useful: the row always contains current lifecycle state plus a substantial recent rolling output window, independent of chunk rotation.
