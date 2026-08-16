@@ -977,14 +977,36 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     return meta
 
 
-def _rollback_locked(state: RollbackState) -> bool:
-    """Restore the exact previous known-good commit and worker.
+def _retire_candidate_locked(state: RollbackState) -> bool:
+    """Stop the pending-mission candidate and prove its exact death.
 
-    With a live external supervisor the rollback is a durable settlement: a
-    newer desired generation selects the previous exact commit and the daemon
-    starts a fresh previous-commit worker from its sealed runtime; deployctl
-    then records the terminal ``rolled_back`` history. Without a supervisor
-    (one-time bootstrap / emergency path only) the legacy direct restore runs.
+    Rollback must never mutate the checkout, restart the previous worker, or
+    record terminal ``rolled_back`` state while the candidate worker might
+    still be alive: ``stop_worker`` reporting success is never trusted alone.
+    The exact candidate identity is independently rechecked after the stop, so
+    a stop that fails or a misleading success keeps the rollback nonterminal.
+
+    Args:
+        state: Pending rollback mission.
+
+    Returns:
+        ``True`` only when the candidate worker is proven dead.
+    """
+    if not stop_worker(state.new_meta, state.stop_grace_seconds):
+        append_deploy_log("supervised rollback could not stop the candidate worker")
+        return False
+    if worker_alive(state.new_meta):
+        append_deploy_log("supervised rollback requires the candidate worker to be proven dead")
+        return False
+    return True
+
+
+def _restore_previous_locked(state: RollbackState) -> bool:
+    """Restore the previous exact checkout and worker after candidate death.
+
+    Assumes the candidate worker has been proven dead, so the previous
+    known-good checkout may be force-restored, the previous worker restarted,
+    its metadata written, and the terminal ``rolled_back`` state recorded.
 
     Args:
         state: Pending rollback mission.
@@ -992,25 +1014,6 @@ def _rollback_locked(state: RollbackState) -> bool:
     Returns:
         ``True`` only when checkout, worker, metadata, and state are restored.
     """
-    if state.status != STATUS_PENDING:
-        return True
-    if supervise.supervisor_running():
-        try:
-            settle_desired(state.previous_commit, state.repo, state.uv_path)
-        except DeployCtlError:
-            append_deploy_log("supervised rollback could not settle the previous commit")
-            return False
-        _write_state(replace(state, status=STATUS_ROLLED_BACK, challenge_hash=None))
-        cli.remove_cli_root(state.commit)
-        if cli.reconcile_pointer(state.previous_commit):
-            append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
-        else:
-            append_deploy_log(
-                f"supervised rollback restored commit {state.previous_commit} "
-                "but could not restore the maintained CLI pointer"
-            )
-        return True
-    stop_worker(state.new_meta, state.stop_grace_seconds)
     repo = Path(state.repo)
     if not _checkout(repo, state.previous_commit, state.git_timeout_seconds, force=True):
         append_deploy_log("supervised rollback could not restore previous checkout")
@@ -1030,6 +1033,48 @@ def _rollback_locked(state: RollbackState) -> bool:
             "but could not restore the maintained CLI pointer"
         )
     return True
+
+
+def _rollback_locked(state: RollbackState) -> bool:
+    """Restore the exact previous known-good commit and worker.
+
+    With a live external supervisor the rollback is a durable settlement: a
+    newer desired generation selects the previous exact commit and the daemon
+    starts a fresh previous-commit worker from its sealed runtime; deployctl
+    then records the terminal ``rolled_back`` history. Without a supervisor
+    (one-time bootstrap / emergency path only) the legacy direct restore runs,
+    and it fails closed: the candidate worker must be genuinely dead before any
+    checkout mutation, previous-worker restart, metadata write, or terminal
+    ``rolled_back`` state.
+
+    Args:
+        state: Pending rollback mission.
+
+    Returns:
+        ``True`` only when checkout, worker, metadata, and state are restored and
+        the candidate worker is proven dead.
+    """
+    if state.status != STATUS_PENDING:
+        return True
+    if supervise.supervisor_running():
+        try:
+            settle_desired(state.previous_commit, state.repo, state.uv_path)
+        except DeployCtlError:
+            append_deploy_log("supervised rollback could not settle the previous commit")
+            return False
+        _write_state(replace(state, status=STATUS_ROLLED_BACK, challenge_hash=None))
+        cli.remove_cli_root(state.commit)
+        if cli.reconcile_pointer(state.previous_commit):
+            append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
+        else:
+            append_deploy_log(
+                f"supervised rollback restored commit {state.previous_commit} "
+                "but could not restore the maintained CLI pointer"
+            )
+        return True
+    if not _retire_candidate_locked(state):
+        return False
+    return _restore_previous_locked(state)
 
 
 def _watchdog_main(lock_timeout_seconds: float) -> None:
