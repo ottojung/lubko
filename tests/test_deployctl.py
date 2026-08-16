@@ -931,9 +931,24 @@ def test_wrong_challenge_rollback_preserves_previous_cli(
     state = pending_state(repo=str(repo), old=first, new=second)
     challenged = replace(state, challenge_hash=dc._challenge_digest("3fa91c0"))
     dc._write_state(challenged)
-    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
     options = make_options(repo)
-    patch_rollback_dependencies(monkeypatch)
+    candidate_dead = False
+
+    def worker_alive_mod(meta: WorkerMeta) -> bool:
+        identity = meta.pid, meta.start_time_ticks
+        new_identity = state.new_meta.pid, state.new_meta.start_time_ticks
+        if identity == new_identity:
+            return not candidate_dead
+        return True
+
+    def stop_candidate(_meta: WorkerMeta, _grace: float) -> bool:
+        nonlocal candidate_dead
+        candidate_dead = True
+        return True
+
+    monkeypatch.setattr(dc, "worker_alive", worker_alive_mod)
+    monkeypatch.setattr(dc, "stop_worker", stop_candidate)
+    monkeypatch.setattr(dc, "_restart_previous", lambda _state: _state.previous_meta)
 
     with pytest.raises(dc.DeployCtlError, match="incorrect"):
         dc._confirm_locked(
@@ -1172,6 +1187,209 @@ def test_rollback_restores_pointer_off_a_provisional_candidate(
 
     assert cli.current_commit() == first
     assert run_launcher(bin_dir / "lubko-agent") == f"lubko-agent@{first}"
+
+
+def test_rollback_fails_closed_when_candidate_stop_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed candidate stop keeps rollback nonterminal and untouched."""
+    state = pending_state()
+    checkouts: list[tuple[str, bool]] = []
+    restarts: list[dc.RollbackState] = []
+    writes: list[dc.RollbackState] = []
+    logs: list[str] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "stop_worker", lambda _meta, _grace: False)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+    monkeypatch.setattr(dc, "append_deploy_log", logs.append)
+
+    def record_checkout(_repo: Path, commit: str, _timeout: float, *, force: bool) -> bool:
+        checkouts.append((commit, force))
+        return True
+
+    def record_restart(_state: dc.RollbackState) -> WorkerMeta:
+        restarts.append(_state)
+        return _state.previous_meta
+
+    monkeypatch.setattr(dc, "_checkout", record_checkout)
+    monkeypatch.setattr(dc, "_restart_previous", record_restart)
+
+    def record_write_state(value: dc.RollbackState) -> None:
+        writes.append(value)
+
+    monkeypatch.setattr(dc, "_write_state", record_write_state)
+
+    assert dc._rollback_locked(state) is False
+
+    assert checkouts == []
+    assert restarts == []
+    assert writes == []
+    assert any("candidate" in message and "stop" in message for message in logs)
+
+
+def test_rollback_fails_closed_when_candidate_survives_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A misleading stop success never hides a still-live candidate."""
+    state = pending_state()
+    checkouts: list[tuple[str, bool]] = []
+    restarts: list[dc.RollbackState] = []
+    writes: list[dc.RollbackState] = []
+    logs: list[str] = []
+    observed: list[WorkerMeta] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "stop_worker", lambda _meta, _grace: True)
+    monkeypatch.setattr(dc, "append_deploy_log", logs.append)
+
+    def record_alive(meta: WorkerMeta) -> bool:
+        observed.append(meta)
+        return True
+
+    def record_checkout(_repo: Path, commit: str, _timeout: float, *, force: bool) -> bool:
+        checkouts.append((commit, force))
+        return True
+
+    def record_restart(_state: dc.RollbackState) -> WorkerMeta:
+        restarts.append(_state)
+        return _state.previous_meta
+
+    def record_write_state(value: dc.RollbackState) -> None:
+        writes.append(value)
+
+    monkeypatch.setattr(dc, "worker_alive", record_alive)
+    monkeypatch.setattr(dc, "_checkout", record_checkout)
+    monkeypatch.setattr(dc, "_restart_previous", record_restart)
+    monkeypatch.setattr(dc, "_write_state", record_write_state)
+
+    assert dc._rollback_locked(state) is False
+
+    assert observed == [state.new_meta]
+    assert checkouts == []
+    assert restarts == []
+    assert writes == []
+    assert any("candidate" in message and "dead" in message for message in logs)
+
+
+def test_rollback_proves_candidate_death_before_restoration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful rollback verifies candidate death before restoring."""
+    state = pending_state()
+    events: list[str] = []
+    observed: list[WorkerMeta] = []
+    writes: list[dc.RollbackState] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+
+    def record_stop(_meta: WorkerMeta, _grace: float) -> bool:
+        events.append("stop")
+        return True
+
+    monkeypatch.setattr(dc, "stop_worker", record_stop)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
+    monkeypatch.setattr(cli, "remove_cli_root", lambda _commit: None)
+    monkeypatch.setattr(cli, "reconcile_pointer", lambda _commit: True)
+
+    def record_alive(meta: WorkerMeta) -> bool:
+        observed.append(meta)
+        events.append("alive")
+        return False
+
+    def record_checkout(_repo: Path, commit: str, _timeout: float, *, force: bool) -> bool:
+        assert force
+        events.append(f"checkout:{commit}")
+        return True
+
+    def record_restart(_state: dc.RollbackState) -> WorkerMeta:
+        events.append("restart")
+        return _state.previous_meta
+
+    def record_write_meta(_meta: WorkerMeta) -> None:
+        events.append("write_meta")
+
+    def record_write_state(value: dc.RollbackState) -> None:
+        events.append("state")
+        writes.append(value)
+
+    monkeypatch.setattr(dc, "worker_alive", record_alive)
+    monkeypatch.setattr(dc, "_checkout", record_checkout)
+    monkeypatch.setattr(dc, "_restart_previous", record_restart)
+    monkeypatch.setattr(dc, "write_meta", record_write_meta)
+    monkeypatch.setattr(dc, "_write_state", record_write_state)
+
+    assert dc._rollback_locked(state) is True
+
+    assert observed == [state.new_meta]
+    assert events == [
+        "stop",
+        "alive",
+        f"checkout:{state.previous_commit}",
+        "restart",
+        "write_meta",
+        "state",
+    ]
+    assert writes == [replace(state, status=dc.STATUS_ROLLED_BACK, challenge_hash=None)]
+
+
+def test_process_level_rollback_fails_closed_when_candidate_retirement_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-live candidate process keeps a real legacy rollback nonterminal.
+
+    The exact candidate identity is spawned as a real session-leader process
+    and the pending mission is persisted, then retirement is simulated to fail
+    while the candidate stays alive. The rollback must fail closed: the
+    persisted mission remains pending rather than terminal ``rolled_back``,
+    the checkout is never rewritten, the previous worker is never started or
+    reused (any call fails the test, so a second process can never be created),
+    and no replacement metadata is written, so a second queue consumer can
+    never be introduced by rollback. The real candidate survives under its
+    exact recorded identity and is cleaned up by that exact identity.
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    token = secrets.token_hex(16)
+    candidate = spawn_real_process(token)
+    try:
+        candidate_meta = real_meta(candidate, repo, second, token)
+        assert worker_alive(candidate_meta)
+        state = replace(
+            pending_state(repo=str(repo), old=first, new=second),
+            new_meta=candidate_meta,
+        )
+        dc._write_state(state)
+        assert dc._read_state() == state
+
+        logs: list[str] = []
+        monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+        monkeypatch.setattr(dc, "stop_worker", lambda _meta, _grace: False)
+        monkeypatch.setattr(dc, "append_deploy_log", logs.append)
+        monkeypatch.setattr(
+            dc,
+            "_checkout",
+            lambda *_args, **_kwargs: pytest.fail("rollback must not rewrite the checkout"),
+        )
+        monkeypatch.setattr(
+            dc,
+            "_restart_previous",
+            lambda _state: pytest.fail("rollback must not start or reuse the previous worker"),
+        )
+
+        try:
+            assert dc._rollback_locked(state) is False
+
+            assert worker_alive(candidate_meta)
+            assert candidate.poll() is None
+            assert cli.git_commit(repo, 5.0) == second
+            rolled = dc._read_state()
+            assert rolled is not None
+            assert rolled == state
+            assert rolled.status == dc.STATUS_PENDING
+            assert read_meta() is None
+            assert any("candidate" in message and "stop" in message for message in logs)
+        finally:
+            lifecycle.stop_worker(state.new_meta, state.stop_grace_seconds)
+    finally:
+        kill_proc(candidate)
 
 
 def test_restart_previous_reuses_healthy_previous_before_retirement(
