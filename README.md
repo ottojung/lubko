@@ -430,6 +430,103 @@ lubko-deploy deploy --bootstrap
 
 Subsequent upgrades replace maintained workers with no manual PID discovery.
 
+## External worker supervision
+
+`lubko-supervisor` is the small, stable control component outside the worker
+process whose job is to ensure that exactly one intended maintained Lubko
+worker is running and to restore a verified last-known-good worker after an
+unexpected worker exit. It is deliberately independent of the worker and of
+the Lubko job queue: it never needs a queue roundtrip to notice or repair
+worker death.
+
+### Container startup contract
+
+The supervisor is designed to be the container's **main long-lived process**.
+The production container currently runs `tini-static -- sleep infinity`; the
+supported startup contract replaces the `sleep infinity` child of Tini with the
+supervisor:
+
+```sh
+tini-static -- lubko-supervisor
+```
+
+This is a real startup artifact: on every container start Tini launches the
+supervisor, which reconstructs the intended maintained worker deterministically
+from durable state and restores service without any human terminal. The exact
+runtime requirement (switching the container command from `sleep infinity` to
+`lubko-supervisor`) is configured in the container image, which lives outside
+this repository; all repository-side pieces required by that contract are
+implemented here (`lubko-supervisor`, its durable protocol, and its startup
+reconstruction). Until the container command is switched, the supervisor is not
+restarted by the runtime and must be started by other means — the acceptance
+criterion that automatic startup survives container restart therefore depends
+on that one image configuration change.
+
+A fresh system bootstraps the maintained worker once with
+`lubko-deploy deploy --bootstrap` (which builds the immutable per-commit CLI
+environment and activates the maintained commands), then the container command
+above is installed. From then on the supervisor owns and restarts the worker
+across every crash and every container restart.
+
+### Ownership model
+
+The supervisor is the stable authority that actually starts, stops, and
+restarts worker processes:
+
+- it spawns the worker as its **direct child** from the immutable per-commit
+  maintained environment (`$XDG_STATE_HOME/lubko/cli/<commit>/`), never from a
+  mutable working tree, so a crash never launches arbitrary checkout contents
+  and ordinary restarts never run repository validation or mutate Git;
+- it never uses `pkill`/`killall`/argv matching/process-name discovery: every
+  stop and liveness check uses the exact recorded process identity (PID,
+  process group, session, start time, lifecycle token, and direct-parent
+  check), so a recycled PID can never be signalled;
+- `lubko-deploy deploy` hands the exact confirmed commit to the supervisor
+  through a durable desired-intent protocol and waits until the supervisor
+  proves its worker consumes the queue. A normal maintained install **refuses**
+  to fall back to direct spawning when the supervisor is absent; only the
+  one-time `--bootstrap` path and the explicit emergency `recover`/`repair`
+  commands start workers without it;
+- `lubko-deploy stop` asks the supervisor to stop and hold, so an intentionally
+  stopped worker is never resurrected;
+- during a supervised deployment the supervisor recognises the durable pending
+  mission (`worker/rollback.json`) and holds: it never resurrects the
+  intentionally retiring previous worker, and on container restart during a
+  pending mission it resolves the abandoned mission before restoring a worker,
+  so exactly one maintained consumer exists after every crash/deploy/restart.
+
+### Durable protocol state
+
+Supervisor state lives under `$XDG_STATE_HOME/lubko/supervisor/`:
+
+- `desired.json` — the explicit intent written by `lubko-deploy deploy` /
+  `lubko-deploy stop`; a monotonic `generation` makes concurrent writers
+  last-writer-wins and lets the daemon recognise every new intent exactly once;
+- `state.json` — the daemon's durable record of the generation it applied, the
+  worker child it owns, and its crash-loop backoff, so a supervisor restart
+  reconstructs deterministically without duplicating the worker;
+- `status.json` — a machine-readable observation surface (`lubko-deploy
+  status` reports it; `lubko-supervisor --status` prints it) exposing the
+  supervisor PID, applied generation, desired commit, live worker exact
+  identity, queue readiness, last worker exit, restart count, next retry time,
+  and the supervised-deployment mission state;
+- `supervisor.pid` — the daemon's own exact identity, used only to detect that
+  a daemon is running and to refuse a second daemon.
+
+### Crash, backoff, and readiness
+
+An unexpected worker exit is recorded (return code and time), restarted with
+bounded exponential backoff, and never run from a mutable checkout. Readiness
+is a real queue roundtrip bound to the exact supervisor child — PID liveness
+and database connectivity are not enough — so a replacement is only reported
+ready after it actually consumes `lubko.jobs`. A worker that stays alive during
+a transient PostgreSQL/DNS outage is never duplicated, and a restart during an
+outage backs off until readiness is possible again.
+
+Corrupt or contradictory supervised-deployment metadata fails closed: the
+supervisor holds without a worker rather than launching an arbitrary process
+during an unknown handoff.
+
 ## Agent management CLI
 
 `lubko-agent` is the maintained interface for managed AI agent sessions inside
@@ -480,12 +577,12 @@ reused.
 
 ## Installing the maintained commands
 
-The maintained entry points (`lubko-agent`, `lubko-worker`, `lubko-deploy`,
-`lubko-deploy-ctl`, `lubko-install`, `my-lubko-agent`) are versioned in
-`pyproject.toml`. In a checkout they are available through the project
-virtualenv (`uv sync`); to make them available on PATH in every login and
-interactive shell without a hand-maintained copy, install them into the user
-bin directory with the maintained installer:
+The maintained entry points (`lubko-agent`, `lubko-worker`, `lubko-supervisor`,
+`lubko-deploy`, `lubko-deploy-ctl`, `lubko-install`, `my-lubko-agent`) are
+versioned in `pyproject.toml`. In a checkout they are available through the
+project virtualenv (`uv sync`); to make them available on PATH in every login
+and interactive shell without a hand-maintained copy, install them into the
+user bin directory with the maintained installer:
 
 ```sh
 lubko-install --repo /path/to/lubko

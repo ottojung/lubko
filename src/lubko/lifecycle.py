@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, toolchain
+from lubko import cli, supervise, toolchain
 from lubko.config import load_database_config
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
@@ -203,6 +203,7 @@ class DeployOptions:
     git_timeout_seconds: float
     cli_timeout_seconds: float
     probe_timeout_seconds: float = DEFAULT_REPAIR_PROBE_TIMEOUT_SECONDS
+    direct_spawn: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -998,32 +999,84 @@ def _activate_maintained_cli(commit: str) -> bool:
     return True
 
 
-def _deploy_locked(options: DeployOptions) -> int:
-    """Perform a deployment while holding the deployment lock.
+def _deploy_through_supervisor(options: DeployOptions, commit: str) -> WorkerMeta:
+    """Ask the external supervisor to start the worker for the confirmed commit.
+
+    The supervisor owns the maintained worker process, so a deployment hands
+    the exact commit to the daemon through the durable desired-intent protocol
+    and waits until the daemon reports a live worker for it.  The supervisor
+    already retired any previous worker it owned, so no separate stop is
+    needed here.
 
     Args:
         options: Deployment inputs.
+        commit: Exact commit to deploy.
 
     Returns:
-        A process exit code.
+        The maintained metadata the supervisor recorded for the worker.
 
     Raises:
-        DeployAbortedError: If the deployment must abort and leave the current
-            worker untouched.
+        DeployAbortedError: If the supervisor did not start a verified worker.
     """
-    previous = read_meta()
-    state = worker_state(previous)
+    worker_id = os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
+    _out("requesting the external supervisor to start the worker ...")
+    generation = supervise.request_run(
+        commit,
+        repo=str(options.repo),
+        uv_path=options.uv_path,
+        worker_id=worker_id,
+    )
+    if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        _err("the external supervisor did not apply the requested worker start")
+        raise DeployAbortedError
+    if not supervise.wait_until_ready(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        _err(
+            "the external supervisor did not prove its worker consumes the queue; "
+            "the deployment is not verified"
+        )
+        raise DeployAbortedError
+    meta = read_meta()
+    if meta is None or not worker_alive(meta) or meta.git_commit != commit:
+        _err(
+            "the external supervisor did not report a live maintained worker for the deployed "
+            "commit"
+        )
+        raise DeployAbortedError
+    if not check_postgres(options.postgres_timeout_seconds):
+        _err("the replacement worker cannot reach PostgreSQL; leaving the current worker untouched")
+        raise DeployAbortedError
+    append_deploy_log(f"supervisor started worker pid={meta.pid} commit={commit}")
+    return meta
 
-    if state == STATE_UNMANAGED:
-        if not options.bootstrap:
-            _err(UNMANAGED_WORKER_MESSAGE)
-            _err("stop the legacy worker manually once, then rerun with --bootstrap")
-            raise DeployAbortedError
-        _out("bootstrap: no maintained worker metadata; assuming the legacy worker was stopped")
 
-    commit = _validate_and_prepare(options)
+def _deploy_direct(
+    options: DeployOptions,
+    previous: WorkerMeta | None,
+    state: str,
+    commit: str,
+    log_file: Path,
+) -> WorkerMeta:
+    """Start the replacement worker directly, bypassing the external supervisor.
 
-    log_file = worker_log_path()
+    This is the narrow legacy path used only by the one-time bootstrap and by
+    tests that exercise the direct mechanism explicitly.  A normal maintained
+    install never reaches it: :func:`_deploy_locked` refuses without the
+    external supervisor.
+
+    Args:
+        options: Deployment inputs.
+        previous: Previously recorded worker metadata, or ``None``.
+        state: Effective state of the previous worker.
+        commit: Exact commit to deploy.
+        log_file: Stable worker log path.
+
+    Returns:
+        The maintained metadata of the started worker.
+
+    Raises:
+        DeployAbortedError: If the direct replacement cannot be verified or the
+            previous worker cannot be stopped.
+    """
     token = secrets.token_hex(16)
     env = worker_env(token)
     worker_id = env.get("LUBKO_WORKER_ID") or socket.gethostname()
@@ -1067,13 +1120,62 @@ def _deploy_locked(options: DeployOptions) -> int:
             raise DeployAbortedError
 
     write_meta(new_meta)
+    return new_meta
+
+
+def _deploy_locked(options: DeployOptions) -> int:
+    """Perform a deployment while holding the deployment lock.
+
+    The external supervisor is the single authority that owns the maintained
+    worker; a normal deployment hands the exact commit to the daemon and never
+    silently falls back to direct spawning when the daemon is absent.
+
+    Args:
+        options: Deployment inputs.
+
+    Returns:
+        A process exit code.
+
+    Raises:
+        DeployAbortedError: If the deployment must abort and leave the current
+            worker untouched.
+    """
+    previous = read_meta()
+    state = worker_state(previous)
+
+    if state == STATE_UNMANAGED:
+        if not options.bootstrap:
+            _err(UNMANAGED_WORKER_MESSAGE)
+            _err("stop the legacy worker manually once, then rerun with --bootstrap")
+            raise DeployAbortedError
+        _out("bootstrap: no maintained worker metadata; assuming the legacy worker was stopped")
+
+    commit = _validate_and_prepare(options)
+
+    log_file = worker_log_path()
+    if supervise.supervisor_running():
+        new_meta = _deploy_through_supervisor(options, commit)
+        _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
+    elif options.bootstrap or options.direct_spawn:
+        new_meta = _deploy_direct(options, previous, state, commit, log_file)
+        _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
+    else:
+        _err(
+            "no external supervisor is running; refusing to deploy the maintained worker without "
+            "automatic restart protection"
+        )
+        _err(
+            "start the supervisor as the container's main process (see README 'External worker "
+            "supervision'), or use the one-time '--bootstrap' path on a fresh install"
+        )
+        raise DeployAbortedError
+
     cli_ok = _activate_maintained_cli(commit)
     append_deploy_log(
         f"deployed commit {commit} pid={new_meta.pid}"
         + ("" if cli_ok else "; maintained CLI activation failed")
     )
     _out(f"deployed git commit {commit}")
-    _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     _out(f"log: {log_file}")
     if not cli_ok:
         _err("error: the worker runs the new commit but the maintained CLIs could not be switched")
@@ -1377,6 +1479,31 @@ def _wait_for_probe_terminal(
         if str(row[0]) in {"succeeded", "failed", "cancelled"}:
             return
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+
+
+def verify_worker_consumes_queue(
+    worker_id: str,
+    cwd: str,
+    worker_pid: int,
+    timeout_seconds: float,
+) -> bool:
+    """Prove an exact worker process consumes the queue through a real roundtrip.
+
+    This is the public readiness proof used by the external supervisor: PID
+    aliveness and database connectivity do not prove a worker is the queue
+    consumer, so a probe job must be claimed and executed by the exact process.
+    The probe is cancelled, awaited terminal, and removed in all cases.
+
+    Args:
+        worker_id: Worker identifier the worker records on claims.
+        cwd: Working directory for the probe job.
+        worker_pid: Exact PID of the worker process to prove.
+        timeout_seconds: Maximum seconds to wait for the probe to be claimed.
+
+    Returns:
+        ``True`` only when the exact worker consumed the probe.
+    """
+    return _verify_queue_roundtrip(worker_id, cwd, worker_pid, timeout_seconds)
 
 
 def _verify_queue_roundtrip(
@@ -1813,6 +1940,40 @@ def _err(message: str) -> None:
     sys.stderr.write(message + "\n")
 
 
+def _print_supervisor_status() -> None:
+    """Report whether an external supervisor guards the maintained worker.
+
+    The supervisor owns the worker process and restores it after an unexpected
+    exit; its presence is the difference between a crash that self-heals and a
+    crash that requires a human.
+    """
+    if not supervise.supervisor_running():
+        _out("supervisor: not running (no automatic worker restart)")
+        return
+    status = supervise.read_status()
+    if status is None:
+        _out("supervisor: running (status not yet published)")
+        return
+    _out(f"supervisor: running (pid {status.supervisor_pid})")
+    _out(f"supervisor generation: {status.applied_generation}")
+    _out(f"supervisor mode: {status.mode}")
+    if status.commit is not None:
+        _out(f"supervisor commit: {status.commit}")
+    if status.mission is not None:
+        _out(f"supervisor mission: {status.mission}")
+    if status.restart_count:
+        _out(f"supervisor restarts: {status.restart_count}")
+        if status.next_attempt_at is not None:
+            retry = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(status.next_attempt_at))
+            _out(f"supervisor next retry: {retry}")
+    if status.last_exit is not None:
+        _out(f"last worker exit code: {status.last_exit.returncode}")
+    if status.db_ready is not None:
+        _out(f"supervisor database reachable: {status.db_ready}")
+    if status.message is not None:
+        _out(f"supervisor message: {status.message}")
+
+
 def status_cmd() -> int:
     """Show the effective worker lifecycle state.
 
@@ -1825,8 +1986,10 @@ def status_cmd() -> int:
     if state == STATE_UNMANAGED:
         _out(UNMANAGED_WORKER_MESSAGE)
         _out("after stopping the legacy worker manually once, run: lubko-deploy deploy --bootstrap")
+        _print_supervisor_status()
         return EXIT_OK
     if meta is None:
+        _print_supervisor_status()
         return EXIT_OK
     _out(f"pid: {meta.pid}")
     _out(f"pgid: {meta.pgid}")
@@ -1847,11 +2010,16 @@ def status_cmd() -> int:
                 f"warning: maintained CLIs resolve to {active or 'nothing'}, not the maintained "
                 f"worker commit {meta.git_commit}; run lubko-deploy-ctl status to reconcile"
             )
+    _print_supervisor_status()
     return EXIT_OK
 
 
 def stop_cmd(grace_seconds: float) -> int:
     """Stop the maintained worker by its exact recorded identity.
+
+    When the external supervisor is running, the stop is handed to the daemon
+    through the durable protocol so it never resurrects an intentionally
+    stopped worker; otherwise the worker is stopped directly.
 
     Args:
         grace_seconds: Grace period before force-killing.
@@ -1864,6 +2032,8 @@ def stop_cmd(grace_seconds: float) -> int:
         _err(UNMANAGED_WORKER_MESSAGE)
         _err("stop the legacy worker manually once; see README 'Bootstrap'")
         return EXIT_ERROR
+    if supervise.supervisor_running():
+        return _stop_through_supervisor()
     if not worker_alive(meta):
         _out("no maintained worker is running")
         return EXIT_OK
@@ -1873,6 +2043,25 @@ def stop_cmd(grace_seconds: float) -> int:
         return EXIT_ERROR
     write_meta(replace(meta, state=STATE_STOPPED, stopped_at=time.time()))
     append_deploy_log(f"stopped worker pid={meta.pid}")
+    _out("stopped")
+    return EXIT_OK
+
+
+def _stop_through_supervisor() -> int:
+    """Ask the external supervisor to stop and hold the maintained worker.
+
+    Returns:
+        A process exit code.
+    """
+    _out("requesting the external supervisor to stop the maintained worker ...")
+    generation = supervise.request_stop()
+    if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+        _err("the external supervisor did not apply the stop request")
+        return EXIT_ERROR
+    current = read_meta()
+    if current is not None and worker_alive(current):
+        _err(f"could not stop worker pid {current.pid}")
+        return EXIT_ERROR
     _out("stopped")
     return EXIT_OK
 
@@ -1919,6 +2108,7 @@ def deploy_cmd(args: argparse.Namespace) -> int:
         repo=args.repo,
         uv_path=uv_path,
         bootstrap=args.bootstrap,
+        direct_spawn=args.bootstrap,
         stop_grace_seconds=args.grace_seconds,
         postgres_timeout_seconds=args.db_timeout,
         lock_timeout_seconds=args.lock_timeout,

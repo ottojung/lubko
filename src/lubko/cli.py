@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 ENTRY_POINTS: Final = (
     "lubko-agent",
     "lubko-worker",
+    "lubko-supervisor",
     "lubko-deploy",
     "lubko-deploy-ctl",
     "lubko-install",
@@ -143,7 +144,7 @@ def _root_is_usable(commit: str) -> bool:
     """Return whether a commit's CLI environment looks fully built.
 
     Every maintained entry point must exist: older commits may predate one of
-    the six entry points, and activating such a root would leave that global
+    the seven entry points, and activating such a root would leave that global
     command broken.
 
     Args:

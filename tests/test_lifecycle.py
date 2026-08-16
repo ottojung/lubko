@@ -177,6 +177,10 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
 def make_options(repo: Path, *, bootstrap: bool) -> lifecycle.DeployOptions:
     """Build deployment options for tests.
 
+    ``direct_spawn`` is enabled explicitly: these unit tests exercise the
+    narrow legacy direct-spawn mechanism that a normal maintained install no
+    longer falls back to silently.
+
     Args:
         repo: Repository path to deploy.
         bootstrap: Whether to allow the unmanaged bootstrap case.
@@ -188,6 +192,7 @@ def make_options(repo: Path, *, bootstrap: bool) -> lifecycle.DeployOptions:
         repo=repo,
         uv_path="uv",
         bootstrap=bootstrap,
+        direct_spawn=True,
         stop_grace_seconds=0.5,
         postgres_timeout_seconds=1.0,
         lock_timeout_seconds=1.0,
@@ -665,6 +670,61 @@ def test_deploy_success_replaces_worker(
         assert GIT_SHA in out
     finally:
         kill_proc(old)
+        kill_many(spawned)
+
+
+def test_deploy_refuses_without_supervisor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A normal deploy without the external supervisor refuses loudly.
+
+    The external supervisor is the single authority that owns the maintained
+    worker; a maintained install must never silently fall back to direct
+    spawning merely because the supervisor is absent.
+    """
+    spawned = patch_deploy(monkeypatch)
+    lifecycle.write_meta(
+        WorkerMeta(
+            schema_version=1,
+            state=lifecycle.STATE_STOPPED,
+            pid=999_999,
+            pgid=999_999,
+            sid=999_999,
+            start_time_ticks=1,
+            token=STALE_MARKER,
+            repo=str(tmp_path),
+            git_commit=GIT_SHA,
+            worker_id="old",
+            log_path=str(tmp_path / "old.log"),
+            started_at=1.0,
+            stopped_at=1.0,
+        )
+    )
+    options = lifecycle.DeployOptions(
+        repo=tmp_path,
+        uv_path="uv",
+        bootstrap=False,
+        direct_spawn=False,
+        stop_grace_seconds=0.5,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=5.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=5.0,
+    )
+    try:
+        code = lifecycle.deploy(options)
+        assert code == EXIT_ERROR
+        assert not spawned
+        current = lifecycle.read_meta()
+        assert current is not None
+        assert current.state == lifecycle.STATE_STOPPED
+        assert current.pid == 999_999
+        err = capsys.readouterr().err
+        assert "external supervisor is running" in err
+    finally:
         kill_many(spawned)
 
 

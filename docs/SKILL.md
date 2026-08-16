@@ -1038,7 +1038,17 @@ lubko-deploy status
 lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
 lubko-deploy stop [--grace-seconds N]
 lubko-deploy log [--lines N]
+lubko-supervisor --status
 ```
+
+The maintained worker is owned by an external supervisor (`lubko-supervisor`,
+the container's main process, replacing the former `sleep infinity` child of
+Tini). `deploy` hands the exact confirmed commit to the supervisor, which owns
+the worker as its direct child and restarts it automatically after an
+unexpected exit, with bounded backoff and no manual intervention. A normal
+`deploy` refuses to fall back to direct spawning when the supervisor is not
+running; only the one-time `--bootstrap` path and the explicit emergency
+`recover`/`repair` commands start workers without it.
 
 `deploy` first validates the checkout by running `uv sync` and the repository-required checks (`ruff format --check`, `ruff check`, `mypy`, `pytest`). If validation fails, deployment is refused and the current worker is left untouched. Only a passing checkout is deployed.
 
@@ -1049,7 +1059,7 @@ Deployment behavior:
 - the previous maintained worker is stopped by its exact recorded PID/process-group/session identity — never by `pkill`, `killall`, or process-name matching;
 - the deployed git commit is reported, and git state is never mutated (no silent pull, reset, stash, or checkout).
 
-Per-user lifecycle state and logs live under `$XDG_STATE_HOME/lubko` (default `~/.local/state/lubko`), with `worker/meta.json`, `worker/worker.log`, `worker/deploy.log`, a `worker/.deploy.lock` serializing concurrent deployments, and `toolchain.json` recording the maintained `uv` executable.
+Per-user lifecycle state and logs live under `$XDG_STATE_HOME/lubko` (default `~/.local/state/lubko`), with `worker/meta.json`, `worker/worker.log`, `worker/deploy.log`, a `worker/.deploy.lock` serializing concurrent deployments, `supervisor/` holding the external supervisor's durable desired/state/status files, and `toolchain.json` recording the maintained `uv` executable.
 
 ## Bootstrap and the unmanaged legacy worker
 

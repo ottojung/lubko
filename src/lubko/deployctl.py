@@ -876,6 +876,83 @@ def _fork_watchdog(lock_timeout_seconds: float) -> None:
         os._exit(0)
 
 
+def read_rollback_state() -> RollbackState | None:
+    """Read the durable supervised-deployment state for external observers.
+
+    This is the public read used by the external supervisor.  A missing state
+    file is reported as ``None`` (no mission).  Corrupt or contradictory state
+    raises :class:`DeployCtlError` so the supervisor can fail closed into a
+    hold: it must never treat untrustworthy mission metadata as "no mission"
+    and run a worker during an unknown handoff.
+
+    Returns:
+        The parsed state, or ``None`` when no state file exists.
+
+    Raises:
+        DeployCtlError: If an existing state file is malformed, unsupported, or
+            unreadable.
+    """
+    path = rollback_state_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        msg = f"cannot read supervised deployment state: {exc}"
+        raise DeployCtlError(msg) from exc
+    try:
+        decoded = json.loads(raw)
+    except ValueError as exc:
+        msg = "supervised deployment state is not valid JSON"
+        raise DeployCtlError(msg) from exc
+    if not isinstance(decoded, dict):
+        msg = "supervised deployment state must be an object"
+        raise DeployCtlError(msg)
+    try:
+        state = RollbackState.from_dict(decoded)
+    except (KeyError, TypeError, ValueError) as exc:
+        msg = "supervised deployment state is malformed"
+        raise DeployCtlError(msg) from exc
+    if state.schema_version != ROLLBACK_SCHEMA_VERSION:
+        msg = f"unsupported supervised deployment state version {state.schema_version}"
+        raise DeployCtlError(msg)
+    return state
+
+
+def resolve_abandoned_mission(lock_timeout_seconds: float) -> None:
+    """Resolve a pending supervised mission whose candidate is gone.
+
+    This is the recovery entry point for the external supervisor.  A pending
+    mission whose candidate is still alive inside its confirmation window is a
+    live deployment and is left untouched.  Anything else (dead candidate or
+    lapsed deadline) is rolled back under the deployment lock, so a container
+    restart during a supervised deployment deterministically restores the
+    previous known-good worker instead of stranding the queue with no consumer.
+
+    Corrupt mission state fails closed: the mission is never rolled back from
+    untrusted metadata, and the caller is expected to hold without a worker.
+
+    Args:
+        lock_timeout_seconds: Deployment-lock wait timeout.
+    """
+    try:
+        state = read_rollback_state()
+    except DeployCtlError:
+        return
+    if state is None or state.status != STATUS_PENDING:
+        return
+    if worker_alive(state.new_meta) and time.time() < state.deadline:
+        return
+    try:
+        with deploy_lock(lock_timeout_seconds):
+            current = read_rollback_state()
+            if current is not None and current.status == STATUS_PENDING:
+                if _rollback_locked(current):
+                    append_deploy_log("supervised rollback resolved an abandoned pending mission")
+    except (DeployCtlError, LockTimeoutError):
+        pass
+
+
 def _cleanup_pending_locked() -> None:
     """Resolve an abandoned pending mission before accepting another checkout.
 
