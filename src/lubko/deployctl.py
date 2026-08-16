@@ -1881,6 +1881,20 @@ def _checkout_failure_exit_code(request_type: str, response: dict[str, object]) 
     return EXIT_OK
 
 
+# Public queue-handoff transport primitives shared with the ``lubko-deploy``
+# CLI (issue #68). A queue-invoked ``lubko-deploy deploy`` forks the same
+# detached-handoff pattern as a supervised checkout and must obey the same
+# ordering: the initiating queue row reaches durable ``succeeded`` before any
+# destructive old-worker retirement. These public names are the tested private
+# helpers above, exposed so the deploy path reuses exactly one implementation.
+current_queue_job_id = _current_queue_job_id
+read_pipe_line = _read_pipe_line
+send_helper_response = _send_helper_response
+send_helper_error = _send_helper_error
+wait_for_durable_success = _wait_for_durable_success
+handoff_durable_wait_seconds = HANDOFF_DURABLE_WAIT_SECONDS
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one stable-wrapper protocol request.
 

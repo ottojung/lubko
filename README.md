@@ -365,6 +365,58 @@ resolved executable is used to run validation (`uv sync`, `ruff`, `mypy`,
     activates the maintained CLI environment for that commit, and reports the
     deployed git commit.
 
+### Queue-invoked self-deploy survives the old worker's shutdown
+
+When `lubko-deploy deploy` (or `lubko-deploy restart`) is submitted through the
+Lubko queue, the worker that claims it is the very worker about to be replaced
+or retired by the external supervisor. Without protection, the supervisor's
+handoff would retire that old worker, whose shutdown terminates every active job
+group — including the group running the initiating command — cancelling the
+control row even though the deployment/restart converges (the production
+split-state regression).
+
+A queue-invoked `lubko-deploy deploy`/`restart` therefore uses the same
+detached-handoff protection as a supervised checkout
+(`docs/issue21-deploy-protocol.md`). The worker injects the exact root job UUID
+as `LUBKO_JOB_ID`, the command recognizes its own queue row through that exact
+injected value (never `process_pgid`), and forks a detached handoff helper into
+its own session; a failed detachment fails closed with an error so the row is
+recorded `failed`, never falsely `succeeded`, and the helper closes every
+inherited descriptor except its response pipe and the standard streams:
+
+1. the helper validates the checkout/restart and seals the candidate CLI
+   environment, then reports the outcome over a pipe;
+2. the controller parent prints the summary and exits zero only for a genuine
+   prepared response — a helper error or helper death exits non-zero, so the
+   owning worker records the row as durably `failed`, never falsely `succeeded`;
+3. the helper waits for that exact row to be durably `succeeded` with no
+   cancellation marker;
+4. only then does it request the supervisor handoff (deploy) or process
+   replacement (restart) at a strictly newer generation, wait for the supervisor
+   to prove the worker consumes the queue, and activate the maintained CLI
+   environment (deploy) — so the CLI pointer, the supervisor desired+applied
+   state, and the new worker commit converge without requiring a later manual
+   `lubko-deploy-ctl status` reconciliation;
+5. if the deploy then fails and the environment is not exactly coherent — the
+   candidate not proven, or proven but its CLI activation never converged — the
+   helper settles the supervisor back to the previous confirmed commit and
+   reconciles the maintained CLIs to it, so the live worker, the supervisor
+   desired/applied commit, and `cli/current` all select the same exact commit.
+   Only a candidate that is live, proven, *and* already selected by the
+   maintained CLIs is left untouched.
+
+The initiating control row is therefore durably terminal `succeeded` (or
+`failed`) before the old worker is ever stopped, and the deploy/restart command
+is never killed merely because its own old worker is retired. No ordinary job is
+ever exempted from shutdown cleanup; the helper simply is no longer a tracked
+job process group by the time the worker shuts down.
+
+A queue-invoked `lubko-deploy deploy --bootstrap` is refused: a queue job is
+executed by a live worker, so the bootstrap precondition (the legacy worker was
+stopped manually first) is inherently unsatisfied and the replacement could
+start alongside a live consumer. Bootstrap remains a manual, out-of-queue
+operation only.
+
 `lubko-deploy restart` replaces the current worker process with a fresh process
 of the **same exact confirmed deployed commit**, through the external
 supervisor, and waits until the replacement is proven queue-ready. A restart
