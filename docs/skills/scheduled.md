@@ -82,7 +82,7 @@ Immediately after claiming or inheriting an issue, re-read the canonical status 
 
 While an orchestrator intends to retain ownership of a `working` issue, it must update the canonical status comment **at least once every 5 minutes**, even when no other work-state change needs to be recorded.
 
-The authoritative activity time is the comment's GitHub `updated_at`; there is no separate heartbeat field in the comment body.
+The authoritative activity time is the comment's GitHub `updated_at`.
 
 Before refreshing the comment, re-read the canonical issue status comment. If its `owner` is no longer this invocation's owner ID, another orchestrator has inherited the issue. Stop orchestrating that issue rather than overwriting the newer ownership record.
 
