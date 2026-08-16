@@ -145,7 +145,7 @@ payload.output.<stream>.tail / start / end / previous   bounded live output wind
 payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
 ```
 
-Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware: `command` rows need a `request` object with a non-empty `request.process` argv array and `state.status`, while `output_chunk` rows need explicit `thread` ownership and value/offset shape.
+Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware but deliberately generic: `command` rows need a `request` object and `state.status`, while `output_chunk` rows need explicit `thread` ownership and value/offset shape. The payload parser (`protocol.py`) is what enforces that `request.process` is required — a non-empty array of non-empty strings — and that the legacy `request.command` / `request.args` keys are rejected; none of that is encoded in SQL, so a protocol-version change needs no DDL.
 
 Immutable historical output lives in separate `output_chunk` rows in the same two-column table, explicitly owned by a root job via `payload.thread`. Root live output tails are bounded rolling windows of the newest up to 4000 raw bytes per stream (decoded to at most 4000 characters), never shortened by archival rotation. Chunk insertion and the root `previous` pointer update are transactional, and the publication transaction first retains the root `command` row with a row-level lock so a root deleted concurrently leaves no new chunk rows.
 
@@ -155,11 +155,15 @@ One worker is a single nonblocking supervisor and runs arbitrarily many jobs con
 
 Protocol version upgrades are breaking and destructive. The v2 → v3 cutover
 **discards old transport contents rather than migrating them**: every existing
-root `command` row and its `output_chunk` history in `lubko.jobs` is purged.
-The procedure is to stop every queue consumer, run `truncate lubko.jobs`, and
-only then start a v3 worker against the same two-column table. There is no
-drain, no migration, and no compatibility path — v3 rejects all v2 payloads,
-including any still carrying `request.command` or `request.args`.
+root `command` row and its `output_chunk` history in `lubko.jobs` is purged,
+and no v2 row is transformed or preserved. There is no protocol-data drain or migration,
+and no compatibility path — v3 rejects all v2 payloads, including any still
+carrying `request.command` or `request.args`. Operationally, quiesce the
+live queue by stopping new submissions, let any in-flight v2 work become durably
+terminal, bring up and prove the v3 supervisor/worker, then `truncate
+lubko.jobs` while quiescent to purge the whole transport, and prove a fresh v3
+round trip. The end state is an empty `lubko.jobs` with no v2 or historical
+content left behind.
 
 ---
 
@@ -1280,7 +1284,7 @@ Rules:
 
 ## Supabase job failure
 
-If the shell job used to invoke a Lubko command fails: inspect stdout and stderr, determine whether the command syntax, environment, or Lubko tool failed, and submit a corrective job. Do not assume the agent itself failed merely because a surrounding shell invocation failed.
+If the job used to invoke a Lubko command fails: inspect stdout and stderr, determine whether the command syntax, environment, or Lubko tool failed, and submit a corrective job. Do not assume the agent itself failed merely because a surrounding invocation (for example a submitted argv that explicitly ran a shell) failed.
 
 ## Agent failure
 
@@ -1357,13 +1361,17 @@ Not all operations are equally safe to retry:
 - **Reads and status checks** (SELECT, polling for job status, reading agent state) are inherently idempotent and safe to retry without restriction.
 - **Writes and mutations** (INSERT, UPDATE) must be retried with care. Before retrying a write, verify that the intended state change was not already applied by the previous attempt. Use idempotency keys, conditional WHERE clauses, or state checks to avoid duplicating mutations.
 
-## Lubko shell-job failure
+## Lubko job failure
 
-The row was inserted successfully, the worker claimed it, and the queued shell command returned a non-zero exit code. This is a Lubko command-execution result.
+The row was inserted successfully, the worker claimed it, and the queued
+process argv returned a non-zero exit code. This is a Lubko job-execution
+result.
 
 ## Managed-agent failure
 
-The Supabase shell job may have succeeded in creating an agent, but the agent may later finish in a failed state. Use the **agent ID**, not the original Supabase job ID, to inspect that lifecycle.
+The Supabase job may have succeeded in creating an agent, but the agent may
+later finish in a failed state. Use the **agent ID**, not the original Supabase
+job ID, to inspect that lifecycle.
 
 ---
 

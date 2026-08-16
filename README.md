@@ -274,10 +274,14 @@ is provisioned does not fail.
 **Protocol upgrades are destructive.** The v2 → v3 cutover discards old
 transport contents rather than migrating them: the physical two-column table
 is identical in v2 and v3, and v3 rejects every v2 payload (including any still
-carrying `request.command` or `request.args`). Upgrading production means
-stopping every queue consumer, running `truncate lubko.jobs` (purging every old
-root `command` row and its `output_chunk` history), and only then starting a v3
-worker. There is no drain, no migration, and no compatibility path.
+carrying `request.command` or `request.args`). There is no protocol-data drain or migration,
+and no compatibility path. Operationally, the cutover quiesces the live queue: stop
+new submissions, let any in-flight v2 work become durably terminal, bring up
+and prove the v3 supervisor/worker, then `truncate lubko.jobs` while quiescent
+to purge every old root `command` row and `output_chunk` history, and prove a
+fresh v3 round trip. Truncating before the first v3 start is equally valid;
+either way the end state is an empty `lubko.jobs` with no v2 row or history
+preserved.
 
 Run the worker with:
 

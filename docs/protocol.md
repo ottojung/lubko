@@ -114,11 +114,14 @@ access contract.
   unsupported: its `request.command` shell-string and `request.args` argv forms
   are not accepted by any v3 parser, builder, or worker, and there is **no
   compatibility path and no migration**. Because the two-column transport
-  schema is identical for v2 and v3, the cutover runs entirely in place: stop
-  every queue consumer, purge the transport contents with `truncate lubko.jobs`
-  (discarding every old root `command` row and its `output_chunk` history), then
-  start a v3 worker against the same table. No v2 row is transformed, migrated,
-  or preserved, and no existing table is altered.
+  schema is identical for v2 and v3, the cutover runs entirely in place against
+  the live queue. A valid procedure is: quiesce new submissions, let any
+  in-flight v2 work become durably terminal, bring up and prove the v3
+  supervisor/worker, then `truncate lubko.jobs` while quiescent (discarding
+  every old root `command` row and its `output_chunk` history), and prove a
+  fresh v3 round trip. Truncating before the first v3 start is also valid; the
+  requirement is only that the end state is an empty transport. No v2 row is
+  transformed, migrated, or preserved, and no existing table is altered.
 - A v3 worker rejects any payload whose version it does not understand; the job
   is failed with a diagnostic instead of being stuck in the queue.
 
@@ -461,9 +464,11 @@ values ('{"v":3,"type":"command","request":{"cwd":"...","process":["git","status
 
 Upgrading an existing transport from v2 is a destructive cutover that needs
 **no schema change**: the two-column table is identical in v2 and v3, and the
-v3 worker does not understand v2 rows. Stop every queue consumer, purge the
-transport contents with `truncate lubko.jobs` (discarding every old root
-`command` row and `output_chunk` history), then start a v3 worker against the
-same table. Old v2 contents are discarded, never migrated or drained. Only the
-payload protocol version changes; the physical schema stays the canonical
-two-column table.
+v3 worker does not understand v2 rows. Run it against the live queue: quiesce
+new submissions, let any in-flight v2 work become durably terminal, bring up
+and prove the v3 supervisor/worker, then `truncate lubko.jobs` while quiescent
+(discarding every old root `command` row and `output_chunk` history), and prove
+a fresh v3 round trip. Truncating before the first v3 start is equally valid;
+only the end state matters. Old v2 contents are discarded; there is no protocol-data
+drain/migration path, and no v2 row is transformed or preserved. Only the payload protocol
+version changes; the physical schema stays the canonical two-column table.

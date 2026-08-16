@@ -31,12 +31,15 @@
 -- no rollback path to maintain.
 --
 -- The v2 -> v3 cutover is DESTRUCTIVE and needs NO DDL upgrade. Protocol v3
--- does not accept v2 rows and there is no migration, drain, or compatibility
--- path; the physical schema is identical for v2 and v3. The supported cutover
--- is: stop every queue consumer, purge the transport contents with
--- `truncate lubko.jobs` (dropping every old root command row and every
--- output_chunk row), then start a v3 worker against the same table. No v2 row
--- is transformed, migrated, or preserved, and no existing table is altered.
+-- does not accept v2 rows and there is no protocol-data drain/migration or compatibility
+-- path; the physical schema is identical for v2 and v3. The cutover runs
+-- against the live queue: quiesce new submissions, let any in-flight v2 work
+-- become durably terminal, bring up and prove the v3 supervisor/worker, then
+-- `truncate lubko.jobs` while quiescent (dropping every old root command row
+-- and every output_chunk row), and prove a fresh v3 round trip. Truncating
+-- before the first v3 start is equally valid; only the end state matters, and
+-- that end state is an empty transport. No v2 row is transformed, migrated,
+-- or preserved, and no existing table is altered.
 
 create table if not exists lubko.jobs (
     id uuid primary key default gen_random_uuid(),
