@@ -2214,7 +2214,7 @@ def _terminal_or_unknown(aid: str) -> bool:
 
 
 def _stale_running(aid: str) -> bool:
-    """Return whether an agent records a running process that is dead.
+    """Return whether the agent records a running process that is dead.
 
     Args:
         aid: Lubko agent ID.
@@ -2542,7 +2542,7 @@ class _ArgumentSpec:
 
 @dataclass(frozen=True, slots=True)
 class _SubcommandSpec:
-    """Specification for one command line argument."""
+    """Specification for one subcommand."""
 
     name: str
     help: str
