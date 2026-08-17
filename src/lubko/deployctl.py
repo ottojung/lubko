@@ -30,7 +30,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, NoReturn
 from uuid import UUID
 
 import psycopg
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
-ROLLBACK_SCHEMA_VERSION: Final = 2
+ROLLBACK_SCHEMA_VERSION: Final = 3
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
@@ -140,6 +140,7 @@ class RollbackState:
     previous_retiring: bool
     previous_meta: WorkerMeta
     new_meta: WorkerMeta
+    supervised: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize durable rollback state.
@@ -162,6 +163,7 @@ class RollbackState:
             "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
             "new_meta": self.new_meta.to_dict(),
+            "supervised": self.supervised,
         }
 
     @classmethod
@@ -185,6 +187,9 @@ class RollbackState:
             generation = int(data["generation"])
             if generation < 1:
                 raise ValueError
+            supervised = data["supervised"]
+            if not isinstance(supervised, bool):
+                raise TypeError
             return cls(
                 schema_version=int(data["schema_version"]),
                 generation=generation,
@@ -200,6 +205,7 @@ class RollbackState:
                 previous_retiring=data.get("previous_retiring", False) is True,
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
+                supervised=supervised,
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervised deployment state is malformed"
@@ -346,22 +352,36 @@ def _supervised_mission_active(state: RollbackState) -> bool:
     )
 
 
-def _mission_candidate_alive(state: RollbackState) -> bool:
-    """Return whether the pending-mission candidate is genuinely live.
-
-    With a live external supervisor the candidate liveness is observed through
-    the daemon's durable child identity; otherwise the legacy recorded
-    candidate metadata is used (one-time bootstrap / emergency path).
+def _supervised_mission_ready(state: RollbackState) -> bool:
+    """Return whether the supervisor has proved the mission candidate ready.
 
     Args:
         state: Pending supervised-deployment mission.
 
     Returns:
-        ``True`` when the candidate consumer is currently live.
+        ``True`` only when the exact candidate is live and queue-ready.
     """
-    if supervise.supervisor_running():
-        return _supervised_mission_active(state)
-    return worker_alive(state.new_meta)
+    supervisor_state = supervise.read_state()
+    return _supervised_mission_active(state) and supervisor_state.ready
+
+
+def _mission_requires_rollback(state: RollbackState) -> bool:
+    """Return whether a pending mission has a proven rollback condition.
+
+    A supervised mission has exactly one rollback condition: its durable
+    confirmation deadline has expired. Its placeholder metadata and temporary
+    supervisor absence are never legacy candidate-death evidence. Legacy
+    missions retain immediate exact-candidate death behavior.
+
+    Args:
+        state: Pending deployment mission.
+
+    Returns:
+        ``True`` when rollback may safely be attempted by the owning mode.
+    """
+    if state.supervised:
+        return time.time() >= state.deadline
+    return time.time() >= state.deadline or not worker_alive(state.new_meta)
 
 
 def settle_desired(commit: str, repo: str, uv_path: str) -> int:
@@ -1056,7 +1076,27 @@ def _rollback_locked(state: RollbackState) -> bool:
     """
     if state.status != STATUS_PENDING:
         return True
-    if supervise.supervisor_running():
+    if state.supervised:
+        desired = supervise.read_desired()
+        if (
+            desired is None
+            or desired.commit != state.previous_commit
+            or desired.generation <= state.generation
+        ):
+            supervise.request_run(
+                state.previous_commit,
+                repo=state.repo,
+                uv_path=state.uv_path,
+                worker_id=state.previous_meta.worker_id or None,
+            )
+            append_deploy_log(
+                f"supervised rollback requested previous commit {state.previous_commit}"
+            )
+        if not supervise.supervisor_running():
+            append_deploy_log(
+                "supervised rollback deferred because the external supervisor is absent"
+            )
+            return False
         try:
             settle_desired(state.previous_commit, state.repo, state.uv_path)
         except DeployCtlError:
@@ -1096,10 +1136,10 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             continue
         if state is None or state.status in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
             return
-        if supervise.supervisor_running():
-            should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
-                state
-            )
+        if state.supervised:
+            # A detached watchdog can outlive a supervisor restart. Never
+            # interpret that ownership gap as legacy candidate death.
+            should_rollback = time.time() >= state.deadline
         else:
             should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
         if should_rollback:
@@ -1222,7 +1262,7 @@ def _cleanup_pending_locked() -> None:
         return
     if state.status != STATUS_PENDING:
         raise DeployCtlError(f"unknown supervised deployment status {state.status!r}")
-    if _mission_candidate_alive(state) and time.time() < state.deadline:
+    if not _mission_requires_rollback(state):
         raise DeployCtlError("another supervised checkout is still pending confirmation")
     if not _rollback_locked(state):
         raise DeployCtlError("an unresolved rollback is still pending")
@@ -1301,6 +1341,7 @@ def _prepare_locked(
         previous_retiring=False,
         previous_meta=previous,
         new_meta=new_meta,
+        supervised=supervised,
     )
     if not supervised:
         _publish_legacy_mission(state, gated, options.lock_timeout_seconds)
@@ -1625,19 +1666,47 @@ def _verify_challenge(state: RollbackState, answer: object) -> None:
         state: Live pending deployment state.
         answer: Decoded challenge response.
 
-    Raises:
-        DeployCtlError: If the challenge response is unexpected, malformed, or
-            does not match the stored challenge.
     """
     if not isinstance(answer, str) or state.challenge_hash is None:
-        _rollback_locked(state)
-        raise DeployCtlError("unexpected challenge response; deployment was rolled back")
+        _raise_after_rollback(state, "unexpected challenge response")
     if CHALLENGE_RE.fullmatch(answer) is None:
-        _rollback_locked(state)
-        raise DeployCtlError("malformed challenge response; deployment was rolled back")
+        _raise_after_rollback(state, "malformed challenge response")
     if not secrets.compare_digest(_challenge_digest(answer[::-1]), state.challenge_hash):
-        _rollback_locked(state)
-        raise DeployCtlError("challenge response is incorrect; deployment was rolled back")
+        _raise_after_rollback(state, "challenge response is incorrect")
+
+
+def _require_confirmation_candidate(state: RollbackState) -> None:
+    """Require a candidate that is ready for confirmation without false rollback.
+
+    Args:
+        state: Pending deployment mission.
+
+    Raises:
+        DeployCtlError: If the deadline expired or the candidate is not yet
+            ready for confirmation.
+    """
+    if _mission_requires_rollback(state):
+        _raise_after_rollback(state, "confirmation window lapsed")
+    if state.supervised:
+        if not _supervised_mission_ready(state):
+            raise DeployCtlError("candidate is still recovering; confirmation remains pending")
+    elif not worker_alive(state.new_meta):
+        _raise_after_rollback(state, "candidate died before confirmation")
+
+
+def _raise_after_rollback(state: RollbackState, reason: str) -> NoReturn:
+    """Raise a confirmation error without overstating deferred rollback.
+
+    Args:
+        state: Pending deployment mission to roll back.
+        reason: Human-facing confirmation failure reason.
+
+    Raises:
+        DeployCtlError: Always, with the actual rollback completion state.
+    """
+    if _rollback_locked(state):
+        raise DeployCtlError(f"{reason}; deployment was rolled back")
+    raise DeployCtlError(f"{reason}; rollback remains pending supervisor recovery")
 
 
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
@@ -1656,13 +1725,10 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     state = _read_state()
     if state is None or state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
-    if time.time() >= state.deadline or not _mission_candidate_alive(state):
-        _rollback_locked(state)
-        raise DeployCtlError("confirmation window lapsed; deployment was rolled back")
+    _require_confirmation_candidate(state)
     commit = request.get("commit")
     if commit != state.commit:
-        _rollback_locked(state)
-        raise DeployCtlError("confirmation commit does not match the proposed commit; rolled back")
+        _raise_after_rollback(state, "confirmation commit does not match the proposed commit")
     answer = request.get("challenge")
     if answer is None:
         challenge = _generate_challenge()
@@ -1674,10 +1740,8 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
             "challenge": challenge,
         }
     _verify_challenge(state, answer)
-    if time.time() >= state.deadline or not _mission_candidate_alive(state):
-        _rollback_locked(state)
-        raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
-    if supervise.supervisor_running():
+    _require_confirmation_candidate(state)
+    if state.supervised:
         settle_desired(state.commit, state.repo, state.uv_path)
     else:
         try:
@@ -1729,7 +1793,7 @@ def _handle_status(options: Options) -> dict[str, object]:
         with deploy_lock(options.lock_timeout_seconds):
             state = _read_state()
             if state is not None and state.status == STATUS_PENDING:
-                if time.time() >= state.deadline or not _mission_candidate_alive(state):
+                if _mission_requires_rollback(state):
                     _rollback_locked(state)
                     state = _read_state()
             meta = read_meta()

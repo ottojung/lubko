@@ -352,6 +352,8 @@ class SupervisorDaemon:
         Args:
             now: Monotonic time at the start of the turn.
         """
+        if self._enforce_expired_mission():
+            return
         desired = read_desired()
         state = read_state()
         action, commit = self._derive_action(state)
@@ -383,6 +385,99 @@ class SupervisorDaemon:
         self._ensure_worker(commit)
         self._record_mission_progress(commit)
         self._probe_readiness(now)
+
+    def _enforce_expired_mission(self) -> bool:
+        """Start and finish durable rollback after a supervised deadline.
+
+        The detached deploy watchdog is intentionally not the only deadline
+        authority: it dies with a container restart and can observe a transient
+        supervisor ownership gap. A restarted supervisor therefore requests
+        the previous commit itself, using the normal generation protocol, and
+        archives the mission only after that exact worker is ready. No direct
+        legacy worker restoration is possible from this path.
+
+        Returns:
+            ``True`` when a rollback intent was newly requested and the current
+            tick must stop before deriving another action.
+        """
+        try:
+            mission = deployctl.read_rollback_state()
+        except deployctl.DeployCtlError:
+            return False
+        if (
+            mission is None
+            or not mission.supervised
+            or mission.status != deployctl.STATUS_PENDING
+            or time.time() < mission.deadline
+        ):
+            return False
+        desired = read_desired()
+        if desired is None or desired.generation <= mission.generation:
+            supervise.request_run(
+                mission.previous_commit,
+                repo=mission.repo,
+                uv_path=mission.uv_path,
+                worker_id=mission.previous_meta.worker_id or None,
+            )
+            self._message = (
+                f"supervised mission deadline expired; settling previous commit "
+                f"{mission.previous_commit}"
+            )
+            return True
+        if desired.commit == mission.previous_commit and self._previous_worker_is_ready(
+            mission, desired
+        ):
+            self._archive_expired_mission(mission)
+        return False
+
+    def _previous_worker_is_ready(
+        self,
+        mission: deployctl.RollbackState,
+        desired: supervise.SupervisorDesired,
+    ) -> bool:
+        """Return whether the requested previous worker is ready to archive rollback.
+
+        Args:
+            mission: Expired supervised mission.
+            desired: Previous-commit settlement intent.
+
+        Returns:
+            ``True`` when the exact previous worker is live and ready.
+        """
+        state = read_state()
+        return not (
+            desired.generation > state.applied_generation
+            or state.commit != mission.previous_commit
+            or state.child is None
+            or not self._child_alive(state)
+            or not state.ready
+        )
+
+    def _archive_expired_mission(self, mission: deployctl.RollbackState) -> None:
+        """Archive an expired supervised mission after the previous worker is ready."""
+        try:
+            with lifecycle.deploy_lock(self.settings.lock_timeout_seconds):
+                self._archive_expired_mission_locked(mission)
+        except (deployctl.DeployCtlError, lifecycle.LockTimeoutError):
+            return
+
+    @staticmethod
+    def _archive_expired_mission_locked(mission: deployctl.RollbackState) -> None:
+        """Archive the matching pending mission while the deployment lock is held.
+
+        Args:
+            mission: Expired supervised mission to archive.
+        """
+        current = deployctl.read_rollback_state()
+        if (
+            current is not None
+            and current.status == deployctl.STATUS_PENDING
+            and current.supervised
+            and current.generation == mission.generation
+        ):
+            deployctl.archive_mission(current, deployctl.STATUS_ROLLED_BACK)
+            cli.remove_cli_root(current.commit)
+            cli.reconcile_pointer(current.previous_commit)
 
     def _record_mission_progress(self, commit: str) -> None:
         """Advance the applied generation once a mission candidate is running.

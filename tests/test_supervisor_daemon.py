@@ -559,6 +559,7 @@ def mission_state(
             started_at=1.0,
             stopped_at=None,
         ),
+        supervised=True,
     )
 
 
@@ -1282,11 +1283,12 @@ def test_status_rolls_back_supervised_mission_with_lapsed_deadline(
         assert original_pid is not None
 
         lapsed = mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo))
-        write_rollback(replace(lapsed, deadline=time.time() - 1))
+        write_rollback(lapsed)
         wait_for_replacement(original_pid)
         wait_until(status_ready, timeout=30.0)
         candidate_pid = worker_pid()
         assert candidate_pid is not None
+        write_rollback(replace(lapsed, deadline=time.time() - 1))
 
         result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
 
@@ -1344,6 +1346,55 @@ def test_supervisor_restart_resumes_pending_mission_candidate(
         write_rollback(
             mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
         )
+
+
+def test_supervisor_restart_enforces_expired_supervised_mission(
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A restarted supervisor durably rolls back an expired pending mission."""
+    repo, first, second = maintained_env
+    first_proc = start_supervisor(supervisor_env)
+    second_proc: subprocess.Popen[bytes] | None = None
+    try:
+        applied = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+        pending = mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo))
+        dc.publish_mission(pending, lock_timeout_seconds=5.0)
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+        candidate_pid = worker_pid()
+        assert candidate_pid is not None
+
+        first_proc.kill()
+        first_proc.wait(timeout=5)
+        guard.unregister(first_proc)
+        write_rollback(replace(pending, deadline=time.time() - 1))
+
+        second_proc = start_supervisor(supervisor_env)
+        wait_until(
+            lambda: (
+                (status := supervise.read_status()) is not None
+                and status.supervisor_pid == second_proc.pid
+                and status.commit == first
+                and status.ready is True
+                and (mission := dc.read_rollback_state()) is not None
+                and mission.status == dc.STATUS_ROLLED_BACK
+            ),
+            timeout=60.0,
+        )
+        final = supervise.read_status()
+        assert final is not None
+        assert final.commit == first
+        assert final.child is not None
+        assert final.child.pid != candidate_pid
+        wait_until(lambda: not process_alive(candidate_pid), timeout=30.0)
+    finally:
+        if second_proc is not None:
+            stop_supervisor(second_proc)
+        if first_proc.poll() is None:
+            stop_supervisor(first_proc)
 
 
 def test_deploy_and_restart_generations_strictly_increase(

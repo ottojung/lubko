@@ -705,6 +705,183 @@ def test_watchdog_rollback_condition_uses_deadline_or_candidate_death(
     assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
 
 
+def test_supervised_watchdog_ignores_transient_supervisor_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervised watchdog never applies legacy placeholder liveness."""
+    base = pending_state()
+    state = replace(
+        base,
+        new_meta=dc._placeholder_meta(base.commit, base.repo),
+        supervised=True,
+    )
+    terminal = replace(state, status=dc.STATUS_CONFIRMED)
+    states = iter((state, state, terminal))
+    rollbacks: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_rollback_locked", rollbacks.append)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    dc._watchdog_main(lock_timeout_seconds=1.0)
+
+    assert rollbacks == []
+
+
+def test_supervised_watchdog_rolls_back_after_live_candidate_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervised watchdog still rolls back when the live daemon loses its candidate."""
+    base = pending_state()
+    state = replace(
+        base,
+        new_meta=dc._placeholder_meta(base.commit, base.repo),
+        deadline=time.time() - 1,
+        supervised=True,
+    )
+    states = iter((state, state))
+    rollbacks: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    dc._watchdog_main(lock_timeout_seconds=1.0)
+
+    assert rollbacks == [state]
+
+
+def test_supervised_status_and_confirm_defer_during_supervisor_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Status and confirmation never reinterpret a supervised gap as legacy death."""
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo), supervised=True)
+    options = make_options(tmp_path / "repo")
+    writes: list[dc.RollbackState] = []
+    rollbacks: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+    monkeypatch.setattr(dc, "_rollback_locked", rollbacks.append)
+    monkeypatch.setattr(dc, "_write_state", writes.append)
+
+    status = dc._handle_status(options)
+    with pytest.raises(dc.DeployCtlError, match="still recovering"):
+        dc._confirm_locked({"type": "confirm", "commit": state.commit}, options)
+
+    assert status["phase"] == "await-confirmation"
+    assert rollbacks == []
+    assert writes == []
+
+
+def test_supervised_inactive_replacement_stays_pending_before_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A live replacement daemon may restore a candidate after status is queried."""
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo), supervised=True)
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+    monkeypatch.setattr(dc, "_rollback_locked", rollbacks.append)
+
+    result = dc._handle_status(options)
+    with pytest.raises(dc.DeployCtlError, match="still recovering"):
+        dc._confirm_locked({"type": "confirm", "commit": state.commit}, options)
+
+    assert result["phase"] == "await-confirmation"
+    assert rollbacks == []
+
+
+def test_supervised_rollback_never_spawns_without_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervised rollback defers rather than entering legacy lifecycle code."""
+    state = replace(
+        pending_state(),
+        new_meta=dc._placeholder_meta("2" * 40, "/workspace/Lubko"),
+        supervised=True,
+    )
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
+    monkeypatch.setattr(
+        dc,
+        "_restart_previous",
+        lambda _state: pytest.fail("supervised rollback must not spawn a worker"),
+    )
+    monkeypatch.setattr(
+        dc,
+        "_checkout",
+        lambda *_args, **_kwargs: pytest.fail("supervised rollback must not restore checkout"),
+    )
+
+    assert dc._rollback_locked(state) is False
+
+
+def test_supervised_rollback_records_request_while_supervisor_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired supervised rollback is durably requested without direct lifecycle work."""
+    state = replace(
+        pending_state(),
+        new_meta=dc._placeholder_meta("2" * 40, "/workspace/Lubko"),
+        deadline=time.time() - 1,
+        supervised=True,
+    )
+    requested: list[tuple[str, str, str, str | None]] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+
+    def request_run(
+        commit: str,
+        *,
+        repo: str,
+        uv_path: str,
+        worker_id: str | None,
+    ) -> int:
+        requested.append((commit, repo, uv_path, worker_id))
+        return 7
+
+    monkeypatch.setattr(supervise, "request_run", request_run)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
+
+    assert dc._rollback_locked(state) is False
+    assert requested == [(state.previous_commit, state.repo, state.uv_path, "test-worker")]
+
+
+def test_supervised_challenge_failure_does_not_claim_deferred_rollback_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervised challenge failure reports pending recovery when rollback is deferred."""
+    state = replace(
+        pending_state(),
+        challenge_hash=dc._challenge_digest("3fa91c0"),
+        supervised=True,
+    )
+    monkeypatch.setattr(dc, "_rollback_locked", lambda _state: False)
+
+    with pytest.raises(dc.DeployCtlError, match="pending supervisor recovery"):
+        dc._verify_challenge(state, "1111111")
+
+
 def test_status_keeps_live_supervised_pending_mission(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -717,7 +894,11 @@ def test_status_keeps_live_supervised_pending_mission(
     phase instead of rolling the live deployment back.
     """
     base = pending_state()
-    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    state = replace(
+        base,
+        new_meta=dc._placeholder_meta(base.commit, base.repo),
+        supervised=True,
+    )
     options = make_options(tmp_path / "repo")
     rollbacks: list[dc.RollbackState] = []
     current: list[dc.RollbackState] = [state]
@@ -761,9 +942,14 @@ def test_status_rolls_back_supervised_mission_when_candidate_gone(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A status query rolls back a supervised candidate the daemon no longer tracks."""
+    """A status query rolls back an expired supervised mission with no candidate."""
     base = pending_state()
-    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    state = replace(
+        base,
+        new_meta=dc._placeholder_meta(base.commit, base.repo),
+        deadline=time.time() - 1,
+        supervised=True,
+    )
     rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
     options = make_options(tmp_path / "repo")
     rollbacks: list[dc.RollbackState] = []
@@ -803,6 +989,7 @@ def test_status_rolls_back_supervised_mission_after_deadline(
         base,
         new_meta=dc._placeholder_meta(base.commit, base.repo),
         deadline=time.time() - 1,
+        supervised=True,
     )
     rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
     options = make_options(tmp_path / "repo")
