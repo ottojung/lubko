@@ -366,6 +366,35 @@ def status_commit_is(commit: str) -> Callable[[], bool]:
     return check
 
 
+def supervisor_status_is(
+    supervisor_pid: int,
+    commit: str,
+    generation: int,
+) -> bool:
+    """Return whether the exact supervisor has proven the requested worker.
+
+    Args:
+        supervisor_pid: Replacement supervisor process ID.
+        commit: Exact candidate commit.
+        generation: Candidate mission generation.
+
+    Returns:
+        ``True`` only when the current identity-bound snapshot is ready.
+    """
+    status = supervise.read_status()
+    recorded = supervise.read_supervisor_pid()
+    return bool(
+        status is not None
+        and recorded is not None
+        and recorded[0] == supervisor_pid
+        and status.supervisor_pid == supervisor_pid
+        and status.supervisor_start_time_ticks == recorded[1]
+        and status.applied_generation >= generation
+        and status.commit == commit
+        and status.ready is True
+    )
+
+
 def status_has_no_child() -> bool:
     """Return whether the supervisor currently owns no worker child.
 
@@ -849,6 +878,7 @@ def test_supervisor_takeover_stops_orphan_worker_by_exact_identity(
         first_proc.wait(timeout=5)
         guard.unregister(first_proc)
         assert process_alive(orphan_pid)
+        assert supervise.read_status() is None
 
         second_proc = start_supervisor(supervisor_env)
         try:
@@ -1296,15 +1326,20 @@ def test_supervisor_restart_resumes_pending_mission_candidate(
         first_candidate = worker_pid()
         assert first_candidate is not None
 
-    with running_supervisor(supervisor_env):
-        wait_until(lambda: worker_pid() is not None, timeout=30.0)
-        wait_until(status_ready, timeout=30.0)
+    with running_supervisor(supervisor_env) as replacement:
+        wait_until(
+            lambda: supervisor_status_is(replacement.pid, second, applied + 1),
+            timeout=30.0,
+        )
         resumed_pid = worker_pid()
         assert resumed_pid is not None
         assert resumed_pid != first_candidate
         status = supervise.read_status()
         assert status is not None
         assert status.commit == second
+        assert status.applied_generation >= applied + 1
+        assert status.ready is True
+        assert status.supervisor_pid == replacement.pid
         assert len(direct_children(status.supervisor_pid)) == 1
         write_rollback(
             mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
@@ -1409,6 +1444,76 @@ def test_migrate_from_stale_fake_state_then_supervisor_reconstructs(
 # ---------------------------------------------------------------------------
 # Unit-level decision and identity guarantees
 # ---------------------------------------------------------------------------
+
+
+def test_read_status_rejects_snapshot_without_supervisor_identity() -> None:
+    """A pre-identity status snapshot is never accepted as current."""
+    current = supervise.SupervisorStatus(
+        schema_version=supervise.SCHEMA_VERSION,
+        supervisor_pid=os.getpid(),
+        supervisor_start_time_ticks=supervise.proc_start_ticks(os.getpid()) or 1,
+        started_at=0.0,
+        applied_generation=1,
+        mode=supervise.MODE_RUN,
+        commit="1" * 40,
+        child=None,
+        intent=supervise.INTENT_RUN,
+        restart_count=0,
+        next_attempt_at=None,
+        last_exit=None,
+        mission=None,
+        db_ready=True,
+        ready=True,
+        message=None,
+    ).to_dict()
+    del current["supervisor_start_time_ticks"]
+    supervise.status_path().parent.mkdir(parents=True, exist_ok=True)
+    supervise.status_path().write_text(json.dumps(current) + "\n", encoding="utf-8")
+    supervise.write_supervisor_pid(os.getpid(), supervise.proc_start_ticks(os.getpid()) or 1)
+
+    assert supervise.read_status() is None
+
+
+def test_read_status_rejects_supervisor_pid_or_start_time_mismatch() -> None:
+    """A changed PID or start time cannot validate an old status snapshot."""
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "30"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    try:
+        ticks = supervise.proc_start_ticks(proc.pid)
+        assert ticks is not None
+        supervise.write_status(
+            supervise.SupervisorStatus(
+                schema_version=supervise.SCHEMA_VERSION,
+                supervisor_pid=proc.pid,
+                supervisor_start_time_ticks=ticks,
+                started_at=0.0,
+                applied_generation=1,
+                mode=supervise.MODE_RUN,
+                commit="1" * 40,
+                child=None,
+                intent=supervise.INTENT_RUN,
+                restart_count=0,
+                next_attempt_at=None,
+                last_exit=None,
+                mission=None,
+                db_ready=True,
+                ready=True,
+                message=None,
+            )
+        )
+        supervise.write_supervisor_pid(proc.pid + 1, ticks)
+        assert supervise.read_status() is None
+
+        supervise.write_supervisor_pid(proc.pid, ticks + 1)
+        assert supervise.read_status() is None
+    finally:
+        guard.teardown_tracked(fail_on_leak=False)
 
 
 def test_derive_action_fails_closed_on_corrupt_rollback(tmp_path: Path) -> None:

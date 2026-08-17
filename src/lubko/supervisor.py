@@ -311,6 +311,7 @@ class SupervisorDaemon:
         self._next_db_check_at = 0.0
         self._message: str | None = None
         self._ownership_fd: int | None = None
+        self._supervisor_start_time_ticks = 0
 
     def run(self) -> None:
         """Run the supervisor loop until a shutdown signal arrives.
@@ -1026,8 +1027,7 @@ class SupervisorDaemon:
         self._write_status("stopped")
         LOGGER.info("supervisor stopped")
 
-    @staticmethod
-    def _write_pidfile() -> None:
+    def _write_pidfile(self) -> None:
         """Record our exact identity, refusing to double-run a live daemon.
 
         The process-level ownership lock acquired in :meth:`run` already held
@@ -1037,6 +1037,7 @@ class SupervisorDaemon:
 
         Raises:
             SystemExit: If another live supervisor daemon is already running.
+            RuntimeError: If this process's exact start time is unavailable.
         """
         recorded = read_supervisor_pid()
         if recorded is not None and supervise.supervisor_running():
@@ -1046,7 +1047,12 @@ class SupervisorDaemon:
             )
             LOGGER.error(msg)
             raise SystemExit(1)
-        write_supervisor_pid(os.getpid(), proc_start_ticks(os.getpid()) or 0)
+        start_time_ticks = proc_start_ticks(os.getpid())
+        if start_time_ticks is None:
+            msg = "could not determine the supervisor's exact start time"
+            raise RuntimeError(msg)
+        self._supervisor_start_time_ticks = start_time_ticks
+        write_supervisor_pid(os.getpid(), start_time_ticks)
 
     def _write_status(self, message: str | None = None) -> None:
         """Publish the machine-readable status snapshot.
@@ -1075,6 +1081,7 @@ class SupervisorDaemon:
             SupervisorStatus(
                 schema_version=SCHEMA_VERSION,
                 supervisor_pid=os.getpid(),
+                supervisor_start_time_ticks=self._supervisor_start_time_ticks,
                 started_at=self._started_at,
                 applied_generation=state.applied_generation,
                 mode=state.mode,

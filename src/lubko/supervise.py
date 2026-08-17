@@ -260,6 +260,7 @@ class SupervisorStatus:
 
     schema_version: int
     supervisor_pid: int
+    supervisor_start_time_ticks: int
     started_at: float
     applied_generation: int
     mode: str
@@ -283,6 +284,7 @@ class SupervisorStatus:
         return {
             "schema_version": self.schema_version,
             "supervisor_pid": self.supervisor_pid,
+            "supervisor_start_time_ticks": self.supervisor_start_time_ticks,
             "started_at": self.started_at,
             "applied_generation": self.applied_generation,
             "mode": self.mode,
@@ -333,6 +335,7 @@ class SupervisorStatus:
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
             supervisor_pid=_optional_int(data.get("supervisor_pid")) or 0,
+            supervisor_start_time_ticks=_optional_int(data.get("supervisor_start_time_ticks")) or 0,
             started_at=_optional_float(data.get("started_at")) or 0.0,
             applied_generation=_optional_int(data.get("applied_generation")) or 0,
             mode=_optional_string(data.get("mode")) or MODE_IDLE,
@@ -598,16 +601,35 @@ def write_status(status: SupervisorStatus) -> None:
 
 
 def read_status() -> SupervisorStatus | None:
-    """Load the machine-readable status.
+    """Load status only when it belongs to the current live supervisor.
+
+    ``status.json`` survives a supervisor crash and is replaced only after the
+    new daemon has written its pidfile.  A snapshot is therefore not a
+    liveness proof by itself.  Require the snapshot identity to match the
+    recorded pidfile, verify that exact ``(pid, start_time_ticks)`` is still a
+    live supervisor, and confirm that the pidfile did not change while it was
+    being read.  A missing identity field deliberately fails closed as an old
+    snapshot.
 
     Returns:
-        The parsed status, or ``None`` when absent or malformed.
+        The parsed current status, or ``None`` when absent, malformed, stale,
+        or unverifiable.
     """
     data = _read_json(status_path())
     if data is None:
         return None
     status = SupervisorStatus.from_dict(data)
-    if status.schema_version != SCHEMA_VERSION:
+    recorded = read_supervisor_pid()
+    if status.schema_version != SCHEMA_VERSION or recorded is None:
+        return None
+    if (
+        status.supervisor_pid,
+        status.supervisor_start_time_ticks,
+    ) != recorded:
+        return None
+    if not _supervisor_identity_is_live(recorded):
+        return None
+    if read_supervisor_pid() != recorded:
         return None
     return status
 
@@ -893,14 +915,27 @@ def supervisor_running() -> bool:
     recorded = read_supervisor_pid()
     if recorded is None:
         return False
-    pid, ticks = recorded
-    if ticks == 0:
+    return _supervisor_identity_is_live(recorded)
+
+
+def _supervisor_identity_is_live(identity: tuple[int, int]) -> bool:
+    """Return whether an exact recorded supervisor identity is live.
+
+    Args:
+        identity: The recorded ``(pid, start_time_ticks)`` pair.
+
+    Returns:
+        ``True`` only for a non-zombie supervisor with the exact start time.
+    """
+    pid, ticks = identity
+    if pid <= 0 or ticks <= 0:
         return False
     if _process_is_zombie(pid):
         return False
     if proc_start_ticks(pid) != ticks:
         return False
-    return "lubko-supervisor" in _read_cmdline(pid) or "lubko.supervisor" in _read_cmdline(pid)
+    command_line = _read_cmdline(pid)
+    return "lubko-supervisor" in command_line or "lubko.supervisor" in command_line
 
 
 # ---------------------------------------------------------------------------
