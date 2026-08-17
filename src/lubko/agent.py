@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 Meta = dict[str, Any]
 
 # Implementation details (hidden from the user-facing interface).
-DEFAULT_MODEL: Final = "opencode-go/deepseek-v4-flash"
+DEFAULT_MODEL: Final = "opencode-go/mimo-v2.5"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
@@ -2214,7 +2214,7 @@ def _terminal_or_unknown(aid: str) -> bool:
 
 
 def _stale_running(aid: str) -> bool:
-    """Return whether the agent records a running process that is dead.
+    """Return whether an agent records a running process that is dead.
 
     Args:
         aid: Lubko agent ID.
@@ -2542,7 +2542,7 @@ class _ArgumentSpec:
 
 @dataclass(frozen=True, slots=True)
 class _SubcommandSpec:
-    """Specification for one subcommand."""
+    """Specification for one command line argument."""
 
     name: str
     help: str
