@@ -43,7 +43,7 @@ Meta = dict[str, Any]
 
 # Implementation details (hidden from the user-facing interface).
 DEFAULT_MODEL: Final = "opencode-go/deepseek-v4-flash"
-DEFAULT_VARIANT: Final = "high"
+DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
 STOP_REASONS: Final = frozenset({"stop", "kill"})
