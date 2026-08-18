@@ -14,6 +14,14 @@ default rather than an opt-in:
 - an ambient "production-like" sentinel state tree and live process are
   created once per session so the regressions can prove byte-for-byte that the
   suite never mutates ambient state and never signals an ambient process.
+
+Sentinel incarnation safety
+---------------------------
+
+``ambient_sentinel_alive`` verifies three independent properties of the
+sentinel process — PID liveness, start-time-in-clock-ticks match, and the
+lifecycle-token environment marker — so a reused PID after a crash can never
+be mistaken for the original sentinel incarnation.
 """
 
 from __future__ import annotations
@@ -46,25 +54,110 @@ AMBIENT_STATE_ROOT: Path | None = None
 # creates it.
 AMBIENT_SENTINEL_PID: int | None = None
 
+# Start time in clock ticks of the ambient sentinel, captured at spawn so
+# ``ambient_sentinel_alive`` can verify the same process incarnation survived
+# and not merely a PID-reused look-alike.
+AMBIENT_SENTINEL_START_TICKS: int | None = None
 
-def ambient_sentinel_alive() -> bool:
-    """Return whether the ambient sentinel live worker is still running.
+# The lifecycle token the sentinel carries in its environment, used as the
+# third incarnation-proof property.
+AMBIENT_SENTINEL_TOKEN: str | None = None
 
-    The sentinel is a real session/process-group leader that receives SIGTERM
-    (and dies on SIGTERM/SIGKILL) if any test helper ever signals it, so
-    liveness is a direct proof that no test signalled an ambient process.
+# /proc/stat field layout constants (same as lifecycle.py).
+_STAT_MIN_FIELDS: Final = 20
+_STAT_STARTTIME_FIELD_INDEX: Final = 19
+
+
+def proc_start_ticks(pid: int) -> int | None:
+    """Return a process start time in clock ticks, or ``None``.
+
+    The start time is unique per process on a given boot and survives PID
+    reuse, making it the reliable incarnation anchor.
+
+    Args:
+        pid: Process ID to inspect.
 
     Returns:
-        ``True`` when the sentinel process is still alive.
+        The start time in clock ticks, or ``None`` when unreadable.
+    """
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+    except OSError:
+        return None
+    close_paren = stat.rfind(b")")
+    if close_paren == -1:
+        return None
+    fields = stat[close_paren + 2 :].split()
+    if len(fields) < _STAT_MIN_FIELDS:
+        return None
+    try:
+        return int(fields[_STAT_STARTTIME_FIELD_INDEX])
+    except ValueError:
+        return None
+
+
+def _proc_has_token(pid: int, token: str) -> bool:
+    """Return whether a process environment carries the lifecycle token.
+
+    The ``/proc/<pid>/environ`` file contains NUL-separated
+    ``KEY=VALUE`` entries.  This function checks for an exact match of
+    ``LUBKO_LIFECYCLE_TOKEN=<token>`` among those entries so a substring
+    match against a different variable name (e.g. ``LUBKO_LIFECYCLE_TOKEN_OLD``)
+    is never accepted.
+
+    Args:
+        pid: Process ID to inspect.
+        token: Expected lifecycle token string.
+
+    Returns:
+        ``True`` when the exact token entry is present.
+    """
+    expected = f"LUBKO_LIFECYCLE_TOKEN={token}".encode()
+    try:
+        environ = (Path("/proc") / str(pid) / "environ").read_bytes()
+    except OSError:
+        return False
+    return expected in environ.split(b"\0")
+
+
+def ambient_sentinel_alive() -> bool:
+    """Return whether the ambient sentinel is still the original incarnation.
+
+    Three independent properties are verified so a reused PID after a crash
+    can never be mistaken for the sentinel:
+
+    1. PID is alive (``kill(pid, 0)`` succeeds).
+    2. Start time in clock ticks matches the value captured at spawn.
+    3. The lifecycle-token environment marker is present.
+
+    Once ``AMBIENT_SENTINEL_PID`` is set (sentinel was created), all three
+    identity fields — PID, start ticks, and token — must be non-``None``.
+    A missing tick or token value is treated as a failed incarnation check,
+    not as a skipped property.
+
+    Returns:
+        ``True`` when the sentinel is confirmed alive as the original
+        incarnation, or when no sentinel was ever created.
     """
     pid = AMBIENT_SENTINEL_PID
     if pid is None:
         return True
+    # All three identity fields must be present once PID is set.
+    expected_ticks = AMBIENT_SENTINEL_START_TICKS
+    expected_token = AMBIENT_SENTINEL_TOKEN
+    if expected_ticks is None or expected_token is None:
+        return False
+    # Property 1: PID liveness.
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    # Property 2: start-time incarnation anchor.
+    actual_ticks = proc_start_ticks(pid)
+    if actual_ticks is None or actual_ticks != expected_ticks:
+        return False
+    # Property 3: lifecycle-token environment marker (exact NUL-separated match).
+    return _proc_has_token(pid, expected_token)
 
 
 def assert_test_owned_state_root() -> Path:
