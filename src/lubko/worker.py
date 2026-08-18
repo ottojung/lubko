@@ -221,6 +221,7 @@ class ActiveJob:
     pid: int
     pgid: int
     started_mono: float
+    claimed_at: float
     stdout: OutputStream = field(init=False)
     stderr: OutputStream = field(init=False)
     completed: bool = False
@@ -1779,11 +1780,13 @@ class Supervisor:
         except psycopg.Error:
             LOGGER.exception("finalizing job %s failed", job.id)
             return False
+        duration_seconds = time.monotonic() - job.started_mono
         LOGGER.info(
-            "finished job %s with status %s and exit code %d",
+            "finished job %s with status %s exit_code=%d duration=%.3fs",
             job.id,
             final_status,
             result.exit_code,
+            duration_seconds,
         )
         self._last_completed_job_id = str(job.id)
         self._last_completed_at = time.time()
@@ -1868,6 +1871,7 @@ class Supervisor:
             pid=proc.pid,
             pgid=pgid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         job.stdout = OutputStream(path=stdout_path)
         job.stderr = OutputStream(path=stderr_path)
@@ -1941,7 +1945,7 @@ class Supervisor:
         if self.active:
             first_job = next(iter(self.active.values()))
             current_job_id = str(first_job.id)
-            current_job_started_at = first_job.started_mono
+            current_job_started_at = first_job.claimed_at
         return WorkerHealth(
             schema_version=1,
             worker_id=self.settings.worker_id,
@@ -1949,6 +1953,7 @@ class Supervisor:
             pid=os.getpid(),
             start_time_ticks=self._start_time_ticks,
             started_at=self._started_at,
+            published_at=time.time(),
             alive=alive,
             db_connected=self.conn is not None,
             db_connected_at=self._db_connected_at,

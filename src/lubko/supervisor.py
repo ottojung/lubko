@@ -718,9 +718,13 @@ class SupervisorDaemon:
         if not ready:
             self._record_not_ready(state, now, child.pid, reason)
             return
+        try:
+            publish_current_health_surface(child.token)
+            publish_current_log_surface(child.token)
+        except OSError:
+            self._record_not_ready(state, now, child.pid, "stable symlink publication failed")
+            return
         write_state(replace(state, ready=True, next_readiness_at=None))
-        publish_current_health_surface(child.token)
-        publish_current_log_surface(child.token)
         LOGGER.info("worker child pid=%d proven to consume the queue", child.pid)
         lifecycle.append_deploy_log(
             f"supervisor verified worker pid={child.pid} consumes the queue"
@@ -753,6 +757,12 @@ class SupervisorDaemon:
             return (
                 False,
                 f"snapshot ticks {snapshot.start_time_ticks} != child {child.start_time_ticks}",
+            )
+        if snapshot.worker_incarnation != child.token:
+            inc = snapshot.worker_incarnation
+            return (
+                False,
+                f"snapshot incarnation {inc!r} != child token {child.token!r}",
             )
         return True, "ok"
 
