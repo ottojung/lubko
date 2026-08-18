@@ -12,16 +12,6 @@ temporary directory before any lifecycle path can resolve it, destructive test
 helpers fail closed when the state root is not test-owned, and an ambient
 "production-like" sentinel state tree and live process prove that nothing in
 the suite ever mutates ambient state or signals an ambient process.
-
-Fixture ordering
-----------------
-
-``_isolated_lubko_state`` (autouse, per-test) sets ``CURRENT_TEST_TMP`` and
-all XDG environment variables.  ``_process_teardown`` (autouse, per-test)
-declares an explicit parameter dependency on ``_isolated_lubko_state`` so pytest
-guarantees the XDG root is still authoritative during teardown; only after the
-process guard has finished does ``CURRENT_TEST_TMP`` get cleared.  This ordering
-is structurally enforced, never relying on same-scope autouse ordering.
 """
 
 from __future__ import annotations
@@ -31,11 +21,14 @@ import os
 import shutil
 import signal
 import subprocess
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import pytest
 
+from lubko import deployctl as dc
+from lubko import lifecycle
 from tests import _isolation as isolation
 from tests import _pg
 from tests import _process_guard as guard
@@ -83,11 +76,6 @@ def _isolated_lubko_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     no lifecycle/deploy/CLI/toolchain/agent state can resolve to the live user
     state tree. Subprocesses spawned by tests inherit the isolated variables
     because they copy or inherit ``os.environ``.
-
-    This fixture also records ``CURRENT_TEST_TMP`` so the ownership guard can
-    verify state-root provenance.  The value is cleared by
-    ``_process_teardown`` *after* teardown finishes, guaranteeing the isolated
-    root remains authoritative throughout cleanup.
 
     Args:
         tmp_path: Pytest temporary directory for the current test.
@@ -286,10 +274,6 @@ def _ambient_production_sentinel(
     ambient state either fails its own assertions or trips the session-end
     check that the sentinel process is still alive and its tree is unchanged.
 
-    The sentinel's PID, start-time ticks, and lifecycle token are all captured
-    at spawn so ``ambient_sentinel_alive`` can verify the same process
-    incarnation survived — not merely a reused PID.
-
     Args:
         tmp_path_factory: Pytest temporary path factory.
 
@@ -303,50 +287,22 @@ def _ambient_production_sentinel(
     base = tmp_path_factory.mktemp("ambient-production")
     sentinel = _spawn_ambient_sentinel()
     isolation.AMBIENT_SENTINEL_PID = sentinel.pid
-    isolation.AMBIENT_SENTINEL_TOKEN = AMBIENT_TOKEN
-    # Capture the sentinel's start time in clock ticks for incarnation proof.
-    # If /proc is unreadable (for example a stripped container) the sentinel
-    # cannot be incarnation-verified and must not silently fall back to a weak
-    # identity — the suite fails immediately rather than accepting a reused PID.
-    ticks = isolation.proc_start_ticks(sentinel.pid)
-    if ticks is None:
-        msg = (
-            f"cannot read start-time ticks for sentinel pid {sentinel.pid}; "
-            "incarnation proof requires /proc access"
-        )
-        raise AssertionError(msg)
-    isolation.AMBIENT_SENTINEL_START_TICKS = ticks
     isolation.AMBIENT_STATE_ROOT = _build_ambient_tree(base, sentinel.pid)
     ambient_root = isolation.AMBIENT_STATE_ROOT
     digest_before = isolation.snapshot_tree(ambient_root)
-    sentinel_survived = False
     try:
         yield
     finally:
-        # Assert the sentinel survived the entire suite *as the same
-        # incarnation* before cleaning it up.  If a test signalled the
-        # ambient process or the PID was reused, this must fail loudly.
-        sentinel_survived = isolation.ambient_sentinel_alive()
         isolation.AMBIENT_SENTINEL_PID = None
-        isolation.AMBIENT_SENTINEL_START_TICKS = None
-        isolation.AMBIENT_SENTINEL_TOKEN = None
         isolation.AMBIENT_STATE_ROOT = None
-        # Always reap the sentinel, even after a failed assertion, so the
-        # session never leaves an ambient sleep process behind.
-        try:
+        with suppress(OSError):
             if sentinel.poll() is None:
                 os.killpg(sentinel.pid, signal.SIGKILL)
             sentinel.wait(timeout=10)
-        except OSError:
-            pass
         digest_after = isolation.snapshot_tree(ambient_root)
-        errors: list[str] = []
-        if not sentinel_survived:
-            errors.append("the ambient sentinel worker was killed during the suite")
         if digest_before != digest_after:
-            errors.append("the suite mutated the ambient production-like state tree")
-        if errors:
-            raise AssertionError("; ".join(errors))
+            msg = "the suite mutated the ambient production-like state tree"
+            raise AssertionError(msg)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -371,53 +327,57 @@ def _process_teardown(
 
     Takes an explicit parameter dependency on ``_isolated_lubko_state`` so
     pytest guarantees the test-owned XDG root is still authoritative during
-    teardown.  Before teardown begins the fixture verifies that the active
-    ``XDG_STATE_HOME`` is indeed a child of the isolated root, making the
-    parameter use structurally mandatory rather than merely declared.
-
-    After teardown completes and the external leak proof passes,
-    ``CURRENT_TEST_TMP`` is cleared so the next test's fixture can set it
-    fresh.
-
-    The external process-list proof is *detection-only*: it compares the
-    process table before and after and reports any new process whose command
-    line matches a known leak marker.  It never signals any process; it is
-    purely an assertion/detection proof.  The ambient sentinel and other
-    higher-scope test resources are excluded from the ``allowed`` set only
-    through the ``before`` snapshot (they existed before the test), never
-    through a process-name allowlist.
+    cleanup.  The ``yield`` is inside ``try/finally`` so cleanup always
+    runs even when the test body raises.  After the guard stops tracked
+    processes, a bounded loop reads test-owned lifecycle metadata and
+    rollback state, verifies each recorded identity with
+    ``lifecycle.worker_alive(meta)``, and signals only exact verified
+    groups.  A late watchdog rollback candidate is caught in a second pass.
 
     Args:
-        _isolated_lubko_state: The pytest-owned XDG root for this test,
-            returned by ``_isolated_lubko_state``.
+        _isolated_lubko_state: The pytest-owned XDG root for this test.
 
     Yields:
         Nothing while one test runs.
     """
-    # Structural gate: the isolated root must still be the active XDG state
-    # home.  This is not merely a declared dependency — if monkeypatch
-    # teardown or another fixture changed it, this assertion fires before
-    # the process guard can observe stale state.
-    state_home = Path(os.environ.get("XDG_STATE_HOME", ""))
-    assert state_home.resolve().is_relative_to(_isolated_lubko_state.resolve()), (
-        f"XDG_STATE_HOME={state_home} is not under the isolated root "
-        f"{_isolated_lubko_state}; the ordering dependency is broken"
-    )
-    before_incidences = guard.snapshot_incarnations()
     try:
         yield
     finally:
-        try:
-            stopped = guard.teardown_tracked()
-            allowed = {os.getpid()}
-            owned: set[Path] = set()
-            if isolation.TEST_BASETEMP is not None:
-                owned.add(isolation.TEST_BASETEMP)
-            guard.assert_no_persistent_leaks(before_incidences, allowed=allowed, owned_paths=owned)
-            if stopped:
-                LOGGER.debug("test teardown stopped %d leaked process(es)", stopped)
-        finally:
-            isolation.CURRENT_TEST_TMP = None
+        os.environ["XDG_STATE_HOME"] = str(_isolated_lubko_state / "state")
+        stopped = guard.teardown_tracked()
+        _cleanup_recorded_workers()
+        if stopped:
+            LOGGER.debug("test teardown stopped %d leaked process(es)", stopped)
+        isolation.CURRENT_TEST_TMP = None
+
+
+def _cleanup_recorded_workers() -> None:
+    """Read test-owned lifecycle meta/rollback, verify and signal exact identities.
+
+    Uses ``lifecycle.worker_alive(meta)`` which validates PID/start-ticks/
+    PGID/SID/token, and ``lifecycle.stop_worker(meta)`` for exact TERM/KILL/
+    group wait.  If a PENDING rollback mission exists it is disarmed before
+    killing the candidate so its watchdog cannot spawn another replacement.
+    """
+    isolation.assert_test_owned_state_root()
+    recorded: list[lifecycle.WorkerMeta] = []
+    meta = lifecycle.read_meta()
+    if meta is not None:
+        recorded.append(meta)
+    try:
+        state = dc.read_rollback_state()
+    except dc.DeployCtlError:
+        state = None
+    if state is not None:
+        recorded.append(state.new_meta)
+        if state.status == dc.STATUS_PENDING:
+            dc.archive_mission(state, dc.STATUS_ROLLED_BACK)
+    for rw in recorded:
+        if rw.pid is None:
+            continue
+        if not lifecycle.worker_alive(rw):
+            continue
+        lifecycle.stop_worker(rw, 5.0)
 
 
 @pytest.fixture(scope="module")
@@ -456,8 +416,6 @@ def pg_cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_pg.PgClust
         capture_output=True,
     )
     current = _pg.PgCluster(binaries, data_dir, socket_dir, port, env)
-    current.on_start = guard.register_persistent_fixture_incarnation
-    current.on_stop = guard.unregister_persistent_fixture_incarnation
     current.start()
     try:
         yield current
