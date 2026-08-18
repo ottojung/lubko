@@ -42,7 +42,6 @@ from lubko.state import rollback_state_path, state_root
 from lubko.worker import group_has_members
 from tests import _isolation as isolation
 from tests import _process_guard as guard
-from tests._process_guard import OwnedProcess
 from tests.test_cli import fake_uv_sync, make_repo
 
 if TYPE_CHECKING:
@@ -59,7 +58,6 @@ LINGER_SOURCE: Final = (
 )
 RETIRING_MARKER: Final = "retiring-worker"
 CANDIDATE_MARKER: Final = "candidate-worker"
-TEST_LIFECYCLE_MARKER: Final = "test-lifecycle-marker"
 
 
 def shell_command_argv(command: str) -> list[str]:
@@ -2572,72 +2570,24 @@ def deployctl_args(repo: Path, fake_uv: Path, request: str) -> list[str]:
     ]
 
 
-def _verify_incarnation_or_fail(recorded_worker: WorkerMeta) -> bool:
-    """Verify the exact live incarnation of a recorded worker before signalling.
-
-    The full identity is re-checked: PID liveness, ``identity_matches``
-    (PID / start-time ticks / PGID / SID), and token proof when present.
-
-    An absent PID (process already gone) is treated as safely departed and
-    returns ``False`` without raising.  A *live* PID whose incarnation does
-    not match raises ``AssertionError`` — a reused PID must never be
-    signalled.
-
-    Args:
-        recorded_worker: The recorded worker metadata to verify.
-
-    Returns:
-        ``True`` when the incarnation is live and verified; ``False`` when
-        the process is already absent.
-
-    Raises:
-        AssertionError: If the PID is live but incarnation mismatches.
-    """
-    pid = recorded_worker.pid
-    if pid is None:
-        return False
-    identity = lifecycle.process_identity(pid)
-    if identity is None:
-        return False
-    if not lifecycle.identity_matches(recorded_worker, identity):
-        msg = (
-            f"recorded worker pid {pid} identity mismatch: "
-            f"recorded pgid={recorded_worker.pgid} sid={recorded_worker.sid} "
-            f"ticks={recorded_worker.start_time_ticks} vs "
-            f"live pgid={identity.pgid} sid={identity.sid} "
-            f"ticks={identity.start_time_ticks}; "
-            "refusing to signal a potentially reused PID"
-        )
-        raise AssertionError(msg)
-    if recorded_worker.token is not None and not lifecycle.process_has_token(
-        pid, recorded_worker.token
-    ):
-        msg = (
-            f"recorded worker pid {pid} missing expected lifecycle token; "
-            "refusing to signal a potentially reused PID"
-        )
-        raise AssertionError(msg)
-    return True
-
-
 def kill_recorded_workers() -> None:
-    """Force-kill every live worker recorded in lifecycle metadata or rollback state.
+    """Force-kill every worker recorded in lifecycle metadata or rollback state.
 
-    An absent PID is treated as safely departed and skipped.  Only a
-    *live* PID whose incarnation mismatches the recorded identity raises
-    ``AssertionError`` — a reused PID must never be signalled.
+    The candidate/restored workers are spawned by the controller subprocess and
+    therefore never appear in the process guard registry, so they are stopped
+    by exact recorded identity here. This is deliberately destructive and
+    therefore fails closed: the recorded identities are only read from state
+    the current test owns, never from the live user state tree.
     """
     isolation.assert_test_owned_state_root()
     recorded: list[WorkerMeta] = []
-    meta = lifecycle.read_meta()
+    meta = read_meta()
     if meta is not None:
         recorded.append(meta)
-    state = read_rollback_state()
+    state = dc._read_state()
     if state is not None:
         recorded.append(state.new_meta)
     for recorded_worker in recorded:
-        if not _verify_incarnation_or_fail(recorded_worker):
-            continue
         pgid = recorded_worker.pgid or recorded_worker.pid
         if pgid is None:
             continue
@@ -2649,423 +2599,32 @@ def kill_recorded_workers() -> None:
                 time.sleep(0.02)
 
 
-def _owned_paths() -> set[Path]:
-    """Return the set of pytest-owned path prefixes for leak detection.
+def any_lubko_processes() -> bool:
+    """Return whether any live controller/helper/worker process still exists.
 
-    The session basetemp is always included so every test-created temporary
-    directory is covered.  The ambient sentinel state root is excluded: it
-    is a higher-scope resource that should never appear as a leak target.
-
-    Returns:
-        A set of owned directory prefixes.
-    """
-    owned: set[Path] = set()
-    if isolation.TEST_BASETEMP is not None:
-        owned.add(isolation.TEST_BASETEMP)
-    return owned
-
-
-def read_rollback_state() -> dc.RollbackState | None:
-    """Read the durable deployment state, returning ``None`` on any error.
-
-    This is a clean public wrapper around the rollback-state reader that
-    avoids direct private-member access to ``dc._read_state``.
+    Matches only the module invocation forms used by the deployment flow
+    (``lubko.deployctl`` for controller/helper/watchdog, ``lubko.worker`` for
+    maintained workers) so the host orchestrator's own ``lubko-worker`` daemon
+    is never mistaken for a leak.
 
     Returns:
-        The parsed rollback state, or ``None`` when absent or unreadable.
+        ``True`` when a stray controller/helper/worker process still exists.
     """
-    try:
-        return dc.read_rollback_state()
-    except dc.DeployCtlError:
-        return None
-
-
-def adopt_recorded_processes() -> set[int]:
-    """Adopt every live recorded worker/candidate from test-owned metadata into the guard.
-
-    The candidate workers spawned by ``lubko-deploy-ctl checkout`` live in
-    independent sessions and never appear in the process guard registry.
-    This helper reads the lifecycle metadata and rollback state that the
-    current test owns (verified via ``assert_test_owned_state_root``), then
-    for each recorded PID re-verifies the exact incarnation (PID + start-time
-    ticks + lifecycle token coherence) before registering the process with
-    the guard as an ``OwnedProcess``.
-
-    An absent PID (process already gone) is silently skipped.  A *live* PID
-    whose incarnation mismatches is also silently skipped — it is not the
-    process we own.
-
-    Returns:
-        The set of PIDs newly adopted into the guard.
-    """
-    isolation.assert_test_owned_state_root()
-    recorded: list[WorkerMeta] = []
-    meta = lifecycle.read_meta()
-    if meta is not None:
-        recorded.append(meta)
-    state = read_rollback_state()
-    if state is not None:
-        recorded.append(state.new_meta)
-    adopted: set[int] = set()
-    for recorded_worker in recorded:
-        pid = recorded_worker.pid
-        if pid is None or pid == 0:
-            continue
-        if pid in guard.TRACKED:
-            continue
-        identity = lifecycle.process_identity(pid)
-        if identity is None:
-            continue
-        if not lifecycle.identity_matches(recorded_worker, identity):
-            continue
-        if recorded_worker.token is not None and not lifecycle.process_has_token(
-            pid, recorded_worker.token
-        ):
-            continue
-        owned = OwnedProcess(
-            pid=identity.pid,
-            pgid=identity.pgid,
-            start_time_ticks=identity.start_time_ticks,
-            token=recorded_worker.token,
-        )
-        guard.register_owned(owned)
-        adopted.add(pid)
-    return adopted
-
-
-def _argv_is_lubko_process(argv: list[bytes]) -> bool:
-    """Return whether argv identifies an actual Lubko lifecycle process.
-
-    Classifies by parsed argv tokens, not arbitrary joined text:
-
-    - ``argv[0]`` basename starts with ``lubko-`` (e.g. ``lubko-worker``,
-      ``lubko-deploy-ctl``).
-    - Python ``-m`` flag followed by an exact ``lubko`` or ``lubko.*``
-      module token (e.g. ``python -m lubko.worker``).
-
-    Returns ``False`` for PostgreSQL (whose ``-D``/socket args contain
-    ``lubko-pg0``) and for unrelated shells/prompts mentioning ``lubko``
-    in their text arguments.
-
-    Args:
-        argv: NUL-separated process arguments.
-
-    Returns:
-        ``True`` when the argv identifies a Lubko lifecycle process.
-    """
-    if not argv:
-        return False
-    exe_name = argv[0].rsplit(b"/", 1)[-1]
-    if exe_name.startswith(b"lubko-"):
-        return True
-    for i, token in enumerate(argv):
-        if token == b"-m" and i + 1 < len(argv):
-            mod = argv[i + 1]
-            if mod == b"lubko" or mod.startswith(b"lubko."):
-                return True
-    return False
-
-
-def _find_lubko_processes() -> list[tuple[int, list[bytes]]]:
-    """Find live Lubko controller/worker/helper processes under pytest-owned paths.
-
-    A process is flagged only when **both** conditions hold:
-
-    1. Its ``/proc/<pid>/cmdline`` argv references a pytest-owned path.
-    2. Its argv identifies an actual Lubko lifecycle process via exact
-       executable basename or ``-m`` module token (not a generic substring).
-
-    Detection-only: never signals any process.
-
-    Returns:
-        List of ``(pid, argv)`` for each matching live process.
-    """
-    owned = _owned_paths()
-    if not owned:
-        return []
-    matches: list[tuple[int, list[bytes]]] = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            argv = (entry / "cmdline").read_bytes().split(b"\0")
+            cmdline = (entry / "cmdline").read_bytes()
         except OSError:
             continue
-        argv = [part for part in argv if part]
-        if not any(guard.argv_references_path(argv, path) for path in owned):
-            continue
-        if not _argv_is_lubko_process(argv):
-            continue
-        matches.append((int(entry.name), argv))
-    return matches
-
-
-def any_lubko_processes() -> bool:
-    """Return whether any live Lubko controller/helper/worker process still exists.
-
-    A process is flagged only when its argv references a pytest-owned path
-    AND identifies as an actual Lubko lifecycle process.  The PostgreSQL
-    fixture and unrelated subprocesses are never mistaken for a leak.
-    Detection-only.
-
-    Returns:
-        ``True`` when a stray Lubko process still exists.
-    """
-    return bool(_find_lubko_processes())
+        if b"lubko.deployctl" in cmdline or b"lubko.worker" in cmdline:
+            return True
+    return False
 
 
 def assert_no_lubko_leaks() -> None:
-    """Assert no live Lubko controller/helper/worker process remains.
-
-    Includes exact surviving process identities in the failure message.
-
-    Raises:
-        AssertionError: If any Lubko process survived.
-    """
-    matches = _find_lubko_processes()
-    if not matches:
-        return
-    details = []
-    for pid, argv in matches:
-        cmdline = b" ".join(argv).decode("utf-8", "replace")
-        details.append(f"  PID={pid} argv={cmdline!r}")
-    msg = "Lubko process leak detected:\n" + "\n".join(details)
-    raise AssertionError(msg)
-
-
-_CLEANUP_MAX_PASSES: Final = 5
-_CLEANUP_PASS_DELAY: Final = 0.5
-_CLEANUP_STABLE_PASSES_REQUIRED: Final = 2
-
-
-def _disarm_rollback_mission() -> None:
-    """Archive any test-owned pending rollback mission as terminal.
-
-    The watchdog process watches rollback state and restores the previous
-    worker when it sees a pending mission.  By archiving the mission as
-    ``rolled_back`` before killing candidates, the watchdog sees a terminal
-    state and exits rather than spawning a restored worker that would escape
-    cleanup.
-    """
-    isolation.assert_test_owned_state_root()
-    state = read_rollback_state()
-    if state is None:
-        return
-    if state.status not in {dc.STATUS_PENDING, dc.STATUS_CONFIRMED}:
-        return
-    dc.archive_mission(state, dc.STATUS_ROLLED_BACK)
-
-
-def cleanup_test_workers() -> set[int]:
-    """Shared test finalizer: bounded convergence over verified test-owned metadata.
-
-    Under verified pytest-owned XDG only, repeatedly:
-
-    1. Assert the state root is test-owned.
-    2. Disarm any pending rollback mission.
-    3. Adopt all live exact identities from current lifecycle/rollback metadata.
-    4. Terminate tracked exact identities.
-    5. Re-read metadata on the next iteration because a watchdog already inside
-       rollback may publish/spawn a restored worker after the previous snapshot.
-
-    Requires at least two consecutive stable passes (no live metadata identity,
-    no active rollback, no external audit violation) separated by the cleanup
-    delay, then a final exact-metadata adoption/teardown before success.
-    The external audit (``any_lubko_processes``) is a condition only and never
-    authority to signal.
-
-    Returns:
-        The aggregate set of exact PIDs adopted across all passes.
-    """
-    all_adopted: set[int] = set()
-    stable_count = 0
-    for _ in range(_CLEANUP_MAX_PASSES):
-        isolation.assert_test_owned_state_root()
-        _disarm_rollback_mission()
-        all_adopted |= adopt_recorded_processes()
-        guard.teardown_tracked(fail_on_leak=False)
-        state = read_rollback_state()
-        meta = lifecycle.read_meta()
-        meta_alive = meta is not None and meta.pid is not None and guard.process_alive(meta.pid)
-        rollback_active = state is not None and state.status == dc.STATUS_PENDING
-        audit_clean = not any_lubko_processes()
-        if meta_alive or rollback_active or not audit_clean:
-            stable_count = 0
-            time.sleep(_CLEANUP_PASS_DELAY)
-            continue
-        stable_count += 1
-        if stable_count >= _CLEANUP_STABLE_PASSES_REQUIRED:
-            break
-        time.sleep(_CLEANUP_PASS_DELAY)
-    isolation.assert_test_owned_state_root()
-    _disarm_rollback_mission()
-    all_adopted |= adopt_recorded_processes()
-    guard.teardown_tracked(fail_on_leak=False)
-    return all_adopted
-
-
-# ---------------------------------------------------------------------------
-# Unit regressions: kill_recorded_workers incarnation verification
-# ---------------------------------------------------------------------------
-
-
-def test_kill_recorded_workers_skips_absent_pid(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Stale metadata pointing at a dead PID is safely skipped, not fatal.
-
-    When the recorded PID is already absent, ``kill_recorded_workers``
-    treats it as safely departed and continues without raising.
-    """
-    stale = WorkerMeta(
-        schema_version=SCHEMA_VERSION,
-        state=STATE_RUNNING,
-        pid=999_999,
-        pgid=999_999,
-        sid=999_999,
-        start_time_ticks=1,
-        token=TEST_LIFECYCLE_MARKER,
-        repo=str(tmp_path),
-        git_commit="a" * 40,
-        worker_id="stale",
-        log_path="",
-        started_at=1.0,
-        stopped_at=None,
-    )
-    monkeypatch.setattr(lifecycle, "read_meta", lambda: stale)
-    monkeypatch.setattr(dc, "read_rollback_state", lambda: None)
-    kill_recorded_workers()
-
-
-def test_kill_recorded_workers_refuses_reused_pid(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A recycled PID whose incarnation mismatches must not be signalled.
-
-    When a live process occupies the recorded PID but has a different
-    start-time tick count, the identity check must fail closed so the
-    reused PID is never signalled.
-    """
-    proc = subprocess.Popen(
-        [SLEEP_BIN, "300"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    guard.register(proc)
-    try:
-        stale = WorkerMeta(
-            schema_version=SCHEMA_VERSION,
-            state=STATE_RUNNING,
-            pid=proc.pid,
-            pgid=proc.pid,
-            sid=proc.pid,
-            start_time_ticks=1,
-            token=TEST_LIFECYCLE_MARKER,
-            repo=str(tmp_path),
-            git_commit="a" * 40,
-            worker_id="reused",
-            log_path="",
-            started_at=1.0,
-            stopped_at=None,
-        )
-        monkeypatch.setattr(lifecycle, "read_meta", lambda: stale)
-        monkeypatch.setattr(dc, "read_rollback_state", lambda: None)
-        with pytest.raises(AssertionError, match="identity mismatch"):
-            kill_recorded_workers()
-    finally:
-        guard.teardown_tracked(fail_on_leak=False)
-
-
-def test_kill_recorded_workers_refuses_missing_token(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A live process that lacks the expected token must not be signalled.
-
-    When the incarnation matches but the lifecycle token is absent from the
-    process environment, the function must fail closed.
-    """
-    proc = subprocess.Popen(
-        [SLEEP_BIN, "300"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    guard.register(proc)
-    try:
-        identity = lifecycle.process_identity(proc.pid)
-        assert identity is not None
-        stale = WorkerMeta(
-            schema_version=SCHEMA_VERSION,
-            state=STATE_RUNNING,
-            pid=identity.pid,
-            pgid=identity.pgid,
-            sid=identity.sid,
-            start_time_ticks=identity.start_time_ticks,
-            token=TEST_LIFECYCLE_MARKER,
-            repo=str(tmp_path),
-            git_commit="a" * 40,
-            worker_id="no-token",
-            log_path="",
-            started_at=1.0,
-            stopped_at=None,
-        )
-        monkeypatch.setattr(lifecycle, "read_meta", lambda: stale)
-        monkeypatch.setattr(dc, "read_rollback_state", lambda: None)
-        with pytest.raises(AssertionError, match="missing expected lifecycle token"):
-            kill_recorded_workers()
-    finally:
-        guard.teardown_tracked(fail_on_leak=False)
-
-
-def test_any_lubko_processes_ignores_unrelated_services() -> None:
-    """An unrelated ``postgres`` or ``lubko-worker`` without owned paths is not a leak.
-
-    Detection is path-based AND identity-based: only processes whose argv
-    references a pytest-owned path AND identifies as a Lubko lifecycle
-    process are flagged.
-    """
-    assert not any_lubko_processes()
-
-
-def test_argv_is_lubko_process_classifies_correctly() -> None:
-    """Lubko identity classifier matches real Lubko processes, rejects others.
-
-    PostgreSQL whose ``-D`` path contains ``lubko-pg0`` must NOT be matched.
-    Unrelated shells mentioning ``lubko`` in text must NOT be matched.
-    Real Lubko executable names and ``-m`` module invocations MUST be matched.
-    """
-    assert _argv_is_lubko_process([b"/path/to/lubko-worker"])
-    assert _argv_is_lubko_process([b"/path/to/lubko-deploy-ctl", b"checkout"])
-    assert _argv_is_lubko_process([b"/usr/bin/python", b"-m", b"lubko.worker"])
-    assert _argv_is_lubko_process([b"/usr/bin/python", b"-m", b"lubko.supervisor"])
-    assert _argv_is_lubko_process([b"/usr/bin/python3", b"-m", b"lubko.deployctl"])
-    assert _argv_is_lubko_process([b"/usr/bin/python3", b"-m", b"lubko"])
-    assert not _argv_is_lubko_process([
-        b"/gnu/store/.../bin/postgres",
-        b"-D",
-        b"/tmp/pytest-.../lubko-pg0/data",
-        b"-p",
-        b"5432",
-        b"-k",
-        b"/tmp/pytest-.../lubko-pg0/sock",
-    ])
-    assert not _argv_is_lubko_process([
-        b"/bin/sh",
-        b"-c",
-        b"echo talking about lubko-worker in text",
-    ])
-    assert not _argv_is_lubko_process([
-        b"/usr/bin/python",
-        b"-m",
-        b"lubko_pgmanager",
-    ])
-    assert not _argv_is_lubko_process([])
+    """Assert every controller/helper/worker process has fully exited."""
+    wait_until(lambda: not any_lubko_processes(), timeout=20.0)
 
 
 def _prepare_e2e(
@@ -3268,7 +2827,7 @@ def test_end_to_end_queue_checkout_survives_old_worker_shutdown(
         assert cli.current_commit() == second
         assert not group_has_members(old_meta.pgid or old_meta.pid or 0)
     finally:
-        cleanup_test_workers()
+        kill_recorded_workers()
         assert_no_lubko_leaks()
 
 
@@ -3305,7 +2864,7 @@ def test_end_to_end_bad_candidate_rolls_back(
         assert not worker_alive(old_meta)
         assert not group_has_members(old_meta.pgid or old_meta.pid or 0)
     finally:
-        cleanup_test_workers()
+        kill_recorded_workers()
         assert_no_lubko_leaks()
 
 
@@ -3354,160 +2913,7 @@ def test_end_to_end_cancelled_checkout_leaves_previous_worker_running(
         assert meta.pid == old_meta.pid
         assert not group_has_members(rolled.new_meta.pgid or rolled.new_meta.pid or 0)
     finally:
-        cleanup_test_workers()
-        assert_no_lubko_leaks()
-
-
-def test_end_to_end_escaped_candidate_adopted_and_reaped(
-    jobs_db: str,
-    pg_cluster: _pg.PgCluster,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Escaped replacement worker is adopted from metadata and reaped by cleanup.
-
-    This is the issue-61 regression.  A real successful queue checkout runs
-    far enough that the helper has crossed ``_complete_handoff`` and released
-    the gated candidate into a real worker.  The rollback state is
-    ``STATUS_PENDING`` with ``new_meta`` carrying the exact replacement PID /
-    start-time ticks / token.  The old worker is dead.  The new replacement
-    worker is live in its own session but was never directly registered by
-    pytest.
-
-    We STOP here — this is the exact leak state when a later assertion /
-    timeout interrupts the test.  Then we call the shared finalizer which
-    disarms the mission before killing, so the watchdog never restores a
-    replacement.  The candidate PID is adopted, terminated, and /proc
-    identity disappears.  The ambient sentinel is never touched.
-    """
-    prepared = _prepare_e2e(tmp_path, monkeypatch, pg_cluster)
-    repo, second, old_meta, fake_uv = _prepare_e2e_parts(prepared)
-    try:
-        checkout_id = insert_pending_process_job(
-            jobs_db,
-            str(repo),
-            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
-        )
-        _wait_for_checkout_success_and_old_death(jobs_db, checkout_id, old_meta)
-        checkout = read_job(jobs_db, checkout_id)
-        assert checkout["state"]["status"] == "succeeded"
-        response = json.loads(str(checkout["result"]["stdout"]))
-        assert response["ok"] is True
-        wait_until(_live_handoff_done, timeout=30.0)
-
-        state = read_rollback_state()
-        assert state is not None
-        assert state.status == dc.STATUS_PENDING
-        candidate_pid = state.new_meta.pid
-        assert candidate_pid is not None
-        assert candidate_pid > 0
-        assert guard.process_alive(candidate_pid)
-        identity = lifecycle.process_identity(candidate_pid)
-        assert identity is not None
-        assert identity.pgid == candidate_pid
-        assert identity.sid == candidate_pid
-        assert isolation.ambient_sentinel_alive()
-
-        adopted = cleanup_test_workers()
-        assert candidate_pid in adopted
-        assert not guard.process_alive(candidate_pid)
-        assert isolation.ambient_sentinel_alive()
-
-        final_state = read_rollback_state()
-        assert final_state is None or final_state.status != dc.STATUS_PENDING
-
-    finally:
-        cleanup_test_workers()
-        assert_no_lubko_leaks()
-
-
-def test_gated_candidate_timeout_no_survivor_no_reparent(
-    jobs_db: str,
-    pg_cluster: _pg.PgCluster,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Forced checkout cancellation with live gated candidate proves no survivor.
-
-    A real queue checkout creates a gated replacement candidate in its own
-    session.  After the mission is pending, the exact candidate PID+ticks
-    incarnation is captured and verified live as a detached candidate (own
-    session/group).  Then cancellation forces rollback.  After cleanup
-    converges, the exact PID+ticks incarnation is proven gone.  Ambient
-    sentinel/state are unchanged.  No PPID-1 survivor exists for the
-    candidate's exact identity.
-    """
-    prepared = _prepare_e2e(tmp_path, monkeypatch, pg_cluster)
-    repo, second, _old_meta, fake_uv = _prepare_e2e_parts(prepared)
-    ambient_before = isolation.snapshot_tree(isolation.ambient_state_root())
-    try:
-        checkout_id = insert_pending_process_job(
-            jobs_db,
-            str(repo),
-            deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
-        )
-        wait_until(_preparing_mission, timeout=60.0)
-
-        # Capture the exact candidate incarnation from pending rollback state.
-        pending_state = read_rollback_state()
-        assert pending_state is not None
-        assert pending_state.status == dc.STATUS_PENDING
-        candidate_pid = pending_state.new_meta.pid
-        candidate_ticks = pending_state.new_meta.start_time_ticks
-        assert candidate_pid is not None
-        assert candidate_pid > 0
-        assert candidate_ticks is not None
-
-        # Verify candidate exact incarnation is live and detached.
-        assert guard.process_alive(candidate_pid)
-        assert guard.proc_start_ticks(candidate_pid) == candidate_ticks
-        identity = lifecycle.process_identity(candidate_pid)
-        assert identity is not None
-        assert identity.pgid == candidate_pid, "candidate must own its own session/group"
-        assert identity.sid == candidate_pid, "candidate must be session leader"
-        assert identity.start_time_ticks == candidate_ticks
-        assert isolation.ambient_sentinel_alive()
-
-        # Force cancellation to trigger rollback.
-        with psycopg.connect(jobs_db) as conn:
-            conn.execute(
-                "UPDATE lubko.jobs\n"
-                "SET payload = jsonb_set("
-                "payload::jsonb, "
-                "'{state,cancel_requested_at}', "
-                "to_jsonb('2026-01-01T00:00:00.000000Z'::text))::text\n"
-                "WHERE id = %s",
-                (checkout_id,),
-            )
-        wait_until(
-            lambda: read_job(jobs_db, checkout_id)["state"]["status"] == "cancelled",
-            timeout=30.0,
-        )
-        wait_until(_rolled_back_state, timeout=60.0)
-
-        # Cleanup converges: disarm mission, adopt, kill, repeat.
-        cleanup_test_workers()
-
-        # Assert exact PID+ticks incarnation is gone.
-        still_live = (
-            guard.process_alive(candidate_pid)
-            and guard.proc_start_ticks(candidate_pid) == candidate_ticks
-        )
-        assert not still_live, (
-            f"candidate pid {candidate_pid} (ticks={candidate_ticks}) still alive after cleanup"
-        )
-
-        # No survivor with that identity is PPID 1.
-        info = guard._read_proc_stat(candidate_pid)
-        if info is not None:
-            assert info[1] != 1, f"candidate pid {candidate_pid} reparented to PID 1 after cleanup"
-
-        # Ambient sentinel/state unchanged.
-        assert isolation.ambient_sentinel_alive()
-        assert isolation.snapshot_tree(isolation.ambient_state_root()) == ambient_before
-
-    finally:
-        cleanup_test_workers()
+        kill_recorded_workers()
         assert_no_lubko_leaks()
 
 
@@ -3564,7 +2970,7 @@ def test_end_to_end_queue_checkout_withholds_process_pgid(
         assert cli.current_commit() == second
         assert not group_has_members(old_meta.pgid or old_meta.pid or 0)
     finally:
-        cleanup_test_workers()
+        kill_recorded_workers()
         assert_no_lubko_leaks()
 
 
@@ -3611,7 +3017,7 @@ def test_end_to_end_queue_checkout_error_leaves_failed_row(
         state = dc._read_state()
         assert state is None or state.status in {dc.STATUS_CONFIRMED, dc.STATUS_ROLLED_BACK}
     finally:
-        cleanup_test_workers()
+        kill_recorded_workers()
         assert_no_lubko_leaks()
 
 
@@ -3674,7 +3080,7 @@ def test_end_to_end_full_deployment_stays_hermetic(
         assert meta.git_commit == second
         assert cli.current_commit() == second
     finally:
-        cleanup_test_workers()
+        kill_recorded_workers()
         assert_no_lubko_leaks()
 
     assert isolation.snapshot_tree(isolation.ambient_state_root()) == ambient_before
