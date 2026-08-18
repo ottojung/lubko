@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
-ROLLBACK_SCHEMA_VERSION: Final = 2
+ROLLBACK_SCHEMA_VERSION: Final = 3
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
@@ -140,6 +140,7 @@ class RollbackState:
     previous_retiring: bool
     previous_meta: WorkerMeta
     new_meta: WorkerMeta
+    supervisor_owned: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize durable rollback state.
@@ -162,6 +163,7 @@ class RollbackState:
             "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
             "new_meta": self.new_meta.to_dict(),
+            "supervisor_owned": self.supervisor_owned,
         }
 
     @classmethod
@@ -200,6 +202,7 @@ class RollbackState:
                 previous_retiring=data.get("previous_retiring", False) is True,
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
+                supervisor_owned=_optional_bool(data.get("supervisor_owned")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervised deployment state is malformed"
@@ -225,6 +228,23 @@ def _optional_string(value: object | None) -> str | None:
         The string, or ``None``.
     """
     return value if isinstance(value, str) else None
+
+
+def _optional_bool(value: object | None) -> bool | None:
+    """Return a boolean value or ``None`` when absent.
+
+    ``None`` signals unknown lifecycle authority: the caller must fail closed
+    rather than granting legacy rollback permission.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        ``True``, ``False``, or ``None`` when the key is absent.
+    """
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 def _write_state(state: RollbackState) -> None:
@@ -329,19 +349,22 @@ def _supervised_mission_active(state: RollbackState) -> bool:
 
     In supervised mode the candidate identity lives in the supervisor's durable
     state, so a mission is active exactly when the supervisor tracks that exact
-    candidate commit as its live child at or after the mission generation.
+    candidate commit as its live child at or after the mission generation.  The
+    recorded child identity is independently verified: a stale ``state.json``
+    left by a hard-killed supervisor must not be mistaken for a live candidate.
 
     Args:
         state: Pending supervised-deployment mission.
 
     Returns:
-        ``True`` when the supervisor owns a live worker for ``state.commit``
-        that it began under this mission generation.
+        ``True`` when the supervisor owns a proven-live worker for
+        ``state.commit`` that it began under this mission generation.
     """
     supervisor_state = supervise.read_state()
     return (
         supervisor_state.commit == state.commit
         and supervisor_state.child is not None
+        and supervise.child_alive(supervisor_state.child)
         and supervisor_state.applied_generation >= state.generation
     )
 
@@ -1097,9 +1120,21 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
         if state is None or state.status in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
             return
         if supervise.supervisor_running():
+            # While the supervisor is present, candidate liveness is a separate
+            # observation: only roll back after the deadline AND the exact child
+            # is no longer proven live.  A stale state.json child must not count
+            # as live.
             should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
                 state
             )
+        elif state.supervisor_owned is not False:
+            # Pending supervised missions and missions with unknown lifecycle
+            # authority must never enter the legacy direct rollback/worker
+            # lifecycle.  If the supervisor is temporarily absent, fail closed
+            # and leave the durable mission and desired generation untouched for
+            # the next supervisor incarnation.  ``None`` (unknown authority)
+            # fails closed identically to ``True``.
+            should_rollback = False
         else:
             should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
         if should_rollback:
@@ -1301,6 +1336,7 @@ def _prepare_locked(
         previous_retiring=False,
         previous_meta=previous,
         new_meta=new_meta,
+        supervisor_owned=supervised,
     )
     if not supervised:
         _publish_legacy_mission(state, gated, options.lock_timeout_seconds)
