@@ -69,6 +69,7 @@ from lubko.health import (
     WorkerHealth,
     configure_worker_logging,
     install_worker_exception_hooks,
+    interpret_worker_health,
     proc_start_ticks,
     read_worker_health,
     worker_under_lifecycle,
@@ -2023,6 +2024,7 @@ class Supervisor:
             raise
         self.conn = conn
         self._db_connected_at = time.time()
+        LOGGER.info("database connection established")
         self._publish_health_force()
 
     def _enter_outage(self) -> None:
@@ -2302,7 +2304,12 @@ def main(argv: list[str] | None = None) -> int:
         if snapshot is None:
             sys.stdout.write("worker: no health snapshot\n")
             return 1
-        sys.stdout.write(json.dumps(snapshot.to_dict(), sort_keys=True, indent=2) + "\n")
+        effective = interpret_worker_health(snapshot)
+        output = snapshot.to_dict()
+        output["_effective_live"] = effective.live
+        output["_effective_stale"] = effective.stale
+        output["_effective_reason"] = effective.reason
+        sys.stdout.write(json.dumps(output, sort_keys=True, indent=2) + "\n")
         return 0
 
     try:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -46,6 +47,29 @@ WORKER_LOG_MAX_BYTES: Final = 2 * 1024 * 1024  # 2 MiB per file
 WORKER_LOG_BACKUP_COUNT: Final = 3
 
 LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
+
+#: Regex matching safe filename components (hex tokens, alphanumerics, hyphens).
+_SAFE_FILENAME_RE: Final = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def validate_incarnation_token(token: str) -> None:
+    """Validate that a lifecycle incarnation token is safe for use in filenames.
+
+    The token is embedded in per-incarnation health and log file paths, so it
+    must contain only characters that are safe across all platforms.
+
+    Args:
+        token: The incarnation token to validate.
+
+    Raises:
+        ValueError: If the token contains unsafe characters.
+    """
+    if not token:
+        msg = "incarnation token must not be empty"
+        raise ValueError(msg)
+    if not _SAFE_FILENAME_RE.match(token):
+        msg = f"incarnation token contains unsafe characters: {token!r}"
+        raise ValueError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +284,7 @@ def write_worker_health(health: WorkerHealth) -> None:
     Args:
         health: Health snapshot to store.
     """
+    validate_incarnation_token(health.worker_incarnation)
     inc_path = health_incarnation_path(health.worker_incarnation)
     inc_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -283,36 +308,62 @@ def write_worker_health(health: WorkerHealth) -> None:
 # ---------------------------------------------------------------------------
 
 
-def publish_current_health_surface(incarnation: str) -> None:
-    """Update the stable ``health.json`` symlink to point at an incarnation.
+def publish_current_surfaces(incarnation: str) -> None:
+    """Update both stable symlinks atomically; roll back on second failure.
 
-    This is the **sole** place the stable symlink is ever written.  The
-    supervisor calls this only after matching the exact child PID, start-time
-    ticks, incarnation identifier, and queue-readiness — so a retiring old
-    worker or a stale candidate can never move the symlink.
-
-    Args:
-        incarnation: The confirmed incarnation whose snapshot is current.
-    """
-    symlink = health_current_path()
-    symlink.parent.mkdir(parents=True, exist_ok=True)
-    target_name = str(Path(HEALTH_DIR) / f"health-{incarnation}.json")
-    _atomic_symlink_update(symlink, target_name)
-
-
-def publish_current_log_surface(incarnation: str) -> None:
-    """Update the stable ``worker.log`` symlink to point at an incarnation.
-
-    This is the **sole** place the stable log symlink is ever written.
-    Same contract as :func:`publish_current_health_surface`.
+    The health and log symlinks are updated in sequence.  If the second
+    symlink fails, the first is rolled back to its previous target (or
+    removed if it did not exist), so a partial publication never leaves the
+    read surface in an inconsistent state.
 
     Args:
-        incarnation: The confirmed incarnation whose log is current.
+        incarnation: The confirmed incarnation whose files are current.
+
+    Raises:
+        OSError: If either symlink update fails (after rollback).
     """
-    symlink = worker_log_current_path()
-    symlink.parent.mkdir(parents=True, exist_ok=True)
-    target_name = str(Path(LOGS_DIR) / f"worker-{incarnation}.log")
-    _atomic_symlink_update(symlink, target_name)
+    validate_incarnation_token(incarnation)
+    health_symlink = health_current_path()
+    health_symlink.parent.mkdir(parents=True, exist_ok=True)
+    health_target = str(Path(HEALTH_DIR) / f"health-{incarnation}.json")
+    old_health_target = _read_symlink_target(health_symlink)
+    _atomic_symlink_update(health_symlink, health_target)
+    try:
+        log_symlink = worker_log_current_path()
+        log_symlink.parent.mkdir(parents=True, exist_ok=True)
+        log_target = str(Path(LOGS_DIR) / f"worker-{incarnation}.log")
+        _atomic_symlink_update(log_symlink, log_target)
+    except OSError:
+        _rollback_symlink(health_symlink, old_health_target)
+        raise
+
+
+def _read_symlink_target(symlink: Path) -> str | None:
+    """Read the current target of a symlink, or ``None`` if absent.
+
+    Args:
+        symlink: The symlink path.
+
+    Returns:
+        The symlink target name, or ``None``.
+    """
+    try:
+        return str(symlink.readlink())
+    except OSError:
+        return None
+
+
+def _rollback_symlink(symlink: Path, old_target: str | None) -> None:
+    """Roll back a symlink to its previous target or remove it.
+
+    Args:
+        symlink: The symlink to roll back.
+        old_target: The previous target, or ``None`` to remove.
+    """
+    if old_target is None:
+        symlink.unlink(missing_ok=True)
+    else:
+        _atomic_symlink_update(symlink, old_target)
 
 
 def _atomic_symlink_update(symlink: Path, target_name: str) -> None:
@@ -570,11 +621,13 @@ def proc_start_ticks(pid: int) -> int | None:
 
 
 def configure_worker_logging(incarnation: str) -> logging.Logger:
-    """Configure the root logger with a per-incarnation ``RotatingFileHandler``.
+    """Configure the ``lubko.worker`` logger with a per-incarnation handler.
 
     The handler writes to a per-incarnation log file so two overlapping
-    workers never share a log file.  The supervisor later publishes a stable
-    ``worker.log`` symlink pointing to the confirmed incarnation's log.
+    workers never share a log file.  The handler is attached to the
+    ``lubko.worker`` logger (not the root logger), so unrelated library
+    loggers cannot leak sentinel secrets or operational noise into the
+    worker log.
 
     This is the **only** place a ``RotatingFileHandler`` for any worker log
     is created in the worker process: the parent process (supervisor,
@@ -587,6 +640,7 @@ def configure_worker_logging(incarnation: str) -> logging.Logger:
     Returns:
         The configured ``lubko.worker`` logger.
     """
+    validate_incarnation_token(incarnation)
     log_path = worker_log_incarnation_path(incarnation)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(
@@ -596,10 +650,10 @@ def configure_worker_logging(incarnation: str) -> logging.Logger:
         encoding="utf-8",
     )
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(handler)
-    return logging.getLogger("lubko.worker")
+    logger = logging.getLogger("lubko.worker")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    return logger
 
 
 def install_worker_exception_hooks() -> None:

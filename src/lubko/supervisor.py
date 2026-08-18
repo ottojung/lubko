@@ -77,8 +77,7 @@ from typing import TYPE_CHECKING, Final
 
 from lubko import cli, deployctl, lifecycle, supervise
 from lubko.health import (
-    publish_current_health_surface,
-    publish_current_log_surface,
+    publish_current_surfaces,
     read_worker_health,
     read_worker_health_by_incarnation,
     worker_health_payload,
@@ -719,8 +718,7 @@ class SupervisorDaemon:
             self._record_not_ready(state, now, child.pid, reason)
             return
         try:
-            publish_current_health_surface(child.token)
-            publish_current_log_surface(child.token)
+            publish_current_surfaces(child.token)
         except OSError:
             self._record_not_ready(state, now, child.pid, "stable symlink publication failed")
             return
