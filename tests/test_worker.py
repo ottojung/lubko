@@ -43,6 +43,7 @@ from lubko.worker import (
     request_cancel,
     request_group_reap,
     request_stop,
+    sanitize_for_postgres,
     signal_kill,
     spawn_job,
     stream_size,
@@ -103,6 +104,8 @@ class _RecordingConnection:
     def __init__(self) -> None:
         self.executions: list[tuple[str, object | None]] = []
         self.rows: list[object] = []
+        self.broken: bool = False
+        self.closed: bool = False
 
     def cursor(self, **_kwargs: object) -> "_RecordingCursor":
         return _RecordingCursor(self)
@@ -923,8 +926,456 @@ def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
     finally:
         if proc.poll() is None:
             with suppress(ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Issue #94: PostgreSQL-safe output — regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_for_postgres_replaces_nul() -> None:
+    """NUL bytes are replaced with U+FFFD by the canonical sanitizer."""
+    assert sanitize_for_postgres("before\x00after") == "before\ufffdafter"
+    assert sanitize_for_postgres("\x00") == "\ufffd"
+    assert sanitize_for_postgres("no\x00n\x00ul\x00s") == "no\ufffdn\ufffdul\ufffds"
+
+
+def test_sanitize_for_postgres_preserves_valid_text() -> None:
+    """Valid UTF-8 text without NUL is returned unchanged."""
+    assert sanitize_for_postgres("hello\n") == "hello\n"
+    assert not sanitize_for_postgres("")
+
+
+def test_sanitize_for_postgres_preserves_replacement_char() -> None:
+    """Existing U+FFFD (from invalid UTF-8 replacement) is preserved."""
+    assert sanitize_for_postgres("before\ufffdafter") == "before\ufffdafter"
+
+
+def test_truncate_output_sanitizes_nul() -> None:
+    """truncate_output applies NUL sanitization before returning."""
+    data = b"before\x00after"
+    result = truncate_output(data, 128)
+    assert "\x00" not in result
+    assert "before" in result
+    assert "after" in result
+    assert "\ufffd" in result
+
+
+def test_output_window_text_sanitizes_nul(tmp_path: Path) -> None:
+    """output_window_text replaces NUL in the live tail."""
+    cap = tmp_path / "stdout.cap"
+    cap.write_bytes(b"before\x00after")
+    text, start, end = worker.output_window_text(cap, 4096)
+    assert "\x00" not in text
+    assert "before" in text
+    assert "after" in text
+    assert "\ufffd" in text
+    assert start == 0
+    assert end == len(b"before\x00after")
+
+
+def test_decode_range_sanitizes_nul(tmp_path: Path) -> None:
+    """decode_range replaces NUL in the decoded text."""
+    cap = tmp_path / "stdout.cap"
+    cap.write_bytes(b"a\x00b\x00c")
+    text = worker.decode_range(cap, 0, 5)
+    assert text == "a\ufffdb\ufffdc"
+
+
+def test_output_window_text_offsets_preserved_with_nul(tmp_path: Path) -> None:
+    """Byte offsets remain correct across NUL sanitization."""
+    cap = tmp_path / "stdout.cap"
+    cap.write_bytes(b"xx\x00yy\x00zz")
+    text, start, end = worker.output_window_text(cap, 4096)
+    assert start == 0
+    assert end == 8  # file size in bytes
+    assert text == "xx\ufffdyy\ufffdzz"
+    # NUL is 1 byte -> 1 decoded char -> 1 replacement char; total 8 chars
+    assert len(text) == 8
+
+
+def test_publish_output_nul_in_live_tail(
+    tmp_path: Path,
+) -> None:
+    """NUL in the live tail is sanitized before PostgreSQL persistence."""
+    job = make_active_job(tmp_path)
+    job.stdout.path.write_bytes(b"before\x00after")
+    conn = _RecordingConnection()
+    _queue_root(conn, job.id)
+
+    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    assert "\x00" not in job.stdout.tail_text
+    assert "before" in job.stdout.tail_text
+    assert "after" in job.stdout.tail_text
+    assert "\ufffd" in job.stdout.tail_text
+    updates = [(sql, params) for sql, params in conn.executions if sql.startswith("UPDATE")]
+    assert len(updates) == 1
+    _, params = updates[0]
+    assert isinstance(params, dict)
+    window = json.loads(cast("str", params["output"]))["stdout"]
+    assert "\x00" not in window["tail"]
+    assert "\ufffd" in window["tail"]
+
+
+def test_publish_output_nul_in_stderr(tmp_path: Path) -> None:
+    """NUL in stderr is sanitized before persistence."""
+    job = make_active_job(tmp_path)
+    job.stderr.path.write_bytes(b"err\x00or")
+    conn = _RecordingConnection()
+    _queue_root(conn, job.id)
+
+    publish_output(
+        as_db(conn),
+        job,
+        ["stderr"],
+        time.monotonic(),
+        force=True,
+    )
+
+    assert "\x00" not in job.stderr.tail_text
+    assert "err" in job.stderr.tail_text
+    assert "or" in job.stderr.tail_text
+    assert "\ufffd" in job.stderr.tail_text
+
+
+def test_publish_output_nul_in_immutable_chunk(tmp_path: Path) -> None:
+    """NUL in data old enough to become an immutable chunk is sanitized."""
+    job = make_active_job(tmp_path)
+    nul_region = b"chunk\x00data"
+    tail_region = b"t" * 3000
+    job.stdout.path.write_bytes(nul_region + b"x" * 2000 + tail_region)
+    conn = _RecordingConnection()
+    _queue_root(conn, job.id)
+
+    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    inserts = [(sql, params) for sql, params in conn.executions if sql.startswith("INSERT")]
+    assert len(inserts) >= 1
+    for _sql, params in inserts:
+        assert isinstance(params, tuple)
+        chunk = parse_chunk_payload(params[1])
+        assert "\x00" not in chunk.value
+        if chunk.start < len(nul_region):
+            assert "\ufffd" in chunk.value
+
+
+def test_finish_job_nul_in_result_persists(jobs_db: str, tmp_path: Path) -> None:
+    """Terminal result stdout/stderr containing NUL persists to real PostgreSQL."""
+    conn = psycopg.connect(jobs_db)
+    job_id = uuid4()
+    conn.execute(
+        "INSERT INTO lubko.jobs (id, payload) VALUES (%s, %s)",
+        (
+            job_id,
+            json.dumps({
+                "v": 3,
+                "type": "command",
+                "request": {"cwd": str(tmp_path), "process": ["echo", "hi"]},
+                "state": {"status": "running"},
+            }),
+        ),
+    )
+    conn.commit()
+
+    result = JobResult(
+        status="succeeded",
+        exit_code=0,
+        stdout="before\ufffdafter",
+        stderr="err\ufffdor",
+        cancellation_note=None,
+    )
+    status = finish_job(conn, job_id, result)
+
+    assert status == "succeeded"
+    row = conn.execute(
+        "SELECT (payload::jsonb)->'result'->>'stdout', "
+        "(payload::jsonb)->'result'->>'stderr' "
+        "FROM lubko.jobs WHERE id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "before\ufffdafter"
+    assert row[1] == "err\ufffdor"
+    conn.close()
+
+
+def test_finish_job_actual_nul_not_sanitized_persists(jobs_db: str, tmp_path: Path) -> None:
+    """If somehow unsanitized NUL reaches finish_job, it would fail; sanitized version works."""
+    conn = psycopg.connect(jobs_db)
+    job_id = uuid4()
+    conn.execute(
+        "INSERT INTO lubko.jobs (id, payload) VALUES (%s, %s)",
+        (
+            job_id,
+            json.dumps({
+                "v": 3,
+                "type": "command",
+                "request": {"cwd": str(tmp_path), "process": ["echo", "hi"]},
+                "state": {"status": "running"},
+            }),
+        ),
+    )
+    conn.commit()
+
+    raw_bytes = b"before\x00after"
+    safe_text = sanitize_for_postgres(raw_bytes.decode("utf-8", errors="replace"))
+    assert "\x00" not in safe_text
+
+    result = JobResult(
+        status="succeeded",
+        exit_code=0,
+        stdout=safe_text,
+        stderr="",
+        cancellation_note=None,
+    )
+    status = finish_job(conn, job_id, result)
+    assert status == "succeeded"
+    conn.close()
+
+
+def test_publish_output_nul_persists_to_real_pg(jobs_db: str, tmp_path: Path) -> None:
+    """publish_output with NUL bytes succeeds against real PostgreSQL jsonb."""
+    conn = psycopg.connect(jobs_db)
+    job_id = uuid4()
+    conn.execute(
+        "INSERT INTO lubko.jobs (id, payload) VALUES (%s, %s)",
+        (
+            job_id,
+            json.dumps({
+                "v": 3,
+                "type": "command",
+                "request": {"cwd": str(tmp_path), "process": ["echo", "hi"]},
+                "state": {"status": "running"},
+            }),
+        ),
+    )
+    conn.commit()
+
+    proc = subprocess.Popen(
+        ["/bin/true"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    active = ActiveJob(
+        id=job_id,
+        cwd=str(tmp_path),
+        process=("echo", "hi"),
+        proc=proc,
+        pid=proc.pid,
+        pgid=proc.pid,
+        started_mono=time.monotonic(),
+    )
+
+    stdout_path = tmp_path / "stdout.cap"
+    stderr_path = tmp_path / "stderr.cap"
+    stdout_path.write_bytes(b"before\x00after\x00end")
+    stderr_path.write_bytes(b"err\x00or")
+    active.stdout = OutputStream(path=stdout_path)
+    active.stderr = OutputStream(path=stderr_path)
+
+    try:
+        result = publish_output(
+            conn,
+            active,
+            ["stdout", "stderr"],
+            time.monotonic(),
+            force=True,
+        )
+        assert result is True
+        assert "\x00" not in active.stdout.tail_text
+        assert "\x00" not in active.stderr.tail_text
+        assert "\ufffd" in active.stdout.tail_text
+
+        row = conn.execute(
+            "SELECT (payload::jsonb)->'output'->'stdout'->>'tail', "
+            "(payload::jsonb)->'output'->'stderr'->>'tail' "
+            "FROM lubko.jobs WHERE id = %s",
+            (job_id,),
+        ).fetchone()
+        assert row is not None
+        assert "\x00" not in row[0]
+        assert "\x00" not in row[1]
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+        guard.unregister(proc)
+        conn.close()
+
+
+def test_publish_output_unrelated_job_not_affected_by_nul_job(
+    tmp_path: Path,
+) -> None:
+    """An unrelated running job continues to publish normally alongside a NUL job."""
+    nul_dir = tmp_path / "nul"
+    nul_dir.mkdir()
+    nul_job = make_active_job(nul_dir)
+    nul_job.stdout.path.write_bytes(b"nul\x00data")
+
+    clean_dir = tmp_path / "clean"
+    clean_dir.mkdir()
+    clean_job = make_active_job(clean_dir)
+    clean_job.stdout.path.write_bytes(b"clean output")
+
+    conn = _RecordingConnection()
+    _queue_root(conn, nul_job.id)
+    _queue_root(conn, clean_job.id)
+
+    publish_output(as_db(conn), nul_job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+    publish_output(as_db(conn), clean_job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    assert "\ufffd" in nul_job.stdout.tail_text
+    assert "\x00" not in nul_job.stdout.tail_text
+    assert clean_job.stdout.tail_text == "clean output"
+    assert "\ufffd" not in clean_job.stdout.tail_text
+
+
+def test_is_connectivity_error_classifies_08() -> None:
+    """SQLSTATE class 08 errors are classified as connectivity errors."""
+    proc = subprocess.Popen(
+        ["/bin/true"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    try:
+        # Use a real connection wrapper to test conn.broken/conn.closed paths
+        # via the module-qualified helper.
+        rec = _RecordingConnection()
+        real_conn = cast("JobsConnection", rec)
+
+        exc_conn = psycopg.OperationalError("connection refused")
+        exc_conn.sqlstate = "08006"
+        assert worker._is_connectivity_error(exc_conn, real_conn) is True
+
+        exc_data = psycopg.DataError("unsupported Unicode escape sequence")
+        exc_data.sqlstate = "22P05"
+        assert worker._is_connectivity_error(exc_data, real_conn) is False
+
+        exc_program = psycopg.ProgrammingError("column does not exist")
+        exc_program.sqlstate = "42703"
+        assert worker._is_connectivity_error(exc_program, real_conn) is False
+
+        # Client-side OperationalError without sqlstate → outage
+        exc_client = psycopg.OperationalError("timeout expired")
+        exc_client.sqlstate = None
+        assert worker._is_connectivity_error(exc_client, real_conn) is True
+
+        # Generic Error without sqlstate and not OperationalError → not connectivity
+        exc_generic = psycopg.Error("generic")
+        assert worker._is_connectivity_error(exc_generic, real_conn) is False
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+        guard.unregister(proc)
+
+
+def test_publish_output_data_error_does_not_raise(tmp_path: Path) -> None:
+    """Data error (22P05) is raised by publish_output for the caller to classify."""
+
+    class _DataErrorConnection(_RecordingConnection):
+        @override
+        def cursor(self, **_kwargs: object) -> "_RecordingCursor":
+            return _DataErrorCursor(self)
+
+    class _DataErrorCursor(_RecordingCursor):
+        @override
+        def execute(self, sql: str, params: object | None = None) -> None:
+            if sql.strip().startswith("UPDATE"):
+                exc = psycopg.DataError("unsupported Unicode escape sequence")
+                exc.sqlstate = "22P05"
+                self._conn.executions.append((sql, params))
+                raise exc
+            super().execute(sql, params)
+
+    job = make_active_job(tmp_path)
+    job.stdout.path.write_bytes(b"test")
+    data_conn = _DataErrorConnection()
+    _queue_root(data_conn, job.id)
+
+    # publish_output propagates the error; _publish_all catches and classifies it
+    with pytest.raises(psycopg.DataError, match="unsupported Unicode"):
+        publish_output(as_db(data_conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+    # In-memory state must NOT be advanced after a failed transaction
+    assert job.stdout.published_size == 0
+    assert not job.stdout.tail_text
+
+
+def test_publish_output_connectivity_error_propagates(tmp_path: Path) -> None:
+    """A connectivity error (SQLSTATE class 08) propagates for outage handling."""
+
+    class _ConnErrorConnection(_RecordingConnection):
+        @override
+        def cursor(self, **_kwargs: object) -> "_RecordingCursor":
+            return _ConnErrorCursor(self)
+
+    class _ConnErrorCursor(_RecordingCursor):
+        @override
+        def execute(self, sql: str, params: object | None = None) -> None:
+            if sql.strip().startswith("UPDATE"):
+                exc = psycopg.OperationalError("connection reset")
+                exc.sqlstate = "08006"
+                self._conn.executions.append((sql, params))
+                raise exc
+            super().execute(sql, params)
+
+    job = make_active_job(tmp_path)
+    job.stdout.path.write_bytes(b"test")
+    conn = _ConnErrorConnection()
+    _queue_root(conn, job.id)
+
+    with pytest.raises(psycopg.OperationalError, match="connection reset"):
+        publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+
+def test_invalid_utf8_combined_with_nul(tmp_path: Path) -> None:
+    """Invalid UTF-8 combined with NUL is handled deterministically."""
+    cap = tmp_path / "stdout.cap"
+    cap.write_bytes(b"good\x00\xff\xfe\x00end")
+    text, start, end = worker.output_window_text(cap, 4096)
+    assert start == 0
+    assert end == 11
+    assert "\x00" not in text
+    assert "good" in text
+    assert "end" in text
+    # Invalid bytes become U+FFFD, NUL also becomes U+FFFD
+    assert text.count("\ufffd") >= 3  # at least 3 replacement chars
+
+
+def test_chunk_offsets_correct_with_nul(tmp_path: Path) -> None:
+    """Chunk byte offsets remain correct when NUL bytes are present."""
+    job = make_active_job(tmp_path)
+    # Create output that will produce chunks: NUL in early data, clean in tail
+    early_data = b"a\x00b\x00c" + b"d" * 1994  # 2000 bytes with NUL
+    tail_data = b"t" * 4000
+    job.stdout.path.write_bytes(early_data + tail_data)
+    conn = _RecordingConnection()
+    _queue_root(conn, job.id)
+
+    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+
+    inserts = [(sql, params) for sql, params in conn.executions if sql.startswith("INSERT")]
+    assert len(inserts) >= 1
+    for _sql, params in inserts:
+        assert isinstance(params, tuple)
+        chunk = parse_chunk_payload(params[1])
+        assert chunk.start >= 0
+        assert chunk.end > chunk.start
+        assert chunk.end - chunk.start <= 2000
+        assert "\x00" not in chunk.value
+        assert "\ufffd" in chunk.value
+
+    assert job.stdout.tail_start > 0
+    assert job.stdout.tail_end == len(early_data) + len(tail_data)
 
 
 def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:

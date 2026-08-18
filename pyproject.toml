@@ -98,6 +98,7 @@ convention = "google"
     "magic-value-comparison",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
+    "private-member-access",
 ]
 "tests/test_deployctl.py" = [
     "private-member-access",

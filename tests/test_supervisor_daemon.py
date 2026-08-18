@@ -1220,12 +1220,12 @@ def test_status_keeps_live_supervised_pending_mission(
         assert status is not None
         assert status.commit == second
 
-        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
+        result = dc._handle_status(_status_options(repo))
 
         assert result["phase"] == "await-confirmation"
         assert result["proposed_commit"] == second
         assert result["previous_commit"] == first
-        after = dc._read_state()  # ruff: ignore[private-member-access]
+        after = dc._read_state()
         assert after is not None
         assert after.status == dc.STATUS_PENDING
         assert worker_pid() == candidate_pid
@@ -1258,11 +1258,11 @@ def test_status_rolls_back_supervised_mission_with_lapsed_deadline(
         candidate_pid = worker_pid()
         assert candidate_pid is not None
 
-        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
+        result = dc._handle_status(_status_options(repo))
 
         assert result["phase"] == "idle"
         assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
-        final = dc._read_state()  # ruff: ignore[private-member-access]
+        final = dc._read_state()
         assert final is not None
         assert final.status == dc.STATUS_ROLLED_BACK
         wait_until(status_commit_is(first), timeout=30.0)
@@ -1434,7 +1434,7 @@ def test_derive_action_fails_closed_on_corrupt_rollback(tmp_path: Path) -> None:
         )
     )
     daemon = SupervisorDaemon(Settings())
-    action, commit = daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
+    action, commit = daemon._derive_action(supervise.read_state())
     assert action == "hold"
     assert commit is None
 
@@ -1446,7 +1446,7 @@ def _derive_action() -> tuple[str, str | None]:
         The ``(action, commit)`` pair.
     """
     daemon = SupervisorDaemon(Settings())
-    return daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
+    return daemon._derive_action(supervise.read_state())
 
 
 def test_derive_action_pending_newer_than_desired_selects_candidate(
@@ -1580,7 +1580,7 @@ def test_wait_for_identity_rejects_non_leader_on_timeout() -> None:
     guard.register(proc)
     try:
         daemon = SupervisorDaemon(Settings(identity_timeout_seconds=0.3))
-        assert daemon._wait_for_identity(proc.pid) is None  # ruff: ignore[private-member-access]
+        assert daemon._wait_for_identity(proc.pid) is None
     finally:
         guard.teardown_tracked(fail_on_leak=False)
 
@@ -1689,7 +1689,7 @@ def test_tick_derives_before_applying_stale_desired(
     monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
     monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
     monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
-    daemon._tick(0.0)  # ruff: ignore[private-member-access]
+    daemon._tick(0.0)
     assert applied == []
     assert ensured == ["3" * 40]
 

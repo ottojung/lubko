@@ -118,12 +118,56 @@ OUTPUT_STREAM_STDERR: Final = "stderr"
 OUTPUT_STREAMS: Final = (OUTPUT_STREAM_STDOUT, OUTPUT_STREAM_STDERR)
 ARCHIVE_MARGIN_CHARS: Final = 2000
 
+#: NUL (U+0000) is valid UTF-8 but PostgreSQL rejects it in text/jsonb with
+#: ``unsupported Unicode escape sequence`` (SQLSTATE 22P05).  Every raw-byte
+#: output string must pass through :func:`sanitize_for_postgres` before it can
+#: reach a ``text`` / ``jsonb`` column.
+PG_NUL_REPLACEMENT: Final = "\ufffd"
+
 STOP_REASON_CANCEL: Final = "cancel"
 STOP_REASON_SHUTDOWN: Final = "shutdown"
 STOP_REASON_LEASE: Final = "lease"
 STOP_REASON_ROW_LOST: Final = "row_lost"
 STOP_REASON_PERSIST: Final = "persist"
 JOB_ID_ENV: Final = "LUBKO_JOB_ID"
+
+#: PostgreSQL SQLSTATE class ``08`` — connection exceptions.  Errors in this
+#: class indicate the connection is broken or unusable and must trigger the
+#: existing outage/lease-safety path.  Deterministic data/representation
+#: errors (e.g. 22P05 for NUL in text) live outside this class and must not
+#: poison the worker-wide DB phase.
+PGSQLSTATE_CONNECTIVITY_PREFIX: Final = "08"
+
+
+def _is_connectivity_error(exc: psycopg.Error, conn: JobsConnection) -> bool:
+    """Return ``True`` when *exc* indicates a broken or unusable connection.
+
+    Classification rules (Psycopg 3):
+
+    - ``conn.broken`` or ``conn.closed`` means the connection is unusable
+      regardless of the exception's SQLSTATE.
+    - SQLSTATE class ``08`` (connection exceptions) is always connectivity.
+    - Client-side ``OperationalError`` without a SQLSTATE (e.g. timeout,
+      network reset) arising from an established DB operation is treated as
+      a client connection failure and triggers outage, not per-job quarantine.
+    - Deterministic server/data errors (e.g. 22P05 for NUL in text) on a
+      still-usable connection are per-job, not connectivity.
+
+    Args:
+        exc: The caught psycopg exception.
+        conn: The PostgreSQL connection on which the error occurred.
+
+    Returns:
+        ``True`` when the error is a connectivity-level failure.
+    """
+    if conn.broken or conn.closed:
+        return True
+    sqlstate: str | None = getattr(exc, "sqlstate", None)
+    if sqlstate and sqlstate.startswith(PGSQLSTATE_CONNECTIVITY_PREFIX):
+        return True
+    # Client-side OperationalError without sqlstate from an established
+    # connection (timeout, reset, etc.) is a connectivity failure.
+    return sqlstate is None and isinstance(exc, psycopg.OperationalError)
 
 
 def _jsonb_set_chain(base: str, updates: list[tuple[str, str]]) -> str:
@@ -368,6 +412,25 @@ class Settings:
 # ---------------------------------------------------------------------------
 
 
+def sanitize_for_postgres(text: str) -> str:
+    """Replace U+0000 (NUL) with U+FFFD so the result is safe for PostgreSQL ``text`` and ``jsonb``.
+
+    PostgreSQL rejects NUL in text/jsonb values with SQLSTATE 22P05
+    (``unsupported Unicode escape sequence``).  This canonical conversion
+    preserves logical byte offsets because both NUL and U+FFFD are single-byte
+    in their respective UTF-8 representations when the input was decoded from
+    the raw capture file.  Invalid UTF-8 is already replaced with U+FFFD by the
+    ``errors='replace'`` decode strategy used upstream.
+
+    Args:
+        text: Decoded UTF-8 text that may contain NUL characters.
+
+    Returns:
+        The same text with NUL replaced by the Unicode replacement character.
+    """
+    return text.replace("\x00", PG_NUL_REPLACEMENT)
+
+
 def truncate_output(data: bytes, limit: int) -> str:
     """Decode output while retaining at most the newest ``limit`` bytes.
 
@@ -389,7 +452,7 @@ def truncate_output(data: bytes, limit: int) -> str:
         payload = TRUNCATION_MARKER + data[-(limit - len(TRUNCATION_MARKER)) :]
     else:
         payload = data
-    return payload.decode("utf-8", errors="replace")
+    return sanitize_for_postgres(payload.decode("utf-8", errors="replace"))
 
 
 def read_output(path: Path) -> bytes:
@@ -433,7 +496,11 @@ def read_range(path: Path, start: int, end: int) -> bytes:
 
 
 def decode_range(path: Path, start: int, end: int) -> str:
-    """Decode the bytes in ``[start, end)`` as UTF-8 text with replacement.
+    """Decode the bytes in ``[start, end)`` as UTF-8 text with replacement and NUL sanitization.
+
+    The result is safe for PostgreSQL ``text`` / ``jsonb`` columns: invalid
+    UTF-8 is replaced with U+FFFD by the decode strategy and NUL (U+0000) is
+    replaced with U+FFFD by :func:`sanitize_for_postgres`.
 
     Args:
         path: Capture file for the stream.
@@ -441,9 +508,9 @@ def decode_range(path: Path, start: int, end: int) -> str:
         end: Exclusive byte offset.
 
     Returns:
-        The decoded text.
+        The decoded and sanitized text.
     """
-    return read_range(path, start, end).decode("utf-8", errors="replace")
+    return sanitize_for_postgres(read_range(path, start, end).decode("utf-8", errors="replace"))
 
 
 def output_window_text(path: Path, max_chars: int) -> tuple[str, int, int]:
@@ -1534,8 +1601,8 @@ class Supervisor:
         while not self._stopping:
             try:
                 self._tick(time.monotonic())
-            except psycopg.Error:
-                self._enter_outage()
+            except psycopg.Error as exc:
+                self._enter_outage(exc)
             time.sleep(self.settings.process_poll_interval_seconds)
         self._shutdown()
 
@@ -1659,7 +1726,13 @@ class Supervisor:
                 request_stop(job, STOP_REASON_CANCEL)
 
     def _publish_all(self, now: float) -> None:
-        """Publish changed output tails/chunks of running jobs, throttled."""
+        """Publish changed output tails/chunks of running jobs, throttled.
+
+        Connectivity errors (SQLSTATE class 08) are re-raised so the caller
+        enters the outage/lease-safety path.  Deterministic data errors are
+        logged with the real exception and the offending job is quarantined
+        without affecting unrelated jobs.
+        """
         conn = self.conn
         if conn is None:
             return
@@ -1667,24 +1740,83 @@ class Supervisor:
         for job in list(self.active.values()):
             if job.completed or job.finalized:
                 continue
-            changed: list[str] = []
-            for name in OUTPUT_STREAMS:
-                stream = getattr(job, name)
-                if now - stream.published_at < interval:
-                    continue
-                try:
-                    size = stream_size(stream.path)
-                except OSError:
-                    continue
-                if size == stream.published_size:
-                    continue
-                changed.append(name)
-            if changed and not publish_output(conn, job, changed, now):
-                job.row_lost = True
-                request_stop(job, STOP_REASON_ROW_LOST)
+            changed = self._collect_changed_streams(job, now, interval)
+            if changed:
+                self._publish_one_job(conn, job, changed, now)
+
+    @staticmethod
+    def _collect_changed_streams(job: ActiveJob, now: float, interval: float) -> list[str]:
+        """Return stream names whose capture files have grown past the throttle.
+
+        Args:
+            job: The active job to inspect.
+            now: Monotonic time of this publication pass.
+            interval: Minimum seconds between publications per stream.
+
+        Returns:
+            The list of changed stream names.
+        """
+        changed: list[str] = []
+        for name in OUTPUT_STREAMS:
+            stream = getattr(job, name)
+            if now - stream.published_at < interval:
+                continue
+            try:
+                size = stream_size(stream.path)
+            except OSError:
+                continue
+            if size == stream.published_size:
+                continue
+            changed.append(name)
+        return changed
+
+    @staticmethod
+    def _publish_one_job(
+        conn: JobsConnection, job: ActiveJob, changed: list[str], now: float
+    ) -> None:
+        """Publish output for one job, classifying errors appropriately.
+
+        Connectivity errors (SQLSTATE class 08) are re-raised so the caller
+        enters the outage/lease-safety path.  Deterministic data errors are
+        logged with the real exception and the offending job is quarantined
+        without affecting unrelated jobs.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job: The active job whose output to publish.
+            changed: Which streams to publish.
+            now: Monotonic time of this publication pass.
+
+        Raises:
+            psycopg.Error: When a connectivity-level database failure occurs.
+        """
+        try:
+            retained = publish_output(conn, job, changed, now)
+        except psycopg.Error as exc:
+            if _is_connectivity_error(exc, conn):
+                raise
+            LOGGER.exception(
+                "publishing output for job %s quarantined; unrelated jobs remain serviceable",
+                job.id,
+            )
+            job.row_lost = True
+            request_stop(job, STOP_REASON_ROW_LOST)
+            return
+        if not retained:
+            job.row_lost = True
+            request_stop(job, STOP_REASON_ROW_LOST)
 
     def _finalize_completed(self) -> None:
-        """Publish final output and finalize every job whose process is fully gone."""
+        """Publish final output and finalize every job whose process is fully gone.
+
+        Connectivity errors (SQLSTATE class 08) are re-raised so the caller
+        enters the outage/lease-safety path.  Deterministic data errors are
+        logged with the real exception and the offending job is quarantined
+        without affecting unrelated jobs.
+
+        Raises:
+            psycopg.Error: When a connectivity-level database failure occurs.
+        """
         conn = self.conn
         if conn is None:
             return
@@ -1695,7 +1827,21 @@ class Supervisor:
                 # Background members of the exact process group are still being
                 # reaped; finalizing (and untracking) now would leak them.
                 continue
-            if not publish_output(conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True):
+            try:
+                retained = publish_output(
+                    conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True
+                )
+            except psycopg.Error as exc:
+                if _is_connectivity_error(exc, conn):
+                    raise
+                LOGGER.exception(
+                    "publishing final output for job %s quarantined; "
+                    "unrelated jobs remain serviceable",
+                    job.id,
+                )
+                self._untrack_lost_job(job)
+                continue
+            if not retained:
                 self._untrack_lost_job(job)
                 continue
             if self._finalize_one(job):
@@ -1724,6 +1870,9 @@ class Supervisor:
 
         Returns:
             ``True`` when the job was finalized and its capture files removed.
+
+        Raises:
+            psycopg.Error: When a connectivity-level database failure occurs.
         """
         conn = self.conn
         if conn is None:
@@ -1737,8 +1886,10 @@ class Supervisor:
         )
         try:
             final_status = finish_job(conn, job.id, result)
-        except psycopg.Error:
-            LOGGER.exception("finalizing job %s failed", job.id)
+        except psycopg.Error as exc:
+            if _is_connectivity_error(exc, conn):
+                raise
+            LOGGER.exception("finalizing job %s quarantined", job.id)
             return False
         LOGGER.info(
             "finished job %s with status %s and exit code %d",
@@ -1834,7 +1985,10 @@ class Supervisor:
         try:
             _persist_process(conn, job.id, job.pid, job.pgid)
         except psycopg.Error:
-            LOGGER.exception("unable to persist process identity for job %s", job.id)
+            LOGGER.exception(
+                "unable to persist process identity for job %s",
+                job.id,
+            )
             request_stop(job, STOP_REASON_PERSIST)
 
     def _finalize_immediate(self, job_id: UUID, result: JobResult) -> None:
@@ -1910,11 +2064,15 @@ class Supervisor:
             raise
         self.conn = conn
 
-    def _enter_outage(self) -> None:
+    def _enter_outage(self, _exc: psycopg.Error) -> None:
         """Transition into database outage handling, discarding the connection.
 
         The in-memory active registry is kept so local process ownership is
-        never lost.
+        never lost.  *_exc* is the exception that triggered the outage; the
+        caller's ``except`` block provides traceback diagnostics.
+
+        Args:
+            _exc: The exception that triggered the outage.
         """
         LOGGER.error("database operation failed; entering outage handling")
         if self.conn is not None:
@@ -2015,7 +2173,10 @@ class Supervisor:
                     force=True,
                 )
             except psycopg.Error:
-                LOGGER.exception("publishing shutdown output for job %s failed", job.id)
+                LOGGER.exception(
+                    "publishing shutdown output for job %s failed",
+                    job.id,
+                )
                 continue
             if not retained:
                 self._untrack_lost_job(job)
