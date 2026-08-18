@@ -41,6 +41,7 @@ from lubko.worker import (
     Supervisor,
     delete_job_and_chunks,
     group_has_members,
+    pg_safe_decode,
     publish_output,
     request_cancel,
     verify_jobs_table_invariant,
@@ -1687,13 +1688,19 @@ ARCHIVAL_NUL_PYTHON: Final = (
 def test_nul_invalid_utf8_archival_chunk_boundaries(
     jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
 ) -> None:
-    """Persisted chunk start/end match raw byte positions for NUL+invalid-UTF8.
+    """Persisted chunk/root start/end match exact raw capture byte positions.
 
     A job writes 6003 bytes (3000 X + 3 invalid + 3000 Y).  The supervisor
     archives output older than the live tail into immutable output_chunk rows.
-    Each chunk's ``start`` and ``end`` must correspond to exact byte offsets in
-    the capture file, and the ``value`` must be PostgreSQL-safe (no NUL).
+    Each chunk's ``start``/``end`` must correspond to exact byte offsets, and
+    each chunk's ``value`` must equal ``pg_safe_decode`` of the exact raw slice.
+    The live tail window must also match the exact raw slice.  Chunks must be
+    contiguous and not overlap the live tail (accounting for the designed
+    archive-margin overlap).
     """
+    raw = b"X" * 3000 + b"\xff\x00\xfe" + b"Y" * 3000
+    assert len(raw) == 6003
+
     job_id = insert_process_job(jobs_db, str(tmp_path), list(ARCHIVAL_NUL_PYTHON))
 
     with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
@@ -1703,21 +1710,49 @@ def test_nul_invalid_utf8_archival_chunk_boundaries(
     chunks = read_chunks(jobs_db, job_id)
     assert len(chunks) >= 1, "expected at least one archived chunk"
 
-    for _chunk_id, chunk in chunks:
-        value = chunk["value"]
-        assert chunk["end"] - chunk["start"] <= OUTPUT_CHUNK_MAX_BYTES
-        assert "\x00" not in value, "chunk value must be NUL-free"
+    # Sort chunks by start offset and validate contiguity.
+    sorted_chunks = sorted(chunks, key=lambda c: c[1]["start"])
+    prev_end = 0
+    for _chunk_id, chunk in sorted_chunks:
+        start = chunk["start"]
+        end = chunk["end"]
+        assert start == prev_end, (
+            f"chunks must be contiguous: expected start={prev_end}, got {start}"
+        )
+        assert end <= len(raw), f"chunk end {end} exceeds raw length {len(raw)}"
+        assert end - start <= OUTPUT_CHUNK_MAX_BYTES
+        # Validate value against canonical decode of the exact raw slice.
+        expected_value = pg_safe_decode(raw[start:end])
+        assert chunk["value"] == expected_value, (
+            f"chunk [{start}:{end}] value mismatch: "
+            f"expected {expected_value!r}, got {chunk['value']!r}"
+        )
+        prev_end = end
 
+    # Validate the live tail window against the exact raw slice.
     payload = read_root(jobs_db, job_id)
     output = payload.get("output") or {}
     stdout_window = output.get("stdout") or {}
-    tail_start = stdout_window.get("start")
-    tail_end = stdout_window.get("end")
-    assert tail_start is not None
-    assert tail_end is not None
-    assert tail_end == 6003
-    assert tail_start > 0, "tail is a bounded window, not the full stream"
-    assert "\x00" not in (stdout_window.get("tail") or ""), "tail value must be NUL-free"
+    tail_start = stdout_window["start"]
+    tail_end = stdout_window["end"]
+    tail_text = stdout_window["tail"]
+
+    assert tail_end == len(raw), f"tail_end={tail_end}, expected {len(raw)}"
+    assert tail_start >= 0
+    assert tail_start < tail_end
+    # Tail must start at or after the last chunk end (archive margin overlap
+    # is allowed by the protocol, but tail never shortens archived data).
+    assert tail_start >= sorted_chunks[-1][1]["start"], (
+        f"tail_start={tail_start} precedes last chunk start"
+    )
+    # Validate tail text against canonical decode of the exact raw slice.
+    expected_tail = pg_safe_decode(raw[tail_start:tail_end])
+    assert tail_text == expected_tail, (
+        f"tail [{tail_start}:{tail_end}] value mismatch: "
+        f"expected {expected_tail!r}, got {tail_text!r}"
+    )
+    # NUL must not appear in any persisted text.
+    assert "\x00" not in tail_text
 
 
 # ---------------------------------------------------------------------------
