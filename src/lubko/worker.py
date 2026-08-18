@@ -1598,9 +1598,10 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     ``command`` rows whose ``finished_at`` is older than the retention window
     is selected and atomically marked with ``state.gc = true``.  Publication
     explicitly refuses GC-marked roots, so no new ``output_chunk`` rows can be
-    created for them after the mark commits.  ``pending`` and ``running`` rows
-    are never selected; abandoned ``running`` rows are handled by
-    :func:`recover_stale_jobs`.
+    created for them after the mark commits.  Only rows with
+    ``status IN ('succeeded', 'failed', 'cancelled')`` are eligible; unknown
+    or future statuses are retained.  Abandoned ``running`` rows are handled
+    by :func:`recover_stale_jobs`.
 
     **Phase 2 — Chunk drain + root finalization** (one transaction per batch):
     For each GC-marked root, a bounded batch of its owned chunks (via
@@ -1642,7 +1643,8 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    SELECT id\n"
             "    FROM lubko.jobs\n"
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
-            "        AND (payload::jsonb)->'state'->>'status' NOT IN ('pending', 'running')\n"
+            "        AND (payload::jsonb)->'state'->>'status'\n"
+            "            IN ('succeeded', 'failed', 'cancelled')\n"
             "        AND (payload::jsonb)->'state'->>'finished_at' IS NOT NULL\n"
             "        AND ((payload::jsonb)->'state'->>'finished_at') < " + GC_RETENTION_SQL + "\n"
             "        AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
@@ -1713,7 +1715,8 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    AND NOT EXISTS (\n"
             "        SELECT 1\n"
             "        FROM lubko.jobs AS root\n"
-            "        WHERE root.id = (chunk.payload::jsonb->>'thread')::uuid\n"
+            "        WHERE root.id =\n"
+            "            (chunk.payload::jsonb->>'thread')::uuid\n"
             "            AND root.payload::jsonb->>'type' = 'command'\n"
             "    )\n"
             "LIMIT %(limit)s\n"

@@ -38,9 +38,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
     from uuid import UUID
 
-    from lubko.worker import (
-        JobsConnection,
-    )
+    from lubko.worker import JobsConnection
 
 
 def _make_settings(
@@ -993,5 +991,278 @@ def test_gc_mark_drain_vs_publish_output_race(db: str) -> None:
         ).fetchone()
     assert row is not None
     assert row[0] == 0
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 eligibility: unknown/future status is retained
+# ---------------------------------------------------------------------------
+
+
+def test_gc_does_not_mark_unknown_status(db: str) -> None:
+    """A command with an unknown/future status is never marked by GC.
+
+    Phase-1 explicitly selects status IN succeeded/failed/cancelled.
+    Any unknown or future status value is retained, not collected.
+    """
+    payload = json.dumps({
+        "v": 3,
+        "type": "command",
+        "request": {"cwd": "/workspace", "process": ["echo", "hi"]},
+        "state": {
+            "status": "mystery",
+            "finished_at": "2020-01-01T00:00:00.000000Z",
+        },
+    })
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (payload,)
+        ).fetchone()
+    assert row is not None
+    unknown_id = cast("UUID", row[0])
+
+    settings = _make_settings(gc_retention_seconds=0.0)
+    with psycopg.connect(db) as conn:
+        roots, _c, _o = collect_transport(conn, settings)
+    assert unknown_id not in roots
+    assert _row_exists(db, unknown_id)
+    assert not _is_gc_marked(db, unknown_id)
+
+
+def test_gc_does_not_mark_pending_status(db: str) -> None:
+    """A pending command is never marked by GC."""
+    root_id = _insert_pending_job(db)
+    settings = _make_settings(gc_retention_seconds=0.0)
+    with psycopg.connect(db) as conn:
+        roots, _c, _o = collect_transport(conn, settings)
+    assert root_id not in roots
+
+
+def test_gc_does_not_mark_running_status(db: str) -> None:
+    """A running command is never marked by GC."""
+    root_id = _insert_running_job(db)
+    settings = _make_settings(gc_retention_seconds=0.0)
+    with psycopg.connect(db) as conn:
+        roots, _c, _o = collect_transport(conn, settings)
+    assert root_id not in roots
+
+
+# ---------------------------------------------------------------------------
+# Orphan matching: malformed/non-UUID thread text
+# ---------------------------------------------------------------------------
+
+
+def test_gc_orphan_pass_skips_malformed_thread(db: str) -> None:
+    """Chunks with non-UUID thread text are safely skipped, not crashed.
+
+    The orphan anti-join uses CASE-safe cast so malformed thread values
+    never cause a cast error.
+    """
+    # Insert a chunk with completely invalid thread text.
+    bad_payload = json.dumps({
+        "v": 3,
+        "type": "output_chunk",
+        "thread": "not-a-uuid-at-all",
+        "stream": "stdout",
+        "sequence": 0,
+        "start": 0,
+        "end": 5,
+        "value": "hello",
+        "previous": None,
+    })
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (bad_payload,)
+        ).fetchone()
+    assert row is not None
+    bad_id = cast("UUID", row[0])
+
+    # Insert a chunk with uppercase UUID (valid format, different case).
+    upper_id = uuid4()
+    upper_payload = json.dumps({
+        "v": 3,
+        "type": "output_chunk",
+        "thread": str(upper_id).upper(),
+        "stream": "stdout",
+        "sequence": 0,
+        "start": 0,
+        "end": 5,
+        "value": "hello",
+        "previous": None,
+    })
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (upper_payload,)
+        ).fetchone()
+    assert row is not None
+    upper_chunk_id = cast("UUID", row[0])
+
+    # Insert a chunk with empty thread.
+    empty_payload = json.dumps({
+        "v": 3,
+        "type": "output_chunk",
+        "thread": "",
+        "stream": "stdout",
+        "sequence": 0,
+        "start": 0,
+        "end": 5,
+        "value": "hello",
+        "previous": None,
+    })
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (empty_payload,)
+        ).fetchone()
+    assert row is not None
+    empty_id = cast("UUID", row[0])
+
+    # GC orphan pass must not crash and must skip all three.
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=100)
+    with psycopg.connect(db) as conn:
+        _roots, _chunks, orphans = collect_transport(conn, settings)
+
+    # None of these should be cleaned (no valid owning root exists, but
+    # they're also not valid UUIDs so the CASE returns NULL).
+    assert _row_exists(db, bad_id)
+    assert _row_exists(db, upper_chunk_id)
+    assert _row_exists(db, empty_id)
+    # The orphan count should be 0 since none matched the CASE-safe path.
+    assert orphans == 0
+
+
+def test_gc_orphan_pass_cleans_valid_uuid_orphan(db: str) -> None:
+    """Chunks with valid UUID thread but no owning root are cleaned."""
+    dangling = uuid4()
+    orphan = _insert_orphan_chunk(db, dangling)
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=100)
+    with psycopg.connect(db) as conn:
+        _roots, _chunks, orphans = collect_transport(conn, settings)
+    assert orphans == 1
+    assert not _row_exists(db, orphan)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent publication-vs-GC race (genuinely concurrent)
+# ---------------------------------------------------------------------------
+
+
+def _insert_race_chunks(conn: psycopg.Connection[object], root_id: UUID, count: int) -> None:
+    """Insert output chunks for the race test.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        root_id: Owning root job identifier.
+        count: Number of chunks to insert.
+    """
+    for i in range(count):
+        payload = json.dumps({
+            "v": 3,
+            "type": "output_chunk",
+            "thread": str(root_id),
+            "stream": "stdout",
+            "sequence": 100 + i,
+            "start": 0,
+            "end": 5,
+            "value": f"race{i}",
+            "previous": None,
+        })
+        conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (payload,))
+
+
+def test_gc_concurrent_publish_then_mark(db: str) -> None:
+    """Concurrent publication before mark commits chunks; post-mark publication refused.
+
+    Thread 1: publisher holds root lock, inserts chunks, commits.
+    Thread 2: GC mark queues on the same root, waits for lock.
+    After Thread 1 commits, Thread 2 observes gc=false, marks it.
+    A subsequent publication sees gc=true and refuses.
+    """
+    root_id = _insert_terminal_job(db)
+    # Add chunks so Phase 2 doesn't delete root.
+    for i in range(15):
+        _insert_output_chunk(db, root_id, sequence=i)
+
+    tmp = Path(tempfile.mkdtemp())
+    stdout_path = tmp / "stdout.cap"
+    stdout_path.write_bytes(b"y" * 9000)
+    stderr_path = tmp / "stderr.cap"
+    stderr_path.write_bytes(b"")
+
+    barrier = threading.Barrier(2, timeout=10)
+    results: dict[str, object] = {}
+
+    def publisher() -> None:
+        """Hold root lock, insert chunks, commit, release lock."""
+        with psycopg.connect(db) as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM lubko.jobs WHERE id = %s FOR UPDATE",
+                    (root_id,),
+                )
+                barrier.wait()  # signal GC that we hold the lock
+                barrier.wait()  # wait for GC to be queued
+                _insert_race_chunks(conn, root_id, 3)
+            conn.commit()  # release lock
+        results["publisher"] = "done"
+
+    def gc_marker() -> None:
+        """Queue for root lock, then mark gc=true."""
+        barrier.wait()  # wait for publisher to hold lock
+        barrier.wait()  # signal publisher we're queued
+        # This will block until publisher commits.
+        with psycopg.connect(db) as conn:
+            conn.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = jsonb_set(payload::jsonb, '{state,gc}', to_jsonb(true))::text\n"
+                "WHERE id = %s AND (payload::jsonb)->>'type' = 'command'",
+                (root_id,),
+            )
+            conn.commit()
+        results["gc_marker"] = "done"
+
+    t_pub = threading.Thread(target=publisher)
+    t_gc = threading.Thread(target=gc_marker)
+    t_pub.start()
+    t_gc.start()
+    t_pub.join(timeout=10)
+    t_gc.join(timeout=10)
+
+    assert results.get("publisher") == "done"
+    assert results.get("gc_marker") == "done"
+    assert _is_gc_marked(db, root_id)
+
+    # Count chunks: original 15 + 3 from concurrent publisher.
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "SELECT count(*)::int FROM lubko.jobs "
+            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
+            "AND (payload::jsonb)->>'thread' = %s",
+            (str(root_id),),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 18
+
+    # A new publication must refuse (gc=true).
+    job = ActiveJob(
+        id=root_id,
+        cwd=str(tmp),
+        process=("echo", "test"),
+        proc=subprocess.Popen(
+            ["/bin/true"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ),
+        pid=0,
+        pgid=0,
+        started_mono=time.monotonic(),
+    )
+    job.stdout = OutputStream(path=stdout_path)
+    job.stderr = OutputStream(path=stderr_path)
+    with psycopg.connect(db) as conn:
+        published = publish_output(conn, job, ["stdout"], time.monotonic(), force=True)
+    assert published is False
 
     shutil.rmtree(tmp, ignore_errors=True)
