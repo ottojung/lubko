@@ -256,10 +256,17 @@ class SupervisorState:
 
 @dataclass(frozen=True, slots=True)
 class SupervisorStatus:
-    """Machine-readable observation of the running supervisor."""
+    """Machine-readable observation of the running supervisor.
+
+    ``supervisor_start_time_ticks`` is the exact start time of the supervisor
+    process in clock ticks, persisted alongside ``supervisor_pid`` so that
+    ``read_status()`` can bind the snapshot to the exact current incarnation
+    and reject stale, dead, replaced, or PID-reused snapshots.
+    """
 
     schema_version: int
     supervisor_pid: int
+    supervisor_start_time_ticks: int
     started_at: float
     applied_generation: int
     mode: str
@@ -283,6 +290,7 @@ class SupervisorStatus:
         return {
             "schema_version": self.schema_version,
             "supervisor_pid": self.supervisor_pid,
+            "supervisor_start_time_ticks": self.supervisor_start_time_ticks,
             "started_at": self.started_at,
             "applied_generation": self.applied_generation,
             "mode": self.mode,
@@ -333,6 +341,7 @@ class SupervisorStatus:
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
             supervisor_pid=_optional_int(data.get("supervisor_pid")) or 0,
+            supervisor_start_time_ticks=_optional_int(data.get("supervisor_start_time_ticks")) or 0,
             started_at=_optional_float(data.get("started_at")) or 0.0,
             applied_generation=_optional_int(data.get("applied_generation")) or 0,
             mode=_optional_string(data.get("mode")) or MODE_IDLE,
@@ -600,8 +609,15 @@ def write_status(status: SupervisorStatus) -> None:
 def read_status() -> SupervisorStatus | None:
     """Load the machine-readable status.
 
+    The status is only returned when its persisted identity matches the current
+    supervisor incarnation: the recorded ``supervisor_pid`` and ``started_at``
+    must agree with the daemon identity file (``supervisor.pid``), and that
+    exact process must be a live, non-zombie ``lubko-supervisor``.  This
+    prevents stale, dead, replaced, or PID-reused snapshots from ever
+    appearing ready.
+
     Returns:
-        The parsed status, or ``None`` when absent or malformed.
+        The parsed status, or ``None`` when absent, malformed, or stale.
     """
     data = _read_json(status_path())
     if data is None:
@@ -609,7 +625,41 @@ def read_status() -> SupervisorStatus | None:
     status = SupervisorStatus.from_dict(data)
     if status.schema_version != SCHEMA_VERSION:
         return None
+    if status.supervisor_pid == 0:
+        return None
+    if not _status_identity_matches(status):
+        return None
     return status
+
+
+def _status_identity_matches(status: SupervisorStatus) -> bool:
+    """Return whether the status identity matches the live supervisor process.
+
+    Three-way binding is required: the status snapshot's own ``supervisor_pid``
+    and ``supervisor_start_time_ticks`` must agree with the daemon identity
+    file (``supervisor.pid``), and that exact process must be a live, non-zombie
+    ``lubko-supervisor``.  When the identity file is missing, stale, the process
+    is dead/replaced, or the PID was reused with a different start time, the
+    status snapshot is treated as stale.
+
+    Args:
+        status: Parsed status to validate.
+
+    Returns:
+        ``True`` when the identity is the current live supervisor incarnation.
+    """
+    recorded = read_supervisor_pid()
+    if recorded is None:
+        return False
+    pid, ticks = recorded
+    return (
+        pid == status.supervisor_pid
+        and status.supervisor_start_time_ticks == ticks
+        and ticks != 0
+        and not _process_is_zombie(pid)
+        and proc_start_ticks(pid) == ticks
+        and ("lubko-supervisor" in _read_cmdline(pid) or "lubko.supervisor" in _read_cmdline(pid))
+    )
 
 
 def write_supervisor_pid(pid: int, start_time_ticks: int) -> None:
