@@ -2155,3 +2155,225 @@ def test_queue_deploy_cli_activation_failure_rolls_back_and_converges(
         assert isinstance(result, dict)
         assert result["exit_code"] == 0
         assert second in str(result["stdout"])
+
+
+# ---------------------------------------------------------------------------
+# Status identity binding regressions (#90)
+# ---------------------------------------------------------------------------
+
+
+def _write_status_snapshot(
+    supervisor_pid: int,
+    supervisor_start_time_ticks: int,
+    *,
+    ready: bool = True,
+    commit: str = "a" * 40,
+    child_pid: int = 100,
+) -> None:
+    """Persist a raw status snapshot for identity-binding tests.
+
+    Args:
+        supervisor_pid: PID recorded in the status.
+        supervisor_start_time_ticks: Start time ticks recorded in the status.
+        ready: Whether the snapshot claims readiness.
+        commit: Commit the snapshot claims to run.
+        child_pid: Worker child PID in the snapshot.
+    """
+    supervise.write_status(
+        supervise.SupervisorStatus(
+            schema_version=supervise.SCHEMA_VERSION,
+            supervisor_pid=supervisor_pid,
+            supervisor_start_time_ticks=supervisor_start_time_ticks,
+            started_at=0.0,
+            applied_generation=1,
+            mode=supervise.MODE_RUN,
+            commit=commit,
+            child=supervise.WorkerChild(
+                pid=child_pid,
+                pgid=child_pid,
+                sid=child_pid,
+                start_time_ticks=1,
+                token=f"token-{child_pid}",
+                worker_id="test-worker",
+                spawned_at=0.0,
+            ),
+            intent=supervise.INTENT_RUN,
+            restart_count=0,
+            next_attempt_at=None,
+            last_exit=None,
+            mission=None,
+            db_ready=True,
+            ready=ready,
+            message=None,
+        )
+    )
+
+
+def test_read_status_returns_none_when_no_pidfile(
+    tmp_path: Path,
+) -> None:
+    """A status snapshot with no pidfile is treated as stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks)
+    supervise.supervisor_pid_path().unlink(missing_ok=True)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_none_when_pidfile_mismatch(
+    tmp_path: Path,
+) -> None:
+    """A status whose PID disagrees with the pidfile is stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks)
+    supervise.write_supervisor_pid(pid + 999, ticks)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_none_when_status_ticks_mismatch_pidfile(
+    tmp_path: Path,
+) -> None:
+    """A status whose start_time_ticks disagree with the pidfile is stale.
+
+    This is the PID-reuse scenario: same PID, different incarnation.
+    """
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks)
+    supervise.write_supervisor_pid(pid, ticks + 1)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_none_when_process_dead(
+    tmp_path: Path,
+) -> None:
+    """A status whose supervisor process has died is stale."""
+    del tmp_path
+    _write_status_snapshot(999_999, 1)
+    supervise.write_supervisor_pid(999_999, 1)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_none_when_process_zombie(
+    tmp_path: Path,
+) -> None:
+    """A status whose supervisor process is a zombie is stale."""
+    del tmp_path
+    _write_status_snapshot(999_999, 1)
+    supervise.write_supervisor_pid(999_999, 1)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_valid_for_live_supervisor(
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A status snapshot from the live supervisor is accepted."""
+    repo, first, _second = maintained_env
+    with running_supervisor(supervisor_env):
+        request_and_wait(first, repo)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.supervisor_pid > 0
+        assert status.supervisor_start_time_ticks > 0
+        assert status.ready is True
+        assert status.commit == first
+
+
+def test_stale_ready_status_rejected_by_wait_until_ready(
+    tmp_path: Path,
+) -> None:
+    """wait_until_ready returns False when the status snapshot is stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks, ready=True)
+    supervise.supervisor_pid_path().unlink(missing_ok=True)
+    assert not supervise.wait_until_ready(1, 0.2)
+
+
+def test_stale_ready_status_rejected_by_wait_for_generation(
+    tmp_path: Path,
+) -> None:
+    """wait_for_generation returns False when the status snapshot is stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks, ready=True)
+    supervise.supervisor_pid_path().unlink(missing_ok=True)
+    assert not supervise.wait_for_generation(1, 0.2)
+
+
+def test_status_roundtrip_includes_start_time_ticks(tmp_path: Path) -> None:
+    """SupervisorStatus survives serialization and retains start_time_ticks."""
+    del tmp_path
+    original = supervise.SupervisorStatus(
+        schema_version=supervise.SCHEMA_VERSION,
+        supervisor_pid=42,
+        supervisor_start_time_ticks=777,
+        started_at=1.5,
+        applied_generation=3,
+        mode=supervise.MODE_RUN,
+        commit="a" * 40,
+        child=supervise.WorkerChild(
+            pid=100,
+            pgid=100,
+            sid=100,
+            start_time_ticks=10,
+            token=f"token-{42}",
+            worker_id="w",
+            spawned_at=2.0,
+        ),
+        intent=supervise.INTENT_RUN,
+        restart_count=1,
+        next_attempt_at=None,
+        last_exit=supervise.LastExit(returncode=1, at=3.0),
+        mission=None,
+        db_ready=True,
+        ready=True,
+        message="ok",
+    )
+    data = original.to_dict()
+    restored = supervise.SupervisorStatus.from_dict(data)
+    assert restored.supervisor_pid == 42
+    assert restored.supervisor_start_time_ticks == 777
+    assert restored.child is not None
+    assert restored.child.pid == 100
+    assert restored.ready is True
+    assert isinstance(data["started_at"], float)
+
+
+def test_old_status_schema_without_start_time_ticks_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A legacy status without supervisor_start_time_ticks defaults to 0 and is stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    supervise.write_supervisor_pid(pid, ticks)
+    legacy_data = {
+        "schema_version": supervise.SCHEMA_VERSION,
+        "supervisor_pid": pid,
+        "started_at": 0.0,
+        "applied_generation": 1,
+        "mode": supervise.MODE_RUN,
+        "commit": "a" * 40,
+        "child": None,
+        "intent": supervise.INTENT_RUN,
+        "restart_count": 0,
+        "next_attempt_at": None,
+        "last_exit": None,
+        "mission": None,
+        "db_ready": None,
+        "ready": True,
+        "message": None,
+    }
+    supervise.status_path().parent.mkdir(parents=True, exist_ok=True)
+    temporary = supervise.status_path().with_name(f"{supervise.status_path().name}.tmp")
+    temporary.write_text(json.dumps(legacy_data, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(supervise.status_path())
+    assert supervise.read_status() is None

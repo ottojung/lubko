@@ -1107,6 +1107,7 @@ def test_restore_after_handoff_failure_keeps_fully_converged_candidate(
         lambda: supervise.SupervisorStatus(
             schema_version=supervise.SCHEMA_VERSION,
             supervisor_pid=1,
+            supervisor_start_time_ticks=1,
             started_at=0.0,
             applied_generation=2,
             mode=supervise.MODE_RUN,
@@ -1158,6 +1159,7 @@ def test_restore_after_handoff_failure_rolls_back_when_cli_stale(
         lambda: supervise.SupervisorStatus(
             schema_version=supervise.SCHEMA_VERSION,
             supervisor_pid=1,
+            supervisor_start_time_ticks=1,
             started_at=0.0,
             applied_generation=2,
             mode=supervise.MODE_RUN,

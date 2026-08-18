@@ -311,6 +311,7 @@ class SupervisorDaemon:
         self._next_db_check_at = 0.0
         self._message: str | None = None
         self._ownership_fd: int | None = None
+        self._start_time_ticks: int = 0
 
     def run(self) -> None:
         """Run the supervisor loop until a shutdown signal arrives.
@@ -328,6 +329,7 @@ class SupervisorDaemon:
         self._acquire_ownership()
         try:
             self._write_pidfile()
+            self._invalidate_stale_status()
             self._install_signal_handlers()
             self._write_status("starting")
             while not self._stopping:
@@ -1027,7 +1029,18 @@ class SupervisorDaemon:
         LOGGER.info("supervisor stopped")
 
     @staticmethod
-    def _write_pidfile() -> None:
+    def _invalidate_stale_status() -> None:
+        """Remove any stale status snapshot left by a previous incarnation.
+
+        After the ownership lock and pidfile are established, the old status
+        may still carry ``ready=true`` for a dead supervisor.  Removing the
+        file ensures that ``read_status()`` returns ``None`` until this
+        incarnation publishes its own fresh snapshot.
+        """
+        with suppress(OSError):
+            supervise.status_path().unlink(missing_ok=True)
+
+    def _write_pidfile(self) -> None:
         """Record our exact identity, refusing to double-run a live daemon.
 
         The process-level ownership lock acquired in :meth:`run` already held
@@ -1046,7 +1059,8 @@ class SupervisorDaemon:
             )
             LOGGER.error(msg)
             raise SystemExit(1)
-        write_supervisor_pid(os.getpid(), proc_start_ticks(os.getpid()) or 0)
+        self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
+        write_supervisor_pid(os.getpid(), self._start_time_ticks)
 
     def _write_status(self, message: str | None = None) -> None:
         """Publish the machine-readable status snapshot.
@@ -1075,6 +1089,7 @@ class SupervisorDaemon:
             SupervisorStatus(
                 schema_version=SCHEMA_VERSION,
                 supervisor_pid=os.getpid(),
+                supervisor_start_time_ticks=self._start_time_ticks,
                 started_at=self._started_at,
                 applied_generation=state.applied_generation,
                 mode=state.mode,
