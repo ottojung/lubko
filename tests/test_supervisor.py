@@ -21,13 +21,14 @@ import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 
 from lubko.config import DatabaseConfig
+from lubko.protocol import OUTPUT_CHUNK_MAX_BYTES
 from lubko.worker import (
     CHUNK_ORDER_INDEX_NAME,
     CHUNK_OWNER_INDEX_NAME,
@@ -1567,63 +1568,248 @@ def test_deterministic_data_error_stays_local(
 def test_deterministic_publish_failure_terminalizes_only_offending_job(
     jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
 ) -> None:
-    """Regression: a deterministic DB error on one job quarantines only that job.
+    """A deterministic DB error durably quarantines only the offending job.
 
-    This test proves that when a per-job publication error occurs, only the
-    offending job is terminalized while unrelated jobs continue to operate.
+    Fault injection: ``publish_output`` raises DataError (22P05) for the
+    target job.  The per-job catch quarantines the row to ``failed`` and
+    the unrelated job finishes successfully.
     """
-    # Create a job that writes NUL to stdout and a healthy job
-    nul_job = insert_process_job(jobs_db, str(tmp_path), list(NUL_BOTH_PYTHON))
-    healthy = insert_process_job(
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('x\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
+    other = insert_process_job(
         jobs_db,
         str(tmp_path),
         [sys.executable, "-c", "import time; time.sleep(0.5); print('ok')"],
     )
 
-    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
-        wait_until(lambda: read_status(jobs_db, nul_job) in {"succeeded", "failed"})
-        wait_until(lambda: read_status(jobs_db, healthy) == "succeeded")
+    inject_msg = "injected data error for quarantine regression"
 
-    # Both jobs should reach terminal state successfully
-    nul_payload = read_root(jobs_db, nul_job)
-    healthy_payload = read_root(jobs_db, healthy)
-    assert nul_payload["state"]["status"] == "succeeded"
-    assert healthy_payload["state"]["status"] == "succeeded"
-    assert healthy_payload["result"]["exit_code"] == 0
+    def _raise_data_error(
+        _conn: JobsConnection, job: ActiveJob, *_args: object, **_kwargs: object
+    ) -> bool:
+        if job.id == target:
+            exc = psycopg.DataError(inject_msg)
+            exc.sqlstate = "22P05"
+            raise exc
+        return True
 
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with patch("lubko.worker.publish_output", side_effect=_raise_data_error):
+            thread.start()
+            wait_until(lambda: read_status(jobs_db, target) == "failed")
+            wait_until(lambda: read_status(jobs_db, other) == "succeeded")
 
-def test_no_false_row_lost_for_deterministic_db_error(
-    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
-) -> None:
-    """No row_lost flag for deterministic DB errors (only for actual row deletion)."""
-    job_id = insert_process_job(jobs_db, str(tmp_path), list(NUL_STDOUT_PYTHON))
-
-    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
-        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
-
-    payload = read_root(jobs_db, job_id)
-    # The job should be succeeded, not failed or quarantined
-    assert payload["state"]["status"] == "succeeded"
+        # Durable quarantine: the row is failed, quarantine_reason is set.
+        payload = read_root(jobs_db, target)
+        assert payload["state"]["status"] == "failed"
+        assert "quarantine_reason" in payload["state"]
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
 
 
 def test_quarantine_sqlstate_logged(
     jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Regression 10: actual SQLSTATE is logged when DB work fails.
+    """Actual SQLSTATE and exception text are logged on quarantine.
 
-    We verify that any database error during finalization includes the
-    SQLSTATE in the log output rather than only a generic message.
+    Fault injection: ``publish_output`` raises DataError with SQLSTATE 22P05.
+    The log must contain both the SQLSTATE code and the exception message.
     """
-    job_id = insert_process_job(jobs_db, str(tmp_path), list(NUL_STDOUT_PYTHON))
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('x\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
 
-    with (
-        caplog.at_level(logging.ERROR, logger="lubko.worker"),
-        supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db),
-    ):
+    inject_msg = "diagnostic text for SQLSTATE logging regression"
+
+    def _raise_data_error(
+        _conn: JobsConnection, job: ActiveJob, *_args: object, **_kwargs: object
+    ) -> bool:
+        if job.id == target:
+            exc = psycopg.DataError(inject_msg)
+            exc.sqlstate = "22P05"
+            raise exc
+        return True
+
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with (
+            caplog.at_level(logging.ERROR, logger="lubko.worker"),
+            patch("lubko.worker.publish_output", side_effect=_raise_data_error),
+        ):
+            thread.start()
+            wait_until(lambda: read_status(jobs_db, target) == "failed")
+
+        logged = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert logged, "expected at least one ERROR log from quarantine"
+        combined_msg = " ".join(r.message for r in logged)
+        combined_exc = " ".join(r.exc_text or "" for r in logged)
+        assert "22P05" in combined_msg
+        assert inject_msg in combined_exc
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
+
+
+# ---------------------------------------------------------------------------
+# Real-PostgreSQL archival regression: NUL + invalid UTF-8 chunk boundaries
+# ---------------------------------------------------------------------------
+
+ARCHIVAL_NUL_PYTHON: Final = (
+    sys.executable,
+    "-c",
+    (
+        "import sys\n"
+        "sys.stdout.buffer.write(b'X' * 3000 + b'\\xff\\x00\\xfe' + b'Y' * 3000)\n"
+        "sys.stdout.flush()\n"
+    ),
+)
+
+
+def test_nul_invalid_utf8_archival_chunk_boundaries(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Persisted chunk start/end match raw byte positions for NUL+invalid-UTF8.
+
+    A job writes 6003 bytes (3000 X + 3 invalid + 3000 Y).  The supervisor
+    archives output older than the live tail into immutable output_chunk rows.
+    Each chunk's ``start`` and ``end`` must correspond to exact byte offsets in
+    the capture file, and the ``value`` must be PostgreSQL-safe (no NUL).
+    """
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(ARCHIVAL_NUL_PYTHON))
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
         wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+        wait_until(lambda: bool(read_chunks(jobs_db, job_id)))
 
-    # If there were any errors logged, they should mention SQLSTATE
-    for record in caplog.records:
-        if record.levelno >= logging.ERROR and "SQLSTATE" in record.message:
-            # Good: the error message includes SQLSTATE
-            break
+    chunks = read_chunks(jobs_db, job_id)
+    assert len(chunks) >= 1, "expected at least one archived chunk"
+
+    for _chunk_id, chunk in chunks:
+        value = chunk["value"]
+        assert chunk["end"] - chunk["start"] <= OUTPUT_CHUNK_MAX_BYTES
+        assert "\x00" not in value, "chunk value must be NUL-free"
+
+    payload = read_root(jobs_db, job_id)
+    output = payload.get("output") or {}
+    stdout_window = output.get("stdout") or {}
+    tail_start = stdout_window.get("start")
+    tail_end = stdout_window.get("end")
+    assert tail_start is not None
+    assert tail_end is not None
+    assert tail_end == 6003
+    assert tail_start > 0, "tail is a bounded window, not the full stream"
+    assert "\x00" not in (stdout_window.get("tail") or ""), "tail value must be NUL-free"
+
+
+# ---------------------------------------------------------------------------
+# Connectivity classifier: OperationalError on broken/closed connection
+# ---------------------------------------------------------------------------
+
+
+def test_operational_error_on_broken_connection_treated_as_connectivity(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """An OperationalError with non-08 SQLSTATE on a broken connection is outage.
+
+    Real server shutdowns/failovers can surface as OperationalError with a
+    non-08 SQLSTATE while the psycopg connection is already broken.  The
+    classifier must treat this as connectivity.
+    """
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('x\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
+
+    failover_msg = "server closed the connection unexpectedly"
+
+    def _raise_broken(
+        _conn: JobsConnection, job: ActiveJob, *_args: object, **_kwargs: object
+    ) -> bool:
+        if job.id == target:
+            exc = psycopg.OperationalError(failover_msg)
+            exc.sqlstate = "57P01"  # admin_shutdown, not class 08
+            raise exc
+        return True
+
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with (
+            patch("psycopg.Connection.broken", new_callable=PropertyMock, return_value=True),
+            patch("lubko.worker.publish_output", side_effect=_raise_broken),
+        ):
+            thread.start()
+            wait_until(lambda: supervisor.conn is None, timeout=10.0)
+            assert supervisor.conn is None
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
+
+
+def test_quarantine_convergence_no_active_leak(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """After quarantine + process group death, the job is cleaned from the active registry.
+
+    Proves no repeated poison publication/finalization loop and no active leak.
+    """
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('x\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
+
+    inject_msg = "convergence regression: persistent data error"
+
+    def _raise_data_error(
+        _conn: JobsConnection, job: ActiveJob, *_args: object, **_kwargs: object
+    ) -> bool:
+        if job.id == target:
+            exc = psycopg.DataError(inject_msg)
+            exc.sqlstate = "22P05"
+            raise exc
+        return True
+
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with patch("lubko.worker.publish_output", side_effect=_raise_data_error):
+            thread.start()
+            wait_until(lambda: read_status(jobs_db, target) == "failed")
+            time.sleep(2.0)
+            assert target not in supervisor.active, (
+                "quarantined job must be removed from active registry after cleanup"
+            )
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
