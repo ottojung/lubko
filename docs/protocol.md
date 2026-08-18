@@ -91,12 +91,12 @@ create index jobs_chunk_order_idx
 
 `lubko_worker` is the stable role the worker connects as (see the README
 database configuration) and must hold the privileges it needs to claim, cancel,
-poll, publish output (including inserting immutable `output_chunk` rows), and
-finalize jobs:
+poll, publish output (including inserting immutable `output_chunk` rows),
+finalize jobs, and collect transport garbage:
 
 ```sql
 grant usage on schema lubko to lubko_worker;
-grant select, insert, update on table lubko.jobs to lubko_worker;
+grant select, insert, update, delete on table lubko.jobs to lubko_worker;
 ```
 
 The baseline migration `migrations/0001_two_column_protocol.sql` applies these

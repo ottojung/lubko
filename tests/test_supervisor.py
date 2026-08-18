@@ -39,6 +39,7 @@ from lubko.worker import (
     SchemaInvariantError,
     Settings,
     Supervisor,
+    collect_transport,
     delete_job_and_chunks,
     group_has_members,
     pg_safe_decode,
@@ -466,6 +467,94 @@ def test_worker_role_can_operate_on_a_fresh_install(
         ).fetchone()
     assert row is not None
     assert row[0] > 0
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute(RESET_WORKER_ROLE_SQL)
+
+
+def test_worker_role_can_run_gc_cleanup(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """The lubko_worker role can execute the GC collect_transport path.
+
+    Automatic transport garbage collection uses DELETE to remove terminal
+    roots and their owned chunks. The baseline migration must grant DELETE
+    so the worker role can exercise this authority on a fresh install.
+    """
+    with psycopg.connect(jobs_db) as conn:
+        conn.execute(RESET_WORKER_ROLE_SQL)
+        conn.execute("CREATE ROLE lubko_worker LOGIN")
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+
+    # Insert a terminal root with chunks as the worker role.
+    terminal_payload = json.dumps({
+        "v": 3,
+        "type": "command",
+        "request": {"cwd": str(tmp_path), "process": ["echo", "done"]},
+        "state": {
+            "status": "succeeded",
+            "finished_at": "2020-01-01T00:00:00.000000Z",
+            "worker_id": "old-worker",
+        },
+    })
+    with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (terminal_payload,),
+        ).fetchone()
+    assert row is not None
+    terminal_id = cast("UUID", row[0])
+
+    chunk_payload = json.dumps({
+        "v": 3,
+        "type": "output_chunk",
+        "thread": str(terminal_id),
+        "stream": "stdout",
+        "sequence": 0,
+        "start": 0,
+        "end": 5,
+        "value": "hello",
+        "previous": None,
+    })
+    with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
+        conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (chunk_payload,))
+
+    # collect_transport must succeed as the worker role (needs DELETE).
+    settings = Settings(
+        worker_id="test-worker",
+        poll_interval_seconds=0.05,
+        process_poll_interval_seconds=0.01,
+        cancel_grace_seconds=0.5,
+        lease_duration_seconds=1.0,
+        lease_refresh_interval_seconds=0.2,
+        lease_recovery_interval_seconds=0.1,
+        lease_safety_margin_seconds=0.2,
+        gc_retention_seconds=0.0,
+        gc_batch_limit=10,
+    )
+    with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
+        roots, _chunks, _orphans = collect_transport(conn, settings)
+
+    assert terminal_id in roots
+
+    # The terminal root and its chunk should be gone after drain.
+    for _ in range(10):
+        with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
+            collect_transport(conn, settings)
+        with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
+            row = conn.execute("SELECT 1 FROM lubko.jobs WHERE id = %s", (terminal_id,)).fetchone()
+        if row is None:
+            break
+    with psycopg.connect(_worker_conninfo(pg_cluster)) as conn:
+        remaining = conn.execute(
+            "SELECT count(*)::int FROM lubko.jobs "
+            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
+            "AND (payload::jsonb)->>'thread' = %s",
+            (str(terminal_id),),
+        ).fetchone()
+    assert remaining is not None
+    assert remaining[0] == 0
+
     with psycopg.connect(jobs_db) as conn:
         conn.execute(RESET_WORKER_ROLE_SQL)
 

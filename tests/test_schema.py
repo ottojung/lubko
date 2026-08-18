@@ -287,7 +287,7 @@ def test_baseline_migration_grants_worker_access() -> None:
     sql = _read_baseline_migration()
 
     assert "grant usage on schema lubko to lubko_worker" in sql
-    assert "grant select, insert, update on table lubko.jobs to lubko_worker" in sql
+    assert "grant select, insert, update, delete on table lubko.jobs to lubko_worker" in sql
     assert "to_regrole('lubko_worker')" in sql
 
 
@@ -362,7 +362,9 @@ def test_worker_role_access_is_part_of_the_binding() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "grant usage on schema lubko to lubko_worker" in protocol_doc
-    assert "grant select, insert, update on table lubko.jobs to lubko_worker" in protocol_doc
+    assert (
+        "grant select, insert, update, delete on table lubko.jobs to lubko_worker" in protocol_doc
+    )
     assert "lubko_worker" in readme
 
 

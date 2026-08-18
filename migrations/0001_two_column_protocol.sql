@@ -74,7 +74,7 @@ do $$
 begin
     if to_regrole('lubko_worker') is not null then
         execute 'grant usage on schema lubko to lubko_worker';
-        execute 'grant select, insert, update on table lubko.jobs to lubko_worker';
+        execute 'grant select, insert, update, delete on table lubko.jobs to lubko_worker';
     end if;
 end
 $$;
