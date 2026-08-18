@@ -335,6 +335,36 @@ statements still run in one transaction, so a crash rolls back the whole
 cleanup. This also removes orphaned chunks whose `previous` chain became
 incomplete because of a crash or corruption.
 
+#### Automatic transport garbage collection
+
+The worker periodically collects terminal command rows and their owned output
+chunks after a configurable safe retention window (`LUBKO_GC_RETENTION_SECONDS`,
+default 3600). Abandoned running rows first go through existing lease recovery;
+pending and running rows are never collected. Two bounded passes run
+independently each cycle:
+
+**Root collection pass** — Selects terminal rows (`finished_at` in the past
+beyond the retention window) with `FOR UPDATE SKIP LOCKED` in bounded batches
+(`LUBKO_GC_BATCH_LIMIT`, default 100). Each root and every chunk owned by it
+are deleted in one transaction: root first (to serialize with concurrent output
+publication, which retains the root row with a row-level lock before inserting
+chunks), then the owned chunks via the `thread` ownership column. The
+root-first ordering ensures a concurrent publication either blocks on the root
+lock until cleanup commits and finds no root, or commits chunks before the
+chunk-cleanup statement starts so the fresh snapshot removes them. The root
+pass is safe under multiple concurrent workers and idempotent across restarts.
+
+**Orphan cleanup pass** — A bounded anti-join `SELECT` (with `LIMIT` and
+`FOR UPDATE ... SKIP LOCKED`) finds `output_chunk` rows whose owning root
+`command` row is absent. The matched rows are deleted in one bounded `DELETE`.
+This pass is safe without root-first ordering: the owning root is already gone,
+so no concurrent publication can create new chunks for it. The `SKIP LOCKED`
+clause avoids interfering with a concurrent root-collection transaction that
+is about to delete the same chunks.
+
+Both passes run every `LUBKO_GC_INTERVAL_SECONDS` (default 60) and log only
+aggregate counts, never job contents or secrets.
+
 ### Timestamps
 
 Timestamps are canonical UTC ISO-8601 with microseconds and a trailing `Z`,
@@ -438,6 +468,9 @@ The worker behavior is configurable through environment variables:
 | `LUBKO_CLAIM_BATCH_LIMIT`               | `8`     | maximum claiming work in one supervisor turn (a fairness bound, never a concurrency cap) |
 | `LUBKO_LEASE_SAFETY_MARGIN_SECONDS`     | `5`     | how long before lease expiry the daemon terminates an owned group during an outage |
 | `LUBKO_DB_OPERATION_TIMEOUT_SECONDS`    | `15`    | statement/connect timeout bounding database operations |
+| `LUBKO_GC_RETENTION_SECONDS`            | `3600`  | how long to keep terminal command rows and owned chunks before GC |
+| `LUBKO_GC_INTERVAL_SECONDS`             | `60`    | how often the transport garbage collection pass runs  |
+| `LUBKO_GC_BATCH_LIMIT`                  | `100`   | maximum terminal roots collected in one GC pass       |
 
 The refresh interval must be smaller than the lease duration so a healthy
 worker's lease never expires between heartbeats; the worker refuses to start

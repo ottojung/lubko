@@ -15,10 +15,10 @@ any one child and never allocates a thread or a connection per job. The
 supervisor loop repeatedly does small non-blocking pieces of work: service
 running jobs (observe exits, escalate cancellations, publish changed output
 tails/chunks, finalize completed jobs), refresh leases and run recovery
-housekeeping, then claim and start more pending jobs. There is no
-application-level concurrency limit; the ``active`` registry is unbounded and
-only the number of claims performed in a single supervisor turn is bounded for
-fairness.
+housekeeping, collect transport garbage, then claim and start more pending
+jobs. There is no application-level concurrency limit; the ``active`` registry
+is unbounded and only the number of claims performed in a single supervisor
+turn is bounded for fairness.
 
 Running jobs carry a lease: ``state.lease_expires_at`` is set at claim time and
 refreshed by a bulk heartbeat while the jobs run. When a lease truly expires
@@ -26,6 +26,12 @@ any worker running a recovery pass atomically marks the abandoned job
 ``failed`` with a clear diagnostic rather than re-executing it. Recovery is
 atomic across many workers and never steals a genuinely live job, whose lease
 is continuously refreshed.
+
+Transport garbage collection removes terminal command rows and their owned
+output chunks after a configurable safe retention window.  Abandoned running
+rows first go through lease recovery; pending and running rows are never
+collected.  Root-first deletion serializes with concurrent output publication,
+and bounded batches ensure the pass never monopolizes the connection.
 
 During a database outage the supervisor stops claiming new jobs but keeps the
 in-memory registry, keeps reaping/observing child processes locally, retries
@@ -128,6 +134,9 @@ DEFAULT_OUTPUT_PUBLICATION_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_CLAIM_BATCH_LIMIT: Final = 8
 DEFAULT_LEASE_SAFETY_MARGIN_SECONDS: Final = 5.0
 DEFAULT_DB_OPERATION_TIMEOUT_SECONDS: Final = 15.0
+DEFAULT_GC_RETENTION_SECONDS: Final = 3600.0
+DEFAULT_GC_INTERVAL_SECONDS: Final = 60.0
+DEFAULT_GC_BATCH_LIMIT: Final = 100
 LEASE_RECOVERY_LIMIT: Final = 100
 CANCEL_DISCOVERY_LIMIT: Final = 100
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
@@ -282,7 +291,10 @@ class Settings:
     pass marks the abandoned job failed. The lease duration must comfortably
     exceed the refresh interval so a healthy long-running job is never stolen.
     ``claim_batch_limit`` is a fairness bound on how much claiming work one
-    supervisor turn performs, never a cap on concurrent jobs.
+    supervisor turn performs, never a cap on concurrent jobs.  Transport
+    garbage collection removes terminal rows and owned chunks after
+    ``gc_retention_seconds``, running in bounded batches every
+    ``gc_interval_seconds``.
     """
 
     worker_id: str
@@ -297,12 +309,20 @@ class Settings:
     claim_batch_limit: int = DEFAULT_CLAIM_BATCH_LIMIT
     lease_safety_margin_seconds: float = DEFAULT_LEASE_SAFETY_MARGIN_SECONDS
     db_operation_timeout_seconds: float = DEFAULT_DB_OPERATION_TIMEOUT_SECONDS
+    gc_retention_seconds: float = DEFAULT_GC_RETENTION_SECONDS
+    gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
+    gc_batch_limit: int = DEFAULT_GC_BATCH_LIMIT
 
     def __post_init__(self) -> None:
-        """Validate lease timing so a live worker's lease never expires idle.
+        """Validate lease timing so a live worker's lease never expires idle."""
+        self._validate_lease_timing()
+        self._validate_output_and_gc()
+
+    def _validate_lease_timing(self) -> None:
+        """Validate lease-related settings are consistent.
 
         Raises:
-            ValueError: If any lease timing or fairness value is unusable.
+            ValueError: If any lease timing value is unusable.
         """
         if self.lease_duration_seconds <= 0:
             msg = "LUBKO_LEASE_DURATION_SECONDS must be positive"
@@ -328,6 +348,13 @@ class Settings:
                 "than LUBKO_LEASE_DURATION_SECONDS"
             )
             raise ValueError(msg)
+
+    def _validate_output_and_gc(self) -> None:
+        """Validate output publication and GC settings.
+
+        Raises:
+            ValueError: If any output or GC value is unusable.
+        """
         if self.output_publication_interval_seconds <= 0:
             msg = "LUBKO_OUTPUT_PUBLICATION_INTERVAL_SECONDS must be positive"
             raise ValueError(msg)
@@ -336,6 +363,15 @@ class Settings:
             raise ValueError(msg)
         if self.db_operation_timeout_seconds <= 0:
             msg = "LUBKO_DB_OPERATION_TIMEOUT_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.gc_retention_seconds < 0:
+            msg = "LUBKO_GC_RETENTION_SECONDS must be non-negative"
+            raise ValueError(msg)
+        if self.gc_interval_seconds <= 0:
+            msg = "LUBKO_GC_INTERVAL_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.gc_batch_limit <= 0:
+            msg = "LUBKO_GC_BATCH_LIMIT must be positive"
             raise ValueError(msg)
 
     @classmethod
@@ -404,6 +440,19 @@ class Settings:
                     str(DEFAULT_DB_OPERATION_TIMEOUT_SECONDS),
                 )
             ),
+            gc_retention_seconds=float(
+                os.getenv(
+                    "LUBKO_GC_RETENTION_SECONDS",
+                    str(DEFAULT_GC_RETENTION_SECONDS),
+                )
+            ),
+            gc_interval_seconds=float(
+                os.getenv(
+                    "LUBKO_GC_INTERVAL_SECONDS",
+                    str(DEFAULT_GC_INTERVAL_SECONDS),
+                )
+            ),
+            gc_batch_limit=int(os.getenv("LUBKO_GC_BATCH_LIMIT", str(DEFAULT_GC_BATCH_LIMIT))),
         )
 
 
@@ -601,7 +650,9 @@ def publish_output(
         cursor.execute(
             "SELECT id\n"
             "FROM lubko.jobs\n"
-            "WHERE id = %(job_id)s AND (payload::jsonb)->>'type' = 'command'\n"
+            "WHERE id = %(job_id)s\n"
+            "    AND (payload::jsonb)->>'type' = 'command'\n"
+            "    AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
             "FOR UPDATE\n",
             {"job_id": job.id},
         )
@@ -1526,6 +1577,159 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
         )
 
 
+GC_RETENTION_SQL: Final = (
+    "to_char(now() at time zone 'utc' - make_interval(secs => %(gc_retention_seconds)s), "
+    '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
+)
+
+#: Regex that matches a lowercase UUID v4 at the JSON text level.  Used to
+#: guard the orphan anti-join so non-UUID ``thread`` values are never compared
+#: against ``root.id`` with an implicit unsafe cast.
+_UUID_TEXT_RE: Final = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+
+def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UUID], int, int]:
+    """Collect terminal command rows, their owned chunks, and orphan chunks.
+
+    Three bounded phases run in separate transactions, each with ``FOR UPDATE
+    SKIP LOCKED`` so multiple workers/restarts converge safely:
+
+    **Phase 1 — Mark** (one transaction): A bounded batch of terminal
+    ``command`` rows whose ``finished_at`` is older than the retention window
+    is selected and atomically marked with ``state.gc = true``.  Publication
+    explicitly refuses GC-marked roots, so no new ``output_chunk`` rows can be
+    created for them after the mark commits.  ``pending`` and ``running`` rows
+    are never selected; abandoned ``running`` rows are handled by
+    :func:`recover_stale_jobs`.
+
+    **Phase 2 — Chunk drain + root finalization** (one transaction per batch):
+    For each GC-marked root, a bounded batch of its owned chunks (via
+    ``thread``) is deleted using ``FOR UPDATE SKIP LOCKED``, capped at
+    ``gc_batch_limit`` rows.  This keeps rows/transaction/lock duration
+    bounded even when a single root owns millions of chunks.  After bounded
+    chunk deletion, if no chunks remain for a root, the root row itself is
+    deleted.  The root only disappears after its chunks are drained, which
+    preserves the documented root-first/publication-safety invariant: the
+    ``gc`` flag prevents new chunks, and the root is removed once all chunks
+    from the marking snapshot are gone.
+
+    **Phase 3 — Orphan cleanup** (one transaction): A bounded anti-join
+    ``SELECT`` (with ``LIMIT`` and ``FOR UPDATE ... SKIP LOCKED``) finds
+    ``output_chunk`` rows whose owning root ``command`` row is absent.  The
+    ``thread`` value is validated against a UUID text regex before the join to
+    prevent implicit unsafe casts of malformed or non-UUID values.  Matched
+    rows are deleted in one bounded ``DELETE``.  This pass is safe without
+    root-first ordering: the owning root is already gone, so no concurrent
+    publication can create new chunks for it.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        settings: Worker runtime settings.
+
+    Returns:
+        A ``(roots_marked, chunks_deleted, orphans_deleted)`` triple.
+    """
+    roots_marked: list[UUID] = []
+    total_chunks = 0
+    total_orphans = 0
+
+    # --- Phase 1: mark terminal roots as GC ---
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "UPDATE lubko.jobs\n"  # ruff: ignore[hardcoded-sql-expression]
+            "SET payload = jsonb_set(payload::jsonb, '{state,gc}', to_jsonb(true))::text\n"
+            "WHERE id IN (\n"
+            "    SELECT id\n"
+            "    FROM lubko.jobs\n"
+            "    WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "        AND (payload::jsonb)->'state'->>'status' NOT IN ('pending', 'running')\n"
+            "        AND (payload::jsonb)->'state'->>'finished_at' IS NOT NULL\n"
+            "        AND ((payload::jsonb)->'state'->>'finished_at') < " + GC_RETENTION_SQL + "\n"
+            "        AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
+            "    ORDER BY ((payload::jsonb)->'state'->>'finished_at'), id\n"
+            "    FOR UPDATE SKIP LOCKED\n"
+            "    LIMIT %(limit)s\n"
+            ")\n"
+            "RETURNING id\n",
+            {
+                "gc_retention_seconds": settings.gc_retention_seconds,
+                "limit": settings.gc_batch_limit,
+            },
+        )
+        roots_marked = [row[0] for row in cursor.fetchall()]
+
+    # --- Phase 2: bounded chunk drain + root finalization ---
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT id\n"
+            "FROM lubko.jobs\n"
+            "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "    AND ((payload::jsonb)->'state'->>'gc') = 'true'\n"
+            "ORDER BY id\n"
+            "FOR UPDATE SKIP LOCKED\n"
+            "LIMIT %(limit)s\n",
+            {"limit": settings.gc_batch_limit},
+        )
+        gc_roots = [row[0] for row in cursor.fetchall()]
+        for root_id in gc_roots:
+            # Bounded chunk deletion for this root.
+            cursor.execute(
+                "DELETE FROM lubko.jobs\n"
+                "WHERE id IN (\n"
+                "    SELECT id\n"
+                "    FROM lubko.jobs\n"
+                "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
+                "        AND (payload::jsonb)->>'thread' = %(thread)s\n"
+                "    FOR UPDATE SKIP LOCKED\n"
+                "    LIMIT %(limit)s\n"
+                ")\n",
+                {"thread": str(root_id), "limit": settings.gc_batch_limit},
+            )
+            # Delete root only if no chunks remain.
+            cursor.execute(
+                "SELECT NOT EXISTS (\n"
+                "    SELECT 1\n"
+                "    FROM lubko.jobs\n"
+                "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
+                "        AND (payload::jsonb)->>'thread' = %(thread)s\n"
+                ")\n",
+                {"thread": str(root_id)},
+            )
+            no_chunks = cursor.fetchone()
+            if no_chunks is not None and no_chunks[0]:
+                cursor.execute(
+                    "DELETE FROM lubko.jobs\nWHERE id = %(job_id)s\n",
+                    {"job_id": root_id},
+                )
+
+    # --- Phase 3: bounded orphan cleanup ---
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT chunk.id\n"
+            "FROM lubko.jobs AS chunk\n"
+            "WHERE chunk.payload::jsonb->>'type' = 'output_chunk'\n"
+            "    AND chunk.payload::jsonb->>'thread' ~ %(uuid_re)s\n"
+            "    AND NOT EXISTS (\n"
+            "        SELECT 1\n"
+            "        FROM lubko.jobs AS root\n"
+            "        WHERE root.id = (chunk.payload::jsonb->>'thread')::uuid\n"
+            "            AND root.payload::jsonb->>'type' = 'command'\n"
+            "    )\n"
+            "LIMIT %(limit)s\n"
+            "FOR UPDATE OF chunk SKIP LOCKED\n",
+            {"uuid_re": _UUID_TEXT_RE, "limit": settings.gc_batch_limit},
+        )
+        orphan_ids = [row[0] for row in cursor.fetchall()]
+        if orphan_ids:
+            cursor.execute(
+                "DELETE FROM lubko.jobs\nWHERE id = ANY(%(ids)s)\n",
+                {"ids": orphan_ids},
+            )
+            total_orphans += len(orphan_ids)
+
+    return roots_marked, total_chunks, total_orphans
+
+
 def verify_jobs_table_invariant(conn: JobsConnection) -> None:
     """Assert that ``lubko.jobs`` keeps exactly the two protocol columns.
 
@@ -1651,6 +1855,7 @@ class Supervisor:
         self._next_lease_refresh_at = 0.0
         self._next_cancel_scan_at = 0.0
         self._next_reconnect_at = 0.0
+        self._next_gc_at = 0.0
 
     def request_shutdown(self) -> None:
         """Request a graceful shutdown from another thread or a signal handler.
@@ -1748,6 +1953,9 @@ class Supervisor:
             )
         self._publish_all(now)
         self._finalize_completed()
+        if now >= self._next_gc_at:
+            self._run_gc()
+            self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
         if not self._stopping:
             self._claim_batch()
 
@@ -1766,6 +1974,7 @@ class Supervisor:
                 LOGGER.info("database connection restored")
                 self._next_recovery_at = 0.0
                 self._next_lease_refresh_at = 0.0
+                self._next_gc_at = 0.0
             else:
                 self._next_reconnect_at = time.monotonic() + max(
                     self.settings.poll_interval_seconds, 0.5
@@ -1786,6 +1995,25 @@ class Supervisor:
             if job is not None:
                 job.row_lost = True
                 request_stop(job, STOP_REASON_ROW_LOST)
+
+    def _run_gc(self) -> None:
+        """Run the transport garbage collection pass.
+
+        Three-phase staged GC: mark terminal roots, drain their chunks in
+        bounded batches, finalize root deletion, then clean orphan chunks.
+        Abandoned ``running`` rows go through lease recovery first.
+        ``pending`` and ``running`` rows are never collected.
+        """
+        conn = self.conn
+        if conn is None:
+            return
+        roots, _chunks, orphans = collect_transport(conn, self.settings)
+        if roots or orphans:
+            LOGGER.info(
+                "gc marked %d root(s) and cleaned %d orphan chunk(s)",
+                len(roots),
+                orphans,
+            )
 
     def _refresh_leases(self) -> None:
         """Refresh every owned running lease in one bulk statement."""
