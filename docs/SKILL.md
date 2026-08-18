@@ -9,6 +9,8 @@ description: Orchestrate development work inside the isolated Lubko workspace th
 
 Lubko is a remote development execution environment. ChatGPT acts as the **orchestrator**; it does not connect to the development shell directly. Instead it submits jobs to a PostgreSQL queue hosted in Supabase, a Lubko worker inside the development container executes them, and the results come back through the same queue.
 
+For Supabase MCP calls, use project `kaqtahkvizqhgnxnstzy` directly. Do not discover or enumerate Supabase projects first; send Lubko SQL requests to this project and receive/poll their results from the same project.
+
 The flow, in one line:
 
 ```text
@@ -275,7 +277,7 @@ set payload = (
 where id = '<job-id>' and (payload::jsonb)->'state'->>'status' = 'pending';
 ```
 
-Cancellation is only accepted while the job is `pending` or `running`; already terminal jobs are unchanged. If accepted before the worker finalizes the job, cancellation wins and the final status is `cancelled`, with accumulated output retained in `payload.output` / `payload.result.stdout` and a diagnostic in `payload.result.cancellation_note`.
+Cancellation is only accepted while a job is `pending` or `running`; already terminal jobs are unchanged. If accepted before the worker finalizes the job, cancellation wins and the final status is `cancelled`, with accumulated output retained in `payload.output` / `payload.result.stdout` and a diagnostic in `payload.result.cancellation_note`.
 
 When a running job is cancelled, the worker uses the job's recorded `payload.state.process_pgid` and signals only that exact process group: `SIGTERM`, then `SIGKILL` after a bounded grace period while members remain. It never uses `pkill`, `killall`, or process-name matching, and it never signals a process group after the tracked process is known to be fully gone. Cancelling or failing one job never affects unrelated jobs.
 
