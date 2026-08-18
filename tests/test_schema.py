@@ -18,6 +18,7 @@ from lubko.worker import (
     verify_jobs_table_invariant,
     verify_protocol_schema,
 )
+from tests import _pg
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR: Final = REPO_ROOT / "migrations"
@@ -452,3 +453,146 @@ def test_verify_protocol_schema_rejects_non_canonical_shape() -> None:
 
     with pytest.raises(SchemaInvariantError, match=r"0001_two_column_protocol\.sql"):
         verify_protocol_schema(conn)
+
+
+# ---------------------------------------------------------------------------
+# Incremental migration 0002: DELETE grant for GC
+# ---------------------------------------------------------------------------
+
+GC_MIGRATION: Final = MIGRATIONS_DIR / "0002_grant_transport_gc_delete.sql"
+
+
+def _read_gc_migration() -> str:
+    """Read the incremental GC migration SQL text.
+
+    Returns:
+        The migration file contents.
+    """
+    return GC_MIGRATION.read_text(encoding="utf-8")
+
+
+def test_gc_migration_grants_delete_only() -> None:
+    """Migration 0002 grants exactly DELETE, not broader privileges."""
+    sql = _read_gc_migration()
+
+    assert "grant delete on table lubko.jobs to lubko_worker" in sql
+    # Must not grant SELECT/INSERT/UPDATE (those belong in 0001).
+    assert "grant select" not in sql
+    assert "grant insert" not in sql
+    assert "grant update" not in sql
+
+
+def test_gc_migration_is_idempotent() -> None:
+    """Migration 0002 uses guarded GRANT safe to re-apply."""
+    sql = _read_gc_migration()
+
+    assert "to_regrole('lubko_worker')" in sql
+    assert "grant delete" in sql
+
+
+def test_gc_migration_does_not_alter_table() -> None:
+    """Migration 0002 contains no DDL that alters the transport table."""
+    sql = _read_gc_migration()
+
+    assert "alter table" not in sql.lower()
+    assert "create table" not in sql.lower()
+    assert "create index" not in sql.lower()
+
+
+def test_baseline_and_gc_migration_combined_grant() -> None:
+    """Fresh install applying both 0001 and 0002 gets SELECT/INSERT/UPDATE/DELETE.
+
+    The two migrations are composable: 0001 provides the full baseline and
+    0002 adds only the missing DELETE for existing installations.
+    """
+    baseline = _read_baseline_migration()
+    gc = _read_gc_migration()
+
+    # 0001 has SELECT/INSERT/UPDATE/DELETE.
+    assert "grant select, insert, update, delete on table lubko.jobs to lubko_worker" in baseline
+    # 0002 has DELETE only.
+    assert "grant delete on table lubko.jobs to lubko_worker" in gc
+    # Together they are idempotent and do not conflict.
+    combined = baseline + "\n" + gc
+    assert combined.count("grant delete") >= 1
+
+
+# ---------------------------------------------------------------------------
+# Real PostgreSQL upgrade regression
+# ---------------------------------------------------------------------------
+
+
+def test_gc_migration_upgrades_existing_install(
+    pg_cluster: _pg.PgCluster,
+) -> None:
+    """Apply 0002 on an existing-install state and verify DELETE is granted.
+
+    Simulates an existing installation that applied 0001 before the GC
+    feature: the role exists with SELECT/INSERT/UPDATE but not DELETE.
+    After applying 0002, ``has_table_privilege`` confirms DELETE is granted.
+    Re-applying 0002 proves idempotency.  Existing privileges are unchanged.
+    """
+    conninfo = pg_cluster.conninfo()
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute("DROP SCHEMA IF EXISTS lubko CASCADE")
+        conn.execute("CREATE SCHEMA lubko")
+        conn.execute(
+            "CREATE TABLE lubko.jobs ("
+            "id uuid primary key default gen_random_uuid(),"
+            "payload text not null"
+            ")"
+        )
+        conn.execute("DROP ROLE IF EXISTS lubko_worker")
+        conn.execute("CREATE ROLE lubko_worker LOGIN")
+        # Apply baseline without DELETE (simulates pre-GC install).
+        conn.execute("grant usage on schema lubko to lubko_worker")
+        conn.execute("grant select, insert, update on table lubko.jobs to lubko_worker")
+
+    # Verify DELETE is not yet granted.
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "SELECT has_table_privilege('lubko_worker', 'lubko.jobs', 'DELETE')"
+        ).fetchone()
+    assert row is not None
+    assert row[0] is False
+
+    # Apply migration 0002.
+    with psycopg.connect(conninfo) as conn:
+        conn.execute(_read_gc_migration())
+
+    # Verify DELETE is now granted.
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "SELECT has_table_privilege('lubko_worker', 'lubko.jobs', 'DELETE')"
+        ).fetchone()
+    assert row is not None
+    assert row[0] is True
+
+    # Verify existing privileges are unchanged.
+    with psycopg.connect(conninfo) as conn:
+        for priv in ("SELECT", "INSERT", "UPDATE"):
+            row = conn.execute(
+                "SELECT has_table_privilege('lubko_worker', 'lubko.jobs', %s)",
+                (priv,),
+            ).fetchone()
+            assert row is not None
+            assert row[0] is True, f"{priv} should still be granted"
+
+    # Re-apply 0002 to prove idempotency.
+    with psycopg.connect(conninfo) as conn:
+        conn.execute(_read_gc_migration())
+
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "SELECT has_table_privilege('lubko_worker', 'lubko.jobs', 'DELETE')"
+        ).fetchone()
+    assert row is not None
+    assert row[0] is True
+
+    # Cleanup.
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("REVOKE DELETE ON lubko.jobs FROM lubko_worker")
+        conn.execute("REVOKE SELECT, INSERT, UPDATE ON lubko.jobs FROM lubko_worker")
+        conn.execute("REVOKE USAGE ON SCHEMA lubko FROM lubko_worker")
+        conn.execute("DROP ROLE IF EXISTS lubko_worker")

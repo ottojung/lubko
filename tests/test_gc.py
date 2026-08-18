@@ -316,16 +316,17 @@ def test_collect_transport_returns_empty_on_no_work() -> None:
     assert orphans == 0
 
 
-def test_collect_transport_orphan_pass_validates_uuid() -> None:
-    """Phase 3 validates thread values are UUIDs before the anti-join."""
+def test_collect_transport_orphan_pass_uses_case_safe_cast() -> None:
+    """Phase 3 uses CASE-safe cast so malformed thread never raises."""
     conn = _RecordingConnection()
     conn.rows = [[], [], []]  # Phase 1, 2, 3
 
     collect_transport(_as_db(conn), _make_settings())
 
     sql = conn.executions[2][0]
-    assert "~" in sql  # UUID regex validation
-    assert "uuid" in sql  # explicit cast for the join
+    assert "CASE" in sql  # CASE guard for safe cast
+    assert "~" in sql  # UUID regex inside CASE WHEN
+    assert "uuid" in sql  # cast inside CASE THEN
 
 
 def test_collect_transport_orphan_pass_uses_for_update_skip_locked() -> None:
@@ -1053,93 +1054,63 @@ def test_gc_does_not_mark_running_status(db: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_gc_orphan_pass_skips_malformed_thread(db: str) -> None:
-    """Chunks with non-UUID thread text are safely skipped, not crashed.
+def test_gc_orphan_pass_cleans_malformed_thread(db: str) -> None:
+    """Malformed/empty/non-UUID thread chunks are orphans and get cleaned.
 
-    The orphan anti-join uses CASE-safe cast so malformed thread values
-    never cause a cast error.
+    The CASE-safe cast inside NOT EXISTS means non-UUID thread text
+    produces NULL, so root.id = NULL is never true, NOT EXISTS is true,
+    and the chunk is correctly treated as an orphan with no possible owner.
+    No cast error is ever raised regardless of planner predicate order.
     """
-    # Insert a chunk with completely invalid thread text.
-    bad_payload = json.dumps({
-        "v": 3,
-        "type": "output_chunk",
-        "thread": "not-a-uuid-at-all",
-        "stream": "stdout",
-        "sequence": 0,
-        "start": 0,
-        "end": 5,
-        "value": "hello",
-        "previous": None,
-    })
-    with psycopg.connect(db) as conn:
-        row = conn.execute(
-            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (bad_payload,)
-        ).fetchone()
-    assert row is not None
-    bad_id = cast("UUID", row[0])
+    # Insert chunks with various malformed thread values.
+    cases = [
+        ("not-a-uuid-at-all", "malformed"),
+        ("", "empty"),
+        ("ABCDEF01-2345-4321-ABCD-EF0123456789", "uppercase"),
+        ("12345", "short"),
+        ("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz", "non-hex"),
+    ]
+    chunk_ids: list[UUID] = []
+    for thread_val, _label in cases:
+        payload = json.dumps({
+            "v": 3,
+            "type": "output_chunk",
+            "thread": thread_val,
+            "stream": "stdout",
+            "sequence": 0,
+            "start": 0,
+            "end": 5,
+            "value": "hello",
+            "previous": None,
+        })
+        with psycopg.connect(db) as conn:
+            row = conn.execute(
+                "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (payload,)
+            ).fetchone()
+        assert row is not None
+        chunk_ids.append(cast("UUID", row[0]))
 
-    # Insert a chunk with uppercase UUID (valid format, different case).
-    upper_id = uuid4()
-    upper_payload = json.dumps({
-        "v": 3,
-        "type": "output_chunk",
-        "thread": str(upper_id).upper(),
-        "stream": "stdout",
-        "sequence": 0,
-        "start": 0,
-        "end": 5,
-        "value": "hello",
-        "previous": None,
-    })
-    with psycopg.connect(db) as conn:
-        row = conn.execute(
-            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (upper_payload,)
-        ).fetchone()
-    assert row is not None
-    upper_chunk_id = cast("UUID", row[0])
-
-    # Insert a chunk with empty thread.
-    empty_payload = json.dumps({
-        "v": 3,
-        "type": "output_chunk",
-        "thread": "",
-        "stream": "stdout",
-        "sequence": 0,
-        "start": 0,
-        "end": 5,
-        "value": "hello",
-        "previous": None,
-    })
-    with psycopg.connect(db) as conn:
-        row = conn.execute(
-            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (empty_payload,)
-        ).fetchone()
-    assert row is not None
-    empty_id = cast("UUID", row[0])
-
-    # GC orphan pass must not crash and must skip all three.
+    # GC orphan pass must not crash and must clean all five.
     settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=100)
     with psycopg.connect(db) as conn:
         _roots, _chunks, orphans = collect_transport(conn, settings)
 
-    # None of these should be cleaned (no valid owning root exists, but
-    # they're also not valid UUIDs so the CASE returns NULL).
-    assert _row_exists(db, bad_id)
-    assert _row_exists(db, upper_chunk_id)
-    assert _row_exists(db, empty_id)
-    # The orphan count should be 0 since none matched the CASE-safe path.
+    assert orphans == 5
+    for cid in chunk_ids:
+        assert not _row_exists(db, cid), f"chunk {cid} should be cleaned"
+
+
+def test_gc_orphan_pass_retains_valid_owned_chunks(db: str) -> None:
+    """Chunks with valid UUID thread and an existing root are NOT orphans."""
+    root_id = _insert_terminal_job(db, finished_at="2099-01-01T00:00:00.000000Z")
+    chunk = _insert_output_chunk(db, root_id, sequence=0)
+
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=100)
+    with psycopg.connect(db) as conn:
+        _roots, _chunks, orphans = collect_transport(conn, settings)
+
     assert orphans == 0
-
-
-def test_gc_orphan_pass_cleans_valid_uuid_orphan(db: str) -> None:
-    """Chunks with valid UUID thread but no owning root are cleaned."""
-    dangling = uuid4()
-    orphan = _insert_orphan_chunk(db, dangling)
-    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=100)
-    with psycopg.connect(db) as conn:
-        _roots, _chunks, orphans = collect_transport(conn, settings)
-    assert orphans == 1
-    assert not _row_exists(db, orphan)
+    assert _row_exists(db, chunk)
 
 
 # ---------------------------------------------------------------------------
@@ -1266,3 +1237,81 @@ def test_gc_concurrent_publish_then_mark(db: str) -> None:
     assert published is False
 
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Uppercase canonical UUID thread: must be recognised and retained
+# ---------------------------------------------------------------------------
+
+
+def test_gc_orphan_retains_uppercase_thread_with_existing_root(db: str) -> None:
+    """A chunk whose thread is an uppercase UUID and whose root exists is retained.
+
+    PostgreSQL UUID input is case-insensitive, so the CASE regex must accept
+    canonical upper/lower hex.  The chunk is not an orphan and must not be
+    deleted.
+    """
+    root_id = _insert_terminal_job(db, finished_at="2099-01-01T00:00:00.000000Z")
+    payload = json.dumps({
+        "v": 3,
+        "type": "output_chunk",
+        "thread": str(root_id).upper(),
+        "stream": "stdout",
+        "sequence": 0,
+        "start": 0,
+        "end": 5,
+        "value": "hello",
+        "previous": None,
+    })
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (payload,)
+        ).fetchone()
+    assert row is not None
+    chunk_id = cast("UUID", row[0])
+
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=100)
+    with psycopg.connect(db) as conn:
+        _roots, _chunks, orphans = collect_transport(conn, settings)
+
+    assert orphans == 0
+    assert _row_exists(db, chunk_id)
+
+
+def test_gc_orphan_deletes_malformed_with_no_owner(db: str) -> None:
+    """Malformed/empty thread chunks are deleted even when other roots exist.
+
+    A chunk with thread 'not-a-uuid' has no possible owner.  The CASE
+    returns NULL, NOT EXISTS is true, and the chunk is correctly cleaned.
+    Other valid owned chunks in the table are not affected.
+    """
+    # A valid root with a valid chunk — must be retained.
+    valid_root = _insert_terminal_job(db, finished_at="2099-01-01T00:00:00.000000Z")
+    valid_chunk = _insert_output_chunk(db, valid_root, sequence=0)
+
+    # A malformed chunk — must be deleted.
+    bad_payload = json.dumps({
+        "v": 3,
+        "type": "output_chunk",
+        "thread": "not-a-uuid",
+        "stream": "stdout",
+        "sequence": 0,
+        "start": 0,
+        "end": 5,
+        "value": "garbage",
+        "previous": None,
+    })
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (bad_payload,)
+        ).fetchone()
+    assert row is not None
+    bad_id = cast("UUID", row[0])
+
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=100)
+    with psycopg.connect(db) as conn:
+        _roots, _chunks, orphans = collect_transport(conn, settings)
+
+    assert orphans == 1
+    assert not _row_exists(db, bad_id)
+    assert _row_exists(db, valid_chunk)

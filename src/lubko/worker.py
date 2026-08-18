@@ -1582,10 +1582,12 @@ GC_RETENTION_SQL: Final = (
     '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
 )
 
-#: Regex that matches a lowercase UUID v4 at the JSON text level.  Used to
-#: guard the orphan anti-join so non-UUID ``thread`` values are never compared
-#: against ``root.id`` with an implicit unsafe cast.
-_UUID_TEXT_RE: Final = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+#: Regex that matches a canonical UUID at the JSON text level (case-insensitive
+#: hex).  Used as the CASE WHEN guard inside the orphan anti-join so the
+#: ``::uuid`` cast is only attempted on recognisable UUID text.
+_UUID_TEXT_RE: Final = (
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UUID], int, int]:
@@ -1706,17 +1708,27 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 )
 
     # --- Phase 3: bounded orphan cleanup ---
+    # The CASE inside NOT EXISTS is the sole safety mechanism against
+    # malformed/non-UUID thread text.  The WHEN clause checks the regex
+    # before attempting the ::uuid cast, so PostgreSQL can never evaluate
+    # the cast on non-UUID text regardless of planner predicate reordering.
+    # Malformed/empty thread text makes the CASE return NULL, which means
+    # root.id = NULL is never true, so NOT EXISTS is true and the chunk
+    # is correctly treated as an orphan (no possible owner exists).
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT chunk.id\n"
             "FROM lubko.jobs AS chunk\n"
             "WHERE chunk.payload::jsonb->>'type' = 'output_chunk'\n"
-            "    AND chunk.payload::jsonb->>'thread' ~ %(uuid_re)s\n"
             "    AND NOT EXISTS (\n"
             "        SELECT 1\n"
             "        FROM lubko.jobs AS root\n"
-            "        WHERE root.id =\n"
-            "            (chunk.payload::jsonb->>'thread')::uuid\n"
+            "        WHERE root.id = CASE\n"
+            "            WHEN chunk.payload::jsonb->>'thread'\n"
+            "                ~ %(uuid_re)s\n"
+            "            THEN\n"
+            "                (chunk.payload::jsonb->>'thread')::uuid\n"
+            "            ELSE NULL END\n"
             "            AND root.payload::jsonb->>'type' = 'command'\n"
             "    )\n"
             "LIMIT %(limit)s\n"
