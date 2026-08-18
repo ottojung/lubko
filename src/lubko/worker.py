@@ -2945,10 +2945,21 @@ def main(argv: list[str] | None = None) -> int:
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
     LOGGER.info(
-        "worker starting: worker_id=%s incarnation=%s pid=%d",
+        "worker starting: worker_id=%s incarnation=%s pid=%d "
+        "poll=%.1fs process_poll=%.1fs "
+        "lease=%.1fs lease_refresh=%.1fs lease_recovery=%.1fs "
+        "output_pub=%.1fs claim_batch=%d health_pub=%.1fs",
         settings.worker_id,
         settings.worker_incarnation,
         os.getpid(),
+        settings.poll_interval_seconds,
+        settings.process_poll_interval_seconds,
+        settings.lease_duration_seconds,
+        settings.lease_refresh_interval_seconds,
+        settings.lease_recovery_interval_seconds,
+        settings.output_publication_interval_seconds,
+        settings.claim_batch_limit,
+        settings.health_publish_interval_seconds,
     )
     supervisor = Supervisor(settings, database)
 

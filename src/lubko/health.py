@@ -466,6 +466,48 @@ def _read_health_file(path: Path) -> WorkerHealth | None:
 
 
 # ---------------------------------------------------------------------------
+# Bounded disk: prune old incarnation artifacts
+# ---------------------------------------------------------------------------
+
+
+def prune_old_incarnation_artifacts(current_token: str) -> None:
+    """Best-effort remove health/log files from older incarnations.
+
+    Retains the current incarnation's ``health-{token}.json``,
+    ``worker-{token}.log``, and its rotation backups (``.1``, ``.2``, ...).
+    Everything else matching the known filename patterns in the health and
+    logs directories is removed.  Failures are logged as warnings and never
+    undo the current stable surfaces.
+
+    Args:
+        current_token: The confirmed incarnation token to keep.
+    """
+    _prune_dir(_health_dir(), f"health-{current_token}.json", "health-*.json")
+    _prune_dir(_logs_dir(), f"worker-{current_token}.log", "worker-*.log*")
+
+
+def _prune_dir(directory: Path, keep_prefix: str, pattern: str) -> None:
+    """Remove files matching ``pattern`` that do not start with ``keep_prefix``.
+
+    Args:
+        directory: The directory to scan.
+        keep_prefix: Filename prefix to retain (e.g. ``health-abc.json``).
+        pattern: Glob pattern for candidate files.
+    """
+    if not directory.is_dir():
+        return
+    for entry in directory.glob(pattern):
+        if not entry.is_file():
+            continue
+        if entry.name == keep_prefix or entry.name.startswith(keep_prefix + "."):
+            continue
+        try:
+            entry.unlink()
+        except OSError:
+            LOGGER.warning("could not prune old artifact %s", entry, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Liveness interpretation
 # ---------------------------------------------------------------------------
 
@@ -663,13 +705,14 @@ def install_worker_exception_hooks() -> None:
     in the worker log rather than silently lost.
     """
     default_hook = sys.excepthook
+    worker_logger = logging.getLogger("lubko.worker")
 
     def _log_exception(
         exc_type: type[BaseException],
         exc_value: BaseException,
         exc_traceback: TracebackType | None,
     ) -> None:
-        LOGGER.error("Unhandled exception: %s", exc_value)
+        worker_logger.error("Unhandled exception: %s", exc_value)
         default_hook(exc_type, exc_value, exc_traceback)
 
     sys.excepthook = _log_exception

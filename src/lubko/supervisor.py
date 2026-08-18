@@ -77,6 +77,8 @@ from typing import TYPE_CHECKING, Final
 
 from lubko import cli, deployctl, lifecycle, supervise
 from lubko.health import (
+    interpret_worker_health,
+    prune_old_incarnation_artifacts,
     publish_current_surfaces,
     read_worker_health,
     read_worker_health_by_incarnation,
@@ -359,6 +361,7 @@ class SupervisorDaemon:
         Args:
             now: Monotonic time at the start of the turn.
         """
+        self._message = None
         desired = read_desired()
         state = read_state()
         action, commit = self._derive_action(state)
@@ -727,6 +730,7 @@ class SupervisorDaemon:
         lifecycle.append_deploy_log(
             f"supervisor verified worker pid={child.pid} consumes the queue"
         )
+        prune_old_incarnation_artifacts(child.token)
 
     def _check_readiness(
         self,
@@ -757,12 +761,10 @@ class SupervisorDaemon:
                 f"snapshot ticks {snapshot.start_time_ticks} != child {child.start_time_ticks}",
             )
         if snapshot.worker_incarnation != child.token:
-            inc = snapshot.worker_incarnation
-            return (
-                False,
-                f"snapshot incarnation {inc!r} != child token {child.token!r}",
-            )
-        return True, "ok"
+            inc, tok = snapshot.worker_incarnation, child.token
+            return (False, f"snapshot incarnation {inc!r} != child token {tok!r}")
+        eff = interpret_worker_health(snapshot)
+        return (True, "ok") if eff.live else (False, f"worker health not live: {eff.reason}")
 
     def _record_not_ready(
         self,
