@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from lubko import lifecycle
 from lubko.state import rollback_state_path, state_root
 
 if TYPE_CHECKING:
@@ -927,6 +928,39 @@ def _read_cmdline(pid: int) -> str:
     except OSError:
         return ""
     return " ".join(part.decode("utf-8", "replace") for part in raw.split(b"\0") if part)
+
+
+def child_alive(child: WorkerChild) -> bool:
+    """Return whether the recorded worker child identity is genuinely live.
+
+    A child is only trusted when its exact identity (PID, start-time ticks)
+    matches a live, non-zombie process.  This prevents stale state left by a
+    hard-killed supervisor from being mistaken for a live candidate.
+
+    Args:
+        child: The exact worker child identity to verify.
+
+    Returns:
+        ``True`` when the exact identity matches a live non-zombie process.
+    """
+    meta = lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=child.pid,
+        pgid=child.pgid,
+        sid=child.sid,
+        start_time_ticks=child.start_time_ticks,
+        token=child.token,
+        repo="",
+        git_commit=None,
+        worker_id=child.worker_id,
+        log_path="",
+        started_at=child.spawned_at,
+        stopped_at=None,
+    )
+    if not lifecycle.worker_alive(meta):
+        return False
+    return proc_start_ticks(child.pid) == child.start_time_ticks
 
 
 def supervisor_running() -> bool:

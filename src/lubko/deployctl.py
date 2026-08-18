@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
-ROLLBACK_SCHEMA_VERSION: Final = 2
+ROLLBACK_SCHEMA_VERSION: Final = 3
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
@@ -140,6 +140,7 @@ class RollbackState:
     previous_retiring: bool
     previous_meta: WorkerMeta
     new_meta: WorkerMeta
+    supervisor_owned: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize durable rollback state.
@@ -162,6 +163,7 @@ class RollbackState:
             "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
             "new_meta": self.new_meta.to_dict(),
+            "supervisor_owned": self.supervisor_owned,
         }
 
     @classmethod
@@ -200,6 +202,7 @@ class RollbackState:
                 previous_retiring=data.get("previous_retiring", False) is True,
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
+                supervisor_owned=data.get("supervisor_owned", False) is True,
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervised deployment state is malformed"
@@ -329,7 +332,9 @@ def _supervised_mission_active(state: RollbackState) -> bool:
 
     In supervised mode the candidate identity lives in the supervisor's durable
     state, so a mission is active exactly when the supervisor tracks that exact
-    candidate commit as its live child at or after the mission generation.
+    candidate commit as its live child at or after the mission generation.  The
+    child's exact process identity (PID and start-time ticks) is proven live so
+    stale state left by a hard-killed supervisor is never treated as active.
 
     Args:
         state: Pending supervised-deployment mission.
@@ -342,6 +347,7 @@ def _supervised_mission_active(state: RollbackState) -> bool:
     return (
         supervisor_state.commit == state.commit
         and supervisor_state.child is not None
+        and supervise.child_alive(supervisor_state.child)
         and supervisor_state.applied_generation >= state.generation
     )
 
@@ -1085,6 +1091,13 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
     consumer live, so it never fights the supervisor's own bounded restart of a
     transiently crashed candidate.
 
+    For supervisor-owned missions the watchdog never takes the legacy direct
+    worker retire/restore path: when the supervisor is temporarily absent during
+    a pending mission, the watchdog fails closed and leaves the durable
+    desired/mission state unchanged so a replacement supervisor can resume the
+    candidate.  Legacy (non-supervisor-owned) missions still use the original
+    rollback semantics.
+
     Args:
         lock_timeout_seconds: Deployment-lock timeout for rollback attempts.
     """
@@ -1100,6 +1113,8 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
                 state
             )
+        elif state.supervisor_owned:
+            should_rollback = False
         else:
             should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
         if should_rollback:
@@ -1301,6 +1316,7 @@ def _prepare_locked(
         previous_retiring=False,
         previous_meta=previous,
         new_meta=new_meta,
+        supervisor_owned=supervised,
     )
     if not supervised:
         _publish_legacy_mission(state, gated, options.lock_timeout_seconds)

@@ -2377,3 +2377,127 @@ def test_old_status_schema_without_start_time_ticks_fails_closed(
     temporary.write_text(json.dumps(legacy_data, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(supervise.status_path())
     assert supervise.read_status() is None
+
+
+# ---------------------------------------------------------------------------
+# Acceptance: deterministic SIGKILL regression and replacement recovery (#91)
+# ---------------------------------------------------------------------------
+
+
+def test_supervisor_hard_kill_pending_candidate_replacement_resumes(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """Deterministic SIGKILL regression: supervisor hard-killed while pending candidate.
+
+    The supervisor is hard-killed while a pending mission is active.  The orphan
+    candidate identity is handled safely (no legacy fallback, no duplicate
+    worker).  A replacement supervisor starts and resumes the candidate commit
+    from the durable pending mission state.  The mission generation and desired
+    generation remain unchanged through the gap.
+    """
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    first_proc = start_supervisor(supervisor_env)
+    try:
+        applied = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        dc.publish_mission(
+            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            lock_timeout_seconds=5.0,
+        )
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+        first_candidate = worker_pid()
+        assert first_candidate is not None
+        assert process_alive(first_candidate)
+
+        first_proc.kill()
+        first_proc.wait(timeout=5)
+        guard.unregister(first_proc)
+        assert not process_alive(first_proc.pid)
+
+        mission = dc.read_rollback_state()
+        assert mission is not None
+        assert mission.status == dc.STATUS_PENDING
+        assert mission.commit == second
+        assert mission.generation == applied + 1
+
+        second_proc = start_supervisor(supervisor_env)
+        try:
+            wait_until(lambda: worker_pid() is not None, timeout=30.0)
+            wait_until(status_ready, timeout=30.0)
+            resumed_pid = worker_pid()
+            assert resumed_pid is not None
+            status = supervise.read_status()
+            assert status is not None
+            assert status.commit == second
+            assert len(direct_children(status.supervisor_pid)) == 1
+
+            write_rollback(
+                mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+            )
+        finally:
+            stop_supervisor(second_proc)
+    finally:
+        if first_proc.poll() is None:
+            stop_supervisor(first_proc)
+
+
+def test_supervisor_restart_resumes_mission_repeated(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """Repeated supervisor restart-resume cycles are stable.
+
+    A pending mission survives multiple supervisor restart cycles without
+    state mutation or duplicate workers.  Each restart reconstructs the
+    candidate from durable state, and the mission remains pending throughout.
+    """
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+
+    for _cycle in range(3):
+        with running_supervisor(supervisor_env):
+            current_applied = supervise.read_state().applied_generation
+            dc.publish_mission(
+                mission_state(
+                    current_applied + 1,
+                    dc.STATUS_PENDING,
+                    second,
+                    first,
+                    repo=str(repo),
+                ),
+                lock_timeout_seconds=5.0,
+            )
+            wait_until(status_ready, timeout=30.0)
+            candidate = worker_pid()
+            assert candidate is not None
+            assert process_alive(candidate)
+
+        status = supervise.read_status()
+        if status is not None:
+            assert status.commit == second
+            mission = dc.read_rollback_state()
+            assert mission is not None
+            assert mission.status == dc.STATUS_PENDING
+            assert mission.commit == second
+            assert mission.generation > applied
+
+    write_rollback(
+        mission_state(
+            supervise.read_state().applied_generation,
+            dc.STATUS_CONFIRMED,
+            second,
+            first,
+            repo=str(repo),
+        )
+    )

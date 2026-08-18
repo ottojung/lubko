@@ -725,6 +725,7 @@ def test_status_keeps_live_supervised_pending_mission(
     current: list[dc.RollbackState] = [state]
 
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: True)
     monkeypatch.setattr(
         supervise,
         "read_state",
@@ -812,6 +813,7 @@ def test_status_rolls_back_supervised_mission_after_deadline(
     states = iter((state, rolled_back))
 
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: True)
     monkeypatch.setattr(
         supervise,
         "read_state",
@@ -3684,3 +3686,114 @@ def test_end_to_end_full_deployment_stays_hermetic(
     assert state_root().is_relative_to(test_tmp)
     resolved_home = Path(os.environ["XDG_STATE_HOME"]).resolve()
     assert resolved_home.is_relative_to(test_tmp)
+
+
+# ---------------------------------------------------------------------------
+# Unit regressions: supervisor-owned mission invariants (#91)
+# ---------------------------------------------------------------------------
+
+
+def test_stale_child_identity_not_considered_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded supervisor child whose exact identity is dead returns inactive.
+
+    After a hard-killed supervisor the durable state.json may still carry a
+    child record that is no longer live.  ``_supervised_mission_active`` must
+    prove the child's exact PID and start-time ticks are alive before treating
+    the mission as active.
+    """
+    state = pending_state()
+    stale_child = supervise.WorkerChild(
+        pid=4242,
+        pgid=4242,
+        sid=4242,
+        start_time_ticks=42_424_242,
+        token=f"stale-{4242}-token",
+        worker_id="stale-worker",
+        spawned_at=1.0,
+    )
+    supervisor_state = replace(
+        supervise.fresh_state(),
+        mode=supervise.MODE_RUN,
+        commit=state.commit,
+        applied_generation=state.generation,
+        child=stale_child,
+    )
+    monkeypatch.setattr(supervise, "read_state", lambda: supervisor_state)
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: False)
+
+    assert dc._supervised_mission_active(state) is False
+
+
+def test_supervised_mission_never_triggers_legacy_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervisor-owned mission is never legacy-rolled-back while supervisor absent.
+
+    The watchdog must never take the legacy direct worker retire/restore path
+    for a supervisor-owned mission: when the supervisor is temporarily absent,
+    the watchdog fails closed and leaves the durable mission state unchanged so
+    a replacement supervisor can resume the candidate.
+    """
+    state = replace(pending_state(), supervisor_owned=True, deadline=time.time() - 1)
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
+    states = iter((state, rolled_back))
+    calls: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        calls.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    dc._watchdog_main(lock_timeout_seconds=1.0)
+
+    assert calls == [], "supervisor-owned mission must not trigger legacy rollback"
+
+
+def test_supervisor_restart_gap_preserves_supervised_mission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervisor gap preserves a pending supervised mission unchanged.
+
+    When the supervisor is temporarily absent during a pending mission, the
+    watchdog leaves the durable state unchanged.  A replacement supervisor can
+    then resume the candidate without any rollback or state mutation.
+    """
+    state = replace(pending_state(), supervisor_owned=True)
+    dc._write_state(state)
+    calls: list[dc.RollbackState] = []
+    write_calls: list[dc.RollbackState] = []
+    read_count = 0
+
+    def read_once() -> dc.RollbackState | None:
+        nonlocal read_count
+        read_count += 1
+        if read_count > 2:
+            return replace(state, status=dc.STATUS_CONFIRMED)
+        return state
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", read_once)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        calls.append(value)
+        return True
+
+    def record_write(value: dc.RollbackState) -> None:
+        write_calls.append(value)
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+    monkeypatch.setattr(dc, "_write_state", record_write)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    dc._watchdog_main(lock_timeout_seconds=1.0)
+
+    assert calls == [], "supervisor-owned mission must not trigger rollback during gap"
+    assert write_calls == [], "no state mutation should occur during supervisor gap"
