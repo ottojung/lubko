@@ -340,30 +340,40 @@ incomplete because of a crash or corruption.
 The worker periodically collects terminal command rows and their owned output
 chunks after a configurable safe retention window (`LUBKO_GC_RETENTION_SECONDS`,
 default 3600). Abandoned running rows first go through existing lease recovery;
-pending and running rows are never collected. Two bounded passes run
-independently each cycle:
+pending and running rows are never collected. Three bounded phases run in
+separate transactions each cycle:
 
-**Root collection pass** — Selects terminal rows (`finished_at` in the past
-beyond the retention window) with `FOR UPDATE SKIP LOCKED` in bounded batches
-(`LUBKO_GC_BATCH_LIMIT`, default 100). Each root and every chunk owned by it
-are deleted in one transaction: root first (to serialize with concurrent output
-publication, which retains the root row with a row-level lock before inserting
-chunks), then the owned chunks via the `thread` ownership column. The
-root-first ordering ensures a concurrent publication either blocks on the root
-lock until cleanup commits and finds no root, or commits chunks before the
-chunk-cleanup statement starts so the fresh snapshot removes them. The root
-pass is safe under multiple concurrent workers and idempotent across restarts.
+**Phase 1 — Mark** (one transaction): A bounded batch of terminal `command`
+rows whose `finished_at` is older than the retention window and whose `status`
+is one of `succeeded`, `failed`, or `cancelled` is selected with `FOR UPDATE
+SKIP LOCKED` and atomically marked with `state.gc = true`. Publication
+explicitly refuses GC-marked roots (`WHERE ... IS DISTINCT FROM 'true'`), so
+no new `output_chunk` rows can be created for them after the mark commits.
+Unknown or future status values are retained, not collected.
 
-**Orphan cleanup pass** — A bounded anti-join `SELECT` (with `LIMIT` and
-`FOR UPDATE ... SKIP LOCKED`) finds `output_chunk` rows whose owning root
-`command` row is absent. The matched rows are deleted in one bounded `DELETE`.
-This pass is safe without root-first ordering: the owning root is already gone,
-so no concurrent publication can create new chunks for it. The `SKIP LOCKED`
-clause avoids interfering with a concurrent root-collection transaction that
-is about to delete the same chunks.
+**Phase 2 — Chunk drain + root finalization** (one transaction per batch):
+For each GC-marked root, a bounded batch of its owned chunks (via `thread`) is
+deleted using `FOR UPDATE SKIP LOCKED`, capped at `LUBKO_GC_BATCH_LIMIT` rows.
+This keeps rows, transaction size, and lock duration bounded even when a single
+root owns millions of chunks. After bounded chunk deletion, if no chunks remain
+for a root, the root row itself is deleted. The root only disappears after its
+chunks are drained, which preserves the root-first publication-safety invariant:
+the `gc` flag prevents new chunks, and the root is removed once all chunks from
+the marking snapshot are gone.
 
-Both passes run every `LUBKO_GC_INTERVAL_SECONDS` (default 60) and log only
-aggregate counts, never job contents or secrets.
+**Phase 3 — Orphan cleanup** (one transaction): A bounded anti-join `SELECT`
+(with `LIMIT` and `FOR UPDATE ... SKIP LOCKED`) finds `output_chunk` rows
+whose owning root `command` row is absent. The comparison is cast-free
+(`root.id::text = thread`), so malformed, empty, or non-UUID thread text
+never causes a cast error regardless of planner predicate reordering. Matched
+rows are deleted in one bounded `DELETE`. This pass is safe without root-first
+ordering: the owning root is already gone, so no concurrent publication can
+create new chunks for it.
+
+All three phases run every `LUBKO_GC_INTERVAL_SECONDS` (default 60) and log
+only aggregate counts of roots marked, chunks deleted, and orphans cleaned,
+never job contents or secrets. The pass is idempotent under multiple workers
+and restarts.
 
 ### Timestamps
 

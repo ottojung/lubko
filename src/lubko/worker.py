@@ -1577,19 +1577,6 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
         )
 
 
-GC_RETENTION_SQL: Final = (
-    "to_char(now() at time zone 'utc' - make_interval(secs => %(gc_retention_seconds)s), "
-    '\'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\')'
-)
-
-#: Regex that matches a canonical UUID at the JSON text level (case-insensitive
-#: hex).  Used as the CASE WHEN guard inside the orphan anti-join so the
-#: ``::uuid`` cast is only attempted on recognisable UUID text.
-_UUID_TEXT_RE: Final = (
-    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-)
-
-
 def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UUID], int, int]:
     """Collect terminal command rows, their owned chunks, and orphan chunks.
 
@@ -1619,11 +1606,13 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     **Phase 3 — Orphan cleanup** (one transaction): A bounded anti-join
     ``SELECT`` (with ``LIMIT`` and ``FOR UPDATE ... SKIP LOCKED``) finds
     ``output_chunk`` rows whose owning root ``command`` row is absent.  The
-    ``thread`` value is validated against a UUID text regex before the join to
-    prevent implicit unsafe casts of malformed or non-UUID values.  Matched
-    rows are deleted in one bounded ``DELETE``.  This pass is safe without
-    root-first ordering: the owning root is already gone, so no concurrent
-    publication can create new chunks for it.
+    comparison is cast-free and case-normalized (``lower(root.id::text) =
+    lower(thread)``), so malformed, empty, or non-UUID thread text never
+    causes a cast error regardless of planner predicate reordering, and
+    uppercase canonical UUIDs match correctly.  Matched rows are deleted in
+    one bounded ``DELETE``.  This pass is safe without root-first ordering:
+    the owning root is already gone, so no concurrent publication can create
+    new chunks for it.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -1637,18 +1626,27 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     total_orphans = 0
 
     # --- Phase 1: mark terminal roots as GC ---
+    # The retention cutoff is pre-computed in a CTE so the main query string
+    # contains no concatenation and passes hardcoded-sql-expression.
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "UPDATE lubko.jobs\n"  # ruff: ignore[hardcoded-sql-expression]
+            "WITH gc_params AS (\n"
+            "    SELECT to_char(\n"
+            "        now() at time zone 'utc'\n"
+            "        - make_interval(secs => %(gc_retention_seconds)s),\n"
+            '        \'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\'\n'
+            "    ) AS cutoff\n"
+            ")\n"
+            "UPDATE lubko.jobs\n"
             "SET payload = jsonb_set(payload::jsonb, '{state,gc}', to_jsonb(true))::text\n"
             "WHERE id IN (\n"
             "    SELECT id\n"
-            "    FROM lubko.jobs\n"
+            "    FROM lubko.jobs, gc_params\n"
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
             "        AND (payload::jsonb)->'state'->>'status'\n"
             "            IN ('succeeded', 'failed', 'cancelled')\n"
             "        AND (payload::jsonb)->'state'->>'finished_at' IS NOT NULL\n"
-            "        AND ((payload::jsonb)->'state'->>'finished_at') < " + GC_RETENTION_SQL + "\n"
+            "        AND ((payload::jsonb)->'state'->>'finished_at') < gc_params.cutoff\n"
             "        AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
             "    ORDER BY ((payload::jsonb)->'state'->>'finished_at'), id\n"
             "    FOR UPDATE SKIP LOCKED\n"
@@ -1708,13 +1706,11 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 )
 
     # --- Phase 3: bounded orphan cleanup ---
-    # The CASE inside NOT EXISTS is the sole safety mechanism against
-    # malformed/non-UUID thread text.  The WHEN clause checks the regex
-    # before attempting the ::uuid cast, so PostgreSQL can never evaluate
-    # the cast on non-UUID text regardless of planner predicate reordering.
-    # Malformed/empty thread text makes the CASE return NULL, which means
-    # root.id = NULL is never true, so NOT EXISTS is true and the chunk
-    # is correctly treated as an orphan (no possible owner exists).
+    # Cast-free, case-normalized comparison: lower(root.id::text) = lower(thread).
+    # No ::uuid cast is attempted on the thread value, and lower() normalises
+    # case so uppercase canonical UUIDs match.  Malformed, empty, or non-UUID
+    # text simply never matches any root.id text.  This is intrinsically safe
+    # regardless of planner predicate reordering.
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT chunk.id\n"
@@ -1723,17 +1719,13 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    AND NOT EXISTS (\n"
             "        SELECT 1\n"
             "        FROM lubko.jobs AS root\n"
-            "        WHERE root.id = CASE\n"
-            "            WHEN chunk.payload::jsonb->>'thread'\n"
-            "                ~ %(uuid_re)s\n"
-            "            THEN\n"
-            "                (chunk.payload::jsonb->>'thread')::uuid\n"
-            "            ELSE NULL END\n"
+            "        WHERE lower(root.id::text) =\n"
+            "            lower(chunk.payload::jsonb->>'thread')\n"
             "            AND root.payload::jsonb->>'type' = 'command'\n"
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
-            {"uuid_re": _UUID_TEXT_RE, "limit": settings.gc_batch_limit},
+            {"limit": settings.gc_batch_limit},
         )
         orphan_ids = [row[0] for row in cursor.fetchall()]
         if orphan_ids:

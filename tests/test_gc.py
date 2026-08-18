@@ -316,17 +316,18 @@ def test_collect_transport_returns_empty_on_no_work() -> None:
     assert orphans == 0
 
 
-def test_collect_transport_orphan_pass_uses_case_safe_cast() -> None:
-    """Phase 3 uses CASE-safe cast so malformed thread never raises."""
+def test_collect_transport_orphan_pass_uses_cast_free_comparison() -> None:
+    """Phase 3 uses cast-free, case-normalized comparison."""
     conn = _RecordingConnection()
     conn.rows = [[], [], []]  # Phase 1, 2, 3
 
     collect_transport(_as_db(conn), _make_settings())
 
     sql = conn.executions[2][0]
-    assert "CASE" in sql  # CASE guard for safe cast
-    assert "~" in sql  # UUID regex inside CASE WHEN
-    assert "uuid" in sql  # cast inside CASE THEN
+    assert "lower(root.id::text)" in sql  # cast-free, case-normalized
+    assert "lower(chunk.payload::jsonb->>'thread')" in sql
+    # No ::uuid cast on the thread value
+    assert "::uuid" not in sql
 
 
 def test_collect_transport_orphan_pass_uses_for_update_skip_locked() -> None:
