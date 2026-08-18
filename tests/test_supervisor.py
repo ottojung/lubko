@@ -1018,6 +1018,7 @@ def _publish_job_for(job_id: UUID, cwd: str) -> ActiveJob:
         pid=proc.pid,
         pgid=proc.pid,
         started_mono=time.monotonic(),
+        claimed_at=time.time(),
     )
     job.stdout = OutputStream(path=Path(cwd) / "stdout.cap")
     job.stderr = OutputStream(path=Path(cwd) / "stderr.cap")

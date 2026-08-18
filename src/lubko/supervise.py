@@ -357,9 +357,7 @@ class SupervisorStatus:
             db_ready=_optional_bool(data.get("db_ready")),
             ready=_optional_bool(data.get("ready")),
             message=_optional_string(data.get("message")),
-            worker_health=data.get("worker_health")
-            if isinstance(data.get("worker_health"), dict)
-            else None,
+            worker_health=_optional_dict(data.get("worker_health")),
         )
 
 
@@ -1045,6 +1043,18 @@ def _optional_bool(value: object | None) -> bool | None:
         The boolean, or ``None``.
     """
     return value if isinstance(value, bool) else None
+
+
+def _optional_dict(value: object | None) -> dict[str, object] | None:
+    """Return a dictionary value or ``None``.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        The dictionary, or ``None``.
+    """
+    return value if isinstance(value, dict) else None
 
 
 def _child_to_dict(child: WorkerChild) -> dict[str, object]:
