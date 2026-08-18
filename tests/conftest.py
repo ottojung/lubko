@@ -404,18 +404,20 @@ def _process_teardown(
         f"{_isolated_lubko_state}; the ordering dependency is broken"
     )
     before_incidences = guard.snapshot_incarnations()
-    yield
     try:
-        stopped = guard.teardown_tracked()
-        allowed = {os.getpid()}
-        owned: set[Path] = set()
-        if isolation.TEST_BASETEMP is not None:
-            owned.add(isolation.TEST_BASETEMP)
-        guard.assert_no_persistent_leaks(before_incidences, allowed=allowed, owned_paths=owned)
-        if stopped:
-            LOGGER.debug("test teardown stopped %d leaked process(es)", stopped)
+        yield
     finally:
-        isolation.CURRENT_TEST_TMP = None
+        try:
+            stopped = guard.teardown_tracked()
+            allowed = {os.getpid()}
+            owned: set[Path] = set()
+            if isolation.TEST_BASETEMP is not None:
+                owned.add(isolation.TEST_BASETEMP)
+            guard.assert_no_persistent_leaks(before_incidences, allowed=allowed, owned_paths=owned)
+            if stopped:
+                LOGGER.debug("test teardown stopped %d leaked process(es)", stopped)
+        finally:
+            isolation.CURRENT_TEST_TMP = None
 
 
 @pytest.fixture(scope="module")
