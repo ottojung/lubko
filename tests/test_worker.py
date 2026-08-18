@@ -231,6 +231,8 @@ def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> A
         start_new_session=True,
     )
     guard.register(proc)
+    proc.wait(timeout=10)
+    guard.unregister(proc)
     job = ActiveJob(
         id=uuid4(),
         cwd=str(tmp_path),
