@@ -161,6 +161,8 @@ STOP_REASON_LEASE: Final = "lease"
 STOP_REASON_ROW_LOST: Final = "row_lost"
 STOP_REASON_PERSIST: Final = "persist"
 STOP_REASON_QUARANTINE: Final = "quarantine"
+QUARANTINE_MAX_RETRIES: Final = 5
+QUARANTINE_RETRY_BASE_SECONDS: Final = 0.5
 JOB_ID_ENV: Final = "LUBKO_JOB_ID"
 
 
@@ -262,6 +264,8 @@ class ActiveJob:
     finalized: bool = False
     quarantined: bool = False
     quarantine_pending: bool = False
+    quarantine_retries: int = 0
+    quarantine_next_retry_at: float = 0.0
     last_heartbeat_at: float = 0.0
 
 
@@ -1881,18 +1885,21 @@ class Supervisor:
                 self._publish_job_output(job, now)
 
     def _cleanup_quarantined_jobs(self) -> None:
-        """Untrack quarantined jobs and retry quarantine-pending jobs.
+        """Untrack quarantined jobs and retry quarantine-pending jobs with backoff.
 
         After durable quarantine the row is already terminal; once the owned
         process group is dead we clean capture files and remove the job from
         the active registry without re-entering publication/finalization.
 
         For quarantine-pending jobs (terminalization write previously failed)
-        whose process group has exited, we retry only the safe quarantine
-        terminalization — never poison publication/finalization — until the
-        durable terminal state is proven.
+        whose process group has exited, we retry the safe quarantine
+        terminalization with exponential backoff.  After
+        ``QUARANTINE_MAX_RETRIES`` exhausted attempts we log CRITICAL and
+        stop the supervisor so the external crash-loop backoff owns further
+        recovery — we never retry at process-poll rate forever.
         """
         conn = self.conn
+        now = time.monotonic()
         for job in list(self.active.values()):
             if job.quarantined and job.completed and not group_has_members(job.pgid):
                 cleanup_job(job)
@@ -1904,13 +1911,28 @@ class Supervisor:
                 and job.completed
                 and not group_has_members(job.pgid)
                 and conn is not None
-                and _quarantine_job(conn, job.id, f"quarantine retry for {job.id}")
             ):
-                job.quarantined = True
-                job.quarantine_pending = False
-                cleanup_job(job)
-                job.finalized = True
-                self.active.pop(job.id, None)
+                if now < job.quarantine_next_retry_at:
+                    continue
+                if job.quarantine_retries >= QUARANTINE_MAX_RETRIES:
+                    LOGGER.critical(
+                        "quarantine terminalization for job %s failed after %d "
+                        "retries; stopping supervisor for external recovery",
+                        job.id,
+                        job.quarantine_retries,
+                    )
+                    self._stopping = True
+                    return
+                if _quarantine_job(conn, job.id, f"quarantine retry for {job.id}"):
+                    job.quarantined = True
+                    job.quarantine_pending = False
+                    cleanup_job(job)
+                    job.finalized = True
+                    self.active.pop(job.id, None)
+                else:
+                    job.quarantine_retries += 1
+                    delay = QUARANTINE_RETRY_BASE_SECONDS * (2**job.quarantine_retries)
+                    job.quarantine_next_retry_at = now + delay
 
     def _finalize_completed(self) -> None:
         """Publish final output and finalize every job whose process is fully gone.
