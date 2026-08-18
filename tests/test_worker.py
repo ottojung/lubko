@@ -32,10 +32,12 @@ from lubko.worker import (
     bulk_refresh_leases,
     claim_job,
     claim_jobs,
+    decode_range,
     delete_job_and_chunks,
     discover_cancellations,
     finish_job,
     group_has_members,
+    pg_safe_decode,
     publish_output,
     read_output,
     read_range,
@@ -925,8 +927,82 @@ def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
     finally:
         if proc.poll() is None:
             with suppress(ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# pg_safe_decode unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_pg_safe_decode_clean_utf8() -> None:
+    """Valid UTF-8 without NUL passes through unchanged."""
+    assert pg_safe_decode(b"hello world") == "hello world"
+
+
+def test_pg_safe_decode_nul_replaced() -> None:
+    """NUL bytes are replaced with U+FFFD."""
+    data = b"before\x00after"
+    result = pg_safe_decode(data)
+    assert result == "before\ufffdafter"
+    assert "\x00" not in result
+
+
+def test_pg_safe_decode_multiple_nul() -> None:
+    """Multiple NUL bytes are all replaced."""
+    assert pg_safe_decode(b"\x00\x00\x00") == "\ufffd\ufffd\ufffd"
+
+
+def test_pg_safe_decode_invalid_utf8() -> None:
+    """Invalid UTF-8 sequences become U+FFFD."""
+    assert pg_safe_decode(b"\xff\xfe\xfd") == "\ufffd\ufffd\ufffd"
+
+
+def test_pg_safe_decode_invalid_utf8_with_nul() -> None:
+    """Invalid UTF-8 combined with NUL: both are replaced."""
+    assert pg_safe_decode(b"\xff\x00\xfe") == "\ufffd\ufffd\ufffd"
+
+
+def test_pg_safe_decode_empty() -> None:
+    """Empty input produces empty output."""
+    assert not pg_safe_decode(b"")
+
+
+def test_pg_safe_decode_nul_in_multibyte() -> None:
+    """NUL adjacent to valid multibyte UTF-8 is handled correctly."""
+    data = "caf\u00e9".encode() + b"\x00" + "\u00e9".encode()
+    assert pg_safe_decode(data) == "caf\u00e9\ufffd\u00e9"
+
+
+def test_pg_safe_decode_json_safe() -> None:
+    """The decoded string can be JSON-encoded without PostgreSQL-rejecting escapes."""
+    result = pg_safe_decode(b"before\x00after")
+    encoded = json.dumps(result)
+    assert "\\u0000" not in encoded
+    assert "\\ufffd" in encoded
+
+
+def test_truncate_output_applies_pg_safe_decode() -> None:
+    """truncate_output applies NUL replacement via pg_safe_decode."""
+    data = b"hello\x00world"
+    result = truncate_output(data, 100)
+    assert "\x00" not in result
+    assert "hello" in result
+    assert "world" in result
+
+
+def test_decode_range_pg_safe() -> None:
+    """decode_range returns PostgreSQL-safe text with correct byte offsets."""
+    tmp = Path(__file__).resolve().parent.parent / "test_output_bytes.bin"
+    try:
+        tmp.write_bytes(b"AAAA\x00BBBB\x00CCCC")
+        text = decode_range(tmp, 0, 9)
+        assert text == "AAAA\ufffdBBBB"
+        text2 = decode_range(tmp, 5, 14)
+        assert text2 == "BBBB\ufffdCCCC"
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
