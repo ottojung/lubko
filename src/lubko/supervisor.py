@@ -296,7 +296,7 @@ def _child_to_meta(child: WorkerChild, repo: str) -> WorkerMeta:
         repo=repo,
         git_commit=None,
         worker_id=child.worker_id,
-        log_path=str(lifecycle.worker_log_path()),
+        log_path=str(lifecycle.worker_log_path(child.token)),
         started_at=child.spawned_at,
         stopped_at=None,
     )
