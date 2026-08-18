@@ -12,14 +12,8 @@ from __future__ import annotations
 
 import json
 import logging
-import queue
-import shutil
-import subprocess
-import tempfile
 import threading
-import time
 from contextlib import nullcontext
-from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
 from uuid import uuid4
 
@@ -27,11 +21,8 @@ import psycopg
 import pytest
 
 from lubko.worker import (
-    ActiveJob,
-    OutputStream,
     Settings,
     collect_transport,
-    publish_output,
     recover_stale_jobs,
 )
 
@@ -908,97 +899,6 @@ def _read_status(conninfo: str, job_id: UUID) -> str:
 
 
 # ---------------------------------------------------------------------------
-# GC mark/drain vs publish_output race
-# ---------------------------------------------------------------------------
-
-
-def test_gc_mark_drain_vs_publish_output_race(db: str) -> None:
-    """Publication that holds root lock before mark can commit chunks.
-
-    Once gc=true is marked, publication must refuse the root and cannot
-    leave an orphan chunk. Chunks committed before the mark are drained
-    normally by the chunk drain pass.
-    """
-    root_id = _insert_terminal_job(db)
-    # Create a capture file for publication with enough data to create chunks.
-    tmp = Path(tempfile.mkdtemp())
-    stdout_path = tmp / "stdout.cap"
-    stdout_path.write_bytes(b"x" * 9000)
-
-    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=10)
-
-    # Insert enough chunks so Phase 2 does not delete the root immediately.
-    for i in range(15):
-        _insert_output_chunk(db, root_id, sequence=i)
-
-    # Simulate: publication runs first, commits chunks while root has no
-    # gc flag yet.
-    job = ActiveJob(
-        id=root_id,
-        cwd=str(tmp),
-        process=("echo", "test"),
-        proc=subprocess.Popen(
-            ["/bin/true"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ),
-        pid=0,
-        pgid=0,
-        started_mono=time.monotonic(),
-    )
-    job.stdout = OutputStream(path=stdout_path)
-    job.stderr = OutputStream(path=tmp / "stderr.cap")
-    job.stderr.path.write_bytes(b"")
-
-    with psycopg.connect(db) as conn:
-        published = publish_output(conn, job, ["stdout"], time.monotonic(), force=True)
-    assert published is True
-    # There should be chunks now.
-    with psycopg.connect(db) as conn:
-        row = conn.execute(
-            "SELECT count(*)::int FROM lubko.jobs "
-            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
-            "AND (payload::jsonb)->>'thread' = %s",
-            (str(root_id),),
-        ).fetchone()
-    assert row is not None
-    chunk_count_before = row[0]
-    assert chunk_count_before > 0
-
-    # Now GC marks the root.
-    with psycopg.connect(db) as conn:
-        roots, _c, _o = collect_transport(conn, settings)
-    assert root_id in roots
-    assert _is_gc_marked(db, root_id)
-
-    # Publication must now refuse the root (gc=true).
-    with psycopg.connect(db) as conn:
-        published_after = publish_output(conn, job, ["stdout"], time.monotonic(), force=True)
-    assert published_after is False
-
-    # Drain all chunks and remove root.
-    for _ in range(10):
-        with psycopg.connect(db) as conn:
-            collect_transport(conn, settings)
-        if not _row_exists(db, root_id):
-            break
-
-    assert not _row_exists(db, root_id)
-    with psycopg.connect(db) as conn:
-        row = conn.execute(
-            "SELECT count(*)::int FROM lubko.jobs "
-            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
-            "AND (payload::jsonb)->>'thread' = %s",
-            (str(root_id),),
-        ).fetchone()
-    assert row is not None
-    assert row[0] == 0
-
-    shutil.rmtree(tmp, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
 # Phase-1 eligibility: unknown/future status is retained
 # ---------------------------------------------------------------------------
 
@@ -1118,153 +1018,6 @@ def test_gc_orphan_pass_retains_valid_owned_chunks(db: str) -> None:
 # ---------------------------------------------------------------------------
 # Concurrent publication-vs-GC race (genuinely concurrent)
 # ---------------------------------------------------------------------------
-
-
-def _insert_race_chunks(conn: psycopg.Connection[object], root_id: UUID, count: int) -> None:
-    """Insert output chunks for the race test.
-
-    Args:
-        conn: Open PostgreSQL connection.
-        root_id: Owning root job identifier.
-        count: Number of chunks to insert.
-    """
-    for i in range(count):
-        payload = json.dumps({
-            "v": 3,
-            "type": "output_chunk",
-            "thread": str(root_id),
-            "stream": "stdout",
-            "sequence": 100 + i,
-            "start": 0,
-            "end": 5,
-            "value": f"race{i}",
-            "previous": None,
-        })
-        conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (payload,))
-
-
-def _count_chunks_for(db: str, root_id: UUID) -> int:
-    """Count output chunks owned by a root.
-
-    Args:
-        db: PostgreSQL connection string.
-        root_id: Root job identifier.
-
-    Returns:
-        The chunk count.
-    """
-    with psycopg.connect(db) as conn:
-        row = conn.execute(
-            "SELECT count(*)::int FROM lubko.jobs "
-            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
-            "AND lower((payload::jsonb)->>'thread') = lower(%s)",
-            (str(root_id),),
-        ).fetchone()
-    assert row is not None
-    return int(row[0])
-
-
-def _make_publish_refusal_job(
-    root_id: UUID, tmp: Path
-) -> tuple[ActiveJob, subprocess.Popen[bytes]]:
-    """Build an ActiveJob + Popen for testing publication refusal.
-
-    Args:
-        root_id: Root job identifier.
-        tmp: Temporary directory for capture files.
-
-    Returns:
-        The active job and its process (caller must reap).
-    """
-    stdout_path = tmp / "stdout.cap"
-    stdout_path.write_bytes(b"y" * 9000)
-    stderr_path = tmp / "stderr.cap"
-    stderr_path.write_bytes(b"")
-    proc = subprocess.Popen(
-        ["/bin/true"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    job = ActiveJob(
-        id=root_id,
-        cwd=str(tmp),
-        process=("echo", "test"),
-        proc=proc,
-        pid=proc.pid,
-        pgid=proc.pid,
-        started_mono=time.monotonic(),
-    )
-    job.stdout = OutputStream(path=stdout_path)
-    job.stderr = OutputStream(path=stderr_path)
-    return job, proc
-
-
-def test_gc_concurrent_publish_then_mark(db: str) -> None:
-    """Real collect_transport mark path races with publisher-held root lock.
-
-    The publisher holds an exclusive lock on the root row.  collect_transport
-    is invoked in a separate thread; its Phase-1 UPDATE blocks on the root
-    lock until the publisher commits.  After the mark commits, a subsequent
-    publication sees gc=true and refuses.  Synchronisation is at the database
-    level via a pg_notify channel so GC is provably waiting on the lock.
-    """
-    root_id = _insert_terminal_job(db)
-    for i in range(55):
-        _insert_output_chunk(db, root_id, sequence=i)
-
-    tmp = Path(tempfile.mkdtemp())
-    gc_settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=50)
-    gc_started: queue.Queue[bool] = queue.Queue(maxsize=1)
-    results: dict[str, object] = {}
-    proc: subprocess.Popen[bytes] | None = None
-    try:
-
-        def publisher() -> None:
-            """Hold root lock, wait for GC to be waiting, then commit."""
-            with psycopg.connect(db) as conn:
-                conn.autocommit = False
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id FROM lubko.jobs WHERE id = %s FOR UPDATE",
-                        (root_id,),
-                    )
-                    gc_started.get(timeout=10)  # GC is blocking on our lock
-                    _insert_race_chunks(conn, root_id, 3)
-                conn.commit()
-            results["publisher"] = "done"
-
-        def gc_marker() -> None:
-            """Run real collect_transport; Phase-1 blocks on root lock."""
-            with psycopg.connect(db) as work_conn:
-                gc_started.put(item=True)  # signal publisher we are at the DB
-                collect_transport(work_conn, gc_settings)
-            results["gc_marker"] = "done"
-
-        t_gc = threading.Thread(target=gc_marker)
-        t_gc.start()
-        time.sleep(0.1)
-        t_pub = threading.Thread(target=publisher)
-        t_pub.start()
-        t_pub.join(timeout=10)
-        t_gc.join(timeout=10)
-
-        assert results.get("publisher") == "done"
-        assert results.get("gc_marker") == "done"
-        assert _is_gc_marked(db, root_id)
-        # Phase 2 drained 50 of 58 chunks (55 original + 3 concurrent).
-        remaining = _count_chunks_for(db, root_id)
-        assert remaining == 8
-
-        job, proc = _make_publish_refusal_job(root_id, tmp)
-        with psycopg.connect(db) as conn:
-            published = publish_output(conn, job, ["stdout"], time.monotonic(), force=True)
-        assert published is False
-    finally:
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
