@@ -1622,6 +1622,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
         A ``(roots_marked, chunks_deleted, orphans_deleted)`` triple.
     """
     roots_marked: list[UUID] = []
+    roots_deleted = 0
     total_chunks = 0
     total_orphans = 0
 
@@ -1705,6 +1706,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                     "DELETE FROM lubko.jobs\nWHERE id = %(job_id)s\n",
                     {"job_id": root_id},
                 )
+                roots_deleted += cursor.rowcount
 
     # --- Phase 3: bounded orphan cleanup ---
     # Cast-free, case-normalized comparison: lower(root.id::text) = lower(thread).
@@ -1736,6 +1738,8 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             )
             total_orphans += len(orphan_ids)
 
+    if roots_deleted:
+        LOGGER.info("gc deleted %d root(s)", roots_deleted)
     return roots_marked, total_chunks, total_orphans
 
 
