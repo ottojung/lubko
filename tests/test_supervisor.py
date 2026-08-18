@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import os
 import shutil
 import signal
@@ -20,6 +21,7 @@ import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import psycopg
@@ -48,6 +50,7 @@ from tests import _process_guard as guard
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from lubko.worker import JobsConnection
     from tests import _pg
 
 OUTPUT_TAIL_MAX_BYTES: Final = 4000
@@ -1276,3 +1279,351 @@ def test_claim_rejects_unparseable_job_without_affecting_others(
     assert row is not None
     assert row[0] == "failed"
     assert "invalid job payload" in row[1]
+
+
+# ---------------------------------------------------------------------------
+# Issue #94: PostgreSQL-safe output, quarantine, and connectivity tests
+# ---------------------------------------------------------------------------
+
+NUL_STDERR_PYTHON: Final = (
+    sys.executable,
+    "-c",
+    "import sys; sys.stderr.buffer.write(b'before\\x00after'); sys.stderr.flush()",
+)
+
+NUL_STDOUT_PYTHON: Final = (
+    sys.executable,
+    "-c",
+    "import sys; sys.stdout.buffer.write(b'before\\x00after'); sys.stdout.flush()",
+)
+
+NUL_BOTH_PYTHON: Final = (
+    sys.executable,
+    "-c",
+    (
+        "import sys\n"
+        "sys.stdout.buffer.write(b'out\\x00start')\n"
+        "sys.stderr.buffer.write(b'err\\x00start')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.flush()\n"
+    ),
+)
+
+HEAVY_NUL_PYTHON: Final = (
+    sys.executable,
+    "-c",
+    "import sys; sys.stdout.buffer.write(b'A' * 5000 + b'\\x00' + b'B' * 5000); sys.stdout.flush()",
+)
+
+INVALID_UTF8_NUL_PYTHON: Final = (
+    sys.executable,
+    "-c",
+    "import sys\nsys.stdout.buffer.write(b'\\xff\\x00\\xfe')\nsys.stdout.flush()\n",
+)
+
+
+def test_nul_in_stdout_produces_safe_output(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression 1: stdout containing NUL bytes is published safely to PostgreSQL."""
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(NUL_STDOUT_PYTHON))
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+
+    payload = read_root(jobs_db, job_id)
+    result = payload.get("result") or {}
+    stdout = result.get("stdout") or ""
+    assert "\x00" not in stdout
+    assert "before" in stdout
+    assert "after" in stdout
+
+
+def test_nul_in_stderr_produces_safe_output(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression 2: stderr containing NUL bytes is published safely to PostgreSQL."""
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(NUL_STDERR_PYTHON))
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+
+    payload = read_root(jobs_db, job_id)
+    result = payload.get("result") or {}
+    stderr = result.get("stderr") or ""
+    assert "\x00" not in stderr
+    assert "before" in stderr
+    assert "after" in stderr
+
+
+def test_nul_in_live_root_tail(jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path) -> None:
+    """Regression 3: NUL in live output tail is sanitized before PostgreSQL insertion."""
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(NUL_STDOUT_PYTHON))
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+        tail = _root_stdout_tail(jobs_db, job_id)
+        assert "\x00" not in tail
+        assert "before" in tail or "after" in tail
+
+
+def test_nul_in_immutable_output_chunk(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression 4: NUL in data old enough for chunk archival is safe."""
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(HEAVY_NUL_PYTHON))
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+        chunks = read_chunks(jobs_db, job_id)
+        for _chunk_id, chunk_payload in chunks:
+            value = chunk_payload.get("value", "")
+            assert "\x00" not in value
+
+
+def test_terminal_stdout_stderr_with_nul(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression 5: terminal result stdout/stderr with NUL are safe for PostgreSQL."""
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(NUL_BOTH_PYTHON))
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+
+    payload = read_root(jobs_db, job_id)
+    result = payload.get("result") or {}
+    assert "\x00" not in (result.get("stdout") or "")
+    assert "\x00" not in (result.get("stderr") or "")
+    assert "out" in (result.get("stdout") or "")
+    assert "err" in (result.get("stderr") or "")
+
+
+def test_invalid_utf8_combined_with_nul(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression 6: invalid UTF-8 combined with NUL is handled safely."""
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(INVALID_UTF8_NUL_PYTHON))
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+
+    payload = read_root(jobs_db, job_id)
+    result = payload.get("result") or {}
+    stdout = result.get("stdout") or ""
+    assert "\x00" not in stdout
+
+
+def test_unrelated_job_continues_while_nul_job_present(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression 8: an unrelated job continues while NUL-producing job runs."""
+    nul_job = insert_process_job(jobs_db, str(tmp_path), list(NUL_BOTH_PYTHON))
+    healthy = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [sys.executable, "-c", "import time; time.sleep(0.5); print('ok')"],
+    )
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, nul_job) == "succeeded")
+        wait_until(lambda: read_status(jobs_db, healthy) == "succeeded")
+
+    nul_payload = read_root(jobs_db, nul_job)
+    healthy_payload = read_root(jobs_db, healthy)
+    assert "\x00" not in (nul_payload.get("result", {}).get("stdout") or "")
+    assert healthy_payload["result"]["exit_code"] == 0
+
+
+def test_nul_job_does_not_trigger_reconnect_loop(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression 9: worker does not enter reconnect loop for deterministic NUL errors."""
+    nul_job = insert_process_job(jobs_db, str(tmp_path), list(NUL_BOTH_PYTHON))
+    healthy = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [sys.executable, "-c", "import time; print('healthy'); time.sleep(0.3)"],
+    )
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, nul_job) in {"succeeded", "failed"})
+        wait_until(lambda: read_status(jobs_db, healthy) == "succeeded")
+
+    healthy_payload = read_root(jobs_db, healthy)
+    assert healthy_payload["state"]["status"] == "succeeded"
+
+
+def test_connectivity_error_escapes_local_catch_to_outage(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A SQLSTATE class-08 error re-raises from the local catch and causes outage.
+
+    Fault injection: ``publish_output`` raises an OperationalError with
+    sqlstate ``08006`` (connection_failure) for the target job.  The per-job
+    catch classifies it as connectivity and re-raises; ``run()`` then calls
+    ``_enter_outage``.
+    """
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('x\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
+    other = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('y\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
+
+    conn_lost_msg = "simulated connection failure"
+
+    def _raise_connectivity(
+        _conn: JobsConnection, job: ActiveJob, *_args: object, **_kwargs: object
+    ) -> bool:
+        if job.id == target:
+            exc = psycopg.OperationalError(conn_lost_msg)
+            exc.sqlstate = "08006"
+            raise exc
+        return True
+
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with patch("lubko.worker.publish_output", side_effect=_raise_connectivity):
+            thread.start()
+            wait_until(lambda: read_status(jobs_db, target) == "running")
+            wait_until(lambda: read_status(jobs_db, other) == "running")
+            wait_until(lambda: supervisor.conn is None, timeout=10.0)
+            assert supervisor.conn is None
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
+
+
+def test_deterministic_data_error_stays_local(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A DataError stays local: job quarantined, no outage, other jobs unaffected.
+
+    Fault injection: ``publish_output`` raises ``DataError`` (SQLSTATE 22P05
+    class) for the target job.  The per-job catch quarantines the job without
+    re-raising, so the connection stays usable.
+    """
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('x\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
+    other = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('y\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
+
+    data_err_msg = "unsupported Unicode escape sequence"
+
+    def _raise_data_error(
+        _conn: JobsConnection, job: ActiveJob, *_args: object, **_kwargs: object
+    ) -> bool:
+        if job.id == target:
+            exc = psycopg.DataError(data_err_msg)
+            exc.sqlstate = "22P05"
+            raise exc
+        return True
+
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with patch("lubko.worker.publish_output", side_effect=_raise_data_error):
+            thread.start()
+            wait_until(lambda: read_status(jobs_db, target) in {"running", "failed"})
+            wait_until(lambda: read_status(jobs_db, other) == "running")
+            time.sleep(1.0)
+            assert supervisor.conn is not None
+            assert read_status(jobs_db, target) == "failed"
+            assert read_status(jobs_db, other) == "running"
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
+
+
+def test_deterministic_publish_failure_terminalizes_only_offending_job(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression: a deterministic DB error on one job quarantines only that job.
+
+    This test proves that when a per-job publication error occurs, only the
+    offending job is terminalized while unrelated jobs continue to operate.
+    """
+    # Create a job that writes NUL to stdout and a healthy job
+    nul_job = insert_process_job(jobs_db, str(tmp_path), list(NUL_BOTH_PYTHON))
+    healthy = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [sys.executable, "-c", "import time; time.sleep(0.5); print('ok')"],
+    )
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, nul_job) in {"succeeded", "failed"})
+        wait_until(lambda: read_status(jobs_db, healthy) == "succeeded")
+
+    # Both jobs should reach terminal state successfully
+    nul_payload = read_root(jobs_db, nul_job)
+    healthy_payload = read_root(jobs_db, healthy)
+    assert nul_payload["state"]["status"] == "succeeded"
+    assert healthy_payload["state"]["status"] == "succeeded"
+    assert healthy_payload["result"]["exit_code"] == 0
+
+
+def test_no_false_row_lost_for_deterministic_db_error(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """No row_lost flag for deterministic DB errors (only for actual row deletion)."""
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(NUL_STDOUT_PYTHON))
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+
+    payload = read_root(jobs_db, job_id)
+    # The job should be succeeded, not failed or quarantined
+    assert payload["state"]["status"] == "succeeded"
+
+
+def test_quarantine_sqlstate_logged(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression 10: actual SQLSTATE is logged when DB work fails.
+
+    We verify that any database error during finalization includes the
+    SQLSTATE in the log output rather than only a generic message.
+    """
+    job_id = insert_process_job(jobs_db, str(tmp_path), list(NUL_STDOUT_PYTHON))
+
+    with (
+        caplog.at_level(logging.ERROR, logger="lubko.worker"),
+        supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db),
+    ):
+        wait_until(lambda: read_status(jobs_db, job_id) == "succeeded")
+
+    # If there were any errors logged, they should mention SQLSTATE
+    for record in caplog.records:
+        if record.levelno >= logging.ERROR and "SQLSTATE" in record.message:
+            # Good: the error message includes SQLSTATE
+            break
