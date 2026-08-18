@@ -12,6 +12,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -315,3 +317,57 @@ def test_pgcluster_on_start_failure_stops_postmaster(
         pid, ticks = captured[0]
         alive = guard.process_alive(pid) and guard.proc_start_ticks(pid) == ticks
         assert not alive
+
+
+def test_stop_popen_cleans_group_after_leader_exit() -> None:
+    """When a leader exits but its group has surviving children, the group is SIGKILLed.
+
+    A live session-leader shell spawns a background child that inherits
+    SIGTERM ignored, prints the child PID, resets the leader TERM trap to
+    exit, and loops.  ``_stop_popen`` is called while the leader is still
+    alive so ``_process_group_of`` resolves pgid from a live leader.  After
+    SIGTERM the leader dies but the child survives in the same group;
+    ``_stop_popen`` must SIGKILL the surviving group and wait for it empty.
+    """
+    leader_script = (
+        "import os, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(300)\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        "print(os.getpid())\n"
+        "sys.stdout.flush()\n"
+        "while True:\n"
+        "    time.sleep(300)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", leader_script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    child_pid_line = proc.stdout.readline()  # type: ignore[union-attr]
+    child_pid = int(child_pid_line.strip())
+    child_ticks = guard.proc_start_ticks(child_pid)
+    assert child_ticks is not None
+    pgid = proc.pid
+    try:
+        assert proc.poll() is None, "leader must still be alive"
+        assert guard.process_alive(child_pid)
+        assert guard.group_has_members(pgid)
+        guard._stop_popen(proc)  # ruff: ignore[private-member-access]
+        assert proc.poll() is not None, "leader must be reaped"
+        child_alive = (
+            guard.process_alive(child_pid) and guard.proc_start_ticks(child_pid) == child_ticks
+        )
+        assert not child_alive, f"child pid {child_pid} (ticks={child_ticks}) still alive"
+        assert not guard.group_has_members(pgid)
+    finally:
+        if guard.group_has_members(pgid):
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and guard.group_has_members(pgid):
+                time.sleep(0.02)

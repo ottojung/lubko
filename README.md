@@ -33,7 +33,8 @@ This is enforced by default, not by opt-in:
   per-user metadata can never be read or signalled by a test;
 - teardown only signals processes owned by the current test execution through
   the explicit process-guard registry; lifecycle-state cleanup supplements it
-  only inside the verified test root;
+  only inside the verified test root; every signal targets an exact PID+ticks
+  incarnation (never `pkill`, `killall`, or process-name matching);
 - an ambient "production-like" sentinel state tree and live worker process are
   created for the session, and the suite fails if the tree is ever mutated or
   the sentinel is ever signalled.

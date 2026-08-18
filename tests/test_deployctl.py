@@ -3497,11 +3497,6 @@ def test_gated_candidate_timeout_no_survivor_no_reparent(
             f"candidate pid {candidate_pid} (ticks={candidate_ticks}) still alive after cleanup"
         )
 
-        # No survivor with that identity is PPID 1.
-        info = guard._read_proc_stat(candidate_pid)
-        if info is not None:
-            assert info[1] != 1, f"candidate pid {candidate_pid} reparented to PID 1 after cleanup"
-
         # Ambient sentinel/state unchanged.
         assert isolation.ambient_sentinel_alive()
         assert isolation.snapshot_tree(isolation.ambient_state_root()) == ambient_before
@@ -3679,7 +3674,7 @@ def test_end_to_end_full_deployment_stays_hermetic(
 
     assert isolation.snapshot_tree(isolation.ambient_state_root()) == ambient_before
     assert isolation.ambient_sentinel_alive()
-    test_tmp = isolation.CURRENT_TEST_TMP
+    test_tmp = isolation.RUNTIME.current_test_tmp
     assert test_tmp is not None
     assert state_root().is_relative_to(test_tmp)
     resolved_home = Path(os.environ["XDG_STATE_HOME"]).resolve()

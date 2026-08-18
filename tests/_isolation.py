@@ -26,11 +26,19 @@ be mistaken for the original sentinel incarnation.
 
 from __future__ import annotations
 
+import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from lubko.state import state_root
+from tests import _process_guard as guard
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+LOGGER = logging.getLogger(__name__)
 
 STATE_HOME_ENV: Final = "XDG_STATE_HOME"
 
@@ -38,10 +46,6 @@ STATE_HOME_ENV: Final = "XDG_STATE_HOME"
 # recorded by the conftest session fixture so test-side guards can verify
 # ownership without re-deriving pytest internals.
 TEST_BASETEMP: Path | None = None
-
-# Temporary directory owned by the currently running test (``tmp_path``),
-# recorded by the conftest autouse isolation fixture.
-CURRENT_TEST_TMP: Path | None = None
 
 # The ambient "production-like" Lubko state root created once per session. It
 # deliberately lives outside every per-test XDG root so a test can only ever
@@ -66,6 +70,21 @@ AMBIENT_SENTINEL_TOKEN: str | None = None
 # /proc/stat field layout constants (same as lifecycle.py).
 _STAT_MIN_FIELDS: Final = 20
 _STAT_STARTTIME_FIELD_INDEX: Final = 19
+
+
+@dataclass(slots=True)
+class RuntimeState:
+    """Mutable runtime state that requires attribute assignment.
+
+    Only ``CURRENT_TEST_TMP`` needs per-test mutation; all other module-level
+    state (``TEST_BASETEMP``, ambient sentinel fields) is set once per session
+    and never reassigned inside a generator, so bare module names suffice.
+    """
+
+    current_test_tmp: Path | None = None
+
+
+RUNTIME = RuntimeState()
 
 
 def proc_start_ticks(pid: int) -> int | None:
@@ -183,7 +202,7 @@ def assert_test_owned_state_root() -> Path:
             current test's temporary directory, or isolation was never
             established.
     """
-    if CURRENT_TEST_TMP is None:
+    if RUNTIME.current_test_tmp is None:
         msg = "test state isolation was not established before a destructive lifecycle op"
         raise AssertionError(msg)
     raw = os.environ.get(STATE_HOME_ENV)
@@ -194,7 +213,7 @@ def assert_test_owned_state_root() -> Path:
         )
         raise AssertionError(msg)
     resolved = Path(raw).resolve()
-    test_tmp = CURRENT_TEST_TMP.resolve()
+    test_tmp = RUNTIME.current_test_tmp.resolve()
     if resolved == test_tmp:
         return resolved
     if test_tmp not in resolved.parents:
@@ -256,3 +275,76 @@ def snapshot_tree(root: Path) -> dict[str, tuple[str, str]]:
     for entry in sorted(root.iterdir(), key=lambda item: item.name):
         visit(entry)
     return snapshot
+
+
+def teardown_generator() -> Generator[dict[int, int], None, None]:
+    """Yield the process-incarnation snapshot, then deterministically clean up.
+
+    This is the exact teardown body shared by ``_process_teardown`` and by
+    regression tests that drive the fixture logic directly.  The generator
+    yields the ``before_incidences`` snapshot to the caller (the test body);
+    when the caller finishes — whether by normal return, ``Exception``, or
+    ``BaseException`` — the ``finally`` block tears down every tracked
+    process, asserts no persistent leaks, and clears ``RUNTIME.current_test_tmp``.
+
+    Error propagation:
+
+    - If the body raises and cleanup also raises, the original body exception
+      is re-raised with the cleanup exception chained as context.
+    - If the body succeeds but cleanup raises, the cleanup exception
+      propagates normally.
+    - If only the body raises, the original body exception propagates.
+
+    ``RUNTIME.current_test_tmp`` is cleared unconditionally in all paths.
+
+    Yields:
+        The pre-test incarnation snapshot (PID → start-time ticks).
+    """
+    before_incidences = guard.snapshot_incarnations()
+    body_error: BaseException | None = None
+    try:
+        yield before_incidences
+    except BaseException as exc:
+        body_error = exc
+        raise
+    finally:
+        cleanup_error = _run_teardown_cleanup(before_incidences)
+        if body_error is not None and cleanup_error is not None:
+            raise body_error from cleanup_error
+        if body_error is None and cleanup_error is not None:
+            raise cleanup_error
+
+
+def _run_teardown_cleanup(before_incidences: dict[int, int]) -> BaseException | None:
+    """Run teardown cleanup and return any exception, always clearing CURRENT_TEST_TMP.
+
+    Args:
+        before_incidences: The pre-test incarnation snapshot.
+
+    Returns:
+        The cleanup exception, or ``None`` if cleanup succeeded.
+    """
+    cleanup_error: BaseException | None = None
+    try:
+        _execute_teardown(before_incidences)
+    except BaseException as exc:  # ruff: ignore[blind-except]
+        cleanup_error = exc
+    finally:
+        RUNTIME.current_test_tmp = None
+    return cleanup_error
+
+
+def _execute_teardown(before_incidences: dict[int, int]) -> None:
+    """Execute the teardown steps: stop tracked processes and assert no leaks.
+
+    Args:
+        before_incidences: The pre-test incarnation snapshot.
+    """
+    stopped = guard.teardown_tracked()
+    allowed = {os.getpid()}
+    owned: set[Path] = set()
+    if RUNTIME.current_test_tmp is not None:
+        owned.add(RUNTIME.current_test_tmp)
+    guard.assert_no_persistent_leaks(before_incidences, allowed=allowed, owned_paths=owned)
+    if stopped:
+        LOGGER.debug("test teardown stopped %d leaked process(es)", stopped)

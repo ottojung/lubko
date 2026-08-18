@@ -97,7 +97,7 @@ def _isolated_lubko_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
         The pytest-owned XDG root for the current test.
     """
     root = tmp_path / "xdg"
-    isolation.CURRENT_TEST_TMP = tmp_path
+    isolation.RUNTIME.current_test_tmp = tmp_path
     monkeypatch.setenv("XDG_STATE_HOME", str(root / "state"))
     monkeypatch.setenv("XDG_DATA_HOME", str(root / "share"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(root / "cache"))
@@ -366,7 +366,7 @@ def _session_process_teardown() -> Iterator[None]:
 @pytest.fixture(autouse=True)
 def _process_teardown(
     _isolated_lubko_state: Path,
-) -> Iterator[None]:
+) -> Iterator[dict[int, int]]:
     """Own and deterministically stop every process a test creates.
 
     Takes an explicit parameter dependency on ``_isolated_lubko_state`` so

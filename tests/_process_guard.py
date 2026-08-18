@@ -437,6 +437,9 @@ def _stop_popen(proc: subprocess.Popen[bytes]) -> None:
         time.sleep(GROUP_POLL_SECONDS)
     if proc.poll() is None and (pgid is None or pgid != pid or group_has_members(pgid)):
         _signal_exact(pid, pgid, signal.SIGKILL)
+    if proc.poll() is not None and pgid is not None and pgid == pid and group_has_members(pgid):
+        with suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
     if proc.poll() is None:
         with suppress(Exception):
             proc.wait(timeout=KILL_GRACE_SECONDS)
