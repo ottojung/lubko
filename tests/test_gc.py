@@ -12,8 +12,13 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import subprocess
+import tempfile
 import threading
+import time
 from contextlib import nullcontext
+from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
 from uuid import uuid4
 
@@ -21,8 +26,12 @@ import psycopg
 import pytest
 
 from lubko.worker import (
+    ActiveJob,
+    OutputStream,
     Settings,
     collect_transport,
+    publish_output,
+    recover_stale_jobs,
 )
 
 if TYPE_CHECKING:
@@ -760,3 +769,229 @@ def test_gc_no_job_contents_in_logs(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.DEBUG):
         collect_transport(_as_db(conn), _make_settings())
     assert "root_id" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Chunk counting
+# ---------------------------------------------------------------------------
+
+
+def test_gc_chunk_count_is_accurate(db: str) -> None:
+    """collect_transport returns the actual number of owned chunks deleted."""
+    root_id = _insert_terminal_job(db)
+    chunk_ids = [_insert_output_chunk(db, root_id, sequence=i) for i in range(7)]
+
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=10)
+    with psycopg.connect(db) as conn:
+        _roots, chunks, _orphans = collect_transport(conn, settings)
+
+    assert chunks == 7
+    for cid in chunk_ids:
+        assert not _row_exists(db, cid)
+
+
+def test_gc_chunk_count_partial_drain(db: str) -> None:
+    """Chunk count reflects only the bounded batch actually deleted."""
+    root_id = _insert_terminal_job(db)
+    for i in range(10):
+        _insert_output_chunk(db, root_id, sequence=i)
+
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=3)
+    with psycopg.connect(db) as conn:
+        _roots, chunks, _orphans = collect_transport(conn, settings)
+
+    assert chunks == 3
+
+
+def test_gc_chunk_count_zero_when_no_chunks(db: str) -> None:
+    """Chunk count is zero when roots have no owned chunks."""
+    _insert_terminal_job(db)
+
+    settings = _make_settings(gc_retention_seconds=0.0)
+    with psycopg.connect(db) as conn:
+        _roots, chunks, _orphans = collect_transport(conn, settings)
+
+    assert chunks == 0
+
+
+# ---------------------------------------------------------------------------
+# Lease-recovery interaction
+# ---------------------------------------------------------------------------
+
+
+def test_gc_collects_after_lease_recovery_makes_terminal(db: str) -> None:
+    """An expired running job is recovered first, then GC collects it later.
+
+    GC itself never collects live running rows. The expired lease is
+    recovered by recover_stale_jobs into a terminal failed status, and only
+    once the finished_at timestamp is old enough does GC mark and drain it.
+    """
+    # Insert a running job with an expired lease.
+    root_id = _insert_running_job(db)
+    # Force the lease into the past.
+    with psycopg.connect(db) as conn:
+        conn.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = jsonb_set(\n"
+            "    payload::jsonb,\n"
+            "    '{state,lease_expires_at}',\n"
+            "    to_jsonb('2020-01-01T00:00:00.000000Z'::text)\n"
+            ")::text\n"
+            "WHERE id = %s",
+            (root_id,),
+        )
+
+    # GC must NOT collect it (still running, even though lease expired).
+    settings = _make_settings(gc_retention_seconds=0.0)
+    with psycopg.connect(db) as conn:
+        roots, _c, _o = collect_transport(conn, settings)
+    assert root_id not in roots
+    assert _row_exists(db, root_id)
+
+    # Lease recovery marks it failed.
+    with psycopg.connect(db) as conn:
+        recovered = recover_stale_jobs(conn)
+    assert len(recovered) == 1
+    assert recovered[0][0] == root_id
+    assert _read_status(db, root_id) == "failed"
+
+    # GC with large retention must NOT collect it (finished_at is recent).
+    settings_big = _make_settings(gc_retention_seconds=86400.0)
+    with psycopg.connect(db) as conn:
+        roots, _c, _o = collect_transport(conn, settings_big)
+    assert root_id not in roots
+
+    # Force finished_at into the deep past so the retention window covers it.
+    with psycopg.connect(db) as conn:
+        conn.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = jsonb_set(\n"
+            "    payload::jsonb,\n"
+            "    '{state,finished_at}',\n"
+            "    to_jsonb('2020-01-01T00:00:00.000000Z'::text)\n"
+            ")::text\n"
+            "WHERE id = %s",
+            (root_id,),
+        )
+
+    # Add chunks so Phase 2 does not delete the root immediately.
+    for i in range(5):
+        _insert_output_chunk(db, root_id, sequence=i)
+
+    # Now GC marks it and root survives Phase 2 (chunks > batch_limit).
+    small_batch = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=2)
+    with psycopg.connect(db) as conn:
+        roots, _c, _o = collect_transport(conn, small_batch)
+    assert root_id in roots
+    assert _is_gc_marked(db, root_id)
+    assert _row_exists(db, root_id)
+
+
+def _read_status(conninfo: str, job_id: UUID) -> str:
+    """Read the current status of a job.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        job_id: Job identifier.
+
+    Returns:
+        The current job status.
+    """
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "SELECT (payload::jsonb)->'state'->>'status'\nFROM lubko.jobs WHERE id = %s",
+            (job_id,),
+        ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+# ---------------------------------------------------------------------------
+# GC mark/drain vs publish_output race
+# ---------------------------------------------------------------------------
+
+
+def test_gc_mark_drain_vs_publish_output_race(db: str) -> None:
+    """Publication that holds root lock before mark can commit chunks.
+
+    Once gc=true is marked, publication must refuse the root and cannot
+    leave an orphan chunk. Chunks committed before the mark are drained
+    normally by the chunk drain pass.
+    """
+    root_id = _insert_terminal_job(db)
+    # Create a capture file for publication with enough data to create chunks.
+    tmp = Path(tempfile.mkdtemp())
+    stdout_path = tmp / "stdout.cap"
+    stdout_path.write_bytes(b"x" * 9000)
+
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=10)
+
+    # Insert enough chunks so Phase 2 does not delete the root immediately.
+    for i in range(15):
+        _insert_output_chunk(db, root_id, sequence=i)
+
+    # Simulate: publication runs first, commits chunks while root has no
+    # gc flag yet.
+    job = ActiveJob(
+        id=root_id,
+        cwd=str(tmp),
+        process=("echo", "test"),
+        proc=subprocess.Popen(
+            ["/bin/true"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ),
+        pid=0,
+        pgid=0,
+        started_mono=time.monotonic(),
+    )
+    job.stdout = OutputStream(path=stdout_path)
+    job.stderr = OutputStream(path=tmp / "stderr.cap")
+    job.stderr.path.write_bytes(b"")
+
+    with psycopg.connect(db) as conn:
+        published = publish_output(conn, job, ["stdout"], time.monotonic(), force=True)
+    assert published is True
+    # There should be chunks now.
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "SELECT count(*)::int FROM lubko.jobs "
+            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
+            "AND (payload::jsonb)->>'thread' = %s",
+            (str(root_id),),
+        ).fetchone()
+    assert row is not None
+    chunk_count_before = row[0]
+    assert chunk_count_before > 0
+
+    # Now GC marks the root.
+    with psycopg.connect(db) as conn:
+        roots, _c, _o = collect_transport(conn, settings)
+    assert root_id in roots
+    assert _is_gc_marked(db, root_id)
+
+    # Publication must now refuse the root (gc=true).
+    with psycopg.connect(db) as conn:
+        published_after = publish_output(conn, job, ["stdout"], time.monotonic(), force=True)
+    assert published_after is False
+
+    # Drain all chunks and remove root.
+    for _ in range(10):
+        with psycopg.connect(db) as conn:
+            collect_transport(conn, settings)
+        if not _row_exists(db, root_id):
+            break
+
+    assert not _row_exists(db, root_id)
+    with psycopg.connect(db) as conn:
+        row = conn.execute(
+            "SELECT count(*)::int FROM lubko.jobs "
+            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
+            "AND (payload::jsonb)->>'thread' = %s",
+            (str(root_id),),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 0
+
+    shutil.rmtree(tmp, ignore_errors=True)

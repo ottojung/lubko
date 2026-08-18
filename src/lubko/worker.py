@@ -1685,6 +1685,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 ")\n",
                 {"thread": str(root_id), "limit": settings.gc_batch_limit},
             )
+            total_chunks += cursor.rowcount
             # Delete root only if no chunks remain.
             cursor.execute(
                 "SELECT NOT EXISTS (\n"
@@ -2007,11 +2008,12 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
-        roots, _chunks, orphans = collect_transport(conn, self.settings)
-        if roots or orphans:
+        roots, chunks, orphans = collect_transport(conn, self.settings)
+        if roots or chunks or orphans:
             LOGGER.info(
-                "gc marked %d root(s) and cleaned %d orphan chunk(s)",
+                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)",
                 len(roots),
+                chunks,
                 orphans,
             )
 
