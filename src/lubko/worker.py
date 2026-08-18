@@ -1876,12 +1876,19 @@ class Supervisor:
         Connectivity errors are re-raised so the main loop enters outage
         handling.  Deterministic per-job data/SQL errors are quarantined so
         the offending job does not poison publication of unrelated jobs.
-        Quarantined jobs are skipped.
+        Quarantined jobs and quarantine-pending jobs awaiting retry
+        backoff are skipped; only ``_cleanup_quarantined_jobs`` may
+        retry their safe terminalization.
         """
         if self.conn is None:
             return
         for job in list(self.active.values()):
-            if not job.completed and not job.finalized and not job.quarantined:
+            if (
+                not job.completed
+                and not job.finalized
+                and not job.quarantined
+                and not job.quarantine_pending
+            ):
                 self._publish_job_output(job, now)
 
     def _cleanup_quarantined_jobs(self) -> None:
@@ -1942,6 +1949,9 @@ class Supervisor:
         the offending job does not poison finalization of unrelated jobs.
         Quarantined jobs whose process group is dead are cleaned up and
         untracked without re-entering publication/finalization.
+        Quarantine-pending jobs awaiting retry backoff are skipped;
+        only ``_cleanup_quarantined_jobs`` may retry their safe
+        terminalization.
 
         Raises:
             psycopg.Error: When the error is a connectivity issue.
@@ -1951,7 +1961,11 @@ class Supervisor:
             return
         self._cleanup_quarantined_jobs()
         for job in list(self.active.values()):
-            if not (job.completed and not job.finalized):
+            if (
+                not (job.completed and not job.finalized)
+                or job.quarantined
+                or job.quarantine_pending
+            ):
                 continue
             if group_has_members(job.pgid):
                 # Background members of the exact process group are still being

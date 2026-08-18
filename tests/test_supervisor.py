@@ -1848,3 +1848,74 @@ def test_quarantine_convergence_no_active_leak(
         supervisor.request_shutdown()
         thread.join(timeout=30)
         _kill_leftover_groups(jobs_db)
+
+
+def test_quarantine_pending_excluded_from_publish_and_finalize(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Regression: publish_output is not re-entered while quarantine_pending backoff.
+
+    When _quarantine_job fails and quarantine_pending is set, _publish_all
+    and _finalize_completed must not call publish_output for that job.
+    Only _cleanup_quarantined_jobs may retry its safe terminalization.
+    """
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys, time\n"
+                "for _ in range(5):\n"
+                "    sys.stdout.write('tick\\n')\n"
+                "    sys.stdout.flush()\n"
+                "    time.sleep(0.1)\n"
+            ),
+        ],
+    )
+    other = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('ok\\n'); sys.stdout.flush(); time.sleep(30)",
+        ],
+    )
+
+    publish_calls: dict[UUID, int] = {}
+
+    def _publish_side_effect(
+        _conn: JobsConnection, job: ActiveJob, *_args: object, **_kwargs: object
+    ) -> bool:
+        count = publish_calls.get(job.id, 0)
+        publish_calls[job.id] = count + 1
+        if job.id == target and count == 0:
+            exc = psycopg.DataError("quarantine pending regression injection")
+            exc.sqlstate = "22P05"
+            raise exc
+        return True
+
+    def _quarantine_always_pending(_conn: JobsConnection, _job_id: UUID, _reason: str) -> bool:
+        return False
+
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with (
+            patch("lubko.worker.publish_output", side_effect=_publish_side_effect),
+            patch("lubko.worker._quarantine_job", side_effect=_quarantine_always_pending),
+        ):
+            thread.start()
+            wait_until(lambda: read_status(jobs_db, other) == "running")
+            wait_until(lambda: read_status(jobs_db, target) in {"running", "failed"})
+            time.sleep(1.0)
+            assert target in supervisor.active
+            target_job = supervisor.active[target]
+            assert target_job.quarantine_pending
+            assert publish_calls.get(target, 0) == 1
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
