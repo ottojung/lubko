@@ -741,28 +741,31 @@ def spawn_worker(
     """Start the worker detached from the invoking shell.
 
     The worker becomes its own session and process group leader, with stdin
-    disconnected and both output streams appended to the stable worker log.
+    disconnected and both output streams directed to ``/dev/null``.  The
+    worker owns its own ``RotatingFileHandler`` for ``worker.log`` so there
+    is exactly one writer; the parent never opens the worker log file.
 
     Args:
         repo: Repository checkout to run the worker from.
         uv_path: Path to the ``uv`` executable.
-        log_path: Stable path of the worker log.
+        log_path: Stable path of the worker log (unused, kept for interface
+            compatibility; the worker owns its own log).
         env: Environment for the worker, including the lifecycle token.
 
     Returns:
         The started worker process.
     """
-    with log_path.open("ab") as log:
-        return subprocess.Popen(
-            _worker_command(uv_path),
-            cwd=repo,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            env=env,
-        )
+    del log_path
+    return subprocess.Popen(
+        _worker_command(uv_path),
+        cwd=repo,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
 
 
 def _credential_environment_variable(name: str) -> bool:

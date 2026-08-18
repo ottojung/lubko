@@ -45,12 +45,14 @@ no new chunk rows. Archiving never shortens the live tail. See
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import suppress
@@ -63,6 +65,15 @@ import psycopg
 from psycopg.rows import tuple_row
 
 from lubko.config import load_database_config
+from lubko.health import (
+    WorkerHealth,
+    configure_worker_logging,
+    install_worker_exception_hooks,
+    proc_start_ticks,
+    read_worker_health,
+    worker_under_lifecycle,
+    write_worker_health,
+)
 from lubko.protocol import (
     OUTPUT_CHUNK_MAX_BYTES,
     OUTPUT_TAIL_MAX_BYTES,
@@ -88,6 +99,7 @@ DEFAULT_LEASE_DURATION_SECONDS: Final = 30.0
 DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS: Final = 5.0
 DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS: Final = 10.0
 DEFAULT_OUTPUT_PUBLICATION_INTERVAL_SECONDS: Final = 1.0
+DEFAULT_HEALTH_PUBLISH_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_CLAIM_BATCH_LIMIT: Final = 8
 DEFAULT_LEASE_SAFETY_MARGIN_SECONDS: Final = 5.0
 DEFAULT_DB_OPERATION_TIMEOUT_SECONDS: Final = 15.0
@@ -245,11 +257,14 @@ class Settings:
     poll_interval_seconds: float
     process_poll_interval_seconds: float
     cancel_grace_seconds: float
-    worker_incarnation: str = field(default_factory=lambda: uuid4().hex)
+    worker_incarnation: str = field(
+        default_factory=lambda: os.environ.get("LUBKO_LIFECYCLE_TOKEN", uuid4().hex)
+    )
     lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS
     lease_refresh_interval_seconds: float = DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
     lease_recovery_interval_seconds: float = DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
     output_publication_interval_seconds: float = DEFAULT_OUTPUT_PUBLICATION_INTERVAL_SECONDS
+    health_publish_interval_seconds: float = DEFAULT_HEALTH_PUBLISH_INTERVAL_SECONDS
     claim_batch_limit: int = DEFAULT_CLAIM_BATCH_LIMIT
     lease_safety_margin_seconds: float = DEFAULT_LEASE_SAFETY_MARGIN_SECONDS
     db_operation_timeout_seconds: float = DEFAULT_DB_OPERATION_TIMEOUT_SECONDS
@@ -286,6 +301,9 @@ class Settings:
             raise ValueError(msg)
         if self.output_publication_interval_seconds <= 0:
             msg = "LUBKO_OUTPUT_PUBLICATION_INTERVAL_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.health_publish_interval_seconds <= 0:
+            msg = "LUBKO_HEALTH_PUBLISH_INTERVAL_SECONDS must be positive"
             raise ValueError(msg)
         if self.claim_batch_limit <= 0:
             msg = "LUBKO_CLAIM_BATCH_LIMIT must be positive"
@@ -343,6 +361,12 @@ class Settings:
                 os.getenv(
                     "LUBKO_OUTPUT_PUBLICATION_INTERVAL_SECONDS",
                     str(DEFAULT_OUTPUT_PUBLICATION_INTERVAL_SECONDS),
+                )
+            ),
+            health_publish_interval_seconds=float(
+                os.getenv(
+                    "LUBKO_HEALTH_PUBLISH_INTERVAL_SECONDS",
+                    str(DEFAULT_HEALTH_PUBLISH_INTERVAL_SECONDS),
                 )
             ),
             claim_batch_limit=int(
@@ -1515,6 +1539,15 @@ class Supervisor:
         self._next_lease_refresh_at = 0.0
         self._next_cancel_scan_at = 0.0
         self._next_reconnect_at = 0.0
+        self._started_at = time.time()
+        self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
+        self._db_connected_at: float | None = None
+        self._db_error_at: float | None = None
+        self._last_completed_job_id: str | None = None
+        self._last_completed_at: float | None = None
+        self._last_completed_status: str | None = None
+        self._next_health_publish_at = 0.0
+        self._health_force = True
 
     def request_shutdown(self) -> None:
         """Request a graceful shutdown from another thread or a signal handler.
@@ -1531,11 +1564,13 @@ class Supervisor:
         invariant; a violated invariant is fatal.
         """
         self._connect()
+        self._publish_health(force=True)
         while not self._stopping:
             try:
                 self._tick(time.monotonic())
             except psycopg.Error:
                 self._enter_outage()
+            self._publish_health()
             time.sleep(self.settings.process_poll_interval_seconds)
         self._shutdown()
 
@@ -1719,6 +1754,10 @@ class Supervisor:
     def _finalize_one(self, job: ActiveJob) -> bool:
         """Persist the terminal state of one completed job.
 
+        ``last_completed_*`` health fields are only updated after the
+        terminal DB finalization succeeds, so a failed persist never poisons
+        the health snapshot.
+
         Args:
             job: The completed active job.
 
@@ -1746,7 +1785,11 @@ class Supervisor:
             final_status,
             result.exit_code,
         )
+        self._last_completed_job_id = str(job.id)
+        self._last_completed_at = time.time()
+        self._last_completed_status = final_status
         cleanup_job(job)
+        self._publish_health_force()
         return True
 
     def _claim_batch(self) -> None:
@@ -1831,6 +1874,7 @@ class Supervisor:
         job.last_heartbeat_at = time.monotonic()
         self.active[claimed.id] = job
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
+        self._publish_health_force()
         try:
             _persist_process(conn, job.id, job.pid, job.pgid)
         except psycopg.Error:
@@ -1878,6 +1922,68 @@ class Supervisor:
                 job.lease_evicted = True
                 request_stop(job, STOP_REASON_LEASE)
 
+    # ------------------------------------------------------------------
+    # Health publishing
+    # ------------------------------------------------------------------
+
+    def _build_health(self, *, alive: bool = True, shutting_down: bool = False) -> WorkerHealth:
+        """Build a health snapshot from the current supervisor state.
+
+        Args:
+            alive: Whether the worker is alive.
+            shutting_down: Whether the worker is shutting down.
+
+        Returns:
+            A fresh health snapshot.
+        """
+        current_job_id: str | None = None
+        current_job_started_at: float | None = None
+        if self.active:
+            first_job = next(iter(self.active.values()))
+            current_job_id = str(first_job.id)
+            current_job_started_at = first_job.started_mono
+        return WorkerHealth(
+            schema_version=1,
+            worker_id=self.settings.worker_id,
+            worker_incarnation=self.settings.worker_incarnation,
+            pid=os.getpid(),
+            start_time_ticks=self._start_time_ticks,
+            started_at=self._started_at,
+            alive=alive,
+            db_connected=self.conn is not None,
+            db_connected_at=self._db_connected_at,
+            db_error_at=self._db_error_at,
+            current_job_id=current_job_id,
+            current_job_started_at=current_job_started_at,
+            last_completed_job_id=self._last_completed_job_id,
+            last_completed_at=self._last_completed_at,
+            last_completed_status=self._last_completed_status,
+            shutting_down=shutting_down,
+        )
+
+    def _publish_health(self, *, force: bool = False) -> None:
+        """Write an atomic health snapshot, throttled unless forced.
+
+        Args:
+            force: Publish regardless of the throttle interval.
+        """
+        now = time.time()
+        if not force and now < self._next_health_publish_at:
+            return
+        health = self._build_health()
+        try:
+            write_worker_health(health)
+        except OSError:
+            LOGGER.debug("failed to write health snapshot", exc_info=True)
+        interval = self.settings.health_publish_interval_seconds
+        self._next_health_publish_at = now + interval
+        self._health_force = False
+
+    def _publish_health_force(self) -> None:
+        """Publish a health snapshot immediately."""
+        self._health_force = True
+        self._publish_health(force=True)
+
     def _connect(self) -> None:
         """Open and verify the supervisor's single database connection.
 
@@ -1897,6 +2003,8 @@ class Supervisor:
         except psycopg.Error:
             LOGGER.exception("database connection failed")
             self.conn = None
+            self._db_error_at = time.time()
+            self._publish_health_force()
             return
         try:
             verify_jobs_table_invariant(conn)
@@ -1909,6 +2017,8 @@ class Supervisor:
                 conn.close()
             raise
         self.conn = conn
+        self._db_connected_at = time.time()
+        self._publish_health_force()
 
     def _enter_outage(self) -> None:
         """Transition into database outage handling, discarding the connection.
@@ -1921,7 +2031,9 @@ class Supervisor:
             with suppress(Exception):
                 self.conn.close()
         self.conn = None
+        self._db_error_at = time.time()
         self._next_reconnect_at = 0.0
+        self._publish_health_force()
 
     def _shutdown(self) -> None:
         """Gracefully terminate, reap, and finalize every tracked process group.
@@ -1942,6 +2054,11 @@ class Supervisor:
             with suppress(Exception):
                 self.conn.close()
             self.conn = None
+        health = self._build_health(alive=False, shutting_down=True)
+        try:
+            write_worker_health(health)
+        except OSError:
+            LOGGER.debug("failed to write shutdown health snapshot", exc_info=True)
 
     def _drain_active_groups(self) -> None:
         """Wait for every active process group to exit, escalating to SIGKILL."""
@@ -2149,17 +2266,40 @@ def _stop_note(reason: str) -> str:
     return notes.get(reason, "stopped")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     """Run the Lubko worker supervisor.
+
+    Args:
+        argv: Command line arguments, or ``None`` to use ``sys.argv``.
+
+    Returns:
+        A process exit code.
 
     Raises:
         SystemExit: If the database configuration file cannot be loaded or the
             runtime settings are invalid.
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    parser = argparse.ArgumentParser(
+        prog="lubko-worker",
+        description=(
+            "Poll PostgreSQL for jobs, execute them concurrently, and supervise them safely."
+        ),
     )
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="print the current worker health snapshot and exit",
+    )
+    args = parser.parse_args(argv)
+
+    if args.health:
+        snapshot = read_worker_health()
+        if snapshot is None:
+            sys.stdout.write("worker: no health snapshot\n")
+            return 1
+        sys.stdout.write(json.dumps(snapshot.to_dict(), sort_keys=True, indent=2) + "\n")
+        return 0
+
     try:
         database = load_database_config()
     except (OSError, ValueError):
@@ -2170,6 +2310,21 @@ def main() -> None:
     except ValueError:
         LOGGER.exception("invalid worker runtime settings")
         raise SystemExit(1) from None
+
+    if worker_under_lifecycle():
+        configure_worker_logging(settings.worker_incarnation)
+        install_worker_exception_hooks()
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    LOGGER.info(
+        "worker starting: worker_id=%s incarnation=%s pid=%d",
+        settings.worker_id,
+        settings.worker_incarnation,
+        os.getpid(),
+    )
     supervisor = Supervisor(settings, database)
 
     def _handle_shutdown(signum: int, _frame: object) -> None:
@@ -2179,6 +2334,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
     supervisor.run()
+    return 0
 
 
 if __name__ == "__main__":

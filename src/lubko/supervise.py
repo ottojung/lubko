@@ -280,6 +280,7 @@ class SupervisorStatus:
     db_ready: bool | None
     ready: bool | None
     message: str | None
+    worker_health: dict[str, object] | None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -309,6 +310,7 @@ class SupervisorStatus:
             "db_ready": self.db_ready,
             "ready": self.ready,
             "message": self.message,
+            "worker_health": self.worker_health,
         }
 
     @classmethod
@@ -355,6 +357,9 @@ class SupervisorStatus:
             db_ready=_optional_bool(data.get("db_ready")),
             ready=_optional_bool(data.get("ready")),
             message=_optional_string(data.get("message")),
+            worker_health=data.get("worker_health")
+            if isinstance(data.get("worker_health"), dict)
+            else None,
         )
 
 
