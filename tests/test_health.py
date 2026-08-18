@@ -31,6 +31,7 @@ from lubko.health import (
     worker_log_incarnation_path,
     write_worker_health,
 )
+from lubko.lifecycle import worker_log_path
 
 _PID_1000 = 1000
 _PID_999 = 999
@@ -495,8 +496,6 @@ def test_effective_health_fields() -> None:
 
 def test_per_incarnation_log_paths_are_distinct() -> None:
     """Each incarnation gets a unique log file path; no shared writer."""
-    from lubko.health import worker_log_incarnation_path
-
     path_a = worker_log_incarnation_path("inc-a")
     path_b = worker_log_incarnation_path("inc-b")
     assert path_a != path_b
@@ -505,8 +504,6 @@ def test_per_incarnation_log_paths_are_distinct() -> None:
 
 def test_worker_log_path_returns_per_incarnation_with_token() -> None:
     """worker_log_path(token) returns per-incarnation path."""
-    from lubko.lifecycle import worker_log_path
-
     path = worker_log_path("test-token-abc")
     assert path.name == "worker-test-token-abc.log"
     assert path.parent.name == "logs"
@@ -514,8 +511,6 @@ def test_worker_log_path_returns_per_incarnation_with_token() -> None:
 
 def test_worker_log_path_returns_stable_without_token() -> None:
     """worker_log_path() without token returns stable path."""
-    from lubko.lifecycle import worker_log_path
-
     path = worker_log_path()
     assert path.name == "worker.log"
     assert path.parent.name == "worker"
@@ -523,7 +518,5 @@ def test_worker_log_path_returns_stable_without_token() -> None:
 
 def test_stable_log_symlink_not_created_by_worker() -> None:
     """Worker never creates the stable worker.log symlink."""
-    from lubko.health import worker_log_current_path
-
     symlink = worker_log_current_path()
     assert not symlink.exists(), "worker must not create the stable log symlink"
