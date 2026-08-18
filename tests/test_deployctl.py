@@ -135,6 +135,7 @@ def pending_state(
         previous_retiring=previous_retiring,
         previous_meta=worker_meta(old, pid=100, repo=repo),
         new_meta=worker_meta(new, pid=200, repo=repo),
+        supervisor_owned=False,
     )
 
 
@@ -728,6 +729,7 @@ def test_status_keeps_live_supervised_pending_mission(
         "read_state",
         lambda: _supervisor_child_state(state.commit, state.generation),
     )
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: True)
     monkeypatch.setattr(dc, "_read_state", lambda: current[0])
     monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
     monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
@@ -815,6 +817,7 @@ def test_status_rolls_back_supervised_mission_after_deadline(
         "read_state",
         lambda: _supervisor_child_state(state.commit, state.generation),
     )
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: True)
     monkeypatch.setattr(dc, "_read_state", lambda: next(states))
     monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
     monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)

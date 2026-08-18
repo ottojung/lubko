@@ -472,17 +472,17 @@ def mission_state(
     status: str,
     commit: str,
     previous_commit: str,
-    *,
-    repo: str = "",
 ) -> dc.RollbackState:
     """Build a durable supervised-deployment mission for the override tests.
+
+    Use ``dataclasses.replace`` at call sites to set ``repo`` or
+    ``supervisor_owned`` when the test needs non-default values.
 
     Args:
         generation: Monotonic mission generation.
         status: ``pending``, ``confirmed``, or ``rolled_back``.
         commit: Candidate commit.
         previous_commit: Previously confirmed commit.
-        repo: Maintained checkout, defaults to ``""``.
 
     Returns:
         A minimal but valid :class:`dc.RollbackState`.
@@ -495,7 +495,7 @@ def mission_state(
         previous_commit=previous_commit,
         challenge_hash=None,
         deadline=time.time() + 60,
-        repo=repo,
+        repo="",
         uv_path="uv",
         stop_grace_seconds=1.0,
         git_timeout_seconds=5.0,
@@ -1063,7 +1063,13 @@ def test_pending_mission_drives_candidate_and_settlement_converges(
         original_pid = worker_pid()
         assert original_pid is not None
 
-        write_rollback(mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)))
+        write_rollback(
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
+        )
         wait_for_replacement(original_pid)
         wait_until(status_ready, timeout=30.0)
         candidate_pid = worker_pid()
@@ -1105,7 +1111,11 @@ def test_supervised_deploy_candidate_is_direct_supervisor_child(
         assert original_pid is not None
 
         dc.publish_mission(
-            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
             lock_timeout_seconds=5.0,
         )
         wait_for_replacement(original_pid)
@@ -1126,7 +1136,11 @@ def test_supervised_deploy_candidate_is_direct_supervisor_child(
         assert final_status.commit == second
         assert len(direct_children(final_status.supervisor_pid)) == 1
         write_rollback(
-            mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+            replace(
+                mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
         )
 
 
@@ -1145,7 +1159,11 @@ def test_supervised_bad_candidate_rollback_converges_to_previous(
         assert original_pid is not None
 
         dc.publish_mission(
-            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
             lock_timeout_seconds=5.0,
         )
         wait_for_replacement(original_pid)
@@ -1164,7 +1182,11 @@ def test_supervised_bad_candidate_rollback_converges_to_previous(
         assert final_status.commit == first
         assert len(direct_children(final_status.supervisor_pid)) == 1
         write_rollback(
-            mission_state(applied + 1, dc.STATUS_ROLLED_BACK, second, first, repo=str(repo))
+            replace(
+                mission_state(applied + 1, dc.STATUS_ROLLED_BACK, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
         )
 
 
@@ -1211,7 +1233,13 @@ def test_status_keeps_live_supervised_pending_mission(
         original_pid = worker_pid()
         assert original_pid is not None
 
-        write_rollback(mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)))
+        write_rollback(
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
+        )
         wait_for_replacement(original_pid)
         wait_until(status_ready, timeout=30.0)
         candidate_pid = worker_pid()
@@ -1251,7 +1279,11 @@ def test_status_rolls_back_supervised_mission_with_lapsed_deadline(
         original_pid = worker_pid()
         assert original_pid is not None
 
-        lapsed = mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo))
+        lapsed = replace(
+            mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+            repo=str(repo),
+            supervisor_owned=True,
+        )
         write_rollback(replace(lapsed, deadline=time.time() - 1))
         wait_for_replacement(original_pid)
         wait_until(status_ready, timeout=30.0)
@@ -1288,7 +1320,11 @@ def test_supervisor_restart_resumes_pending_mission_candidate(
         original_pid = worker_pid()
         assert original_pid is not None
         dc.publish_mission(
-            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
             lock_timeout_seconds=5.0,
         )
         wait_for_replacement(original_pid)
@@ -1307,7 +1343,11 @@ def test_supervisor_restart_resumes_pending_mission_candidate(
         assert status.commit == second
         assert len(direct_children(status.supervisor_pid)) == 1
         write_rollback(
-            mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+            replace(
+                mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
         )
 
 
@@ -1338,7 +1378,11 @@ def test_deploy_and_restart_generations_strictly_increase(
         mission_gen = dc.next_mission_generation()
         assert mission_gen > restart_gen
         dc.publish_mission(
-            mission_state(mission_gen, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            replace(
+                mission_state(mission_gen, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
             lock_timeout_seconds=5.0,
         )
         wait_until(status_commit_is(second), timeout=30.0)
@@ -1357,7 +1401,11 @@ def test_deploy_and_restart_generations_strictly_increase(
         assert len(direct_children(status.supervisor_pid)) == 1
         assert status.applied_generation == settle_gen
         write_rollback(
-            mission_state(mission_gen, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+            replace(
+                mission_state(mission_gen, dc.STATUS_CONFIRMED, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
         )
 
 
