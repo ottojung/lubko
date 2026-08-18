@@ -627,7 +627,7 @@ def _spawn_gated_candidate(options: Options, commit: str) -> GatedWorker:
         repo=str(options.repo),
         git_commit=commit,
         worker_id=worker_id,
-        log_path=str(worker_log_path()),
+        log_path=str(worker_log_path(token)),
         started_at=time.time(),
         stopped_at=None,
     )
@@ -971,7 +971,7 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
         proc = spawn_worker(
             Path(state.repo),
             state.uv_path,
-            worker_log_path(),
+            worker_log_path(token),
             env,
         )
     except OSError:
@@ -990,7 +990,7 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
         repo=state.repo,
         git_commit=state.previous_commit,
         worker_id=worker_id,
-        log_path=str(worker_log_path()),
+        log_path=str(worker_log_path(token)),
         started_at=time.time(),
         stopped_at=None,
     )
