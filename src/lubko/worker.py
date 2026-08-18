@@ -1876,12 +1876,18 @@ class Supervisor:
         Connectivity errors are re-raised so the main loop enters outage
         handling.  Deterministic per-job data/SQL errors are quarantined so
         the offending job does not poison publication of unrelated jobs.
-        Quarantined jobs are skipped.
+        Quarantined and quarantine-pending jobs are skipped — only the
+        bounded quarantine retry owner may touch DB state until convergence.
         """
         if self.conn is None:
             return
         for job in list(self.active.values()):
-            if not job.completed and not job.finalized and not job.quarantined:
+            if (
+                not job.completed
+                and not job.finalized
+                and not job.quarantined
+                and not job.quarantine_pending
+            ):
                 self._publish_job_output(job, now)
 
     def _cleanup_quarantined_jobs(self) -> None:
@@ -1934,17 +1940,52 @@ class Supervisor:
                     delay = QUARANTINE_RETRY_BASE_SECONDS * (2**job.quarantine_retries)
                     job.quarantine_next_retry_at = now + delay
 
+    def _try_finalize_one_completed(self, job: ActiveJob) -> None:
+        """Attempt final publication and finalization for one completed job.
+
+        Args:
+            job: The completed active job.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
+        """
+        conn = self.conn
+        if conn is None:
+            return
+        try:
+            published = publish_output(
+                conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True
+            )
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "publishing final output for job %s failed (SQLSTATE %s)",
+                job.id,
+                exc.sqlstate or "N/A",
+            )
+            if _quarantine_job(conn, job.id, f"final publication error: {exc}"):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
+            request_stop(job, STOP_REASON_QUARANTINE)
+            return
+        if not published:
+            self._untrack_lost_job(job)
+            return
+        if self._finalize_one(job):
+            job.finalized = True
+            self.active.pop(job.id, None)
+
     def _finalize_completed(self) -> None:
         """Publish final output and finalize every job whose process is fully gone.
 
         Connectivity errors are re-raised so the main loop enters outage
         handling.  Deterministic per-job data/SQL errors are quarantined so
         the offending job does not poison finalization of unrelated jobs.
-        Quarantined jobs whose process group is dead are cleaned up and
-        untracked without re-entering publication/finalization.
-
-        Raises:
-            psycopg.Error: When the error is a connectivity issue.
+        Quarantined and quarantine-pending jobs are excluded from normal
+        publication/finalization — only the bounded quarantine retry owner
+        may touch DB state until convergence.
         """
         conn = self.conn
         if conn is None:
@@ -1953,34 +1994,11 @@ class Supervisor:
         for job in list(self.active.values()):
             if not (job.completed and not job.finalized):
                 continue
+            if job.quarantined or job.quarantine_pending:
+                continue
             if group_has_members(job.pgid):
-                # Background members of the exact process group are still being
-                # reaped; finalizing (and untracking) now would leak them.
                 continue
-            try:
-                published = publish_output(
-                    conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True
-                )
-            except psycopg.Error as exc:
-                if self._is_connectivity_error(exc):
-                    raise
-                LOGGER.exception(
-                    "publishing final output for job %s failed (SQLSTATE %s)",
-                    job.id,
-                    exc.sqlstate or "N/A",
-                )
-                if _quarantine_job(conn, job.id, f"final publication error: {exc}"):
-                    job.quarantined = True
-                else:
-                    job.quarantine_pending = True
-                request_stop(job, STOP_REASON_QUARANTINE)
-                continue
-            if not published:
-                self._untrack_lost_job(job)
-                continue
-            if self._finalize_one(job):
-                job.finalized = True
-                self.active.pop(job.id, None)
+            self._try_finalize_one_completed(job)
 
     def _untrack_lost_job(self, job: ActiveJob) -> None:
         """Untrack a completed job whose root row was deleted concurrently.
@@ -2032,8 +2050,10 @@ class Supervisor:
                 job.id,
                 exc.sqlstate or "N/A",
             )
-            _quarantine_job(conn, job.id, f"finalization error: {exc}")
-            job.quarantined = True
+            if _quarantine_job(conn, job.id, f"finalization error: {exc}"):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
             request_stop(job, STOP_REASON_QUARANTINE)
             return False
         LOGGER.info(
@@ -2147,7 +2167,9 @@ class Supervisor:
         """Finalize a job that failed before or during spawning.
 
         Connectivity errors are re-raised so the main loop enters outage
-        handling.  Deterministic per-job errors are logged and swallowed.
+        handling.  Deterministic per-job errors attempt quarantine
+        terminalization directly so the row does not remain non-terminal
+        indefinitely.
 
         Args:
             job_id: The job identifier.
@@ -2169,6 +2191,7 @@ class Supervisor:
                 job_id,
                 exc.sqlstate or "N/A",
             )
+            _quarantine_job(conn, job_id, f"immediate finalization error: {exc}")
 
     def _enforce_lease_safety(self) -> None:
         """Terminate owned groups whose lease can no longer be refreshed in time.
@@ -2326,7 +2349,15 @@ class Supervisor:
         return job.completed and not group_has_members(job.pgid)
 
     def _finalize_all_for_shutdown(self) -> None:
-        """Finalize every tracked job when PostgreSQL is available."""
+        """Finalize every tracked job when PostgreSQL is available.
+
+        Connectivity errors are re-raised so the caller can handle outage
+        before continuing shutdown.  Deterministic per-job errors are logged
+        and the job is quarantined, preserving lease/row safety.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
+        """
         if self.conn is None:
             return
         for job in list(self.active.values()):
@@ -2344,11 +2375,14 @@ class Supervisor:
                     force=True,
                 )
             except psycopg.Error as exc:
+                if self._is_connectivity_error(exc):
+                    raise
                 LOGGER.exception(
                     "publishing shutdown output for job %s failed (SQLSTATE %s)",
                     job.id,
                     exc.sqlstate or "N/A",
                 )
+                _quarantine_job(self.conn, job.id, f"shutdown publication error: {exc}")
                 continue
             if not retained:
                 self._untrack_lost_job(job)
