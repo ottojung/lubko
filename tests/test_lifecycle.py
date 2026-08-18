@@ -2738,3 +2738,54 @@ def test_repair_refuses_a_foreground_worker(
             proc.kill()
         proc.wait(timeout=5)
         guard.unregister(proc)
+
+
+def test_process_has_token_rejects_adjacent_env_key() -> None:
+    """A different env key containing the token substring is never accepted.
+
+    ``/proc/<pid>/environ`` is NUL-separated; a naive ``marker in environ``
+    byte-substring check would accept ``X_LUBKO_LIFECYCLE_TOKEN=<token>``
+    because the expected ``LUBKO_LIFECYCLE_TOKEN=<token>`` appears as a
+    suffix of the adjacent entry's bytes.  The function must parse NUL-
+    separated entries and require exact ``KEY=VALUE`` equality.
+    """
+    token = uuid4().hex
+    wrong_key_env = dict(os.environ)
+    wrong_key_env["X_LUBKO_LIFECYCLE_TOKEN"] = token
+    wrong_proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=wrong_key_env,
+    )
+    guard.register(wrong_proc)
+    try:
+        assert not lifecycle.process_has_token(wrong_proc.pid, token)
+    finally:
+        if wrong_proc.poll() is None:
+            wrong_proc.kill()
+        wrong_proc.wait(timeout=5)
+        guard.unregister(wrong_proc)
+
+    exact_env = dict(os.environ)
+    exact_env[lifecycle.LIFECYCLE_MARKER_VAR] = token
+    exact_proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=exact_env,
+    )
+    guard.register(exact_proc)
+    try:
+        assert lifecycle.process_has_token(exact_proc.pid, token)
+    finally:
+        if exact_proc.poll() is None:
+            exact_proc.kill()
+        exact_proc.wait(timeout=5)
+        guard.unregister(exact_proc)

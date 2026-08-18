@@ -348,6 +348,12 @@ def process_identity(pid: int) -> ProcessIdentity | None:
 def process_has_token(pid: int, token: str) -> bool:
     """Return whether a process environment carries the lifecycle token.
 
+    ``/proc/<pid>/environ`` is NUL-separated; a naive substring check on the
+    raw bytes could falsely accept a *different* environment variable whose
+    value or key happens to contain ``LUBKO_LIFECYCLE_TOKEN=<token>`` as a
+    prefix or infix (e.g. ``X_LUBKO_LIFECYCLE_TOKEN=<token>``).  Instead we
+    split on NUL and require exact ``KEY=VALUE`` equality on one entry.
+
     Args:
         pid: Process ID to inspect.
         token: Expected lifecycle token.
@@ -355,12 +361,12 @@ def process_has_token(pid: int, token: str) -> bool:
     Returns:
         ``True`` when the token marker is present in the process environment.
     """
-    marker = f"{LIFECYCLE_MARKER_VAR}={token}".encode()
+    expected = f"{LIFECYCLE_MARKER_VAR}={token}".encode()
     try:
         environ = (Path("/proc") / str(pid) / "environ").read_bytes()
     except OSError:
         return False
-    return marker in environ
+    return any(entry == expected for entry in environ.split(b"\0"))
 
 
 def identity_matches(meta: WorkerMeta, identity: ProcessIdentity) -> bool:
