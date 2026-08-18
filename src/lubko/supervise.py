@@ -913,6 +913,24 @@ def _process_is_zombie(pid: int) -> bool:
     return fields[STAT_STATE_FIELD_INDEX] in {b"Z", b"X"}
 
 
+def child_alive(child: WorkerChild) -> bool:
+    """Return whether the recorded child identity is genuinely alive.
+
+    The exact PID and start time must match a live non-zombie process.  This
+    is a lightweight liveness check used by external observers (e.g. the
+    deployctl watchdog) that cannot verify the parent relationship.
+
+    Args:
+        child: Exact child identity recorded by the supervisor.
+
+    Returns:
+        ``True`` when the process is live and its start time matches.
+    """
+    if _process_is_zombie(child.pid):
+        return False
+    return proc_start_ticks(child.pid) == child.start_time_ticks
+
+
 def _read_cmdline(pid: int) -> str:
     """Read the joined command line of a live process.
 
