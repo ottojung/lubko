@@ -1674,14 +1674,15 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
         for root_id in gc_roots:
-            # Bounded chunk deletion for this root.
+            # Bounded chunk deletion for this root.  lower() normalises
+            # case so uppercase-UUID thread chunks are matched correctly.
             cursor.execute(
                 "DELETE FROM lubko.jobs\n"
                 "WHERE id IN (\n"
                 "    SELECT id\n"
                 "    FROM lubko.jobs\n"
                 "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
-                "        AND (payload::jsonb)->>'thread' = %(thread)s\n"
+                "        AND lower((payload::jsonb)->>'thread') = lower(%(thread)s)\n"
                 "    FOR UPDATE SKIP LOCKED\n"
                 "    LIMIT %(limit)s\n"
                 ")\n",
@@ -1694,7 +1695,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 "    SELECT 1\n"
                 "    FROM lubko.jobs\n"
                 "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
-                "        AND (payload::jsonb)->>'thread' = %(thread)s\n"
+                "        AND lower((payload::jsonb)->>'thread') = lower(%(thread)s)\n"
                 ")\n",
                 {"thread": str(root_id)},
             )
