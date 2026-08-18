@@ -140,6 +140,7 @@ class WorkerHealth:
     pid: int
     start_time_ticks: int
     started_at: float
+    published_at: float
     alive: bool
     db_connected: bool
     db_connected_at: float | None
@@ -164,6 +165,7 @@ class WorkerHealth:
             "pid": self.pid,
             "start_time_ticks": self.start_time_ticks,
             "started_at": self.started_at,
+            "published_at": self.published_at,
             "alive": self.alive,
             "db_connected": self.db_connected,
             "db_connected_at": self.db_connected_at,
@@ -193,6 +195,7 @@ class WorkerHealth:
             pid=int(data.get("pid") or 0),
             start_time_ticks=int(data.get("start_time_ticks") or 0),
             started_at=float(data.get("started_at") or 0.0),
+            published_at=float(data.get("published_at") or 0.0),
             alive=bool(data.get("alive")),
             db_connected=bool(data.get("db_connected")),
             db_connected_at=_optional_float(data.get("db_connected_at")),
@@ -315,20 +318,17 @@ def publish_current_log_surface(incarnation: str) -> None:
 def _atomic_symlink_update(symlink: Path, target_name: str) -> None:
     """Atomically replace a symlink to point at a new target name.
 
-    Uses a temporary symlink + ``os.replace()`` so a concurrent reader never
-    sees a partial update or a dangling intermediate.
+    Uses a temporary symlink + ``Path.replace()`` so a concurrent reader
+    never sees a partial update or a dangling intermediate.
 
     Args:
         symlink: The stable symlink path.
         target_name: The new target filename (relative to the symlink's parent).
     """
     tmp_symlink = symlink.with_name(f"{symlink.name}.tmp")
-    try:
-        tmp_symlink.unlink(missing_ok=True)
-        tmp_symlink.symlink_to(target_name)
-        tmp_symlink.replace(symlink)
-    except OSError:
-        LOGGER.debug("failed to update stable symlink %s", symlink, exc_info=True)
+    tmp_symlink.unlink(missing_ok=True)
+    tmp_symlink.symlink_to(target_name)
+    tmp_symlink.replace(symlink)
 
 
 # ---------------------------------------------------------------------------
@@ -457,7 +457,7 @@ def interpret_worker_health(
     if snapshot is None:
         return EffectiveHealth(snapshot=None, live=False, stale=False, reason="no health snapshot")
     now = time.time()
-    age = now - snapshot.started_at
+    age = now - snapshot.published_at
     pid = snapshot.pid
     reason = "ok"
     live = snapshot.alive

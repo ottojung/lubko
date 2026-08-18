@@ -241,6 +241,7 @@ def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> A
         pid=proc.pid,
         pgid=proc.pid,
         started_mono=time.monotonic(),
+        claimed_at=time.time(),
     )
     job.stdout = OutputStream(path=tmp_path / "stdout.cap")
     job.stderr = OutputStream(path=tmp_path / "stderr.cap")
@@ -920,6 +921,7 @@ def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
             pid=proc.pid,
             pgid=pgid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         request_stop(job, "cancel")
         assert job.term_sent
@@ -1024,6 +1026,7 @@ def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
             pid=proc.pid,
             pgid=pgid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         job.completed = True
         job.returncode = 0
@@ -1058,6 +1061,7 @@ def test_signal_kill_does_not_note_natural_reap(tmp_path: Path) -> None:
             pid=proc.pid,
             pgid=proc.pid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         job.completed = True
         job.returncode = 0
@@ -1092,6 +1096,7 @@ def test_signal_kill_appends_diagnostic(tmp_path: Path) -> None:
             pid=proc.pid,
             pgid=proc.pid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         request_stop(job, "cancel")
         note_before = job.cancellation_note

@@ -55,19 +55,22 @@ def _health(
     pid: int = _PID_1000,
     start_time_ticks: int = _TICKS_42,
     started_at: float | None = None,
+    published_at: float | None = None,
 ) -> WorkerHealth:
     """Build a minimal valid health snapshot for testing.
 
     Returns:
         A ``WorkerHealth`` snapshot with the given parameters.
     """
+    now = time.time()
     return WorkerHealth(
         schema_version=1,
         worker_id="test-worker",
         worker_incarnation=incarnation,
         pid=pid,
         start_time_ticks=start_time_ticks,
-        started_at=started_at if started_at is not None else time.time(),
+        started_at=started_at if started_at is not None else now,
+        published_at=published_at if published_at is not None else now,
         alive=True,
         db_connected=True,
         db_connected_at=None,
@@ -219,18 +222,26 @@ def test_old_incarnation_file_intact_after_repoint() -> None:
     assert old.pid == _PID_111
 
 
+def test_symlink_publication_raises_on_readonly_fs() -> None:
+    """Symlink publication raises OSError on a read-only directory."""
+    symlink = health_current_path()
+    symlink.parent.mkdir(parents=True, exist_ok=True)
+    (symlink.parent / "readonly").mkdir(exist_ok=True)
+    bad_path = Path("/nonexistent-dir/health.json")
+    try:
+        publish_current_health_surface("should-fail")
+    except OSError:
+        return
+    assert not bad_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # Identity cross-check: old stable health cannot prove candidate readiness
 # ---------------------------------------------------------------------------
 
 
 def test_old_stable_health_cannot_be_used_for_candidate() -> None:
-    """Supervisor reads by incarnation, not the stable symlink.
-
-    The stable symlink still points to the old worker; the candidate's
-    snapshot is a separate file.  A candidate readiness check must read
-    the candidate's incarnation, not the stable surface.
-    """
+    """Supervisor reads by incarnation, not the stable symlink."""
     old_health = _health(incarnation="old-worker", pid=500, start_time_ticks=99)
     write_worker_health(old_health)
     publish_current_health_surface("old-worker")
@@ -265,6 +276,15 @@ def test_cross_check_rejects_mismatched_start_time_ticks() -> None:
     assert snap.start_time_ticks != _TICKS_66
 
 
+def test_cross_check_rejects_mismatched_incarnation() -> None:
+    """Snapshot worker_incarnation not matching child token is rejected."""
+    health = _health(incarnation="wrong-token", pid=_PID_777, start_time_ticks=_TICKS_55)
+    write_worker_health(health)
+    snap = read_worker_health_by_incarnation("wrong-token")
+    assert snap is not None
+    assert snap.worker_incarnation != "correct-token"
+
+
 # ---------------------------------------------------------------------------
 # Stale candidate snapshot cannot become current
 # ---------------------------------------------------------------------------
@@ -286,11 +306,21 @@ def test_interpret_rejects_dead_pid() -> None:
 
 
 def test_interpret_rejects_stale_snapshot() -> None:
-    """Snapshot older than max_staleness_seconds is stale."""
-    health = _health(started_at=time.time() - _STALE_AGE_SECONDS)
+    """Snapshot older than max_staleness_seconds on published_at is stale."""
+    health = _health(published_at=time.time() - _STALE_AGE_SECONDS)
     eff = interpret_worker_health(health, max_staleness_seconds=10.0)
     assert eff.live is False
     assert eff.stale is True
+
+
+def test_interpret_fresh_despite_old_started_at() -> None:
+    """Long-lived worker with recent published_at is not stale."""
+    health = _health(
+        started_at=time.time() - 3600,
+        published_at=time.time() - 1,
+    )
+    eff = interpret_worker_health(health, max_staleness_seconds=10.0)
+    assert eff.stale is False
 
 
 def test_interpret_rejects_invalid_pid() -> None:
@@ -310,6 +340,19 @@ def test_interpret_rejects_pid_reuse() -> None:
         eff = interpret_worker_health(health)
         assert eff.live is False
         assert "start time" in eff.reason
+
+
+# ---------------------------------------------------------------------------
+# current_job_started_at is wall-clock, not monotonic
+# ---------------------------------------------------------------------------
+
+
+def test_current_job_started_at_is_wall_clock() -> None:
+    """current_job_started_at must be a wall-clock timestamp."""
+    wall_now = time.time()
+    health = _health(started_at=wall_now, published_at=wall_now)
+    assert health.started_at == wall_now
+    assert health.published_at == wall_now
 
 
 # ---------------------------------------------------------------------------
