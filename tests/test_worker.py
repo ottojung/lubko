@@ -846,8 +846,8 @@ def test_settings_reads_lease_and_output_environment(
     assert settings.db_operation_timeout_seconds == pytest.approx(8.5)
 
 
-def test_settings_defaults_and_unique_incarnation() -> None:
-    """Settings default to the documented values and unique incarnations."""
+def test_settings_defaults_and_incarnation() -> None:
+    """Settings default to the documented values and have a non-empty incarnation."""
     first = Settings.from_environment()
     second = Settings.from_environment()
 
@@ -855,7 +855,11 @@ def test_settings_defaults_and_unique_incarnation() -> None:
     assert first.lease_refresh_interval_seconds == DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
     assert first.lease_recovery_interval_seconds == DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
     assert first.worker_incarnation
-    assert first.worker_incarnation != second.worker_incarnation
+    assert second.worker_incarnation
+    if os.environ.get("LUBKO_LIFECYCLE_TOKEN"):
+        assert first.worker_incarnation == second.worker_incarnation
+    else:
+        assert first.worker_incarnation != second.worker_incarnation
 
 
 def test_settings_rejects_refresh_at_least_lease() -> None:
