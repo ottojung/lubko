@@ -324,12 +324,32 @@ def _placeholder_meta(commit: str, repo: str) -> WorkerMeta:
     )
 
 
+def _is_supervisor_owned_mission(state: RollbackState) -> bool:
+    """Return whether the mission candidate was spawned by the external supervisor.
+
+    A supervisor-owned mission uses a never-alive placeholder identity; the
+    actual candidate process is owned by the daemon.  deployctl must never
+    invoke the legacy direct worker-retirement/restore path for such missions.
+
+    Args:
+        state: Pending supervised-deployment mission.
+
+    Returns:
+        ``True`` when the candidate identity is the supervisor placeholder.
+    """
+    return state.new_meta.pid == 0
+
+
 def _supervised_mission_active(state: RollbackState) -> bool:
     """Return whether the supervisor is currently running the mission candidate.
 
     In supervised mode the candidate identity lives in the supervisor's durable
     state, so a mission is active exactly when the supervisor tracks that exact
-    candidate commit as its live child at or after the mission generation.
+    candidate commit as its live child at or after the mission generation.  The
+    supervisor daemon's own liveness (verified by the caller through
+    :func:`supervise.supervisor_running`) is the proof that its state.json
+    child record is authoritative; deployctl never independently verifies the
+    child process identity.
 
     Args:
         state: Pending supervised-deployment mission.
@@ -1056,6 +1076,12 @@ def _rollback_locked(state: RollbackState) -> bool:
     """
     if state.status != STATUS_PENDING:
         return True
+    if _is_supervisor_owned_mission(state) and not supervise.supervisor_running():
+        append_deploy_log(
+            "supervisor-owned mission with supervisor absent; "
+            "leaving mission pending for the next supervisor incarnation"
+        )
+        return False
     if supervise.supervisor_running():
         try:
             settle_desired(state.previous_commit, state.repo, state.uv_path)
@@ -1100,6 +1126,8 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
                 state
             )
+        elif _is_supervisor_owned_mission(state):
+            should_rollback = False
         else:
             should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
         if should_rollback:
@@ -1222,6 +1250,11 @@ def _cleanup_pending_locked() -> None:
         return
     if state.status != STATUS_PENDING:
         raise DeployCtlError(f"unknown supervised deployment status {state.status!r}")
+    if _is_supervisor_owned_mission(state) and not supervise.supervisor_running():
+        raise DeployCtlError(
+            "a supervised deployment mission is pending and the supervisor is not running; "
+            "waiting for the supervisor to resume"
+        )
     if _mission_candidate_alive(state) and time.time() < state.deadline:
         raise DeployCtlError("another supervised checkout is still pending confirmation")
     if not _rollback_locked(state):
@@ -1656,7 +1689,12 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     state = _read_state()
     if state is None or state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
-    if time.time() >= state.deadline or not _mission_candidate_alive(state):
+    supervisor_absent_supervised = (
+        _is_supervisor_owned_mission(state) and not supervise.supervisor_running()
+    )
+    if not supervisor_absent_supervised and (
+        time.time() >= state.deadline or not _mission_candidate_alive(state)
+    ):
         _rollback_locked(state)
         raise DeployCtlError("confirmation window lapsed; deployment was rolled back")
     commit = request.get("commit")
@@ -1674,7 +1712,9 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
             "challenge": challenge,
         }
     _verify_challenge(state, answer)
-    if time.time() >= state.deadline or not _mission_candidate_alive(state):
+    if not supervisor_absent_supervised and (
+        time.time() >= state.deadline or not _mission_candidate_alive(state)
+    ):
         _rollback_locked(state)
         raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
     if supervise.supervisor_running():
@@ -1729,7 +1769,12 @@ def _handle_status(options: Options) -> dict[str, object]:
         with deploy_lock(options.lock_timeout_seconds):
             state = _read_state()
             if state is not None and state.status == STATUS_PENDING:
-                if time.time() >= state.deadline or not _mission_candidate_alive(state):
+                supervisor_absent_supervised = (
+                    _is_supervisor_owned_mission(state) and not supervise.supervisor_running()
+                )
+                if not supervisor_absent_supervised and (
+                    time.time() >= state.deadline or not _mission_candidate_alive(state)
+                ):
                     _rollback_locked(state)
                     state = _read_state()
             meta = read_meta()

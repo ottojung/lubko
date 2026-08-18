@@ -863,7 +863,167 @@ def test_status_keeps_live_legacy_pending_mission(
     assert result["previous_commit"] == state.previous_commit
 
 
-def test_watchdog_child_drops_inherited_file_descriptors(tmp_path: Path) -> None:
+def test_rollback_fails_closed_for_supervisor_owned_mission_when_supervisor_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervisor-owned mission must not invoke legacy retirement when the supervisor is absent.
+
+    The external supervisor is the sole process-lifecycle authority for its
+    missions.  Between supervisor incarnations, ``_rollback_locked`` must fail
+    closed rather than falling through to the legacy direct worker-retirement
+    path, and the durable mission must remain pending for the next supervisor
+    incarnation to resume.
+    """
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _msg: None)
+
+    assert dc._rollback_locked(state) is False
+
+
+def test_status_leaves_supervised_mission_pending_when_supervisor_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Status keeps a supervisor-owned pending mission live when the supervisor is absent.
+
+    Between incarnations the mission must not be rolled back via the legacy
+    path; it stays pending for the next supervisor to resume.
+    """
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == []
+    assert result["phase"] == "await-confirmation"
+    assert result["proposed_commit"] == state.commit
+
+
+def test_watchdog_skips_supervised_mission_when_supervisor_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The watchdog must not trigger legacy rollback for a supervisor-owned mission.
+
+    When the external supervisor is absent between incarnations the watchdog
+    must not fall through to the legacy ``worker_alive`` check (which always
+    fails for the placeholder identity) and must leave the mission pending.
+    """
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    options = make_options(tmp_path / "repo")
+    rollbacks: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
+    monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
+    monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    def rollback(value: dc.RollbackState) -> bool:
+        rollbacks.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    result = dc._handle_status(options)
+
+    assert rollbacks == []
+    assert result["phase"] == "await-confirmation"
+
+
+def test_cleanup_pending_blocked_by_supervised_mission_without_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new checkout is blocked when a supervised mission is pending.
+
+    The supervisor must be running for a supervised mission to be resolved.
+    """
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+
+    with pytest.raises(dc.DeployCtlError, match="supervisor is not running"):
+        dc._cleanup_pending_locked()
+
+
+def test_supervised_mission_active_requires_supervisor_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervisor-owned mission is active only when the supervisor daemon is confirmed running.
+
+    The supervisor daemon's exact PID/start-ticks identity proof is the
+    authority that makes its state.json child record trustworthy.  A stale
+    state.json left by a hard-killed supervisor is never treated as live.
+    """
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: _supervisor_child_state(state.commit, state.generation),
+    )
+
+    assert dc._supervised_mission_active(state) is True
+
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+
+    assert dc._supervised_mission_active(state) is False
+
+
+def test_no_legacy_worker_fallback_for_supervised_missions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Supervised missions must never fall through to the legacy uv-run worker path.
+
+    ``_rollback_locked`` for a supervisor-owned mission when the supervisor is
+    absent must return ``False`` without invoking ``_retire_candidate_locked``
+    or ``_restore_previous_locked``.
+    """
+    base = pending_state()
+    state = replace(base, new_meta=dc._placeholder_meta(base.commit, base.repo))
+    retire_calls: list[dc.RollbackState] = []
+    restore_calls: list[dc.RollbackState] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _msg: None)
+
+    def record_retire(_state: dc.RollbackState) -> bool:
+        retire_calls.append(_state)
+        return True
+
+    def record_restore(_state: dc.RollbackState) -> bool:
+        restore_calls.append(_state)
+        return True
+
+    monkeypatch.setattr(dc, "_retire_candidate_locked", record_retire)
+    monkeypatch.setattr(dc, "_restore_previous_locked", record_restore)
+
+    assert dc._rollback_locked(state) is False
+
+    assert retire_calls == []
+    assert restore_calls == []
     """A forked watchdog drops inherited descriptors without closing the parent's copy."""
     fd = os.open(tmp_path / "held", os.O_CREAT | os.O_RDWR)
     pid = os.fork()
