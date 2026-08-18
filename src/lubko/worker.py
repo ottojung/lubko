@@ -80,6 +80,43 @@ if TYPE_CHECKING:
 
 JobsConnection = psycopg.Connection[tuple[Any, ...]]
 
+
+def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None) -> bool:
+    """Classify a database error as a connectivity issue vs. a per-job deterministic failure.
+
+    Connectivity errors require entering outage handling and reconnecting.
+    Per-job deterministic errors (for example data representation failures)
+    are logged and the offending job is quarantined, but the connection
+    remains usable and other jobs are unaffected.
+
+    Classification rules (applied in order):
+
+    * SQLSTATE class ``08`` (connection exception) is always connectivity.
+    * An ``OperationalError`` on a broken or closed connection is always
+      connectivity, regardless of whether a SQLSTATE is populated (real
+      server shutdowns/failovers can surface as OperationalError with a
+      non-08 SQLSTATE while the connection is already unusable).
+    * Everything else (including server-side ``DataError``,
+      ``ProgrammingError``, ``IntegrityError``) is a per-job deterministic
+      failure.
+
+    Args:
+        exc: The caught psycopg exception.
+        conn: The current database connection, or ``None``.
+
+    Returns:
+        ``True`` when the error indicates a lost/unusable connection.
+    """
+    sqlstate = exc.sqlstate
+    if sqlstate is not None and sqlstate.startswith("08"):
+        return True
+    return (
+        isinstance(exc, psycopg.OperationalError)
+        and conn is not None
+        and (conn.broken or conn.closed)
+    )
+
+
 LOGGER: Final = logging.getLogger(__name__)
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_PROCESS_POLL_INTERVAL_SECONDS: Final = 0.1
@@ -123,6 +160,9 @@ STOP_REASON_SHUTDOWN: Final = "shutdown"
 STOP_REASON_LEASE: Final = "lease"
 STOP_REASON_ROW_LOST: Final = "row_lost"
 STOP_REASON_PERSIST: Final = "persist"
+STOP_REASON_QUARANTINE: Final = "quarantine"
+QUARANTINE_MAX_RETRIES: Final = 5
+QUARANTINE_RETRY_BASE_SECONDS: Final = 0.5
 JOB_ID_ENV: Final = "LUBKO_JOB_ID"
 
 
@@ -222,6 +262,10 @@ class ActiveJob:
     lease_evicted: bool = False
     row_lost: bool = False
     finalized: bool = False
+    quarantined: bool = False
+    quarantine_pending: bool = False
+    quarantine_retries: int = 0
+    quarantine_next_retry_at: float = 0.0
     last_heartbeat_at: float = 0.0
 
 
@@ -371,12 +415,15 @@ class Settings:
 def truncate_output(data: bytes, limit: int) -> str:
     """Decode output while retaining at most the newest ``limit`` bytes.
 
+    The canonical :func:`pg_safe_decode` conversion is used so the result is
+    always safe for PostgreSQL ``text`` / ``jsonb``.
+
     Args:
         data: Raw process output.
         limit: Maximum number of bytes to retain.
 
     Returns:
-        UTF-8 text, replacing invalid byte sequences.
+        UTF-8 text, replacing invalid byte sequences and NUL.
 
     Raises:
         ValueError: If ``limit`` is too small for the truncation marker.
@@ -389,7 +436,7 @@ def truncate_output(data: bytes, limit: int) -> str:
         payload = TRUNCATION_MARKER + data[-(limit - len(TRUNCATION_MARKER)) :]
     else:
         payload = data
-    return payload.decode("utf-8", errors="replace")
+    return pg_safe_decode(payload)
 
 
 def read_output(path: Path) -> bytes:
@@ -432,8 +479,33 @@ def read_range(path: Path, start: int, end: int) -> bytes:
         return fh.read(end - start)
 
 
+def pg_safe_decode(data: bytes) -> str:
+    r"""Decode arbitrary bytes into a string that is safe for PostgreSQL text/jsonb.
+
+    Invalid UTF-8 byte sequences are replaced with U+FFFD (the standard
+    replacement character), and U+0000 (NUL) is replaced with U+FFFD.
+    PostgreSQL's ``text`` / ``jsonb`` representation rejects the JSON escape
+    sequence for U+0000 (``\\u0000``), so NUL must never survive into protocol
+    text.
+
+    The replacement is purely textual; raw byte offsets used for chunking and
+    live-tail windowing are computed before decoding and are never affected.
+
+    Args:
+        data: Arbitrary captured output bytes.
+
+    Returns:
+        UTF-8 text safe for PostgreSQL ``text`` / ``jsonb``.
+    """
+    return data.decode("utf-8", errors="replace").replace("\x00", "\ufffd")
+
+
 def decode_range(path: Path, start: int, end: int) -> str:
-    """Decode the bytes in ``[start, end)`` as UTF-8 text with replacement.
+    """Decode the bytes in ``[start, end)`` as PostgreSQL-safe UTF-8 text.
+
+    The canonical conversion uses :func:`pg_safe_decode`: invalid UTF-8 byte
+    sequences become U+FFFD and NUL (U+0000) is replaced with U+FFFD so the
+    result is always safe for PostgreSQL ``text`` / ``jsonb``.
 
     Args:
         path: Capture file for the stream.
@@ -443,7 +515,7 @@ def decode_range(path: Path, start: int, end: int) -> str:
     Returns:
         The decoded text.
     """
-    return read_range(path, start, end).decode("utf-8", errors="replace")
+    return pg_safe_decode(read_range(path, start, end))
 
 
 def output_window_text(path: Path, max_chars: int) -> tuple[str, int, int]:
@@ -1353,6 +1425,70 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
     return _read_job_status(conn, job_id)
 
 
+def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str) -> bool:
+    """Terminalize a job that hit a deterministic database error.
+
+    Writes a ``failed`` terminal status directly, bypassing the normal
+    finalization path so publication/finalization data errors cannot block
+    terminalization. Only non-terminal rows are updated: already-terminal
+    rows are left untouched.
+
+    A connectivity error during the terminalization attempt is re-raised
+    so the caller can enter outage handling; a different deterministic
+    error is logged and returns ``False`` so the caller can retry later.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        job_id: Identifier of the job to quarantine.
+        reason: PostgreSQL-safe diagnostic text (no NUL bytes).
+
+    Returns:
+        ``True`` when the row was successfully terminalized or was already
+        terminal (durable).  ``False`` when the terminalization write
+        failed and must be retried.
+
+    Raises:
+        psycopg.Error: When the error is a connectivity issue.
+    """
+    safe_reason = reason.replace("\x00", "\ufffd")
+    try:
+        with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = (\n"
+                "  jsonb_set(\n"
+                "    jsonb_set(\n"
+                "      jsonb_set(\n"
+                "        jsonb_set(payload::jsonb, '{state,status}', to_jsonb('failed'::text)),\n"
+                "        '{state,finished_at}', " + UTC_ISO_SQL + "\n"
+                "      ),\n"
+                "      '{state,updated_at}', " + UTC_ISO_SQL + "\n"
+                "    ),\n"
+                "    '{state,quarantine_reason}', to_jsonb(%(reason)s::text)\n"
+                "  )\n"
+                ")::text\n"
+                "WHERE id = %(job_id)s\n"
+                "  AND (payload::jsonb)->>'type' = 'command'\n"
+                "  AND (payload::jsonb)->'state'->>'status'\n"
+                "      NOT IN ('succeeded','failed','cancelled')\n"
+                "RETURNING id\n",
+                {"job_id": job_id, "reason": safe_reason},
+            )
+            cursor.fetchone()
+    except psycopg.Error as exc:
+        if _is_connectivity_error_check(exc, conn):
+            raise
+        LOGGER.exception(
+            "quarantine terminalization for job %s failed (SQLSTATE %s)",
+            job_id,
+            exc.sqlstate or "N/A",
+        )
+        return False
+    # RETURNING found no row: either already terminal or type mismatch.
+    # Either way the row is safe — nothing more to write.
+    return True
+
+
 def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
     """Delete a root job and every output chunk explicitly owned by it.
 
@@ -1529,13 +1665,37 @@ class Supervisor:
 
         The first connection is verified against the two-column transport
         invariant; a violated invariant is fatal.
+
+        Connection-level failures (lost/unusable connection) enter outage
+        handling and trigger reconnection.  Per-job deterministic data/SQL
+        errors are caught locally within the db-phase methods so one bad
+        job never poisons the entire worker or triggers a reconnect loop.
+
+        Any unexpected ``psycopg.Error`` that escapes the per-job boundaries
+        and reaches this outer catch is classified:
+
+        * Connectivity errors (class 08 or broken/closed connection) enter
+          outage handling and reconnection.
+        * Non-connectivity errors are unexpected at this level and indicate
+          a global programming or schema fault.  The supervisor logs the
+          real exception/SQLSTATE and stops, deferring recovery to the
+          external process supervisor's crash-loop backoff.
         """
         self._connect()
         while not self._stopping:
             try:
                 self._tick(time.monotonic())
-            except psycopg.Error:
-                self._enter_outage()
+            except psycopg.Error as exc:
+                if self._is_connectivity_error(exc):
+                    self._enter_outage()
+                else:
+                    LOGGER.critical(
+                        "unexpected non-connectivity database error "
+                        "(SQLSTATE %s); stopping supervisor: %s",
+                        exc.sqlstate or "N/A",
+                        exc,
+                    )
+                    self._stopping = True
             time.sleep(self.settings.process_poll_interval_seconds)
         self._shutdown()
 
@@ -1658,49 +1818,187 @@ class Supervisor:
                 job.cancel_requested = True
                 request_stop(job, STOP_REASON_CANCEL)
 
-    def _publish_all(self, now: float) -> None:
-        """Publish changed output tails/chunks of running jobs, throttled."""
+    def _changed_streams(self, job: ActiveJob, now: float) -> list[str]:
+        """Return stream names with changed output since last publication."""
+        interval = self.settings.output_publication_interval_seconds
+        changed: list[str] = []
+        for name in OUTPUT_STREAMS:
+            stream = getattr(job, name)
+            if now - stream.published_at < interval:
+                continue
+            try:
+                size = stream_size(stream.path)
+            except OSError:
+                continue
+            if size != stream.published_size:
+                changed.append(name)
+        return changed
+
+    def _publish_job_output(self, job: ActiveJob, now: float) -> None:
+        """Publish changed output for one job, quarantining deterministic errors.
+
+        Args:
+            job: The active job to publish.
+            now: Monotonic time.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
+        """
         conn = self.conn
         if conn is None:
             return
-        interval = self.settings.output_publication_interval_seconds
+        changed = self._changed_streams(job, now)
+        if not changed:
+            return
+        try:
+            published = publish_output(conn, job, changed, now)
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "publishing output for job %s failed (SQLSTATE %s)",
+                job.id,
+                exc.sqlstate or "N/A",
+            )
+            if _quarantine_job(conn, job.id, f"publication error: {exc}"):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
+            request_stop(job, STOP_REASON_QUARANTINE)
+            return
+        if not published:
+            job.row_lost = True
+            request_stop(job, STOP_REASON_ROW_LOST)
+
+    def _publish_all(self, now: float) -> None:
+        """Publish changed output tails/chunks of running jobs, throttled.
+
+        Connectivity errors are re-raised so the main loop enters outage
+        handling.  Deterministic per-job data/SQL errors are quarantined so
+        the offending job does not poison publication of unrelated jobs.
+        Quarantined and quarantine-pending jobs are skipped — only the
+        bounded quarantine retry owner may touch DB state until convergence.
+        """
+        if self.conn is None:
+            return
         for job in list(self.active.values()):
-            if job.completed or job.finalized:
+            if (
+                not job.completed
+                and not job.finalized
+                and not job.quarantined
+                and not job.quarantine_pending
+            ):
+                self._publish_job_output(job, now)
+
+    def _cleanup_quarantined_jobs(self) -> None:
+        """Untrack quarantined jobs and retry quarantine-pending jobs with backoff.
+
+        After durable quarantine the row is already terminal; once the owned
+        process group is dead we clean capture files and remove the job from
+        the active registry without re-entering publication/finalization.
+
+        For quarantine-pending jobs (terminalization write previously failed)
+        whose process group has exited, we retry the safe quarantine
+        terminalization with exponential backoff.  After
+        ``QUARANTINE_MAX_RETRIES`` exhausted attempts we log CRITICAL and
+        stop the supervisor so the external crash-loop backoff owns further
+        recovery — we never retry at process-poll rate forever.
+        """
+        conn = self.conn
+        now = time.monotonic()
+        for job in list(self.active.values()):
+            if job.quarantined and job.completed and not group_has_members(job.pgid):
+                cleanup_job(job)
+                job.finalized = True
+                self.active.pop(job.id, None)
                 continue
-            changed: list[str] = []
-            for name in OUTPUT_STREAMS:
-                stream = getattr(job, name)
-                if now - stream.published_at < interval:
+            if (
+                job.quarantine_pending
+                and job.completed
+                and not group_has_members(job.pgid)
+                and conn is not None
+            ):
+                if now < job.quarantine_next_retry_at:
                     continue
-                try:
-                    size = stream_size(stream.path)
-                except OSError:
-                    continue
-                if size == stream.published_size:
-                    continue
-                changed.append(name)
-            if changed and not publish_output(conn, job, changed, now):
-                job.row_lost = True
-                request_stop(job, STOP_REASON_ROW_LOST)
+                if job.quarantine_retries >= QUARANTINE_MAX_RETRIES:
+                    LOGGER.critical(
+                        "quarantine terminalization for job %s failed after %d "
+                        "retries; stopping supervisor for external recovery",
+                        job.id,
+                        job.quarantine_retries,
+                    )
+                    self._stopping = True
+                    return
+                if _quarantine_job(conn, job.id, f"quarantine retry for {job.id}"):
+                    job.quarantined = True
+                    job.quarantine_pending = False
+                    cleanup_job(job)
+                    job.finalized = True
+                    self.active.pop(job.id, None)
+                else:
+                    job.quarantine_retries += 1
+                    delay = QUARANTINE_RETRY_BASE_SECONDS * (2**job.quarantine_retries)
+                    job.quarantine_next_retry_at = now + delay
+
+    def _try_finalize_one_completed(self, job: ActiveJob) -> None:
+        """Attempt final publication and finalization for one completed job.
+
+        Args:
+            job: The completed active job.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
+        """
+        conn = self.conn
+        if conn is None:
+            return
+        try:
+            published = publish_output(
+                conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True
+            )
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "publishing final output for job %s failed (SQLSTATE %s)",
+                job.id,
+                exc.sqlstate or "N/A",
+            )
+            if _quarantine_job(conn, job.id, f"final publication error: {exc}"):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
+            request_stop(job, STOP_REASON_QUARANTINE)
+            return
+        if not published:
+            self._untrack_lost_job(job)
+            return
+        if self._finalize_one(job):
+            job.finalized = True
+            self.active.pop(job.id, None)
 
     def _finalize_completed(self) -> None:
-        """Publish final output and finalize every job whose process is fully gone."""
+        """Publish final output and finalize every job whose process is fully gone.
+
+        Connectivity errors are re-raised so the main loop enters outage
+        handling.  Deterministic per-job data/SQL errors are quarantined so
+        the offending job does not poison finalization of unrelated jobs.
+        Quarantined and quarantine-pending jobs are excluded from normal
+        publication/finalization — only the bounded quarantine retry owner
+        may touch DB state until convergence.
+        """
         conn = self.conn
         if conn is None:
             return
+        self._cleanup_quarantined_jobs()
         for job in list(self.active.values()):
             if not (job.completed and not job.finalized):
                 continue
+            if job.quarantined or job.quarantine_pending:
+                continue
             if group_has_members(job.pgid):
-                # Background members of the exact process group are still being
-                # reaped; finalizing (and untracking) now would leak them.
                 continue
-            if not publish_output(conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True):
-                self._untrack_lost_job(job)
-                continue
-            if self._finalize_one(job):
-                job.finalized = True
-                self.active.pop(job.id, None)
+            self._try_finalize_one_completed(job)
 
     def _untrack_lost_job(self, job: ActiveJob) -> None:
         """Untrack a completed job whose root row was deleted concurrently.
@@ -1719,11 +2017,18 @@ class Supervisor:
     def _finalize_one(self, job: ActiveJob) -> bool:
         """Persist the terminal state of one completed job.
 
+        Connectivity errors are re-raised so the main loop enters outage
+        handling.  Deterministic per-job data/SQL errors are quarantined so
+        the offending job does not block finalization of unrelated jobs.
+
         Args:
             job: The completed active job.
 
         Returns:
             ``True`` when the job was finalized and its capture files removed.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
         """
         conn = self.conn
         if conn is None:
@@ -1737,8 +2042,19 @@ class Supervisor:
         )
         try:
             final_status = finish_job(conn, job.id, result)
-        except psycopg.Error:
-            LOGGER.exception("finalizing job %s failed", job.id)
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "finalizing job %s failed (SQLSTATE %s)",
+                job.id,
+                exc.sqlstate or "N/A",
+            )
+            if _quarantine_job(conn, job.id, f"finalization error: {exc}"):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
+            request_stop(job, STOP_REASON_QUARANTINE)
             return False
         LOGGER.info(
             "finished job %s with status %s and exit code %d",
@@ -1772,6 +2088,10 @@ class Supervisor:
 
         Args:
             claimed: The claimed job.
+
+        Raises:
+            psycopg.Error: When persisting the process identity fails with a
+                connectivity error.
         """
         conn = self.conn
         if conn is None:
@@ -1833,24 +2153,45 @@ class Supervisor:
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
         try:
             _persist_process(conn, job.id, job.pid, job.pgid)
-        except psycopg.Error:
-            LOGGER.exception("unable to persist process identity for job %s", job.id)
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "unable to persist process identity for job %s (SQLSTATE %s)",
+                job.id,
+                exc.sqlstate or "N/A",
+            )
             request_stop(job, STOP_REASON_PERSIST)
 
     def _finalize_immediate(self, job_id: UUID, result: JobResult) -> None:
         """Finalize a job that failed before or during spawning.
 
+        Connectivity errors are re-raised so the main loop enters outage
+        handling.  Deterministic per-job errors attempt quarantine
+        terminalization directly so the row does not remain non-terminal
+        indefinitely.
+
         Args:
             job_id: The job identifier.
             result: The failure result.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
         """
         conn = self.conn
         if conn is None:
             return
         try:
             finish_job(conn, job_id, result)
-        except psycopg.Error:
-            LOGGER.exception("unable to finalize job %s", job_id)
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "unable to finalize job %s (SQLSTATE %s)",
+                job_id,
+                exc.sqlstate or "N/A",
+            )
+            _quarantine_job(conn, job_id, f"immediate finalization error: {exc}")
 
     def _enforce_lease_safety(self) -> None:
         """Terminate owned groups whose lease can no longer be refreshed in time.
@@ -1909,6 +2250,17 @@ class Supervisor:
                 conn.close()
             raise
         self.conn = conn
+
+    def _is_connectivity_error(self, exc: psycopg.Error) -> bool:
+        """Classify a database error as a connectivity issue.
+
+        Delegates to :func:`_is_connectivity_error_check` with the current
+        connection.  See that function for the full classification rules.
+
+        Returns:
+            ``True`` when the error indicates a lost/unusable connection.
+        """
+        return _is_connectivity_error_check(exc, self.conn)
 
     def _enter_outage(self) -> None:
         """Transition into database outage handling, discarding the connection.
@@ -1997,7 +2349,15 @@ class Supervisor:
         return job.completed and not group_has_members(job.pgid)
 
     def _finalize_all_for_shutdown(self) -> None:
-        """Finalize every tracked job when PostgreSQL is available."""
+        """Finalize every tracked job when PostgreSQL is available.
+
+        Connectivity errors are re-raised so the caller can handle outage
+        before continuing shutdown.  Deterministic per-job errors are logged
+        and the job is quarantined, preserving lease/row safety.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
+        """
         if self.conn is None:
             return
         for job in list(self.active.values()):
@@ -2014,8 +2374,15 @@ class Supervisor:
                     time.monotonic(),
                     force=True,
                 )
-            except psycopg.Error:
-                LOGGER.exception("publishing shutdown output for job %s failed", job.id)
+            except psycopg.Error as exc:
+                if self._is_connectivity_error(exc):
+                    raise
+                LOGGER.exception(
+                    "publishing shutdown output for job %s failed (SQLSTATE %s)",
+                    job.id,
+                    exc.sqlstate or "N/A",
+                )
+                _quarantine_job(self.conn, job.id, f"shutdown publication error: {exc}")
                 continue
             if not retained:
                 self._untrack_lost_job(job)
@@ -2061,7 +2428,12 @@ def _finalize_status(job: ActiveJob) -> str:
     """
     if job.stop_reason in {STOP_REASON_CANCEL, STOP_REASON_SHUTDOWN}:
         return "cancelled"
-    if job.stop_reason in {STOP_REASON_LEASE, STOP_REASON_ROW_LOST, STOP_REASON_PERSIST}:
+    if job.stop_reason in {
+        STOP_REASON_LEASE,
+        STOP_REASON_ROW_LOST,
+        STOP_REASON_PERSIST,
+        STOP_REASON_QUARANTINE,
+    }:
         return "failed"
     if job.cancel_requested:
         return "cancelled"
