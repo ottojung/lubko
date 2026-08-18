@@ -280,6 +280,7 @@ class SupervisorStatus:
     db_ready: bool | None
     ready: bool | None
     message: str | None
+    worker_health: dict[str, object] | None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -309,6 +310,7 @@ class SupervisorStatus:
             "db_ready": self.db_ready,
             "ready": self.ready,
             "message": self.message,
+            "worker_health": self.worker_health,
         }
 
     @classmethod
@@ -355,6 +357,7 @@ class SupervisorStatus:
             db_ready=_optional_bool(data.get("db_ready")),
             ready=_optional_bool(data.get("ready")),
             message=_optional_string(data.get("message")),
+            worker_health=_optional_dict(data.get("worker_health")),
         )
 
 
@@ -1040,6 +1043,18 @@ def _optional_bool(value: object | None) -> bool | None:
         The boolean, or ``None``.
     """
     return value if isinstance(value, bool) else None
+
+
+def _optional_dict(value: object | None) -> dict[str, object] | None:
+    """Return a dictionary value or ``None``.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        The dictionary, or ``None``.
+    """
+    return value if isinstance(value, dict) else None
 
 
 def _child_to_dict(child: WorkerChild) -> dict[str, object]:

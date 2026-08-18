@@ -667,7 +667,11 @@ def test_deploy_success_replaces_worker(
         assert meta.state == lifecycle.STATE_RUNNING
         assert meta.pid == spawned[0].pid
         assert meta.git_commit == GIT_SHA
-        assert lifecycle.worker_log_path().is_file()
+        assert meta.log_path
+        log_p = Path(meta.log_path)
+        assert log_p.parent.name == "logs"
+        assert log_p.name.startswith("worker-")
+        assert log_p.name.endswith(".log")
         out = capsys.readouterr().out
         assert "deployed git commit" in out
         assert GIT_SHA in out
@@ -1129,6 +1133,7 @@ def test_restore_after_handoff_failure_keeps_fully_converged_candidate(
             db_ready=True,
             ready=True,
             message=None,
+            worker_health=None,
         ),
     )
     requested: list[object] = []
@@ -1181,6 +1186,7 @@ def test_restore_after_handoff_failure_rolls_back_when_cli_stale(
             db_ready=True,
             ready=True,
             message=None,
+            worker_health=None,
         ),
     )
     requested: list[tuple[str, str, str]] = []

@@ -231,12 +231,22 @@ def meta_path() -> Path:
     return worker_state_dir() / "meta.json"
 
 
-def worker_log_path() -> Path:
-    """Return the stable path of the maintained worker's log.
+def worker_log_path(incarnation: str | None = None) -> Path:
+    """Return the log path for a worker incarnation.
+
+    When ``incarnation`` is provided, returns the per-incarnation file path
+    so metadata advertises a truthful single-writer log location.  When
+    ``incarnation`` is ``None``, returns the stable ``worker.log`` path
+    (a supervisor-owned symlink target or a legacy direct-logging path).
+
+    Args:
+        incarnation: Worker incarnation identifier, or ``None``.
 
     Returns:
         The worker log path.
     """
+    if incarnation is not None:
+        return worker_state_dir() / "logs" / f"worker-{incarnation}.log"
     return worker_state_dir() / "worker.log"
 
 
@@ -741,28 +751,31 @@ def spawn_worker(
     """Start the worker detached from the invoking shell.
 
     The worker becomes its own session and process group leader, with stdin
-    disconnected and both output streams appended to the stable worker log.
+    disconnected and both output streams directed to ``/dev/null``.  The
+    worker owns its own ``RotatingFileHandler`` for ``worker.log`` so there
+    is exactly one writer; the parent never opens the worker log file.
 
     Args:
         repo: Repository checkout to run the worker from.
         uv_path: Path to the ``uv`` executable.
-        log_path: Stable path of the worker log.
+        log_path: Stable path of the worker log (unused, kept for interface
+            compatibility; the worker owns its own log).
         env: Environment for the worker, including the lifecycle token.
 
     Returns:
         The started worker process.
     """
-    with log_path.open("ab") as log:
-        return subprocess.Popen(
-            _worker_command(uv_path),
-            cwd=repo,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            env=env,
-        )
+    del log_path
+    return subprocess.Popen(
+        _worker_command(uv_path),
+        cwd=repo,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
 
 
 def _credential_environment_variable(name: str) -> bool:
@@ -1467,7 +1480,6 @@ def _deploy_direct(
     previous: WorkerMeta | None,
     state: str,
     commit: str,
-    log_file: Path,
 ) -> WorkerMeta:
     """Start the replacement worker directly, bypassing the external supervisor.
 
@@ -1481,7 +1493,6 @@ def _deploy_direct(
         previous: Previously recorded worker metadata, or ``None``.
         state: Effective state of the previous worker.
         commit: Exact commit to deploy.
-        log_file: Stable worker log path.
 
     Returns:
         The maintained metadata of the started worker.
@@ -1496,7 +1507,7 @@ def _deploy_direct(
 
     _out("starting replacement worker ...")
     try:
-        proc = spawn_worker(options.repo, options.uv_path, log_file, env)
+        proc = spawn_worker(options.repo, options.uv_path, worker_log_path(token), env)
     except OSError as exc:
         _err(f"could not start the replacement worker: {exc}")
         raise DeployAbortedError from None
@@ -1517,7 +1528,7 @@ def _deploy_direct(
         repo=str(options.repo),
         git_commit=commit,
         worker_id=worker_id,
-        log_path=str(log_file),
+        log_path=str(worker_log_path(token)),
         started_at=time.time(),
         stopped_at=None,
     )
@@ -1594,12 +1605,13 @@ def _complete_deploy_handoff(
     Raises:
         DeployAbortedError: If the worker handoff cannot complete.
     """
-    log_file = worker_log_path()
     if supervise.supervisor_running():
         new_meta = _deploy_through_supervisor(options, commit)
+        log_file = worker_log_path(new_meta.token)
         _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     elif options.bootstrap or options.direct_spawn:
-        new_meta = _deploy_direct(options, previous, state, commit, log_file)
+        new_meta = _deploy_direct(options, previous, state, commit)
+        log_file = worker_log_path(new_meta.token)
         supervise.request_run(
             commit,
             repo=str(options.repo),
@@ -2116,7 +2128,7 @@ def _adoption_candidate(
         repo=str(options.repo),
         git_commit=commit,
         worker_id=worker_id,
-        log_path=str(worker_log_path()),
+        log_path=str(worker_log_path(process_env.get(LIFECYCLE_MARKER_VAR))),
         started_at=time.time(),
         stopped_at=None,
     ), worker_id
@@ -2329,7 +2341,7 @@ def _recover_locked(options: DeployOptions) -> int:
     env = worker_env(token)
     worker_id = env.get("LUBKO_WORKER_ID") or socket.gethostname()
     try:
-        proc = spawn_worker(options.repo, options.uv_path, worker_log_path(), env)
+        proc = spawn_worker(options.repo, options.uv_path, worker_log_path(token), env)
     except OSError as exc:
         _err(f"could not start the recovery worker: {exc}")
         return EXIT_ERROR
@@ -2878,16 +2890,25 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
 def log_cmd(lines: int) -> int:
     """Show the tail of the maintained worker log.
 
+    Resolves through the stable ``worker.log`` symlink (supervisor path) or
+    reads the per-incarnation file from metadata (legacy path).
+
     Args:
         lines: Number of trailing lines to show.
 
     Returns:
         A process exit code.
     """
-    path = worker_log_path()
-    if not path.is_file():
-        _out("no worker log yet")
-        return EXIT_OK
+    stable = worker_log_path()
+    if stable.is_symlink() or stable.is_file():
+        path = stable
+    else:
+        meta = read_meta()
+        if meta is not None and meta.log_path:
+            path = Path(meta.log_path)
+        else:
+            _out("no worker log yet")
+            return EXIT_OK
     try:
         text = path.read_text()
     except OSError as exc:
