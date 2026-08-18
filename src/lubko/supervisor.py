@@ -76,6 +76,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from lubko import cli, deployctl, lifecycle, supervise
+from lubko.health import (
+    publish_current_health_surface,
+    publish_current_log_surface,
+    read_worker_health,
+    read_worker_health_by_incarnation,
+    worker_health_payload,
+)
 from lubko.supervise import (
     INTENT_RUN,
     MODE_RUN,
@@ -685,6 +692,18 @@ class SupervisorDaemon:
         cancelled, awaited terminal, and removed, so a failed probe never
         leaves a row or process behind and never shortens availability.
 
+        The candidate's health snapshot is read by its exact incarnation
+        (not through the stable ``health.json`` symlink, which may still
+        point to the old confirmed worker).  The snapshot's PID and
+        start-time ticks are cross-checked against the recorded child
+        identity so a stale candidate snapshot cannot masquerade as the
+        confirmed worker.
+
+        The stable health/log symlinks are published only after the queue
+        roundtrip succeeds and the identity cross-check passes — so a
+        retiring old worker or a stale candidate can never move the
+        stable read surface.
+
         Args:
             now: Monotonic time.
         """
@@ -692,31 +711,78 @@ class SupervisorDaemon:
         child = state.child
         if child is None or not self._child_alive(state):
             return
-        if state.ready:
-            return
-        if state.next_readiness_at is not None and now < state.next_readiness_at:
+        if state.ready or (state.next_readiness_at is not None and now < state.next_readiness_at):
             return
         probe_cwd = _runtime_dir(state.commit)
-        if lifecycle.verify_worker_consumes_queue(
+        ready, reason = self._check_readiness(child, probe_cwd)
+        if not ready:
+            self._record_not_ready(state, now, child.pid, reason)
+            return
+        write_state(replace(state, ready=True, next_readiness_at=None))
+        publish_current_health_surface(child.token)
+        publish_current_log_surface(child.token)
+        LOGGER.info("worker child pid=%d proven to consume the queue", child.pid)
+        lifecycle.append_deploy_log(
+            f"supervisor verified worker pid={child.pid} consumes the queue"
+        )
+
+    def _check_readiness(
+        self,
+        child: supervise.WorkerChild,
+        probe_cwd: str,
+    ) -> tuple[bool, str]:
+        """Verify queue consumption and health identity cross-check.
+
+        Args:
+            child: The worker child identity.
+            probe_cwd: Working directory for the queue probe.
+
+        Returns:
+            A ``(ready, reason)`` tuple.
+        """
+        if not lifecycle.verify_worker_consumes_queue(
             child.worker_id, probe_cwd, child.pid, self.settings.probe_timeout_seconds
         ):
-            write_state(replace(state, ready=True, next_readiness_at=None))
-            LOGGER.info("worker child pid=%d proven to consume the queue", child.pid)
-            lifecycle.append_deploy_log(
-                f"supervisor verified worker pid={child.pid} consumes the queue"
+            return False, "queue consumption not proven"
+        snapshot = read_worker_health_by_incarnation(child.token)
+        if snapshot is None:
+            return False, f"no health snapshot for incarnation {child.token}"
+        if snapshot.pid != child.pid:
+            return False, f"snapshot PID {snapshot.pid} != child PID {child.pid}"
+        if snapshot.start_time_ticks != child.start_time_ticks:
+            return (
+                False,
+                f"snapshot ticks {snapshot.start_time_ticks} != child {child.start_time_ticks}",
             )
-        else:
-            write_state(
-                replace(
-                    state,
-                    ready=False,
-                    next_readiness_at=now + self.settings.readiness_interval_seconds,
-                )
+        return True, "ok"
+
+    def _record_not_ready(
+        self,
+        state: supervise.SupervisorState,
+        now: float,
+        child_pid: int,
+        reason: str,
+    ) -> None:
+        """Record a not-ready probe result and schedule a retry.
+
+        Args:
+            state: Current daemon state.
+            now: Monotonic time.
+            child_pid: PID of the worker child.
+            reason: Why readiness was not confirmed.
+        """
+        write_state(
+            replace(
+                state,
+                ready=False,
+                next_readiness_at=now + self.settings.readiness_interval_seconds,
             )
-            LOGGER.warning(
-                "worker child pid=%d not yet proven to consume the queue; will retry",
-                child.pid,
-            )
+        )
+        LOGGER.warning(
+            "worker child pid=%d not ready: %s; will retry",
+            child_pid,
+            reason,
+        )
 
     def _retire_child(self) -> None:
         """Stop the current worker child by exact identity and forget it.
@@ -893,20 +959,17 @@ class SupervisorDaemon:
             or socket.gethostname()
         )
         env["LUBKO_WORKER_ID"] = worker_id
-        log_path = lifecycle.worker_log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with log_path.open("ab") as log:
-                proc = subprocess.Popen(
-                    [str(executable)],
-                    cwd=str(cli.cli_commit_dir(commit)),
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    close_fds=True,
-                    env=env,
-                )
+            proc = subprocess.Popen(
+                [str(executable)],
+                cwd=str(cli.cli_commit_dir(commit)),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+                env=env,
+            )
         except OSError:
             LOGGER.exception("could not start the worker for commit %s", commit)
             return None
@@ -1085,6 +1148,7 @@ class SupervisorDaemon:
             self._message = "corrupt supervised-deployment state; holding without a worker"
         if rollback is not None:
             mission = rollback.status
+        worker_health = worker_health_payload(read_worker_health())
         write_status(
             SupervisorStatus(
                 schema_version=SCHEMA_VERSION,
@@ -1103,6 +1167,7 @@ class SupervisorDaemon:
                 db_ready=db_ready,
                 ready=state.ready if state.child is not None else None,
                 message=self._message if message is None else message,
+                worker_health=worker_health,
             )
         )
 
