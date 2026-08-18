@@ -1129,6 +1129,7 @@ def test_restore_after_handoff_failure_keeps_fully_converged_candidate(
             db_ready=True,
             ready=True,
             message=None,
+            worker_health=None,
         ),
     )
     requested: list[object] = []
@@ -1181,6 +1182,7 @@ def test_restore_after_handoff_failure_rolls_back_when_cli_stale(
             db_ready=True,
             ready=True,
             message=None,
+            worker_health=None,
         ),
     )
     requested: list[tuple[str, str, str]] = []

@@ -205,10 +205,13 @@ def test_publish_repoints_symlink_to_new_incarnation() -> None:
     write_worker_health(_health(incarnation="old"))
     write_worker_health(_health(incarnation="new"))
     publish_current_health_surface("old")
-    assert read_worker_health() is not None
-    assert read_worker_health().worker_incarnation == "old"
+    loaded_old = read_worker_health()
+    assert loaded_old is not None
+    assert loaded_old.worker_incarnation == "old"
     publish_current_health_surface("new")
-    assert read_worker_health().worker_incarnation == "new"
+    loaded_new = read_worker_health()
+    assert loaded_new is not None
+    assert loaded_new.worker_incarnation == "new"
 
 
 def test_old_incarnation_file_intact_after_repoint() -> None:
@@ -432,7 +435,9 @@ def test_log_writes_to_per_incarnation_file() -> None:
 def test_rotating_handler_backup_count_bounded() -> None:
     """RotatingFileHandler has bounded backup count >= 1."""
     logger = configure_worker_logging("log-inc-bound")
-    handlers = [h for h in logger.parent.handlers if isinstance(h, RotatingFileHandler)]
+    parent = logger.parent
+    assert parent is not None
+    handlers = [h for h in parent.handlers if isinstance(h, RotatingFileHandler)]
     assert len(handlers) >= 1
     handler = handlers[-1]
     assert handler.maxBytes == _LOG_MAX_BYTES_EXPECTED
@@ -465,6 +470,7 @@ def test_payload_with_valid_snapshot() -> None:
 def test_payload_fields() -> None:
     """Payload has the expected keys."""
     result = worker_health_payload(None)
+    assert result is not None
     assert set(result.keys()) == {"snapshot", "live", "stale", "reason"}
 
 

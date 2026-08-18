@@ -2205,6 +2205,7 @@ def _write_status_snapshot(
             db_ready=True,
             ready=ready,
             message=None,
+            worker_health=None,
         )
     )
 
@@ -2336,6 +2337,7 @@ def test_status_roundtrip_includes_start_time_ticks(tmp_path: Path) -> None:
         db_ready=True,
         ready=True,
         message="ok",
+        worker_health=None,
     )
     data = original.to_dict()
     restored = supervise.SupervisorStatus.from_dict(data)
