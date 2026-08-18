@@ -43,6 +43,7 @@ from lubko.state import cli_root_dir, rollback_state_path
 from lubko.supervisor import Settings, SupervisorDaemon
 from lubko.supervisor import main as supervisor_main
 from lubko.worker import group_has_members
+from tests import _isolation as isolation
 from tests import _process_guard as guard
 from tests.test_cli import make_repo
 
@@ -57,6 +58,41 @@ BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
 TEST_WORKER_ID: Final = "test-supervisor-worker"
 LEGACY_MARKER: Final = "legacy-token"
+
+
+def _assert_env_state_home_test_owned(env: dict[str, str]) -> None:
+    """Fail closed unless ``env[XDG_STATE_HOME]`` is the current test-owned root.
+
+    The check is on the caller-supplied ``env`` dict, not ``os.environ``, so
+    a caller that passes an ambient environment is caught before any
+    state-writing helper can use it.
+
+    Args:
+        env: Caller-supplied environment dictionary.
+
+    Raises:
+        AssertionError: If ``XDG_STATE_HOME`` is missing, unset, or resolves
+            outside the current test's temporary directory.
+    """
+    if isolation.CURRENT_TEST_TMP is None:
+        msg = "test state isolation was not established before starting a supervisor"
+        raise AssertionError(msg)
+    raw = env.get(isolation.STATE_HOME_ENV)
+    if not raw:
+        msg = (
+            f"{isolation.STATE_HOME_ENV} is unset in the supplied env; "
+            "state would resolve to the live user state root"
+        )
+        raise AssertionError(msg)
+    resolved = Path(raw).resolve()
+    test_tmp = isolation.CURRENT_TEST_TMP.resolve()
+    if resolved != test_tmp and test_tmp not in resolved.parents:
+        msg = (
+            f"{isolation.STATE_HOME_ENV}={resolved} in the supplied env is not under "
+            f"the current test's pytest-owned temporary directory {test_tmp}; "
+            "refusing to launch a supervisor against non-test state"
+        )
+        raise AssertionError(msg)
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
@@ -256,12 +292,19 @@ def supervisor_env(
 def start_supervisor(env: dict[str, str]) -> subprocess.Popen[bytes]:
     """Start the real supervisor daemon as a separate process.
 
+    Refuses to launch when the caller-supplied ``env[XDG_STATE_HOME]`` does
+    not resolve under the current pytest-owned temporary directory.  The check
+    is on the *supplied* ``env`` dict, not ``os.environ``, so a caller that
+    passes an ambient environment is caught before the daemon can write or
+    read any state.
+
     Args:
         env: Environment for the daemon (and its worker child).
 
     Returns:
         The daemon process.
     """
+    _assert_env_state_home_test_owned(env)
     proc = subprocess.Popen(
         [sys.executable, "-m", "lubko.supervisor"],
         cwd=REPO_ROOT,
@@ -275,8 +318,65 @@ def start_supervisor(env: dict[str, str]) -> subprocess.Popen[bytes]:
     return proc
 
 
+def _stop_orphaned_worker_children() -> None:
+    """Stop any worker child the supervisor daemon owned.
+
+    The supervisor's durable state records the exact worker child identity
+    (PID, PGID, SID, start_time_ticks, token).  After the daemon exits,
+    those worker processes are orphaned to PID 1 because they run in their
+    own session.  This helper reads the state and stops the worker — but
+    ONLY after verifying the recorded identity is the exact live process
+    that was observed during this test execution.
+
+    Safety contract:
+    1.  ``assert_test_owned_state_root()`` — refuse to read durable state
+        unless the resolved state root is the current pytest-owned root;
+    2.  lifecycle.worker_alive — the recorded PID/start-time/tokens must
+        match a live process right now, exactly like production;
+    3.  group_has_members — the recorded PGID must still have members.
+
+    If any check fails the helper aborts (fail-closed); a stale or forged
+    child identity is never signalled.
+    """
+    isolation.assert_test_owned_state_root()
+    state = supervise.read_state()
+    child = state.child
+    if child is None:
+        return
+    meta = lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=child.pid,
+        pgid=child.pgid,
+        sid=child.sid,
+        start_time_ticks=child.start_time_ticks,
+        token=child.token,
+        repo="",
+        git_commit=None,
+        worker_id=child.worker_id,
+        log_path="",
+        started_at=child.spawned_at,
+        stopped_at=None,
+    )
+    if not lifecycle.worker_alive(meta):
+        return
+    if not group_has_members(child.pgid):
+        return
+    with suppress(ProcessLookupError):
+        os.killpg(child.pgid, signal.SIGKILL)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and group_has_members(child.pgid):
+        time.sleep(0.02)
+
+
 def stop_supervisor(proc: subprocess.Popen[bytes]) -> None:
     """Gracefully stop the supervisor so it retires its worker child.
+
+    After the supervisor process exits (gracefully or by force), any worker
+    child the daemon owned is read from the durable supervisor state and
+    stopped by its exact recorded identity.  This prevents a hard-killed
+    supervisor from orphaning a separately-sessioned worker that PID 1 would
+    otherwise reparent.
 
     Args:
         proc: The daemon process.
@@ -288,6 +388,7 @@ def stop_supervisor(proc: subprocess.Popen[bytes]) -> None:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=5)
+    _stop_orphaned_worker_children()
     guard.unregister(proc)
 
 
@@ -311,6 +412,10 @@ def running_supervisor(env: dict[str, str]) -> Iterator[subprocess.Popen[bytes]]
 def request_and_wait(commit: str, repo: Path) -> int:
     """Ask the supervisor to run a commit and wait until it is queue-ready.
 
+    Refuses to write when ``XDG_STATE_HOME`` is not the current test's
+    pytest-owned root, so desired intent state can never escape into ambient
+    state.
+
     Args:
         commit: Exact commit to run.
         repo: Maintained checkout.
@@ -318,6 +423,7 @@ def request_and_wait(commit: str, repo: Path) -> int:
     Returns:
         The applied generation.
     """
+    isolation.assert_test_owned_state_root()
     generation = supervise.request_run(
         commit,
         repo=str(repo),
@@ -457,9 +563,13 @@ def read_payload(conninfo: str, job_id: UUID) -> dict[str, object]:
 def write_rollback(state: dc.RollbackState) -> None:
     """Persist durable supervised-deployment state atomically.
 
+    Refuses to write when ``XDG_STATE_HOME`` is not the current test's
+    pytest-owned root, so rollback state can never escape into ambient state.
+
     Args:
         state: State to store.
     """
+    isolation.assert_test_owned_state_root()
     path = rollback_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")

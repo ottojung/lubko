@@ -366,7 +366,7 @@ def pg_cluster(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_pg.PgClust
         capture_output=True,
     )
     current = _pg.PgCluster(binaries, data_dir, socket_dir, port, env)
-    current.start()
+    current.start(guard_mod=guard)
     try:
         yield current
     finally:
