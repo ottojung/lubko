@@ -92,11 +92,13 @@ def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None
     Classification rules (applied in order):
 
     * SQLSTATE class ``08`` (connection exception) is always connectivity.
-    * A client-side ``OperationalError`` with no ``sqlstate`` and a broken
-      or closed connection is connectivity.
+    * An ``OperationalError`` on a broken or closed connection is always
+      connectivity, regardless of whether a SQLSTATE is populated (real
+      server shutdowns/failovers can surface as OperationalError with a
+      non-08 SQLSTATE while the connection is already unusable).
     * Everything else (including server-side ``DataError``,
-      ``ProgrammingError``, ``IntegrityError`` with any sqlstate) is a
-      per-job deterministic failure.
+      ``ProgrammingError``, ``IntegrityError``) is a per-job deterministic
+      failure.
 
     Args:
         exc: The caught psycopg exception.
@@ -110,7 +112,6 @@ def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None
         return True
     return (
         isinstance(exc, psycopg.OperationalError)
-        and sqlstate is None
         and conn is not None
         and (conn.broken or conn.closed)
     )
@@ -259,6 +260,7 @@ class ActiveJob:
     lease_evicted: bool = False
     row_lost: bool = False
     finalized: bool = False
+    quarantined: bool = False
     last_heartbeat_at: float = 0.0
 
 
@@ -1658,22 +1660,20 @@ class Supervisor:
         invariant; a violated invariant is fatal.
 
         Connection-level failures (lost/unusable connection) enter outage
-        handling and trigger reconnection. Deterministic per-job data/SQL
+        handling and trigger reconnection.  Per-job deterministic data/SQL
         errors are caught locally within the db-phase methods so one bad
         job never poisons the entire worker or triggers a reconnect loop.
+
+        Any unexpected ``psycopg.Error`` that escapes the per-job boundaries
+        and reaches this outer catch is treated conservatively: the worker
+        enters outage handling to avoid a tight forever retry/log loop.
         """
         self._connect()
         while not self._stopping:
             try:
                 self._tick(time.monotonic())
-            except psycopg.Error as exc:
-                if self._is_connectivity_error(exc):
-                    self._enter_outage()
-                else:
-                    LOGGER.exception(
-                        "database error (SQLSTATE %s)",
-                        exc.sqlstate or "N/A",
-                    )
+            except psycopg.Error:
+                self._enter_outage()
             time.sleep(self.settings.process_poll_interval_seconds)
         self._shutdown()
 
@@ -1835,6 +1835,7 @@ class Supervisor:
                 exc.sqlstate or "N/A",
             )
             _quarantine_job(conn, job.id, f"publication error: {exc}")
+            job.quarantined = True
             request_stop(job, STOP_REASON_QUARANTINE)
             return
         if not published:
@@ -1847,12 +1848,26 @@ class Supervisor:
         Connectivity errors are re-raised so the main loop enters outage
         handling.  Deterministic per-job data/SQL errors are quarantined so
         the offending job does not poison publication of unrelated jobs.
+        Quarantined jobs are skipped.
         """
         if self.conn is None:
             return
         for job in list(self.active.values()):
-            if not job.completed and not job.finalized:
+            if not job.completed and not job.finalized and not job.quarantined:
                 self._publish_job_output(job, now)
+
+    def _cleanup_quarantined_jobs(self) -> None:
+        """Untrack quarantined jobs whose process group has fully exited.
+
+        After durable quarantine the row is already terminal; once the owned
+        process group is dead we clean capture files and remove the job from
+        the active registry without re-entering publication/finalization.
+        """
+        for job in list(self.active.values()):
+            if job.quarantined and job.completed and not group_has_members(job.pgid):
+                cleanup_job(job)
+                job.finalized = True
+                self.active.pop(job.id, None)
 
     def _finalize_completed(self) -> None:
         """Publish final output and finalize every job whose process is fully gone.
@@ -1860,6 +1875,8 @@ class Supervisor:
         Connectivity errors are re-raised so the main loop enters outage
         handling.  Deterministic per-job data/SQL errors are quarantined so
         the offending job does not poison finalization of unrelated jobs.
+        Quarantined jobs whose process group is dead are cleaned up and
+        untracked without re-entering publication/finalization.
 
         Raises:
             psycopg.Error: When the error is a connectivity issue.
@@ -1867,6 +1884,7 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
+        self._cleanup_quarantined_jobs()
         for job in list(self.active.values()):
             if not (job.completed and not job.finalized):
                 continue
@@ -1887,6 +1905,7 @@ class Supervisor:
                     exc.sqlstate or "N/A",
                 )
                 _quarantine_job(conn, job.id, f"final publication error: {exc}")
+                job.quarantined = True
                 request_stop(job, STOP_REASON_QUARANTINE)
                 continue
             if not published:
@@ -1947,6 +1966,7 @@ class Supervisor:
                 exc.sqlstate or "N/A",
             )
             _quarantine_job(conn, job.id, f"finalization error: {exc}")
+            job.quarantined = True
             request_stop(job, STOP_REASON_QUARANTINE)
             return False
         LOGGER.info(
@@ -2307,7 +2327,12 @@ def _finalize_status(job: ActiveJob) -> str:
     """
     if job.stop_reason in {STOP_REASON_CANCEL, STOP_REASON_SHUTDOWN}:
         return "cancelled"
-    if job.stop_reason in {STOP_REASON_LEASE, STOP_REASON_ROW_LOST, STOP_REASON_PERSIST}:
+    if job.stop_reason in {
+        STOP_REASON_LEASE,
+        STOP_REASON_ROW_LOST,
+        STOP_REASON_PERSIST,
+        STOP_REASON_QUARANTINE,
+    }:
         return "failed"
     if job.cancel_requested:
         return "cancelled"
