@@ -708,86 +708,52 @@ def test_crash_recovery_recovers_stale_job_without_reexecution(
 def wait_for_replacement(old_pid: int) -> int:
     """Wait until the daemon records a worker child different from ``old_pid``.
 
-    Exactly one status read is taken per poll and the exact observed
-    replacement PID is returned, so the caller never re-reads a disagreeing
-    snapshot.  The previous predicate read the status twice
-    (``worker_pid() is not None and worker_pid() != old_pid``); when the first
-    read saw a replacement and the second read saw a transient ``None`` the
-    predicate was ``True`` (because ``None != old_pid``), so the caller's
-    separate read could then observe ``None`` -- the deployment failure at line
-    731.
+    A single status read is taken per poll (via :func:`wait_until`) and the
+    exact observed replacement PID is captured and returned, so the caller
+    never re-reads a disagreeing snapshot.  The previous predicate read the
+    status twice (``worker_pid() is not None and worker_pid() != old_pid``);
+    those two reads are independent snapshots, so a multi-read TOCTOU in the
+    test harness is logically capable of making the predicate ``True`` while the
+    current child is ``None`` (because ``None != old_pid``), after which the
+    caller's separate :func:`worker_pid` read could observe ``None`` -- the
+    observed deployment symptom at line 731.  This helper removes the defect by
+    returning the one PID it matched.
 
     Args:
         old_pid: The previous worker child PID.
 
     Returns:
         The exact replacement worker PID recorded by the daemon.
-
-    Raises:
-        AssertionError: If no replacement is observed within the timeout.
     """
-    deadline = time.monotonic() + 30.0
-    while time.monotonic() < deadline:
-        observed = worker_pid()
-        if observed is not None and observed != old_pid:
-            return observed
-        time.sleep(0.05)
-    msg = "replacement worker not observed within timeout"
-    raise AssertionError(msg)
+    observed: list[int] = []
+
+    def _check() -> bool:
+        candidate = worker_pid()
+        if candidate is not None and candidate != old_pid:
+            observed.append(candidate)
+            return True
+        return False
+
+    wait_until(_check, timeout=30.0)
+    return observed[0]
 
 
-def test_wait_for_replacement_old_double_read_false_positives() -> None:
-    """Prove the deployment-race predicate is logically unsound.
-
-    The previous predicate evaluated the status twice:
-
-        worker_pid() is not None and worker_pid() != old_pid
-
-    When the first read observes a replacement PID but the second read observes
-    a transient ``None`` (the supervisor clearing the child before respawning),
-    the predicate is ``True`` because ``None != old_pid``.  The caller then
-    re-reads ``worker_pid()`` and can observe ``None`` -- exactly the line 731
-    deployment failure.  This test reproduces that false positive.
-    """
-    old_pid = 4242
-
-    def old_racy_predicate() -> bool:
-        return worker_pid() is not None and worker_pid() != old_pid
-
-    readings: list[int | None] = [9999, None]
-    reader = iter(readings)
-
-    def worker_pid() -> int | None:
-        return next(reader)
-
-    assert old_racy_predicate() is True
-
-
-def test_wait_for_replacement_returns_exact_observed_pid(
+def test_wait_for_replacement_rejects_transient_none_and_returns_observed_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Return the exact PID the helper matched, never a re-read snapshot.
+    """A transient ``None`` snapshot must not satisfy the helper.
 
-    The single-read helper returns the exact PID it matched, never a value
-    the caller then re-reads from a disagreeing snapshot.
-
-    With the same transient transition that false-positived the old predicate,
-    the helper observes one consistent snapshot per poll and returns the
-    replacement it actually saw; the caller uses that returned PID directly.
+    The exact observed replacement PID must be returned to the caller.  The
+    helper observes one status snapshot per poll.  A ``None`` child (the
+    supervisor having cleared the previous child before respawning) is not a
+    replacement, so the helper must keep waiting; once a real replacement PID
+    appears it is returned exactly, with no separate re-read that could disagree.
     """
     old_pid = 4242
-
-    def racy_transition() -> Iterator[int | None]:
-        yield old_pid
-        yield 9999
-        yield 9999
-        while True:
-            yield 9999
-
-    reader = racy_transition()
+    sequence = iter([old_pid, None, None, 9999, 9999])
 
     def fake_worker_pid() -> int | None:
-        return next(reader)
+        return next(sequence)
 
     monkeypatch.setattr(
         "tests.test_supervisor_daemon.worker_pid",
@@ -796,37 +762,6 @@ def test_wait_for_replacement_returns_exact_observed_pid(
     replacement = wait_for_replacement(old_pid)
     assert replacement == 9999
     assert replacement != old_pid
-
-
-def test_wait_for_replacement_keeps_waiting_through_transient_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A transient ``None`` snapshot must not satisfy the helper.
-
-    The helper must wait until a real replacement is observed (or raise on
-    timeout).
-    """
-    old_pid = 4242
-
-    def mostly_none_then_replacement() -> Iterator[int | None]:
-        for _ in range(10):
-            yield old_pid
-        for _ in range(10):
-            yield None
-        while True:
-            yield 7777
-
-    reader = mostly_none_then_replacement()
-
-    def fake_worker_pid() -> int | None:
-        return next(reader)
-
-    monkeypatch.setattr(
-        "tests.test_supervisor_daemon.worker_pid",
-        fake_worker_pid,
-    )
-    replacement = wait_for_replacement(old_pid)
-    assert replacement == 7777
 
 
 def test_repeated_crashes_never_accumulate_workers(
@@ -841,10 +776,7 @@ def test_repeated_crashes_never_accumulate_workers(
         assert previous is not None
         for _ in range(3):
             os.killpg(previous, signal.SIGKILL)
-            replacement = wait_for_replacement(previous)
-            assert replacement is not None
-            assert replacement != previous
-            previous = replacement
+            previous = wait_for_replacement(previous)
         status = supervise.read_status()
         assert status is not None
         assert status.restart_count >= 1
