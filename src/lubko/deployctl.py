@@ -644,6 +644,46 @@ def _close_gate(gate_writer: int) -> None:
         os.close(gate_writer)
 
 
+_GATED_ABORT_GRACE_SECONDS: Final = 2.0
+
+
+def _abort_gated_candidate(gated: GatedWorker) -> None:
+    """Close the gate and synchronously reap the exact gated candidate.
+
+    The candidate is blocked reading from the gate pipe; closing it delivers
+    EOF so the shim exits.  A bounded wait follows so the child is reaped
+    before the caller proceeds (restoring checkout, rolling back state).
+    If the candidate fails to exit within the grace period the exact gated
+    metadata identity is escalated through :func:`stop_worker` which
+    revalidates PID / start-time-ticks / PGID / SID / token at every signal
+    step, so a recycled or reused PID is never signalled.  If the exact
+    retirement cannot be proven the caller is failed closed.
+
+    Args:
+        gated: The gated candidate to abort.
+
+    Raises:
+        DeployCtlError: If the candidate cannot be reaped within the
+            escalation bound.
+    """
+    _close_gate(gated.gate_writer)
+    proc = gated.proc
+    if proc.poll() is not None:
+        return
+    try:
+        proc.wait(timeout=_GATED_ABORT_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if not stop_worker(gated.meta, _GATED_ABORT_GRACE_SECONDS):
+        msg = (
+            f"gated candidate pid {gated.meta.pid} could not be reaped after "
+            "exact-identity escalation"
+        )
+        raise DeployCtlError(msg)
+    proc.wait(timeout=_GATED_ABORT_GRACE_SECONDS)
+
+
 def _release_gate(gate_writer: int) -> None:
     """Release a candidate to exec the worker.
 
@@ -882,7 +922,7 @@ def _abort_mission(gated: GatedWorker | None, state: RollbackState) -> None:
         state: The pending rollback mission.
     """
     if gated is not None:
-        _close_gate(gated.gate_writer)
+        _abort_gated_candidate(gated)
     _checkout(
         Path(state.repo),
         state.previous_commit,
@@ -935,7 +975,7 @@ def _complete_handoff(
         _write_state(live)
         return live
     except DeployCtlError:
-        _close_gate(gated.gate_writer)
+        _abort_gated_candidate(gated)
         _rollback_locked(retiring)
         raise
 
@@ -1318,7 +1358,7 @@ def _prepare_locked(
     gated, new_meta = _candidate_identity(options, commit, supervised=supervised)
     if not check_postgres(options.postgres_timeout_seconds):
         if gated is not None:
-            _close_gate(gated.gate_writer)
+            _abort_gated_candidate(gated)
         _restore_previous_prep(options, previous_commit, commit)
         raise DeployCtlError("stable wrapper cannot reach PostgreSQL before handoff")
     state = RollbackState(
@@ -1389,7 +1429,7 @@ def _publish_legacy_mission(
         _fork_watchdog(lock_timeout_seconds)
     except DeployCtlError:
         if gated is not None:
-            _close_gate(gated.gate_writer)
+            _abort_gated_candidate(gated)
         _rollback_locked(state)
         raise
 
