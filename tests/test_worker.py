@@ -216,14 +216,19 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
 
 
 def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> ActiveJob:
-    """Build an active job with capture files under ``tmp_path``.
+    """Build a synthetic active job with capture files under ``tmp_path``.
+
+    The synthetic child is ``/bin/true`` spawned in its own session and
+    deterministically reaped before return.  It is not a live registered
+    process: callers that need a live process must spawn and own one directly.
 
     Args:
         tmp_path: Temporary directory for the capture files.
         process: Process argv recorded on the job.
 
     Returns:
-        A registered active job with empty capture files.
+        A synthetic active job whose child has terminated and been reaped, with
+        empty capture files.
     """
     proc = subprocess.Popen(
         ["/bin/true"],
@@ -233,6 +238,8 @@ def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> A
         start_new_session=True,
     )
     guard.register(proc)
+    proc.wait(timeout=10)
+    guard.unregister(proc)
     job = ActiveJob(
         id=uuid4(),
         cwd=str(tmp_path),
@@ -246,6 +253,21 @@ def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> A
     job.stdout = OutputStream(path=tmp_path / "stdout.cap")
     job.stderr = OutputStream(path=tmp_path / "stderr.cap")
     return job
+
+
+def test_make_active_job_synthetic_child_is_reaped_and_unregistered(
+    tmp_path: Path,
+) -> None:
+    """The synthetic child exited and is not left registered with the guard.
+
+    ``make_active_job`` must reap ``/bin/true`` before returning and drop the
+    guard's ownership of it, so the job is a synthetic (already-terminated)
+    fixture rather than a live, tracked process that would trip the global leak
+    assertions.
+    """
+    job = make_active_job(tmp_path)
+    assert job.proc.poll() == 0
+    assert job.proc.pid not in guard.tracked_pids()
 
 
 def test_truncate_output_preserves_short_output() -> None:
