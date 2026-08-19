@@ -40,6 +40,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -52,6 +53,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 SCHEMA_VERSION: Final = 1
+
+SUPERVISOR_RUNTIME_COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}\n\Z")
 
 STAT_MIN_FIELDS: Final = 20
 STAT_STARTTIME_FIELD_INDEX: Final = 19
@@ -409,6 +412,21 @@ def supervisor_pid_path() -> Path:
         The ``supervisor.pid`` path.
     """
     return supervisor_dir() / "supervisor.pid"
+
+
+def supervisor_runtime_override_path() -> Path:
+    """Return the path of the temporary supervisor-runtime override pointer.
+
+    This is a plain text file containing exactly one 40-hex commit followed
+    by a newline.  The stable ``lubko-supervisor`` shell launcher reads it
+    to choose which runtime the *supervisor daemon itself* runs from, while
+    ``cli/current``, ``desired.json``, and the confirmed worker commit
+    remain untouched.
+
+    Returns:
+        The ``supervisor-runtime`` path (no extension, plain text).
+    """
+    return supervisor_dir() / "supervisor-runtime"
 
 
 def supervisor_log_path() -> Path:
@@ -1110,3 +1128,63 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
         worker_id=worker_id,
         spawned_at=_optional_float(data.get("spawned_at")) or 0.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Supervisor-runtime override (plain-text 40-hex commit pointer)
+# ---------------------------------------------------------------------------
+
+
+def read_supervisor_runtime_override() -> str | None:
+    """Read the supervisor-runtime override commit, if present and valid.
+
+    The override is a plain text file containing exactly one 40-hex commit
+    followed by a newline.  The stable ``lubko-supervisor`` shell launcher
+    reads it to choose which runtime the daemon runs from; ``cli/current``
+    and ``desired.json`` remain untouched.
+
+    Returns:
+        The 40-hex commit, or ``None`` when absent or malformed.
+    """
+    path = supervisor_runtime_override_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not SUPERVISOR_RUNTIME_COMMIT_RE.fullmatch(raw):
+        return None
+    return raw[:40]
+
+
+def write_supervisor_runtime_override(commit: str) -> None:
+    """Atomically publish the supervisor-runtime override pointer.
+
+    The file contains exactly one 40-hex commit followed by a newline.
+    An interrupted write never leaves a partial file: the temporary is
+    replaced atomically.
+
+    Args:
+        commit: Exact 40-hex commit the supervisor launcher should run.
+    """
+    path = supervisor_runtime_override_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(f"{commit}\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def clear_supervisor_runtime_override() -> bool:
+    """Remove the supervisor-runtime override pointer if present.
+
+    Only regular files are removed: symlinks, directories, and other
+    special entries are never silently deleted.
+
+    Returns:
+        ``True`` when the override was present and removed, ``False``
+        when it was already absent.
+    """
+    path = supervisor_runtime_override_path()
+    if not path.is_file() or path.is_symlink():
+        return False
+    path.unlink()
+    return True

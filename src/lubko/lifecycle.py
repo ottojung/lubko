@@ -28,6 +28,7 @@ import os
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -1394,6 +1395,29 @@ def _prepare_maintained_cli(options: DeployOptions, commit: str) -> bool:
     return True
 
 
+def _clear_stale_supervisor_override(confirmed_commit: str) -> None:
+    """Clear the supervisor-runtime override after a successful CLI activation.
+
+    The override is a temporary bootstrap pin: it directs the stable
+    ``lubko-supervisor`` launcher to a specific sealed runtime on the next
+    container restart.  Once any CLI activation succeeds, the override has
+    served its purpose and must be removed unconditionally — regardless of
+    whether the override target matches the newly confirmed commit — so a
+    stale override (e.g. staged for B, later activation moves to C) can
+    never pin an obsolete supervisor runtime on the next restart.
+
+    Args:
+        confirmed_commit: The newly confirmed commit that ``cli/current``
+            now selects (used only for the deploy log entry).
+    """
+    override = supervise.read_supervisor_runtime_override()
+    if override is not None:
+        supervise.clear_supervisor_runtime_override()
+        append_deploy_log(
+            f"cleared supervisor-runtime override: commit {confirmed_commit} is now confirmed"
+        )
+
+
 def _activate_maintained_cli(commit: str) -> bool:
     """Activate the confirmed CLI commit, preserving the prior coherent CLI.
 
@@ -1405,6 +1429,12 @@ def _activate_maintained_cli(commit: str) -> bool:
     never garbage-collected, so the global CLIs remain usable even though they
     are temporarily behind the worker; the next status/checkout still repairs
     the pointer idempotently.
+
+    When a supervisor-runtime override was staged by ``lubko-deploy bootstrap``
+    and CLI activation succeeds, the override is unconditionally cleared so
+    future upgrades never pin an obsolete supervisor runtime — even when the
+    override target differs from the newly confirmed commit (e.g. bootstrap
+    staged B, later activation confirmed C).
 
     Args:
         commit: Exact commit to activate.
@@ -1421,6 +1451,7 @@ def _activate_maintained_cli(commit: str) -> bool:
             if attempt < CLI_ACTIVATION_ATTEMPTS - 1:
                 time.sleep(CLI_ACTIVATION_RETRY_SECONDS)
             continue
+        _clear_stale_supervisor_override(commit)
         cli.gc_cli_roots((commit,))
         return True
     _err(f"error: maintained CLI activation failed: {last_error}")
@@ -2893,6 +2924,185 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+
+
+def bootstrap_cmd(args: argparse.Namespace) -> int:
+    """Materialize a target runtime and stage a supervisor-runtime override.
+
+    This is the narrow bootstrap path for the pre-fix live state where an
+    old supervisor (running buggy probe code) cannot confirm readiness for
+    a new commit.  The command:
+
+    1. builds and seals the target commit's immutable CLI runtime;
+    2. publishes a plain-text supervisor-runtime override so the *stable*
+       ``lubko-supervisor`` launcher will execute the new code on the next
+       container/environment restart;
+    3. updates the ``lubko-supervisor`` launcher script to carry the
+       override-checking logic;
+    4. preserves the currently confirmed worker runtime (``cli/current``)
+       and all other runtimes for rollback.
+
+    The command does **not** modify ``cli/current``, ``desired.json``,
+    ``worker/meta.json``, or any other confirmed-worker state.  It does
+    **not** kill the running supervisor.  After a successful run the
+    operator restarts the container/environment; the launcher starts the
+    new supervisor code which reads the existing confirmed desired intent
+    and restores exactly one worker for the confirmed commit.  A normal
+    ``lubko-deploy deploy <target>`` can then confirm the target and
+    advance ``cli/current``.
+
+    Safe if interrupted: every step is idempotent.  If interrupted before
+    the override is published the old state is unchanged; if interrupted
+    after the override is published the next restart uses the new
+    supervisor code while the confirmed worker commit is untouched.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        A process exit code.
+    """
+    commit = args.commit
+    if not cli.is_valid_commit_name(commit):
+        _err(f"commit must be exactly 40 hexadecimal characters, got: {commit!r}")
+        return EXIT_ERROR
+    if not supervise.supervisor_running():
+        _err(
+            "the external supervisor is not running; "
+            "use 'lubko-deploy migrate' for cold pre-supervisor state"
+        )
+        return EXIT_ERROR
+    try:
+        uv_path = resolve_uv(args.uv)
+    except UvResolutionError as exc:
+        _err(str(exc))
+        return EXIT_ERROR
+    try:
+        with deploy_lock(args.lock_timeout):
+            return _bootstrap_locked(commit, args.repo, uv_path, args.cli_timeout)
+    except LockTimeoutError:
+        _err("another deployment is already running; refusing to race")
+        return EXIT_ERROR
+
+
+def _bootstrap_locked(
+    commit: str,
+    repo: Path,
+    uv_path: str,
+    cli_timeout: float,
+) -> int:
+    """Run the bootstrap preparation under the deployment lock.
+
+    Every step is idempotent: re-running after a partial failure or
+    interruption completes the remaining steps without disturbing the
+    confirmed worker commit, desired intent, or ``cli/current``.
+
+    Args:
+        commit: Exact 40-hex target commit.
+        repo: Repository checkout containing the commit.
+        uv_path: Resolved ``uv`` executable.
+        cli_timeout: Timeout for building the CLI environment.
+
+    Returns:
+        A process exit code.
+    """
+    confirmed = cli.current_commit()
+    if confirmed == commit:
+        _out(f"commit {commit} is already the confirmed CLI commit; nothing to bootstrap")
+        return EXIT_OK
+
+    _out(f"bootstrap: materializing sealed runtime for {commit} ...")
+    try:
+        cli.build_cli_root(repo, commit, uv_path, cli_timeout)
+    except cli.CliError as exc:
+        _err(f"could not build the CLI environment for {commit}: {exc}")
+        return EXIT_ERROR
+
+    if not cli.runtime_is_usable(commit):
+        _err(f"runtime for {commit} is not usable after build; refusing to stage override")
+        return EXIT_ERROR
+
+    _out("bootstrap: installing lubko-supervisor launcher ...")
+    bin_home = _resolve_bin_home()
+    try:
+        install_supervisor_launcher(bin_home)
+    except OSError as exc:
+        _err(f"could not install the lubko-supervisor launcher: {exc}")
+        _err("refusing to continue without a verified launcher")
+        return EXIT_ERROR
+
+    _out(f"bootstrap: publishing supervisor-runtime override for {commit} ...")
+    supervise.write_supervisor_runtime_override(commit)
+
+    append_deploy_log(
+        f"bootstrap: staged supervisor-runtime override for {commit}"
+        + (f" (confirmed commit remains {confirmed})" if confirmed else "")
+    )
+    _out(f"bootstrap complete: supervisor-runtime override staged for {commit}")
+    if confirmed is not None:
+        _out(f"confirmed commit remains {confirmed}")
+    _out("")
+    _out("next steps:")
+    _out("  1. restart the container/environment to load the new supervisor code")
+    _out("  2. the new supervisor will restore the confirmed worker from desired state")
+    _out("  3. run 'lubko-deploy deploy <target>' to confirm the target and advance cli/current")
+    return EXIT_OK
+
+
+def _resolve_bin_home() -> Path:
+    """Return the user bin directory."""
+    explicit = os.environ.get("XDG_BIN_HOME")
+    if explicit:
+        return Path(explicit)
+    return Path.home() / ".local" / "bin"
+
+
+def install_supervisor_launcher(bin_home: Path) -> None:
+    """Install the lubko-supervisor launcher with override-checking logic.
+
+    Only the supervisor launcher is written; all other launchers resolve
+    through ``cli/current`` as before.  The installation is verified after
+    writing: exact byte content must match the expected source and the
+    executable mode bit must be set, so a partial write, truncated file,
+    or permission error is detected before the override pointer is
+    published.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Raises:
+        OSError: If the directory is missing, the write fails, or
+            verification fails.
+    """
+    if not bin_home.is_dir():
+        msg = f"bin directory {bin_home} does not exist"
+        raise OSError(msg)
+    target = bin_home / "lubko-supervisor"
+    temporary = bin_home / "lubko-supervisor.tmp"
+    expected_bytes = cli.launcher_source("lubko-supervisor").encode("utf-8")
+    temporary.write_bytes(expected_bytes)
+    temporary.chmod(0o755)
+    temporary.replace(target)
+    actual_bytes = target.read_bytes()
+    if actual_bytes != expected_bytes:
+        msg = f"launcher content mismatch after installation: {target}"
+        raise OSError(msg)
+    try:
+        mode = target.stat().st_mode
+    except OSError as exc:
+        msg = f"launcher {target} is not accessible after installation: {exc}"
+        raise OSError(msg) from exc
+    if not stat.S_ISREG(mode):
+        msg = f"launcher {target} is not a regular file after installation"
+        raise OSError(msg)
+    if not (mode & stat.S_IXUSR):
+        msg = f"launcher {target} is not executable after installation"
+        raise OSError(msg)
+
+
 def log_cmd(lines: int) -> int:
     """Show the tail of the maintained worker log.
 
@@ -3116,6 +3326,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="deploy lock wait timeout in seconds (default: 30)",
     )
 
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap",
+        help=(
+            "materialize a target runtime and stage a supervisor-runtime override "
+            "for the next container restart"
+        ),
+    )
+    bootstrap_parser.add_argument(
+        "--commit",
+        required=True,
+        help="exact 40-hex commit to bootstrap the supervisor onto",
+    )
+    bootstrap_parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="repository checkout the commit belongs to (default: current directory)",
+    )
+    bootstrap_parser.add_argument(
+        "--uv",
+        default=None,
+        help="uv executable (default: uv on PATH, then the recorded Lubko toolchain path)",
+    )
+    bootstrap_parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="deploy lock wait timeout in seconds (default: 30)",
+    )
+    bootstrap_parser.add_argument(
+        "--cli-timeout",
+        type=float,
+        default=DEFAULT_CLI_TIMEOUT_SECONDS,
+        help="maintained CLI environment build timeout in seconds (default: 600)",
+    )
+
     repair_parser = subparsers.add_parser(
         "repair",
         help="adopt an independently known recovery worker and reconcile coherent lifecycle state",
@@ -3246,6 +3492,7 @@ def main(argv: list[str] | None = None) -> int:
         "deploy": deploy_cmd,
         "restart": restart_cmd,
         "migrate": migrate_cmd,
+        "bootstrap": bootstrap_cmd,
         "repair": repair_cmd,
         "recover": recover_cmd,
         "log": lambda namespace: log_cmd(namespace.lines),
