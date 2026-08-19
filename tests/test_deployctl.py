@@ -3182,6 +3182,49 @@ def test_prepare_locked_pg_failure_reaps_gated_candidate(
         kill_proc(old)
 
 
+def test_abort_gated_candidate_raises_on_post_escalation_wait_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_abort_gated_candidate translates final wait timeout to DeployCtlError.
+
+    When ``stop_worker`` reports success but the child handle still does not
+    reap within the second grace period the helper must raise a descriptive
+    ``DeployCtlError`` rather than letting ``subprocess.TimeoutExpired`` leak.
+    Both pre- and post-escalation waits time out; stop_worker is mocked True.
+    """
+    dummy = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(dummy)
+    original_wait = dummy.wait
+
+    def timed_out_wait(timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired(cmd=dummy.args, timeout=0.0 if timeout is None else timeout)
+
+    try:
+        gated = dc.GatedWorker(
+            proc=dummy,
+            gate_writer=9,
+            meta=worker_meta("a" * 40, pid=dummy.pid, repo="/r"),
+        )
+        monkeypatch.setattr(dc, "_close_gate", lambda _writer: None)
+        monkeypatch.setattr(dc, "stop_worker", lambda _meta, _grace: True)
+        monkeypatch.setattr(dummy, "wait", timed_out_wait)
+
+        with pytest.raises(dc.DeployCtlError, match="reaping timed out"):
+            dc._abort_gated_candidate(gated)
+    finally:
+        monkeypatch.setattr(dummy, "wait", original_wait)
+        if dummy.poll() is None:
+            guard.unregister(dummy)
+            kill_proc(dummy)
+
+
 # ---------------------------------------------------------------------------
 # Unit regressions: supervisor-owned mission invariants (#91)
 # ---------------------------------------------------------------------------
