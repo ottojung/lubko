@@ -681,7 +681,14 @@ def _abort_gated_candidate(gated: GatedWorker) -> None:
             "exact-identity escalation"
         )
         raise DeployCtlError(msg)
-    proc.wait(timeout=_GATED_ABORT_GRACE_SECONDS)
+    try:
+        proc.wait(timeout=_GATED_ABORT_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        msg = (
+            f"gated candidate pid {gated.meta.pid} survived exact-identity "
+            "escalation; reaping timed out"
+        )
+        raise DeployCtlError(msg) from None
 
 
 def _release_gate(gate_writer: int) -> None:
