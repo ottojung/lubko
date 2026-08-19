@@ -62,6 +62,7 @@ failures at the storage-confirmation boundary.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -111,6 +112,36 @@ def set_fsync_failure_injector(injector: _FsyncInjector) -> None:
 def clear_fsync_failure_injector() -> None:
     """Remove any installed fault injector."""
     _fsync_failure_injector[0] = None
+
+
+def set_one_shot_fsync_failure_injector(
+    *,
+    stage: str = FSYNC_STAGE_DIR,
+    path: Path | None = None,
+) -> None:
+    """Fail the next matching confirmation boundary exactly once, then disable.
+
+    Unlike :func:`set_fsync_failure_injector`, the installed injector clears
+    itself after firing so a subsequent confirmation attempt — for example the
+    best-effort restoration fsync after a failed first write — succeeds.  This
+    lets a regression prove that a failed first confirmation still raises even
+    though the restoration then succeeds.
+
+    Args:
+        stage: The ``FSYNC_STAGE_*`` boundary at which to fail once.
+        path: If given, only fire for this exact destination path.
+    """
+
+    def _inject(current_path: Path, current_stage: str) -> None:
+        if current_stage != stage:
+            return
+        if path is not None and Path(current_path) != Path(path):
+            return
+        set_fsync_failure_injector(None)
+        msg = f"injected one-shot {current_stage} failure at {current_path}"
+        raise DurabilityError(msg)
+
+    set_fsync_failure_injector(_inject)
 
 
 def _maybe_inject(path: Path, stage: str) -> None:
@@ -331,10 +362,12 @@ def write_bytes_durable(path: Path, data: bytes, *, _restore: bool = True) -> No
 
     When the rename succeeds but the final directory fsync cannot be confirmed,
     the write is *not* confirmed: the previously visible authority may be lost
-    on crash and must not drive a lifecycle action.  This implementation
-    therefore prefers to restore the prior destination durably (best effort);
-    only if that restore also cannot be confirmed does it fail closed, so
-    readers and actions can never treat the transition as committed.
+    on crash and must not drive a lifecycle action.  This implementation performs
+    a best-effort fail-closed cleanup — restoring the prior destination durably
+    when one existed, or durably neutralizing the newly visible unconfirmed
+    destination for a first write — but it never converts the failure into
+    success: the original :class:`DurabilityError` is always re-raised so callers
+    cannot advance an action that depended on the new value being committed.
 
     Args:
         path: Destination regular-file path.
@@ -362,13 +395,26 @@ def write_bytes_durable(path: Path, data: bytes, *, _restore: bool = True) -> No
     try:
         fsync_directory(destination.parent)
     except DurabilityError:
-        if _restore and previous is not None:
-            try:
+        # A nested restore/neutralize attempt (``_restore=False``) must never
+        # itself recurse into further restore/neutralize: if the final directory
+        # fsync fails again there is nothing more to attempt, so re-raise the
+        # current failure immediately and let the top-level best-effort cleanup
+        # absorb it.  Only the top-level ``_restore=True`` attempt performs the
+        # cleanup below.
+        if not _restore:
+            raise
+        # The rename landed but its directory entry is not confirmed durable.
+        # Best-effort fail-closed cleanup so a later reader never observes a
+        # torn transition: restore the prior authority when one existed, or
+        # durably neutralize the unconfirmed destination for a first write. This
+        # cleanup MUST NOT convert the failure into success — the original error
+        # is always re-raised so dependent actions cannot advance.
+        if previous is not None:
+            with contextlib.suppress(DurabilityError):
                 write_bytes_durable(destination, previous, _restore=False)
-            except DurabilityError:
-                pass
-            else:
-                return
+        else:
+            with contextlib.suppress(DurabilityError):
+                remove_durable(destination)
         raise
 
 
@@ -385,9 +431,12 @@ def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> 
     :class:`DurabilityError`.
 
     When the rename succeeds but the final directory fsync cannot be confirmed,
-    the write is *not* confirmed; the prior pointer is restored durably when
-    possible, and only if that also cannot be confirmed is the error raised, so
-    the transition is never treated as committed.
+    the write is *not* confirmed.  This implementation performs a best-effort
+    fail-closed cleanup — restoring the prior pointer durably when one existed,
+    or durably neutralizing the unconfirmed destination for a first write — but
+    it never converts the failure into success: the original
+    :class:`DurabilityError` is always re-raised so callers cannot advance an
+    action that depended on the new pointer being committed.
 
     Args:
         path: Destination symlink path.
@@ -420,13 +469,25 @@ def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> 
     try:
         fsync_directory(destination.parent)
     except DurabilityError:
-        if _restore and previous is not None:
-            try:
+        # A nested restore/neutralize attempt (``_restore=False``) must never
+        # itself recurse into further restore/neutralize: if the final directory
+        # fsync fails again there is nothing more to attempt, so re-raise the
+        # current failure immediately and let the top-level best-effort cleanup
+        # absorb it.  Only the top-level ``_restore=True`` attempt performs the
+        # cleanup below.
+        if not _restore:
+            raise
+        # The rename landed but its directory entry is not confirmed durable.
+        # Best-effort fail-closed cleanup: restore the prior pointer when one
+        # existed, or durably neutralize the unconfirmed destination for a first
+        # write. The failure is never converted into success — the original
+        # error is always re-raised.
+        if previous is not None:
+            with contextlib.suppress(DurabilityError):
                 write_symlink_durable(destination, previous, _restore=False)
-            except DurabilityError:
-                pass
-            else:
-                return
+        else:
+            with contextlib.suppress(DurabilityError):
+                remove_durable(destination)
         raise
 
 
@@ -479,6 +540,12 @@ def remove_durable(path: Path) -> None:
         DurabilityError: If the removal cannot be confirmed durable.
     """
     destination = Path(path)
+    # Snapshot the prior bytes of an existing regular file so a failed
+    # confirmation can best-effort restore the authority instead of silently
+    # losing it.  Symlinks and missing entries have no prior bytes to keep.
+    previous = (
+        destination.read_bytes() if (destination.exists() and destination.is_file()) else None
+    )
     try:
         destination.unlink(missing_ok=True)
     except OSError as exc:
@@ -487,4 +554,13 @@ def remove_durable(path: Path) -> None:
     # Confirm the removal is durable: the parent directory no longer references
     # the entry.  A failure here means the removal is not confirmed, so callers
     # must not treat the state as gone.
-    fsync_directory(destination.parent)
+    try:
+        fsync_directory(destination.parent)
+    except DurabilityError:
+        # The removal is not confirmed durable.  Best-effort restore the prior
+        # bytes so the authority is not silently lost, but always re-raise the
+        # original removal failure: a caller must never treat the state as gone.
+        if previous is not None:
+            with contextlib.suppress(DurabilityError):
+                write_bytes_durable(destination, previous, _restore=False)
+        raise

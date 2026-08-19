@@ -25,7 +25,9 @@ from lubko.durable import (
     FSYNC_STAGE_REPLACE,
     DurabilityError,
     clear_fsync_failure_injector,
+    remove_durable,
     set_fsync_failure_injector,
+    set_one_shot_fsync_failure_injector,
     write_bytes_durable,
     write_json_durable,
     write_symlink_durable,
@@ -497,6 +499,158 @@ def test_set_current_dir_fsync_failure_restores_previous() -> None:
     with pytest.raises(cli.CliError):
         cli.set_current("b" * 40)
     assert cli.current_commit() == "a" * 40
+
+
+# ---------------------------------------------------------------------------
+# One-shot final-dir-fsync: best-effort restore must NOT convert failure to success
+# ---------------------------------------------------------------------------
+
+
+def test_write_desired_one_shot_dir_fsync_restores_previous_and_raises() -> None:
+    """A one-shot dir-fsync failure must restore prior desired and still raise.
+
+    The first confirmation fails but the best-effort restoration fsync succeeds
+    (one-shot injector disabled after firing).  The original operation must
+    still raise and the caller's dependent action must not advance, proving the
+    restoration does not convert the failure into a successful write.
+    """
+    desired_a = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=1,
+        commit="a" * 40,
+        repo="/repo",
+        uv_path="/uv",
+        worker_id=None,
+    )
+    desired_b = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=2,
+        commit="b" * 40,
+        repo="/repo",
+        uv_path="/uv",
+        worker_id=None,
+    )
+    supervise.write_desired(desired_a)
+    applied = []
+
+    def settle_then_apply(desired: supervise.SupervisorDesired) -> None:
+        supervise.write_desired(desired)
+        applied.append(desired.generation)
+
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR)
+    with pytest.raises(DurabilityError):
+        settle_then_apply(desired_b)
+    # The dependent action must not advance even though restoration succeeded.
+    assert applied == []
+    # The previously confirmed authority is restored.
+    restored = supervise.read_desired()
+    assert restored is not None
+    assert restored.commit == "a" * 40
+    assert restored.generation == 1
+
+
+def test_set_current_one_shot_dir_fsync_restores_previous_and_raises() -> None:
+    """A one-shot dir-fsync failure must restore prior pointer and still raise.
+
+    Mirrors the desired.json regression for the maintained CLI active-pointer
+    symlink: the restoration succeeds but the original ``set_current`` must
+    still report a CLI error and leave the caller's dependent action unrun.
+    """
+    cli.set_current("a" * 40)
+    advanced = []
+
+    def set_then_advance(commit: str) -> None:
+        cli.set_current(commit)
+        advanced.append(commit)
+
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR)
+    with pytest.raises(cli.CliError):
+        set_then_advance("b" * 40)
+    assert advanced == []
+    assert cli.current_commit() == "a" * 40
+
+
+def test_write_bytes_first_write_one_shot_neutralizes_new_destination(tmp_path: Path) -> None:
+    """A first-write dir-fsync failure must neutralize the unconfirmed file.
+
+    With no previous value, the best-effort fail-closed cleanup must durably
+    remove the newly visible (renamed but unconfirmed) destination rather than
+    leaving a torn value behind, and the original write must still raise.
+    """
+    path = tmp_path / "state.json"
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR)
+    with pytest.raises(DurabilityError):
+        write_bytes_durable(path, b"next")
+    # The unconfirmed destination is neutralized; nothing remains visible.
+    assert not path.exists()
+    assert _temp_artifacts(tmp_path) == []
+
+
+def test_write_symlink_first_write_one_shot_neutralizes_new_destination(tmp_path: Path) -> None:
+    """A first symlink-write dir-fsync failure must neutralize the new pointer."""
+    path = tmp_path / "current"
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR)
+    with pytest.raises(DurabilityError):
+        write_symlink_durable(path, "b" * 40)
+    assert not path.exists()
+    assert _temp_artifacts(tmp_path) == []
+
+
+def test_write_bytes_persistent_dir_fsync_failure_terminates_without_recursion(
+    tmp_path: Path,
+) -> None:
+    """A persistent dir-fsync failure must terminate, not recurse forever.
+
+    The persistent injector keeps failing every directory fsync, so the
+    best-effort restore attempt also fails its final fsync.  The nested
+    ``_restore=False`` attempt must re-raise immediately rather than recursing
+    into another restore, and the top-level call must still raise the original
+    :class:`DurabilityError` without exhausting the stack.
+    """
+    path = tmp_path / "state.json"
+    _seed(path, b"previous")
+    _raise_at(FSYNC_STAGE_DIR)
+    with pytest.raises(DurabilityError):
+        write_bytes_durable(path, b"next")
+    # No in-progress temporary artifact survives the failed write.
+    assert _temp_artifacts(tmp_path) == []
+
+
+def test_write_symlink_persistent_dir_fsync_failure_terminates_without_recursion(
+    tmp_path: Path,
+) -> None:
+    """A persistent symlink dir-fsync failure must terminate, not recurse."""
+    path = tmp_path / "current"
+    path.symlink_to("a" * 40)
+    _raise_at(FSYNC_STAGE_DIR)
+    with pytest.raises(DurabilityError):
+        write_symlink_durable(path, "b" * 40)
+    assert _temp_artifacts(tmp_path) == []
+
+
+def test_remove_durable_one_shot_dir_fsync_restores_previous_and_raises(tmp_path: Path) -> None:
+    """A removal dir-fsync failure must restore prior bytes and still raise.
+
+    The authoritative regular file's prior bytes are snapshotted; when the final
+    confirmation fsync fails (one-shot) the prior bytes are restored durably by
+    the best-effort cleanup, but the original removal failure is always
+    re-raised so callers cannot treat the state as gone.
+    """
+    path = tmp_path / "override.json"
+    _seed(path, b"authoritative")
+    advanced: list[str] = []
+
+    def remove_then_advance() -> None:
+        remove_durable(path)
+        advanced.append("gone")
+
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR)
+    with pytest.raises(DurabilityError):
+        remove_then_advance()
+    # The caller's dependent action must not advance.
+    assert advanced == []
+    # The prior authority is restored by best-effort cleanup.
+    assert path.read_bytes() == b"authoritative"
 
 
 # ---------------------------------------------------------------------------
