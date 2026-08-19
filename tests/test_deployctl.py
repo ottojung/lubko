@@ -2898,8 +2898,8 @@ def test_end_to_end_cancelled_checkout_leaves_previous_worker_running(
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
         )
-        wait_until(_preparing_mission, timeout=60.0)
         with psycopg.connect(jobs_db) as conn:
+            wait_until(_preparing_mission, timeout=60.0)
             conn.execute(
                 "UPDATE lubko.jobs\n"
                 "SET payload = jsonb_set("
