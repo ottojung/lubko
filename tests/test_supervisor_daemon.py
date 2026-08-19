@@ -1248,12 +1248,12 @@ def test_status_keeps_live_supervised_pending_mission(
         assert status is not None
         assert status.commit == second
 
-        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
+        result = dc._handle_status(_status_options(repo))
 
         assert result["phase"] == "await-confirmation"
         assert result["proposed_commit"] == second
         assert result["previous_commit"] == first
-        after = dc._read_state()  # ruff: ignore[private-member-access]
+        after = dc._read_state()
         assert after is not None
         assert after.status == dc.STATUS_PENDING
         assert worker_pid() == candidate_pid
@@ -1290,11 +1290,11 @@ def test_status_rolls_back_supervised_mission_with_lapsed_deadline(
         candidate_pid = worker_pid()
         assert candidate_pid is not None
 
-        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
+        result = dc._handle_status(_status_options(repo))
 
         assert result["phase"] == "idle"
         assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
-        final = dc._read_state()  # ruff: ignore[private-member-access]
+        final = dc._read_state()
         assert final is not None
         assert final.status == dc.STATUS_ROLLED_BACK
         wait_until(status_commit_is(first), timeout=30.0)
@@ -1482,7 +1482,7 @@ def test_derive_action_fails_closed_on_corrupt_rollback(tmp_path: Path) -> None:
         )
     )
     daemon = SupervisorDaemon(Settings())
-    action, commit = daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
+    action, commit = daemon._derive_action(supervise.read_state())
     assert action == "hold"
     assert commit is None
 
@@ -1494,7 +1494,7 @@ def _derive_action() -> tuple[str, str | None]:
         The ``(action, commit)`` pair.
     """
     daemon = SupervisorDaemon(Settings())
-    return daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
+    return daemon._derive_action(supervise.read_state())
 
 
 def test_derive_action_pending_newer_than_desired_selects_candidate(
@@ -1628,7 +1628,7 @@ def test_wait_for_identity_rejects_non_leader_on_timeout() -> None:
     guard.register(proc)
     try:
         daemon = SupervisorDaemon(Settings(identity_timeout_seconds=0.3))
-        assert daemon._wait_for_identity(proc.pid) is None  # ruff: ignore[private-member-access]
+        assert daemon._wait_for_identity(proc.pid) is None
     finally:
         guard.teardown_tracked(fail_on_leak=False)
 
@@ -1737,7 +1737,7 @@ def test_tick_derives_before_applying_stale_desired(
     monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
     monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
     monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
-    daemon._tick(0.0)  # ruff: ignore[private-member-access]
+    daemon._tick(0.0)
     assert applied == []
     assert ensured == ["3" * 40]
 
@@ -2443,10 +2443,10 @@ def test_supervisor_hard_kill_pending_candidate_replacement_resumes(
     """Deterministic SIGKILL regression: supervisor hard-killed while pending candidate.
 
     The supervisor is hard-killed while a pending mission is active.  The orphan
-    candidate identity is handled safely (no legacy fallback, no duplicate
-    worker).  A replacement supervisor starts and resumes the candidate commit
-    from the durable pending mission state.  The mission generation and desired
-    generation remain unchanged through the gap.
+    candidate survives initially (reparented to PID 1).  A replacement supervisor
+    starts, retires the orphan by exact identity, and resumes the candidate
+    commit from the durable pending mission state.  After convergence exactly
+    one maintained consumer remains.
     """
     del jobs_db, pg_cluster
     repo, first, second = maintained_env
@@ -2481,16 +2481,25 @@ def test_supervisor_hard_kill_pending_candidate_replacement_resumes(
         assert mission.commit == second
         assert mission.generation == applied + 1
 
+        assert process_alive(first_candidate), "orphan candidate must survive initial SIGKILL"
+
         second_proc = start_supervisor(supervisor_env)
         try:
             wait_until(lambda: worker_pid() is not None, timeout=30.0)
             wait_until(status_ready, timeout=30.0)
             resumed_pid = worker_pid()
             assert resumed_pid is not None
+            assert resumed_pid != first_candidate, "replacement must be a different PID"
+
+            wait_until(lambda: not process_alive(first_candidate), timeout=30.0)
+
             status = supervise.read_status()
             assert status is not None
             assert status.commit == second
             assert len(direct_children(status.supervisor_pid)) == 1
+
+            if resumed_pid is not None:
+                assert process_alive(resumed_pid)
 
             write_rollback(
                 replace(
@@ -2565,3 +2574,154 @@ def test_supervisor_restart_resumes_mission_repeated(
             supervisor_owned=True,
         )
     )
+
+
+def test_ensure_worker_takeover_stops_reparented_orphan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_ensure_worker retires a reparented orphan via lifecycle.stop_worker.
+
+    After a supervisor restart, the old worker is reparented to PID 1.
+    _retire_child skips stop_worker (PPID mismatch), but _ensure_worker
+    reads lifecycle.read_meta(), finds the orphan alive, and retires it
+    by exact identity before spawning a fresh worker.
+    """
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    try:
+        identity = lifecycle.process_identity(proc.pid)
+        assert identity is not None
+        child = supervise.WorkerChild(
+            pid=identity.pid,
+            pgid=identity.pgid,
+            sid=identity.sid,
+            start_time_ticks=identity.start_time_ticks,
+            token="test-orphan-token",
+            worker_id="orphan-worker",
+            spawned_at=1.0,
+        )
+        orphan_meta = lifecycle.WorkerMeta(
+            schema_version=lifecycle.SCHEMA_VERSION,
+            state=lifecycle.STATE_RUNNING,
+            pid=identity.pid,
+            pgid=identity.pgid,
+            sid=identity.sid,
+            start_time_ticks=identity.start_time_ticks,
+            token="test-orphan-token",
+            repo="",
+            git_commit=None,
+            worker_id="orphan-worker",
+            log_path="",
+            started_at=1.0,
+            stopped_at=None,
+        )
+        state = replace(
+            supervise.fresh_state(),
+            mode=supervise.MODE_RUN,
+            commit="a" * 40,
+            child=child,
+            intent=supervise.INTENT_RUN,
+        )
+        supervise.write_state(state)
+
+        stop_calls: list[lifecycle.WorkerMeta] = []
+        saved_stop = lifecycle.stop_worker
+
+        def fake_stop(meta: lifecycle.WorkerMeta, _grace: float) -> bool:
+            stop_calls.append(meta)
+            return saved_stop(meta, _grace)
+
+        def fake_read_meta() -> lifecycle.WorkerMeta | None:
+            return orphan_meta
+
+        daemon = SupervisorDaemon(Settings())
+        monkeypatch.setattr(lifecycle, "stop_worker", fake_stop)
+        monkeypatch.setattr(lifecycle, "read_meta", fake_read_meta)
+        monkeypatch.setattr(daemon, "_spawn_worker", lambda _c: None)
+
+        daemon._ensure_worker("b" * 40)
+
+        assert len(stop_calls) == 1
+        assert stop_calls[0].pid == proc.pid
+        assert stop_calls[0].start_time_ticks == identity.start_time_ticks
+
+        final_state = supervise.read_state()
+        assert final_state.child is None
+    finally:
+        guard.teardown_tracked(fail_on_leak=False)
+
+
+def test_ensure_worker_takeover_fails_closed_on_wrong_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_ensure_worker holds when stop_worker fails — no second consumer spawned.
+
+    When the recorded maintained worker's identity cannot be proven (wrong
+    token, PID reuse), stop_worker returns False and _ensure_worker backs
+    off without spawning.  The daemon state records the backoff and no
+    replacement worker is started.
+    """
+    child = supervise.WorkerChild(
+        pid=999_999,
+        pgid=999_999,
+        sid=999_999,
+        start_time_ticks=42,
+        token="test-token",
+        worker_id="dead-worker",
+        spawned_at=1.0,
+    )
+    stale_meta = lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=999_999,
+        pgid=999_999,
+        sid=999_999,
+        start_time_ticks=42,
+        token="test-token",
+        repo="",
+        git_commit=None,
+        worker_id="dead-worker",
+        log_path="",
+        started_at=1.0,
+        stopped_at=None,
+    )
+    state = replace(
+        supervise.fresh_state(),
+        mode=supervise.MODE_RUN,
+        commit="a" * 40,
+        child=child,
+        intent=supervise.INTENT_RUN,
+    )
+    supervise.write_state(state)
+
+    def fail_stop(_meta: lifecycle.WorkerMeta, _grace: float) -> bool:
+        return False
+
+    def fake_read_meta() -> lifecycle.WorkerMeta | None:
+        return stale_meta
+
+    spawn_calls: list[str] = []
+
+    def fake_spawn(commit: str) -> supervise.WorkerChild | None:
+        spawn_calls.append(commit)
+        return None
+
+    daemon = SupervisorDaemon(Settings())
+    monkeypatch.setattr(lifecycle, "stop_worker", fail_stop)
+    monkeypatch.setattr(lifecycle, "read_meta", fake_read_meta)
+    monkeypatch.setattr(daemon, "_spawn_worker", fake_spawn)
+
+    daemon._ensure_worker("b" * 40)
+
+    assert spawn_calls == [], "no worker must be spawned when stop_worker fails"
+
+    final_state = supervise.read_state()
+    assert final_state.child is None
+    assert final_state.next_attempt_at is not None
+    assert final_state.next_attempt_at > time.monotonic()
