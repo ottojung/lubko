@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import threading
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Self, cast
@@ -21,13 +22,18 @@ import psycopg
 import pytest
 
 from lubko.worker import (
+    OUTPUT_STREAMS,
+    ActiveJob,
+    OutputStream,
     Settings,
     collect_transport,
+    publish_output,
     recover_stale_jobs,
 )
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
+    from pathlib import Path
     from uuid import UUID
 
     from lubko.worker import JobsConnection
@@ -1018,6 +1024,150 @@ def test_gc_orphan_pass_retains_valid_owned_chunks(db: str) -> None:
 # ---------------------------------------------------------------------------
 # Concurrent publication-vs-GC race (genuinely concurrent)
 # ---------------------------------------------------------------------------
+
+
+def test_gc_skips_publisher_locked_root_proving_skip_locked(db: str) -> None:
+    """Publisher-first: SKIP LOCKED skips root locked by concurrent publisher.
+
+    Proof of the two-sided invariant with real PostgreSQL:
+
+    (A) Publisher-first ordering:
+      1. Publisher holds root ``FOR UPDATE`` in an open transaction.
+      2. Real ``collect_transport`` runs concurrently and returns without
+         marking or deleting that locked root (``SKIP LOCKED``).
+      3. Publisher commits; a later GC pass marks, drains, and deletes
+         everything with no orphans.
+    """
+    root_id = _insert_terminal_job(db)
+    for i in range(5):
+        _insert_output_chunk(db, root_id, sequence=i)
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=10)
+
+    # Publisher opens a transaction and visibly locks the root row.
+    pub_conn = psycopg.connect(db)
+    pub_conn.autocommit = False
+    with pub_conn.transaction(), pub_conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM lubko.jobs\n"
+            "WHERE id = %s AND (payload::jsonb)->'state'->>'gc' IS DISTINCT FROM 'true'\n"
+            "FOR UPDATE",
+            (root_id,),
+        )
+
+        # Start GC thread while publisher lock is visibly held.
+        gc_results: list[tuple[list[UUID], int, int]] = []
+
+        def gc_fn() -> None:
+            with psycopg.connect(db) as c:
+                gc_results.append(collect_transport(c, settings))
+
+        gc_thread = threading.Thread(target=gc_fn)
+        gc_thread.start()
+
+        # Bounded join: GC must terminate while publisher lock is still held.
+        gc_thread.join(timeout=30)
+        assert not gc_thread.is_alive(), "GC thread did not terminate"
+        assert len(gc_results) == 1, "GC thread did not return a result"
+        roots_marked, _chunks, _orphans = gc_results[0]
+
+        # SKIP LOCKED: root absent from Phase-1 output and unmodified.
+        assert root_id not in roots_marked
+        with psycopg.connect(db) as chk:
+            row = chk.execute(
+                "SELECT (payload::jsonb)->'state'->>'gc'\nFROM lubko.jobs WHERE id = %s",
+                (root_id,),
+            ).fetchone()
+        assert row is not None
+        assert row[0] != "true"
+        assert _row_exists(db, root_id)
+
+        # Release publisher lock.
+    pub_conn.close()
+
+    # Later GC pass: marks, drains all chunks, deletes root, no orphans.
+    with psycopg.connect(db) as conn:
+        roots, chunks, orphans = collect_transport(conn, settings)
+    assert root_id in roots
+    assert chunks == 5
+    assert orphans == 0
+    assert not _row_exists(db, root_id)
+    assert _count_chunks_for_root(db, root_id) == 0
+
+
+def test_gc_mark_prevents_publication_no_orphan_chunks(db: str, tmp_path: Path) -> None:
+    """GC-wins: after gc mark commits, publish_output refuses the root.
+
+    Proof of the two-sided invariant with real PostgreSQL:
+
+    (B) GC-wins ordering:
+      1. Real ``collect_transport`` marks the root gc=true (Phase 1) and
+         partially drains chunks (Phase 2) in one bounded pass.
+      2. ``publish_output`` on the same root refuses (gc flag visible).
+      3. No new chunk is created; root survives (>batch chunks).
+      4. Subsequent GC passes drain remaining chunks and delete root.
+    """
+    root_id = _insert_terminal_job(db)
+    # More chunks than gc_batch_limit so root survives Phase 2.
+    for i in range(5):
+        _insert_output_chunk(db, root_id, sequence=i)
+    settings = _make_settings(gc_retention_seconds=0.0, gc_batch_limit=3)
+
+    # GC marks the root (Phase 1) and partially drains (Phase 2).
+    with psycopg.connect(db) as conn:
+        roots, _chunks, _orphans = collect_transport(conn, settings)
+    assert root_id in roots
+    assert _is_gc_marked(db, root_id)
+    assert _row_exists(db, root_id)
+    # Phase 2 deleted gc_batch_limit=3 chunks, 2 remain, root alive.
+    assert _count_chunks_for_root(db, root_id) == 2
+
+    # Real subprocess writes capture output into pytest-owned tmp_path.
+    stdout_path = tmp_path / "stdout"
+    stderr_path = tmp_path / "stderr"
+    proc = subprocess.Popen(
+        ["/bin/echo", "hello"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout_data, stderr_data = proc.communicate(timeout=10)
+        stdout_path.write_bytes(stdout_data)
+        stderr_path.write_bytes(stderr_data)
+
+        job = ActiveJob(
+            id=root_id,
+            cwd=str(tmp_path),
+            process=("/bin/echo", "hello"),
+            proc=proc,
+            pid=proc.pid,
+            pgid=proc.pid,
+            started_mono=0.0,
+            claimed_at=0.0,
+        )
+        job.stdout = OutputStream(path=stdout_path)
+        job.stderr = OutputStream(path=stderr_path)
+
+        # publish_output refuses the gc-marked root.
+        with psycopg.connect(db) as conn:
+            published = publish_output(conn, job, list(OUTPUT_STREAMS), 0.0, force=True)
+        assert published is False
+        # No new chunk created by the refused publication.
+        assert _count_chunks_for_root(db, root_id) == 2
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+    # Subsequent GC passes drain remaining chunks and delete root.
+    for _ in range(10):
+        with psycopg.connect(db) as conn:
+            collect_transport(conn, settings)
+        if not _row_exists(db, root_id):
+            break
+    assert not _row_exists(db, root_id)
+    assert _count_chunks_for_root(db, root_id) == 0
 
 
 # ---------------------------------------------------------------------------
