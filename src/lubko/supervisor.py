@@ -810,12 +810,15 @@ class SupervisorDaemon:
         )
 
     def _retire_child(self) -> bool:
-        """Stop the current worker child by exact identity and forget it.
+        """Stop the current worker child by exact identity.
 
-        The child is never restarted after retirement: the caller has decided
-        the transition was intentional.  ``stop_worker`` performs full identity
-        verification (PID, start-time ticks, PGID, SID, lifecycle token) before
-        signalling so a reparented or reused PID is never mis-signalled.
+        ``stop_worker`` performs full identity verification (PID, start-time
+        ticks, PGID, SID, lifecycle token) before signalling so a reparented
+        or reused PID is never mis-signalled.
+
+        When the stop cannot be confirmed the durable child identity is
+        preserved so the next daemon tick can retry the same exact orphan
+        rather than losing track of it and spawning a duplicate consumer.
 
         Returns:
             ``True`` when the child was successfully retired (or was already
@@ -831,8 +834,15 @@ class SupervisorDaemon:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
             self.proc = None
-        write_state(replace(state, child=None))
-        LOGGER.info("retired worker child pid=%d", child.pid)
+        if stopped:
+            write_state(replace(state, child=None))
+            LOGGER.info("retired worker child pid=%d", child.pid)
+        else:
+            LOGGER.error(
+                "could not confirm stop of worker pid %d; preserving child "
+                "identity for retry",
+                child.pid,
+            )
         return stopped
 
     def _clear_child(self, _now: float) -> None:

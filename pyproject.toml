@@ -105,10 +105,6 @@ convention = "google"
 "tests/test_lifecycle.py" = [
     "private-member-access",
 ]
-"tests/test_supervisor_daemon.py" = [
-    "hardcoded-password-func-arg",
-    "private-member-access",
-]
 
 [tool.ruff.format]
 preview = true

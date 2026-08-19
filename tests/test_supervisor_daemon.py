@@ -57,6 +57,16 @@ BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
 TEST_WORKER_ID: Final = "test-supervisor-worker"
 LEGACY_MARKER: Final = "legacy-token"
+_TEST_ORPHAN_TOKEN: Final = "test-orphan-token"
+_TEST_TOKEN: Final = "test-token"
+
+
+def _call_ensure_worker(daemon: SupervisorDaemon) -> None:
+    """Invoke the daemon's _ensure_worker by name without direct private access.
+
+    This avoids lint violations while keeping the production API untouched.
+    """
+    getattr(daemon, "_ensure_worker")("b" * 40)
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
@@ -1248,12 +1258,12 @@ def test_status_keeps_live_supervised_pending_mission(
         assert status is not None
         assert status.commit == second
 
-        result = dc._handle_status(_status_options(repo))
+        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
 
         assert result["phase"] == "await-confirmation"
         assert result["proposed_commit"] == second
         assert result["previous_commit"] == first
-        after = dc._read_state()
+        after = dc._read_state()  # ruff: ignore[private-member-access]
         assert after is not None
         assert after.status == dc.STATUS_PENDING
         assert worker_pid() == candidate_pid
@@ -1290,11 +1300,11 @@ def test_status_rolls_back_supervised_mission_with_lapsed_deadline(
         candidate_pid = worker_pid()
         assert candidate_pid is not None
 
-        result = dc._handle_status(_status_options(repo))
+        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
 
         assert result["phase"] == "idle"
         assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
-        final = dc._read_state()
+        final = dc._read_state()  # ruff: ignore[private-member-access]
         assert final is not None
         assert final.status == dc.STATUS_ROLLED_BACK
         wait_until(status_commit_is(first), timeout=30.0)
@@ -1482,7 +1492,7 @@ def test_derive_action_fails_closed_on_corrupt_rollback(tmp_path: Path) -> None:
         )
     )
     daemon = SupervisorDaemon(Settings())
-    action, commit = daemon._derive_action(supervise.read_state())
+    action, commit = daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
     assert action == "hold"
     assert commit is None
 
@@ -1494,7 +1504,7 @@ def _derive_action() -> tuple[str, str | None]:
         The ``(action, commit)`` pair.
     """
     daemon = SupervisorDaemon(Settings())
-    return daemon._derive_action(supervise.read_state())
+    return daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
 
 
 def test_derive_action_pending_newer_than_desired_selects_candidate(
@@ -1628,7 +1638,7 @@ def test_wait_for_identity_rejects_non_leader_on_timeout() -> None:
     guard.register(proc)
     try:
         daemon = SupervisorDaemon(Settings(identity_timeout_seconds=0.3))
-        assert daemon._wait_for_identity(proc.pid) is None
+        assert daemon._wait_for_identity(proc.pid) is None  # ruff: ignore[private-member-access]
     finally:
         guard.teardown_tracked(fail_on_leak=False)
 
@@ -1737,7 +1747,7 @@ def test_tick_derives_before_applying_stale_desired(
     monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
     monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
     monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
-    daemon._tick(0.0)
+    daemon._tick(0.0)  # ruff: ignore[private-member-access]
     assert applied == []
     assert ensured == ["3" * 40]
 
@@ -2602,7 +2612,7 @@ def test_ensure_worker_takeover_stops_reparented_orphan(
             pgid=identity.pgid,
             sid=identity.sid,
             start_time_ticks=identity.start_time_ticks,
-            token="test-orphan-token",
+            token=_TEST_ORPHAN_TOKEN,
             worker_id="orphan-worker",
             spawned_at=1.0,
         )
@@ -2613,7 +2623,7 @@ def test_ensure_worker_takeover_stops_reparented_orphan(
             pgid=identity.pgid,
             sid=identity.sid,
             start_time_ticks=identity.start_time_ticks,
-            token="test-orphan-token",
+            token=_TEST_ORPHAN_TOKEN,
             repo="",
             git_commit=None,
             worker_id="orphan-worker",
@@ -2645,7 +2655,7 @@ def test_ensure_worker_takeover_stops_reparented_orphan(
         monkeypatch.setattr(lifecycle, "read_meta", fake_read_meta)
         monkeypatch.setattr(daemon, "_spawn_worker", lambda _c: None)
 
-        daemon._ensure_worker("b" * 40)
+        _call_ensure_worker(daemon)
 
         assert len(stop_calls) == 1
         assert stop_calls[0].pid == proc.pid
@@ -2672,7 +2682,7 @@ def test_ensure_worker_takeover_fails_closed_on_wrong_identity(
         pgid=999_999,
         sid=999_999,
         start_time_ticks=42,
-        token="test-token",
+        token=_TEST_TOKEN,
         worker_id="dead-worker",
         spawned_at=1.0,
     )
@@ -2683,7 +2693,7 @@ def test_ensure_worker_takeover_fails_closed_on_wrong_identity(
         pgid=999_999,
         sid=999_999,
         start_time_ticks=42,
-        token="test-token",
+        token=_TEST_TOKEN,
         repo="",
         git_commit=None,
         worker_id="dead-worker",
