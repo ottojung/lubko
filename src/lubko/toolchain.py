@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from lubko.durable import write_json_durable
 from lubko.state import state_root
 
 TOOLCHAIN_SCHEMA_VERSION: Final = 1
@@ -62,17 +63,22 @@ def toolchain_path() -> Path:
 
 
 def write_toolchain(uv_path: str) -> None:
-    """Atomically persist the resolved ``uv`` executable.
+    """Crash-durably persist the resolved ``uv`` executable.
+
+    ``toolchain.json`` is recovery authority for later installs/deploys: it is
+    the fallback ``uv`` used when none is on PATH, so the write must be
+    confirmed durable.
 
     Args:
         uv_path: Absolute path of the ``uv`` executable used.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    directory = toolchain_path().parent
-    directory.mkdir(parents=True, exist_ok=True)
     meta = ToolchainMeta(schema_version=TOOLCHAIN_SCHEMA_VERSION, uv_path=uv_path)
-    tmp_path = directory / "toolchain.json.tmp"
-    tmp_path.write_text(json.dumps(meta.to_dict(), indent=2, sort_keys=True) + "\n")
-    tmp_path.replace(toolchain_path())
+    write_json_durable(toolchain_path(), meta.to_dict())
 
 
 def read_toolchain() -> ToolchainMeta | None:

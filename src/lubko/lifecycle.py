@@ -42,6 +42,7 @@ from psycopg.rows import tuple_row
 
 from lubko import cli, supervise, toolchain
 from lubko.config import load_database_config
+from lubko.durable import write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import JOB_ID_ENV, delete_job_and_chunks, group_has_members, request_cancel
@@ -478,16 +479,21 @@ def _optional_str(value: object | None) -> str | None:
 
 
 def write_meta(meta: WorkerMeta) -> None:
-    """Atomically persist worker lifecycle metadata.
+    """Crash-durably persist worker lifecycle metadata.
+
+    ``meta.json`` is recovery authority for the maintained worker: it records
+    the live worker identity the supervisor reconciles against, so the write
+    must be confirmed durable before any dependent lifecycle action proceeds.
 
     Args:
         meta: Worker metadata to persist.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    directory = worker_state_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    tmp_path = directory / "meta.json.tmp"
-    tmp_path.write_text(json.dumps(meta.to_dict(), indent=2, sort_keys=True) + "\n")
-    tmp_path.replace(meta_path())
+    write_json_durable(meta_path(), meta.to_dict())
 
 
 def read_meta() -> WorkerMeta | None:
