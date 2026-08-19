@@ -803,20 +803,37 @@ if [ -e "$OVERRIDE" ]; then
       exit 1
       ;;
   esac
-  COMMIT="$(cat "$OVERRIDE")" || {
+  # Byte-faithful content validation without lossy command substitution:
+  #   1) bytes 1..40 are exclusively lowercase ASCII hex (residual byte count == 0)
+  #   2) byte 41 is exactly newline (0x0a)
+  _HEX_REMAINING="$(head -c 40 "$OVERRIDE" | LC_ALL=C tr -d '0123456789abcdef' | wc -c)" || {
     printf '%s: could not read supervisor-runtime override\\n' "$ENTRY" >&2
     exit 1
   }
-  # strict validation: exactly 40 lowercase hex chars, nothing else
-  case "$COMMIT" in
-    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
-      ;;
+  case "$_HEX_REMAINING" in
+    0) ;;
     *)
       printf '%s: supervisor-runtime override is not a valid 40-hex commit\\n' \\
         "$ENTRY" >&2
       exit 1
       ;;
   esac
+  _TAIL_BYTE="$(tail -c 1 "$OVERRIDE" | od -An -tx1 | tr -d ' \\n')" || {
+    printf '%s: could not read supervisor-runtime override\\n' "$ENTRY" >&2
+    exit 1
+  }
+  case "$_TAIL_BYTE" in
+    0a) ;;
+    *)
+      printf '%s: supervisor-runtime override is not a valid 40-hex commit\\n' \\
+        "$ENTRY" >&2
+      exit 1
+      ;;
+  esac
+  COMMIT="$(head -c 40 "$OVERRIDE")" || {
+    printf '%s: could not read supervisor-runtime override\\n' "$ENTRY" >&2
+    exit 1
+  }
   ROOT="$STATE/cli/$COMMIT"
   if [ ! -d "$ROOT" ]; then
     printf '%s: supervisor-runtime override commit %s has no runtime dir\\n' \\

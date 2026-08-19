@@ -418,6 +418,67 @@ def test_supervisor_launcher_rejects_symlink_to_file_override(
     assert "is a symlink" in proc.stderr
 
 
+def test_supervisor_launcher_rejects_nul_byte_override(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An override with NUL at byte 41 fails closed.
+
+    Shell command substitution strips NUL, so 40hex+NUL could collapse to
+    a valid-looking 40hex string.  The byte-faithful ``wc -c`` residual
+    count and ``od`` final-byte check reject this without lossy substitution.
+    """
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    override_path = supervise.supervisor_runtime_override_path()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_bytes(b"a" * 40 + b"\x00")
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "not a valid 40-hex commit" in proc.stderr
+
+
+def test_supervisor_launcher_rejects_nul_inside_first_40_bytes(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An override with NUL embedded in the first 40 bytes fails closed.
+
+    ``head -c 40 | tr -d hex | wc -c`` counts the residual non-hex byte
+    (NUL) numerically without ever storing raw bytes in a shell variable.
+    """
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    override_path = supervise.supervisor_runtime_override_path()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_bytes(b"a" * 19 + b"\x00" + b"a" * 20 + b"\n")
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "not a valid 40-hex commit" in proc.stderr
+
+
 def test_missing_bin_dir_aborts_without_override(
     two_commit_repo: tuple[Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
