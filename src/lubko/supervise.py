@@ -54,7 +54,7 @@ if TYPE_CHECKING:
 
 SCHEMA_VERSION: Final = 1
 
-SUPERVISOR_RUNTIME_COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}\n$")
+SUPERVISOR_RUNTIME_COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}\n\Z")
 
 STAT_MIN_FIELDS: Final = 20
 STAT_STARTTIME_FIELD_INDEX: Final = 19
@@ -1151,7 +1151,7 @@ def read_supervisor_runtime_override() -> str | None:
         raw = path.read_text(encoding="utf-8")
     except OSError:
         return None
-    if not SUPERVISOR_RUNTIME_COMMIT_RE.match(raw):
+    if not SUPERVISOR_RUNTIME_COMMIT_RE.fullmatch(raw):
         return None
     return raw[:40]
 
@@ -1176,12 +1176,15 @@ def write_supervisor_runtime_override(commit: str) -> None:
 def clear_supervisor_runtime_override() -> bool:
     """Remove the supervisor-runtime override pointer if present.
 
+    Only regular files are removed: symlinks, directories, and other
+    special entries are never silently deleted.
+
     Returns:
         ``True`` when the override was present and removed, ``False``
         when it was already absent.
     """
     path = supervisor_runtime_override_path()
-    if not path.is_file():
+    if not path.is_file() or path.is_symlink():
         return False
     path.unlink()
     return True

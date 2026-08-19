@@ -1396,18 +1396,22 @@ def _prepare_maintained_cli(options: DeployOptions, commit: str) -> bool:
 
 
 def _clear_stale_supervisor_override(confirmed_commit: str) -> None:
-    """Clear the supervisor-runtime override when it matches the confirmed commit.
+    """Clear the supervisor-runtime override after a successful CLI activation.
 
-    After a normal deploy confirms the same commit the override was staged
-    for, the override is no longer needed and must be removed so future
-    upgrades do not pin an obsolete supervisor runtime.
+    The override is a temporary bootstrap pin: it directs the stable
+    ``lubko-supervisor`` launcher to a specific sealed runtime on the next
+    container restart.  Once any CLI activation succeeds, the override has
+    served its purpose and must be removed unconditionally — regardless of
+    whether the override target matches the newly confirmed commit — so a
+    stale override (e.g. staged for B, later activation moves to C) can
+    never pin an obsolete supervisor runtime on the next restart.
 
     Args:
         confirmed_commit: The newly confirmed commit that ``cli/current``
-            now selects.
+            now selects (used only for the deploy log entry).
     """
     override = supervise.read_supervisor_runtime_override()
-    if override is not None and override == confirmed_commit:
+    if override is not None:
         supervise.clear_supervisor_runtime_override()
         append_deploy_log(
             f"cleared supervisor-runtime override: commit {confirmed_commit} is now confirmed"
@@ -1427,8 +1431,10 @@ def _activate_maintained_cli(commit: str) -> bool:
     the pointer idempotently.
 
     When a supervisor-runtime override was staged by ``lubko-deploy bootstrap``
-    and the newly confirmed commit matches the override target, the override is
-    cleared so future upgrades do not pin an obsolete supervisor runtime.
+    and CLI activation succeeds, the override is unconditionally cleared so
+    future upgrades never pin an obsolete supervisor runtime — even when the
+    override target differs from the newly confirmed commit (e.g. bootstrap
+    staged B, later activation confirmed C).
 
     Args:
         commit: Exact commit to activate.

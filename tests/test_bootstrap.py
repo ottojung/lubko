@@ -136,6 +136,14 @@ def test_empty_file_returns_none() -> None:
     assert supervise.read_supervisor_runtime_override() is None
 
 
+def test_double_newline_rejected() -> None:
+    """40 hex with two trailing newlines is not a valid override."""
+    path = supervise.supervisor_runtime_override_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("a" * 40 + "\n\n", encoding="utf-8")
+    assert supervise.read_supervisor_runtime_override() is None
+
+
 def test_atomic_write_format() -> None:
     """write_supervisor_runtime_override produces exactly the expected format."""
     commit = "b" * 40
@@ -323,8 +331,91 @@ def test_supervisor_launcher_rejects_40hex_with_extra_newline(
 
 
 # ---------------------------------------------------------------------------
-# Missing or unwritable bin leaves no override
+# Override path type rejection: directory, dangling symlink, symlink-to-file
 # ---------------------------------------------------------------------------
+
+
+def test_supervisor_launcher_rejects_directory_override(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A directory at the override path fails closed instead of falling through."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    override_path = supervise.supervisor_runtime_override_path()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.mkdir()
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "is not a regular file" in proc.stderr
+
+
+def test_supervisor_launcher_rejects_dangling_symlink_override(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A dangling symlink at the override path fails closed."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    override_path = supervise.supervisor_runtime_override_path()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.symlink_to(tmp_path / "nonexistent-target")
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "is a symlink" in proc.stderr
+
+
+def test_supervisor_launcher_rejects_symlink_to_file_override(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A symlink to a regular file at the override path fails closed.
+
+    Symlink authority is rejected: only a plain regular file is trusted.
+    """
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    real_file = tmp_path / "real-override"
+    real_file.write_text("a" * 40 + "\n", encoding="utf-8")
+    override_path = supervise.supervisor_runtime_override_path()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.symlink_to(real_file)
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "is a symlink" in proc.stderr
 
 
 def test_missing_bin_dir_aborts_without_override(
@@ -703,3 +794,83 @@ def test_launcher_verification_fails_on_truncated_content(
 
     with pytest.raises(OSError, match="content mismatch"):
         lifecycle.install_supervisor_launcher(bin_home)
+
+
+# ---------------------------------------------------------------------------
+# Override-clearing regression: staged B → activate B with override present
+# → later activate C → override absent
+# ---------------------------------------------------------------------------
+
+
+def test_stale_override_cleared_on_later_activation(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bootstrap override for B is cleared when a later activation moves to C.
+
+    Regression: previously ``_clear_stale_supervisor_override`` only cleared
+    when ``override == confirmed_commit``.  If bootstrap staged override B,
+    activation moved current to B but the override survived an interruption,
+    and a later deploy confirmed C, the stale override B was never removed.
+    The next supervisor restart would then run the obsolete runtime B.
+
+    Proved through the real public ``deploy`` command pipeline: only external
+    boundaries (validation, worker spawn, DB check, supervisor request) are
+    mocked via string-name ``monkeypatch.setattr``; the real
+    ``_deploy_locked`` → ``_complete_deploy_handoff`` →
+    ``_activate_maintained_cli`` chain runs genuine production code including
+    override clearing.
+    """
+    repo, first, second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(lifecycle, "resolve_uv", lambda _uv: "uv")
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+
+    def fake_deploy_through_super(
+        _options: lifecycle.DeployOptions, commit: str
+    ) -> lifecycle.WorkerMeta:
+        return lifecycle.WorkerMeta(
+            schema_version=lifecycle.SCHEMA_VERSION,
+            state=lifecycle.STATE_RUNNING,
+            pid=999001,
+            pgid=999001,
+            sid=999001,
+            start_time_ticks=1000,
+            token=None,
+            repo=str(repo),
+            git_commit=commit,
+            worker_id="test-worker",
+            log_path="/dev/null",
+            started_at=0.0,
+            stopped_at=None,
+        )
+
+    # Mock external boundaries — module object + STRING attr name only.
+    monkeypatch.setattr(lifecycle, "_validate_and_prepare", lambda _opt: second)
+    monkeypatch.setattr(lifecycle, "_deploy_through_supervisor", fake_deploy_through_super)
+
+    deploy_ns = argparse.Namespace(
+        bootstrap=True,
+        repo=repo,
+        uv=None,
+        grace_seconds=5.0,
+        db_timeout=5.0,
+        lock_timeout=30.0,
+        validation_timeout=1200.0,
+        git_timeout=10.0,
+        cli_timeout=60.0,
+    )
+
+    # Stage override for first; current is first.
+    supervise.write_supervisor_runtime_override(first)
+    cli.set_current(first)
+    assert cli.current_commit() == first
+    assert supervise.read_supervisor_runtime_override() == first
+
+    # Deploy to second (C): real _deploy_locked → _complete_deploy_handoff →
+    # _activate_maintained_cli runs, which clears any stale override.
+    assert lifecycle.deploy_cmd(deploy_ns) == lifecycle.EXIT_OK
+    assert cli.current_commit() == second
+    assert supervise.read_supervisor_runtime_override() is None

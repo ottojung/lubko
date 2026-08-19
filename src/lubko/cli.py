@@ -780,7 +780,16 @@ OVERRIDE="$STATE/supervisor/supervisor-runtime"
 LINK="$STATE/cli/current"
 
 # --- resolve override or fall back to cli/current ---
-if [ -f "$OVERRIDE" ]; then
+if [ -L "$OVERRIDE" ]; then
+  printf '%s: supervisor-runtime override path is a symlink\\n' "$ENTRY" >&2
+  exit 1
+fi
+if [ -e "$OVERRIDE" ]; then
+  if [ ! -f "$OVERRIDE" ]; then
+    printf '%s: supervisor-runtime override path exists but is not a regular file\\n' \\
+      "$ENTRY" >&2
+    exit 1
+  fi
   # Portable size gate: exactly 41 bytes (40 hex + newline).
   _OVERRIDE_SIZE="$(wc -c < "$OVERRIDE" 2>/dev/null)" || {
     printf '%s: could not read supervisor-runtime override size\\n' "$ENTRY" >&2
