@@ -342,7 +342,7 @@ class SupervisorDaemon:
             self._write_status("starting")
             while not self._stopping:
                 try:
-                    self._tick(time.monotonic())
+                    self.reconcile(time.monotonic())
                 except Exception:
                     LOGGER.exception("supervisor tick failed; continuing")
                 self._write_status()
@@ -355,11 +355,13 @@ class SupervisorDaemon:
     # Tick / decision
     # ------------------------------------------------------------------
 
-    def _tick(self, now: float) -> None:
-        """Run one supervision decision.
+    def reconcile(self, now: float) -> None:
+        """Run one deterministic supervisor reconciliation cycle.
 
-        Args:
-            now: Monotonic time at the start of the turn.
+        Derives the intended action from durable mission/desired state,
+        handles crash recovery, retires stale children, and ensures the
+        correct worker is running.  Called once per poll interval from
+        :meth:`run`.
         """
         self._message = None
         desired = read_desired()
@@ -374,7 +376,14 @@ class SupervisorDaemon:
             self._apply_desired(desired)
             return
         if state.child is not None and not self._child_alive(state):
-            if state.intent != INTENT_RUN:
+            child_meta = _child_to_meta(state.child, _runtime_dir(state.commit))
+            if lifecycle.worker_alive(child_meta):
+                LOGGER.info(
+                    "worker pid=%d alive but reparented (not our direct child); "
+                    "proceeding to exact retirement",
+                    state.child.pid,
+                )
+            elif state.intent != INTENT_RUN:
                 self._clear_child(now)
             else:
                 self._handle_crash(state, now)
@@ -839,8 +848,7 @@ class SupervisorDaemon:
             LOGGER.info("retired worker child pid=%d", child.pid)
         else:
             LOGGER.error(
-                "could not confirm stop of worker pid %d; preserving child "
-                "identity for retry",
+                "could not confirm stop of worker pid %d; preserving child identity for retry",
                 child.pid,
             )
         return stopped
