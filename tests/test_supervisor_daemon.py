@@ -705,13 +705,63 @@ def test_crash_recovery_recovers_stale_job_without_reexecution(
     kill_job_group_if_any(jobs_db, job_id)
 
 
-def wait_for_replacement(old_pid: int) -> None:
+def wait_for_replacement(old_pid: int) -> int:
     """Wait until the daemon records a worker child different from ``old_pid``.
+
+    A single status read is taken per poll (via :func:`wait_until`) and the
+    exact observed replacement PID is captured and returned, so the caller
+    never re-reads a disagreeing snapshot.  The previous predicate read the
+    status twice (``worker_pid() is not None and worker_pid() != old_pid``);
+    those two reads are independent snapshots, so a multi-read TOCTOU in the
+    test harness is logically capable of making the predicate ``True`` while the
+    current child is ``None`` (because ``None != old_pid``), after which the
+    caller's separate :func:`worker_pid` read could observe ``None`` -- the
+    observed deployment symptom at line 731.  This helper removes the defect by
+    returning the one PID it matched.
 
     Args:
         old_pid: The previous worker child PID.
+
+    Returns:
+        The exact replacement worker PID recorded by the daemon.
     """
-    wait_until(lambda: worker_pid() is not None and worker_pid() != old_pid, timeout=30.0)
+    observed: list[int] = []
+
+    def _check() -> bool:
+        candidate = worker_pid()
+        if candidate is not None and candidate != old_pid:
+            observed.append(candidate)
+            return True
+        return False
+
+    wait_until(_check, timeout=30.0)
+    return observed[0]
+
+
+def test_wait_for_replacement_rejects_transient_none_and_returns_observed_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient ``None`` snapshot must not satisfy the helper.
+
+    The exact observed replacement PID must be returned to the caller.  The
+    helper observes one status snapshot per poll.  A ``None`` child (the
+    supervisor having cleared the previous child before respawning) is not a
+    replacement, so the helper must keep waiting; once a real replacement PID
+    appears it is returned exactly, with no separate re-read that could disagree.
+    """
+    old_pid = 4242
+    sequence = iter([old_pid, None, None, 9999, 9999])
+
+    def fake_worker_pid() -> int | None:
+        return next(sequence)
+
+    monkeypatch.setattr(
+        "tests.test_supervisor_daemon.worker_pid",
+        fake_worker_pid,
+    )
+    replacement = wait_for_replacement(old_pid)
+    assert replacement == 9999
+    assert replacement != old_pid
 
 
 def test_repeated_crashes_never_accumulate_workers(
@@ -726,10 +776,7 @@ def test_repeated_crashes_never_accumulate_workers(
         assert previous is not None
         for _ in range(3):
             os.killpg(previous, signal.SIGKILL)
-            wait_for_replacement(previous)
-            next_pid = worker_pid()
-            assert next_pid is not None
-            previous = next_pid
+            previous = wait_for_replacement(previous)
         status = supervise.read_status()
         assert status is not None
         assert status.restart_count >= 1
