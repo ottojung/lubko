@@ -342,7 +342,7 @@ class SupervisorDaemon:
             self._write_status("starting")
             while not self._stopping:
                 try:
-                    self._tick(time.monotonic())
+                    self.reconcile(time.monotonic())
                 except Exception:
                     LOGGER.exception("supervisor tick failed; continuing")
                 self._write_status()
@@ -355,11 +355,13 @@ class SupervisorDaemon:
     # Tick / decision
     # ------------------------------------------------------------------
 
-    def _tick(self, now: float) -> None:
-        """Run one supervision decision.
+    def reconcile(self, now: float) -> None:
+        """Run one deterministic supervisor reconciliation cycle.
 
-        Args:
-            now: Monotonic time at the start of the turn.
+        Derives the intended action from durable mission/desired state,
+        handles crash recovery, retires stale children, and ensures the
+        correct worker is running.  Called once per poll interval from
+        :meth:`run`.
         """
         self._message = None
         desired = read_desired()
@@ -374,7 +376,14 @@ class SupervisorDaemon:
             self._apply_desired(desired)
             return
         if state.child is not None and not self._child_alive(state):
-            if state.intent != INTENT_RUN:
+            child_meta = _child_to_meta(state.child, _runtime_dir(state.commit))
+            if lifecycle.worker_alive(child_meta):
+                LOGGER.info(
+                    "worker pid=%d alive but reparented (not our direct child); "
+                    "proceeding to exact retirement",
+                    state.child.pid,
+                )
+            elif state.intent != INTENT_RUN:
                 self._clear_child(now)
             else:
                 self._handle_crash(state, now)
@@ -618,8 +627,23 @@ class SupervisorDaemon:
         state = read_state()
         if state.child is not None and self._child_alive(state) and state.commit == commit:
             return
-        if state.child is not None:
-            self._retire_child()
+        if state.child is not None and not self._retire_child():
+            now = time.monotonic()
+            write_state(
+                replace(
+                    read_state(),
+                    next_attempt_at=now + self._backoff_seconds(read_state().restart_count),
+                )
+            )
+            self._message = (
+                f"could not stop recorded worker pid {state.child.pid}; "
+                "holding without starting a worker"
+            )
+            LOGGER.error(
+                "could not stop recorded worker pid %d; holding",
+                state.child.pid,
+            )
+            return
         state = read_state()
         meta = lifecycle.read_meta()
         if meta is not None and lifecycle.worker_alive(meta):
@@ -794,25 +818,40 @@ class SupervisorDaemon:
             reason,
         )
 
-    def _retire_child(self) -> None:
-        """Stop the current worker child by exact identity and forget it.
+    def _retire_child(self) -> bool:
+        """Stop the current worker child by exact identity.
 
-        The child is never restarted after retirement: the caller has decided
-        the transition was intentional.
+        ``stop_worker`` performs full identity verification (PID, start-time
+        ticks, PGID, SID, lifecycle token) before signalling so a reparented
+        or reused PID is never mis-signalled.
+
+        When the stop cannot be confirmed the durable child identity is
+        preserved so the next daemon tick can retry the same exact orphan
+        rather than losing track of it and spawning a duplicate consumer.
+
+        Returns:
+            ``True`` when the child was successfully retired (or was already
+            dead); ``False`` when the stop could not be confirmed.
         """
         state = read_state()
         child = state.child
         if child is None:
-            return
-        if self._child_alive(state):
-            meta = _child_to_meta(child, _runtime_dir(state.commit))
-            lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
+            return True
+        meta = _child_to_meta(child, _runtime_dir(state.commit))
+        stopped = lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
         if self.proc is not None:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
             self.proc = None
-        write_state(replace(state, child=None))
-        LOGGER.info("retired worker child pid=%d", child.pid)
+        if stopped:
+            write_state(replace(state, child=None))
+            LOGGER.info("retired worker child pid=%d", child.pid)
+        else:
+            LOGGER.error(
+                "could not confirm stop of worker pid %d; preserving child identity for retry",
+                child.pid,
+            )
+        return stopped
 
     def _clear_child(self, _now: float) -> None:
         """Forget a child that exited after an intentional retirement.
