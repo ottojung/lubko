@@ -542,9 +542,16 @@ def remove_durable(path: Path) -> None:
     destination = Path(path)
     # Snapshot the prior bytes of an existing regular file so a failed
     # confirmation can best-effort restore the authority instead of silently
-    # losing it.  Symlinks and missing entries have no prior bytes to keep.
+    # losing it.  The check is lstat-safe: ``is_file()`` follows symlinks, so a
+    # symlink (for example the unconfirmed first-write pointer neutralized by
+    # ``write_symlink_durable``) must NOT be treated as a regular file holding
+    # its target's bytes — restoring those bytes would turn the pointer path
+    # into a regular file.  Snapshot only a true regular file that is not a
+    # symlink; symlinks and missing entries have no prior bytes to keep.
     previous = (
-        destination.read_bytes() if (destination.exists() and destination.is_file()) else None
+        destination.read_bytes()
+        if (destination.exists() and destination.is_file() and not destination.is_symlink())
+        else None
     )
     try:
         destination.unlink(missing_ok=True)

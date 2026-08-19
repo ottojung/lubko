@@ -628,6 +628,30 @@ def test_write_symlink_persistent_dir_fsync_failure_terminates_without_recursion
     assert _temp_artifacts(tmp_path) == []
 
 
+def test_write_symlink_first_write_dir_fsync_never_materializes_target_bytes(
+    tmp_path: Path,
+) -> None:
+    """An unconfirmed first symlink must not become a regular target file.
+
+    The pointer is a symlink whose final directory fsync fails, so
+    ``write_symlink_durable`` neutralizes it via ``remove_durable``.  The
+    neutralization's byte snapshot must be lstat-safe: an existing regular
+    target must NOT be read into the pointer, or the pointer path would be
+    turned into a regular file holding the target string.  The operation must
+    raise and the pointer path must not exist as a regular file afterwards.
+    """
+    target = tmp_path / "real-target"
+    target.write_bytes(b"REAL-TARGET-BYTES")
+    path = tmp_path / "current"
+    _raise_at(FSYNC_STAGE_DIR)
+    with pytest.raises(DurabilityError):
+        write_symlink_durable(path, "real-target")
+    # The unconfirmed pointer is neutralized; it must never be materialized as
+    # a regular file containing the target's bytes.
+    assert not path.exists()
+    assert not path.is_file()
+
+
 def test_remove_durable_one_shot_dir_fsync_restores_previous_and_raises(tmp_path: Path) -> None:
     """A removal dir-fsync failure must restore prior bytes and still raise.
 
