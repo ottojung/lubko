@@ -31,6 +31,7 @@ from lubko.lifecycle import (
 )
 from lubko.state import rollback_state_path
 from lubko.worker import JOB_ID_ENV, delete_job_and_chunks, request_cancel
+from tests import _isolation as isolation
 from tests import _pg
 from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
@@ -642,6 +643,46 @@ def test_deploy_verification_failure_preserves_worker(
         current = lifecycle.read_meta()
         assert current is not None
         assert current.pid == old.pid
+    finally:
+        kill_proc(old)
+        kill_many(spawned)
+
+
+def test_deploy_failure_teardown_cannot_leak_or_reparent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed-deploy candidate is fully reaped; ambient sentinel is untouched.
+
+    Proves that when a gated candidate fails verification (postgres check
+    fails), every test-owned process is terminated and reaped — no zombie
+    remains and no process reparents to PID 1 — while the ambient production
+    sentinel process is never touched.
+    """
+    spawned: list[subprocess.Popen[bytes]] = []
+    old = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(old, tmp_path))
+        spawned = patch_deploy(monkeypatch, postgres_ok=False)
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_ERROR
+        assert len(spawned) == 1
+
+        candidate = spawned[0]
+        # poll() reaps the waitpid entry; after that /proc must be gone.
+        assert candidate.poll() is not None
+        assert not Path(f"/proc/{candidate.pid}").exists(), (
+            f"candidate {candidate.pid} was not fully reaped"
+        )
+
+        # Old worker still alive and recorded.
+        assert old.poll() is None
+        current = lifecycle.read_meta()
+        assert current is not None
+        assert lifecycle.worker_alive(current)
+
+        # Ambient sentinel untouched.
+        assert isolation.ambient_sentinel_alive()
     finally:
         kill_proc(old)
         kill_many(spawned)
