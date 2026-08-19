@@ -11,7 +11,7 @@ from typing import Final
 
 import pytest
 
-from lubko import cli
+from lubko import cli, supervise
 from lubko.state import cli_root_dir, state_root
 
 GIT_AUTHOR: Final = "lubko-test"
@@ -618,3 +618,125 @@ def _run_launcher(path: Path) -> str:
     """
     proc = subprocess.run([str(path)], capture_output=True, text=True, check=True)
     return proc.stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# Shell syntax and supervisor-launcher execution regressions
+# ---------------------------------------------------------------------------
+
+
+def test_launcher_shell_syntax_valid() -> None:
+    """Every launcher source passes ``sh -n`` syntax validation."""
+    for entry in ENTRY_POINTS:
+        src = cli.launcher_source(entry)
+        proc = subprocess.run(
+            ["/bin/sh", "-n"],
+            input=src,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"{entry} failed sh -n: {proc.stderr}"
+
+
+def test_supervisor_launcher_rejects_corrupt_override(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Corrupt readable override content reaches the invalid-format branch."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    override_path = supervise.supervisor_runtime_override_path()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_text("not-a-valid-commit\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "not a valid 40-hex commit" in proc.stderr
+
+
+def test_supervisor_launcher_rejects_40hex_without_newline(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """40 hex characters without a trailing newline (40 bytes) are rejected."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    override_path = supervise.supervisor_runtime_override_path()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_text("a" * 40, encoding="utf-8")
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "not a valid 40-hex commit" in proc.stderr
+
+
+def test_supervisor_launcher_rejects_40hex_with_extra_newline(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """40 hex characters with two trailing newlines (42 bytes) are rejected."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    override_path = supervise.supervisor_runtime_override_path()
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_text("a" * 40 + "\n\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "not a valid 40-hex commit" in proc.stderr
+
+
+def test_supervisor_launcher_valid_override_falls_through_to_missing_runtime(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Valid 40hex+newline pointing to a missing runtime reports the specific error."""
+    repo, first, _second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    bin_dir = tmp_path / "bin"
+    cli.install_launchers(bin_dir)
+
+    nonexistent = "0" * 40
+    supervise.write_supervisor_runtime_override(nonexistent)
+
+    proc = subprocess.run(
+        [str(bin_dir / "lubko-supervisor")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "has no runtime dir" in proc.stderr
