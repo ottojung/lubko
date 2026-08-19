@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 from unittest.mock import PropertyMock, patch
@@ -27,6 +28,7 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 
+from lubko import worker as worker_module
 from lubko.config import DatabaseConfig
 from lubko.protocol import OUTPUT_CHUNK_MAX_BYTES
 from lubko.worker import (
@@ -885,6 +887,121 @@ def _all_leases_advance(job_ids: list[UUID], first: dict[UUID, str], conninfo: s
         ``True`` when every lease advanced.
     """
     return all(read_root(conninfo, j)["state"]["lease_expires_at"] > first[j] for j in job_ids)
+
+
+def test_lease_heartbeats_two_jobs_but_not_an_orphaned_owned_row(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scoped heartbeat keeps two active jobs fresh but not an orphan owned row.
+
+    Issue #74: a claimed job whose immediate finalization write failed (or any
+    running row the worker does not locally track) must never be heartbeated
+    merely because two other jobs are active.  The bulk heartbeat refreshes
+    exactly the two locally-owned active jobs; the orphan's lease is left
+    untouched and is allowed to expire for safe recovery.
+    """
+    incarnation = "issue-74-incarnation"
+    monkeypatch.setenv("LUBKO_LIFECYCLE_TOKEN", incarnation)
+    settings = supervisor_settings(worker_id="issue-74-worker")
+    db = make_database_config(pg_cluster)
+
+    active_ids = [insert_job(jobs_db, str(tmp_path), "sleep 30") for _ in range(2)]
+
+    with supervisor_running(settings, db, jobs_db):
+        wait_until(lambda: all(read_status(jobs_db, j) == "running" for j in active_ids))
+        # An owned running row the worker never locally tracked (simulating a
+        # claimed job whose immediate finalization write failed before the
+        # worker recorded it).
+        orphan = _insert_owned_running_row(
+            jobs_db,
+            settings.worker_id,
+            settings.worker_incarnation,
+            settings.lease_duration_seconds,
+        )
+        first_active = {j: read_root(jobs_db, j)["state"]["lease_expires_at"] for j in active_ids}
+        orphan_first = read_root(jobs_db, orphan)["state"]["lease_expires_at"]
+        wait_until(
+            lambda: all(
+                read_root(jobs_db, j)["state"]["lease_expires_at"] > first_active[j]
+                for j in active_ids
+            )
+        )
+        # The two active jobs keep their leases fresh (multi-job efficiency).
+        for j in active_ids:
+            assert read_root(jobs_db, j)["state"]["lease_expires_at"] > first_active[j]
+        # The orphan is NOT heartbeated merely because the others are active.
+        assert read_root(jobs_db, orphan)["state"]["lease_expires_at"] == orphan_first
+
+
+def test_processless_claimed_job_terminal_write_fails_is_not_reexecuted(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A processless claimed job whose immediate terminal write fails is terminalized.
+
+    Issue #74: a job that cannot spawn (processless) and whose immediate
+    finalization write fails must be handled locally — terminalized via the
+    quarantine path, never re-executed, and never heartbeated merely because
+    another job is active.  A genuinely active job keeps heartbeating alongside.
+    """
+
+    def _fail_finish(_conn: object, _job_id: object, _result: object) -> str:
+        msg = "simulated deterministic finalization failure"
+        raise psycopg.DataError(msg)
+
+    monkeypatch.setattr(worker_module, "finish_job", _fail_finish)
+
+    active_id = insert_job(jobs_db, str(tmp_path), "sleep 30")
+    # A processless claimed job: the executable does not exist, so spawn fails
+    # and the supervisor reaches the immediate-finalization path.
+    processless_id = insert_process_job(jobs_db, str(tmp_path), ["/nonexistent/lubko-no-such-bin"])
+
+    settings = supervisor_settings()
+    db = make_database_config(pg_cluster)
+    with supervisor_running(settings, db, jobs_db):
+        wait_until(lambda: read_status(jobs_db, active_id) == "running")
+        # The processless job must become terminal without ever running.
+        wait_until(lambda: read_status(jobs_db, processless_id) in {"failed", "cancelled"})
+        # The genuinely active job keeps its lease fresh (multi-job efficiency).
+        first = read_root(jobs_db, active_id)["state"]["lease_expires_at"]
+        wait_until(lambda: read_root(jobs_db, active_id)["state"]["lease_expires_at"] > first)
+        assert read_status(jobs_db, active_id) == "running"
+        assert read_status(jobs_db, processless_id) == "failed"
+
+
+def _insert_owned_running_row(
+    conninfo: str, worker_id: str, incarnation: str, lease_seconds: float
+) -> UUID:
+    """Insert a running command row owned by the given worker, with a future lease.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        worker_id: Owning worker identifier.
+        incarnation: Owning worker incarnation.
+        lease_seconds: Seconds until the lease expires (kept in the future so
+            the recovery pass does not reclaim it during the test window).
+
+    Returns:
+        The inserted job identifier.
+    """
+    job_id = uuid4()
+    lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
+    payload = json.dumps({
+        "v": 3,
+        "type": "command",
+        "request": {"cwd": "/workspace", "process": ["sleep", "30"]},
+        "state": {
+            "status": "running",
+            "worker_id": worker_id,
+            "worker_incarnation": incarnation,
+            "lease_expires_at": lease,
+        },
+    })
+    with psycopg.connect(conninfo) as conn:
+        conn.execute(
+            "INSERT INTO lubko.jobs (id, payload) VALUES (%s, %s)",
+            (job_id, payload),
+        )
+    return job_id
 
 
 def test_output_tail_bounded_with_immutable_chunks(

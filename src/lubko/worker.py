@@ -92,6 +92,7 @@ from lubko.protocol import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
     from uuid import UUID
 
     from lubko.config import DatabaseConfig
@@ -290,6 +291,20 @@ class ActiveJob:
     quarantine_retries: int = 0
     quarantine_next_retry_at: float = 0.0
     last_heartbeat_at: float = 0.0
+
+
+@dataclass(slots=True)
+class _RetryTerminalization:
+    """Backoff bookkeeping for a job awaiting terminalization retry.
+
+    A claimed job whose immediate finalization write failed is kept locally
+    owned for retry so it stays represented (and its lease is kept alive by the
+    scoped heartbeat) instead of being heartbeated merely because an unrelated
+    job happens to be active, or silently dropped as an orphan.
+    """
+
+    retries: int = 0
+    next_retry_at: float = 0.0
 
 
 class SchemaInvariantError(RuntimeError):
@@ -1243,16 +1258,25 @@ def request_cancel(conn: JobsConnection, job_id: UUID) -> str:
     return str(row[0])
 
 
-def bulk_refresh_leases(conn: JobsConnection, settings: Settings) -> list[UUID]:
-    """Refresh the lease of every running command row owned by this worker.
+def bulk_refresh_leases(
+    conn: JobsConnection, settings: Settings, root_ids: Collection[UUID]
+) -> list[UUID]:
+    """Refresh the lease of the given owned running command rows.
 
-    One statement updates all owned running command rows in a single atomic
-    JSON compare-and-swap, keeping heartbeats efficient under many concurrent
-    jobs.
+    One statement updates only the explicitly listed root IDs in a single
+    atomic JSON compare-and-swap, keeping heartbeats efficient under many
+    concurrent jobs while never touching a row the worker does not locally own.
+    The caller is responsible for passing exactly the locally-owned active or
+    retry-owned root IDs; this scoping is what guarantees an orphaned owned row
+    (for example a claimed job whose immediate finalization write failed) is
+    never heartbeated merely because another job is active.
 
     Args:
         conn: Open PostgreSQL connection.
         settings: Worker runtime settings.
+        root_ids: The exact root IDs whose lease should be refreshed. Rows whose
+            ID is not in this collection are left untouched even if they are
+            owned by this worker.
 
     Returns:
         The IDs of the rows whose lease was refreshed.
@@ -1272,11 +1296,13 @@ def bulk_refresh_leases(conn: JobsConnection, settings: Settings) -> list[UUID]:
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
             "    AND (payload::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"
             "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"
+            "    AND id = ANY(%(root_ids)s)\n"
             "RETURNING id\n",
             {
                 "lease_duration_seconds": settings.lease_duration_seconds,
                 "worker_id": settings.worker_id,
                 "worker_incarnation": settings.worker_incarnation,
+                "root_ids": list(root_ids),
             },
         )
         rows = cursor.fetchall()
@@ -1888,6 +1914,7 @@ class Supervisor:
         self.settings = settings
         self.database = database
         self.active: dict[UUID, ActiveJob] = {}
+        self._retry_terminations: dict[UUID, _RetryTerminalization] = {}
         self.conn: JobsConnection | None = None
         self._stopping = False
         self._next_recovery_at = 0.0
@@ -2003,6 +2030,7 @@ class Supervisor:
             )
         self._publish_all(now)
         self._finalize_completed()
+        self._retry_terminalizations()
         if now >= self._next_gc_at:
             self._run_gc()
             self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
@@ -2066,24 +2094,83 @@ class Supervisor:
                 orphans,
             )
 
+    def _heartbeat_root_ids(self) -> set[UUID]:
+        """Return the root IDs whose lease is refreshed this turn.
+
+        Only explicitly locally-owned running or completed-but-not-finalized
+        jobs tracked in the active registry are eligible.  This is what prevents
+        an orphaned owned row (for example a claimed job whose immediate
+        finalization write failed and which is not locally tracked) from being
+        heartbeated merely because another job is active.  Retry-owned jobs are
+        kept alive by a separate terminalization-retry mechanism, never by the
+        heartbeat, so they are free to expire and be safely recovered.
+
+        Returns:
+            The set of root IDs to refresh.
+        """
+        return {
+            job.id
+            for job in self.active.values()
+            if not job.finalized
+            and not job.quarantined
+            and not job.row_lost
+            and not job.lease_evicted
+        }
+
     def _refresh_leases(self) -> None:
-        """Refresh every owned running lease in one bulk statement."""
+        """Refresh only the locally-owned active leases in one bulk statement."""
         conn = self.conn
         if conn is None:
             return
-        refreshed = set(bulk_refresh_leases(conn, self.settings))
         now = time.monotonic()
+        eligible = self._heartbeat_root_ids()
+        refreshed = set(bulk_refresh_leases(conn, self.settings, eligible))
         for job_id, job in list(self.active.items()):
-            if job.finalized:
+            if job.finalized or job.quarantined or job.row_lost or job.lease_evicted:
                 continue
             if job_id in refreshed:
                 job.last_heartbeat_at = now
-            elif not job.completed:
+            else:
                 # The row is no longer running (for example it was recovered by
                 # another worker): never let the live process continue.
                 LOGGER.warning("job %s is no longer running in the database; stopping it", job_id)
                 job.row_lost = True
                 request_stop(job, STOP_REASON_ROW_LOST)
+
+    def _retry_terminalizations(self) -> None:
+        """Retry the terminalization writes for jobs whose immediate finalization failed.
+
+        A claimed job whose immediate finalization DB write failed is kept
+        locally owned here so it remains represented for retry.  Its lease is
+        intentionally NOT refreshed: the row is left free to expire and be
+        safely recovered as failed (no uncertain re-execution) while this
+        mechanism races to terminalize it directly.  The terminalization is
+        retried
+        with exponential backoff; if every attempt fails the supervisor stops
+        for external recovery rather than retrying forever at process-poll rate.
+        """
+        conn = self.conn
+        if conn is None or not self._retry_terminations:
+            return
+        now = time.monotonic()
+        for job_id in list(self._retry_terminations):
+            state = self._retry_terminations[job_id]
+            if now < state.next_retry_at:
+                continue
+            if state.retries >= QUARANTINE_MAX_RETRIES:
+                LOGGER.critical(
+                    "terminalization retry for job %s failed after %d retries; "
+                    "stopping supervisor for external recovery",
+                    job_id,
+                    state.retries,
+                )
+                self._stopping = True
+                return
+            if _quarantine_job(conn, job_id, f"retry terminalization for {job_id}"):
+                self._retry_terminations.pop(job_id, None)
+            else:
+                state.retries += 1
+                state.next_retry_at = now + QUARANTINE_RETRY_BASE_SECONDS * (2**state.retries)
 
     def _discover_cancellations(self) -> None:
         """Terminate any owned running job whose cancellation marker was set."""
@@ -2481,7 +2568,13 @@ class Supervisor:
                 job_id,
                 exc.sqlstate or "N/A",
             )
-            _quarantine_job(conn, job_id, f"immediate finalization error: {exc}")
+            if not _quarantine_job(conn, job_id, f"immediate finalization error: {exc}"):
+                # Both the finalization and the quarantine terminalization writes
+                # failed: keep the claimed job locally owned for retry so it stays
+                # represented (and its lease is kept alive) rather than being
+                # heartbeated merely because another job is active or silently
+                # orphaned.
+                self._retry_terminations.setdefault(job_id, _RetryTerminalization())
 
     def _enforce_lease_safety(self) -> None:
         """Terminate owned groups whose lease can no longer be refreshed in time.
