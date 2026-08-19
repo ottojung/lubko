@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 Meta = dict[str, Any]
 
 # Implementation details (hidden from the user-facing interface).
-DEFAULT_MODEL: Final = "opencode-go/mimo-v2.5"
+DEFAULT_MODEL: Final = "opencode-go/muse-spark-1.2-contributor"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
