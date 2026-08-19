@@ -48,6 +48,7 @@ from lubko.worker import (
     pg_safe_decode,
     publish_output,
     request_cancel,
+    spawn_job,
     verify_jobs_table_invariant,
     verify_protocol_schema,
 )
@@ -56,7 +57,7 @@ from tests import _process_guard as guard
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from lubko.worker import JobResult, JobsConnection
+    from lubko.worker import Job, JobResult, JobsConnection
     from tests import _pg
 
 OUTPUT_TAIL_MAX_BYTES: Final = 4000
@@ -1563,6 +1564,269 @@ def _terminal_or_failed(conninfo: str, job_id: UUID) -> bool:
         ``True`` when terminal.
     """
     return read_status(conninfo, job_id) not in {"pending", "running"}
+
+
+def _parse_iso_utc(value: str) -> float:
+    """Parse a UTC ISO-8601 timestamp into a POSIX (wall-clock) float.
+
+    Args:
+        value: Timestamp such as ``2026-08-15T23:31:06.123456Z``.
+
+    Returns:
+        Seconds since the POSIX epoch (UTC).
+    """
+    stamp = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+    return stamp.timestamp()
+
+
+def _wait_for_group_death(pgid: int, timeout: float = 15.0) -> float:
+    """Return the monotonic time at which a process group first becomes empty.
+
+    Args:
+        pgid: Process group identifier to watch.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        The monotonic time the group was observed empty.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not group_has_members(pgid):
+            return time.monotonic()
+        time.sleep(0.02)
+    msg = f"process group {pgid} never died within {timeout}s"
+    pytest.fail(msg)
+
+
+def _wait_until_status(conninfo: str, job_id: UUID, status: str, timeout: float = 15.0) -> float:
+    """Return the monotonic time at which a job first reaches ``status``.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        job_id: Job to watch.
+        status: Target status.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        The monotonic time the status was observed.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if read_status(conninfo, job_id) == status:
+            return time.monotonic()
+        time.sleep(0.02)
+    msg = f"job {job_id} never reached status {status!r} within {timeout}s"
+    pytest.fail(msg)
+
+
+def _lease_db_expiry_mono(conninfo: str, job_id: UUID) -> float:
+    """Return the monotonic time at which a job's database lease becomes stale.
+
+    Args:
+        conninfo: PostgreSQL connection string.
+        job_id: Job whose ``state.lease_expires_at`` to read.
+
+    Returns:
+        The monotonic instant the committed database lease expires.
+    """
+    payload = read_root(conninfo, job_id)
+    wall_expiry = _parse_iso_utc(payload["state"]["lease_expires_at"])
+    return time.monotonic() + (wall_expiry - time.time())
+
+
+def _recover_abandoned_jobs(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    settings: Settings,
+    job_ids: list[UUID],
+    deaths: list[float],
+) -> None:
+    """Run a second recovery worker and assert it never overlaps the originals.
+
+    A legitimate stale recovery of the abandoned jobs must only run after every
+    original process group is already dead; this asserts the recovered status
+    appears strictly after each observed group death.
+
+    Args:
+        jobs_db: Connection string for leftover cleanup.
+        pg_cluster: The isolated PostgreSQL cluster (already restarted by the
+            caller's teardown so a second worker can connect).
+        settings: Original supervisor settings (worker id is overridden).
+        job_ids: Abandoned job identifiers, in death order.
+        deaths: Monotonic death times matching ``job_ids``.
+    """
+    recovery_settings = replace(settings, worker_id="recovery", lease_recovery_interval_seconds=0.1)
+    recovery = Supervisor(recovery_settings, make_database_config(pg_cluster))
+    rthread = threading.Thread(target=recovery.run, daemon=True)
+    rthread.start()
+    try:
+        for job_id, death in zip(job_ids, deaths, strict=True):
+            recovery_time = _wait_until_status(jobs_db, job_id, "failed", timeout=15.0)
+            assert death < recovery_time
+            assert read_status(jobs_db, job_id) == "failed"
+    finally:
+        recovery.request_shutdown()
+        rthread.join(timeout=30)
+        with suppress(Exception):
+            pg_cluster.start()
+        _kill_leftover_groups(jobs_db)
+
+
+def test_lease_safety_deadline_bound_to_claim_grant_across_batch(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #78: the lease deadline is bound to the committed claim grant.
+
+    Two jobs are claimed in ONE batch (a single grant), so they share the same
+    committed claim monotonic origin. The first starts immediately; the later
+    job's spawn is deliberately delayed after the same grant. With the database
+    taken out before any post-spawn refresh, the claim grant is the only lease
+    event. The local lease-safety deadline of BOTH jobs is anchored to the
+    shared claim origin, so the claim-to-spawn delay consumed lease budget: the
+    later process dies before the actual database lease stale boundary, and a
+    second recovery worker only legitimately recovers the abandoned jobs AFTER
+    every original process is already dead (recovery never overlaps).
+
+    The contrast assertion that the later process dies earlier than a
+    spawn-anchored deadline is the mutation guard for the original post-spawn
+    bug: under that (pre-fix) behaviour the delayed job would outlive its
+    database lease.
+    """
+    first_id = insert_job(jobs_db, str(tmp_path), "sleep 100")
+    later_id = insert_job(jobs_db, str(tmp_path), "sleep 100")
+    captured: dict[str, object] = {}
+    first_spawned = threading.Event()
+    later_spawned = threading.Event()
+
+    def delayed_spawn(spec: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
+        if spec.id == later_id:
+            time.sleep(1.0)
+            captured["later_spawn_mono"] = time.monotonic()
+        result = spawn_job(spec)
+        if spec.id == first_id:
+            captured["first_pgid"] = result[3]
+            first_spawned.set()
+        else:
+            captured["later_pgid"] = result[3]
+            later_spawned.set()
+        return result
+
+    monkeypatch.setattr(worker_module, "spawn_job", delayed_spawn)
+    settings = Settings(
+        worker_id="orig",
+        poll_interval_seconds=0.05,
+        process_poll_interval_seconds=0.05,
+        cancel_grace_seconds=0.05,
+        lease_duration_seconds=2.0,
+        lease_refresh_interval_seconds=1.8,  # only the early pre-spawn refresh fires
+        lease_recovery_interval_seconds=5.0,
+        output_publication_interval_seconds=0.1,
+        claim_batch_limit=16,
+        lease_safety_margin_seconds=0.3,
+        db_operation_timeout_seconds=3.0,
+    )
+    supervisor = Supervisor(settings, make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    thread.start()
+    first_death = later_death = 0.0
+    try:
+        wait_until(lambda: read_status(jobs_db, first_id) == "running")
+        wait_until(lambda: read_status(jobs_db, later_id) == "running")
+        db_expiry = _lease_db_expiry_mono(jobs_db, later_id)
+        # Both jobs are claimed in ONE batch, so they share the same committed
+        # grant and therefore an identical database lease expiry.
+        first_expiry = _parse_iso_utc(read_root(jobs_db, first_id)["state"]["lease_expires_at"])
+        later_expiry = _parse_iso_utc(read_root(jobs_db, later_id)["state"]["lease_expires_at"])
+        assert first_expiry == later_expiry
+        assert first_spawned.wait(timeout=15.0)
+        assert later_spawned.wait(timeout=15.0)
+        pg_cluster.stop()
+        # Wait for the supervisor to actually enter the outage path before the
+        # lease-safety deadline can evict the groups.
+        wait_until(lambda: supervisor.conn is None, timeout=10.0)
+        first_death = _wait_for_group_death(cast("int", captured["first_pgid"]), timeout=15.0)
+        later_death = _wait_for_group_death(cast("int", captured["later_pgid"]), timeout=15.0)
+        # Both processes are evicted by the deadline derived from the shared
+        # claim origin, which is at most the database lease stale boundary.
+        assert first_death <= db_expiry + 0.5
+        assert later_death <= db_expiry + 0.5
+        # Mutation guard: the claim-to-spawn delay consumed lease budget, so the
+        # later job dies strictly before the deadline it would have had if
+        # anchored to its (later) spawn time. Under that pre-fix behaviour the
+        # delayed job would outlive its database lease.
+        assert later_death < (
+            cast("float", captured["later_spawn_mono"])
+            + settings.lease_duration_seconds
+            - settings.lease_safety_margin_seconds
+        )
+        assert not group_has_members(cast("int", captured["first_pgid"]))
+        assert not group_has_members(cast("int", captured["later_pgid"]))
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        with suppress(Exception):
+            pg_cluster.start()
+    _recover_abandoned_jobs(
+        jobs_db, pg_cluster, settings, [first_id, later_id], [first_death, later_death]
+    )
+
+
+def test_heartbeat_advances_lease_deadline_only_after_commit(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """Issue #78: the local deadline advances only after a committed refresh.
+
+    Through the real production refresh path (a live Supervisor over real
+    PostgreSQL) a committed bulk heartbeat advances the local lease-safety
+    deadline, anchored to a conservative monotonic origin captured before the
+    operation.  When the database is taken out so refresh transactions fail to
+    commit, the local deadline does NOT advance: a missed heartbeat can never
+    silently extend a job's safe lifetime.
+    """
+    job_id = insert_job(jobs_db, str(tmp_path), "sleep 30")
+    settings = replace(
+        supervisor_settings(),
+        lease_duration_seconds=8.0,
+        lease_safety_margin_seconds=0.5,
+    )
+    supervisor = Supervisor(settings, make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    thread.start()
+    try:
+        wait_until(lambda: read_status(jobs_db, job_id) == "running")
+        wait_until(lambda: job_id in supervisor.active)
+        job = supervisor.active[job_id]
+
+        # Committed refresh advances the local deadline.
+        before = job.last_heartbeat_at
+        wait_until(lambda: job.last_heartbeat_at > before, timeout=5.0)
+        advanced = job.last_heartbeat_at
+        assert advanced > before
+        # Anchored to a conservative origin: not in the distant future.
+        assert advanced <= time.monotonic() + 0.5
+
+        # Failed/connectivity path: the database is taken out, every attempted
+        # refresh fails to commit, and the local deadline must stay frozen.
+        pg_cluster.stop()
+        frozen = job.last_heartbeat_at
+        time.sleep(1.0)  # several failed refresh attempts
+        assert abs(job.last_heartbeat_at - frozen) < 1e-9
+
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    finally:
+        if thread.is_alive():
+            supervisor.request_shutdown()
+            thread.join(timeout=30)
+        with suppress(Exception):
+            pg_cluster.start()
+        _kill_leftover_groups(jobs_db)
 
 
 def test_graceful_shutdown_terminates_and_reaps_all_process_groups(

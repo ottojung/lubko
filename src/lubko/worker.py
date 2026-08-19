@@ -290,6 +290,10 @@ class ActiveJob:
     quarantine_pending: bool = False
     quarantine_retries: int = 0
     quarantine_next_retry_at: float = 0.0
+    # Conservative monotonic origin of the last committed lease event (the claim
+    # grant or a bulk refresh), captured before that database operation, never
+    # at commit time and never at spawn. Drives lease-safety eviction so a
+    # process can never outlive its database lease.
     last_heartbeat_at: float = 0.0
 
 
@@ -1310,6 +1314,45 @@ def bulk_refresh_leases(
     return [row[0] for row in rows]
 
 
+def apply_lease_refresh(
+    active: dict[UUID, ActiveJob],
+    refreshed: set[UUID],
+    refresh_mono: float,
+) -> None:
+    """Advance the local lease deadline only for rows whose refresh committed.
+
+    The local lease-safety deadline is advanced exclusively for the job
+    identifiers returned by a *committed* bulk refresh, and it is anchored to
+    ``refresh_mono`` (the monotonic time captured before the refresh database
+    operation, never at commit time) so the deadline never exceeds the database
+    lease.  A refresh that fails to commit never yields a refreshed set, so
+    this function is never invoked with one and a missed heartbeat can never
+    silently extend a job's safe lifetime.
+
+    Only locally-owned active jobs that were eligible for a heartbeat in the
+    first place are considered; quarantined, row-lost, lease-evicted, and
+    finalized jobs are intentionally skipped even when not in ``refreshed``,
+    because they were never part of the refresh and must not be stopped as if a
+    stale recovery had taken their row.
+
+    Args:
+        active: The supervisor's active job registry.
+        refreshed: Identifiers whose lease was refreshed and committed.
+        refresh_mono: Monotonic time captured before the refresh committed.
+    """
+    for job_id, job in list(active.items()):
+        if job.finalized or job.quarantined or job.row_lost or job.lease_evicted:
+            continue
+        if job_id in refreshed:
+            job.last_heartbeat_at = refresh_mono
+        else:
+            # The row is no longer running (for example it was recovered by
+            # another worker): never let the live process continue.
+            LOGGER.warning("job %s is no longer running in the database; stopping it", job_id)
+            job.row_lost = True
+            request_stop(job, STOP_REASON_ROW_LOST)
+
+
 def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUID]:
     """Find owned running command jobs that have a cancellation marker.
 
@@ -2120,24 +2163,26 @@ class Supervisor:
         }
 
     def _refresh_leases(self) -> None:
-        """Refresh only the locally-owned active leases in one bulk statement."""
+        """Refresh only the locally-owned active leases in one bulk statement.
+
+        The refresh origin is captured immediately before the refresh database
+        operation, never at commit time, so the local lease-safety deadline is
+        anchored to a conservative monotonic instant that cannot exceed the
+        database lease. Only the explicitly eligible locally-owned root IDs are
+        refreshed (see :meth:`_heartbeat_root_ids`), and the local deadline is
+        advanced exclusively for the identifiers actually returned by a
+        *committed* refresh. A refresh that fails to commit (for example a
+        connectivity error that escapes to outage handling) leaves
+        ``last_heartbeat_at`` untouched, so a missed heartbeat can never
+        silently extend a job's safe lifetime.
+        """
         conn = self.conn
         if conn is None:
             return
-        now = time.monotonic()
+        refresh_mono = time.monotonic()
         eligible = self._heartbeat_root_ids()
         refreshed = set(bulk_refresh_leases(conn, self.settings, eligible))
-        for job_id, job in list(self.active.items()):
-            if job.finalized or job.quarantined or job.row_lost or job.lease_evicted:
-                continue
-            if job_id in refreshed:
-                job.last_heartbeat_at = now
-            else:
-                # The row is no longer running (for example it was recovered by
-                # another worker): never let the live process continue.
-                LOGGER.warning("job %s is no longer running in the database; stopping it", job_id)
-                job.row_lost = True
-                request_stop(job, STOP_REASON_ROW_LOST)
+        apply_lease_refresh(self.active, refreshed, refresh_mono)
 
     def _retry_terminalizations(self) -> None:
         """Retry the terminalization writes for jobs whose immediate finalization failed.
@@ -2448,23 +2493,39 @@ class Supervisor:
         The batch size is a fairness bound on the amount of claiming work done
         in one turn; it is never a cap on the number of simultaneously active
         jobs.
+
+        The claim timestamp is captured immediately before the claim database
+        operation commits and threaded into every started job so the local
+        lease-safety deadline is bound to the committed lease grant, never to
+        the (possibly delayed) spawn. The claim-to-spawn delay therefore
+        consumes lease budget instead of extending it.
         """
         conn = self.conn
         if conn is None or self._stopping:
             return
+        claim_mono = time.monotonic()
         claimed = claim_jobs(conn, self.settings, self.settings.claim_batch_limit)
         for claimed_job in claimed:
-            self._start_job(claimed_job)
+            self._start_job(claimed_job, claim_mono)
 
-    def _start_job(self, claimed: ClaimedJob) -> None:
+    def _start_job(self, claimed: ClaimedJob, claim_mono: float) -> None:
         """Start one claimed job as a process group and register it.
 
         If the process cannot be started (for example because the operating
         system refused to spawn it), the job fails clearly and independently
         while the daemon stays alive to supervise the jobs that did start.
 
+        The local lease-safety deadline is anchored to ``claim_mono``: the
+        monotonic time captured immediately before the claim database operation
+        commits (never at commit time). Anchoring to the claim (rather than to
+        the spawn that follows it) means any delay between claiming and spawning
+        consumes lease budget and never creates extra lease time a recovery
+        worker could legitimately treat as live.
+
         Args:
             claimed: The claimed job.
+            claim_mono: Monotonic time captured immediately before the claim
+                database operation commits (never at commit time).
 
         Raises:
             psycopg.Error: When persisting the process identity fails with a
@@ -2526,7 +2587,7 @@ class Supervisor:
         )
         job.stdout = OutputStream(path=stdout_path)
         job.stderr = OutputStream(path=stderr_path)
-        job.last_heartbeat_at = time.monotonic()
+        job.last_heartbeat_at = claim_mono
         self.active[claimed.id] = job
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
         self._publish_health_force()
@@ -2582,9 +2643,11 @@ class Supervisor:
     def _enforce_lease_safety(self) -> None:
         """Terminate owned groups whose lease can no longer be refreshed in time.
 
-        The local lease deadline is derived from the last successful heartbeat
-        so the process group is terminated before its database lease can expire
-        and another worker could legitimately treat the job as abandoned.
+        The local lease deadline is derived from the last successful committed
+        heartbeat (anchored to the conservative monotonic origin captured
+        before that heartbeat's database operation) so the process group is
+        terminated before its database lease can expire and another worker could
+        legitimately treat the job as abandoned.
         """
         settings = self.settings
         now = time.monotonic()
