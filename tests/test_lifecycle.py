@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg.rows import tuple_row
 
 from lubko import cli, lifecycle, supervise, toolchain
 from lubko import deployctl as dc
@@ -2789,3 +2790,80 @@ def test_process_has_token_rejects_adjacent_env_key() -> None:
             exact_proc.kill()
         exact_proc.wait(timeout=5)
         guard.unregister(exact_proc)
+
+
+def test_probe_job_independent_of_sys_executable_and_runtime_path(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readiness probe must not depend on sys.executable or the runtime dir.
+
+    Production proved that ``lifecycle._insert_probe_job`` uses
+    ``[sys.executable, -c, sleep]`` and a still-running supervisor loses
+    readiness after its immutable runtime directory is pruned.  The probe
+    process must be a static binary independent of the supervisor runtime
+    path.  This test both inspects the probe payload (unit) and runs the
+    probe through a real worker (E2E) to prove the exact-worker
+    queue-roundtrip proof, cancellation, terminal wait, cleanup, and
+    process isolation are preserved.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    conn = psycopg.connect(load_database_config().conninfo(), autocommit=True)
+    try:
+        probe_id = lifecycle._insert_probe_job(conn, str(tmp_path))
+        assert probe_id is not None
+
+        with conn.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(
+                "SELECT (payload::jsonb)->'request'->'process' FROM lubko.jobs WHERE id = %s",
+                (probe_id,),
+            )
+            row = cursor.fetchone()
+        assert row is not None
+        process_argv = row[0]
+        assert isinstance(process_argv, list)
+        assert len(process_argv) >= 2
+
+        assert sys.executable not in process_argv, (
+            f"probe process must not reference sys.executable ({sys.executable!r}); "
+            "the readiness probe must be independent of the supervisor runtime path"
+        )
+
+        runtime_dir = Path(sys.prefix)
+        for element in process_argv:
+            assert str(runtime_dir) not in str(element), (
+                f"probe process element {element!r} references the runtime directory "
+                f"({runtime_dir!r}); the readiness probe must be independent of the "
+                "supervisor runtime path"
+            )
+
+        worker = spawn_real_worker(conf)
+        try:
+            try:
+                outcome = lifecycle._wait_for_probe_claim(
+                    conn, probe_id, REPAIR_WORKER_ID, worker.pid, 10.0
+                )
+                assert outcome is True, "exact worker must claim the probe proving queue-roundtrip"
+            finally:
+                with suppress(psycopg.Error):
+                    request_cancel(conn, probe_id)
+                lifecycle._wait_for_probe_terminal(conn, probe_id, 10.0)
+                with suppress(psycopg.Error):
+                    delete_job_and_chunks(conn, probe_id)
+
+            with conn.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(
+                    "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
+                    (probe_id,),
+                )
+                terminal_row = cursor.fetchone()
+            assert terminal_row is None, "probe row must be deleted after terminal, proving cleanup"
+            assert worker.poll() is None, "worker must still be alive after probe lifecycle"
+        finally:
+            kill_proc(worker)
+    finally:
+        conn.close()

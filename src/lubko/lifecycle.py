@@ -1788,7 +1788,7 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     probe_payload = json.dumps({
         "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "process": [sys.executable, "-c", "import time; time.sleep(60)"]},
+        "request": {"cwd": cwd, "process": ["/usr/bin/sleep", "60"]},
         "state": {"status": "pending"},
     })
     with conn.cursor() as cursor:
