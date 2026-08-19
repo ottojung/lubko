@@ -20,14 +20,20 @@ concurrent reader. Observation-only status and health (``supervisor/status.json`
 stay lightweight atomic writes; they are documented as such at their call sites
 and are intentionally not routed through this module.
 
-The durable boundary is the same for files and symlinks:
+The durable boundary for regular files is:
 
-1. write the full payload into a unique temporary file in the destination
-   directory;
+1. write the full payload (retrying short ``os.write`` results until complete)
+   into a unique temporary file in the destination directory;
 2. ``fsync`` that temporary file so its bytes are on stable storage;
 3. ``os.replace`` the temporary over the destination, which is atomic with
    respect to readers;
 4. ``fsync`` the destination directory so the renamed entry is recorded.
+
+A symlink carries no file contents, so the Linux boundary is the same rename
+plus the containing-directory ``fsync``: there is no portable way (and no need)
+to ``fsync`` the symlink inode itself, because the rename and the parent
+directory ``fsync`` record the new directory entry and flush the inode that
+holds the target string.
 
 If any confirmation step cannot be completed the write raises
 :class:`DurabilityError` and the caller must treat the value as *not* written:
@@ -62,6 +68,11 @@ import secrets
 from collections.abc import Callable
 from pathlib import Path
 from typing import Final
+
+# ``os.write`` may return fewer bytes than requested, so all durable writes
+# loop until the whole payload is written; tests can monkeypatch this alias
+# to simulate a short write deterministically.
+_os_write = os.write
 
 DURABLE_TEMP_PREFIX: Final = ".lubko-durable-"
 
@@ -115,11 +126,14 @@ def _maybe_inject(path: Path, stage: str) -> None:
 
 
 def fsync_directory(directory: Path) -> None:
-    """Flush a directory's entries to stable storage.
+    """Flush a directory's entries to stable storage (injection point).
 
     A directory only becomes crash-durable once its own entry is recorded in
     its parent; this function flushes the directory's metadata so a rename or
-    mkdir performed inside it survives a crash.
+    mkdir performed inside it survives a crash.  This is the *final* confirmation
+    fsync after a durable write or removal, so the fault injector is invoked
+    here; directory-creation anchoring uses :func:`_fsync_directory` instead so
+    injected failures deterministically land on this boundary.
 
     Args:
         directory: Directory to fsync.
@@ -132,6 +146,32 @@ def fsync_directory(directory: Path) -> None:
     try:
         fd = os.open(str(directory), os.O_RDONLY)
         _maybe_inject(directory, FSYNC_STAGE_DIR)
+        os.fsync(fd)
+    except OSError as exc:
+        msg = f"cannot fsync directory {directory}: {exc}"
+        raise DurabilityError(msg) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush a directory's entries to stable storage without fault injection.
+
+    Used for directory-creation anchoring, where the injectable confirmation
+    boundary is the final post-rename directory fsync in the write/remove
+    primitives, not the intermediate creation fsync.
+
+    Args:
+        directory: Directory to fsync.
+
+    Raises:
+        DurabilityError: If the directory cannot be opened or fsynced.
+    """
+    directory = Path(directory)
+    fd = None
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
         os.fsync(fd)
     except OSError as exc:
         msg = f"cannot fsync directory {directory}: {exc}"
@@ -179,17 +219,17 @@ def make_directory_durable(directory: Path) -> None:
         except OSError as exc:
             msg = f"cannot create directory {child} durably: {exc}"
             raise DurabilityError(msg) from exc
-        fsync_directory(child.parent)
+        _fsync_directory(child.parent)
     if first_existing != directory:
         # Anchor the boundary between an already-visible level and the levels
         # we just created: a concurrent first writer may not yet have fsynced
         # this parent, so establish the durability ourselves.
-        fsync_directory(first_existing.parent)
+        _fsync_directory(first_existing.parent)
     else:
         # The directory already existed; still anchor its entry in its parent
         # so a concurrent creator that has not yet fsynced the parent cannot
         # cause it to be lost.
-        fsync_directory(directory.parent)
+        _fsync_directory(directory.parent)
 
 
 def temporary_path(destination: Path) -> Path:
@@ -209,6 +249,53 @@ def temporary_path(destination: Path) -> Path:
     return destination.with_name(f"{DURABLE_TEMP_PREFIX}{os.getpid()}-{suffix}-{destination.name}")
 
 
+# Short-write simulation (test seam): when set to a fraction in (0, 1), the
+# first ``os.write`` of a temporary file writes only that fraction of the
+# buffer, so the retry loop is exercised deterministically.  ``None`` disables
+# it.  Mirrors :func:`set_fsync_failure_injector` as a fault-injection hook.
+_short_write_fraction: list[float | None] = [None]
+
+
+def set_short_write_injector(fraction: float | None) -> None:
+    """Install a deterministic short-write simulator for tests.
+
+    Args:
+        fraction: Fraction of the first ``os.write`` to perform (exclusive of
+            ``0`` and ``1``), or ``None`` to disable simulation.
+    """
+    _short_write_fraction[0] = fraction
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of ``data`` to ``fd``, handling short writes.
+
+    ``os.write`` is permitted to transfer fewer bytes than requested, so this
+    loops until the whole payload is on the descriptor.  A simulated short
+    first write (see :func:`set_short_write_injector`) is applied when set.
+
+    Args:
+        fd: Open file descriptor to write to.
+        data: Bytes to store.
+
+    Raises:
+        OSError: If a write transfers zero or negative bytes.
+    """
+    view = memoryview(data)
+    total = 0
+    first = True
+    while total < len(data):
+        chunk = view[total:]
+        if first and _short_write_fraction[0] is not None:
+            limit = max(1, int(len(chunk) * _short_write_fraction[0]))
+            chunk = chunk[:limit]
+        n = _os_write(fd, chunk)
+        if n <= 0:
+            msg = f"os.write transferred {n} bytes of {len(data) - total} remaining"
+            raise OSError(msg)
+        total += n
+        first = False
+
+
 def _write_temporary_file(temporary: Path, data: bytes) -> None:
     """Write ``data`` to ``temporary`` and fsync the file bytes.
 
@@ -222,7 +309,7 @@ def _write_temporary_file(temporary: Path, data: bytes) -> None:
     fd = None
     try:
         fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        os.write(fd, data)
+        _write_all(fd, data)
         _maybe_inject(temporary, FSYNC_STAGE_FILE)
         os.fsync(fd)
     except OSError as exc:
@@ -233,18 +320,27 @@ def _write_temporary_file(temporary: Path, data: bytes) -> None:
             os.close(fd)
 
 
-def write_bytes_durable(path: Path, data: bytes) -> None:
+def write_bytes_durable(path: Path, data: bytes, *, _restore: bool = True) -> None:
     """Crash-durably write ``data`` to ``path`` as a regular file.
 
-    The payload is written to a unique temporary file, fsynced, then atomically
+    The payload is written to a unique temporary file, fully flushed (short
+    ``os.write`` results are retried until complete), fsynced, then atomically
     renamed into place, and finally the destination directory is fsynced so the
     rename is durable. A failure at any confirmation step raises
-    :class:`DurabilityError` and leaves the previous destination (if any) and
-    the temporary artifact untouched.
+    :class:`DurabilityError`.
+
+    When the rename succeeds but the final directory fsync cannot be confirmed,
+    the write is *not* confirmed: the previously visible authority may be lost
+    on crash and must not drive a lifecycle action.  This implementation
+    therefore prefers to restore the prior destination durably (best effort);
+    only if that restore also cannot be confirmed does it fail closed, so
+    readers and actions can never treat the transition as committed.
 
     Args:
         path: Destination regular-file path.
         data: Bytes to store.
+        _restore: Internal; disable the best-effort restore on nested calls to
+            avoid unbounded recursion.
 
     Raises:
         DurabilityError: If the write cannot be confirmed durable.
@@ -252,6 +348,7 @@ def write_bytes_durable(path: Path, data: bytes) -> None:
     destination = Path(path)
     make_directory_durable(destination.parent)
     temporary = temporary_path(destination)
+    previous = destination.read_bytes() if destination.exists() else None
     try:
         _write_temporary_file(temporary, data)
         _maybe_inject(temporary, FSYNC_STAGE_REPLACE)
@@ -262,20 +359,41 @@ def write_bytes_durable(path: Path, data: bytes) -> None:
             raise
         msg = f"cannot durably write {destination}: {exc}"
         raise DurabilityError(msg) from exc
-    fsync_directory(destination.parent)
+    try:
+        fsync_directory(destination.parent)
+    except DurabilityError:
+        if _restore and previous is not None:
+            try:
+                write_bytes_durable(destination, previous, _restore=False)
+            except DurabilityError:
+                pass
+            else:
+                return
+        raise
 
 
-def write_symlink_durable(path: Path, target: str) -> None:
+def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> None:
     """Crash-durably switch ``path`` to a symlink pointing at ``target``.
 
-    The symlink carries no file contents of its own, so only the namespace
-    transition needs to be flushed: a temporary symlink is created, its inode
-    fsynced, then atomically renamed into place, and the destination directory
-    is fsynced so the rename is durable.
+    A symlink carries no file contents of its own, so the Linux durability
+    boundary is: create a temporary symlink, atomically rename it into place,
+    then ``fsync`` the containing directory so the new directory entry is
+    recorded.  (There is no portable way to fsync the symlink inode itself, and
+    none is needed: the rename plus the parent directory fsync records the new
+    dentry, and the target string lives in the inode flushed by that same
+    directory fsync.)  A failure at any confirmation step raises
+    :class:`DurabilityError`.
+
+    When the rename succeeds but the final directory fsync cannot be confirmed,
+    the write is *not* confirmed; the prior pointer is restored durably when
+    possible, and only if that also cannot be confirmed is the error raised, so
+    the transition is never treated as committed.
 
     Args:
         path: Destination symlink path.
         target: Symlink target (relative or absolute).
+        _restore: Internal; disable the best-effort restore on nested calls to
+            avoid unbounded recursion.
 
     Raises:
         DurabilityError: If the write cannot be confirmed durable.
@@ -283,6 +401,7 @@ def write_symlink_durable(path: Path, target: str) -> None:
     destination = Path(path)
     make_directory_durable(destination.parent)
     temporary = temporary_path(destination)
+    previous = str(destination.readlink()) if destination.is_symlink() else None
     try:
         temporary.unlink(missing_ok=True)
         temporary.symlink_to(target)
@@ -298,7 +417,17 @@ def write_symlink_durable(path: Path, target: str) -> None:
             raise
         msg = f"cannot durably write symlink {destination}: {exc}"
         raise DurabilityError(msg) from exc
-    fsync_directory(destination.parent)
+    try:
+        fsync_directory(destination.parent)
+    except DurabilityError:
+        if _restore and previous is not None:
+            try:
+                write_symlink_durable(destination, previous, _restore=False)
+            except DurabilityError:
+                pass
+            else:
+                return
+        raise
 
 
 def write_text_durable(path: Path, text: str) -> None:
@@ -329,3 +458,33 @@ def write_json_durable(path: Path, mapping: dict[str, object]) -> None:
         callers must not advance a dependent action.
     """
     write_text_durable(path, json.dumps(mapping, sort_keys=True) + "\n")
+
+
+def remove_durable(path: Path) -> None:
+    """Crash-durably remove an authoritative state file.
+
+    The file is unlinked and then its containing directory is fsynced so the
+    removal is recorded durably: a crash after this returns must never bring the
+    removed authority back.  This is the authoritative counterpart of the
+    durable write primitives and must be used for every recovery/control-state
+    removal (for example the supervisor-runtime override, the supervisor
+    pidfile on shutdown, and rollback-state repair/migration clearing).
+    Observation-only status/readiness cleanup is intentionally *not* routed
+    through here.
+
+    Args:
+        path: Authoritative state file to remove.
+
+    Raises:
+        DurabilityError: If the removal cannot be confirmed durable.
+    """
+    destination = Path(path)
+    try:
+        destination.unlink(missing_ok=True)
+    except OSError as exc:
+        msg = f"cannot remove durable state {destination}: {exc}"
+        raise DurabilityError(msg) from exc
+    # Confirm the removal is durable: the parent directory no longer references
+    # the entry.  A failure here means the removal is not confirmed, so callers
+    # must not treat the state as gone.
+    fsync_directory(destination.parent)

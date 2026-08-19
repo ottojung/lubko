@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from lubko.durable import write_bytes_durable, write_json_durable
+from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 
 if TYPE_CHECKING:
@@ -1205,17 +1205,25 @@ def write_supervisor_runtime_override(commit: str) -> None:
 
 
 def clear_supervisor_runtime_override() -> bool:
-    """Remove the supervisor-runtime override pointer if present.
+    """Crash-durably remove the supervisor-runtime override pointer if present.
 
-    Only regular files are removed: symlinks, directories, and other
-    special entries are never silently deleted.
+    Only regular files are removed: symlinks, directories, and other special
+    entries are never silently deleted. The removal is authoritative state
+    cleanup, so it is routed through :func:`lubko.durable.remove_durable` to
+    fsync the parent directory and fail closed when the removal cannot be
+    confirmed.
 
     Returns:
         ``True`` when the override was present and removed, ``False``
         when it was already absent.
+
+    Note:
+        Fails closed: the underlying :func:`lubko.durable.remove_durable`
+        raises :class:`DurabilityError` when the removal cannot be confirmed
+        durable.
     """
     path = supervisor_runtime_override_path()
     if not path.is_file() or path.is_symlink():
         return False
-    path.unlink()
+    remove_durable(path)
     return True

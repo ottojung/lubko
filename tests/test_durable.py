@@ -44,6 +44,7 @@ def _no_injector_leak() -> Iterator[None]:
     """Clear any fault injector installed by a test."""
     yield
     clear_fsync_failure_injector()
+    durable.set_short_write_injector(None)
 
 
 def _raise_at(stage: str) -> None:
@@ -448,6 +449,54 @@ def test_caller_does_not_advance_after_unconfirmed_desired_write() -> None:
     with pytest.raises(DurabilityError):
         settle_then_apply(desired)
     assert applied == []
+
+
+def test_short_write_is_fully_flushed(tmp_path: Path) -> None:
+    """A short ``os.write`` must be retried until the whole payload is durable."""
+    path = tmp_path / "state.json"
+    payload = bytes((i % 251) for i in range(70000))
+    durable.set_short_write_injector(1 / 3)
+    try:
+        write_bytes_durable(path, payload)
+    finally:
+        durable.set_short_write_injector(None)
+    assert path.read_bytes() == payload
+
+
+def test_write_desired_dir_fsync_failure_restores_previous() -> None:
+    """A failed final dir fsync must restore the previously written desired."""
+    desired_a = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=1,
+        commit="a" * 40,
+        repo="/repo",
+        uv_path="/uv",
+        worker_id=None,
+    )
+    desired_b = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=2,
+        commit="b" * 40,
+        repo="/repo",
+        uv_path="/uv",
+        worker_id=None,
+    )
+    supervise.write_desired(desired_a)
+    _raise_at(FSYNC_STAGE_DIR)
+    with pytest.raises(DurabilityError):
+        supervise.write_desired(desired_b)
+    restored = supervise.read_desired()
+    assert restored is not None
+    assert restored.commit == "a" * 40
+
+
+def test_set_current_dir_fsync_failure_restores_previous() -> None:
+    """A failed final dir fsync must restore the previously active pointer."""
+    cli.set_current("a" * 40)
+    _raise_at(FSYNC_STAGE_DIR)
+    with pytest.raises(cli.CliError):
+        cli.set_current("b" * 40)
+    assert cli.current_commit() == "a" * 40
 
 
 # ---------------------------------------------------------------------------
