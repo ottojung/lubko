@@ -42,6 +42,7 @@ from lubko.worker import (
     read_output,
     read_range,
     recover_stale_jobs,
+    release_gate,
     request_cancel,
     request_group_reap,
     request_stop,
@@ -66,6 +67,24 @@ LEFTOVER_GROUP_PROBE: Final = (
     "-c",
     "import os, time\nif os.fork() == 0:\n    time.sleep(30)\nelse:\n    os._exit(0)\n",
 )
+
+
+def spawn_released(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
+    """Spawn a job and immediately release its start gate so user code runs.
+
+    The production :func:`spawn_job` returns a gated wrapper that blocks until
+    the worker has persisted the exact identity; tests that need the user
+    process to actually execute call this instead of ``spawn_job`` directly.
+
+    Args:
+        job: Claimed job to execute.
+
+    Returns:
+        The same tuple ``spawn_job`` returns (minus the gate write end).
+    """
+    proc, stdout_path, stderr_path, pgid, gate_fd = spawn_job(job)
+    release_gate(gate_fd)
+    return proc, stdout_path, stderr_path, pgid
 
 
 class _RecordingCursor:
@@ -305,7 +324,7 @@ def test_stream_size_and_read_range(tmp_path: Path) -> None:
 
 def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
     """The exact process group is reported while alive and gone after death."""
-    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+    proc, _stdout_path, _stderr_path, pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
@@ -321,7 +340,7 @@ def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
 
 def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> None:
     """A spawned job is a session leader whose group ID equals its PID."""
-    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+    proc, _stdout_path, _stderr_path, pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
@@ -338,7 +357,7 @@ def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> Non
 
 def test_spawn_job_runs_process_and_cleanup_files(tmp_path: Path) -> None:
     """A process job writes its output into the capture files."""
-    proc, stdout_path, stderr_path, _pgid = spawn_job(
+    proc, stdout_path, stderr_path, _pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=(sys.executable, "-c", "print('hi')"))
     )
     guard.register(proc)
@@ -358,7 +377,7 @@ def test_spawn_job_injects_exact_root_job_uuid(tmp_path: Path) -> None:
     """A process job inherits its exact root job UUID as LUBKO_JOB_ID."""
     job_id = uuid4()
     probe = "import os; print(os.environ['LUBKO_JOB_ID'])"
-    proc, stdout_path, stderr_path, _pgid = spawn_job(
+    proc, stdout_path, stderr_path, _pgid = spawn_released(
         Job(id=job_id, cwd=str(tmp_path), process=(sys.executable, "-c", probe))
     )
     guard.register(proc)
@@ -377,7 +396,7 @@ def test_spawn_job_runs_process_in_declared_cwd(tmp_path: Path) -> None:
     work_dir = tmp_path / "runner"
     work_dir.mkdir()
     probe = "import os; print(os.getcwd())"
-    proc, stdout_path, stderr_path, _pgid = spawn_job(
+    proc, stdout_path, stderr_path, _pgid = spawn_released(
         Job(id=uuid4(), cwd=str(work_dir), process=(sys.executable, "-c", probe))
     )
     guard.register(proc)
@@ -401,7 +420,7 @@ def test_spawn_job_passes_shell_metacharacters_literally(tmp_path: Path) -> None
     """
     literal = "a;b $HOME *.txt $(id)"
     probe = "import sys; print(sys.argv[1])"
-    proc, stdout_path, stderr_path, _pgid = spawn_job(
+    proc, stdout_path, stderr_path, _pgid = spawn_released(
         Job(
             id=uuid4(),
             cwd=str(tmp_path),
@@ -957,7 +976,7 @@ def test_settings_rejects_claim_batch_limit_zero() -> None:
 
 def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
     """request_stop terminates the exact recorded process group once."""
-    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+    proc, _stdout_path, _stderr_path, pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
@@ -1060,7 +1079,7 @@ def test_decode_range_pg_safe() -> None:
 
 def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
     """request_group_reap terminates the group without recording a stop reason."""
-    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+    proc, _stdout_path, _stderr_path, pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=LEFTOVER_GROUP_PROBE)
     )
     guard.register(proc)

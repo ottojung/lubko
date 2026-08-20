@@ -71,6 +71,7 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import tuple_row
 
+from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config
 from lubko.health import (
     WorkerHealth,
@@ -1302,8 +1303,12 @@ def _cleanup_output_files(stdout_path: Path, stderr_path: Path) -> None:
     stderr_path.unlink(missing_ok=True)
 
 
-def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
-    """Start a job as a new session and process group leader.
+#: Path of the tiny dedicated start-gate wrapper exec'd by :func:`spawn_job`.
+_START_GATE_WRAPPER: Final = Path(__file__).with_name("_start_gate.py")
+
+
+def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
+    """Start a job behind a persist-before-exec START GATE.
 
     The job's required ``process`` argv is executed directly as the new
     process; the worker never invokes a shell, so argv elements are passed to
@@ -1315,41 +1320,117 @@ def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
     identify its owning queue row deterministically without depending on the
     timing of any later database write.
 
+    The wrapper (not the user program) is the dedicated session/process-group
+    leader. It inherits a gate file descriptor and blocks on it before exec'ing
+    the user argv, so ``Popen`` returns while the wrapper is still gated. The
+    caller must durably persist the exact process identity (PID/PGID/start-time
+    ticks) and then call :func:`release_gate` on the returned gate write end.
+    Only then does the wrapper exec the user code on the exact same PID. If the
+    worker dies before releasing, the kernel closes the gate write end, the
+    wrapper reads EOF, and it exits WITHOUT executing any user code — so a
+    forced SIGKILL in the spawn->persist window can never leave a user side
+    effect running with no durable identity to recover it. The gate is not
+    implemented with ``preexec_fn``: that would let ``Popen`` return only after
+    the child had already run, defeating the gate.
+
     Args:
         job: Claimed job to execute.
 
     Returns:
-        The running process, its capture file paths, and its process group ID.
+        The running gated process, its capture file paths, its process group
+        ID, and the worker-side write end of the start gate.
 
     Raises:
         OSError: If the process cannot be started.
     """
-    argv = list(job.process)
     env = dict(os.environ)
     env[JOB_ID_ENV] = str(job.id)
     stdout_fd, stdout_name = tempfile.mkstemp()
     stderr_fd, stderr_name = tempfile.mkstemp()
     stdout_path = Path(stdout_name)
     stderr_path = Path(stderr_name)
+    gate_read_fd, gate_write_fd = os.pipe()
+    # The read end must survive the wrapper's exec, so it must not be
+    # close-on-exec. Declaring it in ``pass_fds`` makes ``subprocess`` clear the
+    # close-on-exec flag on the child side of the fork, so the wrapper blocks on
+    # it across the exec boundary. The descriptor number is passed to the
+    # wrapper through the environment (not ``argv``) because a Python launcher
+    # re-exec can shift ``argv`` and would otherwise misalign the argument.
+    env["LUBKO_START_GATE_FD"] = str(gate_read_fd)
     try:
         proc = subprocess.Popen(
-            argv,
+            [sys.executable, os.fspath(_START_GATE_WRAPPER), *job.process],
             cwd=job.cwd,
             stdin=subprocess.DEVNULL,
             stdout=stdout_fd,
             stderr=stderr_fd,
             start_new_session=True,
             env=env,
+            pass_fds=(gate_read_fd,),
         )
     except OSError:
+        os.close(gate_read_fd)
+        os.close(gate_write_fd)
         os.close(stdout_fd)
         os.close(stderr_fd)
         _cleanup_output_files(stdout_path, stderr_path)
         raise
+    # The wrapper holds the read end; the worker must not keep a copy of it.
+    os.close(gate_read_fd)
     os.close(stdout_fd)
     os.close(stderr_fd)
     pgid = _wait_for_session(proc.pid)
-    return proc, stdout_path, stderr_path, pgid
+    return proc, stdout_path, stderr_path, pgid, gate_write_fd
+
+
+def release_gate(gate_fd: int) -> None:
+    """Release a gated start so the wrapper execs the user argv.
+
+    Writes the single release control byte and closes the worker's gate write
+    end. The wrapper reads the byte and execs the user program on the exact
+    same PID whose identity the caller has already durably persisted. If this
+    process dies before closing, the kernel closes the write end and the
+    wrapper reads EOF and exits without executing any user code.
+
+    Args:
+        gate_fd: The worker-side write end of the start gate pipe.
+    """
+    with suppress(OSError):
+        os.write(gate_fd, GATE_RELEASE_BYTE)
+    with suppress(OSError):
+        os.close(gate_fd)
+
+
+def abort_gated_start(
+    proc: subprocess.Popen[bytes],
+    pgid: int,
+    stdout_path: Path,
+    stderr_path: Path,
+    gate_fd: int,
+) -> None:
+    """Abort a gated start without ever executing user code.
+
+    Used when the exact process identity cannot be persisted: the gate is
+    closed WITHOUT the release byte so the wrapper exits on EOF, the exact
+    (still gated, childless) process group is terminated, the child is reaped,
+    and the capture files are removed so no unowned process or stray side
+    effect can survive.
+
+    Args:
+        proc: The gated wrapper process.
+        pgid: Exact process group id of the wrapper.
+        stdout_path: Capture file for standard output.
+        stderr_path: Capture file for standard error.
+        gate_fd: The worker-side write end of the start gate pipe.
+    """
+    # Close the gate WITHOUT releasing: the wrapper reads EOF and exits.
+    with suppress(OSError):
+        os.close(gate_fd)
+    _signal_group(pgid, signal.SIGKILL)
+    with suppress(Exception):
+        proc.wait(timeout=5)
+    stdout_path.unlink(missing_ok=True)
+    stderr_path.unlink(missing_ok=True)
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -2834,7 +2915,7 @@ class Supervisor:
             self._finalize_immediate(claimed.id, failure)
             return
         try:
-            proc, stdout_path, stderr_path, pgid = spawn_job(job_spec)
+            proc, stdout_path, stderr_path, pgid, gate_fd = spawn_job(job_spec)
         except OSError as exc:
             LOGGER.warning("unable to start job %s: %s", claimed.id, exc)
             self._finalize_immediate(
@@ -2849,6 +2930,40 @@ class Supervisor:
             )
             return
 
+        try:
+            _persist_process(conn, claimed.id, proc.pid, pgid)
+        except psycopg.Error as exc:
+            # The exact identity was not durably recorded, so the user program
+            # must never run. Close the gate WITHOUT releasing (the wrapper
+            # exits on EOF), terminate the exact childless group, reap it, and
+            # remove the capture files so no unowned process or side effect
+            # survives. A persistent identity row for a never-executed process
+            # would otherwise let a replacement claim the same job only to find
+            # a stranger-owned group, or leak an orphaned process.
+            abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "unable to persist process identity for job %s (SQLSTATE %s)",
+                claimed.id,
+                exc.sqlstate or "N/A",
+            )
+            self._finalize_immediate(
+                claimed.id,
+                JobResult(
+                    status="failed",
+                    exit_code=EXECUTION_ERROR_EXIT_CODE,
+                    stdout="",
+                    stderr="unable to record process identity; job not started",
+                    cancellation_note=None,
+                ),
+            )
+            return
+
+        # The exact identity is now durably recorded. Release the gate so the
+        # wrapper execs the user argv on the exact same PID, after which normal
+        # supervision applies.
+        release_gate(gate_fd)
         job = ActiveJob(
             id=claimed.id,
             cwd=job_spec.cwd,
@@ -2865,17 +2980,6 @@ class Supervisor:
         self.active[claimed.id] = job
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
         self._publish_health_force()
-        try:
-            _persist_process(conn, job.id, job.pid, job.pgid)
-        except psycopg.Error as exc:
-            if self._is_connectivity_error(exc):
-                raise
-            LOGGER.exception(
-                "unable to persist process identity for job %s (SQLSTATE %s)",
-                job.id,
-                exc.sqlstate or "N/A",
-            )
-            request_stop(job, STOP_REASON_PERSIST)
 
     def _finalize_immediate(self, job_id: UUID, result: JobResult) -> None:
         """Finalize a job that failed before or during spawning.

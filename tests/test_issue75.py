@@ -688,6 +688,143 @@ def test_stop_worker_rejects_live_unowned_wrong_token(tmp_path: Path) -> None:
         guard.unregister(proc)
 
 
+def test_start_gate_release_runs_user_code(tmp_path: Path) -> None:
+    """A gated start runs the user argv only after the gate is released.
+
+    The wrapper is the dedicated session/process-group leader and blocks on the
+    gate before ``exec``. While gated it must not have executed any user code;
+    once the worker durably persists the identity and releases the gate, the
+    exact same PID execs the user program.
+    """
+    sentinel = tmp_path / "ran"
+    proc, stdout_path, stderr_path, pgid, gate_fd = worker_mod.spawn_job(
+        worker_mod.Job(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            process=(
+                sys.executable,
+                "-c",
+                "import sys; open(sys.argv[1], 'w').close()",
+                str(sentinel),
+            ),
+        )
+    )
+    guard.register(proc)
+    try:
+        assert pgid == proc.pid
+        time.sleep(0.3)
+        # Still gated: the user program has not been exec'd.
+        assert proc.poll() is None
+        assert not sentinel.exists()
+        worker_mod.release_gate(gate_fd)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not sentinel.exists():
+            time.sleep(0.02)
+        assert sentinel.exists()
+        assert proc.wait(timeout=5) == 0
+        assert worker_mod.read_output(stdout_path) == b""
+    finally:
+        with suppress(ProcessLookupError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+        with suppress(Exception):
+            proc.wait(timeout=5)
+        guard.unregister(proc)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
+def test_start_gate_persist_failure_aborts_cleanly(tmp_path: Path) -> None:
+    """A persist failure terminates the gated process with no user side effect.
+
+    This is the exact branch ``Supervisor._start_job`` takes when
+    :func:`lubko.worker._persist_process` fails: the gate is closed WITHOUT the
+    release byte, the still-gated (childless) process group is terminated and
+    reaped, and the capture files are removed. The user program must never run
+    and no unowned process may survive.
+    """
+    sentinel = tmp_path / "ran"
+    proc, stdout_path, stderr_path, pgid, gate_fd = worker_mod.spawn_job(
+        worker_mod.Job(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            process=(
+                sys.executable,
+                "-c",
+                "import sys; open(sys.argv[1], 'w').close()",
+                str(sentinel),
+            ),
+        )
+    )
+    guard.register(proc)
+    try:
+        time.sleep(0.3)
+        assert proc.poll() is None  # gated, user code not run
+        # Simulate the persist-failure branch of _start_job.
+        worker_mod.abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
+        # No user side effect, no surviving unowned process, no leftover files.
+        assert not sentinel.exists()
+        assert proc.poll() is not None
+        assert not worker_mod.group_has_members(pgid)
+        assert not stdout_path.exists()
+        assert not stderr_path.exists()
+    finally:
+        with suppress(ProcessLookupError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+        with suppress(Exception):
+            proc.wait(timeout=5)
+        guard.unregister(proc)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
+def test_start_gate_worker_death_before_release_leaves_no_orphan(
+    tmp_path: Path,
+) -> None:
+    """A worker SIGKILLed before persist/release never execs user code.
+
+    The gate write end is the worker's only handle to release the wrapper. If
+    the worker dies (simulated here by closing that fd without releasing), the
+    kernel closes it, the wrapper reads EOF, and it exits WITHOUT executing the
+    user argv. No side effect survives and no unowned process remains, so a
+    replacement authority can claim the same job without overlap.
+    """
+    sentinel = tmp_path / "ran"
+    proc, stdout_path, stderr_path, pgid, gate_fd = worker_mod.spawn_job(
+        worker_mod.Job(
+            id=uuid4(),
+            cwd=str(tmp_path),
+            process=(
+                sys.executable,
+                "-c",
+                "import sys; open(sys.argv[1], 'w').close()",
+                str(sentinel),
+            ),
+        )
+    )
+    guard.register(proc)
+    try:
+        time.sleep(0.3)
+        assert proc.poll() is None  # gated
+        # Simulate the worker being force-killed: its gate write end closes.
+        with suppress(OSError):
+            os.close(gate_fd)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and proc.poll() is None:
+            time.sleep(0.02)
+        # The wrapper exited on EOF without exec'ing the user program.
+        assert proc.poll() is not None
+        assert not sentinel.exists()
+        assert not worker_mod.group_has_members(pgid)
+    finally:
+        with suppress(ProcessLookupError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+        with suppress(Exception):
+            proc.wait(timeout=5)
+        guard.unregister(proc)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+
+
 def test_recover_owned_groups_db_failure_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Recovery DB/config failure is a durable blocking obligation.
 

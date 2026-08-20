@@ -1698,7 +1698,11 @@ def test_stop_worker_refuses_wrong_marker(
         meta = meta_for_process(proc, tmp_path)
         forged = replace(meta, token=OTHER_MARKER)
         assert not lifecycle.worker_alive(forged)
-        assert lifecycle.stop_worker(forged, 0.2)
+        # The exact process is alive but carries a different lifecycle token, so
+        # it is a live, unowned process: retirement is refused (reported False)
+        # and the process must NOT be signalled.
+        stopped = lifecycle.stop_worker(forged, 0.2)
+        assert stopped is False
         assert proc.poll() is None
     finally:
         kill_proc(proc)
