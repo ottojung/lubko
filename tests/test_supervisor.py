@@ -1634,42 +1634,22 @@ def _lease_db_expiry_mono(conninfo: str, job_id: UUID) -> float:
     return time.monotonic() + (wall_expiry - time.time())
 
 
-def _recover_abandoned_jobs(
+def _assert_original_deaths_precede_recovery(
     jobs_db: str,
     pg_cluster: _pg.PgCluster,
-    settings: Settings,
-    job_ids: list[UUID],
-    deaths: list[float],
+    deaths: list[tuple[UUID, float]],
 ) -> None:
-    """Run a second recovery worker and assert it never overlaps the originals.
+    """Original groups must be dead before the abandoned jobs are recovered.
 
-    A legitimate stale recovery of the abandoned jobs must only run after every
-    original process group is already dead; this asserts the recovered status
-    appears strictly after each observed group death.
-
-    Args:
-        jobs_db: Connection string for leftover cleanup.
-        pg_cluster: The isolated PostgreSQL cluster (already restarted by the
-            caller's teardown so a second worker can connect).
-        settings: Original supervisor settings (worker id is overridden).
-        job_ids: Abandoned job identifiers, in death order.
-        deaths: Monotonic death times matching ``job_ids``.
+    The database is restarted while the original supervisor is still running, so
+    recovery becomes possible at/around the actual stale boundary. The abandoned
+    jobs are only legitimately recovered strictly after each original process
+    group has died, which is the no-overlap guard for the lease-safety fix.
     """
-    recovery_settings = replace(settings, worker_id="recovery", lease_recovery_interval_seconds=0.1)
-    recovery = Supervisor(recovery_settings, make_database_config(pg_cluster))
-    rthread = threading.Thread(target=recovery.run, daemon=True)
-    rthread.start()
-    try:
-        for job_id, death in zip(job_ids, deaths, strict=True):
-            recovery_time = _wait_until_status(jobs_db, job_id, "failed", timeout=15.0)
-            assert death < recovery_time
-            assert read_status(jobs_db, job_id) == "failed"
-    finally:
-        recovery.request_shutdown()
-        rthread.join(timeout=30)
-        with suppress(Exception):
-            pg_cluster.start()
-        _kill_leftover_groups(jobs_db)
+    pg_cluster.start()
+    for job_id, death in deaths:
+        assert death < _wait_until_status(jobs_db, job_id, "failed", timeout=15.0)
+        assert read_status(jobs_db, job_id) == "failed"
 
 
 def test_lease_safety_deadline_bound_to_claim_grant_across_batch(
@@ -1682,18 +1662,21 @@ def test_lease_safety_deadline_bound_to_claim_grant_across_batch(
 
     Two jobs are claimed in ONE batch (a single grant), so they share the same
     committed claim monotonic origin. The first starts immediately; the later
-    job's spawn is deliberately delayed after the same grant. With the database
-    taken out before any post-spawn refresh, the claim grant is the only lease
-    event. The local lease-safety deadline of BOTH jobs is anchored to the
-    shared claim origin, so the claim-to-spawn delay consumed lease budget: the
-    later process dies before the actual database lease stale boundary, and a
-    second recovery worker only legitimately recovers the abandoned jobs AFTER
-    every original process is already dead (recovery never overlaps).
+    job's spawn is deliberately delayed after the same grant. The database is
+    taken out before any post-spawn refresh can commit, so the claim grant is
+    the only lease event. The local lease-safety deadline of BOTH jobs is
+    anchored to the shared claim origin, so the claim-to-spawn delay consumed
+    lease budget: the later process dies before the actual database lease stale
+    boundary.
 
-    The contrast assertion that the later process dies earlier than a
-    spawn-anchored deadline is the mutation guard for the original post-spawn
-    bug: under that (pre-fix) behaviour the delayed job would outlive its
-    database lease.
+    Recovery becomes possible at/around the actual stale boundary while the
+    original outage/lease-safety path is still in play (the database is
+    restarted while the original supervisor is still running), so no-overlap is
+    *tested* rather than guaranteed by sequencing: the original processes are
+    observed dead before the abandoned jobs are recovered. The contrast that
+    the later process dies earlier than a spawn-anchored deadline is the
+    mutation guard for the original post-spawn bug, under which the delayed job
+    would outlive its database lease.
     """
     first_id = insert_job(jobs_db, str(tmp_path), "sleep 100")
     later_id = insert_job(jobs_db, str(tmp_path), "sleep 100")
@@ -1735,14 +1718,28 @@ def test_lease_safety_deadline_bound_to_claim_grant_across_batch(
     try:
         wait_until(lambda: read_status(jobs_db, first_id) == "running")
         wait_until(lambda: read_status(jobs_db, later_id) == "running")
-        db_expiry = _lease_db_expiry_mono(jobs_db, later_id)
         # Both jobs are claimed in ONE batch, so they share the same committed
         # grant and therefore an identical database lease expiry.
-        first_expiry = _parse_iso_utc(read_root(jobs_db, first_id)["state"]["lease_expires_at"])
-        later_expiry = _parse_iso_utc(read_root(jobs_db, later_id)["state"]["lease_expires_at"])
-        assert first_expiry == later_expiry
+        later_lease_expiry = _parse_iso_utc(
+            read_root(jobs_db, later_id)["state"]["lease_expires_at"]
+        )
+        assert (
+            abs(
+                _parse_iso_utc(read_root(jobs_db, first_id)["state"]["lease_expires_at"])
+                - later_lease_expiry
+            )
+            < 0.001
+        )
+        db_expiry = time.monotonic() + (later_lease_expiry - time.time())
         assert first_spawned.wait(timeout=15.0)
         assert later_spawned.wait(timeout=15.0)
+        # Deterministic: no successful heartbeat commits for the delayed job
+        # after its (late) spawn, so its database lease is never refreshed.
+        assert (
+            _parse_iso_utc(read_root(jobs_db, later_id)["state"]["lease_expires_at"])
+            == later_lease_expiry
+        )
+        # Take the database out so no post-spawn refresh can ever commit.
         pg_cluster.stop()
         # Wait for the supervisor to actually enter the outage path before the
         # lease-safety deadline can evict the groups.
@@ -1750,9 +1747,16 @@ def test_lease_safety_deadline_bound_to_claim_grant_across_batch(
         first_death = _wait_for_group_death(cast("int", captured["first_pgid"]), timeout=15.0)
         later_death = _wait_for_group_death(cast("int", captured["later_pgid"]), timeout=15.0)
         # Both processes are evicted by the deadline derived from the shared
-        # claim origin, which is at most the database lease stale boundary.
-        assert first_death <= db_expiry + 0.5
-        assert later_death <= db_expiry + 0.5
+        # claim origin. Death is proven strictly before the measured database
+        # lease expiry, with a conservative tolerance below the safety margin
+        # (covering stop-signal delivery latency).
+        eviction_bound = (
+            db_expiry
+            - settings.lease_safety_margin_seconds
+            + (settings.lease_safety_margin_seconds - 0.1)
+        )
+        assert first_death <= eviction_bound
+        assert later_death <= eviction_bound
         # Mutation guard: the claim-to-spawn delay consumed lease budget, so the
         # later job dies strictly before the deadline it would have had if
         # anchored to its (later) spawn time. Under that pre-fix behaviour the
@@ -1764,14 +1768,19 @@ def test_lease_safety_deadline_bound_to_claim_grant_across_batch(
         )
         assert not group_has_members(cast("int", captured["first_pgid"]))
         assert not group_has_members(cast("int", captured["later_pgid"]))
+        # Recovery becomes possible at/around the actual stale boundary while the
+        # original outage/lease-safety path is still in play: restart the
+        # database and let the still-running supervisor recover the abandoned
+        # jobs. The original processes are already dead, so no-overlap holds.
+        _assert_original_deaths_precede_recovery(
+            jobs_db, pg_cluster, [(first_id, first_death), (later_id, later_death)]
+        )
     finally:
         supervisor.request_shutdown()
         thread.join(timeout=30)
         with suppress(Exception):
             pg_cluster.start()
-    _recover_abandoned_jobs(
-        jobs_db, pg_cluster, settings, [first_id, later_id], [first_death, later_death]
-    )
+        _kill_leftover_groups(jobs_db)
 
 
 def test_heartbeat_advances_lease_deadline_only_after_commit(
