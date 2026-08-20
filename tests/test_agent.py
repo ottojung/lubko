@@ -1,11 +1,14 @@
 """Tests for the Lubko agent management CLI."""
 
 import contextlib
+import functools
 import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -126,6 +129,41 @@ def make_agent(
     meta.update(overrides)
     agent.write_meta(aid, meta)
     return meta
+
+
+def reserve_runner_generation(
+    aid: str,
+    *,
+    gen: int = 1,
+    mode: str = "new",
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Establish an explicit reserved runner generation for a direct runner.
+
+    The production runner fails closed unless it carries the exact reserved
+    generation, so an in-process ``agent.runner()`` call must first install a
+    matching reservation and set ``LUBKO_RUNNER_GEN``.  The reservation is owned
+    by the current test process, which is exactly the process that will run the
+    runner.
+
+    Args:
+        aid: Exact agent ID.
+        gen: Reserved generation the runner must carry.
+        mode: Reservation mode (``new`` or ``continue``).
+        monkeypatch: Test monkeypatch used to set the runner generation env.
+    """
+    meta = agent.read_meta(aid)
+    assert meta is not None, f"agent {aid} must exist before reserving"
+    meta["runner_reservation"] = {
+        "gen": gen,
+        "owner_pid": os.getpid(),
+        "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
+        "state": "reserved",
+        "reserved_at": time.time(),
+        "mode": mode,
+    }
+    agent.write_meta(aid, meta)
+    monkeypatch.setenv("LUBKO_RUNNER_GEN", str(gen))
 
 
 def fake_agent_command(_meta: agent.Meta, _prompt: str, *, is_continue: bool) -> list[str]:
@@ -931,8 +969,23 @@ def test_cmd_prompt_attached_normalizes_colored_output(
     monkeypatch.setattr(agent, "build_agent_command", colored_command)
     runner_threads: list[threading.Thread] = []
 
-    def spawn_in_thread(_aid: str, mode: str) -> None:
-        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+    def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
+        # The production runner fails closed unless it carries the exact reserved
+        # generation, so the in-thread runner must be told the generation the
+        # locked decision reserved.  Scope the env override to the runner thread
+        # and restore it afterwards so it never leaks into other tests.
+        def _target() -> None:
+            prev = os.environ.get("LUBKO_RUNNER_GEN")
+            os.environ["LUBKO_RUNNER_GEN"] = str(_extra.get("gen", 1))
+            try:
+                agent.runner(_aid, mode)
+            finally:
+                if prev is None:
+                    os.environ.pop("LUBKO_RUNNER_GEN", None)
+                else:
+                    os.environ["LUBKO_RUNNER_GEN"] = prev
+
+        thread = threading.Thread(target=_target, daemon=True)
         thread.start()
         runner_threads.append(thread)
 
@@ -1041,7 +1094,7 @@ def test_cmd_new_creates_idle_agent_with_supplied_id(
 ) -> None:
     """New creates only an idle record with the caller-supplied ID."""
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     cwd = str(state_dir)
     code = agent.main(["new", "--id", "A13F09C2", "--cwd", cwd, "--json"])
     assert code == agent.EXIT_OK
@@ -1149,7 +1202,7 @@ def test_cmd_prompt_first_prompt_creates_native_session(
     """
     agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "do work"])
     assert code == agent.EXIT_OK
     assert spawned == ["new"]
@@ -1173,7 +1226,7 @@ def test_cmd_prompt_continue_uses_existing_native_session(
     )
     monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
     assert code == agent.EXIT_OK
     assert spawned == ["continue"]
@@ -1209,8 +1262,23 @@ def test_prompt_retries_failed_first_attempt_as_new_session(
     agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
     runner_threads: list[threading.Thread] = []
 
-    def spawn_in_thread(_aid: str, mode: str) -> None:
-        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+    def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
+        # The production runner fails closed unless it carries the exact reserved
+        # generation, so the in-thread runner must be told the generation the
+        # locked decision reserved.  Scope the env override to the runner thread
+        # and restore it afterwards so it never leaks into other tests.
+        def _target() -> None:
+            prev = os.environ.get("LUBKO_RUNNER_GEN")
+            os.environ["LUBKO_RUNNER_GEN"] = str(_extra.get("gen", 1))
+            try:
+                agent.runner(_aid, mode)
+            finally:
+                if prev is None:
+                    os.environ.pop("LUBKO_RUNNER_GEN", None)
+                else:
+                    os.environ["LUBKO_RUNNER_GEN"] = prev
+
+        thread = threading.Thread(target=_target, daemon=True)
         thread.start()
         runner_threads.append(thread)
 
@@ -1232,7 +1300,7 @@ def test_prompt_retries_failed_first_attempt_as_new_session(
 
     spawned: list[str] = []
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     retry_code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "retry task"])
     assert retry_code == agent.EXIT_OK
     assert spawned == ["new"]
@@ -1250,7 +1318,7 @@ def test_prompt_continue_with_agent_cmd_override_without_session(
     make_agent(state_dir, "aaaaaaaa", state_value="succeeded", prompt_count=1)
     monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
     assert code == agent.EXIT_OK
     assert spawned == ["new"]
@@ -1269,8 +1337,23 @@ def test_cmd_prompt_attached_follows_and_propagates_exit_code(
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
     runner_threads: list[threading.Thread] = []
 
-    def spawn_in_thread(_aid: str, mode: str) -> None:
-        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+    def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
+        # The production runner fails closed unless it carries the exact reserved
+        # generation, so the in-thread runner must be told the generation the
+        # locked decision reserved.  Scope the env override to the runner thread
+        # and restore it afterwards so it never leaks into other tests.
+        def _target() -> None:
+            prev = os.environ.get("LUBKO_RUNNER_GEN")
+            os.environ["LUBKO_RUNNER_GEN"] = str(_extra.get("gen", 1))
+            try:
+                agent.runner(_aid, mode)
+            finally:
+                if prev is None:
+                    os.environ.pop("LUBKO_RUNNER_GEN", None)
+                else:
+                    os.environ["LUBKO_RUNNER_GEN"] = prev
+
+        thread = threading.Thread(target=_target, daemon=True)
         thread.start()
         runner_threads.append(thread)
 
@@ -1293,7 +1376,7 @@ def test_cmd_prompt_steer_is_plain_prompt_when_idle(
     """--steer on an idle agent is exactly equivalent to an ordinary prompt."""
     agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "task"])
     assert code == agent.EXIT_OK
     assert spawned == ["new"]
@@ -1317,7 +1400,7 @@ def test_cmd_prompt_steer_is_plain_prompt_when_finished(
     )
     monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "task"])
     assert code == agent.EXIT_OK
     assert spawned == ["continue"]
@@ -1335,7 +1418,7 @@ def test_cmd_prompt_refuses_without_steer_when_busy(
     proc = spawn_marked_process("aaaaaaaa")
     try:
         agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
-        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, _mode: None)
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, _mode, **_k: None)
         code = agent.main(["prompt", "--id", "aaaaaaaa", "task"])
         assert code == agent.EXIT_ERROR
         assert "--steer" in capsys.readouterr().err
@@ -1351,7 +1434,7 @@ def test_cmd_prompt_steer_queues_for_busy_agent(
     try:
         agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
         spawned: list[str] = []
-        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
         code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "redirect"])
         assert code == agent.EXIT_OK
         assert spawned == []
@@ -1428,6 +1511,7 @@ def test_runner_runs_invocation_and_records_result(
     """The runner executes one invocation and records a success result."""
     make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "new")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1445,6 +1529,7 @@ def test_runner_drains_queued_steers(state_dir: Path, monkeypatch: pytest.Monkey
     meta["steer_seq"] = 1
     agent.write_meta("aaaaaaaa", meta)
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "new")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1465,6 +1550,7 @@ def test_runner_records_failure(state_dir: Path, monkeypatch: pytest.MonkeyPatch
         return ["sh", "-c", "exit 7"]
 
     monkeypatch.setattr(agent, "build_agent_command", failing_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "new")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1481,6 +1567,7 @@ def test_runner_fails_without_continuation_session(
     meta["pending_prompt"] = "continue this"
     agent.write_meta("aaaaaaaa", meta)
     monkeypatch.setattr(agent, "discover_session_id", lambda _aid: None)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="continue", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "continue")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1645,6 +1732,7 @@ def test_runner_does_not_drop_concurrently_queued_prompt(
         return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
 
     monkeypatch.setattr(agent, "build_agent_command", racing_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="continue", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "continue")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1670,6 +1758,7 @@ def test_runner_runs_prompt_queued_during_invocation(
         return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
 
     monkeypatch.setattr(agent, "build_agent_command", queuing_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "new")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1689,6 +1778,7 @@ def test_runner_reclaims_queued_steer_on_start(
     meta["steer_seq"] = 1
     agent.write_meta("aaaaaaaa", meta)
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="continue", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "continue")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1713,6 +1803,7 @@ def test_runner_abnormal_exit_kills_invocation_group(
         raise RuntimeError(msg)
 
     monkeypatch.setattr(agent, "_wait_for_invocation_exit", boom)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     with pytest.raises(RuntimeError, match="simulated"):
         agent.runner("aaaaaaaa", "new")
 
@@ -1728,7 +1819,7 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A prompt does not spawn a second runner while one is live."""
+    """A prompt reuses a live runner without spawning a second one."""
     runner_proc = spawn_marked_process("aaaaaaaa")
     try:
         meta = make_agent(
@@ -1741,10 +1832,11 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
         meta["active_runner"] = True
         meta["runner_pid"] = runner_proc.pid
         meta["runner_start_time"] = agent.proc_start_ticks(runner_proc.pid)
+        meta["pending_prompt"] = None
         agent.write_meta("aaaaaaaa", meta)
         monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
         spawned: list[str] = []
-        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
         code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
         assert code == agent.EXIT_OK
         assert spawned == []
@@ -1753,6 +1845,414 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
         assert current["pending_prompt"] == "more"
     finally:
         kill_proc(runner_proc)
+
+
+def test_live_runner_two_ordinary_prompts_exactly_one_accepted(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Two ordinary prompts against a live between-invocation runner.
+
+    Both callers observe the old terminal, no-pending state, then both reach
+    the locked decision window.  Exactly one prompt is accepted and reused by
+    the live runner (no second runner spawned, no overwrite); the loser is
+    explicitly busy.
+    """
+    aid = "22222222"
+    runner_proc = spawn_marked_process(aid)
+    try:
+        meta = make_agent(
+            state_dir,
+            aid,
+            state_value="succeeded",
+            prompt_count=1,
+        )
+        meta["active_runner"] = True
+        meta["runner_pid"] = runner_proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(runner_proc.pid)
+        meta["pending_prompt"] = None
+        agent.write_meta(aid, meta)
+        sync = tmp_path / "sync"
+        p1 = _run_cli(
+            ["prompt", "--id", aid, "--detach", "first"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+        )
+        p2 = _run_cli(
+            ["prompt", "--id", aid, "--detach", "second"],
+            sync_dir=sync,
+            LUBKO_AGENT_CMD="sleep 300",
+        )
+        try:
+            _wait_sync_reached(sync, "sc_observe", 2)
+            _release_sync(sync, "sc_observe")
+            _wait_sync_reached(sync, "sc_decide", 2)
+            _release_sync(sync, "sc_decide")
+            rc1 = p1.wait(timeout=30)
+            rc2 = p2.wait(timeout=30)
+            current = agent.read_meta(aid)
+            assert current is not None
+            # No runner was spawned: the single live runner is reused, so the
+            # generation and reservation are untouched and no second identity
+            # exists.  Exactly one prompt owns the runner.
+            assert current["runner_gen"] == 0
+            assert current["runner_reservation"] is None
+            assert current["runner_pid"] == runner_proc.pid
+            assert current["active_runner"] is True
+            assert current["pending_prompt"] in {"first", "second"}
+            assert current["prompt_count"] == 1
+            # The loser is explicitly busy; exactly one call succeeded.
+            assert sorted([rc1, rc2]) == [agent.EXIT_OK, agent.EXIT_ERROR]
+        finally:
+            _teardown_runners(aid, sync)
+    finally:
+        kill_proc(runner_proc)
+
+
+def test_reservation_owner_exact_process_safe_against_pid_reuse(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reused PID with different start ticks never justifies a reservation.
+
+    The original spawner dies and its PID is reused by an unrelated process.
+    Because the reservation records the owner's start ticks, the live reused
+    PID does not justify the reservation, so deterministic recovery is allowed
+    and produces exactly one replacement runner.
+    """
+    aid = "11111111"
+    reused = spawn_marked_process(aid)
+    try:
+        real_ticks = agent.proc_start_ticks(reused.pid)
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["state"] = "running"
+        meta["active_runner"] = True
+        meta["started_at"] = time.time()
+        meta["runner_gen"] = 1
+        # The spawner died; its PID was reused by an unrelated process whose
+        # start ticks differ from the recorded owner identity.
+        meta["runner_reservation"] = {
+            "gen": 1,
+            "owner_pid": reused.pid,
+            "owner_start_ticks": (real_ticks or 0) + 1,
+            "state": "reserved",
+            "reserved_at": time.time(),
+            "mode": "new",
+        }
+        agent.write_meta(aid, meta)
+        # A live reused PID with mismatched start ticks must NOT justify the
+        # reservation.
+        assert agent.reservation_in_flight(meta) is False
+        assert agent.is_genuinely_running(meta) is False
+        # Recovery is allowed and produces exactly one replacement runner.
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
+        rc = agent.main(["prompt", "--id", aid, "--detach", "recover"])
+        assert rc == agent.EXIT_OK
+        assert spawned == ["new"]
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["runner_gen"] == 2
+        assert isinstance(after["runner_reservation"], dict)
+        assert after["runner_reservation"]["gen"] == 2
+        # The replacement reservation is owned by this (alive, matching) process,
+        # so it is genuinely in flight.
+        assert agent.reservation_in_flight(after) is True
+    finally:
+        kill_proc(reused)
+
+
+def test_teardown_signals_only_exact_identities_reused_pid_observation_only(
+    tmp_path: Path,
+) -> None:
+    """Teardown signals only exact identities; reused PIDs stay observation-only.
+
+    A preclaim sync marker naming a PID that is no longer our runner — either
+    because its start ticks differ (a reused PID) or because it lacks the exact
+    agent marker — is never signalled.  A genuine runner carrying the exact
+    agent marker and matching start ticks is signalled exactly.
+    """
+    aid = "33333333"
+    owned = spawn_stale_marked_process(aid, gen=1)
+    reused = spawn_marked_process("ffffffff")
+    wrong_marker = spawn_marked_process("eeeeeeee")
+    try:
+        sync = tmp_path / "sync"
+        sync.mkdir(parents=True, exist_ok=True)
+        # Genuine owned runner: marker matches and recorded ticks match.
+        (sync / f"runner_preclaim.{owned.pid}.reached").touch()
+        o_ticks = agent.proc_start_ticks(owned.pid)
+        if o_ticks is not None:
+            (sync / f"runner_preclaim.{owned.pid}.ticks").write_text(str(o_ticks))
+        # Reused PID: a stale marker names a PID whose start ticks now differ.
+        (sync / f"runner_preclaim.{reused.pid}.reached").touch()
+        r_ticks = agent.proc_start_ticks(reused.pid)
+        (sync / f"runner_preclaim.{reused.pid}.ticks").write_text(str((r_ticks or 1) - 1))
+        # Correct ticks but a different agent marker: not our identity.
+        (sync / f"runner_preclaim.{wrong_marker.pid}.reached").touch()
+        w_ticks = agent.proc_start_ticks(wrong_marker.pid)
+        if w_ticks is not None:
+            (sync / f"runner_preclaim.{wrong_marker.pid}.ticks").write_text(str(w_ticks))
+
+        # No agent meta: teardown consults only the exact sync identities.
+        _teardown_runners(aid, sync)
+
+        # Unknown/reused identities are observation-only: still running.
+        assert reused.poll() is None
+        assert wrong_marker.poll() is None
+        # The genuinely-owned runner was signalled: terminated.
+        wait_until(lambda: owned.poll() is not None, timeout=10)
+    finally:
+        kill_proc(owned)
+        kill_proc(reused)
+        kill_proc(wrong_marker)
+
+
+def test_runner_fails_closed_without_matching_reservation(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A production runner with no matching reservation fails closed.
+
+    A nonzero reserved generation carried into the runner must not execute when
+    the exact reserved generation no longer exists in metadata: the runner
+    bails instead of claiming or running an invocation.
+    """
+    aid = "55555555"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    monkeypatch.setenv("LUBKO_RUNNER_GEN", "7")
+    agent.runner(aid, "new")
+    result = agent.read_meta(aid)
+    assert result is not None
+    assert result.get("runner_pid") is None
+    assert result.get("active_runner") is False
+
+
+def test_runner_fails_closed_with_zero_generation_and_no_reservation(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner carrying generation zero with no reservation fails closed.
+
+    A production runner must never execute without an exact reserved generation;
+    a missing/zero generation with no reservation is not a legacy in-process
+    fallback and must bail instead of claiming or running an invocation.
+    """
+    aid = "11111111"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    monkeypatch.setenv("LUBKO_RUNNER_GEN", "0")
+    agent.runner(aid, "new")
+    result = agent.read_meta(aid)
+    assert result is not None
+    assert result.get("runner_pid") is None
+    assert result.get("active_runner") is False
+
+
+def test_runner_fails_closed_with_zero_generation_against_nonzero_reservation(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero/missing generation cannot claim a nonzero reserved generation.
+
+    The runner must carry the exact reserved generation; a zero or absent
+    generation arriving against a live nonzero reservation fails closed rather
+    than executing under a stolen generation.
+    """
+    aid = "22222222"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    # A direct runner helper creates the explicit nonzero reservation the runner
+    # must carry; the reservation is owned by this process as a real runner
+    # would be.  The failing runner below deliberately arrives without it.
+    reserve_runner_generation(aid, gen=5, mode="new", monkeypatch=monkeypatch)
+    # Zero generation: must not claim the gen-5 reservation.
+    monkeypatch.setenv("LUBKO_RUNNER_GEN", "0")
+    agent.runner(aid, "new")
+    zero = agent.read_meta(aid)
+    assert zero is not None
+    assert zero.get("runner_pid") is None
+    assert zero.get("active_runner") is False
+    # Absent generation (env unset): equally must fail closed.
+    monkeypatch.delenv("LUBKO_RUNNER_GEN", raising=False)
+    agent.runner(aid, "new")
+    absent = agent.read_meta(aid)
+    assert absent is not None
+    assert absent.get("runner_pid") is None
+    assert absent.get("active_runner") is False
+
+
+def test_prompt_continues_established_session_not_second_new(
+    state_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that loses the session race continues, not a second new.
+
+    The caller observes no native session, but another invocation establishes
+    one before the caller's locked decision. Because the native-session mode is
+    derived inside the lock from the current state, the caller reserves
+    ``continue`` for the established session instead of a second ``new`` one
+    (which would have happened under the stale observe→lock TOCTOU).
+    """
+    aid = "dddddddd"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+
+    # A discoverable underlying session registry, initially empty; the session is
+    # established only after the caller pauses at its decision boundary.
+    data_home = tmp_path / "data"
+    data_home.mkdir(parents=True, exist_ok=True)
+    db = data_home / "opencode" / "opencode.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS session (id TEXT, title TEXT, time_created TEXT)")
+        conn.commit()
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+
+    sync = tmp_path / "sync"
+    # Drive the caller as a real subprocess (valid signal setup) and pause it at
+    # sc_observe, with no session discoverable yet.
+    caller = _run_cli(["prompt", "--id", aid, "--detach", "task"], sync_dir=sync)
+    try:
+        _wait_sync_reached(sync, "sc_observe", 1)
+        # Another invocation establishes the native session before the caller's
+        # locked decision.
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute(
+                "INSERT INTO session (id, title, time_created) VALUES (?, ?, ?)",
+                ("sess-established", agent.OPENCODE_TITLE_PREFIX + aid, str(time.time())),
+            )
+            conn.commit()
+        _release_sync(sync, "sc_observe")
+        # The dispatch also pauses at sc_decide; release it so the caller proceeds.
+        _release_sync(sync, "sc_decide")
+        rc = caller.wait(timeout=30)
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert rc == agent.EXIT_OK
+        # The caller must continue the established session, not reserve a second
+        # new session from stale information.
+        assert isinstance(after.get("runner_reservation"), dict)
+        assert after["runner_reservation"]["mode"] == "continue"
+    finally:
+        _teardown_runners(aid, sync)
+        caller.wait(timeout=5)
+
+
+def test_owned_by_me_fails_closed_without_valid_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``owned_by_me`` requires valid, equal current and recorded start ticks.
+
+    Both the current and the recorded start ticks must be valid (not ``None``)
+    and equal; a missing, unreadable, or mismatched tick record fails closed so
+    a reused or unverifiable PID is never treated as the reservation owner.
+    """
+    aid = "77777777"
+    me = os.getpid()
+    real_ticks = agent.proc_start_ticks(me)
+    meta = agent.idle_meta(aid, "/workspace", None)
+    meta["runner_reservation"] = {
+        "gen": 1,
+        "owner_pid": me,
+        "owner_start_ticks": real_ticks,
+        "state": "reserved",
+        "reserved_at": time.time(),
+        "mode": "new",
+    }
+    # Valid match: current and recorded ticks are valid and equal.
+    assert agent.owned_by_me(meta, me) is True
+
+    # Current ticks unavailable -> fail closed even though the record matches.
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: None)
+    assert agent.owned_by_me(meta, me) is False
+
+    # Current ticks mismatched -> fail closed.
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: (real_ticks or 0) + 1)
+    assert agent.owned_by_me(meta, me) is False
+
+    # Recorded ticks missing (None) -> fail closed even if current is valid.
+    meta["runner_reservation"]["owner_start_ticks"] = None
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: real_ticks)
+    assert agent.owned_by_me(meta, me) is False
+
+
+def test_metadata_teardown_fails_closed_without_valid_ticks_or_marker(
+    state_dir: Path,
+) -> None:
+    """Meta teardown signals only with valid ticks and the exact agent marker.
+
+    A registered runner PID is signalled only when ``runner_start_time`` is
+    valid and matches the live process's current start ticks *and* the exact
+    agent environment marker is present. Missing or invalid ticks (either side)
+    or a missing marker leave the process observation-only (never signalled).
+    """
+    aid = "88888888"
+    owned = spawn_stale_marked_process(aid, gen=1)
+    other = spawn_marked_process("bbbbbbbb")
+    try:
+        # Case 1: runner_start_time missing -> fail closed, never signal.
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["active_runner"] = True
+        meta["runner_pid"] = owned.pid
+        meta["runner_start_time"] = None
+        agent.write_meta(aid, meta)
+        _teardown_runners(aid)
+        assert owned.poll() is None
+
+        # Case 2: valid ticks but the process lacks the exact marker -> never
+        # signal.
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["active_runner"] = True
+        meta["runner_pid"] = other.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(other.pid)
+        agent.write_meta(aid, meta)
+        _teardown_runners(aid)
+        assert other.poll() is None
+
+        # Case 3: valid ticks + exact marker -> signalled.
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["active_runner"] = True
+        meta["runner_pid"] = owned.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(owned.pid)
+        agent.write_meta(aid, meta)
+        _teardown_runners(aid)
+        wait_until(lambda: owned.poll() is not None, timeout=10)
+    finally:
+        kill_proc(owned)
+        kill_proc(other)
+
+
+def test_preclaim_teardown_requires_valid_ticks_proof(
+    tmp_path: Path,
+) -> None:
+    """Preclaim teardown signals only with a valid, matching ``.ticks`` proof.
+
+    A missing, malformed, or unreadable start-ticks proof is observation-only
+    and the PID is never signalled, even when the exact agent marker matches.
+    Only a valid matching ticks-proof *and* the exact agent marker are
+    signalled.
+    """
+    aid = "99999999"
+    owned = spawn_stale_marked_process(aid, gen=1)
+    try:
+        sync = tmp_path / "sync"
+        sync.mkdir(parents=True, exist_ok=True)
+        (sync / f"runner_preclaim.{owned.pid}.reached").touch()
+
+        # Missing .ticks proof: marker matches but no proof -> observation-only.
+        _teardown_runners(aid, sync)
+        assert owned.poll() is None
+
+        # Malformed .ticks proof: unreadable as an int -> observation-only.
+        (sync / f"runner_preclaim.{owned.pid}.ticks").write_text("not-an-int")
+        _teardown_runners(aid, sync)
+        assert owned.poll() is None
+
+        # Valid matching .ticks proof + exact marker -> signalled.
+        (sync / f"runner_preclaim.{owned.pid}.ticks").write_text(
+            str(agent.proc_start_ticks(owned.pid))
+        )
+        _teardown_runners(aid, sync)
+        wait_until(lambda: owned.poll() is not None, timeout=10)
+    finally:
+        kill_proc(owned)
 
 
 def test_cmd_stop_escalates_to_sigkill_when_group_survives(
@@ -1859,3 +2359,725 @@ def test_runner_alive_requires_exact_marker(state_dir: Path) -> None:
         assert not agent.runner_alive(meta)
     finally:
         kill_proc(proc)
+
+
+# ---------------------------------------------------------------------------
+# Linearizable prompt/runner reservation (issue #77)
+# ---------------------------------------------------------------------------
+
+
+def _cli_env(sync_dir: Path | None, **extra: str) -> dict[str, str]:
+    """Build an environment for a CLI subprocess under test.
+
+    Args:
+        sync_dir: Synchronization directory for deterministic tests, or
+            ``None`` to disable the test hook.
+        **extra: Extra environment variables.
+
+    Returns:
+        The subprocess environment.
+    """
+    env = dict(os.environ)
+    if sync_dir is not None:
+        env["LUBKO_TEST_SYNC"] = str(sync_dir)
+    env.update(extra)
+    return env
+
+
+def _run_cli(
+    args: list[str], sync_dir: Path | None = None, **extra: str
+) -> subprocess.Popen[bytes]:
+    """Launch ``lubko-agent`` as a real subprocess for a deterministic test.
+
+    Args:
+        args: CLI arguments (without the program name).
+        sync_dir: Synchronization directory, or ``None`` to disable the hook.
+        **extra: Extra environment variables for the subprocess.
+
+    Returns:
+        The launched subprocess.
+    """
+    env = _cli_env(sync_dir, **extra)
+    return subprocess.Popen(
+        [sys.executable, "-m", "lubko.agent", *args],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _release_sync(sync_dir: Path, step: str) -> None:
+    """Release every process paused at a named synchronization point.
+
+    Args:
+        sync_dir: Synchronization directory.
+        step: Named synchronization point.
+    """
+    (sync_dir / f"{step}.release").touch()
+
+
+def _wait_sync_reached(sync_dir: Path, step: str, count: int, timeout: float = 30.0) -> None:
+    """Wait until ``count`` processes have reached a named sync point.
+
+    Args:
+        sync_dir: Synchronization directory.
+        step: Named synchronization point.
+        count: Number of reaching processes expected.
+        timeout: Maximum seconds to wait.
+
+    Raises:
+        AssertionError: If the expected count is not reached in time.
+    """
+    deadline = time.monotonic() + timeout
+    reached = 0
+    while time.monotonic() < deadline:
+        reached = len(list(sync_dir.glob(f"{step}.*.reached")))
+        if reached >= count:
+            return
+        time.sleep(0.005)
+    msg = f"sync point {step!r} reached by only {reached}/{count} processes"
+    raise AssertionError(msg)
+
+
+def _runner_claimed(aid: str) -> bool:
+    """Return whether the agent's runner has claimed and recorded its PID.
+
+    Args:
+        aid: Exact agent ID.
+
+    Returns:
+        ``True`` once ``runner_pid`` is present in meta.
+    """
+    meta = agent.read_meta(aid)
+    return bool(meta and meta.get("runner_pid"))
+
+
+def _runner_dead(pid: int) -> bool:
+    """Return whether an exact runner PID is no longer alive.
+
+    Args:
+        pid: The exact runner process ID.
+
+    Returns:
+        ``True`` once the process has exited.
+    """
+    return not agent.pid_alive(pid)
+
+
+def _reached_pids(sync_dir: Path, step: str) -> list[int]:
+    """Return PIDs that reached a named sync point, recovered from markers.
+
+    The sync hook names each reached marker ``{step}.{pid}.reached``, so the
+    exact process identity that reached the point is recovered from the
+    marker file alone, without any ``/proc`` scan by agent ID or marker.
+
+    Args:
+        sync_dir: Synchronization directory.
+        step: Named synchronization point.
+
+    Returns:
+        The reaching process IDs.
+    """
+    pids: list[int] = []
+    for path in sync_dir.glob(f"{step}.*.reached"):
+        stem = path.name[len(f"{step}.") : -len(".reached")]
+        with contextlib.suppress(ValueError):
+            pids.append(int(stem))
+    return pids
+
+
+def _kill_runner(pid: int) -> None:
+    """Kill a runner process and its whole process group deterministically.
+
+    The PID is an exact identity the test itself created (a runner this test
+    spawned, or a PID a runner registered in its sync marker), never a process
+    discovered by agent ID or environment marker.
+
+    Args:
+        pid: The runner process ID (a session leader).
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGKILL)
+
+
+def _maybe_kill_runner_identity(pid: int, aid: str, sync_dir: Path) -> None:
+    """Signal a preclaim runner only if it is still the exact test-owned identity.
+
+    The start-ticks proof recorded when the runner wrote its sync marker is
+    mandatory: a missing, malformed, or unreadable ``.ticks`` proof is treated
+    as observation-only and the PID is never signalled, even when the exact
+    agent environment marker matches.  Only with a valid matching ticks proof
+    *and* the exact agent marker is the identity signalled.
+
+    Args:
+        pid: The preclaim runner process ID.
+        aid: Exact agent ID the runner must belong to.
+        sync_dir: Synchronization directory holding the marker and ticks.
+    """
+    ticks_path = sync_dir / f"runner_preclaim.{pid}.ticks"
+    try:
+        recorded = int(ticks_path.read_text())
+    except (OSError, ValueError):
+        # Missing/malformed/unreadable ticks proof: observation-only, never
+        # signal even if the agent marker matches.
+        return
+    current = agent.proc_start_ticks(pid)
+    if current is None or current != recorded:
+        # Start ticks differ (or are unreadable): the PID was reused or is not
+        # our runner; never signal it.
+        return
+    if not agent.env_has_marker(pid, aid):
+        # Not our runner's exact identity: observation-only.
+        return
+    _kill_runner(pid)
+
+
+def _teardown_runners(aid: str, sync_dir: Path | None = None) -> None:
+    """Stop exactly the runner(s) this test created, by exact identity only.
+
+    No ``/proc`` scan by agent ID, marker, command text, or process name is
+    performed. Two exact sources are consulted:
+
+    * the runner PID the protocol registered in meta, signalled only when the
+      exact ``runner_start_time`` is valid and matches the process's current
+      start ticks *and* the exact agent environment marker is present; missing
+      or invalid ticks fail closed so no PID is signalled; and
+    * the exact PID a runner wrote into this test's unique ``runner_preclaim``
+      reached marker, verified by exact PID + start-ticks (recorded at the
+      marker) and the exact agent environment marker before any signal.
+
+    Unknown leftovers (including reused PIDs) are observations only and are
+    never signalled.
+
+    Args:
+        aid: Exact agent ID whose registered runner to stop.
+        sync_dir: Synchronization directory, or ``None`` when no sync hook was
+            used (only the meta-registered runner is then considered).
+    """
+    meta = agent.read_meta(aid)
+    if meta is not None:
+        pid = meta.get("runner_pid")
+        if pid:
+            pid = int(pid)
+            expected = meta.get("runner_start_time")
+            current = agent.proc_start_ticks(pid)
+            # Signal only with a valid, exactly matching start-ticks identity
+            # *and* the exact agent marker.  Missing or invalid ticks (on either
+            # side) fail closed: the PID is never signalled.
+            if (
+                expected is not None
+                and current is not None
+                and current == int(expected)
+                and agent.env_has_marker(pid, aid)
+            ):
+                _kill_runner(pid)
+    if sync_dir is not None:
+        for reached in _reached_pids(sync_dir, "runner_preclaim"):
+            _maybe_kill_runner_identity(reached, aid, sync_dir)
+
+
+def _assert_exact_runner(pid: int, aid: str, gen: int) -> None:
+    """Assert an exact PID is the live runner for an exact generation.
+
+    Only the single known ``/proc/<pid>`` entry is read (never a scan): it must
+    advertise the exact agent and generation markers, proving the runner this
+    test reserved is the one actually executing and that no second runner
+    exists for this generation.
+
+    Args:
+        pid: The exact runner process ID.
+        aid: Exact agent ID that must be proven.
+        gen: Runner reservation generation that must be proven.
+    """
+    environ = Path(f"/proc/{pid}/environ").read_bytes()
+    fields = environ.split(b"\0")
+    assert f"LUBKO_AGENT_ID={aid}".encode() in fields
+    assert f"LUBKO_RUNNER_GEN={gen}".encode() in fields
+
+
+def spawn_stale_marked_process(aid: str, gen: int) -> subprocess.Popen[bytes]:
+    """Spawn a long-lived process carrying both the agent and generation marker.
+
+    Used to simulate an old-generation runner that is still alive but will
+    never claim the current reservation.
+
+    Args:
+        aid: Agent ID to place in the process environment.
+        gen: Runner generation marker to advertise.
+
+    Returns:
+        The spawned process.
+    """
+    env = dict(os.environ)
+    env["LUBKO_AGENT_ID"] = aid
+    env["LUBKO_RUNNER_GEN"] = str(gen)
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    guard.register(proc)
+    return proc
+
+
+def test_linearizable_two_concurrent_prompts_exactly_one_runner(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Two concurrent ordinary prompts reserve exactly one runner.
+
+    Both callers observe the idle agent, then both reach the runner-decision
+    window under the lock. The first reserves one runner generation and the
+    second observes the reserved invocation and is rejected (busy) instead of
+    overwriting the pending prompt or spawning a second runner.
+    """
+    aid = "bbbbbbbb"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    sync = tmp_path / "sync"
+    p1 = _run_cli(
+        ["prompt", "--id", aid, "--detach", "first"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+    )
+    p2 = _run_cli(
+        ["prompt", "--id", aid, "--detach", "second"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+    )
+    try:
+        _wait_sync_reached(sync, "sc_observe", 2)
+        _release_sync(sync, "sc_observe")
+        _wait_sync_reached(sync, "sc_decide", 2)
+        _release_sync(sync, "sc_decide")
+        _wait_sync_reached(sync, "runner_preclaim", 1)
+        _release_sync(sync, "runner_preclaim")
+        rc1 = p1.wait(timeout=30)
+        rc2 = p2.wait(timeout=30)
+        wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        # Exactly one runner generation owns the agent.
+        assert meta["runner_gen"] == 1
+        runner_pid = int(meta["runner_pid"])
+        assert agent.pid_alive(runner_pid)
+        _assert_exact_runner(runner_pid, aid, 1)
+        # No prompt was silently overwritten or executed twice.
+        assert meta["prompt_count"] == 1
+        assert meta["last_prompt"] in {"first", "second"}
+        # The losing ordinary prompt gets the documented busy outcome.
+        assert sorted([rc1, rc2]) == [agent.EXIT_OK, agent.EXIT_ERROR]
+    finally:
+        _teardown_runners(aid, sync)
+
+
+def test_linearizable_prompt_and_steer_exactly_one_runner(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """A concurrent prompt plus steer reserve exactly one runner.
+
+    The steer is enqueued deterministically and never spawns a competing
+    runner; the single reserved runner owns the invocation stream.
+    """
+    aid = "cccccccc"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    sync = tmp_path / "sync"
+    p_prompt = _run_cli(
+        ["prompt", "--id", aid, "--detach", "primary"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+    )
+    p_steer = _run_cli(
+        ["prompt", "--id", aid, "--steer", "--detach", "redirect"],
+        sync_dir=sync,
+        LUBKO_AGENT_CMD="sleep 300",
+    )
+    try:
+        _wait_sync_reached(sync, "sc_observe", 2)
+        _release_sync(sync, "sc_observe")
+        _wait_sync_reached(sync, "sc_decide", 2)
+        _release_sync(sync, "sc_decide")
+        _wait_sync_reached(sync, "runner_preclaim", 1)
+        _release_sync(sync, "runner_preclaim")
+        p_prompt.wait(timeout=30)
+        p_steer.wait(timeout=30)
+        wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        assert meta["runner_gen"] == 1
+        runner_pid = int(meta["runner_pid"])
+        assert agent.pid_alive(runner_pid)
+        _assert_exact_runner(runner_pid, aid, 1)
+        assert meta["prompt_count"] == 1
+        # Exactly one runner; the steer instruction is deterministically
+        # recorded (as the pending prompt or queued) and never a second runner.
+        # ``pending_prompt`` is consumed by the runner once it starts, so the
+        # durable ``last_prompt`` proves which prompt was reserved.
+        steer_recorded = meta["last_prompt"] == "redirect" or any(
+            q["prompt"] == "redirect" for q in meta["steer_queue"]
+        )
+        assert steer_recorded
+    finally:
+        _teardown_runners(aid, sync)
+
+
+def test_linearizable_two_concurrent_steers_exactly_one_runner(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Two concurrent steers on an idle agent reserve exactly one runner.
+
+    One steer becomes the pending invocation and the other is enqueued in
+    FIFO order; no competing runner is spawned.
+    """
+    aid = "dddddddd"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    sync = tmp_path / "sync"
+    s1 = _run_cli(
+        ["prompt", "--id", aid, "--steer", "--detach", "steer-one"],
+        sync_dir=sync,
+        LUBKO_AGENT_CMD="sleep 300",
+    )
+    s2 = _run_cli(
+        ["prompt", "--id", aid, "--steer", "--detach", "steer-two"],
+        sync_dir=sync,
+        LUBKO_AGENT_CMD="sleep 300",
+    )
+    try:
+        _wait_sync_reached(sync, "sc_observe", 2)
+        _release_sync(sync, "sc_observe")
+        _wait_sync_reached(sync, "sc_decide", 2)
+        _release_sync(sync, "sc_decide")
+        _wait_sync_reached(sync, "runner_preclaim", 1)
+        _release_sync(sync, "runner_preclaim")
+        s1.wait(timeout=30)
+        s2.wait(timeout=30)
+        wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        assert meta["runner_gen"] == 1
+        runner_pid = int(meta["runner_pid"])
+        assert agent.pid_alive(runner_pid)
+        _assert_exact_runner(runner_pid, aid, 1)
+        assert meta["prompt_count"] == 1
+        prompts = [meta["last_prompt"]] + [q["prompt"] for q in meta["steer_queue"]]
+        assert sorted(prompts) == ["steer-one", "steer-two"]
+    finally:
+        _teardown_runners(aid, sync)
+
+
+def test_reserved_runner_death_before_pid_recovery_single_replacement(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Killing the reserved runner before PID registration recovers once.
+
+    The first reserved runner is killed before it records its identity, but its
+    already-accepted ``pending_prompt`` ("doomed") must survive the takeover
+    deterministically. A recovery caller re-owns the exact stale reservation
+    and starts exactly one replacement runner that executes the original prompt;
+    a concurrent second caller is rejected (busy) rather than overwriting the
+    accepted prompt or spawning a second replacement.
+    """
+    aid = "eeeeeeee"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    sync = tmp_path / "sync"
+    first = _run_cli(
+        ["prompt", "--id", aid, "--detach", "doomed"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+    )
+    try:
+        _wait_sync_reached(sync, "sc_observe", 1)
+        _release_sync(sync, "sc_observe")
+        _wait_sync_reached(sync, "sc_decide", 1)
+        _release_sync(sync, "sc_decide")
+        _wait_sync_reached(sync, "runner_preclaim", 1)
+        # The exact reserved runner PID is recovered from its own sync marker,
+        # not by scanning /proc for the agent.
+        doomed = _reached_pids(sync, "runner_preclaim")
+        assert doomed, "reserved runner must exist before PID registration"
+        _kill_runner(doomed[0])
+        _release_sync(sync, "runner_preclaim")
+        first.wait(timeout=30)
+        # Reservation is now stale: trigger recovery with two concurrent callers.
+        # Their own prompts ("recover-one"/"recover-two") must NOT replace the
+        # already-accepted "doomed" prompt.
+        r1 = _run_cli(
+            ["prompt", "--id", aid, "--detach", "recover-one"], LUBKO_AGENT_CMD="sleep 300"
+        )
+        r2 = _run_cli(
+            ["prompt", "--id", aid, "--detach", "recover-two"], LUBKO_AGENT_CMD="sleep 300"
+        )
+        rc1 = r1.wait(timeout=30)
+        rc2 = r2.wait(timeout=30)
+        wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        # Exactly one replacement runner under a FRESH generation (the stale
+        # gen-1 reservation is invalidated); no second runner is spawned.
+        assert meta["runner_gen"] == 2
+        runner_pid = int(meta["runner_pid"])
+        assert agent.pid_alive(runner_pid)
+        _assert_exact_runner(runner_pid, aid, 2)
+        # The original accepted prompt survived takeover: it is the durable
+        # prompt recorded (last_prompt) and was counted exactly once. The
+        # recovery callers' own prompts never replaced it.
+        assert meta["last_prompt"] == "doomed"
+        assert meta["prompt_count"] == 1
+        # The doomed gen-1 runner is gone; only the gen-2 replacement exists.
+        assert not agent.pid_alive(doomed[0])
+        # No submitted text is silently discarded behind a success code: both
+        # recovery callers are explicitly rejected (busy) even though one of
+        # them triggered recovery of the reserved prompt. Neither overwrote the
+        # accepted prompt nor spawned a competing runner.
+        assert rc1 == agent.EXIT_ERROR
+        assert rc2 == agent.EXIT_ERROR
+    finally:
+        _teardown_runners(aid)
+
+
+def test_stale_preclaim_death_recovery_steer_accepted(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """A stale reserved runner with an accepted prompt recovers under --steer.
+
+    The reserved runner dies before PID registration while its accepted prompt
+    ("doomed") is still pending. A ``--steer`` caller takes over the stale
+    reservation, preserves the original accepted prompt, durably queues the
+    steer behind it, spawns exactly one fresh-generation replacement runner, and
+    returns success. An ordinary retry that arrives while the recovered runner
+    is genuinely live is rejected (busy) and never spawns a competing runner.
+    """
+    aid = "cdcdcdcd"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    # Echo the prompt so the durable log proves execution order, and sleep so the
+    # recovered runner stays genuinely live long enough that the ordinary retry
+    # is deterministically rejected rather than racing a finished agent.
+    echo_sleep = 'printf "%s\\n" "$LUBKO_PROMPT"; sleep 4'
+    sync = tmp_path / "sync"
+    first = _run_cli(
+        ["prompt", "--id", aid, "--detach", "doomed"],
+        sync_dir=sync,
+        LUBKO_AGENT_CMD=echo_sleep,
+    )
+    try:
+        _wait_sync_reached(sync, "sc_observe", 1)
+        _release_sync(sync, "sc_observe")
+        _wait_sync_reached(sync, "sc_decide", 1)
+        _release_sync(sync, "sc_decide")
+        _wait_sync_reached(sync, "runner_preclaim", 1)
+        doomed = _reached_pids(sync, "runner_preclaim")
+        assert doomed, "reserved runner must exist before PID registration"
+        _kill_runner(doomed[0])
+        _release_sync(sync, "runner_preclaim")
+        first.wait(timeout=30)
+        # Reservation is now stale: a --steer caller recovers it, preserving the
+        # accepted "doomed" prompt and queuing the steer behind it.
+        steer = _run_cli(
+            ["prompt", "--id", aid, "--steer", "--detach", "recover-steer"],
+            LUBKO_AGENT_CMD=echo_sleep,
+        )
+        rc_steer = steer.wait(timeout=30)
+        # Wait until the recovered replacement runner has claimed (live runner).
+        wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        # Exactly one fresh-generation replacement; the stale gen-1 is gone.
+        assert meta["runner_gen"] == 2
+        assert isinstance(meta["runner_reservation"], dict)
+        assert meta["runner_reservation"]["gen"] == 2
+        runner_pid = int(meta["runner_pid"])
+        assert agent.pid_alive(runner_pid)
+        _assert_exact_runner(runner_pid, aid, 2)
+        assert not agent.pid_alive(doomed[0])
+        # The original accepted prompt survived takeover: it is still first and
+        # the steer was durably queued, never overwriting it.
+        assert meta["last_prompt"] == "doomed"
+        assert meta["prompt_count"] == 1
+        queued = meta.get("steer_queue") or []
+        assert len(queued) == 1
+        assert queued[0]["prompt"] == "recover-steer"
+        # An ordinary retry while the recovered runner is live is rejected busy
+        # and never spawns a competing runner.
+        ordinary = _run_cli(
+            ["prompt", "--id", aid, "--detach", "recover-ordinary"],
+            LUBKO_AGENT_CMD=echo_sleep,
+        )
+        rc_ordinary = ordinary.wait(timeout=30)
+        # An ordinary retry while the recovered runner is live is rejected busy
+        # and never spawns a competing runner.
+        ordinary = _run_cli(
+            ["prompt", "--id", aid, "--detach", "recover-ordinary"],
+            LUBKO_AGENT_CMD=echo_sleep,
+        )
+        rc_ordinary = ordinary.wait(timeout=30)
+        # Wait for the recovered runner (doomed, then the steer) to exit, not
+        # merely for a terminal-derived state: the agent reports terminal
+        # momentarily between the two invocations, so the runner process exit is
+        # the deterministic signal that both ran.
+        wait_until(lambda: not agent.pid_alive(runner_pid), timeout=30)
+        log = (agent.agents_dir() / aid / "output.log").read_text()
+        lines = [line for line in log.splitlines() if line]
+        assert rc_steer == agent.EXIT_OK
+        assert rc_ordinary == agent.EXIT_ERROR
+        # No competing runner: the original accepted prompt ran exactly once and
+        # first, the steer ran exactly once, and the rejected ordinary never ran.
+        assert lines.count("doomed") == 1
+        assert lines.count("recover-steer") == 1
+        assert "recover-ordinary" not in log
+        assert lines.index("doomed") < lines.index("recover-steer")
+    finally:
+        _teardown_runners(aid, sync)
+
+
+def test_linearizable_stress_no_runner_accumulation(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Repeated concurrent prompts never accumulate runner processes.
+
+    Every iteration reserves exactly one runner and the losing prompt is
+    rejected; after each iteration no runner process for that agent remains.
+    """
+    for i in range(8):
+        aid = f"{i:08x}"
+        agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+        sync = tmp_path / f"sync{i}"
+        a = _run_cli(
+            ["prompt", "--id", aid, "--detach", "A"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+        )
+        b = _run_cli(
+            ["prompt", "--id", aid, "--detach", "B"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+        )
+        try:
+            _wait_sync_reached(sync, "sc_observe", 2)
+            _release_sync(sync, "sc_observe")
+            _wait_sync_reached(sync, "sc_decide", 2)
+            _release_sync(sync, "sc_decide")
+            _wait_sync_reached(sync, "runner_preclaim", 1)
+            _release_sync(sync, "runner_preclaim")
+            a.wait(timeout=30)
+            b.wait(timeout=30)
+            wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+            meta = agent.read_meta(aid)
+            assert meta is not None
+            assert meta["runner_gen"] == 1, f"iteration {i}: unexpected generation"
+            runner_pid = int(meta["runner_pid"])
+            assert agent.pid_alive(runner_pid), f"iteration {i}: runner not alive"
+            _assert_exact_runner(runner_pid, aid, 1)
+            assert meta["prompt_count"] == 1
+            _kill_runner(runner_pid)
+            wait_until(functools.partial(_runner_dead, runner_pid), timeout=10)
+        finally:
+            _teardown_runners(aid, sync)
+
+
+def test_stale_old_generation_marker_does_not_block_recovery(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old-generation live marker must not justify a newer reservation.
+
+    A live process advertising an older runner generation for the same agent
+    proves nothing about the current reservation; recovery of the stale newer
+    reservation must proceed and must not be blocked by that process.
+    """
+    aid = "ffffffff"
+    stale = spawn_stale_marked_process(aid, gen=1)
+    try:
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["state"] = "running"
+        meta["active_runner"] = True
+        meta["started_at"] = time.time()
+        meta["runner_gen"] = 2
+        meta["runner_reservation"] = {
+            "gen": 2,
+            "owner_pid": 999999,
+            "state": "reserved",
+            "reserved_at": time.time(),
+            "mode": "new",
+        }
+        agent.write_meta(aid, meta)
+        # The gen-1 marker must not justify the gen-2 reservation.
+        assert agent.reservation_in_flight(meta) is False
+        assert agent.is_genuinely_running(meta) is False
+        # Recovery proceeds and is not blocked by the stale process.
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
+        rc = agent.main(["prompt", "--id", aid, "--detach", "recover"])
+        assert rc == agent.EXIT_OK
+        assert spawned == ["new"]
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["runner_gen"] == 3
+        assert isinstance(after["runner_reservation"], dict)
+        assert after["runner_reservation"]["gen"] == 3
+        # The stale gen-1 process is still alive: recovery was not blocked.
+        assert stale.poll() is None
+    finally:
+        kill_proc(stale)
+
+
+def test_active_runner_requires_live_identity_or_reservation(tmp_path: Path) -> None:
+    """``active_runner`` is only justified by a live identity or reservation.
+
+    A stale state that leaves ``active_runner`` true without either a proven
+    live runner or an explicit recoverable reservation is never justified.
+    """
+    aid = "aaaaaaaa"
+    live = spawn_marked_process(aid)
+    try:
+        justified = agent.idle_meta(aid, str(tmp_path), None)
+        justified["state"] = "running"
+        justified["active_runner"] = True
+        justified["runner_pid"] = live.pid
+        justified["runner_start_time"] = agent.proc_start_ticks(live.pid)
+        assert agent.active_runner_justified(justified) is True
+
+        no_identity = agent.idle_meta(aid, str(tmp_path), None)
+        no_identity["active_runner"] = True
+        assert agent.active_runner_justified(no_identity) is False
+
+        stale_reservation = agent.idle_meta(aid, str(tmp_path), None)
+        stale_reservation["active_runner"] = True
+        stale_reservation["runner_reservation"] = {
+            "gen": 1,
+            "owner_pid": 999999,
+            "state": "reserved",
+            "reserved_at": 0.0,
+            "mode": "new",
+        }
+        # A reserved reservation is explicitly recoverable, so it justifies
+        # ``active_runner`` even though its spawner is already dead.
+        assert agent.active_runner_justified(stale_reservation) is True
+
+        claimed_dead = agent.idle_meta(aid, str(tmp_path), None)
+        claimed_dead["active_runner"] = True
+        claimed_dead["runner_reservation"] = {
+            "gen": 1,
+            "owner_pid": 999999,
+            "state": "claimed",
+            "reserved_at": 0.0,
+            "mode": "new",
+        }
+        # A claimed reservation whose runner is no longer provably alive is
+        # stuck and must never justify ``active_runner``.
+        assert agent.active_runner_justified(claimed_dead) is False
+
+        live_reservation = agent.idle_meta(aid, str(tmp_path), None)
+        live_reservation["active_runner"] = True
+        live_reservation["runner_reservation"] = {
+            "gen": 1,
+            "owner_pid": os.getpid(),
+            "state": "reserved",
+            "reserved_at": 0.0,
+            "mode": "new",
+        }
+        assert agent.active_runner_justified(live_reservation) is True
+
+        inactive = agent.idle_meta(aid, str(tmp_path), None)
+        inactive["active_runner"] = False
+        assert agent.active_runner_justified(inactive) is True
+    finally:
+        kill_proc(live)
