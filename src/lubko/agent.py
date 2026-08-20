@@ -1027,17 +1027,8 @@ def runner(aid: str, mode: str) -> None:
     def claim(m: Meta) -> None:
         res = m.get("runner_reservation")
         if not isinstance(res, dict):
-            if gen == 0:
-                # No reservation (for example a directly invoked runner in
-                # tests): claim unconditionally so the runner owns its identity.
-                m["runner_pid"] = os.getpid()
-                m["runner_start_time"] = proc_start_ticks(os.getpid())
-                m["active_runner"] = True
-                m["state"] = "running"
-                claimed["ok"] = True
-                return
-            # A production runner carrying a nonzero reserved generation but no
-            # matching reservation must fail closed and never execute.
+            # No reservation: a production runner must never execute without an
+            # exact reserved generation.  Fail closed.
             claimed["ok"] = False
             return
         if res.get("state") != "reserved":
@@ -1045,11 +1036,10 @@ def runner(aid: str, mode: str) -> None:
             # execute.  (A genuinely live claimed runner is the only owner.)
             claimed["ok"] = False
             return
-        if gen != 0 and res.get("gen") != gen:
-            # Production runner: only the exact reserved generation may run.  A
-            # duplicate spawned before the protocol was fixed, or a stale
-            # replacement whose reservation was taken over, bails instead of
-            # double-executing — the exact reserved generation must still exist.
+        if gen == 0 or res.get("gen") != gen:
+            # Only the exact reserved generation may run.  A missing or zero
+            # generation, or a duplicate/stale replacement whose generation no
+            # longer matches, bails instead of double-executing.
             claimed["ok"] = False
             return
         m["runner_pid"] = os.getpid()
@@ -1781,13 +1771,39 @@ def _recover_stale_reservation(
     return True
 
 
+def _resolve_session_mode(m: Meta) -> str | None:
+    """Return the native-session mode derived from the locked agent state.
+
+    The mode (``new`` or ``continue``) is resolved under the per-agent metadata
+    lock from the current agent state, never from a stale pre-lock observation.
+    A recorded underlying session that can no longer be discovered fails closed
+    (``None``), and otherwise the mode is ``continue`` when a native session is
+    recorded or discoverable and ``new`` otherwise.
+
+    Args:
+        m: Agent metadata under the lock.
+
+    Returns:
+        ``"new"``, ``"continue"``, or ``None`` when the session is gone.
+    """
+    recorded = m.get("native_session_id")
+    # Always rediscover under the lock: external session availability is the
+    # authority, and a stale discovery before the lock must never authorize a
+    # second ``new`` session.
+    discovered = discover_session_id(m.get("id", "")) or None
+    if recorded is not None and discovered is None:
+        # A recorded underlying session that can no longer be found must fail
+        # closed rather than silently starting a fresh one.
+        return None
+    return "continue" if (recorded or discovered) is not None else "new"
+
+
 def _decide_invocation(
     m: Meta,
     decision: dict[str, object],
     *,
     prompt: str,
     steer: bool,
-    mode: str,
 ) -> None:
     """Apply one linearizable prompt/steer transition atomically.
 
@@ -1795,12 +1811,46 @@ def _decide_invocation(
     in place and records the caller's next action in ``decision``. The full
     decision order is documented on ``_dispatch_invocation``.
 
+    The native-session mode (``new`` or ``continue``) is derived here, under the
+    lock, from the current agent state rather than from a stale pre-lock
+    observation.  This closes the observe→lock TOCTOU: a caller that initially
+    sees no underlying session but loses the race to another invocation
+    continues the session that invocation established instead of reserving a
+    second ``new`` session from stale information.
+
     Args:
         m: Agent metadata under the lock.
         decision: Caller-owned mapping filled with the resulting action.
         prompt: Instruction to run or steer.
         steer: Whether this is a steer rather than an ordinary prompt.
-        mode: Native session mode (``new`` or ``continue``).
+    """
+    mode = _resolve_session_mode(m)
+    if mode is None:
+        decision["action"] = "error_session_gone"
+        return
+    _apply_locked_transition(m, decision, prompt=prompt, steer=steer, mode=mode)
+
+
+def _apply_locked_transition(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    steer: bool,
+    mode: str,
+) -> None:
+    """Apply the linearizable prompt/steer transition under the metadata lock.
+
+    Assumes the native-session ``mode`` has already been resolved under the lock
+    (see ``_resolve_session_mode``).  Mutates ``m`` in place and records the
+    caller's next action in ``decision``.
+
+    Args:
+        m: Agent metadata under the lock.
+        decision: Caller-owned mapping filled with the resulting action.
+        prompt: Instruction to run or steer.
+        steer: Whether this is a steer rather than an ordinary prompt.
+        mode: Resolved native-session mode (``new`` or ``continue``).
     """
     now = time.time()
     caller_pid = os.getpid()
@@ -1913,23 +1963,20 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    recorded = meta.get("native_session_id")
-    discovered = discover_session_id(aid)
-    if recorded is not None and discovered is None:
-        _err(f"{PROG}: cannot continue agent {aid}: its underlying session is not available")
-        return EXIT_ERROR
-    mode = "continue" if (recorded or discovered) is not None else "new"
 
     _test_sync("sc_observe")
 
     decision: dict[str, object] = {}
     update_meta(
         aid,
-        lambda m: _decide_invocation(m, decision, prompt=prompt, steer=steer, mode=mode),
+        lambda m: _decide_invocation(m, decision, prompt=prompt, steer=steer),
     )
     _test_sync("sc_decide")
 
     action = decision.get("action")
+    if action == "error_session_gone":
+        _err(f"{PROG}: cannot continue agent {aid}: its underlying session is not available")
+        return EXIT_ERROR
     if action == "busy":
         _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
         return EXIT_ERROR

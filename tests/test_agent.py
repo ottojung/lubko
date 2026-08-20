@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -128,6 +129,41 @@ def make_agent(
     meta.update(overrides)
     agent.write_meta(aid, meta)
     return meta
+
+
+def reserve_runner_generation(
+    aid: str,
+    *,
+    gen: int = 1,
+    mode: str = "new",
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Establish an explicit reserved runner generation for a direct runner.
+
+    The production runner fails closed unless it carries the exact reserved
+    generation, so an in-process ``agent.runner()`` call must first install a
+    matching reservation and set ``LUBKO_RUNNER_GEN``.  The reservation is owned
+    by the current test process, which is exactly the process that will run the
+    runner.
+
+    Args:
+        aid: Exact agent ID.
+        gen: Reserved generation the runner must carry.
+        mode: Reservation mode (``new`` or ``continue``).
+        monkeypatch: Test monkeypatch used to set the runner generation env.
+    """
+    meta = agent.read_meta(aid)
+    assert meta is not None, f"agent {aid} must exist before reserving"
+    meta["runner_reservation"] = {
+        "gen": gen,
+        "owner_pid": os.getpid(),
+        "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
+        "state": "reserved",
+        "reserved_at": time.time(),
+        "mode": mode,
+    }
+    agent.write_meta(aid, meta)
+    monkeypatch.setenv("LUBKO_RUNNER_GEN", str(gen))
 
 
 def fake_agent_command(_meta: agent.Meta, _prompt: str, *, is_continue: bool) -> list[str]:
@@ -934,7 +970,22 @@ def test_cmd_prompt_attached_normalizes_colored_output(
     runner_threads: list[threading.Thread] = []
 
     def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
-        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+        # The production runner fails closed unless it carries the exact reserved
+        # generation, so the in-thread runner must be told the generation the
+        # locked decision reserved.  Scope the env override to the runner thread
+        # and restore it afterwards so it never leaks into other tests.
+        def _target() -> None:
+            prev = os.environ.get("LUBKO_RUNNER_GEN")
+            os.environ["LUBKO_RUNNER_GEN"] = str(_extra.get("gen", 1))
+            try:
+                agent.runner(_aid, mode)
+            finally:
+                if prev is None:
+                    os.environ.pop("LUBKO_RUNNER_GEN", None)
+                else:
+                    os.environ["LUBKO_RUNNER_GEN"] = prev
+
+        thread = threading.Thread(target=_target, daemon=True)
         thread.start()
         runner_threads.append(thread)
 
@@ -1212,7 +1263,22 @@ def test_prompt_retries_failed_first_attempt_as_new_session(
     runner_threads: list[threading.Thread] = []
 
     def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
-        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+        # The production runner fails closed unless it carries the exact reserved
+        # generation, so the in-thread runner must be told the generation the
+        # locked decision reserved.  Scope the env override to the runner thread
+        # and restore it afterwards so it never leaks into other tests.
+        def _target() -> None:
+            prev = os.environ.get("LUBKO_RUNNER_GEN")
+            os.environ["LUBKO_RUNNER_GEN"] = str(_extra.get("gen", 1))
+            try:
+                agent.runner(_aid, mode)
+            finally:
+                if prev is None:
+                    os.environ.pop("LUBKO_RUNNER_GEN", None)
+                else:
+                    os.environ["LUBKO_RUNNER_GEN"] = prev
+
+        thread = threading.Thread(target=_target, daemon=True)
         thread.start()
         runner_threads.append(thread)
 
@@ -1272,7 +1338,22 @@ def test_cmd_prompt_attached_follows_and_propagates_exit_code(
     runner_threads: list[threading.Thread] = []
 
     def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
-        thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
+        # The production runner fails closed unless it carries the exact reserved
+        # generation, so the in-thread runner must be told the generation the
+        # locked decision reserved.  Scope the env override to the runner thread
+        # and restore it afterwards so it never leaks into other tests.
+        def _target() -> None:
+            prev = os.environ.get("LUBKO_RUNNER_GEN")
+            os.environ["LUBKO_RUNNER_GEN"] = str(_extra.get("gen", 1))
+            try:
+                agent.runner(_aid, mode)
+            finally:
+                if prev is None:
+                    os.environ.pop("LUBKO_RUNNER_GEN", None)
+                else:
+                    os.environ["LUBKO_RUNNER_GEN"] = prev
+
+        thread = threading.Thread(target=_target, daemon=True)
         thread.start()
         runner_threads.append(thread)
 
@@ -1430,6 +1511,7 @@ def test_runner_runs_invocation_and_records_result(
     """The runner executes one invocation and records a success result."""
     make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "new")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1447,6 +1529,7 @@ def test_runner_drains_queued_steers(state_dir: Path, monkeypatch: pytest.Monkey
     meta["steer_seq"] = 1
     agent.write_meta("aaaaaaaa", meta)
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "new")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1467,6 +1550,7 @@ def test_runner_records_failure(state_dir: Path, monkeypatch: pytest.MonkeyPatch
         return ["sh", "-c", "exit 7"]
 
     monkeypatch.setattr(agent, "build_agent_command", failing_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "new")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1483,6 +1567,7 @@ def test_runner_fails_without_continuation_session(
     meta["pending_prompt"] = "continue this"
     agent.write_meta("aaaaaaaa", meta)
     monkeypatch.setattr(agent, "discover_session_id", lambda _aid: None)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="continue", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "continue")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1647,6 +1732,7 @@ def test_runner_does_not_drop_concurrently_queued_prompt(
         return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
 
     monkeypatch.setattr(agent, "build_agent_command", racing_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="continue", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "continue")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1672,6 +1758,7 @@ def test_runner_runs_prompt_queued_during_invocation(
         return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
 
     monkeypatch.setattr(agent, "build_agent_command", queuing_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "new")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1691,6 +1778,7 @@ def test_runner_reclaims_queued_steer_on_start(
     meta["steer_seq"] = 1
     agent.write_meta("aaaaaaaa", meta)
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="continue", monkeypatch=monkeypatch)
     agent.runner("aaaaaaaa", "continue")
     result = agent.read_meta("aaaaaaaa")
     assert result is not None
@@ -1715,6 +1803,7 @@ def test_runner_abnormal_exit_kills_invocation_group(
         raise RuntimeError(msg)
 
     monkeypatch.setattr(agent, "_wait_for_invocation_exit", boom)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
     with pytest.raises(RuntimeError, match="simulated"):
         agent.runner("aaaaaaaa", "new")
 
@@ -1935,6 +2024,115 @@ def test_runner_fails_closed_without_matching_reservation(
     assert result is not None
     assert result.get("runner_pid") is None
     assert result.get("active_runner") is False
+
+
+def test_runner_fails_closed_with_zero_generation_and_no_reservation(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner carrying generation zero with no reservation fails closed.
+
+    A production runner must never execute without an exact reserved generation;
+    a missing/zero generation with no reservation is not a legacy in-process
+    fallback and must bail instead of claiming or running an invocation.
+    """
+    aid = "11111111"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    monkeypatch.setenv("LUBKO_RUNNER_GEN", "0")
+    agent.runner(aid, "new")
+    result = agent.read_meta(aid)
+    assert result is not None
+    assert result.get("runner_pid") is None
+    assert result.get("active_runner") is False
+
+
+def test_runner_fails_closed_with_zero_generation_against_nonzero_reservation(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero/missing generation cannot claim a nonzero reserved generation.
+
+    The runner must carry the exact reserved generation; a zero or absent
+    generation arriving against a live nonzero reservation fails closed rather
+    than executing under a stolen generation.
+    """
+    aid = "22222222"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    # A direct runner helper creates the explicit nonzero reservation the runner
+    # must carry; the reservation is owned by this process as a real runner
+    # would be.  The failing runner below deliberately arrives without it.
+    reserve_runner_generation(aid, gen=5, mode="new", monkeypatch=monkeypatch)
+    # Zero generation: must not claim the gen-5 reservation.
+    monkeypatch.setenv("LUBKO_RUNNER_GEN", "0")
+    agent.runner(aid, "new")
+    zero = agent.read_meta(aid)
+    assert zero is not None
+    assert zero.get("runner_pid") is None
+    assert zero.get("active_runner") is False
+    # Absent generation (env unset): equally must fail closed.
+    monkeypatch.delenv("LUBKO_RUNNER_GEN", raising=False)
+    agent.runner(aid, "new")
+    absent = agent.read_meta(aid)
+    assert absent is not None
+    assert absent.get("runner_pid") is None
+    assert absent.get("active_runner") is False
+
+
+def test_prompt_continues_established_session_not_second_new(
+    state_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that loses the session race continues, not a second new.
+
+    The caller observes no native session, but another invocation establishes
+    one before the caller's locked decision. Because the native-session mode is
+    derived inside the lock from the current state, the caller reserves
+    ``continue`` for the established session instead of a second ``new`` one
+    (which would have happened under the stale observe→lock TOCTOU).
+    """
+    aid = "dddddddd"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+
+    # A discoverable underlying session registry, initially empty; the session is
+    # established only after the caller pauses at its decision boundary.
+    data_home = tmp_path / "data"
+    data_home.mkdir(parents=True, exist_ok=True)
+    db = data_home / "opencode" / "opencode.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS session (id TEXT, title TEXT, time_created TEXT)")
+        conn.commit()
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+
+    sync = tmp_path / "sync"
+    # Drive the caller as a real subprocess (valid signal setup) and pause it at
+    # sc_observe, with no session discoverable yet.
+    caller = _run_cli(["prompt", "--id", aid, "--detach", "task"], sync_dir=sync)
+    try:
+        _wait_sync_reached(sync, "sc_observe", 1)
+        # Another invocation establishes the native session before the caller's
+        # locked decision.
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute(
+                "INSERT INTO session (id, title, time_created) VALUES (?, ?, ?)",
+                ("sess-established", agent.OPENCODE_TITLE_PREFIX + aid, str(time.time())),
+            )
+            conn.commit()
+        _release_sync(sync, "sc_observe")
+        # The dispatch also pauses at sc_decide; release it so the caller proceeds.
+        _release_sync(sync, "sc_decide")
+        rc = caller.wait(timeout=30)
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert rc == agent.EXIT_OK
+        # The caller must continue the established session, not reserve a second
+        # new session from stale information.
+        assert isinstance(after.get("runner_reservation"), dict)
+        assert after["runner_reservation"]["mode"] == "continue"
+    finally:
+        _teardown_runners(aid, sync)
+        caller.wait(timeout=5)
 
 
 def test_owned_by_me_fails_closed_without_valid_ticks(
@@ -2638,19 +2836,6 @@ def test_reserved_runner_death_before_pid_recovery_single_replacement(
         _teardown_runners(aid)
 
 
-def _agent_terminal(aid: str) -> bool:
-    """Return whether the agent has reached a terminal state.
-
-    Args:
-        aid: Exact agent ID.
-
-    Returns:
-        ``True`` once the agent is no longer running.
-    """
-    meta = agent.read_meta(aid)
-    return meta is not None and agent.derive_state(meta) in agent.TERMINAL_STATES
-
-
 def test_stale_preclaim_death_recovery_steer_accepted(
     state_dir: Path,
     tmp_path: Path,
@@ -2720,8 +2905,18 @@ def test_stale_preclaim_death_recovery_steer_accepted(
             LUBKO_AGENT_CMD=echo_sleep,
         )
         rc_ordinary = ordinary.wait(timeout=30)
-        # Wait for the recovered runner to finish (doomed, then the steer).
-        wait_until(functools.partial(_agent_terminal, aid), timeout=30)
+        # An ordinary retry while the recovered runner is live is rejected busy
+        # and never spawns a competing runner.
+        ordinary = _run_cli(
+            ["prompt", "--id", aid, "--detach", "recover-ordinary"],
+            LUBKO_AGENT_CMD=echo_sleep,
+        )
+        rc_ordinary = ordinary.wait(timeout=30)
+        # Wait for the recovered runner (doomed, then the steer) to exit, not
+        # merely for a terminal-derived state: the agent reports terminal
+        # momentarily between the two invocations, so the runner process exit is
+        # the deterministic signal that both ran.
+        wait_until(lambda: not agent.pid_alive(runner_pid), timeout=30)
         log = (agent.agents_dir() / aid / "output.log").read_text()
         lines = [line for line in log.splitlines() if line]
         assert rc_steer == agent.EXIT_OK
