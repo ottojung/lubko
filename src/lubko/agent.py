@@ -580,12 +580,14 @@ def reservation_in_flight(meta: Meta) -> bool:
     return _runner_marker_alive(meta.get("id", "") or "", int(res.get("gen") or 0))
 
 
-def _owned_by_me(meta: Meta, caller_pid: int) -> bool:
+def owned_by_me(meta: Meta, caller_pid: int) -> bool:
     """Return whether the current runner reservation is owned by ``caller_pid``.
 
     The reservation is owned by the caller only when its PID *and* its start
-    ticks both match, so a reused PID that belongs to an unrelated process
-    cannot be mistaken for the exact original owner.
+    ticks both match.  Both the current and the recorded start ticks must be
+    valid (not ``None``) and equal, so a missing/unreadable tick record or a
+    reused PID that belongs to an unrelated process can never be mistaken for
+    the exact original owner.
 
     Args:
         meta: Agent metadata.
@@ -596,11 +598,11 @@ def _owned_by_me(meta: Meta, caller_pid: int) -> bool:
         owner.
     """
     res = meta.get("runner_reservation")
-    return (
-        isinstance(res, dict)
-        and res.get("owner_pid") == caller_pid
-        and proc_start_ticks(caller_pid) == res.get("owner_start_ticks")
-    )
+    if not isinstance(res, dict) or res.get("owner_pid") != caller_pid:
+        return False
+    recorded = res.get("owner_start_ticks")
+    current = proc_start_ticks(caller_pid)
+    return recorded is not None and current is not None and current == recorded
 
 
 def is_genuinely_running(meta: Meta) -> bool:
@@ -1747,7 +1749,7 @@ def _decide_invocation(
             _queue_steer(m, prompt, now)
             decision["action"] = "reuse"
             decision["interrupt"] = False
-        elif not _owned_by_me(m, caller_pid):
+        elif not owned_by_me(m, caller_pid):
             decision["action"] = "busy"
         else:
             m["pending_prompt"] = prompt

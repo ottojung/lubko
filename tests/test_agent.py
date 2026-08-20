@@ -1937,6 +1937,126 @@ def test_runner_fails_closed_without_matching_reservation(
     assert result.get("active_runner") is False
 
 
+def test_owned_by_me_fails_closed_without_valid_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``owned_by_me`` requires valid, equal current and recorded start ticks.
+
+    Both the current and the recorded start ticks must be valid (not ``None``)
+    and equal; a missing, unreadable, or mismatched tick record fails closed so
+    a reused or unverifiable PID is never treated as the reservation owner.
+    """
+    aid = "77777777"
+    me = os.getpid()
+    real_ticks = agent.proc_start_ticks(me)
+    meta = agent.idle_meta(aid, "/workspace", None)
+    meta["runner_reservation"] = {
+        "gen": 1,
+        "owner_pid": me,
+        "owner_start_ticks": real_ticks,
+        "state": "reserved",
+        "reserved_at": time.time(),
+        "mode": "new",
+    }
+    # Valid match: current and recorded ticks are valid and equal.
+    assert agent.owned_by_me(meta, me) is True
+
+    # Current ticks unavailable -> fail closed even though the record matches.
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: None)
+    assert agent.owned_by_me(meta, me) is False
+
+    # Current ticks mismatched -> fail closed.
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: (real_ticks or 0) + 1)
+    assert agent.owned_by_me(meta, me) is False
+
+    # Recorded ticks missing (None) -> fail closed even if current is valid.
+    meta["runner_reservation"]["owner_start_ticks"] = None
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: real_ticks)
+    assert agent.owned_by_me(meta, me) is False
+
+
+def test_metadata_teardown_fails_closed_without_valid_ticks_or_marker(
+    state_dir: Path,
+) -> None:
+    """Meta teardown signals only with valid ticks and the exact agent marker.
+
+    A registered runner PID is signalled only when ``runner_start_time`` is
+    valid and matches the live process's current start ticks *and* the exact
+    agent environment marker is present. Missing or invalid ticks (either side)
+    or a missing marker leave the process observation-only (never signalled).
+    """
+    aid = "88888888"
+    owned = spawn_stale_marked_process(aid, gen=1)
+    other = spawn_marked_process("bbbbbbbb")
+    try:
+        # Case 1: runner_start_time missing -> fail closed, never signal.
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["active_runner"] = True
+        meta["runner_pid"] = owned.pid
+        meta["runner_start_time"] = None
+        agent.write_meta(aid, meta)
+        _teardown_runners(aid)
+        assert owned.poll() is None
+
+        # Case 2: valid ticks but the process lacks the exact marker -> never
+        # signal.
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["active_runner"] = True
+        meta["runner_pid"] = other.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(other.pid)
+        agent.write_meta(aid, meta)
+        _teardown_runners(aid)
+        assert other.poll() is None
+
+        # Case 3: valid ticks + exact marker -> signalled.
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["active_runner"] = True
+        meta["runner_pid"] = owned.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(owned.pid)
+        agent.write_meta(aid, meta)
+        _teardown_runners(aid)
+        wait_until(lambda: owned.poll() is not None, timeout=10)
+    finally:
+        kill_proc(owned)
+        kill_proc(other)
+
+
+def test_preclaim_teardown_requires_valid_ticks_proof(
+    tmp_path: Path,
+) -> None:
+    """Preclaim teardown signals only with a valid, matching ``.ticks`` proof.
+
+    A missing, malformed, or unreadable start-ticks proof is observation-only
+    and the PID is never signalled, even when the exact agent marker matches.
+    Only a valid matching ticks-proof *and* the exact agent marker are
+    signalled.
+    """
+    aid = "99999999"
+    owned = spawn_stale_marked_process(aid, gen=1)
+    try:
+        sync = tmp_path / "sync"
+        sync.mkdir(parents=True, exist_ok=True)
+        (sync / f"runner_preclaim.{owned.pid}.reached").touch()
+
+        # Missing .ticks proof: marker matches but no proof -> observation-only.
+        _teardown_runners(aid, sync)
+        assert owned.poll() is None
+
+        # Malformed .ticks proof: unreadable as an int -> observation-only.
+        (sync / f"runner_preclaim.{owned.pid}.ticks").write_text("not-an-int")
+        _teardown_runners(aid, sync)
+        assert owned.poll() is None
+
+        # Valid matching .ticks proof + exact marker -> signalled.
+        (sync / f"runner_preclaim.{owned.pid}.ticks").write_text(
+            str(agent.proc_start_ticks(owned.pid))
+        )
+        _teardown_runners(aid, sync)
+        wait_until(lambda: owned.poll() is not None, timeout=10)
+    finally:
+        kill_proc(owned)
+
+
 def test_cmd_stop_escalates_to_sigkill_when_group_survives(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2188,10 +2308,11 @@ def _kill_runner(pid: int) -> None:
 def _maybe_kill_runner_identity(pid: int, aid: str, sync_dir: Path) -> None:
     """Signal a preclaim runner only if it is still the exact test-owned identity.
 
-    The PID is verified against the start ticks recorded when the runner wrote
-    its sync marker and against the exact agent environment marker. A PID that
-    was reused by an unrelated process (mismatched ticks, or no matching agent
-    marker) is observation-only and is never signalled.
+    The start-ticks proof recorded when the runner wrote its sync marker is
+    mandatory: a missing, malformed, or unreadable ``.ticks`` proof is treated
+    as observation-only and the PID is never signalled, even when the exact
+    agent environment marker matches.  Only with a valid matching ticks proof
+    *and* the exact agent marker is the identity signalled.
 
     Args:
         pid: The preclaim runner process ID.
@@ -2199,13 +2320,17 @@ def _maybe_kill_runner_identity(pid: int, aid: str, sync_dir: Path) -> None:
         sync_dir: Synchronization directory holding the marker and ticks.
     """
     ticks_path = sync_dir / f"runner_preclaim.{pid}.ticks"
-    if ticks_path.is_file():
-        with contextlib.suppress(ValueError):
-            recorded = int(ticks_path.read_text())
-            current = agent.proc_start_ticks(pid)
-            if current is None or current != recorded:
-                # Start ticks differ: the PID was reused; never signal it.
-                return
+    try:
+        recorded = int(ticks_path.read_text())
+    except (OSError, ValueError):
+        # Missing/malformed/unreadable ticks proof: observation-only, never
+        # signal even if the agent marker matches.
+        return
+    current = agent.proc_start_ticks(pid)
+    if current is None or current != recorded:
+        # Start ticks differ (or are unreadable): the PID was reused or is not
+        # our runner; never signal it.
+        return
     if not agent.env_has_marker(pid, aid):
         # Not our runner's exact identity: observation-only.
         return
@@ -2218,9 +2343,10 @@ def _teardown_runners(aid: str, sync_dir: Path | None = None) -> None:
     No ``/proc`` scan by agent ID, marker, command text, or process name is
     performed. Two exact sources are consulted:
 
-    * the runner PID the protocol registered in meta, verified against the
-      exact ``runner_start_time`` so a reused PID naming an unrelated process
-      is never signalled; and
+    * the runner PID the protocol registered in meta, signalled only when the
+      exact ``runner_start_time`` is valid and matches the process's current
+      start ticks *and* the exact agent environment marker is present; missing
+      or invalid ticks fail closed so no PID is signalled; and
     * the exact PID a runner wrote into this test's unique ``runner_preclaim``
       reached marker, verified by exact PID + start-ticks (recorded at the
       marker) and the exact agent environment marker before any signal.
@@ -2239,7 +2365,16 @@ def _teardown_runners(aid: str, sync_dir: Path | None = None) -> None:
         if pid:
             pid = int(pid)
             expected = meta.get("runner_start_time")
-            if expected is None or agent.proc_start_ticks(pid) == int(expected):
+            current = agent.proc_start_ticks(pid)
+            # Signal only with a valid, exactly matching start-ticks identity
+            # *and* the exact agent marker.  Missing or invalid ticks (on either
+            # side) fail closed: the PID is never signalled.
+            if (
+                expected is not None
+                and current is not None
+                and current == int(expected)
+                and agent.env_has_marker(pid, aid)
+            ):
                 _kill_runner(pid)
     if sync_dir is not None:
         for reached in _reached_pids(sync_dir, "runner_preclaim"):
