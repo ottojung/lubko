@@ -1694,8 +1694,7 @@ def _recover_stale_reservation(
     decision: dict[str, object],
     *,
     prompt: str,
-    now: float,
-    caller_pid: int,
+    steer: bool,
 ) -> bool:
     """Recover a stale reserved runner, preserving the accepted pending prompt.
 
@@ -1706,22 +1705,31 @@ def _recover_stale_reservation(
     runner.
 
     The already-accepted pending prompt is preserved and never overwritten. When
-    an accepted prompt exists the new caller's own prompt is explicitly
-    rejected (the caller receives a busy disposition) while recovery still
-    proceeds; when none was accepted the caller's prompt becomes the recovered
-    prompt and is accepted. In both cases the recovery caller's text is never
-    silently discarded behind a success code.
+    an accepted prompt exists:
+
+    * an ordinary recovery caller is explicitly rejected (its own prompt is
+      discarded with a busy disposition) while recovery of the original prompt
+      still proceeds; and
+    * a ``--steer`` recovery caller queues the steer deterministically behind
+      the recovered invocation using the existing steer semantics, is durably
+      accepted (the caller receives success), and still lets exactly one
+      replacement runner execute the original prompt.
+
+    When no accepted prompt survived, the recovery caller's prompt is the one to
+    run and is accepted; a stale/idle ``--steer`` is then equivalent to an
+    ordinary prompt. In every case the recovery caller's text is never silently
+    discarded behind a success code.
 
     A concurrent second recovery caller acquires the lock after the first has
     re-owned the reservation, observes it genuinely in flight, and is rejected
-    as busy without spawning a second replacement.
+    as busy (ordinary) or serialized as a queued steer (``--steer``) without
+    spawning a second replacement.
 
     Args:
         m: Agent metadata under the lock.
         decision: Caller-owned mapping filled with the resulting action.
-        prompt: The new caller's prompt.
-        now: Decision timestamp.
-        caller_pid: PID of the recovering caller.
+        prompt: The new caller's prompt or steer.
+        steer: Whether the recovery caller is a ``--steer``.
 
     Returns:
         ``True`` when a stale reservation was recovered here.
@@ -1731,12 +1739,29 @@ def _recover_stale_reservation(
         return False
     if reservation_in_flight(m):
         return False
+    now = time.time()
+    caller_pid = os.getpid()
     gen = int(m.get("runner_gen") or 0) + 1
     take_mode = res.get("mode") or "new"
     accepted = bool(m.get("pending_prompt"))
-    if not accepted:
-        # No accepted prompt survived; the recovery caller's prompt is the one
-        # to run and is accepted (never silently discarded).
+    if accepted:
+        if steer:
+            # A --steer that discovers the same stale reservation queues the
+            # steer deterministically behind the recovered invocation using the
+            # existing steer semantics, is durably accepted (success), and lets
+            # exactly one replacement runner execute the original prompt. The
+            # accepted pending prompt is never overwritten.
+            _queue_steer(m, prompt, now)
+            decision["steer_accepted"] = True
+        else:
+            # An ordinary recovery caller must not overwrite the accepted prompt;
+            # its own prompt is explicitly rejected (busy) while recovery of the
+            # original prompt proceeds via the spawned replacement runner.
+            decision["recover_busy"] = True
+    else:
+        # No accepted prompt survived: the recovery caller's prompt is the one
+        # to run and is accepted. A stale/idle --steer is equivalent to an
+        # ordinary prompt here, so it simply owns the recovered invocation.
         m["pending_prompt"] = prompt
         m["last_prompt"] = _truncate(prompt, 500)
         m["prompt_count"] = int(m.get("prompt_count") or 0) + 1
@@ -1753,10 +1778,6 @@ def _recover_stale_reservation(
     decision["action"] = "spawn"
     decision["mode"] = take_mode
     decision["gen"] = gen
-    # When an accepted prompt already exists the caller's own prompt is rejected
-    # with an explicit busy disposition while recovery of the old prompt still
-    # proceeds via the spawned replacement runner.
-    decision["recover_busy"] = accepted
     return True
 
 
@@ -1830,7 +1851,7 @@ def _decide_invocation(
     # A stale reserved runner (spawner or runner died before claiming its exact
     # identity) is recovered here: the accepted pending prompt is preserved and
     # exactly one replacement runner is started under a fresh generation.
-    if _recover_stale_reservation(m, decision, prompt=prompt, now=now, caller_pid=caller_pid):
+    if _recover_stale_reservation(m, decision, prompt=prompt, steer=steer):
         return
 
     # Nothing is genuinely in flight and no stale reservation to recover: own

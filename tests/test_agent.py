@@ -2638,6 +2638,104 @@ def test_reserved_runner_death_before_pid_recovery_single_replacement(
         _teardown_runners(aid)
 
 
+def _agent_terminal(aid: str) -> bool:
+    """Return whether the agent has reached a terminal state.
+
+    Args:
+        aid: Exact agent ID.
+
+    Returns:
+        ``True`` once the agent is no longer running.
+    """
+    meta = agent.read_meta(aid)
+    return meta is not None and agent.derive_state(meta) in agent.TERMINAL_STATES
+
+
+def test_stale_preclaim_death_recovery_steer_accepted(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """A stale reserved runner with an accepted prompt recovers under --steer.
+
+    The reserved runner dies before PID registration while its accepted prompt
+    ("doomed") is still pending. A ``--steer`` caller takes over the stale
+    reservation, preserves the original accepted prompt, durably queues the
+    steer behind it, spawns exactly one fresh-generation replacement runner, and
+    returns success. An ordinary retry that arrives while the recovered runner
+    is genuinely live is rejected (busy) and never spawns a competing runner.
+    """
+    aid = "cdcdcdcd"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    # Echo the prompt so the durable log proves execution order, and sleep so the
+    # recovered runner stays genuinely live long enough that the ordinary retry
+    # is deterministically rejected rather than racing a finished agent.
+    echo_sleep = 'printf "%s\\n" "$LUBKO_PROMPT"; sleep 4'
+    sync = tmp_path / "sync"
+    first = _run_cli(
+        ["prompt", "--id", aid, "--detach", "doomed"],
+        sync_dir=sync,
+        LUBKO_AGENT_CMD=echo_sleep,
+    )
+    try:
+        _wait_sync_reached(sync, "sc_observe", 1)
+        _release_sync(sync, "sc_observe")
+        _wait_sync_reached(sync, "sc_decide", 1)
+        _release_sync(sync, "sc_decide")
+        _wait_sync_reached(sync, "runner_preclaim", 1)
+        doomed = _reached_pids(sync, "runner_preclaim")
+        assert doomed, "reserved runner must exist before PID registration"
+        _kill_runner(doomed[0])
+        _release_sync(sync, "runner_preclaim")
+        first.wait(timeout=30)
+        # Reservation is now stale: a --steer caller recovers it, preserving the
+        # accepted "doomed" prompt and queuing the steer behind it.
+        steer = _run_cli(
+            ["prompt", "--id", aid, "--steer", "--detach", "recover-steer"],
+            LUBKO_AGENT_CMD=echo_sleep,
+        )
+        rc_steer = steer.wait(timeout=30)
+        # Wait until the recovered replacement runner has claimed (live runner).
+        wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        # Exactly one fresh-generation replacement; the stale gen-1 is gone.
+        assert meta["runner_gen"] == 2
+        assert isinstance(meta["runner_reservation"], dict)
+        assert meta["runner_reservation"]["gen"] == 2
+        runner_pid = int(meta["runner_pid"])
+        assert agent.pid_alive(runner_pid)
+        _assert_exact_runner(runner_pid, aid, 2)
+        assert not agent.pid_alive(doomed[0])
+        # The original accepted prompt survived takeover: it is still first and
+        # the steer was durably queued, never overwriting it.
+        assert meta["last_prompt"] == "doomed"
+        assert meta["prompt_count"] == 1
+        queued = meta.get("steer_queue") or []
+        assert len(queued) == 1
+        assert queued[0]["prompt"] == "recover-steer"
+        # An ordinary retry while the recovered runner is live is rejected busy
+        # and never spawns a competing runner.
+        ordinary = _run_cli(
+            ["prompt", "--id", aid, "--detach", "recover-ordinary"],
+            LUBKO_AGENT_CMD=echo_sleep,
+        )
+        rc_ordinary = ordinary.wait(timeout=30)
+        # Wait for the recovered runner to finish (doomed, then the steer).
+        wait_until(functools.partial(_agent_terminal, aid), timeout=30)
+        log = (agent.agents_dir() / aid / "output.log").read_text()
+        lines = [line for line in log.splitlines() if line]
+        assert rc_steer == agent.EXIT_OK
+        assert rc_ordinary == agent.EXIT_ERROR
+        # No competing runner: the original accepted prompt ran exactly once and
+        # first, the steer ran exactly once, and the rejected ordinary never ran.
+        assert lines.count("doomed") == 1
+        assert lines.count("recover-steer") == 1
+        assert "recover-ordinary" not in log
+        assert lines.index("doomed") < lines.index("recover-steer")
+    finally:
+        _teardown_runners(aid, sync)
+
+
 def test_linearizable_stress_no_runner_accumulation(
     state_dir: Path,
     tmp_path: Path,
