@@ -2769,11 +2769,20 @@ def test_reconcile_takeover_stops_reparented_orphan(
         monkeypatch.setattr(daemon, "_child_alive", lambda _s: False)
         # Model the emergency owned-group recovery explicitly (exact recovery
         # succeeded) rather than depending on a real database configuration, so
-        # the takeover's full retire path is exercised deterministically.
-        monkeypatch.setattr(daemon, "_recover_owned_groups", lambda _i: None)
+        # the takeover's full retire path is exercised deterministically. The
+        # exact token is verified so recovery targets only the retired orphan's
+        # incarnation.
+        recover_calls: list[str] = []
+
+        def fake_recover(token: str) -> None:
+            recover_calls.append(token)
+            assert token == _TEST_ORPHAN_INCARNATION
+
+        monkeypatch.setattr(daemon, "_recover_owned_groups", fake_recover)
 
         daemon.reconcile(0.0)
 
+        assert recover_calls == [_TEST_ORPHAN_INCARNATION]
         assert len(stop_calls) == 1
         assert stop_calls[0].pid == proc.pid
         assert stop_calls[0].start_time_ticks == identity.start_time_ticks
