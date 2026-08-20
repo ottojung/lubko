@@ -933,7 +933,7 @@ def test_cmd_prompt_attached_normalizes_colored_output(
     monkeypatch.setattr(agent, "build_agent_command", colored_command)
     runner_threads: list[threading.Thread] = []
 
-    def spawn_in_thread(_aid: str, mode: str) -> None:
+    def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
         thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
         thread.start()
         runner_threads.append(thread)
@@ -1043,7 +1043,7 @@ def test_cmd_new_creates_idle_agent_with_supplied_id(
 ) -> None:
     """New creates only an idle record with the caller-supplied ID."""
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     cwd = str(state_dir)
     code = agent.main(["new", "--id", "A13F09C2", "--cwd", cwd, "--json"])
     assert code == agent.EXIT_OK
@@ -1151,7 +1151,7 @@ def test_cmd_prompt_first_prompt_creates_native_session(
     """
     agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "do work"])
     assert code == agent.EXIT_OK
     assert spawned == ["new"]
@@ -1175,7 +1175,7 @@ def test_cmd_prompt_continue_uses_existing_native_session(
     )
     monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
     assert code == agent.EXIT_OK
     assert spawned == ["continue"]
@@ -1211,7 +1211,7 @@ def test_prompt_retries_failed_first_attempt_as_new_session(
     agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
     runner_threads: list[threading.Thread] = []
 
-    def spawn_in_thread(_aid: str, mode: str) -> None:
+    def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
         thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
         thread.start()
         runner_threads.append(thread)
@@ -1234,7 +1234,7 @@ def test_prompt_retries_failed_first_attempt_as_new_session(
 
     spawned: list[str] = []
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     retry_code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "retry task"])
     assert retry_code == agent.EXIT_OK
     assert spawned == ["new"]
@@ -1252,7 +1252,7 @@ def test_prompt_continue_with_agent_cmd_override_without_session(
     make_agent(state_dir, "aaaaaaaa", state_value="succeeded", prompt_count=1)
     monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
     assert code == agent.EXIT_OK
     assert spawned == ["new"]
@@ -1271,7 +1271,7 @@ def test_cmd_prompt_attached_follows_and_propagates_exit_code(
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
     runner_threads: list[threading.Thread] = []
 
-    def spawn_in_thread(_aid: str, mode: str) -> None:
+    def spawn_in_thread(_aid: str, mode: str, **_extra: object) -> None:
         thread = threading.Thread(target=agent.runner, args=(_aid, mode), daemon=True)
         thread.start()
         runner_threads.append(thread)
@@ -1295,7 +1295,7 @@ def test_cmd_prompt_steer_is_plain_prompt_when_idle(
     """--steer on an idle agent is exactly equivalent to an ordinary prompt."""
     agent.write_meta("aaaaaaaa", agent.idle_meta("aaaaaaaa", str(state_dir), None))
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "task"])
     assert code == agent.EXIT_OK
     assert spawned == ["new"]
@@ -1319,7 +1319,7 @@ def test_cmd_prompt_steer_is_plain_prompt_when_finished(
     )
     monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
     spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
     code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "task"])
     assert code == agent.EXIT_OK
     assert spawned == ["continue"]
@@ -1337,7 +1337,7 @@ def test_cmd_prompt_refuses_without_steer_when_busy(
     proc = spawn_marked_process("aaaaaaaa")
     try:
         agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
-        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, _mode: None)
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, _mode, **_k: None)
         code = agent.main(["prompt", "--id", "aaaaaaaa", "task"])
         assert code == agent.EXIT_ERROR
         assert "--steer" in capsys.readouterr().err
@@ -1353,7 +1353,7 @@ def test_cmd_prompt_steer_queues_for_busy_agent(
     try:
         agent.write_meta("aaaaaaaa", meta_for_process("aaaaaaaa", proc, "/workspace"))
         spawned: list[str] = []
-        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
         code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "--detach", "redirect"])
         assert code == agent.EXIT_OK
         assert spawned == []
@@ -1747,7 +1747,7 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
         agent.write_meta("aaaaaaaa", meta)
         monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
         spawned: list[str] = []
-        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
         code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
         assert code == agent.EXIT_OK
         assert spawned == []
@@ -1855,7 +1855,7 @@ def test_reservation_owner_exact_process_safe_against_pid_reuse(
         assert agent.is_genuinely_running(meta) is False
         # Recovery is allowed and produces exactly one replacement runner.
         spawned: list[str] = []
-        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
         rc = agent.main(["prompt", "--id", aid, "--detach", "recover"])
         assert rc == agent.EXIT_OK
         assert spawned == ["new"]
@@ -1869,6 +1869,72 @@ def test_reservation_owner_exact_process_safe_against_pid_reuse(
         assert agent.reservation_in_flight(after) is True
     finally:
         kill_proc(reused)
+
+
+def test_teardown_signals_only_exact_identities_reused_pid_observation_only(
+    tmp_path: Path,
+) -> None:
+    """Teardown signals only exact identities; reused PIDs stay observation-only.
+
+    A preclaim sync marker naming a PID that is no longer our runner — either
+    because its start ticks differ (a reused PID) or because it lacks the exact
+    agent marker — is never signalled.  A genuine runner carrying the exact
+    agent marker and matching start ticks is signalled exactly.
+    """
+    aid = "33333333"
+    owned = spawn_stale_marked_process(aid, gen=1)
+    reused = spawn_marked_process("ffffffff")
+    wrong_marker = spawn_marked_process("eeeeeeee")
+    try:
+        sync = tmp_path / "sync"
+        sync.mkdir(parents=True, exist_ok=True)
+        # Genuine owned runner: marker matches and recorded ticks match.
+        (sync / f"runner_preclaim.{owned.pid}.reached").touch()
+        o_ticks = agent.proc_start_ticks(owned.pid)
+        if o_ticks is not None:
+            (sync / f"runner_preclaim.{owned.pid}.ticks").write_text(str(o_ticks))
+        # Reused PID: a stale marker names a PID whose start ticks now differ.
+        (sync / f"runner_preclaim.{reused.pid}.reached").touch()
+        r_ticks = agent.proc_start_ticks(reused.pid)
+        (sync / f"runner_preclaim.{reused.pid}.ticks").write_text(str((r_ticks or 1) - 1))
+        # Correct ticks but a different agent marker: not our identity.
+        (sync / f"runner_preclaim.{wrong_marker.pid}.reached").touch()
+        w_ticks = agent.proc_start_ticks(wrong_marker.pid)
+        if w_ticks is not None:
+            (sync / f"runner_preclaim.{wrong_marker.pid}.ticks").write_text(str(w_ticks))
+
+        # No agent meta: teardown consults only the exact sync identities.
+        _teardown_runners(aid, sync)
+
+        # Unknown/reused identities are observation-only: still running.
+        assert reused.poll() is None
+        assert wrong_marker.poll() is None
+        # The genuinely-owned runner was signalled: terminated.
+        wait_until(lambda: owned.poll() is not None, timeout=10)
+    finally:
+        kill_proc(owned)
+        kill_proc(reused)
+        kill_proc(wrong_marker)
+
+
+def test_runner_fails_closed_without_matching_reservation(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A production runner with no matching reservation fails closed.
+
+    A nonzero reserved generation carried into the runner must not execute when
+    the exact reserved generation no longer exists in metadata: the runner
+    bails instead of claiming or running an invocation.
+    """
+    aid = "55555555"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    monkeypatch.setenv("LUBKO_RUNNER_GEN", "7")
+    agent.runner(aid, "new")
+    result = agent.read_meta(aid)
+    assert result is not None
+    assert result.get("runner_pid") is None
+    assert result.get("active_runner") is False
 
 
 def test_cmd_stop_escalates_to_sigkill_when_group_survives(
@@ -2119,6 +2185,33 @@ def _kill_runner(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
 
 
+def _maybe_kill_runner_identity(pid: int, aid: str, sync_dir: Path) -> None:
+    """Signal a preclaim runner only if it is still the exact test-owned identity.
+
+    The PID is verified against the start ticks recorded when the runner wrote
+    its sync marker and against the exact agent environment marker. A PID that
+    was reused by an unrelated process (mismatched ticks, or no matching agent
+    marker) is observation-only and is never signalled.
+
+    Args:
+        pid: The preclaim runner process ID.
+        aid: Exact agent ID the runner must belong to.
+        sync_dir: Synchronization directory holding the marker and ticks.
+    """
+    ticks_path = sync_dir / f"runner_preclaim.{pid}.ticks"
+    if ticks_path.is_file():
+        with contextlib.suppress(ValueError):
+            recorded = int(ticks_path.read_text())
+            current = agent.proc_start_ticks(pid)
+            if current is None or current != recorded:
+                # Start ticks differ: the PID was reused; never signal it.
+                return
+    if not agent.env_has_marker(pid, aid):
+        # Not our runner's exact identity: observation-only.
+        return
+    _kill_runner(pid)
+
+
 def _teardown_runners(aid: str, sync_dir: Path | None = None) -> None:
     """Stop exactly the runner(s) this test created, by exact identity only.
 
@@ -2129,9 +2222,10 @@ def _teardown_runners(aid: str, sync_dir: Path | None = None) -> None:
       exact ``runner_start_time`` so a reused PID naming an unrelated process
       is never signalled; and
     * the exact PID a runner wrote into this test's unique ``runner_preclaim``
-      reached marker, used only for a runner killed before it could claim.
+      reached marker, verified by exact PID + start-ticks (recorded at the
+      marker) and the exact agent environment marker before any signal.
 
-    Unknown leftovers from older failed runs are observations only and are
+    Unknown leftovers (including reused PIDs) are observations only and are
     never signalled.
 
     Args:
@@ -2149,7 +2243,7 @@ def _teardown_runners(aid: str, sync_dir: Path | None = None) -> None:
                 _kill_runner(pid)
     if sync_dir is not None:
         for reached in _reached_pids(sync_dir, "runner_preclaim"):
-            _kill_runner(reached)
+            _maybe_kill_runner_identity(reached, aid, sync_dir)
 
 
 def _assert_exact_runner(pid: int, aid: str, gen: int) -> None:
@@ -2468,7 +2562,7 @@ def test_stale_old_generation_marker_does_not_block_recovery(
         assert agent.is_genuinely_running(meta) is False
         # Recovery proceeds and is not blocked by the stale process.
         spawned: list[str] = []
-        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
         rc = agent.main(["prompt", "--id", aid, "--detach", "recover"])
         assert rc == agent.EXIT_OK
         assert spawned == ["new"]

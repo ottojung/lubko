@@ -324,7 +324,7 @@ def proc_cpu_seconds(pid: int | None) -> float | None:
     return ticks / ticks_per_second
 
 
-def _env_has_marker(pid: int, aid: str) -> bool:
+def env_has_marker(pid: int, aid: str) -> bool:
     """Return whether a process environment carries the exact agent marker.
 
     The marker is matched against whole NUL-separated environment entries so
@@ -364,7 +364,7 @@ def is_alive(meta: Meta) -> bool:
         return False
     if proc_start_ticks(pid) != meta.get("start_time"):
         return False
-    if not _env_has_marker(pid, meta.get("id", "")):
+    if not env_has_marker(pid, meta.get("id", "")):
         return False
     try:
         os.kill(pid, 0)
@@ -442,7 +442,7 @@ def runner_alive(meta: Meta) -> bool:
         return False
     if proc_start_ticks(int(pid)) != meta.get("runner_start_time"):
         return False
-    if not _env_has_marker(int(pid), meta.get("id", "")):
+    if not env_has_marker(int(pid), meta.get("id", "")):
         return False
     try:
         os.kill(int(pid), 0)
@@ -507,12 +507,35 @@ def _runner_marker_alive(aid: str, expected_gen: int) -> bool:
     return False
 
 
+def _is_zombie(pid: int) -> bool:
+    """Return whether a live PID names a zombie (defunct) process.
+
+    A zombie can no longer do work, so it must never be trusted as a live
+    owner of a reservation.
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        ``True`` when the process is a zombie and cannot bring up a runner.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    rest = stat[stat.rfind(")") + 1 :].split()
+    if not rest:
+        return False
+    return rest[0] == "Z"
+
+
 def _owner_alive(owner: object, owner_ticks: object) -> bool:
     """Return whether ``owner`` is still the exact live reservation owner.
 
-    A PID alone is not trusted: the process start time (ticks) must also match
-    the recorded owner identity, so a PID that was reused by an unrelated
-    process after the spawner died can never justify the reservation.
+    A PID alone is not trusted: the process must be live (not a zombie), its
+    start time (ticks) must be readable, and it must match the recorded owner
+    identity.  Unavailable ticks or a zombie owner fail closed, so a reused PID
+    or a defunct owner can never justify the reservation.
 
     Args:
         owner: Recorded owner process ID, or ``None``.
@@ -523,7 +546,12 @@ def _owner_alive(owner: object, owner_ticks: object) -> bool:
     """
     if not isinstance(owner, int) or not pid_alive(owner):
         return False
-    return proc_start_ticks(owner) == owner_ticks
+    if _is_zombie(owner):
+        return False
+    current = proc_start_ticks(owner)
+    if current is None:
+        return False
+    return current == owner_ticks
 
 
 def reservation_in_flight(meta: Meta) -> bool:
@@ -654,7 +682,13 @@ def _test_sync(step: str) -> None:
         return
     base = Path(sync_dir)
     base.mkdir(parents=True, exist_ok=True)
-    (base / f"{step}.{os.getpid()}.reached").touch()
+    pid = os.getpid()
+    (base / f"{step}.{pid}.reached").touch()
+    # Record the exact start ticks so teardown can prove the reaching process
+    # is still the same identity and never signal a reused PID.
+    ticks = proc_start_ticks(pid)
+    if ticks is not None:
+        (base / f"{step}.{pid}.ticks").write_text(str(ticks))
     release = base / f"{step}.release"
     while not release.exists():
         time.sleep(0.005)
@@ -991,13 +1025,18 @@ def runner(aid: str, mode: str) -> None:
     def claim(m: Meta) -> None:
         res = m.get("runner_reservation")
         if not isinstance(res, dict):
-            # No reservation (for example a directly invoked runner in tests):
-            # claim unconditionally so the runner owns its identity.
-            m["runner_pid"] = os.getpid()
-            m["runner_start_time"] = proc_start_ticks(os.getpid())
-            m["active_runner"] = True
-            m["state"] = "running"
-            claimed["ok"] = True
+            if gen == 0:
+                # No reservation (for example a directly invoked runner in
+                # tests): claim unconditionally so the runner owns its identity.
+                m["runner_pid"] = os.getpid()
+                m["runner_start_time"] = proc_start_ticks(os.getpid())
+                m["active_runner"] = True
+                m["state"] = "running"
+                claimed["ok"] = True
+                return
+            # A production runner carrying a nonzero reserved generation but no
+            # matching reservation must fail closed and never execute.
+            claimed["ok"] = False
             return
         if res.get("state") != "reserved":
             # Already claimed or otherwise owned: a second runner must never
@@ -1005,9 +1044,10 @@ def runner(aid: str, mode: str) -> None:
             claimed["ok"] = False
             return
         if gen != 0 and res.get("gen") != gen:
-            # Production runner: only the exact reservation generation may run.
-            # A duplicate spawned before the protocol was fixed, or a stale
-            # replacement, bails instead of double-executing.
+            # Production runner: only the exact reserved generation may run.  A
+            # duplicate spawned before the protocol was fixed, or a stale
+            # replacement whose reservation was taken over, bails instead of
+            # double-executing — the exact reserved generation must still exist.
             claimed["ok"] = False
             return
         m["runner_pid"] = os.getpid()
@@ -1485,26 +1525,32 @@ def _err(message: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def spawn_runner(aid: str, mode: str) -> None:
+def spawn_runner(aid: str, mode: str, *, gen: int | None = None) -> None:
     """Detach a background runner monitor for an agent.
 
     The runner is spawned with the exact agent marker set so its identity
     can be verified later; no other environment entry is altered.  The runner
-    generation it must claim is read from the live reservation so the spawned
-    runner claims exactly the reservation this caller reserved and never a
-    competing one.
+    generation it must claim is carried from the locked reservation decision
+    (``gen``) rather than reread from mutable metadata, so the spawned runner
+    claims exactly the reservation this caller reserved and never a competing
+    one.
 
     Args:
         aid: Lubko agent ID.
         mode: Invocation mode (``new`` or ``continue``).
+        gen: Exact reserved runner generation to carry into the runner, or
+            ``None`` to fall back to metadata (used only by direct callers).
     """
     script = Path(__file__).resolve()
     env = _runner_env(aid)
-    meta = read_meta(aid)
-    if meta:
-        res = meta.get("runner_reservation")
-        if isinstance(res, dict) and res.get("gen"):
-            env["LUBKO_RUNNER_GEN"] = str(int(res["gen"]))
+    if gen is not None:
+        env["LUBKO_RUNNER_GEN"] = str(int(gen))
+    else:
+        meta = read_meta(aid)
+        if meta:
+            res = meta.get("runner_reservation")
+            if isinstance(res, dict) and res.get("gen"):
+                env["LUBKO_RUNNER_GEN"] = str(int(res["gen"]))
     subprocess.Popen(
         [sys.executable, str(script), "_runner", aid, mode],
         stdin=subprocess.DEVNULL,
@@ -1788,7 +1834,7 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
         _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
         return EXIT_ERROR
     if action == "spawn":
-        spawn_runner(aid, str(decision["mode"]))
+        spawn_runner(aid, str(decision["mode"]), gen=cast("int", decision["gen"]))
     elif action == "reuse" and decision.get("interrupt"):
         _interrupt_steer_if_needed(aid)
 
