@@ -25,12 +25,15 @@ import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Self
+from unittest.mock import MagicMock
 from uuid import uuid4
 
+import pytest
 from psycopg import connect
 
 from lubko import lifecycle
 from lubko import worker as worker_mod
+from lubko.supervisor import OwnedGroupRecoveryError, SupervisorDaemon
 from tests import _process_guard as guard
 from tests.test_lifecycle import identity_of
 
@@ -73,7 +76,8 @@ def spawn_child():
         [
             "/bin/sh", "-c",
             'trap "" TERM; exec %s -c "import signal,time; '
-            'signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"' % sys.executable,
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)  '
+            '# lubko_issue75_child"' % sys.executable,
         ],
         start_new_session=True,
     )
@@ -103,7 +107,7 @@ while True:
 
 
 def _spawn_scripted_worker(
-    tmp_path: Path, token: str, cancel_grace: float
+    tmp_path: Path, token: str, cancel_grace: float, *, env_token: str | None = None
 ) -> subprocess.Popen[bytes]:
     """Spawn the scripted drain worker, registered with the process guard.
 
@@ -111,6 +115,10 @@ def _spawn_scripted_worker(
         tmp_path: Test temporary directory.
         token: Lifecycle token (incarnation) for the worker.
         cancel_grace: Seconds the worker waits before SIGKILLing its group.
+        env_token: The ``LUBKO_LIFECYCLE_TOKEN`` to place in the worker's
+            environment. Defaults to ``token`` so the worker is recognized as
+            owned; a divergent value simulates a live, unowned (wrong-token)
+            process that must not be signalled.
 
     Returns:
         The spawned worker process.
@@ -118,6 +126,8 @@ def _spawn_scripted_worker(
     script = tmp_path / "scripted_worker.py"
     script.write_text(WORKER_SCRIPT, encoding="utf-8")
     child_pgid_file = tmp_path / "child_pgid"
+    env = dict(os.environ)
+    env["LUBKO_LIFECYCLE_TOKEN"] = env_token if env_token is not None else token
     proc = subprocess.Popen(
         [sys.executable, str(script), token, str(child_pgid_file), str(cancel_grace)],
         stdin=subprocess.DEVNULL,
@@ -125,7 +135,7 @@ def _spawn_scripted_worker(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
-        env=dict(os.environ),
+        env=env,
     )
     guard.register(proc)
     return proc
@@ -289,7 +299,10 @@ def test_recover_owned_job_groups_kills_exact_groups_only() -> None:
 
     A wedged worker can leave a command group alive after it is SIGKILLed. The
     recovery targets the exact process-group id persisted in the job row for the
-    retired incarnation and never touches other groups.
+    retired incarnation and never touches other groups. It is also PID-reuse
+    safe: a persisted group id that has since been recycled by an unrelated
+    process (different start-time ticks) is never signalled, even though the
+    group is still alive.
     """
     unrelated = subprocess.Popen(
         [SLEEP_BIN, "300"],
@@ -315,13 +328,23 @@ def test_recover_owned_job_groups_kills_exact_groups_only() -> None:
     )
     guard.register(owned)
     owned_pgid = os.getpgid(owned.pid)
+    # A stale, reused group id: it points at the still-alive ``unrelated``
+    # process but carries start-time ticks that do NOT match that process, so
+    # recovery must treat it as a recycled id and leave it untouched.
+    reused_pgid = os.getpgid(unrelated.pid)
+    reused_ticks = (lifecycle.proc_start_ticks(unrelated.pid) or 0) + 1
     try:
         incarnation = "issue75-wedged-incarnation"
-        conn = _FakeConn([(uuid4(), str(owned_pgid))])
-        acted = worker_mod.recover_owned_job_groups(conn, incarnation, 0.5)  # type: ignore[arg-type]
-        assert acted == [owned_pgid]
+        conn = _FakeConn([
+            (uuid4(), str(owned_pgid), str(lifecycle.proc_start_ticks(owned.pid))),
+            (uuid4(), str(reused_pgid), str(reused_ticks)),
+        ])
+        result = worker_mod.recover_owned_job_groups(conn, incarnation, 0.5)  # type: ignore[arg-type]
+        assert result.reaped == [owned_pgid]
+        assert result.surviving == []
         assert not worker_mod.group_has_members(owned_pgid)
-        assert worker_mod.group_has_members(os.getpgid(unrelated.pid))
+        # The reused id was NOT acted on: the unrelated process is untouched.
+        assert worker_mod.group_has_members(reused_pgid)
     finally:
         if owned.poll() is None:
             with suppress(ProcessLookupError):
@@ -545,6 +568,201 @@ def test_planned_replacement_drains_sigterm_ignoring_command(jobs_db: str, tmp_p
         if worker.poll() is None:
             lifecycle.stop_worker(_meta_for_live(worker, tmp_path, str(incarnation or "x")), 5.0)
         _recover_incarnation(jobs_db, incarnation)
+
+
+@pytest.fixture(autouse=True)
+def _issue75_leak_proof() -> Iterator[None]:
+    """Deterministically reap every test-owned worker and child group.
+
+    Every #75 focused test spawns a scripted worker (and, transitively, a
+    SIGTERM-ignoring command group) that must never reparent to PID 1. Even on
+    an assertion/failure path this fixture kills any surviving process whose
+    command line names our scripted worker or the exact child marker, by exact
+    process group, then asserts zero survivors remain.
+    """
+    yield
+    _kill_issue75_orphans()
+    _assert_no_issue75_processes()
+
+
+ISSUE75_WORKER_MARKER: Final = "scripted_worker.py"
+ISSUE75_CHILD_MARKER: Final = "lubko_issue75_child"
+
+
+def _issue75_survivors() -> list[tuple[int, int]]:
+    """Return ``(pid, pgid)`` of any still-live issue75 test process.
+
+    Returns:
+        Live processes whose command line names the scripted worker or the
+        exact command-group child marker.
+    """
+    survivors: list[tuple[int, int]] = []
+    proc_dir = Path("/proc")
+    if proc_dir.is_dir():
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
+            except OSError:
+                continue
+            text = cmdline.decode("utf-8", "replace")
+            if ISSUE75_WORKER_MARKER in text or ISSUE75_CHILD_MARKER in text:
+                try:
+                    pid = int(entry.name)
+                    pgid = os.getpgid(pid)
+                except (ProcessLookupError, OSError):
+                    continue
+                survivors.append((pid, pgid))
+    return survivors
+
+
+def _kill_issue75_orphans() -> None:
+    """SIGKILL any surviving issue75 test process by exact process group."""
+    for _pid, pgid in _issue75_survivors():
+        with suppress(ProcessLookupError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+
+
+def _assert_no_issue75_processes() -> None:
+    """Assert no issue75 test process survives; kill then re-check if needed.
+
+    Raises:
+        AssertionError: If any issue75 test process is still running after a
+            kill-and-recheck cycle.
+    """
+    survivors = _issue75_survivors()
+    if survivors:
+        _kill_issue75_orphans()
+        time.sleep(0.2)
+        survivors = _issue75_survivors()
+    if survivors:
+        msg = "issue75 test processes still alive after focused tests: " + ", ".join(
+            f"pid={pid}/pgid={pgid}" for pid, pgid in survivors
+        )
+        raise AssertionError(msg)
+
+
+def test_stop_worker_rejects_live_unowned_wrong_token(tmp_path: Path) -> None:
+    """stop_worker must not signal or report success for a live unowned worker.
+
+    A live process may match the recorded identity (PID/PGID/SID/start ticks)
+    yet carry a lifecycle token that is not ours (or none). Such a live,
+    unowned process must never be signalled, and stop_worker must report
+    failure rather than claiming retirement -- so authority is never handed off.
+    """
+    token = "issue75-wrong-token-ctx"  # ruff: ignore[hardcoded-password-string]
+    # The process environment carries a DIFFERENT token, so it is live but not
+    # owned by the recorded incarnation.
+    proc = _spawn_scripted_worker(
+        tmp_path,
+        token,
+        1.0,
+        env_token="issue75-other-incarnation",  # ruff: ignore[hardcoded-password-func-arg]
+    )
+    meta = _meta_for_live(proc, tmp_path, token)
+    try:
+        assert lifecycle.process_identity(proc.pid) is not None
+        assert lifecycle.process_has_token(proc.pid, token) is False
+        stopped = lifecycle.stop_worker(meta, 5.0, cancel_grace_seconds=1.0)
+        assert stopped is False
+        # The worker must not have been signalled: still alive, command group
+        # intact.
+        assert proc.poll() is None
+        assert worker_mod.group_has_members(os.getpgid(proc.pid))
+    finally:
+        # Deterministic reap so teardown sees nothing live; the worker's own
+        # drain handler terminates its child group.
+        with suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except Exception:  # ruff: ignore[blind-except]
+            with suppress(ProcessLookupError, OSError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            with suppress(Exception):
+                proc.wait(timeout=5)
+        guard.unregister(proc)
+
+
+def test_recover_owned_groups_db_failure_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recovery DB/config failure is a durable blocking obligation.
+
+    When the database configuration is missing the supervisor's owned-group
+    recovery must raise :class:`OwnedGroupRecoveryError` rather than silently
+    skipping, so the retired child and sole-consumer authority are preserved
+    and no replacement is spawned alongside stale groups.
+    """
+    monkeypatch.setattr(
+        "lubko.supervisor.load_database_config",
+        lambda: (_ for _ in ()).throw(ValueError("no database configuration available")),
+    )
+    with pytest.raises(OwnedGroupRecoveryError):
+        SupervisorDaemon._recover_owned_groups(  # ruff: ignore[private-member-access]
+            "issue75-blocked-incarnation"
+        )
+
+
+def test_recover_owned_groups_survivor_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A surviving verified-ours group keeps recovery a blocking obligation.
+
+    When emergency recovery acts on a group it proved is ours but the group
+    cannot be reaped within the cancel grace, the supervisor must raise
+    :class:`OwnedGroupRecoveryError` rather than reporting success. The caller
+    then preserves the retired child and does not spawn a replacement alongside
+    a still-live side-effecting group.
+    """
+    surviving_pgid = 424242
+    monkeypatch.setattr(
+        worker_mod,
+        "recover_owned_job_groups",
+        lambda *_, **__: worker_mod.ReclaimedGroups(reaped=[], surviving=[surviving_pgid]),
+    )
+    fake_db = MagicMock()
+    fake_db.conninfo.return_value = ""
+    monkeypatch.setattr("lubko.supervisor.load_database_config", lambda: fake_db)
+    monkeypatch.setattr("lubko.supervisor.psycopg.connect", lambda *_, **__: MagicMock())
+    with pytest.raises(OwnedGroupRecoveryError):
+        SupervisorDaemon._recover_owned_groups(  # ruff: ignore[private-member-access]
+            "issue75-survivor-incarnation"
+        )
+
+
+def test_recover_owned_job_groups_reports_survivors() -> None:
+    """An unreapable verified-ours group is reported as surviving, never hidden.
+
+    When a command group that recovery verified is ours (matching start-time
+    ticks) cannot be reaped within the cancel grace, the recovery pass must
+    report it as ``surviving`` so the orchestrator blocks clearing the retired
+    worker's authority. A zero cancel grace makes the SIGKILL→reap window
+    deterministic: the group is still alive immediately after the forced kill.
+    """
+    owned = subprocess.Popen(
+        [
+            "/bin/sh",
+            "-c",
+            'trap "" TERM; exec ' + sys.executable + ' -c "import signal,time; '
+            'signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"',
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(owned)
+    owned_pgid = os.getpgid(owned.pid)
+    try:
+        conn = _FakeConn([(uuid4(), str(owned_pgid), str(lifecycle.proc_start_ticks(owned.pid)))])
+        result = worker_mod.recover_owned_job_groups(conn, "issue75-survivor", 0.0)  # type: ignore[arg-type]
+        assert result.surviving == [owned_pgid]
+        assert result.reaped == []
+    finally:
+        with suppress(ProcessLookupError, OSError):
+            os.killpg(owned_pgid, signal.SIGKILL)
+        with suppress(Exception):
+            owned.wait(timeout=5)
+        guard.unregister(owned)
 
 
 def _recover_incarnation(conninfo: str, incarnation: object) -> None:

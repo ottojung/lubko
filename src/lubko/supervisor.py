@@ -308,6 +308,19 @@ def _child_to_meta(child: WorkerChild, repo: str) -> WorkerMeta:
     )
 
 
+class OwnedGroupRecoveryError(Exception):
+    """Raised when owned command-group recovery could not be completed.
+
+    This is a durable *blocking* obligation, not a recoverable warning: when the
+    retired worker left command groups alive and they cannot be reaped because
+    the database configuration is missing, the database is unreachable, or the
+    recovery query fails, the supervisor must not clear the retired child or
+    spawn a replacement. Callers let this propagate so the next daemon tick
+    retries the same exact orphan rather than handing off sole-consumer
+    authority alongside stale side-effecting process groups.
+    """
+
+
 class SupervisorDaemon:
     """One long-lived daemon that owns and restarts the maintained worker."""
 
@@ -676,9 +689,13 @@ class SupervisorDaemon:
                         meta.pid,
                     )
                     return
-                # Recover any command group the adopted worker still owned so
-                # the replacement never starts alongside a stale group.
-                self._recover_owned_groups(meta.token or "")
+                # The adopted worker may have left command groups alive. If it
+                # proved a clean drain the groups are already gone and no
+                # emergency recovery is required; otherwise recovery is a durable
+                # blocking obligation — a DB/config/SQL failure must not let us
+                # spawn a replacement alongside stale groups.
+                if not (meta.token and worker_mod.drain_sentinel_matches(meta.token)):
+                    self._recover_owned_groups(meta.token or "")
         child = self._spawn_worker(commit)
         now = time.monotonic()
         if child is None:
@@ -843,12 +860,14 @@ class SupervisorDaemon:
             return True
         meta = _child_to_meta(child, _runtime_dir(state.commit))
         stopped = lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
-        # Even after a clean drain the retired worker's exact-ownership record
-        # must be reaped: a wedged worker that was force-killed can leave command
-        # process groups alive. Recover them by exact group identity (never a
-        # process-name match) so the replacement never shares the queue with a
-        # stale side-effecting group.
-        self._recover_owned_groups(child.token)
+        # A wedged worker that was force-killed can leave command process groups
+        # alive. If the worker proved a clean drain the groups are already gone
+        # and no emergency recovery is required (and no database round-trip that
+        # could fail). Otherwise recovery is a durable blocking obligation: a
+        # DB/config/SQL failure raises, which preserves the retired child and
+        # prevents spawning a replacement alongside stale groups.
+        if not (child.token and worker_mod.drain_sentinel_matches(child.token)):
+            self._recover_owned_groups(child.token)
         if self.proc is not None:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
@@ -870,45 +889,59 @@ class SupervisorDaemon:
         After a worker is stopped or force-killed, any command process group it
         owned must be terminated and reaped by its exact persisted process-group
         id (``state.process_pgid``), never by process-name matching or a broad
-        kill. A missing database configuration or an unreachable database is
-        logged and skipped: the next daemon tick retries the same exact orphan,
-        so surviving groups are never silently forgotten.
+        kill. This is a durable blocking obligation: a missing database
+        configuration, an unreachable database, a recovery query failure, or a
+        verified-ours group that survives the recovery pass raises
+        :class:`OwnedGroupRecoveryError` so the caller preserves the retired
+        child and does not spawn a replacement alongside a still-live
+        side-effecting group. Only exact identities are ever signalled, and the
+        recovery pass proves each target is genuinely dead before it is treated
+        as reclaimed.
 
         Args:
             incarnation: The retired worker's lifecycle token (incarnation).
+
+        Raises:
+            OwnedGroupRecoveryError: If the recovery could not be completed, or
+                if a verified-ours group survived the recovery pass.
         """
         if not incarnation:
             return
         try:
             database = load_database_config()
-        except (OSError, ValueError):
-            LOGGER.exception(
-                "cannot load database config to recover owned groups for %s", incarnation
-            )
-            return
+        except (OSError, ValueError) as exc:
+            msg = f"cannot load database config to recover owned groups for {incarnation}"
+            raise OwnedGroupRecoveryError(msg) from exc
         try:
             conn = psycopg.connect(
                 database.conninfo(),
                 connect_timeout=5,
             )
             conn.autocommit = True
-        except (psycopg.Error, OSError):
-            LOGGER.exception("cannot connect to recover owned groups for %s", incarnation)
-            return
+        except (psycopg.Error, OSError) as exc:
+            msg = f"cannot connect to recover owned groups for {incarnation}"
+            raise OwnedGroupRecoveryError(msg) from exc
         try:
-            acted = worker_mod.recover_owned_job_groups(
+            result = worker_mod.recover_owned_job_groups(
                 conn, incarnation, worker_mod.DEFAULT_CANCEL_GRACE_SECONDS
             )
-        except psycopg.Error:
-            LOGGER.exception("error recovering owned groups for incarnation %s", incarnation)
-            return
+        except psycopg.Error as exc:
+            msg = f"error recovering owned groups for incarnation {incarnation}"
+            raise OwnedGroupRecoveryError(msg) from exc
         finally:
             with suppress(Exception):
                 conn.close()
-        if acted:
+        if result.surviving:
+            msg = (
+                f"owned command group(s) {result.surviving} still alive after "
+                f"recovery for incarnation {incarnation}; holding without "
+                "clearing authority or spawning a replacement"
+            )
+            raise OwnedGroupRecoveryError(msg)
+        if result.reaped:
             LOGGER.info(
                 "recovered %d owned command group(s) for incarnation %s",
-                len(acted),
+                len(result.reaped),
                 incarnation,
             )
 

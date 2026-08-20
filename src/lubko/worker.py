@@ -915,8 +915,12 @@ def _output_update_params(job_id: UUID, output: dict[str, dict[str, Any]]) -> di
 def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) -> None:
     """Persist the exact process identity of a running job.
 
-    The identity is written into ``payload.state.process_pid`` and
-    ``payload.state.process_pgid``, keeping the two-column table invariant.
+    The identity is written into ``payload.state.process_pid``,
+    ``payload.state.process_pgid`` and ``payload.state.process_start_time_ticks``,
+    keeping the two-column table invariant. The start-time ticks make later
+    emergency recovery PID-reuse-safe: a persisted group id that has been
+    recycled by an unrelated process no longer matches the recorded command and
+    is never signalled.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -929,13 +933,17 @@ def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) ->
         [
             ("state,process_pid", "to_jsonb(%s::int)"),
             ("state,process_pgid", "to_jsonb(%s::int)"),
+            (
+                "state,process_start_time_ticks",
+                "to_jsonb(%s::bigint)",
+            ),
             ("state,updated_at", UTC_ISO_SQL),
         ],
     )
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
             "UPDATE lubko.jobs\nSET payload = " + set_chain + "::text\nWHERE id = %s\n",
-            (pid, pgid, job_id),
+            (pid, pgid, proc_start_ticks(pid), job_id),
         )
 
 
@@ -1051,20 +1059,23 @@ def drain_sentinel_matches(incarnation: str) -> bool:
         return False
 
 
-def _owned_running_pgids(conn: JobsConnection, incarnation: str) -> list[int]:
-    """Return the exact process group ids of running jobs owned by an incarnation.
+def _owned_running_groups(conn: JobsConnection, incarnation: str) -> list[tuple[int, int | None]]:
+    """Return the exact (process group id, start-time ticks) of owned commands.
 
     Args:
         conn: Open PostgreSQL connection.
         incarnation: The worker incarnation (lifecycle token) to match.
 
     Returns:
-        The exact process group ids recorded for running commands.
+        Pairs of the exact process group id and the persisted command start-time
+        ticks (``None`` when the legacy row never recorded ticks) for every
+        running command owned by the incarnation.
     """
-    pgids: list[int] = []
+    groups: list[tuple[int, int | None]] = []
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT id, (payload::jsonb)->'state'->>'process_pgid'\n"
+            "SELECT id, (payload::jsonb)->'state'->>'process_pgid',\n"
+            "       (payload::jsonb)->'state'->>'process_start_time_ticks'\n"
             "FROM lubko.jobs\n"
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
@@ -1074,41 +1085,96 @@ def _owned_running_pgids(conn: JobsConnection, incarnation: str) -> list[int]:
         )
         for row in cursor.fetchall():
             pgid = row[1]
+            start_ticks = row[2]
             if pgid is None:
                 continue
             try:
-                pgids.append(int(str(pgid)))
+                pgid_i = int(str(pgid))
             except ValueError:
                 continue
-    return pgids
+            start_i: int | None = None
+            if start_ticks is not None:
+                try:
+                    start_i = int(str(start_ticks))
+                except ValueError:
+                    start_i = None
+            groups.append((pgid_i, start_i))
+    return groups
 
 
-def _terminate_groups(pgids: list[int], cancel_grace_seconds: float) -> None:
-    """Ask exact process groups to terminate, then SIGKILL and reap survivors.
+def _group_still_ours(pgid: int, start_ticks: int | None) -> bool:
+    """Return whether a persisted group id still identifies our command.
+
+    A persisted ``process_pgid`` can be recycled by an unrelated process after
+    our command died. The group leader (``pid == pgid`` for a command that
+    called ``setsid``) carries the command's exact start-time ticks, so we
+    compare them to the persisted value: only when the group still has members
+    and the leader's ticks match do we know the group is our command and safe
+    to signal. Anything else — a reused group, a gone group, or a leader whose
+    ticks disagree — is left untouched so we never kill a stranger's group.
 
     Args:
-        pgids: Exact process group ids to terminate.
-        cancel_grace_seconds: Grace before escalating to SIGKILL.
+        pgid: The persisted process group id.
+        start_ticks: The persisted command start-time ticks, or ``None`` for a
+            legacy row that never recorded them (then only group membership is
+            used as the safety check).
+
+    Returns:
+        ``True`` only when signalling this group targets our exact command.
     """
-    for pgid in pgids:
-        _signal_group(pgid, signal.SIGTERM)
+    if not group_has_members(pgid):
+        return False
+    if start_ticks is None:
+        return True
+    return proc_start_ticks(pgid) == start_ticks
+
+
+@dataclass(frozen=True)
+class ReclaimedGroups:
+    """Exact-owned command groups after an emergency recovery pass.
+
+    Attributes:
+        reaped: Exact process-group ids that were signalled and proven dead.
+        surviving: Exact process-group ids that were verified ours, signalled,
+            but could not be proven dead within the cancel grace. These are a
+            durable blocking obligation: the orchestrator must not clear the
+            retired worker's sole-consumer authority or spawn a replacement
+            until they are proven dead/recovered.
+    """
+
+    reaped: list[int]
+    surviving: list[int]
+
+
+def _terminate_one_group(pgid: int, cancel_grace_seconds: float) -> bool:
+    """Ask one exact process group to terminate, then SIGKILL and reap it.
+
+    Args:
+        pgid: Exact process group id to terminate.
+        cancel_grace_seconds: Grace before escalating to SIGKILL.
+
+    Returns:
+        ``True`` only when the group is proven to have no surviving members
+        after the SIGKILL + reap wait, so the caller knows it is safe to treat
+        the recovery as complete.
+    """
+    _signal_group(pgid, signal.SIGTERM)
     term_deadline = time.monotonic() + cancel_grace_seconds
-    while time.monotonic() < term_deadline and any(group_has_members(p) for p in pgids):
+    while time.monotonic() < term_deadline and group_has_members(pgid):
         time.sleep(0.05)
-    for pgid in pgids:
-        if group_has_members(pgid):
-            _signal_group(pgid, signal.SIGKILL)
-    for pgid in pgids:
-        reap_deadline = time.monotonic() + cancel_grace_seconds
-        while time.monotonic() < reap_deadline and group_has_members(pgid):
-            time.sleep(0.05)
+    if group_has_members(pgid):
+        _signal_group(pgid, signal.SIGKILL)
+    reap_deadline = time.monotonic() + cancel_grace_seconds
+    while time.monotonic() < reap_deadline and group_has_members(pgid):
+        time.sleep(0.05)
+    return not group_has_members(pgid)
 
 
 def recover_owned_job_groups(
     conn: JobsConnection,
     incarnation: str,
     cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
-) -> list[int]:
+) -> ReclaimedGroups:
     """Terminate any live command process group still owned by an incarnation.
 
     This is the exact-ownership emergency recovery used after a maintained
@@ -1116,9 +1182,15 @@ def recover_owned_job_groups(
     wedged worker whose own graceful drain never ran). Every acting target is an
     exact process group id persisted in the job row (``state.process_pgid``) for
     a ``running`` command whose ``worker_incarnation`` matches, so no
-    process-name match or broad ``pkill``/``killall`` is ever used. Surviving
-    groups are asked to terminate, then SIGKILLed after the bounded cancel
-    grace, then reaped.
+    process-name match or broad ``pkill``/``killall`` is ever used. Before any
+    signal the persisted group id is checked against the live leader's
+    start-time ticks (see :func:`_group_still_ours`) so a recycled group id
+    belonging to an unrelated process is never killed.
+
+    Only groups proven to be ours (matching start-time ticks and live members)
+    are signalled. A group that was verified ours but could not be reaped within
+    the cancel grace is reported as surviving so the orchestrator can hold rather
+    than hand off sole-consumer authority alongside a live side-effecting group.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -1127,13 +1199,22 @@ def recover_owned_job_groups(
         cancel_grace_seconds: Grace before escalating to SIGKILL.
 
     Returns:
-        The exact process group ids that were acted on.
+        A :class:`ReclaimedGroups` describing which exact groups were reaped and
+        which verified-ours groups survived the recovery pass.
     """
-    pgids = _owned_running_pgids(conn, incarnation)
-    if not pgids:
-        return pgids
-    _terminate_groups(pgids, cancel_grace_seconds)
-    return pgids
+    groups = _owned_running_groups(conn, incarnation)
+    if not groups:
+        return ReclaimedGroups(reaped=[], surviving=[])
+    reaped: list[int] = []
+    surviving: list[int] = []
+    for pgid, start_ticks in groups:
+        if not _group_still_ours(pgid, start_ticks):
+            continue
+        if _terminate_one_group(pgid, cancel_grace_seconds):
+            reaped.append(pgid)
+        else:
+            surviving.append(pgid)
+    return ReclaimedGroups(reaped=reaped, surviving=surviving)
 
 
 def _wait_for_session(pid: int) -> int:

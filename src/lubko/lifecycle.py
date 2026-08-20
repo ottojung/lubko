@@ -940,13 +940,30 @@ def stop_worker(
             considered wedged.
 
     Returns:
-        ``True`` when the exact worker process is no longer alive afterwards.
+        ``True`` when the exact worker process is no longer alive afterwards
+        (or was already gone / reused). ``False`` when the exact process
+        instance is alive but cannot be authorized for a signal because it does
+        not carry our lifecycle token (including when none was recorded), so
+        retirement is not claimed.
     """
-    identity = process_identity(meta.pid) if meta.pid is not None else None
+    if meta.pid is None:
+        return True
+    identity = process_identity(meta.pid)
     if identity is None or not identity_matches(meta, identity):
         # The exact worker process is gone or its identity changed (a recycled
         # PID can never be mis-signalled). Nothing to stop; retirement succeeds.
         return True
+    if meta.token is None or not process_has_token(meta.pid, meta.token):
+        # The exact process instance is alive but does NOT carry our lifecycle
+        # token: it is a live, unowned process (a wrong token, or none at all —
+        # never ours). Signal authorization requires the exact lifecycle token,
+        # so an absent token is treated identically to a mismatched one: we must
+        # not signal a process we do not own, and we must not report retirement
+        # as successful, so the caller holds rather than handing off
+        # sole-consumer authority. This is distinct from the dead/reused case
+        # above, where no live process matches the recorded identity and
+        # retirement genuinely succeeds.
+        return False
     start = time.monotonic()
     kill_floor = start + cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS
     wait_deadline = start + max(
