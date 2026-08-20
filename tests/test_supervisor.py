@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, suppress
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -55,7 +56,7 @@ from tests import _process_guard as guard
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from lubko.worker import JobsConnection
+    from lubko.worker import JobResult, JobsConnection
     from tests import _pg
 
 OUTPUT_TAIL_MAX_BYTES: Final = 4000
@@ -955,7 +956,7 @@ def test_processless_claimed_job_terminal_write_fails_is_not_reexecuted(
     # and the supervisor reaches the immediate-finalization path.
     processless_id = insert_process_job(jobs_db, str(tmp_path), ["/nonexistent/lubko-no-such-bin"])
 
-    settings = supervisor_settings()
+    settings = _issue74_settings()
     db = make_database_config(pg_cluster)
     with supervisor_running(settings, db, jobs_db):
         wait_until(lambda: read_status(jobs_db, active_id) == "running")
@@ -966,6 +967,237 @@ def test_processless_claimed_job_terminal_write_fails_is_not_reexecuted(
         wait_until(lambda: read_root(jobs_db, active_id)["state"]["lease_expires_at"] > first)
         assert read_status(jobs_db, active_id) == "running"
         assert read_status(jobs_db, processless_id) == "failed"
+
+
+def _select_owned_running_ids(conn: JobsConnection, settings: Settings) -> list[UUID]:
+    """Return every running command row currently owned by this worker.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        settings: Worker runtime settings.
+
+    Returns:
+        The owned running root IDs.
+    """
+    rows = []
+    with conn.transaction():
+        cursor = conn.execute(
+            "SELECT id FROM lubko.jobs\n"
+            "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "  AND (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "  AND (payload::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"
+            "  AND (payload::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n",
+            {
+                "worker_id": settings.worker_id,
+                "worker_incarnation": settings.worker_incarnation,
+            },
+        )
+        rows = cursor.fetchall()
+    return [cast("UUID", row[0]) for row in rows]
+
+
+REAL_BULK_REFRESH = worker_module.bulk_refresh_leases
+REAL_FINISH_JOB = worker_module.finish_job
+
+
+def _old_unscoped_bulk_refresh(
+    conn: JobsConnection, settings: Settings, _root_ids: object
+) -> list[UUID]:
+    """Pre-fix heartbeat: refresh every owned running row regardless of tracking.
+
+    Used only as a mutation-control stand-in for the original unscoped
+    ``bulk_refresh_leases`` so the regression tests can prove the fix would fail
+    under the old behaviour.  Calls the real (saved) ``bulk_refresh_leases`` with
+    the full set of owned running IDs to reproduce the pre-fix behaviour.
+
+    Returns:
+        The refreshed root IDs (all owned running rows).
+    """
+    owned = _select_owned_running_ids(conn, settings)
+    return REAL_BULK_REFRESH(conn, settings, owned)
+
+
+def _issue74_settings() -> Settings:
+    """Supervisor settings whose lease outlives a brief transient outage.
+
+    A transient connectivity/DB outage pauses heartbeats; the lease must be long
+    enough that the active job keeps heartbeating once connectivity returns.
+
+    Returns:
+        Fast-timing supervisor settings with a longer lease.
+    """
+    return replace(
+        supervisor_settings(),
+        lease_duration_seconds=8.0,
+        lease_safety_margin_seconds=0.5,
+    )
+
+
+def test_original_bug_processless_job_not_heartbeated_after_outage(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Original #74 bug: a processless claimed job is not heartbeated after an outage.
+
+    A is an active job that heartbeats. B is claimed, fails before spawn, and
+    its immediate finalization write fails as a transient connectivity/DB
+    outage. Connectivity is restored while A keeps heartbeating. The fix must
+    prove B is NOT refreshed and is eventually stale-recovered as failed, with
+    no uncertain re-execution.
+    """
+    # A is started first and is genuinely active/heartbeating before B exists,
+    # so any claim-batch ordering cannot abort A's startup when B fails.
+    active_id = insert_job(jobs_db, str(tmp_path), "sleep 30")
+
+    def _finish_connectivity_outage(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
+        # Only B's immediate finalization fails as a transient outage; every
+        # other write (including A's and any shutdown finalization) is real so
+        # the supervisor behaves normally around the failure.
+        if job_id == processless_id:
+            exc = psycopg.OperationalError("simulated transient outage")
+            exc.sqlstate = "08006"
+            raise exc
+        return REAL_FINISH_JOB(conn, job_id, result)
+
+    monkeypatch.setattr("lubko.worker.finish_job", _finish_connectivity_outage)
+
+    settings = _issue74_settings()
+    db = make_database_config(pg_cluster)
+    with supervisor_running(settings, db, jobs_db):
+        wait_until(lambda: read_status(jobs_db, active_id) == "running")
+        # Now introduce B: it cannot spawn (processless) and its immediate
+        # finalization hits a transient connectivity outage.  A keeps running
+        # and heartbeating independently of B's failure.
+        processless_id = insert_process_job(
+            jobs_db, str(tmp_path), ["/nonexistent/lubko-no-such-bin"]
+        )
+        wait_until(lambda: read_status(jobs_db, processless_id) == "running")
+        # B's immediate finalization failed on a connectivity error and B is not
+        # locally tracked, so it is never re-finalized; it depends entirely on
+        # the scoped heartbeat staying away so its lease can expire.
+        a_first = read_root(jobs_db, active_id)["state"]["lease_expires_at"]
+        wait_until(lambda: read_root(jobs_db, active_id)["state"]["lease_expires_at"] > a_first)
+        # B must never be heartbeated merely because A is active.
+        b_lease = read_root(jobs_db, processless_id)["state"]["lease_expires_at"]
+        wait_until(
+            lambda: (
+                read_root(jobs_db, active_id)["state"]["lease_expires_at"] > a_first
+                and read_root(jobs_db, processless_id)["state"]["lease_expires_at"] == b_lease
+            )
+        )
+        # B is eventually stale-recovered as failed, with no re-execution.
+        wait_until(lambda: read_status(jobs_db, processless_id) == "failed")
+        assert read_status(jobs_db, active_id) == "running"
+        # B never ran a process (it failed before spawn).
+        assert "process_pgid" not in read_root(jobs_db, processless_id).get("state", {})
+
+
+def test_original_bug_reproduced_under_old_unscoped_heartbeat(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation check: the pre-fix unscoped heartbeat keeps the orphan alive (the bug).
+
+    With ``bulk_refresh_leases`` refreshing every owned running row, an orphaned
+    owned running row (a claimed job whose immediate terminalization write
+    failed and which the worker does not locally track) is heartbeated merely
+    because other jobs are active, so it is never stale-recovered.  The fixed
+    regression ``test_original_bug_processless_job_not_heartbeated_after_outage``
+    proves the inverse: under the scoped heartbeat the same row is left
+    untouched and expires into safe recovery.  This is a controlled stand-in
+    for the issue's stated connectivity-outage sequence so the fix's effect is
+    observable without the claim-rollback that a simulated mid-tick outage would
+    trigger.
+    """
+    monkeypatch.setattr("lubko.worker.bulk_refresh_leases", _old_unscoped_bulk_refresh)
+
+    settings = _issue74_settings()
+    db = make_database_config(pg_cluster)
+
+    active_ids = [insert_job(jobs_db, str(tmp_path), "sleep 30") for _ in range(2)]
+    with supervisor_running(settings, db, jobs_db):
+        wait_until(lambda: all(read_status(jobs_db, j) == "running" for j in active_ids))
+        # An owned running row the worker never locally tracked (simulating a
+        # claimed job whose immediate finalization write failed before the
+        # worker recorded it).
+        orphan = _insert_owned_running_row(
+            jobs_db,
+            settings.worker_id,
+            settings.worker_incarnation,
+            settings.lease_duration_seconds,
+        )
+        first_active = {j: read_root(jobs_db, j)["state"]["lease_expires_at"] for j in active_ids}
+        orphan_first = read_root(jobs_db, orphan)["state"]["lease_expires_at"]
+        wait_until(
+            lambda: all(
+                read_root(jobs_db, j)["state"]["lease_expires_at"] > first_active[j]
+                for j in active_ids
+            )
+        )
+        # Under the old unscoped heartbeat the orphan IS refreshed merely
+        # because the active jobs are heartbeated in the same bulk statement.
+        assert read_root(jobs_db, orphan)["state"]["lease_expires_at"] > orphan_first
+        # Therefore the orphan is never stale-recovered: it stays running.
+        assert read_status(jobs_db, orphan) == "running"
+
+
+def test_retry_terminations_handles_double_terminalization_failure(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both immediate finalization and quarantine fail -> local retry, no heartbeat.
+
+    Forces a processless claimed job whose immediate finalization write fails
+    AND whose quarantine terminalization also fails once, exercising the real
+    ``_retry_terminations`` path: the job is kept locally owned for retry (so it
+    is represented), its lease is never heartbeated, and the bounded retry
+    converges to a terminal failed state with no re-execution.
+    """
+    # A is started first and is genuinely active/heartbeating before B exists.
+    active_id = insert_job(jobs_db, str(tmp_path), "sleep 30")
+
+    quarantine_calls: list[UUID] = []
+
+    def _quarantine_fail_once_then_succeed(_conn: object, job_id: UUID, _reason: str) -> bool:
+        quarantine_calls.append(job_id)
+        # The first (immediate-finalization) call fails so the row is kept
+        # locally for retry; the retry then converges.
+        return len(quarantine_calls) != 1
+
+    monkeypatch.setattr("lubko.worker._quarantine_job", _quarantine_fail_once_then_succeed)
+
+    def _finish_raise(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
+        if job_id == processless_id:
+            msg = "simulated deterministic finalization failure"
+            raise psycopg.DataError(msg)
+        return REAL_FINISH_JOB(conn, job_id, result)
+
+    monkeypatch.setattr("lubko.worker.finish_job", _finish_raise)
+
+    settings = _issue74_settings()
+    db = make_database_config(pg_cluster)
+    with supervisor_running(settings, db, jobs_db):
+        wait_until(lambda: read_status(jobs_db, active_id) == "running")
+        # Introduce B after A is active; B cannot spawn and its immediate
+        # finalization write fails, so it enters the retry-owned path.
+        processless_id = insert_process_job(
+            jobs_db, str(tmp_path), ["/nonexistent/lubko-no-such-bin"]
+        )
+        wait_until(lambda: read_status(jobs_db, processless_id) == "running")
+        # The failed job's lease must never be heartbeated merely because A is
+        # active.
+        b_lease = read_root(jobs_db, processless_id)["state"]["lease_expires_at"]
+        a_first = read_root(jobs_db, active_id)["state"]["lease_expires_at"]
+        # The double-failure path was entered (immediate write + first retry).
+        wait_until(lambda: len(quarantine_calls) >= 2)
+        # A keeps heartbeating; B stays frozen (not refreshed).
+        wait_until(
+            lambda: (
+                read_root(jobs_db, active_id)["state"]["lease_expires_at"] > a_first
+                and read_root(jobs_db, processless_id)["state"]["lease_expires_at"] == b_lease
+            )
+        )
+        # B converges to terminal failed via the retry; never re-executed.
+        wait_until(lambda: read_status(jobs_db, processless_id) == "failed")
+        assert read_status(jobs_db, active_id) == "running"
+        assert "process_pgid" not in read_root(jobs_db, processless_id).get("state", {})
 
 
 def _insert_owned_running_row(

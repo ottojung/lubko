@@ -298,9 +298,10 @@ class _RetryTerminalization:
     """Backoff bookkeeping for a job awaiting terminalization retry.
 
     A claimed job whose immediate finalization write failed is kept locally
-    owned for retry so it stays represented (and its lease is kept alive by the
-    scoped heartbeat) instead of being heartbeated merely because an unrelated
-    job happens to be active, or silently dropped as an orphan.
+    owned for retry so it stays represented.  Its lease is intentionally NOT
+    refreshed (it is not heartbeated merely because an unrelated job happens to
+    be active); it is left free to expire and be safely recovered as failed
+    rather than being silently dropped as an orphan.
     """
 
     retries: int = 0
@@ -2102,8 +2103,9 @@ class Supervisor:
         an orphaned owned row (for example a claimed job whose immediate
         finalization write failed and which is not locally tracked) from being
         heartbeated merely because another job is active.  Retry-owned jobs are
-        kept alive by a separate terminalization-retry mechanism, never by the
-        heartbeat, so they are free to expire and be safely recovered.
+        handled by a separate terminalization-retry mechanism and are
+        intentionally NOT heartbeated: their lease is left free to expire and be
+        safely recovered as failed, with no uncertain re-execution.
 
         Returns:
             The set of root IDs to refresh.
@@ -2571,9 +2573,10 @@ class Supervisor:
             if not _quarantine_job(conn, job_id, f"immediate finalization error: {exc}"):
                 # Both the finalization and the quarantine terminalization writes
                 # failed: keep the claimed job locally owned for retry so it stays
-                # represented (and its lease is kept alive) rather than being
-                # heartbeated merely because another job is active or silently
-                # orphaned.
+                # represented.  Its lease is intentionally NOT refreshed, so it is
+                # never heartbeated merely because another job is active, and it
+                # is free to expire and be safely recovered as failed rather than
+                # being silently orphaned.
                 self._retry_terminations.setdefault(job_id, _RetryTerminalization())
 
     def _enforce_lease_safety(self) -> None:
