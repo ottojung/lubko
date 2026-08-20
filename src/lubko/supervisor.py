@@ -75,7 +75,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+import psycopg
+
 from lubko import cli, deployctl, lifecycle, supervise
+from lubko import worker as worker_mod
+from lubko.config import load_database_config
 from lubko.durable import remove_durable
 from lubko.health import (
     interpret_worker_health,
@@ -661,12 +665,8 @@ class SupervisorDaemon:
                 )
                 if not lifecycle.stop_worker(meta, self.settings.stop_grace_seconds):
                     now = time.monotonic()
-                    write_state(
-                        replace(
-                            read_state(),
-                            next_attempt_at=now + self._backoff_seconds(read_state().restart_count),
-                        )
-                    )
+                    next_backoff = now + self._backoff_seconds(read_state().restart_count)
+                    write_state(replace(read_state(), next_attempt_at=next_backoff))
                     self._message = (
                         f"could not stop the recorded maintained worker pid {meta.pid}; "
                         "holding without starting a worker"
@@ -676,6 +676,9 @@ class SupervisorDaemon:
                         meta.pid,
                     )
                     return
+                # Recover any command group the adopted worker still owned so
+                # the replacement never starts alongside a stale group.
+                self._recover_owned_groups(meta.token or "")
         child = self._spawn_worker(commit)
         now = time.monotonic()
         if child is None:
@@ -840,6 +843,12 @@ class SupervisorDaemon:
             return True
         meta = _child_to_meta(child, _runtime_dir(state.commit))
         stopped = lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
+        # Even after a clean drain the retired worker's exact-ownership record
+        # must be reaped: a wedged worker that was force-killed can leave command
+        # process groups alive. Recover them by exact group identity (never a
+        # process-name match) so the replacement never shares the queue with a
+        # stale side-effecting group.
+        self._recover_owned_groups(child.token)
         if self.proc is not None:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
@@ -853,6 +862,55 @@ class SupervisorDaemon:
                 child.pid,
             )
         return stopped
+
+    @staticmethod
+    def _recover_owned_groups(incarnation: str) -> None:
+        """Recover any command group still owned by a retired worker incarnation.
+
+        After a worker is stopped or force-killed, any command process group it
+        owned must be terminated and reaped by its exact persisted process-group
+        id (``state.process_pgid``), never by process-name matching or a broad
+        kill. A missing database configuration or an unreachable database is
+        logged and skipped: the next daemon tick retries the same exact orphan,
+        so surviving groups are never silently forgotten.
+
+        Args:
+            incarnation: The retired worker's lifecycle token (incarnation).
+        """
+        if not incarnation:
+            return
+        try:
+            database = load_database_config()
+        except (OSError, ValueError):
+            LOGGER.exception(
+                "cannot load database config to recover owned groups for %s", incarnation
+            )
+            return
+        try:
+            conn = psycopg.connect(
+                database.conninfo(),
+                connect_timeout=5,
+            )
+            conn.autocommit = True
+        except (psycopg.Error, OSError):
+            LOGGER.exception("cannot connect to recover owned groups for %s", incarnation)
+            return
+        try:
+            acted = worker_mod.recover_owned_job_groups(
+                conn, incarnation, worker_mod.DEFAULT_CANCEL_GRACE_SECONDS
+            )
+        except psycopg.Error:
+            LOGGER.exception("error recovering owned groups for incarnation %s", incarnation)
+            return
+        finally:
+            with suppress(Exception):
+                conn.close()
+        if acted:
+            LOGGER.info(
+                "recovered %d owned command group(s) for incarnation %s",
+                len(acted),
+                incarnation,
+            )
 
     def _clear_child(self, _now: float) -> None:
         """Forget a child that exited after an intentional retirement.

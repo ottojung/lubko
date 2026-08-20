@@ -45,7 +45,13 @@ from lubko.config import load_database_config
 from lubko.durable import remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
-from lubko.worker import JOB_ID_ENV, delete_job_and_chunks, group_has_members, request_cancel
+from lubko.worker import (
+    DEFAULT_CANCEL_GRACE_SECONDS,
+    JOB_ID_ENV,
+    delete_job_and_chunks,
+    drain_sentinel_matches,
+    request_cancel,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -66,6 +72,11 @@ STATE_PENDING: Final = "pending"
 LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
 
 DEFAULT_STOP_GRACE_SECONDS: Final = 5.0
+#: Bounded finalization overhead the outer stop must grant the worker before it
+#: may treat a still-alive worker as wedged and issue an emergency SIGKILL. The
+#: outer wait is ``max(grace, cancel_grace + this)`` so the two equal/default
+#: timers can never race worker cleanup.
+STOP_DRAIN_OVERHEAD_SLACK_SECONDS: Final = 2.0
 DEFAULT_POSTGRES_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_LOCK_TIMEOUT_SECONDS: Final = 30.0
 DEFAULT_VALIDATION_TIMEOUT_SECONDS: Final = 1200.0
@@ -862,40 +873,128 @@ def _signal_group(pgid: int, sig: int) -> None:
         os.killpg(pgid, sig)
 
 
-def stop_worker(meta: WorkerMeta, grace_seconds: float) -> bool:
-    """Terminate the recorded worker using its exact process group identity.
+def _worker_process_alive(meta: WorkerMeta) -> bool:
+    """Return whether the exact recorded worker process instance is still alive.
 
-    Sends ``SIGTERM`` to the exact recorded process group, waits up to
-    ``grace_seconds``, then sends ``SIGKILL`` while members remain. Identity is
-    revalidated at every step so a recycled process can never be signalled.
+    Unlike :func:`worker_alive`, this does not require the lifecycle token in
+    the process environment. Liveness is decided purely by exact process
+    identity (PID, process group, session, and start-time ticks), which is
+    sufficient and PID-reuse-safe: a recycled PID would carry different
+    start-time ticks and is therefore not treated as alive.
+
+    This is the predicate the retirement state machine must use to decide
+    whether a planned stop has actually completed. Requiring the token here
+    would let a live worker whose environment lacks the marker be mis-reported
+    as already stopped, which would let retirement claim success and hand off
+    sole-consumer authority while the worker — and every command process group
+    it owns — were still alive.
 
     Args:
         meta: Recorded worker metadata.
-        grace_seconds: Grace period before force-killing.
 
     Returns:
-        ``True`` when the worker is no longer alive afterwards.
+        ``True`` when a live process matches every recorded identity field.
     """
-    if not worker_alive(meta):
-        return True
     if meta.pid is None:
-        return True
+        return False
     identity = process_identity(meta.pid)
     if identity is None:
+        return False
+    return identity_matches(meta, identity)
+
+
+def stop_worker(
+    meta: WorkerMeta,
+    grace_seconds: float,
+    *,
+    cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
+) -> bool:
+    """Terminate the recorded worker without leaking owned command groups.
+
+    The worker deliberately starts every command as its own session/process
+    group, so killing the worker process never kills its active command groups.
+    A planned transition must therefore let the worker drain its own groups
+    first. This function asks the worker to drain (``SIGTERM`` to its exact
+    process group) and then observes the worker's explicit safe-to-reap
+    boundary — either the worker process exits, or it writes a drain sentinel
+    proving every owned group is dead — before considering retirement complete.
+
+    Retirement is reported successful only once the exact worker process
+    instance is genuinely gone. The wait floor is ``max(grace_seconds,
+    cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS)`` so the
+    equal/default outer and inner timers can never race: the worker always gets
+    its full cancel grace plus bounded finalization overhead before an emergency
+    SIGKILL is even possible.
+
+    Only if the worker ignores ``SIGTERM`` (wedged) is an emergency SIGKILL sent
+    to the worker group. Owned command groups that survive a wedged worker must
+    be recovered by exact process-group identity elsewhere (see
+    :func:`recover_owned_job_groups`); this function never broad-kills and never
+    reports success while the worker process is still alive.
+
+    Args:
+        meta: Recorded worker metadata.
+        grace_seconds: Intended grace period before the emergency force-kill.
+        cancel_grace_seconds: The worker's own command cancel grace, used to
+            bound how long the worker is given to drain before it can be
+            considered wedged.
+
+    Returns:
+        ``True`` when the exact worker process is no longer alive afterwards.
+    """
+    identity = process_identity(meta.pid) if meta.pid is not None else None
+    if identity is None or not identity_matches(meta, identity):
+        # The exact worker process is gone or its identity changed (a recycled
+        # PID can never be mis-signalled). Nothing to stop; retirement succeeds.
         return True
+    start = time.monotonic()
+    kill_floor = start + cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS
+    wait_deadline = start + max(
+        grace_seconds,
+        cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS,
+    )
+    # 1. Ask the worker to drain its owned command process groups.
     _signal_group(identity.pgid, signal.SIGTERM)
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not worker_alive(meta):
-            return True
-        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+    # 2. Wait for the worker's explicit safe-to-reap boundary.
+    if _wait_for_drain(meta, wait_deadline):
+        return True
+    # 3. Emergency: the worker ignored SIGTERM and never drained. Never fire the
+    #    SIGKILL before the worker's own cancel grace plus finalization slack.
+    if time.monotonic() < kill_floor:
+        time.sleep(kill_floor - time.monotonic())
     _signal_group(identity.pgid, signal.SIGKILL)
     deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not group_has_members(identity.pgid):
-            return True
+    while time.monotonic() < deadline and _worker_process_alive(meta):
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
-    return not group_has_members(identity.pgid)
+    return not _worker_process_alive(meta)
+
+
+def _wait_for_drain(meta: WorkerMeta, wait_deadline: float) -> bool:
+    """Wait until the worker exits or proves its owned groups are drained.
+
+    Returns ``True`` once the exact worker process instance is gone or its
+    drain sentinel is present (and the worker has then also exited). ``False``
+    means the worker neither drained nor exited before the deadline (it is
+    wedged). Liveness is decided by exact process identity
+    (:func:`_worker_process_alive`), never by the token environment, so a live
+    worker is never mistakenly reported as already stopped.
+
+    Args:
+        meta: Recorded worker metadata.
+        wait_deadline: Monotonic deadline for the wait.
+
+    Returns:
+        ``True`` when the worker reached a safe-to-reap boundary.
+    """
+    while time.monotonic() < wait_deadline:
+        if not _worker_process_alive(meta):
+            return True
+        if meta.token is not None and drain_sentinel_matches(meta.token):
+            while time.monotonic() < wait_deadline and _worker_process_alive(meta):
+                time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+            return not _worker_process_alive(meta)
+        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+    return False
 
 
 # ---------------------------------------------------------------------------

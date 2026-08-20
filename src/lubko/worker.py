@@ -90,6 +90,7 @@ from lubko.protocol import (
     build_output_window_payload,
     parse_payload,
 )
+from lubko.state import state_root
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -140,6 +141,11 @@ LOGGER: Final = logging.getLogger(__name__)
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_PROCESS_POLL_INTERVAL_SECONDS: Final = 0.1
 DEFAULT_CANCEL_GRACE_SECONDS: Final = 5.0
+#: Bounded finalization overhead the outer lifecycle authority must let the
+#: worker keep before it may treat a still-alive worker as wedged and issue an
+#: emergency SIGKILL. The outer wait deadline is ``max(stop_grace,
+#: cancel_grace + this)`` so the two timers can never race.
+DRAIN_OVERHEAD_SLACK_SECONDS: Final = 2.0
 DEFAULT_LEASE_DURATION_SECONDS: Final = 30.0
 DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS: Final = 5.0
 DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS: Final = 10.0
@@ -989,6 +995,145 @@ def group_has_members(pgid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def drain_sentinel_dir() -> Path:
+    """Return the directory holding per-incarnation drain acknowledgement files.
+
+    Returns:
+        The drain sentinel directory under the Lubko worker state root.
+    """
+    return state_root() / "worker" / "drain"
+
+
+def drain_sentinel_path(incarnation: str) -> Path:
+    """Return the exact drain-sentinel path for an incarnation.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token).
+
+    Returns:
+        The sentinel file path.
+    """
+    return drain_sentinel_dir() / f"{incarnation}.drained"
+
+
+def write_drain_sentinel(incarnation: str) -> None:
+    """Atomically record that this worker has drained every owned group.
+
+    The sentinel is the explicit acknowledgement the outer lifecycle authority
+    observes: once present (and matching the incarnation), no command process
+    group owned by this worker can still be alive, so the worker may be reaped
+    or forgotten without leaking a side-effecting process.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token).
+    """
+    path = drain_sentinel_path(incarnation)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(f"{incarnation}\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def drain_sentinel_matches(incarnation: str) -> bool:
+    """Return whether a present drain sentinel exactly matches the incarnation.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token) to verify.
+
+    Returns:
+        ``True`` only when the sentinel exists and carries the exact token.
+    """
+    try:
+        return drain_sentinel_path(incarnation).read_text(encoding="utf-8").strip() == incarnation
+    except OSError:
+        return False
+
+
+def _owned_running_pgids(conn: JobsConnection, incarnation: str) -> list[int]:
+    """Return the exact process group ids of running jobs owned by an incarnation.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        incarnation: The worker incarnation (lifecycle token) to match.
+
+    Returns:
+        The exact process group ids recorded for running commands.
+    """
+    pgids: list[int] = []
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT id, (payload::jsonb)->'state'->>'process_pgid'\n"
+            "FROM lubko.jobs\n"
+            "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(inc)s\n"
+            "    AND (payload::jsonb)->'state'->>'process_pgid' IS NOT NULL\n",
+            {"inc": incarnation},
+        )
+        for row in cursor.fetchall():
+            pgid = row[1]
+            if pgid is None:
+                continue
+            try:
+                pgids.append(int(str(pgid)))
+            except ValueError:
+                continue
+    return pgids
+
+
+def _terminate_groups(pgids: list[int], cancel_grace_seconds: float) -> None:
+    """Ask exact process groups to terminate, then SIGKILL and reap survivors.
+
+    Args:
+        pgids: Exact process group ids to terminate.
+        cancel_grace_seconds: Grace before escalating to SIGKILL.
+    """
+    for pgid in pgids:
+        _signal_group(pgid, signal.SIGTERM)
+    term_deadline = time.monotonic() + cancel_grace_seconds
+    while time.monotonic() < term_deadline and any(group_has_members(p) for p in pgids):
+        time.sleep(0.05)
+    for pgid in pgids:
+        if group_has_members(pgid):
+            _signal_group(pgid, signal.SIGKILL)
+    for pgid in pgids:
+        reap_deadline = time.monotonic() + cancel_grace_seconds
+        while time.monotonic() < reap_deadline and group_has_members(pgid):
+            time.sleep(0.05)
+
+
+def recover_owned_job_groups(
+    conn: JobsConnection,
+    incarnation: str,
+    cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
+) -> list[int]:
+    """Terminate any live command process group still owned by an incarnation.
+
+    This is the exact-ownership emergency recovery used after a maintained
+    worker was force-killed while it still owned command process groups (a
+    wedged worker whose own graceful drain never ran). Every acting target is an
+    exact process group id persisted in the job row (``state.process_pgid``) for
+    a ``running`` command whose ``worker_incarnation`` matches, so no
+    process-name match or broad ``pkill``/``killall`` is ever used. Surviving
+    groups are asked to terminate, then SIGKILLed after the bounded cancel
+    grace, then reaped.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        incarnation: The worker incarnation (lifecycle token) whose groups to
+            recover.
+        cancel_grace_seconds: Grace before escalating to SIGKILL.
+
+    Returns:
+        The exact process group ids that were acted on.
+    """
+    pgids = _owned_running_pgids(conn, incarnation)
+    if not pgids:
+        return pgids
+    _terminate_groups(pgids, cancel_grace_seconds)
+    return pgids
 
 
 def _wait_for_session(pid: int) -> int:
@@ -2807,6 +2952,14 @@ class Supervisor:
             if not job.completed and not job.term_sent:
                 request_stop(job, STOP_REASON_SHUTDOWN)
         self._drain_active_groups()
+        # Every owned command process group is now proven dead (the drain above
+        # SIGKILLs and reaps any group that survives the cancel grace). Record
+        # the explicit safe-to-reap boundary so the outer lifecycle authority
+        # can observe it before forgetting or force-killing this worker.
+        try:
+            write_drain_sentinel(self.settings.worker_incarnation)
+        except OSError:
+            LOGGER.debug("could not write drain sentinel", exc_info=True)
         self._finalize_all_for_shutdown()
         self._cleanup_all_files()
         if self.conn is not None:
