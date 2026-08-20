@@ -2575,10 +2575,12 @@ def test_reserved_runner_death_before_pid_recovery_single_replacement(
 ) -> None:
     """Killing the reserved runner before PID registration recovers once.
 
-    The first reserved runner is killed before it records its identity. A
-    later caller proves the reservation stale and takes over with exactly one
-    replacement runner; a concurrent second caller is rejected rather than
-    spawning a second replacement.
+    The first reserved runner is killed before it records its identity, but its
+    already-accepted ``pending_prompt`` ("doomed") must survive the takeover
+    deterministically. A recovery caller re-owns the exact stale reservation
+    and starts exactly one replacement runner that executes the original prompt;
+    a concurrent second caller is rejected (busy) rather than overwriting the
+    accepted prompt or spawning a second replacement.
     """
     aid = "eeeeeeee"
     agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
@@ -2600,6 +2602,8 @@ def test_reserved_runner_death_before_pid_recovery_single_replacement(
         _release_sync(sync, "runner_preclaim")
         first.wait(timeout=30)
         # Reservation is now stale: trigger recovery with two concurrent callers.
+        # Their own prompts ("recover-one"/"recover-two") must NOT replace the
+        # already-accepted "doomed" prompt.
         r1 = _run_cli(
             ["prompt", "--id", aid, "--detach", "recover-one"], LUBKO_AGENT_CMD="sleep 300"
         )
@@ -2611,15 +2615,25 @@ def test_reserved_runner_death_before_pid_recovery_single_replacement(
         wait_until(functools.partial(_runner_claimed, aid), timeout=10)
         meta = agent.read_meta(aid)
         assert meta is not None
-        # Exactly one replacement runner, one generation past the stale one.
+        # Exactly one replacement runner under a FRESH generation (the stale
+        # gen-1 reservation is invalidated); no second runner is spawned.
         assert meta["runner_gen"] == 2
         runner_pid = int(meta["runner_pid"])
         assert agent.pid_alive(runner_pid)
         _assert_exact_runner(runner_pid, aid, 2)
+        # The original accepted prompt survived takeover: it is the durable
+        # prompt recorded (last_prompt) and was counted exactly once. The
+        # recovery callers' own prompts never replaced it.
+        assert meta["last_prompt"] == "doomed"
+        assert meta["prompt_count"] == 1
         # The doomed gen-1 runner is gone; only the gen-2 replacement exists.
         assert not agent.pid_alive(doomed[0])
-        # At most one replacement: exactly one caller succeeded.
-        assert sorted([rc1, rc2]) == [agent.EXIT_OK, agent.EXIT_ERROR]
+        # No submitted text is silently discarded behind a success code: both
+        # recovery callers are explicitly rejected (busy) even though one of
+        # them triggered recovery of the reserved prompt. Neither overwrote the
+        # accepted prompt nor spawned a competing runner.
+        assert rc1 == agent.EXIT_ERROR
+        assert rc2 == agent.EXIT_ERROR
     finally:
         _teardown_runners(aid)
 

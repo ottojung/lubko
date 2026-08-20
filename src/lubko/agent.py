@@ -1689,6 +1689,77 @@ def _interrupt_steer_if_needed(aid: str) -> None:
     send_signal_group(current, signal.SIGTERM)
 
 
+def _recover_stale_reservation(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    now: float,
+    caller_pid: int,
+) -> bool:
+    """Recover a stale reserved runner, preserving the accepted pending prompt.
+
+    Returns ``True`` only when ``m`` holds a reserved runner whose spawner or
+    runner died before claiming its exact identity (nothing genuinely in
+    flight). The caller re-owns the reservation under a fresh generation so the
+    stale old generation is invalidated, and starts exactly one replacement
+    runner.
+
+    The already-accepted pending prompt is preserved and never overwritten. When
+    an accepted prompt exists the new caller's own prompt is explicitly
+    rejected (the caller receives a busy disposition) while recovery still
+    proceeds; when none was accepted the caller's prompt becomes the recovered
+    prompt and is accepted. In both cases the recovery caller's text is never
+    silently discarded behind a success code.
+
+    A concurrent second recovery caller acquires the lock after the first has
+    re-owned the reservation, observes it genuinely in flight, and is rejected
+    as busy without spawning a second replacement.
+
+    Args:
+        m: Agent metadata under the lock.
+        decision: Caller-owned mapping filled with the resulting action.
+        prompt: The new caller's prompt.
+        now: Decision timestamp.
+        caller_pid: PID of the recovering caller.
+
+    Returns:
+        ``True`` when a stale reservation was recovered here.
+    """
+    res = m.get("runner_reservation")
+    if not (isinstance(res, dict) and res.get("state") == "reserved"):
+        return False
+    if reservation_in_flight(m):
+        return False
+    gen = int(m.get("runner_gen") or 0) + 1
+    take_mode = res.get("mode") or "new"
+    accepted = bool(m.get("pending_prompt"))
+    if not accepted:
+        # No accepted prompt survived; the recovery caller's prompt is the one
+        # to run and is accepted (never silently discarded).
+        m["pending_prompt"] = prompt
+        m["last_prompt"] = _truncate(prompt, 500)
+        m["prompt_count"] = int(m.get("prompt_count") or 0) + 1
+    m["active_runner"] = True
+    m["runner_gen"] = gen
+    m["runner_reservation"] = {
+        "gen": gen,
+        "owner_pid": caller_pid,
+        "owner_start_ticks": proc_start_ticks(caller_pid),
+        "state": "reserved",
+        "reserved_at": now,
+        "mode": take_mode,
+    }
+    decision["action"] = "spawn"
+    decision["mode"] = take_mode
+    decision["gen"] = gen
+    # When an accepted prompt already exists the caller's own prompt is rejected
+    # with an explicit busy disposition while recovery of the old prompt still
+    # proceeds via the spawned replacement runner.
+    decision["recover_busy"] = accepted
+    return True
+
+
 def _decide_invocation(
     m: Meta,
     decision: dict[str, object],
@@ -1756,8 +1827,14 @@ def _decide_invocation(
             decision["action"] = "reuse"
         return
 
-    # Nothing is genuinely in flight: own this transition (fresh start or
-    # takeover of a stale reservation) and reserve exactly one runner. A steer
+    # A stale reserved runner (spawner or runner died before claiming its exact
+    # identity) is recovered here: the accepted pending prompt is preserved and
+    # exactly one replacement runner is started under a fresh generation.
+    if _recover_stale_reservation(m, decision, prompt=prompt, now=now, caller_pid=caller_pid):
+        return
+
+    # Nothing is genuinely in flight and no stale reservation to recover: own
+    # this transition (fresh start) and reserve exactly one runner. A steer
     # that reaches here (idle, finished, or a stale reservation) is exactly
     # equivalent to an ordinary prompt, so it sets the pending prompt and
     # becomes the single reserved invocation.
@@ -1837,6 +1914,13 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
         return EXIT_ERROR
     if action == "spawn":
         spawn_runner(aid, str(decision["mode"]), gen=cast("int", decision["gen"]))
+        if decision.get("recover_busy"):
+            # A stale reserved runner was recovered (the accepted pending prompt
+            # is preserved and a replacement runner was started), but this
+            # caller's own prompt is explicitly rejected rather than silently
+            # accepted behind a success code.
+            _err(f"{PROG}: agent {aid} is recovering a reserved prompt; this prompt was rejected")
+            return EXIT_ERROR
     elif action == "reuse" and decision.get("interrupt"):
         _interrupt_steer_if_needed(aid)
 
