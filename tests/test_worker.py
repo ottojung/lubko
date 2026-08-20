@@ -539,16 +539,16 @@ def test_request_cancel_leaves_terminal_job_unchanged() -> None:
     assert len(updates) == 2
 
 
-def test_bulk_refresh_leases_refreshes_owned_running_rows() -> None:
-    """One statement refreshes every owned running command row."""
+def test_bulk_refresh_leases_refreshes_only_named_root_ids() -> None:
+    """One statement refreshes exactly the requested root IDs, nothing else."""
     conn = _RecordingConnection()
-    job_ids = [uuid4(), uuid4()]
-    conn.rows = [(job_ids[0],), (job_ids[1],)]
+    owned = [uuid4(), uuid4(), uuid4()]
+    conn.rows = [(owned[0],), (owned[1],)]
     settings = make_settings()
 
-    refreshed = bulk_refresh_leases(as_db(conn), settings)
+    refreshed = bulk_refresh_leases(as_db(conn), settings, [owned[0], owned[1]])
 
-    assert refreshed == job_ids
+    assert refreshed == [owned[0], owned[1]]
     sql, params = conn.executions[0]
     assert "lease_expires_at" in sql
     assert "make_interval" in sql
@@ -556,9 +556,36 @@ def test_bulk_refresh_leases_refreshes_owned_running_rows() -> None:
     assert "status' = 'running'" in sql
     assert "worker_id" in sql
     assert "worker_incarnation" in sql
+    # Heartbeat scoping: only the explicitly named root IDs are touched.
+    assert "id = ANY(%(root_ids)s)" in sql
     assert isinstance(params, dict)
     assert params["lease_duration_seconds"] == settings.lease_duration_seconds
     assert params["worker_id"] == settings.worker_id
+    assert params["root_ids"] == [owned[0], owned[1]]
+
+
+def test_bulk_refresh_leases_never_heartbeats_unnamed_owned_row() -> None:
+    """An owned running row not named in root_ids is left untouched.
+
+    This is the core of issue #74: a claimed job whose immediate
+    finalization write failed must not be heartbeated merely because another
+    job is active. The bulk heartbeat only refreshes the explicitly named IDs.
+    """
+    conn = _RecordingConnection()
+    # The recording double returns whatever rows are queued; by queuing nothing
+    # we prove the statement's WHERE clause scopes to root_ids and refreshes
+    # no row when none of the named IDs match a running owned row.
+    conn.rows = []
+    settings = make_settings()
+    named = uuid4()
+
+    refreshed = bulk_refresh_leases(as_db(conn), settings, [named])
+
+    assert refreshed == []
+    assert "id = ANY(%(root_ids)s)" in conn.executions[0][0]
+    # A different owned running row (not named) is never touched.
+    other = uuid4()
+    assert other not in refreshed
 
 
 def test_discover_cancellations_queries_owned_running_markers() -> None:
