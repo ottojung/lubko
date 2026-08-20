@@ -1730,7 +1730,7 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A prompt does not spawn a second runner while one is live."""
+    """A prompt reuses a live runner without spawning a second one."""
     runner_proc = spawn_marked_process("aaaaaaaa")
     try:
         meta = make_agent(
@@ -1743,6 +1743,7 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
         meta["active_runner"] = True
         meta["runner_pid"] = runner_proc.pid
         meta["runner_start_time"] = agent.proc_start_ticks(runner_proc.pid)
+        meta["pending_prompt"] = None
         agent.write_meta("aaaaaaaa", meta)
         monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-1")
         spawned: list[str] = []
@@ -1755,6 +1756,119 @@ def test_prompt_skips_duplicate_runner_when_live_runner_exists(
         assert current["pending_prompt"] == "more"
     finally:
         kill_proc(runner_proc)
+
+
+def test_live_runner_two_ordinary_prompts_exactly_one_accepted(
+    state_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """Two ordinary prompts against a live between-invocation runner.
+
+    Both callers observe the old terminal, no-pending state, then both reach
+    the locked decision window.  Exactly one prompt is accepted and reused by
+    the live runner (no second runner spawned, no overwrite); the loser is
+    explicitly busy.
+    """
+    aid = "22222222"
+    runner_proc = spawn_marked_process(aid)
+    try:
+        meta = make_agent(
+            state_dir,
+            aid,
+            state_value="succeeded",
+            prompt_count=1,
+        )
+        meta["active_runner"] = True
+        meta["runner_pid"] = runner_proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(runner_proc.pid)
+        meta["pending_prompt"] = None
+        agent.write_meta(aid, meta)
+        sync = tmp_path / "sync"
+        p1 = _run_cli(
+            ["prompt", "--id", aid, "--detach", "first"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+        )
+        p2 = _run_cli(
+            ["prompt", "--id", aid, "--detach", "second"],
+            sync_dir=sync,
+            LUBKO_AGENT_CMD="sleep 300",
+        )
+        try:
+            _wait_sync_reached(sync, "sc_observe", 2)
+            _release_sync(sync, "sc_observe")
+            _wait_sync_reached(sync, "sc_decide", 2)
+            _release_sync(sync, "sc_decide")
+            rc1 = p1.wait(timeout=30)
+            rc2 = p2.wait(timeout=30)
+            current = agent.read_meta(aid)
+            assert current is not None
+            # No runner was spawned: the single live runner is reused, so the
+            # generation and reservation are untouched and no second identity
+            # exists.  Exactly one prompt owns the runner.
+            assert current["runner_gen"] == 0
+            assert current["runner_reservation"] is None
+            assert current["runner_pid"] == runner_proc.pid
+            assert current["active_runner"] is True
+            assert current["pending_prompt"] in {"first", "second"}
+            assert current["prompt_count"] == 1
+            # The loser is explicitly busy; exactly one call succeeded.
+            assert sorted([rc1, rc2]) == [agent.EXIT_OK, agent.EXIT_ERROR]
+        finally:
+            _teardown_runners(aid, sync)
+    finally:
+        kill_proc(runner_proc)
+
+
+def test_reservation_owner_exact_process_safe_against_pid_reuse(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reused PID with different start ticks never justifies a reservation.
+
+    The original spawner dies and its PID is reused by an unrelated process.
+    Because the reservation records the owner's start ticks, the live reused
+    PID does not justify the reservation, so deterministic recovery is allowed
+    and produces exactly one replacement runner.
+    """
+    aid = "11111111"
+    reused = spawn_marked_process(aid)
+    try:
+        real_ticks = agent.proc_start_ticks(reused.pid)
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["state"] = "running"
+        meta["active_runner"] = True
+        meta["started_at"] = time.time()
+        meta["runner_gen"] = 1
+        # The spawner died; its PID was reused by an unrelated process whose
+        # start ticks differ from the recorded owner identity.
+        meta["runner_reservation"] = {
+            "gen": 1,
+            "owner_pid": reused.pid,
+            "owner_start_ticks": (real_ticks or 0) + 1,
+            "state": "reserved",
+            "reserved_at": time.time(),
+            "mode": "new",
+        }
+        agent.write_meta(aid, meta)
+        # A live reused PID with mismatched start ticks must NOT justify the
+        # reservation.
+        assert agent.reservation_in_flight(meta) is False
+        assert agent.is_genuinely_running(meta) is False
+        # Recovery is allowed and produces exactly one replacement runner.
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode: spawned.append(mode))
+        rc = agent.main(["prompt", "--id", aid, "--detach", "recover"])
+        assert rc == agent.EXIT_OK
+        assert spawned == ["new"]
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["runner_gen"] == 2
+        assert isinstance(after["runner_reservation"], dict)
+        assert after["runner_reservation"]["gen"] == 2
+        # The replacement reservation is owned by this (alive, matching) process,
+        # so it is genuinely in flight.
+        assert agent.reservation_in_flight(after) is True
+    finally:
+        kill_proc(reused)
 
 
 def test_cmd_stop_escalates_to_sigkill_when_group_survives(

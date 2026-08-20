@@ -507,13 +507,32 @@ def _runner_marker_alive(aid: str, expected_gen: int) -> bool:
     return False
 
 
+def _owner_alive(owner: object, owner_ticks: object) -> bool:
+    """Return whether ``owner`` is still the exact live reservation owner.
+
+    A PID alone is not trusted: the process start time (ticks) must also match
+    the recorded owner identity, so a PID that was reused by an unrelated
+    process after the spawner died can never justify the reservation.
+
+    Args:
+        owner: Recorded owner process ID, or ``None``.
+        owner_ticks: Recorded owner start time in clock ticks, or ``None``.
+
+    Returns:
+        ``True`` only when the live process is the exact recorded owner.
+    """
+    if not isinstance(owner, int) or not pid_alive(owner):
+        return False
+    return proc_start_ticks(owner) == owner_ticks
+
+
 def reservation_in_flight(meta: Meta) -> bool:
     """Return whether a reserved runner is still being brought up.
 
     A reservation is in flight when the runner's exact identity is already
-    proven live, or a reserved (not yet claimed) runner is still owned by a
-    live spawner, or a reserved runner process exists but has not yet recorded
-    its exact identity.
+    proven live, or a reserved (not yet claimed) runner is still owned by the
+    exact live spawner (matching PID and start ticks), or a reserved runner
+    process exists but has not yet recorded its exact identity.
 
     Args:
         meta: Agent metadata.
@@ -528,8 +547,7 @@ def reservation_in_flight(meta: Meta) -> bool:
     res = meta.get("runner_reservation")
     if not isinstance(res, dict) or res.get("state") != "reserved":
         return False
-    owner = res.get("owner_pid")
-    if pid_alive(owner):
+    if _owner_alive(res.get("owner_pid"), res.get("owner_start_ticks")):
         return True
     return _runner_marker_alive(meta.get("id", "") or "", int(res.get("gen") or 0))
 
@@ -537,15 +555,24 @@ def reservation_in_flight(meta: Meta) -> bool:
 def _owned_by_me(meta: Meta, caller_pid: int) -> bool:
     """Return whether the current runner reservation is owned by ``caller_pid``.
 
+    The reservation is owned by the caller only when its PID *and* its start
+    ticks both match, so a reused PID that belongs to an unrelated process
+    cannot be mistaken for the exact original owner.
+
     Args:
         meta: Agent metadata.
         caller_pid: PID of the calling process.
 
     Returns:
-        ``True`` when the live reservation names ``caller_pid`` as owner.
+        ``True`` when the live reservation names ``caller_pid`` as the exact
+        owner.
     """
     res = meta.get("runner_reservation")
-    return isinstance(res, dict) and res.get("owner_pid") == caller_pid
+    return (
+        isinstance(res, dict)
+        and res.get("owner_pid") == caller_pid
+        and proc_start_ticks(caller_pid) == res.get("owner_start_ticks")
+    )
 
 
 def is_genuinely_running(meta: Meta) -> bool:
@@ -1656,6 +1683,11 @@ def _decide_invocation(
             _queue_steer(m, prompt, now)
             decision["action"] = "reuse"
             decision["interrupt"] = False
+        elif m.get("pending_prompt"):
+            # An invocation is already accepted and awaiting this live runner;
+            # a second ordinary prompt must never overwrite it.  It is
+            # explicitly busy so exactly one prompt owns the runner.
+            decision["action"] = "busy"
         else:
             m["pending_prompt"] = prompt
             m["state"] = "running"
@@ -1688,6 +1720,7 @@ def _decide_invocation(
     m["runner_reservation"] = {
         "gen": gen,
         "owner_pid": caller_pid,
+        "owner_start_ticks": proc_start_ticks(caller_pid),
         "state": "reserved",
         "reserved_at": now,
         "mode": mode,
