@@ -38,6 +38,7 @@ from psycopg.rows import tuple_row
 
 from lubko import cli, supervise
 from lubko.config import load_database_config
+from lubko.durable import write_json_durable
 from lubko.lifecycle import (
     SCHEMA_VERSION,
     STATE_RUNNING,
@@ -248,16 +249,22 @@ def _optional_bool(value: object | None) -> bool | None:
 
 
 def _write_state(state: RollbackState) -> None:
-    """Atomically persist rollback authority state.
+    """Crash-durably persist rollback authority state.
+
+    ``rollback.json`` is recovery authority: the supervised-deployment mission
+    generation is compared against the supervisor desired/applied state after a
+    restart, so the write must be confirmed durable before the mission is
+    treated as published.
 
     Args:
         state: State to store.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    path = rollback_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state.to_dict(), sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    write_json_durable(rollback_state_path(), state.to_dict())
 
 
 def _read_state() -> RollbackState | None:

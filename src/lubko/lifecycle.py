@@ -42,6 +42,7 @@ from psycopg.rows import tuple_row
 
 from lubko import cli, supervise, toolchain
 from lubko.config import load_database_config
+from lubko.durable import remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import JOB_ID_ENV, delete_job_and_chunks, group_has_members, request_cancel
@@ -478,16 +479,21 @@ def _optional_str(value: object | None) -> str | None:
 
 
 def write_meta(meta: WorkerMeta) -> None:
-    """Atomically persist worker lifecycle metadata.
+    """Crash-durably persist worker lifecycle metadata.
+
+    ``meta.json`` is recovery authority for the maintained worker: it records
+    the live worker identity the supervisor reconciles against, so the write
+    must be confirmed durable before any dependent lifecycle action proceeds.
 
     Args:
         meta: Worker metadata to persist.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    directory = worker_state_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    tmp_path = directory / "meta.json.tmp"
-    tmp_path.write_text(json.dumps(meta.to_dict(), indent=2, sort_keys=True) + "\n")
-    tmp_path.replace(meta_path())
+    write_json_durable(meta_path(), meta.to_dict())
 
 
 def read_meta() -> WorkerMeta | None:
@@ -1773,16 +1779,16 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
-        path.unlink(missing_ok=True)
+        remove_durable(path)
         return
     if not isinstance(data, dict):
-        path.unlink(missing_ok=True)
+        remove_durable(path)
         return
     try:
         new_meta = WorkerMeta.from_dict(data.get("new_meta") or {})
         previous_meta = WorkerMeta.from_dict(data.get("previous_meta") or {})
     except (KeyError, TypeError, ValueError):
-        path.unlink(missing_ok=True)
+        remove_durable(path)
         return
     if (
         data.get("status") == STATE_PENDING
@@ -1803,7 +1809,7 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
             "repair refuses to adopt a different process"
         )
         raise _AdoptionError(msg)
-    path.unlink(missing_ok=True)
+    remove_durable(path)
 
 
 def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
@@ -2911,7 +2917,7 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
             )
         )
     if mission is None:
-        rollback_state_path().unlink(missing_ok=True)
+        remove_durable(rollback_state_path())
         append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
     elif mission.status == deployctl.STATUS_PENDING and mission.generation < generation:
         deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)

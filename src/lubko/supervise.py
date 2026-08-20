@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 
 if TYPE_CHECKING:
@@ -543,12 +544,17 @@ def _read_json(path: Path) -> dict[str, object] | None:
 
 
 def write_desired(desired: SupervisorDesired) -> None:
-    """Atomically persist a desired intent.
+    """Crash-durably persist a desired intent.
 
     Args:
         desired: Intent to store.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    _write_json(desired_path(), desired.to_dict())
+    write_json_durable(desired_path(), desired.to_dict())
 
 
 def read_desired() -> SupervisorDesired | None:
@@ -570,12 +576,21 @@ def read_desired() -> SupervisorDesired | None:
 
 
 def write_state(state: SupervisorState) -> None:
-    """Atomically persist the daemon's durable state.
+    """Crash-durably persist the daemon's durable state.
+
+    This is recovery authority: the applied generation and mode decide which
+    worker the daemon owns after a restart, so the write must be confirmed
+    durable before any dependent lifecycle action proceeds.
 
     Args:
         state: State to store.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    _write_json(state_path(), state.to_dict())
+    write_json_durable(state_path(), state.to_dict())
 
 
 def read_state() -> SupervisorState:
@@ -619,7 +634,12 @@ def fresh_state() -> SupervisorState:
 
 
 def write_status(status: SupervisorStatus) -> None:
-    """Atomically persist the machine-readable status.
+    """Persist the machine-readable status as a lightweight atomic write.
+
+    ``status.json`` is observation-only health/status: it is never used as
+    recovery authority (the live identity binding in ``supervisor.pid`` plus
+    ``state.json`` already decide liveness), so it stays a low-overhead atomic
+    write and is intentionally *not* routed through the crash-durable primitive.
 
     Args:
         status: Status to store.
@@ -684,13 +704,22 @@ def _status_identity_matches(status: SupervisorStatus) -> bool:
 
 
 def write_supervisor_pid(pid: int, start_time_ticks: int) -> None:
-    """Persist the daemon's exact identity for detection by the CLIs.
+    """Crash-durably persist the daemon's exact identity for detection by the CLIs.
+
+    The identity file is recovery authority: it is the exact live supervisor
+    incarnation that every status/health reader binds against, so the write
+    must be confirmed durable.
 
     Args:
         pid: The daemon's process ID.
         start_time_ticks: The daemon's start time in clock ticks.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable.
     """
-    _write_json(
+    write_json_durable(
         supervisor_pid_path(),
         {"schema_version": SCHEMA_VERSION, "pid": pid, "start_time_ticks": start_time_ticks},
     )
@@ -1157,34 +1186,44 @@ def read_supervisor_runtime_override() -> str | None:
 
 
 def write_supervisor_runtime_override(commit: str) -> None:
-    """Atomically publish the supervisor-runtime override pointer.
+    """Crash-durably publish the supervisor-runtime override pointer.
 
-    The file contains exactly one 40-hex commit followed by a newline.
-    An interrupted write never leaves a partial file: the temporary is
-    replaced atomically.
+    The file contains exactly one 40-hex commit followed by a newline.  It is
+    recovery authority: the ``lubko-supervisor`` launcher reads it to choose
+    which runtime the daemon starts from, so the write must be confirmed
+    durable before the staged runtime is treated as active.
 
     Args:
         commit: Exact 40-hex commit the supervisor launcher should run.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_bytes_durable` when it cannot be confirmed
+        durable.
     """
-    path = supervisor_runtime_override_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.write_text(f"{commit}\n", encoding="utf-8")
-    temporary.replace(path)
+    write_bytes_durable(supervisor_runtime_override_path(), f"{commit}\n".encode())
 
 
 def clear_supervisor_runtime_override() -> bool:
-    """Remove the supervisor-runtime override pointer if present.
+    """Crash-durably remove the supervisor-runtime override pointer if present.
 
-    Only regular files are removed: symlinks, directories, and other
-    special entries are never silently deleted.
+    Only regular files are removed: symlinks, directories, and other special
+    entries are never silently deleted. The removal is authoritative state
+    cleanup, so it is routed through :func:`lubko.durable.remove_durable` to
+    fsync the parent directory and fail closed when the removal cannot be
+    confirmed.
 
     Returns:
         ``True`` when the override was present and removed, ``False``
         when it was already absent.
+
+    Note:
+        Fails closed: the underlying :func:`lubko.durable.remove_durable`
+        raises :class:`DurabilityError` when the removal cannot be confirmed
+        durable.
     """
     path = supervisor_runtime_override_path()
     if not path.is_file() or path.is_symlink():
         return False
-    path.unlink()
+    remove_durable(path)
     return True

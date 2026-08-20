@@ -46,6 +46,7 @@ from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from lubko.durable import DurabilityError, write_symlink_durable
 from lubko.state import cli_root_dir, state_root
 from lubko.supervise import read_supervisor_runtime_override
 
@@ -655,7 +656,11 @@ def build_cli_root(repo: Path, commit: str, uv_path: str, timeout_seconds: float
 
 
 def set_current(commit: str) -> None:
-    """Atomically select the commit the maintained CLIs resolve to.
+    """Crash-durably select the commit the maintained CLIs resolve to.
+
+    ``cli/current`` is recovery authority for the maintained CLI environment:
+    every maintained command resolves through it, so the symlink switch must be
+    confirmed durable before the activation is reported as successful.
 
     Args:
         commit: Exact commit hash to activate.
@@ -664,15 +669,9 @@ def set_current(commit: str) -> None:
         CliError: If the pointer cannot be switched or ``commit`` is invalid.
     """
     validate_commit_name(commit)
-    directory = cli_root_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    temporary = directory / CURRENT_TMP_NAME
     try:
-        temporary.symlink_to(commit)
-        temporary.replace(current_link_path())
-    except OSError as exc:
-        with suppress(OSError):
-            temporary.unlink()
+        write_symlink_durable(current_link_path(), commit)
+    except DurabilityError as exc:
         msg = f"could not activate CLI commit {commit}: {exc}"
         raise CliError(msg) from exc
 

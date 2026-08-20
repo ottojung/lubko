@@ -2219,39 +2219,53 @@ def test_queue_deploy_cli_activation_failure_rolls_back_and_converges(
     repo, first, second = maintained_env
     fake_uv = write_fake_uv(tmp_path)
     cli.set_current(first)
-    (cli_root_dir() / cli.CURRENT_TMP_NAME).mkdir()
-    with running_supervisor(supervisor_env):
-        applied = request_and_wait(first, repo)
-        old_meta = lifecycle.read_meta()
-        assert old_meta is not None
-        assert old_meta.pid is not None
-
-        deploy_id = insert_pending_process_job(
-            jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
-        )
-        wait_until(lambda: read_status_of(jobs_db, deploy_id) == "succeeded", timeout=90.0)
-        wait_until(_deploy_rollback_converged(applied, first), timeout=90.0)
-
-        status = supervise.read_status()
-        assert status is not None
-        assert status.commit == first
-        assert status.applied_generation > applied
-        assert status.child is not None
-        assert status.child.pid != old_meta.pid
-        assert len(direct_children(status.supervisor_pid)) == 1
+    # Make the CLI root non-writable so the atomic pointer switch (which now
+    # uses unique temporary names) cannot create its temp symlink or replace
+    # the ``current`` pointer.  Both runtimes are already built by
+    # ``maintained_env``, so this blocks only the final pointer switch and not
+    # any new commit-runtime construction.  The previously established
+    # ``current`` pointer stays readable as ``first``; any ``set_current``
+    # attempt (candidate or rollback) fails closed, leaving the pointer on
+    # ``first`` until the supervisor rolls back to the previous commit.
+    cli_root = cli_root_dir()
+    original_mode = cli_root.stat().st_mode & 0o777
+    cli_root.chmod(original_mode & ~0o222)
+    try:
         assert cli.current_commit() == first
+        with running_supervisor(supervisor_env):
+            applied = request_and_wait(first, repo)
+            old_meta = lifecycle.read_meta()
+            assert old_meta is not None
+            assert old_meta.pid is not None
 
-        meta = lifecycle.read_meta()
-        assert meta is not None
-        assert meta.git_commit == first
-        assert lifecycle.worker_alive(meta)
+            deploy_id = insert_pending_process_job(
+                jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+            )
+            wait_until(lambda: read_status_of(jobs_db, deploy_id) == "succeeded", timeout=90.0)
+            wait_until(_deploy_rollback_converged(applied, first), timeout=90.0)
 
-        payload = read_payload(jobs_db, deploy_id)
-        assert payload_state(payload)["status"] == "succeeded"
-        result = payload["result"]
-        assert isinstance(result, dict)
-        assert result["exit_code"] == 0
-        assert second in str(result["stdout"])
+            status = supervise.read_status()
+            assert status is not None
+            assert status.commit == first
+            assert status.applied_generation > applied
+            assert status.child is not None
+            assert status.child.pid != old_meta.pid
+            assert len(direct_children(status.supervisor_pid)) == 1
+            assert cli.current_commit() == first
+
+            meta = lifecycle.read_meta()
+            assert meta is not None
+            assert meta.git_commit == first
+            assert lifecycle.worker_alive(meta)
+
+            payload = read_payload(jobs_db, deploy_id)
+            assert payload_state(payload)["status"] == "succeeded"
+            result = payload["result"]
+            assert isinstance(result, dict)
+            assert result["exit_code"] == 0
+            assert second in str(result["stdout"])
+    finally:
+        cli_root.chmod(original_mode)
 
 
 # ---------------------------------------------------------------------------

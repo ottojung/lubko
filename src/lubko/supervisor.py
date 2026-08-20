@@ -76,6 +76,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from lubko import cli, deployctl, lifecycle, supervise
+from lubko.durable import remove_durable
 from lubko.health import (
     interpret_worker_health,
     prune_old_incarnation_artifacts,
@@ -1136,7 +1137,7 @@ class SupervisorDaemon:
         LOGGER.info("supervisor shutting down")
         if read_state().child is not None:
             self._retire_child()
-        supervise.supervisor_pid_path().unlink(missing_ok=True)
+        remove_durable(supervise.supervisor_pid_path())
         self._write_status("stopped")
         LOGGER.info("supervisor stopped")
 
