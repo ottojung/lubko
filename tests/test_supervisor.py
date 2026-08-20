@@ -36,6 +36,7 @@ from lubko.worker import (
     CHUNK_ORDER_INDEX_NAME,
     CHUNK_OWNER_INDEX_NAME,
     OUTPUT_STREAM_STDOUT,
+    STOP_REASON_LEASE,
     TYPE_AWARE_CONSTRAINT_NAME,
     ActiveJob,
     OutputStream,
@@ -1690,6 +1691,18 @@ def _record_group_deaths(
 
 
 @dataclass
+class _EvictionState:
+    """The original jobs' stop state captured before stale recovery re-marks them."""
+
+    first_row_lost: bool
+    later_row_lost: bool
+    first_lease_evicted: bool
+    later_lease_evicted: bool
+    first_stop_reason: str | None
+    later_stop_reason: str | None
+
+
+@dataclass
 class _LeaseDeadlineScenario:
     """Recorded observations from the #78 delayed-batch lease-safety scenario."""
 
@@ -1706,15 +1719,37 @@ class _LeaseDeadlineScenario:
     later_death: float
     first_recovery: float
     later_recovery: float
+    eviction: _EvictionState
 
 
-def _disabled_bulk_refresh(*_args: object, **_kwargs: object) -> list[UUID]:
-    """A lease-refresh stub that commits nothing, pinning the lease to the grant.
+def _capture_eviction_state(
+    supervisor: Supervisor, first_id: UUID, later_id: UUID
+) -> _EvictionState:
+    """Record the original jobs' stop state before stale recovery re-marks them.
+
+    This proves the jobs were evicted by the lease-safety path and never stopped
+    by the refresh-result row_lost path: the refresh attempt was deterministically
+    prevented, so ``apply_lease_refresh`` could never mark them row_lost, and the
+    actual stop reason is captured before any recovery worker can re-mark them.
+
+    Args:
+        supervisor: The original supervisor whose active registry is inspected.
+        first_id: Immediate job identifier.
+        later_id: Delayed job identifier.
 
     Returns:
-        An empty list (no lease was refreshed).
+        The captured eviction/stop state of both jobs.
     """
-    return []
+    first = supervisor.active.get(first_id)
+    later = supervisor.active.get(later_id)
+    return _EvictionState(
+        first_row_lost=first.row_lost if first is not None else True,
+        later_row_lost=later.row_lost if later is not None else True,
+        first_lease_evicted=first.lease_evicted if first is not None else False,
+        later_lease_evicted=later.lease_evicted if later is not None else False,
+        first_stop_reason=first.stop_reason if first is not None else None,
+        later_stop_reason=later.stop_reason if later is not None else None,
+    )
 
 
 def _await_shared_claim_grant(jobs_db: str, first_id: UUID, later_id: UUID) -> float:
@@ -1776,11 +1811,13 @@ def _run_delayed_batch_lease_scenario(
     """Drive the #78 delayed-batch lease-safety scenario to completion.
 
     Claims two jobs in one batch (shared claim origin), delays the later job's
-    spawn, deterministically disables lease refresh, cuts the database, and then
-    makes recovery possible *concurrently*: PostgreSQL and a SECOND recovery
-    worker are started at the measured lease-expires-at stale boundary while the
-    original supervisor is still in outage/lease-safety handling. Group liveness
-    and the row recovery transition are recorded.
+    spawn, deterministically prevents the lease-refresh attempt (so the
+    production apply_lease_refresh path can never row_lost/stop the jobs with a
+    false successful-empty refreshed set), cuts the database, and then makes
+    recovery possible *concurrently*: PostgreSQL and a SECOND recovery worker are
+    started at the measured lease-expires-at stale boundary while the original
+    supervisor is still in outage/lease-safety handling. Group liveness, the
+    original jobs' stop reason, and the row recovery transition are recorded.
 
     Args:
         jobs_db: PostgreSQL connection string.
@@ -1811,9 +1848,12 @@ def _run_delayed_batch_lease_scenario(
         return result
 
     monkeypatch.setattr(worker_module, "spawn_job", delayed_spawn)
-    # Deterministically disable lease refresh so the claim grant is the only
-    # committed lease event; the ~0.8s refresh-window timing window is moot.
-    monkeypatch.setattr(worker_module, "bulk_refresh_leases", _disabled_bulk_refresh)
+    # Deterministically prevent the lease-refresh ATTEMPT so the production
+    # apply_lease_refresh path can never mark the jobs row_lost/stop them with a
+    # false successful-empty refreshed set. The claim grant therefore stays the
+    # only committed lease event and the lease-safety eviction is the sole stop
+    # path; the separate heartbeat test covers the real refresh/commit path.
+    monkeypatch.setattr(worker_module.Supervisor, "_refresh_leases", lambda *_args: None)
     settings = Settings(
         worker_id="orig",
         poll_interval_seconds=0.05,
@@ -1865,12 +1905,15 @@ def _run_delayed_batch_lease_scenario(
         # group death: restart PostgreSQL and start a SECOND recovery worker
         # while the original supervisor is still in outage/lease-safety handling.
         time.sleep(max(0.0, db_expiry - time.monotonic() - 0.05))
+        # Capture the original jobs' stop state BEFORE any stale recovery can
+        # re-mark them: this proves they were evicted by the lease-safety path
+        # (STOP_REASON_LEASE) and never stopped by the refresh-result row_lost
+        # path before that eviction.
+        eviction = _capture_eviction_state(supervisor, first_id, later_id)
         pg_cluster.start()
         recovery_worker = _start_recovery_worker(pg_cluster, settings)
         # Wait for the row recovery transition while the groups are observed.
-        first_recovery, later_recovery = _await_recovery_transitions(
-            jobs_db, first_id, later_id, death_stop
-        )
+        recoveries = _await_recovery_transitions(jobs_db, first_id, later_id, death_stop)
         return _LeaseDeadlineScenario(
             jobs_db=jobs_db,
             db_expiry=db_expiry,
@@ -1883,8 +1926,9 @@ def _run_delayed_batch_lease_scenario(
             later_spawn_mono=cast("float", captured["later_spawn_mono"]),
             first_death=deaths["first"],
             later_death=deaths["later"],
-            first_recovery=first_recovery,
-            later_recovery=later_recovery,
+            first_recovery=recoveries[0],
+            later_recovery=recoveries[1],
+            eviction=eviction,
         )
     finally:
         death_stop.set()
@@ -1901,14 +1945,26 @@ def _run_delayed_batch_lease_scenario(
 def _assert_lease_deadline_no_overlap(obs: _LeaseDeadlineScenario) -> None:
     """Prove the #78 lease-safety fix: no stale recovery while a group is alive.
 
-    The abandoned jobs are only legitimately recovered strictly after each
-    original process group has died (no-overlap), both groups are evicted by the
-    shared claim-origin deadline before the measured database lease expiry
-    (within a named tolerance below the safety margin), and the delayed job dies
-    before the spawn-anchored deadline the pre-fix post-spawn bug would produce.
+    The original jobs were evicted by the lease-safety path (stop reason
+    ``lease``, never the refresh-result ``row_lost`` path), they are only
+    legitimately recovered strictly after each original process group has died
+    (no-overlap), both groups are evicted by the shared claim-origin deadline
+    before the measured database lease expiry (within a named tolerance below the
+    safety margin), and the delayed job dies before the spawn-anchored deadline
+    the pre-fix post-spawn bug would produce.
     """
     assert obs.first_death < obs.first_recovery
     assert obs.later_death < obs.later_recovery
+    # The original jobs were evicted by the lease-safety path, never stopped by
+    # the refresh-result row_lost path: the refresh attempt was deterministically
+    # prevented, so apply_lease_refresh could never mark them row_lost, and the
+    # actual stop reason is the lease-safety eviction.
+    assert not obs.eviction.first_row_lost
+    assert not obs.eviction.later_row_lost
+    assert obs.eviction.first_lease_evicted
+    assert obs.eviction.later_lease_evicted
+    assert obs.eviction.first_stop_reason == STOP_REASON_LEASE
+    assert obs.eviction.later_stop_reason == STOP_REASON_LEASE
     stale_overlap_tolerance = obs.safety_margin - 0.1
     assert 0.0 <= stale_overlap_tolerance < obs.safety_margin
     eviction_bound = obs.db_expiry - obs.safety_margin + stale_overlap_tolerance
@@ -1931,11 +1987,14 @@ def test_lease_safety_deadline_bound_to_claim_grant_across_batch(
 
     Two jobs are claimed in ONE batch (a single grant), so they share the same
     committed claim monotonic origin. The first starts immediately; the later
-    job's spawn is deliberately delayed after the same grant. The lease refresh
-    path is deterministically disabled, so the claim grant is the only lease
-    event: the local lease-safety deadline of BOTH jobs is anchored to the
-    shared claim origin, and the claim-to-spawn delay consumed lease budget, so
-    the later process dies before the actual database lease stale boundary.
+    job's spawn is deliberately delayed after the same grant. The lease-refresh
+    ATTEMPT is deterministically prevented (never a successful empty refreshed
+    set), so the claim grant is the only lease event: the local lease-safety
+    deadline of BOTH jobs is anchored to the shared claim origin, and the
+    claim-to-spawn delay consumed lease budget, so the later process dies before
+    the actual database lease stale boundary. The test explicitly proves the
+    original jobs are stopped by the lease-safety path (never the refresh-result
+    row_lost path) before outage eviction.
 
     Recovery is made possible *concurrently*: PostgreSQL and a SECOND recovery
     worker are started at the measured lease-expires-at stale boundary while the
