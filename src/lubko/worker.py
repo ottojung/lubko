@@ -63,6 +63,7 @@ import tempfile
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 from uuid import uuid4
@@ -1102,31 +1103,64 @@ def _owned_running_groups(conn: JobsConnection, incarnation: str) -> list[tuple[
     return groups
 
 
-def _group_still_ours(pgid: int, start_ticks: int | None) -> bool:
-    """Return whether a persisted group id still identifies our command.
+class GroupReclaimDecision(Enum):
+    """Disposition of one persisted owned command group during recovery.
 
-    A persisted ``process_pgid`` can be recycled by an unrelated process after
-    our command died. The group leader (``pid == pgid`` for a command that
-    called ``setsid``) carries the command's exact start-time ticks, so we
-    compare them to the persisted value: only when the group still has members
-    and the leader's ticks match do we know the group is our command and safe
-    to signal. Anything else — a reused group, a gone group, or a leader whose
-    ticks disagree — is left untouched so we never kill a stranger's group.
+    Attributes:
+        GONE: The group has no live members, so it is already safely reaped and
+            recovery has converged for it (no signal, no obligation).
+        RECLAIM: The group has live members and its persisted start-time ticks
+            are valid/positive and exactly match the live leader's ticks, so it
+            is provably our command and safe to signal.
+        UNRESOLVED: The group has live members but its exact identity cannot be
+            proven — missing, malformed, unreadable, or mismatched persisted
+            start-time ticks. It must NOT be signalled, and it remains a durable
+            blocking obligation until it is proven dead/recovered by some other
+            means (e.g. the unrelated process exits) so the orchestrator holds
+            rather than handing off sole-consumer authority alongside a
+            potentially stranger-owned group.
+    """
+
+    GONE = auto()
+    RECLAIM = auto()
+    UNRESOLVED = auto()
+
+
+def _group_reclaim_decision(pgid: int, start_ticks: int | None) -> GroupReclaimDecision:
+    """Decide how to treat one persisted owned command group during recovery.
+
+    A live group may be signalled only when it has members and its persisted
+    ``process_start_time_ticks`` is valid/positive and exactly matches the live
+    group leader's start-time ticks. Anything the persisted identity cannot
+    prove is treated as unresolved (never signalled) so a recycled or stranger
+    group is never killed, but it still blocks retirement until it converges.
 
     Args:
         pgid: The persisted process group id.
-        start_ticks: The persisted command start-time ticks, or ``None`` for a
-            legacy row that never recorded them (then only group membership is
-            used as the safety check).
+        start_ticks: The persisted command start-time ticks, ``None`` for a
+            legacy row that never recorded them.
 
     Returns:
-        ``True`` only when signalling this group targets our exact command.
+        The :class:`GroupReclaimDecision` for this group.
     """
     if not group_has_members(pgid):
-        return False
-    if start_ticks is None:
-        return True
-    return proc_start_ticks(pgid) == start_ticks
+        return GroupReclaimDecision.GONE
+    if not isinstance(start_ticks, int) or start_ticks <= 0:
+        # Missing (legacy/None) or malformed/non-positive ticks: we cannot prove
+        # the live group is our command, so never signal it — but it is still
+        # alive, so it remains a durable blocking obligation.
+        return GroupReclaimDecision.UNRESOLVED
+    live_ticks = proc_start_ticks(pgid)
+    if live_ticks is None:
+        # The leader's identity is unreadable; fail closed rather than risk a
+        # mis-signal, but keep the group as a blocking obligation.
+        return GroupReclaimDecision.UNRESOLVED
+    if live_ticks != start_ticks:
+        # The persisted group id has been recycled by an unrelated process (or
+        # the wrong command): it is not ours, so never signal it. It stays a
+        # blocking obligation until the stranger's group exits and converges.
+        return GroupReclaimDecision.UNRESOLVED
+    return GroupReclaimDecision.RECLAIM
 
 
 @dataclass(frozen=True)
@@ -1135,15 +1169,22 @@ class ReclaimedGroups:
 
     Attributes:
         reaped: Exact process-group ids that were signalled and proven dead.
-        surviving: Exact process-group ids that were verified ours, signalled,
+        surviving: Exact process-group ids that were proven ours, signalled,
             but could not be proven dead within the cancel grace. These are a
             durable blocking obligation: the orchestrator must not clear the
             retired worker's sole-consumer authority or spawn a replacement
             until they are proven dead/recovered.
+        unresolved: Exact process-group ids that have live members but whose
+            exact identity could not be proven (missing/malformed/unreadable/
+            mismatched persisted start-time ticks). They are never signalled,
+            but remain a durable blocking obligation exactly like ``surviving``:
+            the orchestrator must hold and retry rather than clear authority or
+            start a replacement.
     """
 
     reaped: list[int]
     surviving: list[int]
+    unresolved: list[int]
 
 
 def _terminate_one_group(pgid: int, cancel_grace_seconds: float) -> bool:
@@ -1182,15 +1223,16 @@ def recover_owned_job_groups(
     wedged worker whose own graceful drain never ran). Every acting target is an
     exact process group id persisted in the job row (``state.process_pgid``) for
     a ``running`` command whose ``worker_incarnation`` matches, so no
-    process-name match or broad ``pkill``/``killall`` is ever used. Before any
-    signal the persisted group id is checked against the live leader's
-    start-time ticks (see :func:`_group_still_ours`) so a recycled group id
-    belonging to an unrelated process is never killed.
+    process-name match or broad ``pkill``/``killall`` is ever used.
 
-    Only groups proven to be ours (matching start-time ticks and live members)
-    are signalled. A group that was verified ours but could not be reaped within
-    the cancel grace is reported as surviving so the orchestrator can hold rather
-    than hand off sole-consumer authority alongside a live side-effecting group.
+    A live group is signalled only when its persisted ``process_start_time_ticks``
+    is valid/positive and exactly matches the live leader's start-time ticks
+    (see :func:`_group_reclaim_decision`): this makes recovery PID-reuse-safe
+    and fail-closed. A group whose exact identity cannot be proven — missing,
+    malformed, unreadable, or mismatched ticks while it still has members — is
+    never signalled and is reported as ``unresolved`` so the orchestrator holds
+    rather than handing off sole-consumer authority alongside a possibly
+    stranger-owned group. A group with no live members has already converged.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -1199,22 +1241,28 @@ def recover_owned_job_groups(
         cancel_grace_seconds: Grace before escalating to SIGKILL.
 
     Returns:
-        A :class:`ReclaimedGroups` describing which exact groups were reaped and
-        which verified-ours groups survived the recovery pass.
+        A :class:`ReclaimedGroups` describing which exact groups were reaped,
+        which verified-ours groups survived the cancel grace, and which live
+        groups could not be identity-verified (unresolved).
     """
     groups = _owned_running_groups(conn, incarnation)
     if not groups:
-        return ReclaimedGroups(reaped=[], surviving=[])
+        return ReclaimedGroups(reaped=[], surviving=[], unresolved=[])
     reaped: list[int] = []
     surviving: list[int] = []
+    unresolved: list[int] = []
     for pgid, start_ticks in groups:
-        if not _group_still_ours(pgid, start_ticks):
+        decision = _group_reclaim_decision(pgid, start_ticks)
+        if decision is GroupReclaimDecision.GONE:
             continue
-        if _terminate_one_group(pgid, cancel_grace_seconds):
-            reaped.append(pgid)
+        if decision is GroupReclaimDecision.RECLAIM:
+            if _terminate_one_group(pgid, cancel_grace_seconds):
+                reaped.append(pgid)
+            else:
+                surviving.append(pgid)
         else:
-            surviving.append(pgid)
-    return ReclaimedGroups(reaped=reaped, surviving=surviving)
+            unresolved.append(pgid)
+    return ReclaimedGroups(reaped=reaped, surviving=surviving, unresolved=unresolved)
 
 
 def _wait_for_session(pid: int) -> int:

@@ -860,27 +860,35 @@ class SupervisorDaemon:
             return True
         meta = _child_to_meta(child, _runtime_dir(state.commit))
         stopped = lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
-        # A wedged worker that was force-killed can leave command process groups
-        # alive. If the worker proved a clean drain the groups are already gone
-        # and no emergency recovery is required (and no database round-trip that
-        # could fail). Otherwise recovery is a durable blocking obligation: a
-        # DB/config/SQL failure raises, which preserves the retired child and
-        # prevents spawning a replacement alongside stale groups.
+        # A live exact worker that stop_worker could not authorize or stop (e.g.
+        # a wrong/absent lifecycle token, or PID reuse) must not be signalled
+        # and must not be reported retired. Hold immediately: do NOT attempt
+        # owned-group recovery (it is keyed by the same token we could not
+        # authorize) and do NOT clear the child identity or hand off
+        # sole-consumer authority. The next daemon tick retries the same exact
+        # orphan rather than spawning a duplicate consumer.
+        if not stopped:
+            LOGGER.error(
+                "could not confirm stop of worker pid %d; preserving child identity for retry",
+                child.pid,
+            )
+            return False
+        # The worker is confirmed dead. A wedged worker that was force-killed can
+        # leave command process groups alive. If the worker proved a clean drain
+        # the groups are already gone and no emergency recovery is required (and
+        # no database round-trip that could fail). Otherwise recovery is a
+        # durable blocking obligation: a DB/config/SQL failure or a surviving/
+        # unresolved group raises, which preserves the retired child and prevents
+        # spawning a replacement alongside stale groups.
         if not (child.token and worker_mod.drain_sentinel_matches(child.token)):
             self._recover_owned_groups(child.token)
         if self.proc is not None:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
             self.proc = None
-        if stopped:
-            write_state(replace(state, child=None))
-            LOGGER.info("retired worker child pid=%d", child.pid)
-        else:
-            LOGGER.error(
-                "could not confirm stop of worker pid %d; preserving child identity for retry",
-                child.pid,
-            )
-        return stopped
+        write_state(replace(state, child=None))
+        LOGGER.info("retired worker child pid=%d", child.pid)
+        return True
 
     @staticmethod
     def _recover_owned_groups(incarnation: str) -> None:
@@ -936,6 +944,13 @@ class SupervisorDaemon:
                 f"owned command group(s) {result.surviving} still alive after "
                 f"recovery for incarnation {incarnation}; holding without "
                 "clearing authority or spawning a replacement"
+            )
+            raise OwnedGroupRecoveryError(msg)
+        if result.unresolved:
+            msg = (
+                f"owned command group(s) {result.unresolved} could not be "
+                f"identity-verified during recovery for incarnation {incarnation}; "
+                "holding without clearing authority or spawning a replacement"
             )
             raise OwnedGroupRecoveryError(msg)
         if result.reaped:

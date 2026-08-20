@@ -2767,6 +2767,10 @@ def test_reconcile_takeover_stops_reparented_orphan(
         monkeypatch.setattr(lifecycle, "worker_alive", fake_worker_alive)
         monkeypatch.setattr(daemon, "_spawn_worker", lambda _c: None)
         monkeypatch.setattr(daemon, "_child_alive", lambda _s: False)
+        # Model the emergency owned-group recovery explicitly (exact recovery
+        # succeeded) rather than depending on a real database configuration, so
+        # the takeover's full retire path is exercised deterministically.
+        monkeypatch.setattr(daemon, "_recover_owned_groups", lambda _i: None)
 
         daemon.reconcile(0.0)
 

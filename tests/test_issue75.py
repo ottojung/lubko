@@ -300,9 +300,10 @@ def test_recover_owned_job_groups_kills_exact_groups_only() -> None:
     A wedged worker can leave a command group alive after it is SIGKILLed. The
     recovery targets the exact process-group id persisted in the job row for the
     retired incarnation and never touches other groups. It is also PID-reuse
-    safe: a persisted group id that has since been recycled by an unrelated
-    process (different start-time ticks) is never signalled, even though the
-    group is still alive.
+    safe and fail-closed: a persisted group id that has since been recycled by
+    an unrelated process (different start-time ticks) is never signalled even
+    though it is still alive, and the unverifiable group is reported as
+    ``unresolved`` so the orchestrator blocks rather than clearing authority.
     """
     unrelated = subprocess.Popen(
         [SLEEP_BIN, "300"],
@@ -330,7 +331,8 @@ def test_recover_owned_job_groups_kills_exact_groups_only() -> None:
     owned_pgid = os.getpgid(owned.pid)
     # A stale, reused group id: it points at the still-alive ``unrelated``
     # process but carries start-time ticks that do NOT match that process, so
-    # recovery must treat it as a recycled id and leave it untouched.
+    # recovery must treat it as a recycled id, leave it untouched, and report it
+    # as unresolved (a durable blocking obligation).
     reused_pgid = os.getpgid(unrelated.pid)
     reused_ticks = (lifecycle.proc_start_ticks(unrelated.pid) or 0) + 1
     try:
@@ -342,6 +344,7 @@ def test_recover_owned_job_groups_kills_exact_groups_only() -> None:
         result = worker_mod.recover_owned_job_groups(conn, incarnation, 0.5)  # type: ignore[arg-type]
         assert result.reaped == [owned_pgid]
         assert result.surviving == []
+        assert result.unresolved == [reused_pgid]
         assert not worker_mod.group_has_members(owned_pgid)
         # The reused id was NOT acted on: the unrelated process is untouched.
         assert worker_mod.group_has_members(reused_pgid)
@@ -716,7 +719,9 @@ def test_recover_owned_groups_survivor_blocks(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(
         worker_mod,
         "recover_owned_job_groups",
-        lambda *_, **__: worker_mod.ReclaimedGroups(reaped=[], surviving=[surviving_pgid]),
+        lambda *_, **__: worker_mod.ReclaimedGroups(
+            reaped=[], surviving=[surviving_pgid], unresolved=[]
+        ),
     )
     fake_db = MagicMock()
     fake_db.conninfo.return_value = ""
@@ -728,14 +733,15 @@ def test_recover_owned_groups_survivor_blocks(monkeypatch: pytest.MonkeyPatch) -
         )
 
 
-def test_recover_owned_job_groups_reports_survivors() -> None:
+def test_recover_owned_job_groups_reports_survivors(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unreapable verified-ours group is reported as surviving, never hidden.
 
     When a command group that recovery verified is ours (matching start-time
-    ticks) cannot be reaped within the cancel grace, the recovery pass must
-    report it as ``surviving`` so the orchestrator blocks clearing the retired
-    worker's authority. A zero cancel grace makes the SIGKILL→reap window
-    deterministic: the group is still alive immediately after the forced kill.
+    ticks, live members) cannot be reaped, the recovery pass must report it as
+    ``surviving`` so the orchestrator blocks clearing the retired worker's
+    authority. The unreapable outcome is injected through the termination seam
+    (``_terminate_one_group`` returning ``False``) so the test is deterministic
+    and does not race the kernel's SIGKILL→reap window.
     """
     owned = subprocess.Popen(
         [
@@ -752,17 +758,151 @@ def test_recover_owned_job_groups_reports_survivors() -> None:
     )
     guard.register(owned)
     owned_pgid = os.getpgid(owned.pid)
+    monkeypatch.setattr(worker_mod, "_terminate_one_group", lambda *_, **__: False)
     try:
         conn = _FakeConn([(uuid4(), str(owned_pgid), str(lifecycle.proc_start_ticks(owned.pid)))])
-        result = worker_mod.recover_owned_job_groups(conn, "issue75-survivor", 0.0)  # type: ignore[arg-type]
+        result = worker_mod.recover_owned_job_groups(conn, "issue75-survivor", 0.5)  # type: ignore[arg-type]
         assert result.surviving == [owned_pgid]
         assert result.reaped == []
+        assert result.unresolved == []
     finally:
         with suppress(ProcessLookupError, OSError):
             os.killpg(owned_pgid, signal.SIGKILL)
         with suppress(Exception):
             owned.wait(timeout=5)
         guard.unregister(owned)
+
+
+def test_recover_owned_job_groups_missing_ticks_live_unrelated_unresolved() -> None:
+    """Legacy/missing ticks over a live unrelated group: no signal, blocks.
+
+    A persisted row whose ``process_start_time_ticks`` is missing (a legacy row
+    that never recorded them) but whose ``process_pgid`` points at a still-live
+    unrelated process must NOT be signalled. It is nonetheless reported as
+    ``unresolved`` so the orchestrator treats it as a durable blocking
+    obligation and holds rather than clearing authority or starting a
+    replacement.
+    """
+    unrelated = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(unrelated)
+    unrelated_pgid = os.getpgid(unrelated.pid)
+    try:
+        # Ticks column is ``None`` (missing/legacy) while the group is alive.
+        conn = _FakeConn([(uuid4(), str(unrelated_pgid), None)])
+        result = worker_mod.recover_owned_job_groups(conn, "issue75-missing-ticks")  # type: ignore[arg-type]
+        assert result.unresolved == [unrelated_pgid]
+        assert result.reaped == []
+        assert result.surviving == []
+        # The unrelated process is completely untouched.
+        assert worker_mod.group_has_members(unrelated_pgid)
+        assert unrelated.poll() is None
+    finally:
+        if unrelated.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(unrelated_pgid, signal.SIGKILL)
+        with suppress(Exception):
+            unrelated.wait(timeout=5)
+        guard.unregister(unrelated)
+
+
+def test_recover_owned_job_groups_mismatched_ticks_live_group_unresolved() -> None:
+    """Mismatched persisted ticks over a live group: no signal, blocks.
+
+    A persisted row whose ``process_pgid`` points at a live group but whose
+    ``process_start_time_ticks`` does not match the live leader's ticks (the id
+    was recycled by an unrelated process) must NOT be signalled. It is reported
+    as ``unresolved`` so the orchestrator holds rather than risk killing a
+    stranger-owned group.
+    """
+    unrelated = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(unrelated)
+    unrelated_pgid = os.getpgid(unrelated.pid)
+    # Ticks that are valid/positive but do not match the live leader.
+    wrong_ticks = (lifecycle.proc_start_ticks(unrelated.pid) or 0) + 1
+    try:
+        conn = _FakeConn([(uuid4(), str(unrelated_pgid), str(wrong_ticks))])
+        result = worker_mod.recover_owned_job_groups(conn, "issue75-mismatch-ticks")  # type: ignore[arg-type]
+        assert result.unresolved == [unrelated_pgid]
+        assert result.reaped == []
+        assert result.surviving == []
+        assert worker_mod.group_has_members(unrelated_pgid)
+        assert unrelated.poll() is None
+    finally:
+        if unrelated.poll() is None:
+            with suppress(ProcessLookupError):
+                os.killpg(unrelated_pgid, signal.SIGKILL)
+        with suppress(Exception):
+            unrelated.wait(timeout=5)
+        guard.unregister(unrelated)
+
+
+def test_recover_owned_job_groups_missing_ticks_no_members_converges() -> None:
+    """Missing ticks over a gone group converges safely (no signal, no block).
+
+    When the persisted group id has no live members the recovery has already
+    converged: even with missing/malformed ticks the group is not signalled and
+    is not reported as an unresolved blocking obligation.
+    """
+    dead = subprocess.Popen(
+        [SLEEP_BIN, "0.01"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(dead)
+    dead_pgid = os.getpgid(dead.pid)
+    dead.wait(timeout=5)
+    guard.unregister(dead)
+    # After the process exits the group has no live members.
+    assert not worker_mod.group_has_members(dead_pgid)
+    conn = _FakeConn([(uuid4(), str(dead_pgid), None)])
+    result = worker_mod.recover_owned_job_groups(conn, "issue75-gone-missing-ticks")  # type: ignore[arg-type]
+    assert result.reaped == []
+    assert result.surviving == []
+    assert result.unresolved == []
+
+
+def test_recover_owned_groups_unresolved_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unresolved (unverifiable) groups keep recovery a blocking obligation.
+
+    When emergency recovery reports a live group whose exact identity could not
+    be proven (missing/mismatched ticks) it must raise
+    :class:`OwnedGroupRecoveryError` so the orchestrator preserves the retired
+    child and does not spawn a replacement alongside a possibly stranger-owned
+    group.
+    """
+    unresolved_pgid = 515151
+    monkeypatch.setattr(
+        worker_mod,
+        "recover_owned_job_groups",
+        lambda *_, **__: worker_mod.ReclaimedGroups(
+            reaped=[], surviving=[], unresolved=[unresolved_pgid]
+        ),
+    )
+    fake_db = MagicMock()
+    fake_db.conninfo.return_value = ""
+    monkeypatch.setattr("lubko.supervisor.load_database_config", lambda: fake_db)
+    monkeypatch.setattr("lubko.supervisor.psycopg.connect", lambda *_, **__: MagicMock())
+    with pytest.raises(OwnedGroupRecoveryError):
+        SupervisorDaemon._recover_owned_groups(  # ruff: ignore[private-member-access]
+            "issue75-unresolved-incarnation"
+        )
 
 
 def _recover_incarnation(conninfo: str, incarnation: object) -> None:
