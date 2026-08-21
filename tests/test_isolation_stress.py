@@ -23,7 +23,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -379,7 +379,7 @@ def _retire_wedged_owner(handle: OwnedRun, problems: list[str]) -> None:
         problems: Accumulating cleanup-problem descriptions.
     """
     owner = handle.owner
-    problems.extend(_retire_marker_descendants(handle.scenario.marker))
+    _retire_adopted_tree(owner.pid, problems)
     if problems:
         # Descendant containment is unresolved: the subreaper owner must
         # stay alive and untouched so nothing can leak under PID 1.
@@ -398,6 +398,162 @@ def _retire_wedged_owner(handle: OwnedRun, problems: list[str]) -> None:
         owner.wait(timeout=10.0)
     except subprocess.TimeoutExpired:
         problems.append(f"owner pid {owner.pid} could not be reaped")
+
+
+def _fail_closed_owner_shutdown(
+    owner: subprocess.Popen[bytes],
+    owner_ticks: int,
+    nested_pidfile: Path,
+) -> None:
+    """Converge an external owner, retiring it only once its tree is empty.
+
+    Failure cleanup path shared by external-owner regressions: terminate
+    the recorded nested pytest by verified exact identity, wait for the
+    subreaper to converge its adopted tree, and only when a scan finds zero
+    children retire the owner against its SPAWN-TIME PID+start-ticks
+    identity, revalidated immediately before the signal.  The subreaper is
+    never killed while any adopted descendant remains, and a reused owner
+    PID never authorizes a signal.
+
+    Args:
+        owner: The independent owner process.
+        owner_ticks: The owner's start ticks captured at spawn time.
+        nested_pidfile: Pidfile recording the nested pytest identity.
+
+    Raises:
+        AssertionError: If the owner could not be retired cleanly, its
+            adopted tree never emptied, or its identity went stale/reused.
+    """
+    problems: list[str] = []
+    if owner.poll() is not None:
+        return
+    try:
+        _signal_nested_verified(nested_pidfile, signal.SIGKILL)
+    except AssertionError as error:
+        problems.append(str(error))
+    with suppress(subprocess.TimeoutExpired):
+        owner.wait(timeout=180)
+    stall_deadline = time.monotonic() + 300.0
+    while owner.poll() is None:
+        if not _nested_owner.adopted_children(owner.pid):
+            break
+        if time.monotonic() > stall_deadline:
+            live = _nested_owner.adopted_children(owner.pid)
+            msg = f"owner adopted tree never emptied: {live}"
+            raise AssertionError(msg)
+        time.sleep(0.1)
+    if owner.poll() is None:
+        # Revalidate against the ORIGINAL spawn-time identity immediately
+        # before the signal: a reused occupant of the PID is never hit.
+        assert guard.proc_start_ticks(owner.pid) == owner_ticks, (
+            f"owner pid {owner.pid} identity stale/reused; KILL refused"
+        )
+        assert guard.signal_identity_checked(owner.pid, owner_ticks, signal.SIGKILL), (
+            "owner identity went stale; KILL refused"
+        )
+        owner.wait(timeout=30)
+    if owner.poll() is None:
+        problems.append("owner did not retire")
+    if problems:
+        raise AssertionError("; ".join(problems))
+
+
+def _signal_nested_verified(pidfile: Path, sig: signal.Signals) -> None:
+    """Signal the recorded nested pytest only after identity revalidation.
+
+    The pidfile-recorded PID plus start ticks must still match the live
+    occupant immediately before signalling; a gone/stale incarnation fails
+    loudly instead of signalling an unverified PID.
+
+    Args:
+        pidfile: Owner pidfile recording the nested identity.
+        sig: Signal to deliver.
+
+    Raises:
+        AssertionError: If the recorded incarnation is gone or stale.
+    """
+    failure: str | None = None
+    identity = _read_pidfile(pidfile)
+    if identity is None:
+        failure = "nested pytest pidfile is missing"
+    else:
+        pid, ticks = identity
+        current = guard.proc_start_ticks(pid)
+        if current != ticks:
+            failure = f"nested pytest pid {pid} incarnation gone/stale; refusing to signal"
+    if failure is not None:
+        raise AssertionError(failure)
+    assert identity is not None
+    pid, ticks = identity
+    assert guard.signal_identity_checked(pid, ticks, sig)
+
+
+def _retire_one_descendant(child_pid: int, problems: list[str]) -> bool:
+    """Retire one discovered adopted descendant by verified exact identity.
+
+    Args:
+        child_pid: Exact PID of the descendant.
+        problems: Accumulating problem descriptions.
+
+    Returns:
+        ``True`` when the descendant reached a terminal state this pass.
+    """
+    state = _proc_state(child_pid)
+    if state is None:
+        return True
+    if state == "Z":
+        # Not our child to reap (the wedged owner is the parent); report so
+        # retirement stays blocked.
+        problems.append(f"zombie descendant pid {child_pid} unreaped")
+        return False
+    ticks = guard.proc_start_ticks(child_pid)
+    if ticks is None or ticks <= 0:
+        problems.append(f"descendant pid {child_pid} has unverifiable ticks; not signalled")
+        return False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        state = _proc_state(child_pid)
+        if state is None or state == "Z":
+            break
+        guard.signal_identity_checked(child_pid, ticks, sig)
+        wait_deadline = time.monotonic() + 5.0
+        state = _proc_state(child_pid)
+        while state is not None and state != "Z" and time.monotonic() < wait_deadline:
+            time.sleep(0.05)
+            state = _proc_state(child_pid)
+    state = _proc_state(child_pid)
+    if state is None:
+        return True
+    if state == "Z":
+        problems.append(f"descendant pid {child_pid} zombie; unreaped")
+    else:
+        problems.append(f"descendant pid {child_pid} did not retire")
+    return False
+
+
+def _retire_adopted_tree(owner_pid: int, problems: list[str]) -> None:
+    """Retire the owner's full adopted tree by authoritative discovery.
+
+    Rescans ``/proc`` for children of the subreaper until none remain:
+    killing an intermediate parent exposes deeper descendants only on the
+    next reparent transition, so a single pass is not sound.  Marker
+    coverage is irrelevant here — discovery is authoritative.  Every signal
+    re-verifies PID+start-ticks immediately beforehand (group-aware), and
+    every child must become truly absent before the tree counts as empty.
+
+    Args:
+        owner_pid: The subreaper whose adopted descendants to retire.
+        problems: Accumulating problem descriptions.
+    """
+    while True:
+        children = _nested_owner.adopted_children(owner_pid)
+        if not children:
+            break
+        progressed = False
+        for child_pid in children:
+            if _retire_one_descendant(child_pid, problems):
+                progressed = True
+        if not progressed:
+            break
 
 
 def _converge_owner(handle: OwnedRun) -> None:
@@ -711,9 +867,7 @@ def test_interrupted_nested_run_is_contained_never_reparented_to_pid_1(
     scenario = _Scenario(tmp_path, name)
     with owned_run(scenario, lambda: scenario.run("sleep")) as handle:
         _wait_file(scenario.pidfile)
-        identity = _read_pidfile(scenario.pidfile)
-        assert identity is not None
-        nested_pid = identity[0]
+        assert _read_pidfile(scenario.pidfile) is not None
         deadline = time.monotonic() + 60.0
         entries, unproven = _read_marker_entries(scenario.marker)
         while (unproven or not entries) and time.monotonic() < deadline:
@@ -725,7 +879,7 @@ def test_interrupted_nested_run_is_contained_never_reparented_to_pid_1(
         assert not unproven
         # Interrupt only the nested pytest, by exact PID; the independent
         # owner survives and must synchronously reap the abandoned leader.
-        os.kill(nested_pid, sig)
+        _signal_nested_verified(scenario.pidfile, sig)
         while not scenario.result.exists():
             if handle.owner.poll() is not None:
                 break
@@ -861,9 +1015,7 @@ def test_abrupt_termination_still_leaves_recorded_identities(tmp_path: Path) -> 
             assert isinstance(pid, int)
             recorded.append(pid)
         # Abruptly kill only the nested pytest; owner must contain both.
-        identity = _read_pidfile(scenario.pidfile)
-        assert identity is not None
-        os.kill(identity[0], signal.SIGKILL)
+        _signal_nested_verified(scenario.pidfile, signal.SIGKILL)
         assert handle.owner.wait(timeout=60) == 0
     payload = _assert_containment(scenario.result)
     assert payload["survivor_seen"] is True
@@ -1010,9 +1162,7 @@ def test_nonleader_survivor_contained_exactly_without_shared_group_signal(
         assert entries
         assert not unproven
         # Abruptly kill only the nested pytest.
-        identity = _read_pidfile(scenario.pidfile)
-        assert identity is not None
-        os.kill(identity[0], signal.SIGKILL)
+        _signal_nested_verified(scenario.pidfile, signal.SIGKILL)
         assert handle.owner.wait(timeout=60) == 0
 
     survivor_pid_text, sibling_pid_text = sidecar.read_text().split()
@@ -1110,6 +1260,8 @@ def test_owner_rescans_until_grandchild_chain_converges(tmp_path: Path) -> None:
         deadline="120",
         extra_env={"NESTED_SIDECAR": str(sidecar_base)},
     )
+    owner_ticks = guard.proc_start_ticks(owner.pid)
+    assert owner_ticks is not None
     try:
         _wait_for_files(
             [sidecar_base.with_suffix(".mid"), sidecar_base.with_suffix(".gc")],
@@ -1118,9 +1270,7 @@ def test_owner_rescans_until_grandchild_chain_converges(tmp_path: Path) -> None:
         )
         _wait_marker_coverage(marker, owner, timeout=30.0)
         # Abruptly kill only the nested pytest.
-        identity = _read_pidfile(pidfile)
-        assert identity is not None
-        os.kill(identity[0], signal.SIGKILL)
+        _signal_nested_verified(pidfile, signal.SIGKILL)
         assert owner.wait(timeout=120) == 0
 
         mid_pid = int(sidecar_base.with_suffix(".mid").read_text())
@@ -1138,9 +1288,7 @@ def test_owner_rescans_until_grandchild_chain_converges(tmp_path: Path) -> None:
         assert payload["observed_ppid_1"] is False
         assert payload["survivor_seen"] is True
     finally:
-        if owner.poll() is None:
-            owner.kill()
-            owner.wait(timeout=10)
+        _fail_closed_owner_shutdown(owner, owner_ticks, pidfile)
     assert isolation.ambient_sentinel_alive()
     assert _ambient_digest() == before
 
@@ -1545,6 +1693,8 @@ def test_register_then_delete_marker() -> None:
     pidfile = tmp_path / "torn.pid"
     log = tmp_path / "torn.log"
     owner = _start_torn_coverage_owner(module, artifacts=(result, marker, pidfile, log))
+    owner_ticks = guard.proc_start_ticks(owner.pid)
+    assert owner_ticks is not None
     try:
         deadline = time.monotonic() + 60.0
         nested_pid: int | None = None
@@ -1561,7 +1711,7 @@ def test_register_then_delete_marker() -> None:
         assert leader_pid is not None, "registered descendant never appeared"
         # Abruptly kill only the nested pytest; coverage was already torn.
         assert nested_pid is not None
-        os.kill(nested_pid, signal.SIGKILL)
+        _signal_nested_verified(pidfile, signal.SIGKILL)
         assert owner.wait(timeout=120) == 1
         payload = _read_result(result)
         assert payload["coverage_unproven"] is True
@@ -1573,9 +1723,7 @@ def test_register_then_delete_marker() -> None:
             time.sleep(0.05)
         assert _proc_state(leader_pid) in {None, "Z"}
     finally:
-        if owner.poll() is None:
-            owner.kill()
-            owner.wait(timeout=10)
+        _fail_closed_owner_shutdown(owner, owner_ticks, pidfile)
     assert isolation.ambient_sentinel_alive()
     assert _ambient_digest() == before
 
