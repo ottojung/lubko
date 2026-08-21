@@ -3127,22 +3127,33 @@ def _restart_helper_locked(job_id: object, writer: int) -> None:
     append_deploy_log("queue restart converged after durable success")
 
 
-def _complete_restart_handoff() -> None:
-    """Request and await the supervised same-commit process replacement.
+def _request_restart_intent_locked() -> tuple[int, int | None]:
+    """Recheck the supervised guard and write the restart intent under the lock.
 
-    The supervisor is the single process-lifecycle authority: deployctl/lifecycle
-    only record the restart intent at a strictly newer generation and wait until
-    the daemon proves a fresh worker consumes the queue. A worker process that
-    was not actually replaced is reported as a failure.
+    Must be called while the deployment lock is held so a mission that appears
+    after the prepared/durable-success boundary cannot be outranked or
+    disrupted by this handoff.
+
+    Returns:
+        ``(generation, previous_pid)`` for the written restart intent.
 
     Raises:
-        DeployAbortedError: If the supervisor did not apply or prove the
-            replacement, or the worker process was not replaced.
+        DeployAbortedError: If the supervised-state guard refuses, no confirmed
+            commit exists, or its sealed runtime is unusable.
     """
+    blocker = _supervised_mutation_blocker()
+    if blocker is not None:
+        raise DeployAbortedError(blocker)
     state = supervise.read_state()
     commit = state.commit
     if commit is None:
         msg = "no confirmed commit to restart"
+        raise DeployAbortedError(msg)
+    if not cli.runtime_is_usable(commit):
+        msg = (
+            f"the exact sealed runtime for commit {commit} is missing, corrupt, "
+            "incomplete, or not sealed; refusing to restart"
+        )
         raise DeployAbortedError(msg)
     previous = supervise.read_status()
     previous_pid = (
@@ -3159,6 +3170,37 @@ def _complete_restart_handoff() -> None:
             else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
         ),
     )
+    return generation, previous_pid
+
+
+def _complete_restart_handoff() -> None:
+    """Request and await the supervised same-commit process replacement.
+
+    The supervisor is the single process-lifecycle authority: deployctl/lifecycle
+    only record the restart intent at a strictly newer generation and wait until
+    the daemon proves a fresh worker consumes the queue. A worker process that
+    was not actually replaced is reported as a failure.
+
+    The pending/corrupt supervised-state guard, the runtime recheck, and the
+    restart intent request are serialized under a freshly acquired deployment
+    lock: a supervised checkout mission that appears after the prepared/
+    durable-success boundary must abort the handoff instead of being outranked
+    or disrupted. Lock ordering stays deployment-lock before generation-lock,
+    so nesting with ``supervise.request_restart``'s generation lock cannot
+    deadlock; generation/readiness waits run after the lock is released.
+
+    Raises:
+        DeployAbortedError: If the guarded intent request fails (including a
+            supervised state that turned pending/corrupt after durable
+            success), if the supervisor did not apply or prove the replacement,
+            or the worker process was not replaced.
+    """
+    try:
+        with deploy_lock(DEFAULT_LOCK_TIMEOUT_SECONDS):
+            generation, previous_pid = _request_restart_intent_locked()
+    except LockTimeoutError as exc:
+        msg = f"timed out waiting for the deployment lock: {exc}"
+        raise DeployAbortedError(msg) from None
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         msg = "the external supervisor did not apply the restart"
         raise DeployAbortedError(msg)
