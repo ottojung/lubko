@@ -1449,46 +1449,49 @@ def abort_gated_start(
     stderr_path: Path,
     gate_fd: int,
 ) -> bool:
-    """Abort a gated start without ever executing user code.
+    """Abort a gated start using ONLY its exact direct-child identity.
 
     Used when the exact process identity could not be obtained or durably
     persisted, or when the gate release itself failed: the gate is closed
-    WITHOUT the release byte so the wrapper exits on EOF, the exact
-    (still gated, childless) process group is SIGKILLed, and the child is
-    reaped. The abort is complete only when the exact group is POSITIVELY
-    proven member-free; a leader-wait timeout can never mask that proof. When
-    the proof fails, the capture files are retained for diagnosis and the
-    caller must NOT terminalize or untrack the job — its running row keeps the
-    exact persisted identity recoverable by emergency recovery.
+    WITHOUT the release byte so the wrapper exits on EOF. The dedicated group
+    is SIGKILLed only WHILE the exact ``Popen`` remains live — before a
+    successful release it is this process's own childless session leader, so
+    the group is provably ours. Once the direct child becomes terminal and is
+    reaped, the original unreleased childless group is gone by construction
+    and the numeric PGID is deliberately NEVER used again as proof or target,
+    because it could already have been reused by an unrelated process.
 
     Args:
         proc: The gated wrapper process.
-        pgid: Exact process group id of the wrapper.
+        pgid: Exact process group id of the wrapper (used only while the
+            wrapper itself is still live).
         stdout_path: Capture file for standard output.
         stderr_path: Capture file for standard error.
         gate_fd: The worker-side write end of the start gate pipe.
 
     Returns:
-        ``True`` only when the exact gated group is proven member-free and the
-        capture files were removed; ``False`` when the group could not be
-        proven gone (a blocking ownership failure for the caller).
+        ``True`` when the direct child is terminal, reaped, and the capture
+        files were removed (the unreleased group is gone by construction);
+        ``False`` when the child remained live after the bounded first attempt,
+        in which case :func:`await_gated_group_gone` owns it until reap.
     """
     # Close the gate WITHOUT releasing: the wrapper reads EOF and exits.
     with suppress(OSError):
         os.close(gate_fd)
-    _signal_group(pgid, signal.SIGKILL)
-    with suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=5)
     deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline and group_has_members(pgid):
+    while proc.poll() is None and time.monotonic() < deadline:
+        _signal_group(pgid, signal.SIGKILL)
         time.sleep(0.02)
-    if not group_has_members(pgid):
+    if proc.poll() is not None:
+        with suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
         stdout_path.unlink(missing_ok=True)
         stderr_path.unlink(missing_ok=True)
         return True
     LOGGER.error(
-        "gated start abort cannot prove exact group %d member-free; retaining "
-        "the running row and capture files for exact-identity recovery",
+        "gated wrapper %d (exact group %d) stayed live through the bounded "
+        "abort attempt; handing to the blocking direct-child convergence loop",
+        proc.pid,
         pgid,
     )
     return False
@@ -1516,6 +1519,11 @@ def await_gated_group_gone(gated: GatedSpawn) -> None:
         time.sleep(0.05)
     with suppress(subprocess.TimeoutExpired):
         gated.proc.wait(timeout=5)
+    # The direct child is reaped: the original unreleased childless group is
+    # gone by construction. Clean up captures now; never touch the numeric
+    # PGID again (it may already be reused by an unrelated process).
+    gated.stdout_path.unlink(missing_ok=True)
+    gated.stderr_path.unlink(missing_ok=True)
 
 
 def _signal_group(pgid: int, sig: int) -> None:

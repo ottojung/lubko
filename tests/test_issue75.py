@@ -1178,3 +1178,58 @@ def test_teardown_fails_loudly_on_unresolved_owned_group(
         with suppress(Exception):
             proc.wait(timeout=5)
         guard.unregister(proc)
+
+
+def test_abort_gated_start_ignores_reused_pgid_after_reap(tmp_path: Path) -> None:
+    """After the direct wrapper is reaped, the numeric PGID is never signalled.
+
+    Simulates PGID reuse: the original gated Popen is already terminal and
+    reaped while the recorded numeric group id points at a live UNRELATED
+    process (the "reuse"). abort_gated_start must treat the abort as converged
+    purely from the reaped direct child, must NOT signal the unrelated group,
+    and must clean the capture files rather than retain them.
+    """
+    reused = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(reused)
+    # A real, already-terminal-and-reaped Popen stands in for the original
+    # unreleased wrapper.
+    original = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(original)
+    original.wait(timeout=5)
+    guard.unregister(original)
+    assert original.poll() is not None
+    stdout_path = tmp_path / "out.capture"
+    stderr_path = tmp_path / "err.capture"
+    stdout_path.write_bytes(b"")
+    stderr_path.write_bytes(b"")
+    try:
+        converged = worker_mod.abort_gated_start(
+            original, os.getpgid(reused.pid), stdout_path, stderr_path, -1
+        )
+        assert converged is True
+        # The reused group was NOT signalled: the unrelated process is intact.
+        assert reused.poll() is None
+        assert worker_mod.group_has_members(os.getpgid(reused.pid))
+        # Capture files are cleaned on convergence, never retained.
+        assert not stdout_path.exists()
+        assert not stderr_path.exists()
+    finally:
+        with suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(reused.pid), signal.SIGKILL)
+        with suppress(Exception):
+            reused.wait(timeout=5)
+        guard.unregister(reused)

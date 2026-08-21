@@ -2996,7 +2996,8 @@ def _inject_pre_release_failure(monkeypatch: pytest.MonkeyPatch, fail: str) -> N
     Args:
         monkeypatch: Pytest monkeypatch fixture.
         fail: ``"ticks"`` (start-time ticks unavailable for job processes),
-            ``"persist"`` (deterministic identity persistence error), or any
+            ``"persist"`` (deterministic identity persistence error),
+            ``"connectivity"`` (connectivity-class persistence error), or any
             other value (no pre-release injection; used with ``"release"``).
     """
     if fail == "ticks":
@@ -3006,11 +3007,16 @@ def _inject_pre_release_failure(monkeypatch: pytest.MonkeyPatch, fail: str) -> N
             return real_ticks(pid) if pid == os.getpid() else None
 
         monkeypatch.setattr(worker_module, "proc_start_ticks", no_job_ticks)
-    elif fail == "persist":
+    elif fail in {"persist", "connectivity"}:
 
         def failing_persist(*_args: object, **_kwargs: object) -> None:
-            exc = psycopg.DataError("injected deterministic persistence failure")
-            exc.sqlstate = "22P05"
+            exc: psycopg.Error
+            if fail == "connectivity":
+                exc = psycopg.OperationalError("injected connectivity failure")
+                exc.sqlstate = "08006"
+            else:
+                exc = psycopg.DataError("injected deterministic persistence failure")
+                exc.sqlstate = "22P05"
             raise exc
 
         monkeypatch.setattr(worker_module, "_persist_process", failing_persist)
@@ -3038,15 +3044,16 @@ def _run_nonconverging_abort_scenario(
         jobs_db: PostgreSQL connection string.
         pg_cluster: The isolated PostgreSQL cluster.
         tmp_path: Per-test scratch directory.
-        fail: Which failure to inject: ``"ticks"``, ``"persist"``, or
-            ``"release"``.
+        fail: Which failure to inject: ``"ticks"``, ``"persist"``,
+            ``"connectivity"``, or ``"release"``.
     """
     fail_release = fail == "release"
+    connectivity_error = fail == "connectivity"
     expected_stderr = {
         "ticks": "unable to record exact process identity",
         "persist": "unable to record process identity",
         "release": "unable to release gated start",
-    }[fail]
+    }.get(fail, "")
     max_release_calls = 1 if fail_release else 0
     sentinel = tmp_path / "ran"
     job_id = insert_process_job(
@@ -3097,7 +3104,7 @@ def _run_nonconverging_abort_scenario(
     monkeypatch.setattr(worker_module, "release_gate", recording_release)
     _inject_pre_release_failure(monkeypatch, fail)
 
-    with supervisor_running(settings, make_database_config(pg_cluster), jobs_db):
+    with supervisor_running(settings, make_database_config(pg_cluster), jobs_db) as supervisor:
         wait_until(lambda: read_status(jobs_db, job_id) == "running")
         wait_until(lambda: abort_calls["n"] >= 1)
         # The caller is BLOCKED on the live direct child: no terminal row and
@@ -3108,13 +3115,23 @@ def _run_nonconverging_abort_scenario(
             time.sleep(0.02)
         # Let the direct child become terminal: end the injected liveness so
         # the real poll() reports the SIGKILLed wrapper; the worker's local
-        # ownership loop then reaps it and converges by construction.
+        # ownership loop then reaps it and converges by construction. Only
+        # AFTER convergence may the connectivity path re-raise (outage) or a
+        # deterministic path finalize failed.
         injection["hold"] = False
-        wait_until(lambda: read_status(jobs_db, job_id) == "failed")
+        if connectivity_error:
+            wait_until(lambda: supervisor.conn is None)
+        else:
+            wait_until(lambda: read_status(jobs_db, job_id) == "failed")
 
     payload = read_root(jobs_db, job_id)
-    assert payload["state"]["status"] == "failed"
-    assert expected_stderr in str(payload.get("result", {}).get("stderr", ""))
+    if connectivity_error:
+        # Re-raise happens only after convergence; the row stays running and
+        # exactly recoverable — never terminalized by the error path.
+        assert payload["state"]["status"] == "running"
+    else:
+        assert payload["state"]["status"] == "failed"
+        assert expected_stderr in str(payload.get("result", {}).get("stderr", ""))
     # The user program NEVER ran and no fall-through release happened.
     assert not sentinel.exists()
     assert len(release_calls) <= max_release_calls
@@ -3165,4 +3182,20 @@ def test_nonconverging_abort_blocks_after_failed_release(
         pg_cluster,
         tmp_path,
         "release",
+    )
+
+
+def test_nonconverging_abort_blocks_on_connectivity_error(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """Connectivity error + nonconverging abort: converge first, then re-raise."""
+    _run_nonconverging_abort_scenario(
+        monkeypatch,
+        jobs_db,
+        pg_cluster,
+        tmp_path,
+        "connectivity",
     )
