@@ -2867,3 +2867,193 @@ def test_probe_job_independent_of_sys_executable_and_runtime_path(
             kill_proc(worker)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Ordinary deploys are not a version-changing control plane (issue #29)
+# ---------------------------------------------------------------------------
+
+
+def write_pending_mission(*, commit: str = "b" * 40, previous: str = "a" * 40) -> None:
+    """Write a live pending supervised-deployment mission.
+
+    Args:
+        commit: Candidate commit of the pending checkout.
+        previous: Previously confirmed commit.
+    """
+
+    def mission_meta(rev: str, pid: int) -> WorkerMeta:
+        return WorkerMeta(
+            schema_version=1,
+            state=lifecycle.STATE_RUNNING,
+            pid=pid,
+            pgid=pid,
+            sid=pid,
+            start_time_ticks=pid * 10,
+            token=f"mission-{pid}",
+            repo="/workspace/Lubko",
+            git_commit=rev,
+            worker_id="mission-worker",
+            log_path="/workspace/worker.log",
+            started_at=1.0,
+            stopped_at=None,
+        )
+
+    state = dc.RollbackState(
+        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=7,
+        status=dc.STATUS_PENDING,
+        commit=commit,
+        previous_commit=previous,
+        challenge_hash=None,
+        deadline=time.time() + 60,
+        repo="/workspace/Lubko",
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=5.0,
+        previous_retiring=False,
+        previous_meta=mission_meta(previous, 100),
+        new_meta=mission_meta(commit, 200),
+        supervisor_owned=True,
+    )
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(
+        json.dumps(state.to_dict(), sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def test_deploy_refused_while_supervised_checkout_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ordinary deploy fails closed while a supervised checkout is pending."""
+    write_pending_mission()
+    old = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(old, tmp_path))
+        spawned = patch_deploy(monkeypatch)
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_ERROR
+        assert not spawned
+        assert old.poll() is None
+        err = capsys.readouterr().err
+        assert "pending confirmation" in err
+        assert "lubko-deploy-ctl" in err
+    finally:
+        kill_proc(old)
+        kill_many(spawned)
+
+
+def test_deploy_refused_on_corrupt_supervised_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Corrupt supervised state blocks mutation instead of failing open."""
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text("{not json\n", encoding="utf-8")
+    old = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(old, tmp_path))
+        spawned = patch_deploy(monkeypatch)
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_ERROR
+        assert not spawned
+        assert old.poll() is None
+        err = capsys.readouterr().err
+        assert "unreadable or corrupt" in err
+        assert "lubko-deploy-ctl status" in err
+    finally:
+        kill_proc(old)
+        kill_many(spawned)
+
+
+def test_deploy_refuses_version_change_of_live_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A version-changing ordinary deploy is refused once a worker exists."""
+    old = spawn_controlled()
+    try:
+        lifecycle.write_meta(meta_for_process(old, tmp_path))
+        spawned = patch_deploy(monkeypatch)
+        monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: "b" * 40)
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=False))
+        assert code == EXIT_ERROR
+        assert not spawned
+        current = lifecycle.read_meta()
+        assert current is not None
+        assert current.pid == old.pid
+        err = capsys.readouterr().err
+        assert "cannot change versions" in err
+        assert "lubko-deploy-ctl checkout" in err
+    finally:
+        kill_proc(old)
+        kill_many(spawned)
+
+
+def test_first_install_works_without_rollback_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean first installation needs no supervised rollback baseline."""
+    spawned = patch_deploy(monkeypatch)
+    try:
+        code = lifecycle.deploy(make_options(tmp_path, bootstrap=True))
+        assert code == EXIT_OK
+        assert len(spawned) == 1
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert lifecycle.worker_alive(meta)
+    finally:
+        kill_many(spawned)
+
+
+def test_status_stays_available_during_pending_mission(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Read-only status remains available while a mission is pending."""
+    write_pending_mission()
+    assert lifecycle.status_cmd() == EXIT_OK
+    out = capsys.readouterr().out
+    assert "state:" in out
+
+
+def test_repair_reports_failure_when_post_verification_fails(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repair re-proves exactly one consumer after reconstructing state."""
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    worker = spawn_real_worker(conf)
+    roundtrips: list[int] = []
+    real_roundtrip = lifecycle._verify_queue_roundtrip
+
+    def counting_roundtrip(
+        worker_id: str,
+        cwd: str,
+        recovery_worker_pid: int,
+        timeout_seconds: float,
+    ) -> bool:
+        roundtrips.append(recovery_worker_pid)
+        if len(roundtrips) == 1:
+            return real_roundtrip(worker_id, cwd, recovery_worker_pid, timeout_seconds)
+        return False
+
+    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", counting_roundtrip)
+    try:
+        code = lifecycle.repair(make_repair_options(repo), worker.pid)
+        assert code == EXIT_ERROR
+        assert len(roundtrips) == 2
+        assert roundtrips[0] == roundtrips[1] == worker.pid
+    finally:
+        kill_proc(worker)
