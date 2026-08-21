@@ -98,6 +98,46 @@ def test_assert_no_live_tracked_detects_leaks() -> None:
         assert not pid_live(pid)
 
 
+def test_teardown_never_signals_reused_pid_identity() -> None:
+    """A registry entry whose recorded identity no longer matches is never signalled.
+
+    Deterministically simulates kernel PID reuse: a live innocent process
+    occupies a PID whose registry entry records different start ticks, as if
+    the originally-registered process had died and the kernel reassigned its
+    PID.  Teardown must refuse to signal the unverified new occupant and must
+    report the stale identity loudly instead.
+    """
+    innocent = subprocess.Popen(
+        [SLEEP_BIN, "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        current = guard.proc_start_ticks(innocent.pid)
+        assert current is not None
+        guard.register(innocent, start_ticks=current - 1)
+        with pytest.raises(AssertionError, match="stale identit"):
+            guard.teardown_tracked()
+        assert pid_live(innocent.pid)
+    finally:
+        if innocent.poll() is None:
+            innocent.kill()
+            innocent.wait(timeout=10)
+    assert innocent.pid not in guard.TRACKED
+
+
+def test_teardown_stops_exact_identity_after_registration() -> None:
+    """A registered process whose ticks still match is signalled exactly."""
+    proc, pid = spawn_sleep_leader()
+    guard.register(proc)
+    assert guard.proc_start_ticks(pid) is not None
+    with pytest.raises(AssertionError, match="leaked"):
+        guard.teardown_tracked()
+    assert not pid_live(pid)
+    assert pid not in guard.TRACKED
+
+
 def test_teardown_never_signals_parent_process_group() -> None:
     """A non-leader child is stopped by exact PID, never its shared group.
 
