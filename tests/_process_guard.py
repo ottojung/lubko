@@ -24,6 +24,7 @@ a broad process kill.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import time
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
     import subprocess
 
 KILL_GRACE_SECONDS: Final = 5.0
+OWNER_MARKER_ENV: Final = "LUBKO_TEST_OWNER_MARKER"
 GROUP_POLL_SECONDS: Final = 0.02
 
 
@@ -50,6 +52,45 @@ class _Tracked:
 
 
 TRACKED: dict[int, _Tracked] = {}
+
+
+def _record_to_owner_marker(pid: int, ticks: int) -> None:
+    """Append a successfully-registered identity to the stress-owner marker.
+
+    Canonical automatic recording for nested stress runs: when the
+    ``LUBKO_TEST_OWNER_MARKER`` environment variable is present (set by the
+    independent owner's starter), every successful registration appends its
+    exact ``{pid, ticks}`` identity as one JSON line before returning, so
+    the owner can contain descendants even after an abrupt nested-pytest
+    death.  Ordinary tests without the variable are unaffected.  The append
+    is a single O_APPEND write of one newline-terminated line: a reader can
+    therefore distinguish a complete record from a torn partial write and
+    must treat any partial trailing line as unproven coverage.
+
+    Args:
+        pid: The registered process PID.
+        ticks: The captured start ticks.
+
+    Raises:
+        AssertionError: If the identity cannot be recorded while the marker
+            variable is set: registration must guarantee record-before-return.
+    """
+    raw = os.environ.get(OWNER_MARKER_ENV)
+    if not raw:
+        return
+    line = (json.dumps({"pid": pid, "ticks": ticks}, sort_keys=True) + "\n").encode()
+    try:
+        fd = os.open(raw, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    except OSError as error:
+        msg = f"cannot open owner marker {raw} to record pid {pid}: {error}"
+        raise AssertionError(msg) from error
+    try:
+        os.write(fd, line)
+    except OSError as error:
+        msg = f"cannot append pid {pid} to owner marker {raw}: {error}"
+        raise AssertionError(msg) from error
+    finally:
+        os.close(fd)
 
 
 def proc_start_ticks(pid: int) -> int | None:
@@ -109,6 +150,7 @@ def register(proc: subprocess.Popen[bytes], *, start_ticks: int | None = None) -
         )
         raise AssertionError(msg)
     TRACKED[proc.pid] = _Tracked(proc=proc, start_ticks=resolved)
+    _record_to_owner_marker(proc.pid, resolved)
 
 
 def signal_identity_checked(pid: int, ticks: int | None, sig: int) -> bool:
@@ -275,11 +317,20 @@ def _stop_one(tracked: _Tracked) -> bool:
     nothing uses process-name matching or broad ``pkill``.
 
     The recorded start ticks are re-verified immediately before **every**
-    signal — both the initial ``SIGTERM`` and the escalation ``SIGKILL``.
-    A registry entry whose recorded ticks no longer match the current
+    signal directed at the registered PID itself — both the initial
+    ``SIGTERM`` and the escalation ``SIGKILL`` for a non-leader PID.  A
+    registry entry whose recorded ticks no longer match the current
     occupant of the PID (the kernel reused the PID after the original
     died), or whose recorded ticks were never valid, is never signalled;
     the caller reports it as a stale/unverifiable identity instead.
+
+    Dedicated-group ownership is established while the leader's identity is
+    still verifiable, before the TERM is delivered.  If the leader then
+    exits on TERM while a child of its proven dedicated group survives, the
+    escalation SIGKILL goes to that already-owned group even though the
+    leader's ``/proc`` entry is gone: an owned group is never abandoned.  A
+    shared (never-owned) group or a group whose ownership was never
+    established is still never signalled.
 
     Args:
         tracked: The tracked registry entry to stop.
@@ -291,24 +342,42 @@ def _stop_one(tracked: _Tracked) -> bool:
     """
     proc = tracked.proc
     pid = proc.pid
-    if not signal_identity_checked(pid, tracked.start_ticks, signal.SIGTERM):
-        return False
     pgid = _process_group_of(pid)
+    owned_group: int | None = None
+    if (
+        tracked.start_ticks is not None
+        and pgid is not None
+        and proc_start_ticks(pid) == tracked.start_ticks
+    ):
+        # Ownership of the dedicated group is established now, while the
+        # leader's exact identity is verified — before any signal.
+        owned_group = pgid if pgid == pid else None
+        _signal_exact(pid, pgid, signal.SIGTERM)
+    else:
+        # Stale/unverifiable identity (or already gone): never signal.
+        return False
     deadline = time.monotonic() + KILL_GRACE_SECONDS
     while time.monotonic() < deadline:
         if proc.poll() is not None and _group_clear(pgid, pid):
             break
         time.sleep(GROUP_POLL_SECONDS)
-    if not _still_active(proc, pgid):
-        return True
-    # Re-verify immediately before the KILL: if the identity changed after
-    # the TERM (PID reused), the new occupant must never be hit.
-    if not signal_identity_checked(pid, tracked.start_ticks, signal.SIGKILL):
-        return False
+    if _still_active(proc, pgid):
+        if owned_group is not None:
+            # The dedicated group was provably owned before TERM; signal it
+            # on escalation even if the leader itself has since exited.
+            with suppress(ProcessLookupError):
+                os.killpg(owned_group, signal.SIGKILL)
+        # Re-verify immediately before a KILL aimed at the live PID itself:
+        # if the identity changed after the TERM (PID reused), the new
+        # occupant must never be hit.
+        elif not signal_identity_checked(pid, tracked.start_ticks, signal.SIGKILL):
+            return False
     if proc.poll() is None:
         with suppress(Exception):
             proc.wait(timeout=KILL_GRACE_SECONDS)
-    if pgid is not None and pgid == pid:
+    if owned_group is not None:
+        _wait_group_gone(owned_group)
+    elif pgid == pid:
         _wait_group_gone(pgid)
     return True
 

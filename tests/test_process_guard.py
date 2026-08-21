@@ -7,7 +7,6 @@ signals the pytest/shared process group, and fails loudly when a test leaks.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import shutil
 import signal
@@ -211,7 +210,9 @@ def test_teardown_never_kills_identity_reused_after_term(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        # Deliberately NOT a session/group leader: the escalation gate under
+        # test authorizes a KILL of the live PID itself only while its
+        # recorded start-ticks identity matches.
     )
     try:
         # Wait until the subject has installed its SIGTERM handler, so the
@@ -245,12 +246,77 @@ def test_teardown_never_kills_identity_reused_after_term(
     finally:
         monkeypatch.undo()
         if proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
+            proc.kill()
             proc.wait(timeout=10)
         if proc.stdout is not None:
             proc.stdout.close()
     assert proc.pid not in guard.TRACKED
+
+
+CHILD_IGNORES_TERM_SCRIPT: Final = """
+import os, signal, sys, time
+from pathlib import Path
+
+def handler(_signum: int, _frame: object) -> None:
+    Path(sys.argv[1] + ".child-ignored").write_text("ignored")
+
+signal.signal(signal.SIGTERM, handler)
+Path(sys.argv[1] + ".pid").write_text(str(os.getpid()))
+time.sleep(300)
+"""
+
+
+def test_teardown_kills_owned_group_when_leader_exits_on_term(
+    tmp_path: Path,
+) -> None:
+    """A dedicated group proven owned is escalated even after leader exit.
+
+    The registered session/group leader exits on SIGTERM while an
+    already-spawned child of its dedicated group ignores SIGTERM and
+    survives.  Teardown must escalate the KILL to the owned group — the
+    leader's ``/proc`` entry being gone must not abandon the surviving
+    child.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    parent_script = f"""
+import subprocess, sys, time
+from pathlib import Path
+
+child = subprocess.Popen(
+    [sys.executable, "-c", {CHILD_IGNORES_TERM_SCRIPT!r}, {str(tmp_path / "child")!r}],
+)
+Path({str(tmp_path / "child-pid")!r}).write_text(str(child.pid))
+time.sleep(300)
+"""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", parent_script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    child_pid_path = tmp_path / "child-pid"
+    try:
+        deadline = time.monotonic() + 30.0
+        while not child_pid_path.exists() and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert child_pid_path.exists(), "subject never spawned its group member"
+        guard.register(proc)
+        with pytest.raises(AssertionError, match="leaked"):
+            guard.teardown_tracked()
+        # The leader exited on TERM; the ignoring child was killed by the
+        # escalation against the owned dedicated group.
+        assert proc.poll() is not None
+        child_pid = int(child_pid_path.read_text())
+        wait_until(lambda: not pid_live(child_pid), timeout=10.0)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
 
 
 def test_register_ignores_already_terminal_process() -> None:
