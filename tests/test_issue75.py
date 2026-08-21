@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Self, cast
 from unittest.mock import MagicMock
@@ -158,7 +159,9 @@ def _wait_child_pgid(child_pgid_file: Path, timeout: float = 5.0) -> int:
     while time.monotonic() < deadline:
         if child_pgid_file.exists():
             with suppress(ValueError, OSError):
-                return int(child_pgid_file.read_text(encoding="utf-8").strip())
+                pgid = int(child_pgid_file.read_text(encoding="utf-8").strip())
+                _register_owned_group(pgid)
+                return pgid
         time.sleep(0.02)
     msg = "scripted worker never published its child process group id"
     raise AssertionError(msg)
@@ -507,6 +510,7 @@ def _wait_for_claim(jobs_db: str, job_id: object, tmp_path: Path) -> tuple[int, 
     assert child_pgid is not None
     assert incarnation is not None
     assert worker_mod.group_has_members(child_pgid)
+    _register_owned_group(child_pgid)
     return child_pgid, str(incarnation)
 
 
@@ -602,69 +606,101 @@ def _issue75_leak_proof() -> Iterator[None]:
 
     Every #75 focused test spawns a scripted worker (and, transitively, a
     SIGTERM-ignoring command group) that must never reparent to PID 1. Even on
-    an assertion/failure path this fixture kills any surviving process whose
-    command line names our scripted worker or the exact child marker, by exact
-    process group, then asserts zero survivors remain.
+    an assertion/failure path this fixture stops only the exact process groups
+    the test explicitly created and recorded at spawn time (group id plus the
+    recorded leader's start-time ticks), then asserts none of those owned
+    groups survives. No global /proc scan and no marker-name matching is used.
     """
     yield
-    _kill_issue75_orphans()
-    _assert_no_issue75_processes()
+    _stop_owned_groups()
+    _assert_no_owned_groups_live()
 
 
-ISSUE75_WORKER_MARKER: Final = "scripted_worker.py"
-ISSUE75_CHILD_MARKER: Final = "lubko_issue75_child"
+@dataclass(frozen=True)
+class _OwnedGroup:
+    """A command process group the test explicitly created and recorded.
+
+    Attributes:
+        pgid: Exact process group id (the spawned child is its leader).
+        leader_start_ticks: Start-time ticks of the leader at spawn time,
+            proving a later signal targets the same exact process instance.
+    """
+
+    pgid: int
+    leader_start_ticks: int
 
 
-def _issue75_survivors() -> list[tuple[int, int]]:
-    """Return ``(pid, pgid)`` of any still-live issue75 test process.
+OWNED_GROUPS: dict[int, _OwnedGroup] = {}
+
+
+def _register_owned_group(pgid: int) -> None:
+    """Record an explicitly created child group for exact-identity teardown.
+
+    Args:
+        pgid: The exact group id published by the test-spawned child (which
+            leads its own dedicated session/process group).
+    """
+    ticks = lifecycle.proc_start_ticks(pgid)
+    assert ticks is not None, "recorded owned group leader vanished before registration"
+    OWNED_GROUPS[pgid] = _OwnedGroup(pgid=pgid, leader_start_ticks=ticks)
+
+
+def _still_ours(group: _OwnedGroup) -> bool:
+    """Return whether the recorded group identity is unchanged since spawn.
+
+    Args:
+        group: The recorded owned group.
 
     Returns:
-        Live processes whose command line names the scripted worker or the
-        exact command-group child marker.
+        ``True`` only when the live leader's start-time ticks still match the
+        recorded value, so signalling can never hit a recycled group id.
     """
-    survivors: list[tuple[int, int]] = []
-    proc_dir = Path("/proc")
-    if proc_dir.is_dir():
-        for entry in proc_dir.iterdir():
-            if not entry.name.isdigit():
-                continue
-            try:
-                cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ")
-            except OSError:
-                continue
-            text = cmdline.decode("utf-8", "replace")
-            if ISSUE75_WORKER_MARKER in text or ISSUE75_CHILD_MARKER in text:
-                try:
-                    pid = int(entry.name)
-                    pgid = os.getpgid(pid)
-                except (ProcessLookupError, OSError):
-                    continue
-                survivors.append((pid, pgid))
-    return survivors
+    return lifecycle.proc_start_ticks(group.pgid) == group.leader_start_ticks
 
 
-def _kill_issue75_orphans() -> None:
-    """SIGKILL any surviving issue75 test process by exact process group."""
-    for _pid, pgid in _issue75_survivors():
+def _stop_owned_groups() -> None:
+    """Terminate every still-live recorded group by its exact identity."""
+    for group in OWNED_GROUPS.values():
+        if not _still_ours(group) or not worker_mod.group_has_members(group.pgid):
+            continue
         with suppress(ProcessLookupError, OSError):
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(group.pgid, signal.SIGTERM)
+        deadline = time.monotonic() + 2.0
+        while (
+            time.monotonic() < deadline
+            and _still_ours(group)
+            and worker_mod.group_has_members(group.pgid)
+        ):
+            time.sleep(0.02)
+        if _still_ours(group) and worker_mod.group_has_members(group.pgid):
+            with suppress(ProcessLookupError, OSError):
+                os.killpg(group.pgid, signal.SIGKILL)
 
 
-def _assert_no_issue75_processes() -> None:
-    """Assert no issue75 test process survives; kill then re-check if needed.
+def _assert_no_owned_groups_live() -> None:
+    """Assert every recorded owned group is gone after the stop pass.
 
     Raises:
-        AssertionError: If any issue75 test process is still running after a
-            kill-and-recheck cycle.
+        AssertionError: If any recorded group (still identity-verified as ours)
+            has surviving members.
     """
-    survivors = _issue75_survivors()
+    survivors = [
+        group
+        for group in OWNED_GROUPS.values()
+        if _still_ours(group) and worker_mod.group_has_members(group.pgid)
+    ]
+    if not survivors:
+        return
+    _stop_owned_groups()
+    time.sleep(0.2)
+    survivors = [
+        group
+        for group in OWNED_GROUPS.values()
+        if _still_ours(group) and worker_mod.group_has_members(group.pgid)
+    ]
     if survivors:
-        _kill_issue75_orphans()
-        time.sleep(0.2)
-        survivors = _issue75_survivors()
-    if survivors:
-        msg = "issue75 test processes still alive after focused tests: " + ", ".join(
-            f"pid={pid}/pgid={pgid}" for pid, pgid in survivors
+        msg = "issue75-owned command groups still alive after focused tests: " + ", ".join(
+            str(group.pgid) for group in survivors
         )
         raise AssertionError(msg)
 
