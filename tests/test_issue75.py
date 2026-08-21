@@ -24,7 +24,7 @@ import sys
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Self
+from typing import TYPE_CHECKING, Final, Self, cast
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -33,7 +33,7 @@ from psycopg import connect
 
 from lubko import lifecycle
 from lubko import worker as worker_mod
-from lubko.supervisor import OwnedGroupRecoveryError, SupervisorDaemon
+from lubko.supervisor import OwnedGroupRecoveryError, recover_owned_groups
 from tests import _process_guard as guard
 from tests.test_lifecycle import identity_of
 
@@ -204,7 +204,7 @@ def test_stop_worker_respects_drain_of_sigterm_ignoring_group(tmp_path: Path) ->
     command group is still alive, must leave no descendant process, and must see
     the command reach a terminal (gone) state.
     """
-    token = "issue75-drain-token"  # ruff: ignore[hardcoded-password-string]
+    token = f"issue75-drain-{uuid4().hex}"
     cancel_grace = 1.0
     proc = _spawn_scripted_worker(tmp_path, token, cancel_grace)
     meta = _meta_for_live(proc, tmp_path, token)
@@ -238,7 +238,7 @@ def test_stop_worker_equal_timeouts_do_not_race_drain(tmp_path: Path) -> None:
     before the outer authority may treat it as wedged, because the outer wait
     floor is the worker's cancel grace plus finalization slack.
     """
-    token = "issue75-equal-timeout"  # ruff: ignore[hardcoded-password-string]
+    token = f"issue75-equal-timeout-{uuid4().hex}"
     cancel_grace = 1.0
     proc = _spawn_scripted_worker(tmp_path, token, cancel_grace)
     meta = _meta_for_live(proc, tmp_path, token)
@@ -289,7 +289,7 @@ class _FakeConn:
         """Yield self as the transaction context."""
         yield self
 
-    def cursor(self, row_factory: object = None) -> _FakeCursor:  # ruff: ignore[unused-method-argument]
+    def cursor(self, **_kwargs: object) -> _FakeCursor:
         """Return a fake cursor."""
         return _FakeCursor(self._rows)
 
@@ -341,7 +341,9 @@ def test_recover_owned_job_groups_kills_exact_groups_only() -> None:
             (uuid4(), str(owned_pgid), str(lifecycle.proc_start_ticks(owned.pid))),
             (uuid4(), str(reused_pgid), str(reused_ticks)),
         ])
-        result = worker_mod.recover_owned_job_groups(conn, incarnation, 0.5)  # type: ignore[arg-type]
+        result = worker_mod.recover_owned_job_groups(
+            cast("worker_mod.JobsConnection", conn), incarnation, 0.5
+        )
         assert result.reaped == [owned_pgid]
         assert result.surviving == []
         assert result.unresolved == [reused_pgid]
@@ -362,13 +364,19 @@ def test_recover_owned_job_groups_kills_exact_groups_only() -> None:
 
 
 def _spawn_real_worker(
-    db_conf: Path, *, worker_id: str = REPAIR_WORKER_ID
+    db_conf: Path,
+    *,
+    worker_id: str = REPAIR_WORKER_ID,
+    token: str | None = None,
 ) -> subprocess.Popen[bytes]:
     """Spawn a real queue-consuming worker registered with the process guard.
 
     Args:
         db_conf: Database configuration file for the worker.
         worker_id: Worker identifier the worker records on claims.
+        token: Explicit lifecycle token (incarnation) for the worker, so tests
+            can deterministically authorize a later ``stop_worker`` against the
+            exact process. ``None`` lets the worker generate its own token.
 
     Returns:
         The spawned worker process.
@@ -376,6 +384,8 @@ def _spawn_real_worker(
     env = dict(os.environ)
     env["LUBKO_DATABASE_CONFIG"] = str(db_conf)
     env["LUBKO_WORKER_ID"] = worker_id
+    if token is not None:
+        env["LUBKO_LIFECYCLE_TOKEN"] = token
     env.update(REPAIR_TIMINGS)
     proc = subprocess.Popen(
         [sys.executable, "-m", "lubko.worker"],
@@ -442,22 +452,29 @@ def _insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
     return row[0]
 
 
-def _read_job_field(conninfo: str, job_id: object, field_sql: str) -> object:
-    """Read one JSON field from a job's payload.
+_JOB_FIELD_QUERIES: Final = {
+    "status": "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
+    "pgid": "SELECT (payload::jsonb)->'state'->>'process_pgid' FROM lubko.jobs WHERE id = %s",
+    "incarnation": (
+        "SELECT (payload::jsonb)->'state'->>'worker_incarnation' FROM lubko.jobs WHERE id = %s"
+    ),
+}
+
+
+def _read_job_field(conninfo: str, job_id: object, field: str) -> object:
+    """Read one whitelisted JSON field from a job's payload.
 
     Args:
         conninfo: PostgreSQL connection string.
         job_id: Job identifier.
-        field_sql: SQL expression selecting the JSON field.
+        field: Key selecting the exact prebuilt query in
+            :data:`_JOB_FIELD_QUERIES`.
 
     Returns:
         The decoded field value, or ``None``.
     """
     with connect(conninfo) as conn:
-        row = conn.execute(
-            f"SELECT {field_sql} FROM lubko.jobs WHERE id = %s",  # ruff: ignore[hardcoded-sql-expression]
-            (job_id,),
-        ).fetchone()
+        row = conn.execute(_JOB_FIELD_QUERIES[field], (job_id,)).fetchone()
     if row is None or row[0] is None:
         return None
     return row[0]
@@ -475,17 +492,14 @@ def _wait_for_claim(jobs_db: str, job_id: object, tmp_path: Path) -> tuple[int, 
         The claimed ``(child_pgid, incarnation)``.
     """
     del tmp_path
-    status_sql = "(payload::jsonb)->'state'->>'status'"
-    pgid_sql = "(payload::jsonb)->'state'->>'process_pgid'"
-    inc_sql = "(payload::jsonb)->'state'->>'worker_incarnation'"
     deadline = time.monotonic() + 15.0
     child_pgid: int | None = None
     incarnation: object = None
     while time.monotonic() < deadline:
-        status = _read_job_field(jobs_db, job_id, status_sql)
+        status = _read_job_field(jobs_db, job_id, "status")
         if status == "running":
-            pgid = _read_job_field(jobs_db, job_id, pgid_sql)
-            incarnation = _read_job_field(jobs_db, job_id, inc_sql)
+            pgid = _read_job_field(jobs_db, job_id, "pgid")
+            incarnation = _read_job_field(jobs_db, job_id, "incarnation")
             if pgid is not None and incarnation is not None:
                 child_pgid = int(str(pgid))
                 break
@@ -503,18 +517,19 @@ def _assert_root_terminal(jobs_db: str, job_id: object) -> None:
         jobs_db: PostgreSQL connection string.
         job_id: The job identifier.
     """
-    status_sql = "(payload::jsonb)->'state'->>'status'"
     status_deadline = time.monotonic() + 10.0
     status = None
     while time.monotonic() < status_deadline:
-        status = _read_job_field(jobs_db, job_id, status_sql)
+        status = _read_job_field(jobs_db, job_id, "status")
         if status in {"succeeded", "failed", "cancelled"}:
             break
         time.sleep(0.05)
     assert status == "cancelled"
 
 
-def test_planned_replacement_drains_sigterm_ignoring_command(jobs_db: str, tmp_path: Path) -> None:
+def test_planned_replacement_drains_sigterm_ignoring_command(
+    jobs_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A planned replacement must drain a SIGTERM-ignoring command group.
 
     Runs a real maintained worker, claims a command whose process group ignores
@@ -525,7 +540,13 @@ def test_planned_replacement_drains_sigterm_ignoring_command(jobs_db: str, tmp_p
     execution ownership is safe.
     """
     db_conf = _db_conf_from_conninfo(jobs_db, tmp_path)
-    worker = _spawn_real_worker(db_conf)
+    # The readiness roundtrip probe (verify_worker_consumes_queue) runs in this
+    # test process and loads the database configuration from the environment,
+    # exactly like any production caller of the outer lifecycle authority.
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(db_conf))
+    worker_token = f"issue75-worker-{uuid4().hex}"
+    replacement_token = f"issue75-replacement-{uuid4().hex}"
+    worker = _spawn_real_worker(db_conf, token=worker_token)
     py = sys.executable
     command = (
         'trap "" TERM; exec ' + py + ' -c "import signal,time; '
@@ -558,7 +579,9 @@ def test_planned_replacement_drains_sigterm_ignoring_command(jobs_db: str, tmp_p
         # is safe: no old-incarnation group may be alive, and the replacement
         # genuinely consumes the queue.
         assert not worker_mod.group_has_members(child_pgid)
-        replacement = _spawn_real_worker(db_conf, worker_id="replacement-worker")
+        replacement = _spawn_real_worker(
+            db_conf, worker_id="replacement-worker", token=replacement_token
+        )
         try:
             ready = lifecycle.verify_worker_consumes_queue(
                 "replacement-worker", str(tmp_path), replacement.pid, 15.0
@@ -566,10 +589,10 @@ def test_planned_replacement_drains_sigterm_ignoring_command(jobs_db: str, tmp_p
             assert ready
         finally:
             if replacement.poll() is None:
-                lifecycle.stop_worker(_meta_for_live(replacement, tmp_path, "repl-token"), 5.0)
+                lifecycle.stop_worker(_meta_for_live(replacement, tmp_path, replacement_token), 5.0)
     finally:
         if worker.poll() is None:
-            lifecycle.stop_worker(_meta_for_live(worker, tmp_path, str(incarnation or "x")), 5.0)
+            lifecycle.stop_worker(_meta_for_live(worker, tmp_path, worker_token), 5.0)
         _recover_incarnation(jobs_db, incarnation)
 
 
@@ -654,14 +677,14 @@ def test_stop_worker_rejects_live_unowned_wrong_token(tmp_path: Path) -> None:
     unowned process must never be signalled, and stop_worker must report
     failure rather than claiming retirement -- so authority is never handed off.
     """
-    token = "issue75-wrong-token-ctx"  # ruff: ignore[hardcoded-password-string]
+    token = f"issue75-wrong-token-{uuid4().hex}"
     # The process environment carries a DIFFERENT token, so it is live but not
     # owned by the recorded incarnation.
     proc = _spawn_scripted_worker(
         tmp_path,
         token,
         1.0,
-        env_token="issue75-other-incarnation",  # ruff: ignore[hardcoded-password-func-arg]
+        env_token=f"issue75-other-{uuid4().hex}",
     )
     meta = _meta_for_live(proc, tmp_path, token)
     try:
@@ -680,7 +703,7 @@ def test_stop_worker_rejects_live_unowned_wrong_token(tmp_path: Path) -> None:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         try:
             proc.wait(timeout=5)
-        except Exception:  # ruff: ignore[blind-except]
+        except subprocess.SubprocessError:
             with suppress(ProcessLookupError, OSError):
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             with suppress(Exception):
@@ -838,9 +861,7 @@ def test_recover_owned_groups_db_failure_blocks(monkeypatch: pytest.MonkeyPatch)
         lambda: (_ for _ in ()).throw(ValueError("no database configuration available")),
     )
     with pytest.raises(OwnedGroupRecoveryError):
-        SupervisorDaemon._recover_owned_groups(  # ruff: ignore[private-member-access]
-            "issue75-blocked-incarnation"
-        )
+        recover_owned_groups("issue75-blocked-incarnation")
 
 
 def test_recover_owned_groups_survivor_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -865,9 +886,7 @@ def test_recover_owned_groups_survivor_blocks(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("lubko.supervisor.load_database_config", lambda: fake_db)
     monkeypatch.setattr("lubko.supervisor.psycopg.connect", lambda *_, **__: MagicMock())
     with pytest.raises(OwnedGroupRecoveryError):
-        SupervisorDaemon._recover_owned_groups(  # ruff: ignore[private-member-access]
-            "issue75-survivor-incarnation"
-        )
+        recover_owned_groups("issue75-survivor-incarnation")
 
 
 def test_recover_owned_job_groups_reports_survivors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -898,7 +917,9 @@ def test_recover_owned_job_groups_reports_survivors(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(worker_mod, "_terminate_one_group", lambda *_, **__: False)
     try:
         conn = _FakeConn([(uuid4(), str(owned_pgid), str(lifecycle.proc_start_ticks(owned.pid)))])
-        result = worker_mod.recover_owned_job_groups(conn, "issue75-survivor", 0.5)  # type: ignore[arg-type]
+        result = worker_mod.recover_owned_job_groups(
+            cast("worker_mod.JobsConnection", conn), "issue75-survivor", 0.5
+        )
         assert result.surviving == [owned_pgid]
         assert result.reaped == []
         assert result.unresolved == []
@@ -933,7 +954,9 @@ def test_recover_owned_job_groups_missing_ticks_live_unrelated_unresolved() -> N
     try:
         # Ticks column is ``None`` (missing/legacy) while the group is alive.
         conn = _FakeConn([(uuid4(), str(unrelated_pgid), None)])
-        result = worker_mod.recover_owned_job_groups(conn, "issue75-missing-ticks")  # type: ignore[arg-type]
+        result = worker_mod.recover_owned_job_groups(
+            cast("worker_mod.JobsConnection", conn), "issue75-missing-ticks"
+        )
         assert result.unresolved == [unrelated_pgid]
         assert result.reaped == []
         assert result.surviving == []
@@ -972,7 +995,9 @@ def test_recover_owned_job_groups_mismatched_ticks_live_group_unresolved() -> No
     wrong_ticks = (lifecycle.proc_start_ticks(unrelated.pid) or 0) + 1
     try:
         conn = _FakeConn([(uuid4(), str(unrelated_pgid), str(wrong_ticks))])
-        result = worker_mod.recover_owned_job_groups(conn, "issue75-mismatch-ticks")  # type: ignore[arg-type]
+        result = worker_mod.recover_owned_job_groups(
+            cast("worker_mod.JobsConnection", conn), "issue75-mismatch-ticks"
+        )
         assert result.unresolved == [unrelated_pgid]
         assert result.reaped == []
         assert result.surviving == []
@@ -1009,7 +1034,9 @@ def test_recover_owned_job_groups_missing_ticks_no_members_converges() -> None:
     # After the process exits the group has no live members.
     assert not worker_mod.group_has_members(dead_pgid)
     conn = _FakeConn([(uuid4(), str(dead_pgid), None)])
-    result = worker_mod.recover_owned_job_groups(conn, "issue75-gone-missing-ticks")  # type: ignore[arg-type]
+    result = worker_mod.recover_owned_job_groups(
+        cast("worker_mod.JobsConnection", conn), "issue75-gone-missing-ticks"
+    )
     assert result.reaped == []
     assert result.surviving == []
     assert result.unresolved == []
@@ -1037,9 +1064,7 @@ def test_recover_owned_groups_unresolved_blocks(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr("lubko.supervisor.load_database_config", lambda: fake_db)
     monkeypatch.setattr("lubko.supervisor.psycopg.connect", lambda *_, **__: MagicMock())
     with pytest.raises(OwnedGroupRecoveryError):
-        SupervisorDaemon._recover_owned_groups(  # ruff: ignore[private-member-access]
-            "issue75-unresolved-incarnation"
-        )
+        recover_owned_groups("issue75-unresolved-incarnation")
 
 
 def _recover_incarnation(conninfo: str, incarnation: object) -> None:

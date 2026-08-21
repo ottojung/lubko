@@ -1834,7 +1834,7 @@ def _run_delayed_batch_lease_scenario(
     captured: dict[str, object] = {}
     spawned = (threading.Event(), threading.Event())
 
-    def delayed_spawn(spec: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
+    def delayed_spawn(spec: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
         if spec.id == later_id:
             time.sleep(delay)
             captured["later_spawn_mono"] = time.monotonic()
