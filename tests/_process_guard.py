@@ -81,6 +81,8 @@ def register(proc: subprocess.Popen[bytes], *, start_ticks: int | None = None) -
     and whose PID the kernel reused can never cause an innocent new occupant
     of that PID to be signalled.
 
+    An already-terminal (reaped) ``Popen`` is harmless and is not registered.
+
     Args:
         proc: The spawned process to own.
         start_ticks: Explicit recorded start ticks; defaults to reading the
@@ -88,19 +90,53 @@ def register(proc: subprocess.Popen[bytes], *, start_ticks: int | None = None) -
             unverifiable registry entry deterministically.
 
     Raises:
-        AssertionError: If the live process's start ticks cannot be read and
-            no explicit ticks were supplied: an identity that cannot be
-            verified is never registered, so teardown can never be tempted
-            into signalling an unverified PID.
+        AssertionError: If the process is still live but its start ticks
+            cannot be read: a live identity that cannot be verified is never
+            registered, so teardown can never be tempted into signalling an
+            unverified PID.
     """
-    resolved = proc_start_ticks(proc.pid) if start_ticks is None else start_ticks
+    if start_ticks is None:
+        if proc.poll() is not None:
+            # Already terminal and reaped: there is nothing left to own.
+            return
+        resolved = proc_start_ticks(proc.pid)
+    else:
+        resolved = start_ticks
     if resolved is None:
         msg = (
-            f"cannot register pid {proc.pid}: start ticks unreadable; "
+            f"cannot register live pid {proc.pid}: start ticks unreadable; "
             "refusing to own an unverifiable identity"
         )
         raise AssertionError(msg)
     TRACKED[proc.pid] = _Tracked(proc=proc, start_ticks=resolved)
+
+
+def signal_identity_checked(pid: int, ticks: int | None, sig: int) -> bool:
+    """Signal an exact process only while its recorded identity still matches.
+
+    The start-ticks identity is re-read immediately before signalling: a
+    signal is delivered only when ``ticks`` is valid and still matches the
+    live occupant of ``pid``.  A session/process-group leader's whole
+    dedicated group is signalled; any other process is signalled by exact
+    PID only, never its shared group.
+
+    Args:
+        pid: Exact PID to signal.
+        ticks: Recorded start ticks authorizing the signal.
+        sig: Signal to deliver.
+
+    Returns:
+        ``True`` when the signal was delivered, ``False`` when the identity
+        was unresolved, stale, or already gone (nothing was signalled).
+    """
+    current = proc_start_ticks(pid)
+    if ticks is None or ticks <= 0 or current is None or current != ticks:
+        return False
+    pgid = _process_group_of(pid)
+    if pgid is None:
+        return False
+    _signal_exact(pid, pgid, sig)
+    return True
 
 
 def unregister(proc: subprocess.Popen[bytes]) -> None:

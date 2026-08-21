@@ -223,7 +223,10 @@ def main() -> int:
         env=dict(os.environ),
         stdin=subprocess.DEVNULL,
     )
-    args.pidfile.write_text(f"{proc.pid}\n", encoding="utf-8")
+    args.pidfile.write_text(
+        json.dumps({"pid": proc.pid, "ticks": _proc_start_ticks(proc.pid)}),
+        encoding="utf-8",
+    )
     status: int | None = None
     hard_deadline = time.monotonic() + args.deadline
     timed_out = False
