@@ -1448,15 +1448,18 @@ def abort_gated_start(
     stdout_path: Path,
     stderr_path: Path,
     gate_fd: int,
-) -> None:
+) -> bool:
     """Abort a gated start without ever executing user code.
 
     Used when the exact process identity could not be obtained or durably
     persisted, or when the gate release itself failed: the gate is closed
     WITHOUT the release byte so the wrapper exits on EOF, the exact
-    (still gated, childless) process group is terminated, the child is reaped,
-    and the capture files are removed so no unowned process or stray side
-    effect can survive.
+    (still gated, childless) process group is SIGKILLed, and the child is
+    reaped. The abort is complete only when the exact group is POSITIVELY
+    proven member-free; a leader-wait timeout can never mask that proof. When
+    the proof fails, the capture files are retained for diagnosis and the
+    caller must NOT terminalize or untrack the job — its running row keeps the
+    exact persisted identity recoverable by emergency recovery.
 
     Args:
         proc: The gated wrapper process.
@@ -1464,15 +1467,31 @@ def abort_gated_start(
         stdout_path: Capture file for standard output.
         stderr_path: Capture file for standard error.
         gate_fd: The worker-side write end of the start gate pipe.
+
+    Returns:
+        ``True`` only when the exact gated group is proven member-free and the
+        capture files were removed; ``False`` when the group could not be
+        proven gone (a blocking ownership failure for the caller).
     """
     # Close the gate WITHOUT releasing: the wrapper reads EOF and exits.
     with suppress(OSError):
         os.close(gate_fd)
     _signal_group(pgid, signal.SIGKILL)
-    with suppress(Exception):
+    with suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=5)
-    stdout_path.unlink(missing_ok=True)
-    stderr_path.unlink(missing_ok=True)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and group_has_members(pgid):
+        time.sleep(0.02)
+    if not group_has_members(pgid):
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+        return True
+    LOGGER.error(
+        "gated start abort cannot prove exact group %d member-free; retaining "
+        "the running row and capture files for exact-identity recovery",
+        pgid,
+    )
+    return False
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -3030,91 +3049,84 @@ class Supervisor:
         stderr_path = gated.stderr_path
         gate_fd = gated.gate_fd
         start_ticks = proc_start_ticks(proc.pid)
-        if start_ticks is None or start_ticks <= 0:
-            abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
+        failure: str | None = None
+        if start_ticks is not None and start_ticks > 0:
+            try:
+                _persist_process(conn, job_id, proc.pid, pgid, start_ticks)
+            except psycopg.Error as exc:
+                # The exact identity was not durably recorded, so the user
+                # program must never run: abort the exact (still gated,
+                # childless) group. A persistent identity row for a
+                # never-executed process would otherwise let a replacement
+                # claim the same job only to find a stranger-owned group.
+                aborted = abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
+                if self._is_connectivity_error(exc):
+                    raise
+                if aborted:
+                    LOGGER.exception(
+                        "unable to persist process identity for job %s (SQLSTATE %s)",
+                        job_id,
+                        exc.sqlstate or "N/A",
+                    )
+                    failure = "unable to record process identity; job not started"
+        elif abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd):
             LOGGER.error(
                 "unable to obtain exact start-time ticks for job %s (pid %d); "
                 "gated start aborted without executing user code",
                 job_id,
                 proc.pid,
             )
-            self._finalize_immediate(
-                job_id,
-                JobResult(
-                    status="failed",
-                    exit_code=EXECUTION_ERROR_EXIT_CODE,
-                    stdout="",
-                    stderr="unable to record exact process identity; job not started",
-                    cancellation_note=None,
-                ),
-            )
-            return None
-
-        try:
-            _persist_process(conn, job_id, proc.pid, pgid, start_ticks)
-        except psycopg.Error as exc:
-            # The exact identity was not durably recorded, so the user program
-            # must never run. Close the gate WITHOUT releasing (the wrapper
-            # exits on EOF), terminate the exact childless group, reap it, and
-            # remove the capture files so no unowned process or side effect
-            # survives. A persistent identity row for a never-executed process
-            # would otherwise let a replacement claim the same job only to find
-            # a stranger-owned group, or leak an orphaned process.
-            abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
-            if self._is_connectivity_error(exc):
-                raise
-            LOGGER.exception(
-                "unable to persist process identity for job %s (SQLSTATE %s)",
-                job_id,
-                exc.sqlstate or "N/A",
-            )
-            self._finalize_immediate(
-                job_id,
-                JobResult(
-                    status="failed",
-                    exit_code=EXECUTION_ERROR_EXIT_CODE,
-                    stdout="",
-                    stderr="unable to record process identity; job not started",
-                    cancellation_note=None,
-                ),
-            )
-            return None
-
-        # The exact identity is now durably recorded. Release the gate so the
-        # wrapper execs the user argv on the exact same PID, after which normal
-        # supervision applies. A failed release is a start failure: the wrapper
-        # can never be released through this handle, so abort the exact gated
-        # group and finalize failed instead of letting the job later look like
-        # a normally completed user command.
-        if not release_gate(gate_fd):
-            abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
+            failure = "unable to record exact process identity; job not started"
+        else:
             LOGGER.error(
-                "failed to release the start gate for job %s (pid %d); "
-                "gated start aborted without executing user code",
+                "unable to obtain exact start-time ticks for job %s (pid %d) "
+                "and the gated group could not be proven gone; retaining the "
+                "running row for exact-identity recovery",
                 job_id,
                 proc.pid,
             )
-            self._finalize_immediate(
-                job_id,
-                JobResult(
-                    status="failed",
-                    exit_code=EXECUTION_ERROR_EXIT_CODE,
-                    stdout="",
-                    stderr="unable to release gated start; job not started",
-                    cancellation_note=None,
-                ),
-            )
+        if failure is None:
+            # The exact identity is durably recorded. Release the gate so the
+            # wrapper execs the user argv on the exact same PID, after which
+            # normal supervision applies. A failed release is a start failure:
+            # abort the exact gated group instead of letting the job later look
+            # like a normally completed user command.
+            if release_gate(gate_fd):
+                return ActiveJob(
+                    id=job_id,
+                    cwd=job_spec.cwd,
+                    process=job_spec.process,
+                    proc=proc,
+                    pid=proc.pid,
+                    pgid=pgid,
+                    started_mono=time.monotonic(),
+                    claimed_at=claim_mono,
+                )
+            if abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd):
+                LOGGER.error(
+                    "failed to release the start gate for job %s (pid %d); "
+                    "gated start aborted without executing user code",
+                    job_id,
+                    proc.pid,
+                )
+                failure = "unable to release gated start; job not started"
+        if failure is None:
+            # Blocking ownership failure somewhere above: the exact gated group
+            # could not be proven member-free. Never terminalize or untrack —
+            # the running row keeps the persisted identity recoverable by
+            # emergency recovery.
             return None
-        return ActiveJob(
-            id=job_id,
-            cwd=job_spec.cwd,
-            process=job_spec.process,
-            proc=proc,
-            pid=proc.pid,
-            pgid=pgid,
-            started_mono=time.monotonic(),
-            claimed_at=claim_mono,
+        self._finalize_immediate(
+            job_id,
+            JobResult(
+                status="failed",
+                exit_code=EXECUTION_ERROR_EXIT_CODE,
+                stdout="",
+                stderr=failure,
+                cancellation_note=None,
+            ),
         )
+        return None
 
     def _finalize_immediate(self, job_id: UUID, result: JobResult) -> None:
         """Finalize a job that failed before or during spawning.
@@ -3319,16 +3331,26 @@ class Supervisor:
         for job in list(self.active.values()):
             if not job.completed and not job.term_sent:
                 request_stop(job, STOP_REASON_SHUTDOWN)
-        self._drain_active_groups()
-        # Every owned command process group is now proven dead (the drain above
-        # SIGKILLs and reaps any group that survives the cancel grace). Record
-        # the explicit safe-to-reap boundary so the outer lifecycle authority
-        # can observe it before forgetting or force-killing this worker.
-        try:
-            write_drain_sentinel(self.settings.worker_incarnation)
-        except OSError:
-            LOGGER.debug("could not write drain sentinel", exc_info=True)
-        self._finalize_all_for_shutdown()
+        if not self._drain_active_groups():
+            # Positive post-SIGKILL proof failed for at least one exact active
+            # group. This is NOT a clean drain: never emit the sentinel, never
+            # terminalize/untrack those jobs (their running rows keep the exact
+            # persisted identity recoverable by emergency recovery), and fail
+            # loudly in the log so the outer authority holds instead of reaping.
+            surviving = [job.pgid for job in self.active.values() if group_has_members(job.pgid)]
+            LOGGER.error(
+                "shutdown cannot prove groups %s member-free; withholding the "
+                "drain sentinel and retaining their jobs for exact-identity "
+                "recovery",
+                surviving,
+            )
+            self._finalize_all_for_shutdown(retain_groups=surviving)
+        else:
+            try:
+                write_drain_sentinel(self.settings.worker_incarnation)
+            except OSError:
+                LOGGER.debug("could not write drain sentinel", exc_info=True)
+            self._finalize_all_for_shutdown()
         self._cleanup_all_files()
         if self.conn is not None:
             with suppress(Exception):
@@ -3340,8 +3362,15 @@ class Supervisor:
         except OSError:
             LOGGER.debug("failed to write shutdown health snapshot", exc_info=True)
 
-    def _drain_active_groups(self) -> None:
-        """Wait for every active process group to exit, escalating to SIGKILL."""
+    def _drain_active_groups(self) -> bool:
+        """Wait for every active process group to exit, escalating to SIGKILL.
+
+        Returns:
+            ``True`` only when every active job's exact group is positively
+            proven member-free after the escalation; ``False`` when any exact
+            group still has members after the final SIGKILL pass, so no clean
+            drain may be claimed.
+        """
         deadline = time.monotonic() + self.settings.cancel_grace_seconds
         while time.monotonic() < deadline:
             all_gone = all(
@@ -3356,6 +3385,7 @@ class Supervisor:
         for job in self.active.values():
             with suppress(Exception):
                 job.proc.wait(timeout=self.settings.cancel_grace_seconds)
+        return all(not group_has_members(job.pgid) for job in self.active.values())
 
     def _observe_and_escalate(self, job: ActiveJob, now: float) -> bool:
         """Poll one child, escalate its in-flight stop, and report whether it is gone.
@@ -3393,20 +3423,28 @@ class Supervisor:
                 signal_kill(job)
         return job.completed and not group_has_members(job.pgid)
 
-    def _finalize_all_for_shutdown(self) -> None:
+    def _finalize_all_for_shutdown(self, *, retain_groups: list[int] | None = None) -> None:
         """Finalize every tracked job when PostgreSQL is available.
 
         Connectivity errors are re-raised so the caller can handle outage
         before continuing shutdown.  Deterministic per-job errors are logged
-        and the job is quarantined, preserving lease/row safety.
+        and the job is quarantined, preserving lease/row safety. Jobs whose
+        exact group could not be proven member-free (``retain_groups``) are
+        retained in the active set and their rows stay recoverable: they are
+        never terminalized or untracked here.
+
+        Args:
+            retain_groups: Exact group ids that failed post-SIGKILL proof;
+                their jobs are retained instead of finalized.
 
         Raises:
             psycopg.Error: When the error is a connectivity issue.
         """
         if self.conn is None:
             return
+        retained_ids = set(retain_groups or [])
         for job in list(self.active.values()):
-            if job.finalized:
+            if job.finalized or job.pgid in retained_ids:
                 continue
             if not job.completed and job.stop_reason is None:
                 job.stop_reason = STOP_REASON_SHUTDOWN

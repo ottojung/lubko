@@ -46,6 +46,7 @@ from lubko.worker import (
     Supervisor,
     collect_transport,
     delete_job_and_chunks,
+    drain_sentinel_path,
     group_has_members,
     pg_safe_decode,
     publish_output,
@@ -2954,3 +2955,36 @@ def test_start_gate_release_failure_fails_start_not_completion(
         supervisor.request_shutdown()
         thread.join(timeout=30)
         _kill_leftover_groups(jobs_db)
+
+
+def test_shutdown_withholds_drain_sentinel_when_group_proof_fails(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No clean-drain sentinel is emitted while an exact group is unproven.
+
+    Fault injection: ``group_has_members`` reports the running job's exact
+    group as permanently member-occupied, so the final post-SIGKILL proof
+    fails. Shutdown must NOT write the drain sentinel and must retain the job
+    (never terminalize/untrack it), keeping its running row exactly
+    recoverable by emergency recovery.
+    """
+    job_id = insert_job(jobs_db, str(tmp_path), "sleep 300")
+    settings = supervisor_settings(f"sentinel-{uuid4().hex[:8]}")
+    with supervisor_running(settings, make_database_config(pg_cluster), jobs_db) as supervisor:
+        wait_until(lambda: read_status(jobs_db, job_id) == "running")
+        payload = read_root(jobs_db, job_id)
+        pgid = int(payload["state"]["process_pgid"])
+        real_has_members = group_has_members
+
+        def _survives(pgid_arg: int) -> bool:
+            if pgid_arg == pgid:
+                return True
+            return real_has_members(pgid_arg)
+
+        monkeypatch.setattr(worker_module, "group_has_members", _survives)
+        supervisor.request_shutdown()
+
+    # No clean-drain sentinel may exist while the exact group remains.
+    assert not drain_sentinel_path(settings.worker_incarnation).exists()
+    # The job was retained: its row stays recoverable, never terminalized.
+    assert read_status(jobs_db, job_id) == "running"
