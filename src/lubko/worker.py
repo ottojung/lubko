@@ -914,7 +914,13 @@ def _output_update_params(job_id: UUID, output: dict[str, dict[str, Any]]) -> di
 # ---------------------------------------------------------------------------
 
 
-def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) -> None:
+def _persist_process(
+    conn: JobsConnection,
+    job_id: UUID,
+    pid: int,
+    pgid: int,
+    start_ticks: int,
+) -> None:
     """Persist the exact process identity of a running job.
 
     The identity is written into ``payload.state.process_pid``,
@@ -929,6 +935,8 @@ def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) ->
         job_id: Identifier of the running job.
         pid: Exact process ID of the spawned process.
         pgid: Exact process group ID of the spawned process.
+        start_ticks: Valid positive start-time ticks of the exact process,
+            obtained before the start gate was released.
     """
     set_chain = _jsonb_set_chain(
         "payload::jsonb",
@@ -945,7 +953,7 @@ def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) ->
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
             "UPDATE lubko.jobs\nSET payload = " + set_chain + "::text\nWHERE id = %s\n",
-            (pid, pgid, proc_start_ticks(pid), job_id),
+            (pid, pgid, start_ticks, job_id),
         )
 
 
@@ -1383,7 +1391,7 @@ def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
     return proc, stdout_path, stderr_path, pgid, gate_write_fd
 
 
-def release_gate(gate_fd: int) -> None:
+def release_gate(gate_fd: int) -> bool:
     """Release a gated start so the wrapper execs the user argv.
 
     Writes the single release control byte and closes the worker's gate write
@@ -1392,13 +1400,46 @@ def release_gate(gate_fd: int) -> None:
     process dies before closing, the kernel closes the write end and the
     wrapper reads EOF and exits without executing any user code.
 
+    A failure to write the release byte is reported, never silently swallowed:
+    the caller must treat it as a start failure and abort the gated start so
+    the job does not later look like a normally completed user command.
+
     Args:
         gate_fd: The worker-side write end of the start gate pipe.
+
+    Returns:
+        ``True`` when the release byte was written (the wrapper will exec the
+        user argv); ``False`` when the write failed, in which case the wrapper
+        can never be released by this handle.
     """
-    with suppress(OSError):
+    try:
         os.write(gate_fd, GATE_RELEASE_BYTE)
+    except OSError:
+        with suppress(OSError):
+            os.close(gate_fd)
+        return False
     with suppress(OSError):
         os.close(gate_fd)
+    return True
+
+
+@dataclass(frozen=True)
+class GatedSpawn:
+    """Handles and exact identity of one gated start produced by ``spawn_job``.
+
+    Attributes:
+        proc: The gated wrapper process.
+        pgid: Exact process group id of the gated wrapper.
+        stdout_path: Capture file for standard output.
+        stderr_path: Capture file for standard error.
+        gate_fd: The worker-side write end of the start gate pipe.
+    """
+
+    proc: subprocess.Popen[bytes]
+    pgid: int
+    stdout_path: Path
+    stderr_path: Path
+    gate_fd: int
 
 
 def abort_gated_start(
@@ -1410,8 +1451,9 @@ def abort_gated_start(
 ) -> None:
     """Abort a gated start without ever executing user code.
 
-    Used when the exact process identity cannot be persisted: the gate is
-    closed WITHOUT the release byte so the wrapper exits on EOF, the exact
+    Used when the exact process identity could not be obtained or durably
+    persisted, or when the gate release itself failed: the gate is closed
+    WITHOUT the release byte so the wrapper exits on EOF, the exact
     (still gated, childless) process group is terminated, the child is reaped,
     and the capture files are removed so no unowned process or stray side
     effect can survive.
@@ -2881,10 +2923,6 @@ class Supervisor:
             claimed: The claimed job.
             claim_mono: Monotonic time captured immediately before the claim
                 database operation commits (never at commit time).
-
-        Raises:
-            psycopg.Error: When persisting the process identity fails with a
-                connectivity error.
         """
         conn = self.conn
         if conn is None:
@@ -2929,9 +2967,91 @@ class Supervisor:
                 ),
             )
             return
+        gated = GatedSpawn(
+            proc=proc,
+            pgid=pgid,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            gate_fd=gate_fd,
+        )
+
+        # Fail closed BEFORE any release and activate only on success.
+        job = self._activate_gated_job(
+            conn,
+            claimed.id,
+            job_spec,
+            gated,
+            claim_mono=claim_mono,
+        )
+        if job is None:
+            return
+        job.stdout = OutputStream(path=stdout_path)
+        job.stderr = OutputStream(path=stderr_path)
+        job.last_heartbeat_at = claim_mono
+        self.active[claimed.id] = job
+        LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
+        self._publish_health_force()
+
+    def _activate_gated_job(
+        self,
+        conn: JobsConnection,
+        job_id: UUID,
+        job_spec: Job,
+        gated: GatedSpawn,
+        *,
+        claim_mono: float,
+    ) -> ActiveJob | None:
+        """Persist the exact identity, release the gate, and build the active job.
+
+        Fail-closed ordering: valid positive start-time ticks must be obtained
+        and durably persisted BEFORE any release; a persist or release failure
+        aborts the exact gated group and finalizes the job failed so no user
+        side effect survives and a failed start can never later look like a
+        normally completed user command.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job_id: Identifier of the claimed job.
+            job_spec: The claimed job specification.
+            gated: Handles and exact identity of the gated start to activate.
+            claim_mono: Monotonic claim instant carried onto the active job.
+
+        Returns:
+            The :class:`ActiveJob` for normal supervision, or ``None`` when the
+            start failed and was already finalized as such.
+
+        Raises:
+            psycopg.Error: When persisting the identity fails with a
+                connectivity error.
+        """
+        proc = gated.proc
+        pgid = gated.pgid
+        stdout_path = gated.stdout_path
+        stderr_path = gated.stderr_path
+        gate_fd = gated.gate_fd
+        start_ticks = proc_start_ticks(proc.pid)
+        if start_ticks is None or start_ticks <= 0:
+            abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
+            LOGGER.error(
+                "unable to obtain exact start-time ticks for job %s (pid %d); "
+                "gated start aborted without executing user code",
+                job_id,
+                proc.pid,
+            )
+            self._finalize_immediate(
+                job_id,
+                JobResult(
+                    status="failed",
+                    exit_code=EXECUTION_ERROR_EXIT_CODE,
+                    stdout="",
+                    stderr="unable to record exact process identity; job not started",
+                    cancellation_note=None,
+                ),
+            )
+            return None
 
         try:
-            _persist_process(conn, claimed.id, proc.pid, pgid)
+            _persist_process(conn, job_id, proc.pid, pgid, start_ticks)
         except psycopg.Error as exc:
             # The exact identity was not durably recorded, so the user program
             # must never run. Close the gate WITHOUT releasing (the wrapper
@@ -2945,11 +3065,11 @@ class Supervisor:
                 raise
             LOGGER.exception(
                 "unable to persist process identity for job %s (SQLSTATE %s)",
-                claimed.id,
+                job_id,
                 exc.sqlstate or "N/A",
             )
             self._finalize_immediate(
-                claimed.id,
+                job_id,
                 JobResult(
                     status="failed",
                     exit_code=EXECUTION_ERROR_EXIT_CODE,
@@ -2958,28 +3078,43 @@ class Supervisor:
                     cancellation_note=None,
                 ),
             )
-            return
+            return None
 
         # The exact identity is now durably recorded. Release the gate so the
         # wrapper execs the user argv on the exact same PID, after which normal
-        # supervision applies.
-        release_gate(gate_fd)
-        job = ActiveJob(
-            id=claimed.id,
+        # supervision applies. A failed release is a start failure: the wrapper
+        # can never be released through this handle, so abort the exact gated
+        # group and finalize failed instead of letting the job later look like
+        # a normally completed user command.
+        if not release_gate(gate_fd):
+            abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
+            LOGGER.error(
+                "failed to release the start gate for job %s (pid %d); "
+                "gated start aborted without executing user code",
+                job_id,
+                proc.pid,
+            )
+            self._finalize_immediate(
+                job_id,
+                JobResult(
+                    status="failed",
+                    exit_code=EXECUTION_ERROR_EXIT_CODE,
+                    stdout="",
+                    stderr="unable to release gated start; job not started",
+                    cancellation_note=None,
+                ),
+            )
+            return None
+        return ActiveJob(
+            id=job_id,
             cwd=job_spec.cwd,
             process=job_spec.process,
             proc=proc,
             pid=proc.pid,
             pgid=pgid,
             started_mono=time.monotonic(),
-            claimed_at=time.time(),
+            claimed_at=claim_mono,
         )
-        job.stdout = OutputStream(path=stdout_path)
-        job.stderr = OutputStream(path=stderr_path)
-        job.last_heartbeat_at = claim_mono
-        self.active[claimed.id] = job
-        LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
-        self._publish_health_force()
 
     def _finalize_immediate(self, job_id: UUID, result: JobResult) -> None:
         """Finalize a job that failed before or during spawning.

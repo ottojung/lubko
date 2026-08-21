@@ -29,6 +29,7 @@ from uuid import UUID, uuid4
 import psycopg
 import pytest
 
+from lubko import health
 from lubko import worker as worker_module
 from lubko.config import DatabaseConfig
 from lubko.protocol import OUTPUT_CHUNK_MAX_BYTES
@@ -2854,6 +2855,101 @@ def test_quarantine_pending_excluded_from_publish_and_finalize(
             target_job = supervisor.active[target]
             assert target_job.quarantine_pending
             assert publish_calls.get(target, 0) == 1
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
+
+
+def test_start_gate_missing_ticks_fails_closed(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A gated start without obtainable start-time ticks never runs user code.
+
+    Fault injection: ``proc_start_ticks`` returns ``None`` for the spawned job
+    process (never for the supervisor itself). The start gate must fail closed:
+    the job is finalized failed with no persisted exact identity, the exact
+    gated group is terminated, and the user program is never executed.
+    """
+    sentinel = tmp_path / "ran"
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys; open(sys.argv[1], 'w').close()",
+            str(sentinel),
+        ],
+    )
+    real = health.proc_start_ticks
+
+    def _no_job_ticks(pid: int) -> int | None:
+        if pid == os.getpid():
+            return real(pid)
+        return None
+
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with patch("lubko.worker.proc_start_ticks", side_effect=_no_job_ticks):
+            thread.start()
+            wait_until(lambda: read_status(jobs_db, target) == "failed")
+            time.sleep(0.5)
+            assert read_status(jobs_db, target) == "failed"
+        state = read_root(jobs_db, target)["state"]
+        assert state["status"] == "failed"
+        assert state.get("process_pid") is None
+        assert state.get("process_pgid") is None
+        assert state.get("process_start_time_ticks") is None
+        # The user program must NEVER have executed: no side effect survives.
+        assert not sentinel.exists()
+        assert target not in supervisor.active
+    finally:
+        supervisor.request_shutdown()
+        thread.join(timeout=30)
+        _kill_leftover_groups(jobs_db)
+
+
+def test_start_gate_release_failure_fails_start_not_completion(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A failed gate release aborts the start; it never looks like completion.
+
+    Fault injection: ``release_gate`` reports failure to write the release byte.
+    The job must be finalized failed (start failure), the exact gated group
+    terminated and reaped, capture files cleaned, and the user program must
+    never run — the failed start must not later surface as a normally completed
+    user command.
+    """
+    sentinel = tmp_path / "ran"
+    target = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys; open(sys.argv[1], 'w').close()",
+            str(sentinel),
+        ],
+    )
+    supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
+    thread = threading.Thread(target=supervisor.run, daemon=True)
+    try:
+        with patch("lubko.worker.release_gate", return_value=False):
+            thread.start()
+            wait_until(lambda: read_status(jobs_db, target) == "failed")
+            time.sleep(0.5)
+            # Still failed: a failed release must never become a completion.
+            assert read_status(jobs_db, target) == "failed"
+        payload = read_root(jobs_db, target)
+        state = payload["state"]
+        assert state["status"] == "failed"
+        result = payload.get("result", {})
+        assert "gated start" in str(result.get("stderr", ""))
+        # The user program must NEVER have executed and nothing may leak.
+        assert not sentinel.exists()
+        assert target not in supervisor.active
     finally:
         supervisor.request_shutdown()
         thread.join(timeout=30)
