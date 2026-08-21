@@ -238,7 +238,7 @@ def _contain(entry_pid: int, entry_ticks: int, result: dict[str, object]) -> Non
     result["contained"] = False
 
 
-def _adopted_children(owner_pid: int) -> list[int]:
+def adopted_children(owner_pid: int) -> list[int]:
     """Enumerate direct adopted children of the subreaper owner.
 
     After the nested command dies, every orphaned descendant — at any depth
@@ -379,7 +379,7 @@ def _converge_adopted_tree(args: argparse.Namespace, result: dict[str, object]) 
         result: Result dictionary updated in place.
     """
     while True:
-        children = _adopted_children(os.getpid())
+        children = adopted_children(os.getpid())
         if not children:
             # A fresh scan found zero adopted children: retirement is legal.
             break

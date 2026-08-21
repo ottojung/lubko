@@ -38,6 +38,7 @@ class PgCluster:
         self.port = port
         self.env = env
         self.postmaster_pid: int | None = None
+        self.postmaster_start_ticks: int | None = None
 
     def conninfo(self) -> str:
         """Return a connection string for this cluster.
@@ -48,7 +49,7 @@ class PgCluster:
         return f"host={self.socket_dir} port={self.port} dbname=postgres user=postgres"
 
     def start(self) -> None:
-        """Start the postmaster and record its exact PID."""
+        """Start the postmaster and record its exact PID and start ticks."""
         subprocess.run(
             [
                 self.binaries["pg_ctl"],
@@ -69,14 +70,62 @@ class PgCluster:
             self.postmaster_pid = int(pidfile.read_text(encoding="utf-8").splitlines()[0])
         except (OSError, ValueError, IndexError):
             self.postmaster_pid = None
+        if self.postmaster_pid is not None:
+            self.postmaster_start_ticks = proc_start_ticks(self.postmaster_pid)
+        else:
+            self.postmaster_start_ticks = None
+
+    def _identity_is_current(self) -> bool:
+        """Return whether the recorded postmaster identity is verifiably live.
+
+        Authoritative exact-identity check: the recorded start ticks must be
+        valid and still match the live occupant of the recorded PID, so a
+        reused or stale PID can never be force-signalled during teardown.
+
+        Returns:
+            ``True`` only when the recorded identity provably matches.
+        """
+        pid = self.postmaster_pid
+        ticks = self.postmaster_start_ticks
+        if pid is None or ticks is None or ticks <= 0:
+            return False
+        return proc_start_ticks(pid) == ticks
+
+    def _refuse_stale_pre_stop(self) -> None:
+        """Fail closed when the recorded PID is live but its ticks mismatch.
+
+        ``pg_ctl stop`` signals whatever occupies the recorded postmaster
+        PID, so a reused/stale identity must be refused **before** invoking
+        it.  A fully absent occupant is safe to hand to ``pg_ctl``.
+
+        Raises:
+            AssertionError: When a live occupant does not match the recorded
+                start-ticks identity.
+        """
+        pid = self.postmaster_pid
+        if pid is None:
+            return
+        current = proc_start_ticks(pid)
+        if current is None:
+            # Occupant already gone: nothing can be signalled.
+            return
+        ticks = self.postmaster_start_ticks
+        if ticks is None or ticks <= 0 or current != ticks:
+            msg = (
+                f"postgres postmaster pid {pid} identity stale/reused; "
+                "refusing pg_ctl stop against an unverified occupant"
+            )
+            raise AssertionError(msg)
 
     def stop(self) -> None:
         """Stop the cluster and confirm the exact postmaster is gone.
 
-        The postmaster is stopped through ``pg_ctl`` and then verified by its
-        exact recorded PID; if it still lives afterwards the exact PID is
-        force-killed, so a cluster teardown never leaks a postmaster.
+        Identity is validated **before** any ``pg_ctl stop`` (which would
+        signal the recorded PID), and again immediately before any forced
+        signal; a stale/reused or unverifiable PID fails closed instead of
+        being signalled.
         """
+        self._refuse_stale_pre_stop()
         subprocess.run(
             [
                 self.binaries["pg_ctl"],
@@ -90,9 +139,9 @@ class PgCluster:
             check=False,
             capture_output=True,
         )
-        self._assert_postmaster_gone()
+        self.assert_postmaster_gone()
 
-    def _assert_postmaster_gone(self) -> None:
+    def assert_postmaster_gone(self) -> None:
         pid = self.postmaster_pid
         if pid is None:
             return
@@ -100,6 +149,14 @@ class PgCluster:
         while time.monotonic() < deadline and process_live(pid):
             time.sleep(0.05)
         if process_live(pid):
+            # Exact-identity revalidation immediately before any forced
+            # signal: a stale/reused PID must never be signalled.
+            if not self._identity_is_current():
+                msg = (
+                    f"postgres postmaster pid {pid} identity stale/unverifiable; "
+                    "refusing to signal an unverified occupant"
+                )
+                raise AssertionError(msg)
             with suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
             deadline = time.monotonic() + 10.0
@@ -108,6 +165,26 @@ class PgCluster:
         if process_live(pid):
             msg = f"postgres postmaster pid {pid} still live after cluster teardown"
             raise AssertionError(msg)
+
+
+def proc_start_ticks(pid: int) -> int | None:
+    """Return the process start time in clock ticks, or ``None`` when gone.
+
+    Args:
+        pid: Process to inspect.
+
+    Returns:
+        The start time in clock ticks, or ``None`` when unreadable/gone.
+    """
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rest = stat[stat.rfind(")") + 1 :].split()
+    try:
+        return int(rest[19])
+    except (ValueError, IndexError):
+        return None
 
 
 def process_live(pid: int) -> bool:
