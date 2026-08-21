@@ -3104,3 +3104,44 @@ def test_restart_helper_locked_refuses_pending_mission(
         os.close(writer)
     assert errors
     assert "pending confirmation" in errors[0]
+
+
+def test_restart_helper_aborts_when_mission_appears_before_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mission appearing after durable success aborts the restart handoff.
+
+    Deterministic TOCTOU regression for the post-durable boundary: the pending
+    supervised checkout is written exactly where a concurrent controller could
+    create it — after the prepared response and durable success, but before
+    the restart intent. The reacquired deployment-lock guard must refuse the
+    intent: no generation may advance.
+    """
+    _repo, _first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise, "read_state", lambda: replace(supervise.fresh_state(), commit=second)
+    )
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(dc, "send_helper_response", lambda _writer, _response: None)
+    intents: list[object] = []
+
+    def record_request_restart(*_args: object, **_kwargs: object) -> int:
+        intents.append(1)
+        return 99
+
+    monkeypatch.setattr(supervise, "request_restart", record_request_restart)
+
+    def mission_appears_during_wait(_job_id: object, _deadline: float) -> None:
+        write_pending_mission()
+
+    monkeypatch.setattr(dc, "wait_for_durable_success", mission_appears_during_wait)
+    reader, writer = os.pipe()
+    try:
+        os.close(reader)
+        lifecycle._restart_helper_locked(uuid4(), writer)
+    finally:
+        os.close(writer)
+    assert intents == [], "no restart intent may be written once a mission is pending"
+    assert supervise.read_desired() is None, "no generation may advance"
