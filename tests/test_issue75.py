@@ -612,8 +612,11 @@ def _issue75_leak_proof() -> Iterator[None]:
     groups survives. No global /proc scan and no marker-name matching is used.
     """
     yield
-    _stop_owned_groups()
-    _assert_no_owned_groups_live()
+    try:
+        _stop_owned_groups()
+        _assert_no_owned_groups_live()
+    finally:
+        OWNED_GROUPS.clear()
 
 
 @dataclass(frozen=True)
@@ -678,18 +681,30 @@ def _stop_owned_groups() -> None:
 
 
 def _assert_no_owned_groups_live() -> None:
-    """Assert every recorded owned group is gone after the stop pass.
+    """Assert teardown converged for every recorded owned group.
+
+    A recorded group that still has live members is a failure in BOTH cases:
+    when its identity is still verifiable as ours (cleanup did not converge),
+    and when its leader identity became unavailable/mismatched (unresolved —
+    never signalled, but explicitly NOT clean). Only identity-verified groups
+    are ever signalled; an unresolved live target must fail loudly instead of
+    being silently forgotten.
 
     Raises:
-        AssertionError: If any recorded group (still identity-verified as ours)
-            has surviving members.
+        AssertionError: If any recorded group has surviving members, whether
+            verified-ours (surviving) or identity-unresolved (unresolved).
     """
     survivors = [
         group
         for group in OWNED_GROUPS.values()
         if _still_ours(group) and worker_mod.group_has_members(group.pgid)
     ]
-    if not survivors:
+    unresolved = [
+        group
+        for group in OWNED_GROUPS.values()
+        if not _still_ours(group) and worker_mod.group_has_members(group.pgid)
+    ]
+    if not survivors and not unresolved:
         return
     _stop_owned_groups()
     time.sleep(0.2)
@@ -698,9 +713,16 @@ def _assert_no_owned_groups_live() -> None:
         for group in OWNED_GROUPS.values()
         if _still_ours(group) and worker_mod.group_has_members(group.pgid)
     ]
-    if survivors:
-        msg = "issue75-owned command groups still alive after focused tests: " + ", ".join(
-            str(group.pgid) for group in survivors
+    unresolved = [
+        group
+        for group in OWNED_GROUPS.values()
+        if not _still_ours(group) and worker_mod.group_has_members(group.pgid)
+    ]
+    if survivors or unresolved:
+        msg = (
+            "issue75-owned command groups not clean after focused tests: "
+            + ", ".join(f"pgid={g.pgid} (surviving)" for g in survivors)
+            + ", ".join(f"pgid={g.pgid} (unresolved identity)" for g in unresolved)
         )
         raise AssertionError(msg)
 
@@ -1115,3 +1137,44 @@ def _recover_incarnation(conninfo: str, incarnation: object) -> None:
 
     with connect(conninfo) as conn:
         worker_mod.recover_owned_job_groups(conn, str(incarnation), 0.5)
+
+
+def test_teardown_fails_loudly_on_unresolved_owned_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved live owned group is never signalled but fails teardown.
+
+    When the recorded leader's start-time ticks become unavailable while the
+    group still has members, exact signal authorization forbids touching it.
+    The stop pass must not signal anything, and the leak-proof assertion must
+    fail loudly: an unresolved live target is NOT clean and must never be
+    silently forgotten.
+    """
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(proc)
+    pgid = os.getpgid(proc.pid)
+    assert proc.pid == pgid  # dedicated session/group leader
+    _register_owned_group(pgid)
+    # Simulate the leader identity becoming unreadable AFTER registration.
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: None)
+    try:
+        _stop_owned_groups()
+        # No signal was delivered: the process is untouched and still live.
+        assert proc.poll() is None
+        assert worker_mod.group_has_members(pgid)
+        with pytest.raises(AssertionError, match="unresolved identity"):
+            _assert_no_owned_groups_live()
+    finally:
+        OWNED_GROUPS.pop(pgid, None)
+        with suppress(ProcessLookupError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+        with suppress(Exception):
+            proc.wait(timeout=5)
+        guard.unregister(proc)
