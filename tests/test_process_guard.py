@@ -117,7 +117,44 @@ def test_teardown_never_signals_reused_pid_identity() -> None:
         current = guard.proc_start_ticks(innocent.pid)
         assert current is not None
         guard.register(innocent, start_ticks=current - 1)
-        with pytest.raises(AssertionError, match="stale identit"):
+        with pytest.raises(AssertionError, match="never signalled"):
+            guard.teardown_tracked()
+        assert pid_live(innocent.pid)
+    finally:
+        if innocent.poll() is None:
+            innocent.kill()
+            innocent.wait(timeout=10)
+    assert innocent.pid not in guard.TRACKED
+
+
+def test_register_fails_closed_without_spawn_ticks() -> None:
+    """A live registration whose ticks cannot be read is refused outright."""
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Fully reap the child so /proc/<pid> is gone and its start ticks are
+    # unreadable, simulating the fail-closed path deterministically.
+    proc.kill()
+    proc.wait(timeout=10)
+    with pytest.raises(AssertionError, match="unverifiable identity"):
+        guard.register(proc)
+    assert guard.tracked_pids() == ()
+
+
+def test_teardown_never_signals_entries_without_valid_ticks() -> None:
+    """A registry entry without valid recorded ticks is never signalled."""
+    innocent = subprocess.Popen(
+        [SLEEP_BIN, "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        guard.register_unverifiable(innocent)
+        with pytest.raises(AssertionError, match="never signalled"):
             guard.teardown_tracked()
         assert pid_live(innocent.pid)
     finally:

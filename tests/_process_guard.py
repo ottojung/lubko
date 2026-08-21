@@ -84,13 +84,23 @@ def register(proc: subprocess.Popen[bytes], *, start_ticks: int | None = None) -
     Args:
         proc: The spawned process to own.
         start_ticks: Explicit recorded start ticks; defaults to reading the
-            live current value.  Tests use this to simulate a stale registry
-            entry deterministically.
+            live current value.  Tests use this to simulate a stale or
+            unverifiable registry entry deterministically.
+
+    Raises:
+        AssertionError: If the live process's start ticks cannot be read and
+            no explicit ticks were supplied: an identity that cannot be
+            verified is never registered, so teardown can never be tempted
+            into signalling an unverified PID.
     """
-    TRACKED[proc.pid] = _Tracked(
-        proc=proc,
-        start_ticks=proc_start_ticks(proc.pid) if start_ticks is None else start_ticks,
-    )
+    resolved = proc_start_ticks(proc.pid) if start_ticks is None else start_ticks
+    if resolved is None:
+        msg = (
+            f"cannot register pid {proc.pid}: start ticks unreadable; "
+            "refusing to own an unverifiable identity"
+        )
+        raise AssertionError(msg)
+    TRACKED[proc.pid] = _Tracked(proc=proc, start_ticks=resolved)
 
 
 def unregister(proc: subprocess.Popen[bytes]) -> None:
@@ -100,6 +110,19 @@ def unregister(proc: subprocess.Popen[bytes]) -> None:
         proc: The reaped process to forget.
     """
     TRACKED.pop(proc.pid, None)
+
+
+def register_unverifiable(proc: subprocess.Popen[bytes]) -> None:
+    """Insert a registry entry with no valid recorded start ticks.
+
+    This exists so regressions can prove teardown's fail-closed behaviour
+    deterministically: an entry without verifiable ticks is never signalled,
+    no matter which live process occupies its PID.
+
+    Args:
+        proc: The process to track without a verifiable identity.
+    """
+    TRACKED[proc.pid] = _Tracked(proc=proc, start_ticks=None)
 
 
 def tracked_pids() -> tuple[int, ...]:
@@ -217,19 +240,24 @@ def _stop_one(tracked: _Tracked) -> bool:
 
     The recorded start ticks are re-verified before any signal.  A registry
     entry whose recorded ticks no longer match the current occupant of the
-    PID (the kernel reused the PID after the original died) is never
-    signalled; the caller reports it as a stale identity instead.
+    PID (the kernel reused the PID after the original died), or whose
+    recorded ticks were never valid, is never signalled; the caller reports
+    it as a stale/unverifiable identity instead.
 
     Args:
         tracked: The tracked registry entry to stop.
 
     Returns:
-        ``False`` when the identity was stale and nothing was signalled,
-        otherwise ``True``.
+        ``False`` when the identity was stale or unverifiable and nothing
+        was signalled, otherwise ``True``.
     """
     proc = tracked.proc
     pid = proc.pid
-    if tracked.start_ticks is not None and proc_start_ticks(pid) != tracked.start_ticks:
+    if tracked.start_ticks is None:
+        # An identity without valid recorded ticks can never be verified;
+        # signalling it is never authorized, no matter who occupies the PID.
+        return False
+    if proc_start_ticks(pid) != tracked.start_ticks:
         return False
     pgid = _process_group_of(pid)
     _signal_exact(pid, pgid, signal.SIGTERM)
@@ -268,8 +296,8 @@ def teardown_tracked(*, fail_on_leak: bool = True) -> int:
         TRACKED.pop(tracked.proc.pid, None)
     if fail_on_leak and stale:
         msg = (
-            "registry held stale identity/identities (PID reused since "
-            f"registration; never signalled): {', '.join(str(pid) for pid in stale)}"
+            "registry held stale or unverifiable identity/identities "
+            "(PID reuse or missing ticks; never signalled): " + ", ".join(str(pid) for pid in stale)
         )
         raise AssertionError(msg)
     if fail_on_leak and live:
