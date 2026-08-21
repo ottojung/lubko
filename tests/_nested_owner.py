@@ -31,7 +31,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 GRACE_SECONDS: Final = 5.0
 POLL_SECONDS: Final = 0.02
@@ -196,11 +199,24 @@ def _contain(entry_pid: int, entry_ticks: int, result: dict[str, object]) -> Non
     _reap_exact(entry_pid, result)
 
 
-def main() -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    become_subreaper: Callable[[], bool] | None = None,
+) -> int:
     """Run the nested command, then contain and reap its recorded identities.
 
+    Fails closed: without proven subreaper ownership the nested command is
+    never spawned, and marker coverage that is missing, unreadable,
+    malformed, not a list, or contains non-object entries reports a
+    containment failure instead of silently passing.
+
+    Args:
+        argv: Argument vector; defaults to ``sys.argv[1:]``.
+        become_subreaper: Injectable subreaper setup for tests.
+
     Returns:
-        The nested command's exit status, or ``1`` on harness misuse.
+        ``0`` when containment is positively proven, otherwise ``1``.
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--marker", type=Path, required=True)
@@ -208,15 +224,30 @@ def main() -> int:
     parser.add_argument("--pidfile", type=Path, required=True)
     parser.add_argument("--deadline", type=float, default=120.0)
     parser.add_argument("command", nargs="+")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     result: dict[str, object] = {
-        "subreaper": _become_subreaper(),
         "observed_ppid_1": False,
         "identity_mismatch": False,
         "unresolved_ticks": False,
         "contained": True,
     }
+    if (become_subreaper or _become_subreaper)() is False:
+        # Without subreaper ownership an orphaned descendant would reparent
+        # to PID 1: refuse to run the nested command at all.
+        result["subreaper"] = False
+        result["contained"] = False
+        args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+        return 1
+    result["subreaper"] = True
+
+    # Initialize marker storage as infrastructure only: an empty file means
+    # "no process was ever registered", which is provable because every
+    # successful guard registration appends its exact identity before
+    # returning.  After the nested command exits the marker must still
+    # exist and parse, or containment fails closed.
+    args.marker.touch()
+
     proc = subprocess.Popen(
         args.command,
         cwd=os.environ.get("PYTEST_NESTED_CWD", "."),
@@ -241,35 +272,80 @@ def main() -> int:
     result["returncode"] = status
     result["timed_out"] = timed_out
 
-    entries: list[dict[str, object]] = []
-    try:
-        payload = json.loads(args.marker.read_text(encoding="utf-8"))
-        if isinstance(payload, list):
-            entries = [e for e in payload if isinstance(e, dict)]
-    except (OSError, ValueError):
-        entries = []
+    entries, coverage_unproven = _read_marker(args.marker)
+    if coverage_unproven:
+        result["coverage_unproven"] = True
+        result["contained"] = False
 
     for entry in entries:
-        pid = entry.get("pid")
-        ticks = entry.get("ticks")
-        if not isinstance(pid, int):
-            continue
-        if not isinstance(ticks, int) or ticks <= 0:
-            # Missing or invalid recorded ticks: containment is unresolved
-            # and no signal is ever authorized for this identity.
-            result["unresolved_ticks"] = True
-            result["contained"] = False
-            continue
-        current = _proc_start_ticks(pid)
-        if current is not None and current != ticks:
-            # A different live process occupies the PID: never signal it.
-            result["identity_mismatch"] = True
-            result["contained"] = False
-            continue
-        _contain(pid, ticks, result)
+        _process_entry(entry, result)
 
     args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
     return 0 if result["contained"] is True else 1
+
+
+def _read_marker(marker: Path) -> tuple[list[dict[str, object]], bool]:
+    """Read and validate the append-only JSONL marker file.
+
+    The file is one ``{"pid": ..., "ticks": ...}`` JSON object per line,
+    appended by every successful guard registration.  An empty file is
+    valid proof that no process was ever registered.  A missing file, any
+    unparseable line, or a torn final line without a terminating newline is
+    fail-closed unproven coverage; a non-object line likewise.
+
+    Args:
+        marker: Marker path written by the nested run.
+
+    Returns:
+        The valid entries and whether coverage is unproven (fail closed).
+    """
+    try:
+        raw = marker.read_text(encoding="utf-8")
+    except OSError:
+        return [], True
+    if raw and not raw.endswith("\n"):
+        # Torn write from a crash mid-append: never accept partial JSON.
+        return [], True
+    entries: list[dict[str, object]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return [], True
+        if not isinstance(entry, dict):
+            return [], True
+        entries.append(entry)
+    return entries, False
+
+
+def _process_entry(entry: dict[str, object], result: dict[str, object]) -> None:
+    """Contain one recorded descendant identity, failing closed.
+
+    Args:
+        entry: The raw marker entry.
+        result: Result dictionary updated in place.
+    """
+    pid = entry.get("pid")
+    ticks = entry.get("ticks")
+    if not isinstance(pid, int):
+        result["coverage_unproven"] = True
+        result["contained"] = False
+        return
+    if not isinstance(ticks, int) or ticks <= 0:
+        # Missing or invalid recorded ticks: containment is unresolved and
+        # no signal is ever authorized for this identity.
+        result["unresolved_ticks"] = True
+        result["contained"] = False
+        return
+    current = _proc_start_ticks(pid)
+    if current is not None and current != ticks:
+        # A different live process occupies the PID: never signal it.
+        result["identity_mismatch"] = True
+        result["contained"] = False
+        return
+    _contain(pid, ticks, result)
 
 
 if __name__ == "__main__":

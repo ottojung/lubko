@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Final, cast
 import pytest
 
 from tests import _isolation as isolation
+from tests import _nested_owner
 from tests import _process_guard as guard
 
 if TYPE_CHECKING:
@@ -40,22 +41,21 @@ if TYPE_CHECKING:
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 
 # Nested test module used for interruption-mode scenarios. It registers a
-# real session-leader process with the shared guard, records its exact
-# identity (PID plus start ticks) in the owner's marker file, and behaves
-# according to ``NESTED_MODE``:
+# real session-leader process with the shared guard — registration itself
+# appends the exact identity (PID plus start ticks) to the owner marker via
+# the ``LUBKO_TEST_OWNER_MARKER`` environment variable, so no manual marker
+# write exists — and behaves according to ``NESTED_MODE``:
 # - ``success``: owns, stops, and unregisters its own leader cleanly;
 # - ``failure``: leaks the leader on purpose, and the ``finally`` block
 #   (the same teardown contract our conftest enforces) stops it exactly;
 # - ``sleep``: blocks until the scenario interrupts the nested pytest.
 NESTED_MODULE: Final = f'''
 """Nested interruption-mode subject: register a leader, behave on cue."""
-import json
 import os
 import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 sys.path.insert(0, {str(REPO_ROOT)!r})
 
@@ -63,9 +63,8 @@ from tests import _process_guard as guard  # noqa: E402
 
 
 def test_subject() -> None:
-    """Register a session leader, then behave according to NESTED_MODE."""
+    """Register a session leader (auto-recorded), then behave on cue."""
     mode = os.environ["NESTED_MODE"]
-    marker_path = os.environ["NESTED_MARKER"]
 
     proc = subprocess.Popen(
         ["/bin/sleep", "300"],
@@ -76,10 +75,6 @@ def test_subject() -> None:
         close_fds=True,
     )
     guard.register(proc)
-    Path(marker_path).write_text(
-        json.dumps([{{"pid": proc.pid, "ticks": guard.proc_start_ticks(proc.pid)}}]),
-        encoding="utf-8",
-    )
     try:
         if mode == "success":
             os.killpg(proc.pid, signal.SIGTERM)
@@ -88,6 +83,16 @@ def test_subject() -> None:
             return
         if mode == "failure":
             raise AssertionError("deliberate nested failure")
+        if mode == "two":
+            second = subprocess.Popen(
+                ["/bin/sleep", "300"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            guard.register(second)
         time.sleep(300)
     finally:
         guard.teardown_tracked(fail_on_leak=False)
@@ -198,50 +203,26 @@ def _stop_nested_pytest(scenario: _Scenario) -> None:
         _wait_gone(pid, 10.0)
 
 
-def _retire_marker_descendants(marker: Path) -> list[str]:
-    """Fail-closed retire every marker-recorded descendant identity.
+def _wait_truly_absent(pid: int, timeout: float) -> bool:
+    """Wait until ``pid`` has no ``/proc`` entry at all.
 
-    Marker coverage is validated positively: a missing/unreadable/malformed
-    marker, an entry with missing or invalid ticks, an identity that no
-    longer matches its PID occupant, or a descendant not proven gone are all
-    reported as problems.  Identities are re-verified against current start
-    ticks immediately before every signal; unresolved ones are never
-    signalled.  Used only on the forced wedge path, before the owner itself
-    may be retired.
+    Unlike ``_wait_gone``, a zombie is NOT treated as gone: for the
+    owner-retirement prerequisite a not-yet-reaped descendant can still be
+    reparented to PID 1 if the subreaper owner dies first.
 
     Args:
-        marker: Marker file with ``[{"pid": ..., "ticks": ...}]`` entries.
+        pid: PID to await.
+        timeout: Maximum seconds to wait.
 
     Returns:
-        Human-readable problems; empty only when every recorded descendant
-        is positively proven gone.
+        ``True`` only when the ``/proc`` entry is fully absent.
     """
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return [f"marker file missing: {marker}; descendant coverage unproven"]
-    except (OSError, ValueError):
-        return [f"marker file malformed: {marker}; descendant coverage unproven"]
-    if not isinstance(payload, list):
-        return ["marker payload is not a list; descendant coverage unproven"]
-
-    problems: list[str] = []
-    for entry in payload:
-        identity = _valid_identity(entry)
-        if identity is None:
-            problems.append(f"marker entry {entry!r} has missing/invalid identity")
-            continue
-        pid, ticks = identity
-        if guard.proc_start_ticks(pid) != ticks:
-            problems.append(f"descendant pid {pid} identity unresolved/reused; never signalled")
-            continue
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            if _wait_gone(pid, 5.0):
-                break
-            guard.signal_identity_checked(pid, ticks, sig)
-        if not _wait_gone(pid, 5.0):
-            problems.append(f"descendant pid {pid} did not retire")
-    return problems
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _proc_state(pid) is None:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _valid_identity(entry: object) -> tuple[int, int] | None:
@@ -260,6 +241,79 @@ def _valid_identity(entry: object) -> tuple[int, int] | None:
     if not isinstance(pid, int) or not isinstance(ticks, int) or ticks <= 0:
         return None
     return pid, ticks
+
+
+def _retire_recorded_identity(pid: int, ticks: int) -> list[str]:
+    """Retire one positively-identified recorded descendant.
+
+    The identity must currently match; TERM then KILL are delivered by exact
+    group, and the descendant must become truly absent (not merely zombie)
+    before the prerequisite counts as satisfied.
+
+    Args:
+        pid: Exact PID of the recorded descendant.
+        ticks: Recorded start ticks (already validated current-matching).
+
+    Returns:
+        Problems encountered; empty on positive proof of absence.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if _wait_truly_absent(pid, 5.0):
+            return []
+        guard.signal_identity_checked(pid, ticks, sig)
+    if _wait_truly_absent(pid, 5.0):
+        return []
+    state = _proc_state(pid)
+    if state == "Z":
+        return [
+            (
+                f"descendant pid {pid} is a zombie; not reaped, so retiring "
+                "the subreaper owner could reparent it to PID 1"
+            )
+        ]
+    return [f"descendant pid {pid} did not retire"]
+
+
+def _retire_marker_descendants(marker: Path) -> list[str]:
+    """Positively prove every marker-recorded descendant is contained.
+
+    Precise prerequisite for retiring the subreaper owner:
+
+    - an already-truly-absent recorded identity is safe;
+    - a live exact identity may be TERM/KILLed but must become truly absent;
+    - a live mismatched/unverifiable identity blocks owner signalling;
+    - a zombie/not-reaped descendant blocks owner signalling unless it
+      becomes truly absent while the owner remains alive;
+    - missing/malformed markers or invalid entries also block.
+
+    Args:
+        marker: Marker file in append-only JSONL form (one
+            ``{"pid": ..., "ticks": ...}`` object per line).
+
+    Returns:
+        Human-readable problems; empty only when every recorded descendant
+        is positively proven gone (truly absent).
+    """
+    entries, unproven = _read_marker_entries(marker)
+    if unproven:
+        return ["marker coverage unproven (missing/malformed/torn); cannot retire owner"]
+
+    problems: list[str] = []
+    for entry in entries:
+        identity = _valid_identity(entry)
+        if identity is None:
+            problems.append(f"marker entry {entry!r} has missing/invalid identity")
+            continue
+        pid, ticks = identity
+        state = _proc_state(pid)
+        if state is None:
+            # Already truly absent: safe.
+            continue
+        if guard.proc_start_ticks(pid) != ticks:
+            problems.append(f"descendant pid {pid} identity unresolved/reused; never signalled")
+            continue
+        problems.extend(_retire_recorded_identity(pid, ticks))
+    return problems
 
 
 @dataclass
@@ -430,6 +484,9 @@ class _Scenario:
         """
         env = dict(os.environ)
         env["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+        # Canonical automatic recording: every successful guard registration
+        # inside the nested run appends its exact identity to this marker.
+        env[guard.OWNER_MARKER_ENV] = str(self.marker)
         if env_overrides:
             env.update(env_overrides)
         return subprocess.Popen(
@@ -472,7 +529,28 @@ class _Scenario:
         return self._start_owner(
             [str(self.module), "-q", "--no-header", "-p", "no:cacheprovider"],
             deadline=deadline,
-            env_overrides={"NESTED_MODE": mode, "NESTED_MARKER": str(self.marker)},
+            env_overrides={"NESTED_MODE": mode},
+        )
+
+    def run_module(self, module: Path, deadline: float = 120.0) -> subprocess.Popen[bytes]:
+        """Start an owned nested pytest run of an arbitrary generated module.
+
+        Public harness entry point so same-package regressions can drive
+        custom nested subjects without reaching into private helpers.  The
+        owner-marker environment variable is set exactly as for every other
+        scenario, so guard registrations inside the module are recorded
+        automatically.
+
+        Args:
+            module: Generated test module to run.
+            deadline: Owner-enforced wall-clock limit for the nested run.
+
+        Returns:
+            The independent owner process.
+        """
+        return self._start_owner(
+            [str(module), "-q", "--no-header", "-p", "no:cacheprovider"],
+            deadline=deadline,
         )
 
     def run_isolation_module(self, deadline: float = 300.0) -> subprocess.Popen[bytes]:
@@ -525,6 +603,50 @@ def _wait_file(path: Path, timeout: float = 60.0) -> None:
         time.sleep(0.05)
     msg = f"expected file never appeared: {path}"
     raise AssertionError(msg)
+
+
+def _read_marker_entries(marker: Path) -> tuple[list[dict[str, object]], bool]:
+    """Parse the append-only JSONL owner marker from the test side.
+
+    Mirrors the independent owner's fail-closed semantics: a missing file,
+    an unparseable line, a torn final line without a terminating newline,
+    or a non-object line is unproven coverage.
+
+    Args:
+        marker: Marker path to parse.
+
+    Returns:
+        The valid entries and whether coverage is unproven.
+    """
+    try:
+        raw = marker.read_text(encoding="utf-8")
+    except OSError:
+        return [], True
+    if raw and not raw.endswith("\n"):
+        return [], True
+    entries: list[dict[str, object]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return [], True
+        if not isinstance(entry, dict):
+            return [], True
+        entries.append(entry)
+    return entries, False
+
+
+def _write_marker_entries(marker: Path, entries: list[dict[str, int]]) -> None:
+    """Write identities in the append-only JSONL marker format.
+
+    Args:
+        marker: Marker path to write.
+        entries: The ``{"pid": ..., "ticks": ...}`` identities.
+    """
+    lines = "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in entries)
+    marker.write_text(lines, encoding="utf-8")
 
 
 def _assert_containment(result_path: Path) -> dict[str, object]:
@@ -586,9 +708,14 @@ def test_interrupted_nested_run_is_contained_never_reparented_to_pid_1(
         assert identity is not None
         nested_pid = identity[0]
         deadline = time.monotonic() + 60.0
-        while not scenario.marker.exists() and time.monotonic() < deadline:
+        entries, unproven = _read_marker_entries(scenario.marker)
+        while (unproven or not entries) and time.monotonic() < deadline:
+            if handle.owner.poll() is not None:
+                break
             time.sleep(0.05)
-        assert scenario.marker.exists(), scenario.log.read_text(errors="replace")
+            entries, unproven = _read_marker_entries(scenario.marker)
+        assert entries, scenario.log.read_text(errors="replace")
+        assert not unproven
         # Interrupt only the nested pytest, by exact PID; the independent
         # owner survives and must synchronously reap the abandoned leader.
         os.kill(nested_pid, sig)
@@ -615,13 +742,129 @@ def test_owner_enforced_timeout_kills_and_contains(tmp_path: Path) -> None:
     with owned_run(scenario, lambda: scenario.run("sleep", deadline=3.0)) as handle:
         _wait_file(scenario.pidfile)
         deadline = time.monotonic() + 30.0
-        while not scenario.marker.exists() and time.monotonic() < deadline:
+        entries, unproven = _read_marker_entries(scenario.marker)
+        while (unproven or not entries) and time.monotonic() < deadline:
+            if handle.owner.poll() is not None:
+                break
             time.sleep(0.05)
-        assert scenario.marker.exists()
+            entries, unproven = _read_marker_entries(scenario.marker)
+        assert entries
+        assert not unproven
         assert handle.owner.wait(timeout=120) == 0
     result = _assert_containment(scenario.result)
     assert result["timed_out"] is True
     assert result["survivor_seen"] is True
+    assert isolation.ambient_sentinel_alive()
+    assert _ambient_digest() == before
+
+
+TWO_REGISTRATIONS_MODULE: Final = """
+import os, signal, subprocess, sys, time
+
+sys.path.insert(0, "__REPO_ROOT__")
+
+from tests import _process_guard as guard
+
+
+def test_two_registrations() -> None:
+    '''Register two session leaders, then tear them down cleanly.'''
+    first = subprocess.Popen(
+        ["/bin/sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    second = subprocess.Popen(
+        ["/bin/sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(first)
+    guard.register(second)
+    try:
+        if os.environ.get("NESTED_MODE") == "sleep":
+            time.sleep(300)
+    finally:
+        guard.teardown_tracked(fail_on_leak=False)
+""".replace("__REPO_ROOT__", str(REPO_ROOT))
+
+
+def test_auto_recorded_marker_contains_both_identities(tmp_path: Path) -> None:
+    """Nested registrations are recorded automatically, exactly.
+
+    A nested pytest run registers two distinct session-leader processes;
+    after the run, the owner marker must contain both exact ``{pid, ticks}``
+    identities without any manual marker write by the nested subject.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    module = tmp_path / "auto_record.py"
+    module.write_text(TWO_REGISTRATIONS_MODULE, encoding="utf-8")
+    scenario = _Scenario(tmp_path, "autorecord")
+    with owned_run(scenario, partial(scenario.run_module, module)) as handle:
+        assert handle.owner.wait(timeout=120) == 0
+    entries, unproven = _read_marker_entries(scenario.marker)
+    assert not unproven
+    identities: list[tuple[int, int]] = []
+    for entry in entries:
+        pid = entry.get("pid")
+        ticks = entry.get("ticks")
+        assert isinstance(pid, int)
+        assert isinstance(ticks, int)
+        identities.append((pid, ticks))
+    pids = sorted(pid for pid, _ticks in identities)
+    assert len(pids) == 2
+    for pid, ticks in identities:
+        assert ticks > 0
+        # Both identities were torn down by the nested run's own teardown.
+        assert _proc_state(pid) is None
+
+
+def test_abrupt_termination_still_leaves_recorded_identities(tmp_path: Path) -> None:
+    """Identities recorded at registration survive abrupt nested death.
+
+    The nested run registers two leaders and is then SIGKILLed before any
+    cleanup; the owner must still find both exact identities in the marker
+    and contain them (this is exercised through converge on exit).
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    before = _ambient_digest()
+    scenario = _Scenario(tmp_path, "abrupt-record")
+    with owned_run(scenario, lambda: scenario.run("two")) as handle:
+        deadline = time.monotonic() + 60.0
+        entries, unproven = _read_marker_entries(scenario.marker)
+        while (unproven or len(entries) < 2) and time.monotonic() < deadline:
+            if handle.owner.poll() is not None:
+                break
+            time.sleep(0.05)
+            entries, unproven = _read_marker_entries(scenario.marker)
+        assert not unproven
+        assert len(entries) == 2
+        recorded: list[int] = []
+        for entry in entries:
+            pid = entry.get("pid")
+            assert isinstance(pid, int)
+            recorded.append(pid)
+        # Abruptly kill only the nested pytest; owner must contain both.
+        identity = _read_pidfile(scenario.pidfile)
+        assert identity is not None
+        os.kill(identity[0], signal.SIGKILL)
+        assert handle.owner.wait(timeout=60) == 0
+    payload = _assert_containment(scenario.result)
+    assert payload["survivor_seen"] is True
+    for pid in recorded:
+        wait_gone_deadline = time.monotonic() + 10.0
+        while _proc_state(pid) is not None and time.monotonic() < wait_gone_deadline:
+            time.sleep(0.05)
+        assert _proc_state(pid) is None or _proc_state(pid) == "Z"
     assert isolation.ambient_sentinel_alive()
     assert _ambient_digest() == before
 
@@ -648,9 +891,13 @@ def test_forced_outer_failure_converges_without_pid_1_orphans(tmp_path: Path) ->
             handles.append(handle)
             _wait_file(scenario.pidfile)
             deadline = time.monotonic() + 60.0
-            while not scenario.marker.exists() and time.monotonic() < deadline:
+            entries, _unproven = _read_marker_entries(scenario.marker)
+            while not entries and time.monotonic() < deadline:
+                if handle.owner.poll() is not None:
+                    break
                 time.sleep(0.05)
-            assert scenario.marker.exists()
+                entries, _unproven = _read_marker_entries(scenario.marker)
+            assert entries, "nested registration was never auto-recorded"
             failure = RuntimeError("boom")
             raise failure
 
@@ -664,12 +911,12 @@ def test_forced_outer_failure_converges_without_pid_1_orphans(tmp_path: Path) ->
     assert handle.owner.poll() is not None
     nested = _read_pidfile(scenario.pidfile)
     assert nested is not None
-    entries = json.loads(scenario.marker.read_text(encoding="utf-8"))
-    assert isinstance(entries, list)
+    entries, unproven = _read_marker_entries(scenario.marker)
+    assert not unproven
     assert entries
-    leader = entries[0]
-    assert isinstance(leader, dict)
-    for pid in (nested[0], int(leader["pid"])):
+    leader_pid = entries[0].get("pid")
+    assert isinstance(leader_pid, int)
+    for pid in (nested[0], leader_pid):
         assert _proc_state(pid) is None or _proc_state(pid) == "Z"
     payload = _read_result(scenario.result)
     assert payload["contained"] is True
@@ -721,8 +968,10 @@ def test_owner_refuses_missing_marker_ticks_and_never_signals(
         stderr=subprocess.DEVNULL,
     )
     try:
-        # Deliberately omit "ticks" from the marker entry.
-        marker.write_text(json.dumps([{"pid": innocent.pid}]), encoding="utf-8")
+        # Deliberately omit "ticks" from the marker record.
+        marker.write_text(
+            json.dumps({"pid": innocent.pid}, sort_keys=True) + "\n", encoding="utf-8"
+        )
         done = subprocess.run(
             [
                 sys.executable,
@@ -758,6 +1007,189 @@ def test_owner_refuses_missing_marker_ticks_and_never_signals(
         if innocent.poll() is None:
             innocent.kill()
             innocent.wait(timeout=10)
+
+
+def test_owner_fails_closed_when_subreaper_setup_fails(tmp_path: Path) -> None:
+    """Without proven subreaper ownership nothing is spawned and we fail.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    result = tmp_path / "subreaper.result.json"
+    spawned = tmp_path / "spawned.marker"
+    rc = _nested_owner.main(
+        [
+            "--marker",
+            str(tmp_path / "subreaper.marker.json"),
+            "--result",
+            str(result),
+            "--pidfile",
+            str(tmp_path / "subreaper.pid"),
+            "--deadline",
+            "10",
+            "--",
+            sys.executable,
+            "-c",
+            f"Path({str(spawned)!r}).write_text('spawned')",
+        ],
+        become_subreaper=lambda: False,
+    )
+    assert rc == 1
+    payload = _read_result(result)
+    assert payload["subreaper"] is False
+    assert payload["contained"] is False
+    assert not spawned.exists()
+
+
+@pytest.mark.parametrize(
+    ("marker_body", "reason"),
+    [
+        ("not json at all\n", "malformed"),
+        ('{"pid": 123', "torn-partial-line"),
+        ('"just a string"\n', "non-object-line"),
+    ],
+)
+def test_owner_fails_closed_on_unproven_marker_coverage(
+    tmp_path: Path,
+    marker_body: str,
+    reason: str,
+) -> None:
+    """Malformed/torn/non-object marker coverage fails closed.
+
+    The owner itself initializes empty marker storage before spawning, so a
+    missing file cannot occur in a legitimate run; corruption introduced
+    after initialization must be caught instead.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        marker_body: Raw corrupt marker content.
+        reason: Short label asserted to keep cases distinct.
+    """
+    assert reason
+    result = tmp_path / "coverage.result.json"
+    marker = tmp_path / "coverage.marker.json"
+    marker.write_text(marker_body, encoding="utf-8")
+    rc = _nested_owner.main(
+        [
+            "--marker",
+            str(marker),
+            "--result",
+            str(result),
+            "--pidfile",
+            str(tmp_path / "coverage.pid"),
+            "--deadline",
+            "30",
+            "--",
+            sys.executable,
+            "-c",
+            "pass",
+        ],
+    )
+    assert rc == 1
+    payload = _read_result(result)
+    assert payload["contained"] is False
+
+
+def test_owner_fails_closed_when_child_removes_marker(tmp_path: Path) -> None:
+    """A nested child that unlinks the owner marker fails containment.
+
+    Public-path regression: the nested subject removes the marker file the
+    owner initialized, so at containment time coverage is missing even
+    though storage was validly initialized.  The owner must report
+    unproven coverage, exit nonzero, and never claim success.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    result = tmp_path / "removed-marker.result.json"
+    marker = tmp_path / "removed-marker.marker.json"
+    rc = _nested_owner.main(
+        [
+            "--marker",
+            str(marker),
+            "--result",
+            str(result),
+            "--pidfile",
+            str(tmp_path / "removed-marker.pid"),
+            "--deadline",
+            "30",
+            "--",
+            sys.executable,
+            "-c",
+            f"import os; os.unlink({str(marker)!r})",
+        ],
+    )
+    assert rc == 1
+    payload = _read_result(result)
+    assert payload["coverage_unproven"] is True
+    assert payload["contained"] is False
+
+
+def test_retire_marker_descendants_accepts_already_absent(tmp_path: Path) -> None:
+    """An already truly-absent recorded identity is positively safe.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    gone = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    ticks = guard.proc_start_ticks(gone.pid)
+    assert ticks is not None
+    gone.kill()
+    gone.wait(timeout=10)
+    # Fully reaped: /proc entry is truly absent while its old ticks remain
+    # recorded in the marker.
+    marker = tmp_path / "absent.marker.json"
+    _write_marker_entries(marker, [{"pid": gone.pid, "ticks": ticks}])
+    problems = _retire_marker_descendants(marker)
+    assert problems == []
+
+
+def test_retire_marker_descendants_blocks_on_zombie(tmp_path: Path) -> None:
+    """A not-yet-reaped zombie descendant blocks owner retirement proof.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    zombie = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 30.0
+    while zombie.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    # poll() reaped it already on some platforms; force the zombie window
+    # deterministically via fork so the child stays unreaped.
+    if _proc_state(zombie.pid) is None:
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - child side
+            os._exit(0)
+        deadline = time.monotonic() + 30.0
+        while _proc_state(pid) != "Z" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        ticks = guard.proc_start_ticks(pid)
+        assert ticks is not None
+        try:
+            marker = tmp_path / "zombie.marker.json"
+            _write_marker_entries(marker, [{"pid": pid, "ticks": ticks}])
+            problems = _retire_marker_descendants(marker)
+            assert any("zombie" in problem for problem in problems)
+        finally:
+            os.waitpid(pid, 0)
+    else:
+        ticks = guard.proc_start_ticks(zombie.pid)
+        assert ticks is not None
+        marker = tmp_path / "zombie.marker.json"
+        _write_marker_entries(marker, [{"pid": zombie.pid, "ticks": ticks}])
+        problems = _retire_marker_descendants(marker)
+        assert problems == []
+        zombie.wait(timeout=10)
 
 
 # Canonical selection for in-suite repository stress: the whole repository
@@ -836,9 +1268,9 @@ def _run_wedge_scenario(
         innocent_descendant: Live unresolved descendant recorded in the marker.
         recorded_descendant_ticks: Deliberately wrong ticks for the marker.
     """
-    scenario.marker.write_text(
-        json.dumps([{"pid": innocent_descendant.pid, "ticks": recorded_descendant_ticks}]),
-        encoding="utf-8",
+    _write_marker_entries(
+        scenario.marker,
+        [{"pid": innocent_descendant.pid, "ticks": recorded_descendant_ticks}],
     )
     handles: list[OwnedRun] = []
 
