@@ -3381,3 +3381,107 @@ def test_write_meta_is_crash_durable(
     agent.write_meta("abcdef01", meta)
     assert agent.read_meta("abcdef01") == meta
     assert calls == [agent.agent_dir("abcdef01") / "meta.json"]
+
+
+def test_attached_follow_converges_durable_metadata_without_status(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Disappearance during attached follow converges metadata without ``status``.
+
+    The normal attached lifecycle path (``stream_log_until_terminal`` /
+    ``_terminal_or_unknown``) must reconcile the durable record itself: it may
+    never observe a dead invocation as ``unknown``, stop following, and leave
+    ``state=running / active_runner=true`` behind.
+    """
+    aid = "1a2b3c4d"
+    proc = spawn_marked_process(aid)
+    try:
+        agent.write_meta(aid, _dead_invocation_meta(aid, state_dir, proc))
+        agent.stream_log_until_terminal(aid, follow_lines=1)
+        capsys.readouterr()
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        assert after["active_runner"] is False
+        assert after["exit_code"] is None
+        assert after["exit_signal"] is None
+        assert agent.DISAPPEARED_NOTE in str(after.get("error"))
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_wait_converges_durable_metadata_after_runner_death(state_dir: Path) -> None:
+    """``wait`` reconciles when the runner dies without finalizing."""
+    aid = "2b3c4d5e"
+    proc = spawn_marked_process(aid)
+    try:
+        agent.write_meta(aid, _dead_invocation_meta(aid, state_dir, proc))
+        rc = agent.main(["wait", "--timeout", "5", aid])
+        assert rc == agent.EXIT_ERROR  # failed exit mapping, not success
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        assert after["active_runner"] is False
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_reconcile_writes_only_when_state_changes(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconciliation rewrites durable metadata only on an actual change."""
+    aid = "3c4d5e6f"
+    proc = spawn_marked_process(aid)
+    try:
+        stale = _dead_invocation_meta(aid, state_dir, proc)
+        agent.write_meta(aid, stale)
+        writes: list[Path] = []
+
+        def spy(path: Path, text: str) -> None:
+            writes.append(path)
+            write_text_durable(path, text)
+
+        monkeypatch.setattr(agent, "write_text_durable", spy)
+        assert agent.reconcile_meta(aid) is True
+        converged = agent.read_meta(aid)
+        assert converged is not None
+        assert converged["state"] == "failed"
+        writes.clear()
+        # Already converged: repeated calls are pure reads, no rewrite.
+        assert agent.reconcile_meta(aid) is False
+        assert agent.reconcile_meta(aid) is False
+        assert writes == []
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_terminal_or_unknown_reconciles_before_decision(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The shared observation boundary never returns unknown without converging."""
+    aid = "4d5e6f70"
+    proc = spawn_marked_process(aid)
+    try:
+        meta = _dead_invocation_meta(aid, state_dir, proc)
+        meta.pop("pid")
+        meta["pgid"] = None
+        meta["started_at"] = time.time() - 3600  # past the startup grace window
+        agent.write_meta(aid, meta)
+        # Without reconciliation this derives to a stale "unknown"; following
+        # must still converge the durable record through the same boundary.
+        assert agent.derive_state(agent.read_meta(aid)) == "unknown"
+        agent.stream_log_until_terminal(aid, follow_lines=1)
+        capsys.readouterr()
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        assert after["active_runner"] is False
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)

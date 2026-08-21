@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import copy
 import fcntl
 import json
 import os
@@ -764,7 +765,7 @@ def _reconcile_dead_invocation(m: Meta) -> None:
     _set_active_runner(m, value=False)
 
 
-def reconcile_meta(aid: str) -> None:
+def reconcile_meta(aid: str) -> bool:
     """Reconcile an agent's durable metadata after process disappearance.
 
     Idempotent, PID-reuse safe convergence pass: if the durable record still
@@ -772,10 +773,24 @@ def reconcile_meta(aid: str) -> None:
     gone, it is rewritten to an explicit terminal state under the per-agent
     lock. Safe to call any number of times from any number of observers.
 
+    The metadata is only rewritten when reconciliation actually changes it, so
+    hot polling paths (log follow ticks) never pay a needless fsync per tick.
+
     Args:
         aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when the durable record was changed and rewritten.
     """
+    current = read_meta(aid)
+    if current is None:
+        return False
+    candidate = copy.deepcopy(current)
+    _reconcile_dead_invocation(candidate)
+    if candidate == current:
+        return False
     update_meta(aid, _reconcile_dead_invocation)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2785,12 +2800,24 @@ def _drain_and_stop(handle: BinaryIO, normalizer: _LogNormalizer) -> None:
 def _terminal_or_unknown(aid: str) -> bool:
     """Return whether the agent is terminal, unknown, or deleted.
 
+    Before deciding, the durable record is reconciled: a runner/model process
+    that disappeared mid-invocation must converge ``meta.json`` to an explicit
+    terminal state instead of being observed as a stale ``unknown`` that leaves
+    ``state=running / active_runner=true`` behind. Reconciliation rewrites only
+    on an actual change, so follow polling ticks stay fsync-free when healthy.
+
     Args:
         aid: Lubko agent ID.
 
     Returns:
         ``True`` when streaming should stop.
     """
+    meta = read_meta(aid)
+    if meta is None:
+        return True
+    # Reconcile first so the decision below never returns a stale unknown for
+    # a provably dead invocation without also converging the durable record.
+    reconcile_meta(aid)
     meta = read_meta(aid)
     if meta is None:
         return True
@@ -2932,6 +2959,11 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 meta = current
                 break
             time.sleep(0.25)
+        else:
+            # The runner never finalized: converge the durable record instead
+            # of returning while metadata still claims a running invocation.
+            reconcile_meta(aid)
+            meta = read_meta(aid) or meta
         break
 
     return exit_code_for(meta)
