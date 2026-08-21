@@ -1606,6 +1606,51 @@ def test_build_agent_command_creates_session_on_first_prompt() -> None:
     assert "lubko-aaaaaaaa" in cmd
 
 
+def test_default_model_is_ox_alpha_free() -> None:
+    """The one fixed managed model is exactly opencode-go/ox-alpha-free."""
+    assert agent.DEFAULT_MODEL == "opencode-go/ox-alpha-free"
+
+
+def test_build_agent_command_passes_hardcoded_model() -> None:
+    """The OpenCode invocation always receives the fixed hard-coded model."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    cmd = agent.build_agent_command(meta, "first task", is_continue=False)
+    assert cmd is not None
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "opencode-go/ox-alpha-free"
+
+
+def test_build_agent_command_ignores_legacy_metadata_model() -> None:
+    """A conflicting model persisted in legacy metadata never reaches OpenCode."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    meta["model"] = "opencode-go/legacy-model"
+    cmd = agent.build_agent_command(meta, "task", is_continue=False)
+    assert cmd is not None
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "opencode-go/ox-alpha-free"
+    assert cmd[idx + 1] != "opencode-go/legacy-model"
+
+
+def test_build_agent_command_ignores_legacy_model_on_continuation() -> None:
+    """Continuation also ignores any legacy model stored in metadata."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    meta["native_session_id"] = "sess-1"
+    meta["model"] = "opencode-go/legacy-model"
+    cmd = agent.build_agent_command(meta, "task", is_continue=True)
+    assert cmd is not None
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "opencode-go/ox-alpha-free"
+
+
+def test_status_reports_hardcoded_model_regardless_of_metadata() -> None:
+    """Status JSON reports the fixed model even when legacy metadata disagrees."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    meta["model"] = "opencode-go/legacy-model"
+    status_json = agent.__dict__["_status_json"]
+    status = status_json("aaaaaaaa", meta, "running", alive=False)
+    assert status["model"] == "opencode-go/ox-alpha-free"
+
+
 def test_exit_code_for_maps_states() -> None:
     """Exit codes follow the agent state."""
     assert agent.exit_code_for(None) == 1

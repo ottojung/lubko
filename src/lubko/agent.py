@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 Meta = dict[str, Any]
 
 # Implementation details (hidden from the user-facing interface).
-DEFAULT_MODEL: Final = "opencode-go/hy3"
+DEFAULT_MODEL: Final = "opencode-go/ox-alpha-free"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
@@ -243,7 +243,6 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "state": "idle",
         "cwd": cwd,
         "title": title,
-        "model": DEFAULT_MODEL,
         "variant": DEFAULT_VARIANT,
         "native_session_id": None,
         "pid": None,
@@ -919,7 +918,7 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
     env_cmd = os.environ.get("LUBKO_AGENT_CMD")
     if env_cmd:
         return ["/bin/sh", "-c", env_cmd]
-    model = meta.get("model") or DEFAULT_MODEL
+    model = DEFAULT_MODEL
     variant = meta.get("variant") or DEFAULT_VARIANT
     cwd = meta.get("cwd") or str(Path.cwd())
     if is_continue:
@@ -2261,7 +2260,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
             if meta.get("steer_queue")
             else None
         ),
-        "model": meta.get("model"),
+        "model": DEFAULT_MODEL,
         "variant": meta.get("variant"),
         "log": str(agent_dir(aid) / "output.log"),
     }
