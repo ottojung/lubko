@@ -3338,3 +3338,99 @@ def test_supervisor_restart_gap_preserves_supervised_mission(
 
     assert calls == [], "supervisor-owned mission must not trigger rollback during gap"
     assert write_calls == [], "no state mutation should occur during supervisor gap"
+
+
+# ---------------------------------------------------------------------------
+# Rollback-state schema evolution (issue #104)
+# ---------------------------------------------------------------------------
+
+
+def legacy_v2_state_dict(state: dc.RollbackState) -> dict[str, object]:
+    """Downgrade a state mapping to the supported schema-2 shape.
+
+    Schema 2 predates supervisor ownership, so the ``supervisor_owned`` key is
+    absent entirely; parsing must treat its authority as unknown.
+
+    Args:
+        state: A current-schema mission.
+
+    Returns:
+        The same mission as a schema-2 JSON mapping.
+    """
+    data = state.to_dict()
+    del data["supervisor_owned"]
+    data["schema_version"] = 2
+    return data
+
+
+def test_read_rollback_state_parses_supported_legacy_schema() -> None:
+    """A supported older rollback file parses explicitly instead of corrupt."""
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(
+        json.dumps(legacy_v2_state_dict(pending_state()), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    state = dc.read_rollback_state()
+
+    assert state is not None
+    assert state.schema_version == dc.ROLLBACK_SCHEMA_VERSION
+    assert state.status == dc.STATUS_PENDING
+    # Missing ownership fields stay unknown: fail closed, never legacy-authorized.
+    assert state.supervisor_owned is None
+
+
+def test_read_rollback_state_rejects_unsupported_future_version() -> None:
+    """An unknown future schema version remains fail-closed corruption."""
+    future = pending_state().to_dict()
+    future["schema_version"] = dc.ROLLBACK_SCHEMA_VERSION + 1
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(json.dumps(future, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(dc.DeployCtlError, match="unsupported supervised deployment state version"):
+        dc.read_rollback_state()
+
+
+def test_archive_of_parsed_legacy_mission_writes_current_schema() -> None:
+    """Rewrites of a parsed legacy mission use the current schema version."""
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(
+        json.dumps(legacy_v2_state_dict(pending_state()), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    state = dc.read_rollback_state()
+    assert state is not None
+
+    dc.archive_mission(state, dc.STATUS_ROLLED_BACK)
+
+    on_disk = json.loads(rollback_state_path().read_text(encoding="utf-8"))
+    assert on_disk["schema_version"] == dc.ROLLBACK_SCHEMA_VERSION
+
+
+def test_unknown_authority_mission_never_triggers_legacy_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mission without an ownership field is never implicitly authorized.
+
+    An old pending mission whose ownership is unknown must fail closed in the
+    watchdog exactly like a supervisor-owned one: no legacy direct rollback may
+    run while the supervisor is absent.
+    """
+    state = replace(pending_state(), supervisor_owned=None, deadline=time.time() - 1)
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
+    states = iter((state, rolled_back))
+    calls: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        calls.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    dc._watchdog_main(lock_timeout_seconds=1.0)
+
+    assert calls == [], "unknown-authority mission must not trigger legacy rollback"

@@ -1323,28 +1323,39 @@ def _deploy_helper_locked(options: DeployOptions, job_id: object, writer: int) -
 
     previous = read_meta()
     state = worker_state(previous)
+    error: str | None
     if options.bootstrap:
-        deployctl.send_helper_error(
-            writer,
+        error = (
             "queue-invoked bootstrap is refused: the worker executing this job is a live queue "
             "consumer, and the bootstrap path requires the legacy worker to be stopped manually "
-            "first so the replacement never starts alongside a live consumer",
+            "first so the replacement never starts alongside a live consumer"
         )
-        return
-    if state == STATE_UNMANAGED:
-        deployctl.send_helper_error(writer, UNMANAGED_WORKER_MESSAGE)
-        return
-    if not supervise.supervisor_running():
-        deployctl.send_helper_error(
-            writer,
-            "no external supervisor is running; refusing to deploy the maintained worker without "
-            "automatic restart protection",
+    elif state == STATE_UNMANAGED:
+        error = UNMANAGED_WORKER_MESSAGE
+    else:
+        error = _supervised_mutation_blocker() or (
+            None
+            if supervise.supervisor_running()
+            else (
+                "no external supervisor is running; refusing to deploy the maintained worker "
+                "without automatic restart protection"
+            )
         )
+    if error is not None:
+        deployctl.send_helper_error(writer, error)
         return
     try:
         commit = _validate_and_prepare(options)
     except DeployAbortedError as exc:
         deployctl.send_helper_error(writer, str(exc) or "deployment validation failed")
+        return
+    if _refuse_version_changing_deploy(previous, commit) and previous is not None:
+        cli.remove_cli_root(commit)
+        deployctl.send_helper_error(
+            writer,
+            f"a live maintained worker is running commit {previous.git_commit}; ordinary deploys "
+            "cannot change versions; use 'lubko-deploy-ctl checkout'",
+        )
         return
     deployctl.send_helper_response(writer, _queue_prepared_response(commit))
     durable_deadline = time.time() + deployctl.handoff_durable_wait_seconds
@@ -1736,12 +1747,82 @@ def _deploy_direct(
     return new_meta
 
 
+def _supervised_mutation_blocker() -> str | None:
+    """Return why ordinary lifecycle mutation is currently blocked, if it is.
+
+    ``lubko-deploy-ctl`` is the only authority for version-changing worker
+    mutations, and the external supervisor owns the mission state that decides
+    whether a handoff is in flight. Ordinary ``lubko-deploy`` mutations must
+    therefore fail closed while a supervised deployment is pending or while the
+    durable rollback state is unreadable/corrupt: mutating during an unknown
+    handoff could disrupt a rollback or resurrect a superseded commit. Callers
+    must invoke this under the deployment lock so no guard-to-mutation TOCTOU
+    window remains.
+
+    Returns:
+        ``None`` when mutation may proceed, otherwise a human-readable refusal
+        reason.
+
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    try:
+        mission = deployctl.read_rollback_state()
+    except deployctl.DeployCtlError as exc:
+        return (
+            f"supervised deployment state is unreadable or corrupt ({exc}); refusing to mutate "
+            "lifecycle state; inspect with 'lubko-deploy-ctl status'"
+        )
+    if mission is None:
+        return None
+    if mission.status == deployctl.STATUS_PENDING:
+        return (
+            f"a supervised checkout of commit {mission.commit} (generation {mission.generation}) "
+            "is still pending confirmation; lifecycle mutation is blocked until it is resolved "
+            "with 'lubko-deploy-ctl confirm' or 'lubko-deploy-ctl rollback'"
+        )
+    if mission.status not in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}:
+        return (
+            f"supervised deployment state has unknown status {mission.status!r}; refusing to "
+            "mutate lifecycle state"
+        )
+    return None
+
+
+def _refuse_version_changing_deploy(previous: WorkerMeta | None, commit: str) -> bool:
+    """Decide whether an ordinary deploy would change the running version.
+
+    A live maintained worker is owned by the supervised control plane; an
+    ordinary ``lubko-deploy deploy`` must never change its commit. A
+    same-commit invocation stays allowed as a deliberate restart.
+
+    Args:
+        previous: Previously recorded worker metadata, or ``None``.
+        commit: Exact validated target commit.
+
+    Returns:
+        ``True`` when the deploy must be refused.
+    """
+    return (
+        previous is not None
+        and worker_state(previous) == STATE_RUNNING
+        and previous.git_commit != commit
+    )
+
+
 def _deploy_locked(options: DeployOptions) -> int:
     """Perform a deployment while holding the deployment lock.
 
     The external supervisor is the single authority that owns the maintained
     worker; a normal deployment hands the exact commit to the daemon and never
-    silently falls back to direct spawning when the daemon is absent.
+    silently falls back to direct spawning when the daemon is absent. Ordinary
+    deploys serve only the clean first maintained-worker installation and the
+    same-commit restart; version-changing mutations must go through
+    ``lubko-deploy-ctl``, and mutation is refused while supervised rollback
+    state is pending or corrupt. The guard and the mutation share this held
+    deployment lock, so no guard-to-mutation TOCTOU window exists.
 
     Args:
         options: Deployment inputs.
@@ -1756,6 +1837,11 @@ def _deploy_locked(options: DeployOptions) -> int:
     previous = read_meta()
     state = worker_state(previous)
 
+    blocker = _supervised_mutation_blocker()
+    if blocker is not None:
+        _err(blocker)
+        raise DeployAbortedError
+
     if state == STATE_UNMANAGED:
         if not options.bootstrap:
             _err(UNMANAGED_WORKER_MESSAGE)
@@ -1764,6 +1850,14 @@ def _deploy_locked(options: DeployOptions) -> int:
         _out("bootstrap: no maintained worker metadata; assuming the legacy worker was stopped")
 
     commit = _validate_and_prepare(options)
+    live_commit = previous.git_commit if state == STATE_RUNNING and previous is not None else None
+    if live_commit is not None and live_commit != commit:
+        _err(
+            f"a live maintained worker is running commit {live_commit}; ordinary "
+            "'lubko-deploy deploy' cannot change versions"
+        )
+        _err("use 'lubko-deploy-ctl checkout' for the rollback-safe version change")
+        raise DeployAbortedError
     return _complete_deploy_handoff(options, commit, previous, state)
 
 
@@ -2376,6 +2470,14 @@ def _repair_locked(options: DeployOptions, recovery_worker_pid: int) -> int:
     cli.gc_cli_roots((commit,))
     _cleanup_ready_markers(recovery_worker_pid)
     _reconcile_toolchain(options.uv_path)
+    if not _verify_queue_roundtrip(
+        worker_id, str(options.repo), recovery_worker_pid, options.probe_timeout_seconds
+    ):
+        _err(
+            "post-repair verification failed: the adopted worker no longer exclusively "
+            "consumes the queue; refusing to report success"
+        )
+        return EXIT_ERROR
     append_deploy_log(f"repaired: adopted recovery worker pid={new_meta.pid} commit={commit}")
     _out(f"adopted recovery worker pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     _out(f"worker id: {worker_id}")

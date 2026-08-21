@@ -1658,6 +1658,45 @@ def test_derive_action_no_desired_selects_newer_pending_candidate(
     assert commit == "2" * 40
 
 
+def test_derive_action_legacy_v2_mission_without_ownership_is_parsed(tmp_path: Path) -> None:
+    """A supported schema-2 mission parses; unknown ownership never authorizes.
+
+    The old file must not look corrupt to the supervisor, and its missing
+    ``supervisor_owned`` field must stay unknown (fail-closed) instead of being
+    implicitly legacy-authorized.
+    """
+    del tmp_path
+    supervise.request_run("2" * 40, repo="", uv_path="uv", worker_id="w")
+    legacy = mission_state(1, dc.STATUS_PENDING, "2" * 40, "1" * 40).to_dict()
+    del legacy["supervisor_owned"]
+    legacy["schema_version"] = 2
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8")
+
+    parsed = dc.read_rollback_state()
+
+    assert parsed is not None
+    assert parsed.schema_version == dc.ROLLBACK_SCHEMA_VERSION
+    assert parsed.supervisor_owned is None
+    # The old pending mission is older than the freshly written desired intent,
+    # so it is stale history: the supervisor runs the desired commit.
+    action, commit = _derive_action()
+    assert action == "run"
+    assert commit == "2" * 40
+
+
+def test_derive_action_fails_closed_on_unsupported_future_version(tmp_path: Path) -> None:
+    """A valid-looking future-schema mission holds without a worker."""
+    del tmp_path
+    future = mission_state(3, dc.STATUS_PENDING, "2" * 40, "1" * 40).to_dict()
+    future["schema_version"] = dc.ROLLBACK_SCHEMA_VERSION + 1
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(json.dumps(future, sort_keys=True) + "\n", encoding="utf-8")
+    action, commit = _derive_action()
+    assert action == "hold"
+    assert commit is None
+
+
 def test_next_generation_surpasses_open_mission(tmp_path: Path) -> None:
     """Generation allocation always outranks an open mission."""
     del tmp_path
