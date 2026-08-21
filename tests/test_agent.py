@@ -9,6 +9,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -1310,23 +1311,6 @@ def test_prompt_retries_failed_first_attempt_as_new_session(
     assert meta["pending_prompt"] == "retry task"
 
 
-def test_prompt_continue_with_agent_cmd_override_without_session(
-    state_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """LUBKO_AGENT_CMD continuation needs no native session and is never refused."""
-    make_agent(state_dir, "aaaaaaaa", state_value="succeeded", prompt_count=1)
-    monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
-    spawned: list[str] = []
-    monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
-    code = agent.main(["prompt", "--id", "aaaaaaaa", "--detach", "more"])
-    assert code == agent.EXIT_OK
-    assert spawned == ["new"]
-    meta = agent.read_meta("aaaaaaaa")
-    assert meta is not None
-    assert meta["pending_prompt"] == "more"
-
-
 def test_cmd_prompt_attached_follows_and_propagates_exit_code(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1575,28 +1559,6 @@ def test_runner_fails_without_continuation_session(
     assert "session not available" in result["error"]
 
 
-def test_build_agent_command_honors_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    """LUBKO_AGENT_CMD overrides the underlying agent command."""
-    monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
-    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
-    assert agent.build_agent_command(meta, "hi", is_continue=False) == [
-        "/bin/sh",
-        "-c",
-        "opencode run --auto",
-    ]
-
-
-def test_build_agent_command_override_used_for_continuation_without_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """LUBKO_AGENT_CMD continuation needs no recorded native session."""
-    monkeypatch.setenv("LUBKO_AGENT_CMD", "opencode run --auto")
-    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
-    meta["native_session_id"] = None
-    cmd = agent.build_agent_command(meta, "hi", is_continue=True)
-    assert cmd == ["/bin/sh", "-c", "opencode run --auto"]
-
-
 def test_build_agent_command_creates_session_on_first_prompt() -> None:
     """The first invocation creates a native session with the agent title."""
     meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
@@ -1604,6 +1566,67 @@ def test_build_agent_command_creates_session_on_first_prompt() -> None:
     assert cmd is not None
     assert "--title" in cmd
     assert "lubko-aaaaaaaa" in cmd
+
+
+def test_default_model_is_ox_alpha_free() -> None:
+    """The one fixed managed model is exactly opencode-go/ox-alpha-free."""
+    assert agent.AGENT_MODEL == "opencode-go/ox-alpha-free"
+
+
+def test_build_agent_command_passes_hardcoded_model() -> None:
+    """The OpenCode invocation always receives the fixed hard-coded model."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    cmd = agent.build_agent_command(meta, "first task", is_continue=False)
+    assert cmd is not None
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "opencode-go/ox-alpha-free"
+
+
+def test_build_agent_command_ignores_legacy_metadata_model() -> None:
+    """A conflicting model persisted in legacy metadata never reaches OpenCode."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    meta["model"] = "opencode-go/legacy-model"
+    cmd = agent.build_agent_command(meta, "task", is_continue=False)
+    assert cmd is not None
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "opencode-go/ox-alpha-free"
+    assert cmd[idx + 1] != "opencode-go/legacy-model"
+
+
+def test_build_agent_command_ignores_legacy_model_on_continuation() -> None:
+    """Continuation also ignores any legacy model stored in metadata."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    meta["native_session_id"] = "sess-1"
+    meta["model"] = "opencode-go/legacy-model"
+    cmd = agent.build_agent_command(meta, "task", is_continue=True)
+    assert cmd is not None
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "opencode-go/ox-alpha-free"
+
+
+def test_status_reports_hardcoded_model_regardless_of_metadata() -> None:
+    """Status JSON reports the fixed model even when legacy metadata disagrees."""
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    meta["model"] = "opencode-go/legacy-model"
+    status_json = agent.__dict__["_status_json"]
+    status = status_json("aaaaaaaa", meta, "running", alive=False)
+    assert status["model"] == "opencode-go/ox-alpha-free"
+
+
+def test_build_agent_command_ignores_lubko_agent_cmd_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No environment variable can reconfigure the agent command or model.
+
+    ``LUBKO_AGENT_CMD`` is removed; even if set, the runner still launches the
+    fixed ``opencode run --model opencode-go/ox-alpha-free`` argv.
+    """
+    monkeypatch.setenv("LUBKO_AGENT_CMD", "totally different command")
+    meta = agent.idle_meta("aaaaaaaa", "/workspace", None)
+    cmd = agent.build_agent_command(meta, "task", is_continue=False)
+    assert cmd is not None
+    assert cmd[:2] == ["opencode", "run"]
+    idx = cmd.index("--model")
+    assert cmd[idx + 1] == "opencode-go/ox-alpha-free"
+    assert "totally different command" not in cmd
 
 
 def test_exit_code_for_maps_states() -> None:
@@ -1874,12 +1897,14 @@ def test_live_runner_two_ordinary_prompts_exactly_one_accepted(
         agent.write_meta(aid, meta)
         sync = tmp_path / "sync"
         p1 = _run_cli(
-            ["prompt", "--id", aid, "--detach", "first"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+            ["prompt", "--id", aid, "--detach", "first"],
+            sync_dir=sync,
+            FAKE_OPENCODE_CMD="sleep 300",
         )
         p2 = _run_cli(
             ["prompt", "--id", aid, "--detach", "second"],
             sync_dir=sync,
-            LUBKO_AGENT_CMD="sleep 300",
+            FAKE_OPENCODE_CMD="sleep 300",
         )
         try:
             _wait_sync_reached(sync, "sc_observe", 2)
@@ -2380,6 +2405,71 @@ def _cli_env(sync_dir: Path | None, **extra: str) -> dict[str, str]:
     env = dict(os.environ)
     if sync_dir is not None:
         env["LUBKO_TEST_SYNC"] = str(sync_dir)
+    # Test-only harness: instead of allowing the agent to honour an
+    # agent-command override (which would let the model be reconfigured), we
+    # drop a real ``opencode`` executable earlier on PATH that simply execs the
+    # supplied shell command.  Production code never sees this variable and
+    # still builds its fixed ``opencode run --model opencode-go/ox-alpha-free``
+    # argv; only the test fake reads FAKE_OPENCODE_CMD.
+    fake_cmd = extra.pop("FAKE_OPENCODE_CMD", None)
+    if fake_cmd is not None:
+        # Keep the fake session DB in a pytest-owned directory so first-run
+        # session creation and later steer/continuation discovery share one DB
+        # without touching the real home.  Derive it from XDG_STATE_HOME (set by
+        # the state_dir fixture) so it is stable across separate _run_cli calls
+        # within the same test.
+        state_home = env.get("XDG_STATE_HOME")
+        if state_home:
+            fake_data = Path(state_home) / "fake-opencode-data"
+        else:
+            fake_data = Path(tempfile.mkdtemp(prefix="lubko-fake-data-"))
+        fake_data.mkdir(parents=True, exist_ok=True)
+        base = sync_dir if sync_dir is not None else fake_data
+        fake_bin = base / "fake-opencode-bin"
+        fake_bin.mkdir(parents=True, exist_ok=True)
+        opencode = fake_bin / "opencode"
+        # Test-only fake for the underlying OpenCode binary.  It records a
+        # minimal session row (so `discover_session_id` works for
+        # continuation/steer) on new invocations, then execs the supplied
+        # harness command.  Production code never sees FAKE_OPENCODE_CMD and
+        # still builds the fixed `opencode run --model opencode-go/ox-alpha-free`
+        # argv; only this fake reads it.
+        script = (
+            "#!" + sys.executable + "\n"
+            "import os\n"
+            "import sqlite3\n"
+            "import subprocess\n"
+            "import sys\n"
+            "import time\n"
+            "\n"
+            "_args = sys.argv[1:]\n"
+            '_title = _args[_args.index("--title") + 1] if "--title" in _args else None\n'
+            '_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")\n'
+            '_dbdir = os.path.join(_data, "opencode")\n'
+            "os.makedirs(_dbdir, exist_ok=True)\n"
+            '_db = os.path.join(_dbdir, "opencode.db")\n'
+            "_conn = sqlite3.connect(_db)\n"
+            "try:\n"
+            "    _conn.execute(\n"
+            '        "CREATE" + " TABLE IF NOT EXISTS session("\n'
+            '        "    id TEXT, title TEXT, time_created INTEGER)"\n'
+            "    )\n"
+            "    if _title:\n"
+            "        _conn.execute(\n"
+            '            "INSERT" + " INTO session(id, title, time_created) VALUES (?, ?, ?)",\n'
+            '            ("fake-" + _title, _title, int(time.time() * 1000)),\n'
+            "        )\n"
+            "    _conn.commit()\n"
+            "finally:\n"
+            "    _conn.close()\n"
+            '_cmd = os.environ.get("FAKE_OPENCODE_CMD", "sleep 1")\n'
+            'sys.exit(subprocess.call(["/bin/sh", "-c", _cmd]))\n'
+        )
+        opencode.write_text(script)
+        opencode.chmod(0o755)
+        env["FAKE_OPENCODE_CMD"] = fake_cmd
+        env["XDG_DATA_HOME"] = str(fake_data)
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
     env.update(extra)
     return env
 
@@ -2642,10 +2732,10 @@ def test_linearizable_two_concurrent_prompts_exactly_one_runner(
     agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
     sync = tmp_path / "sync"
     p1 = _run_cli(
-        ["prompt", "--id", aid, "--detach", "first"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+        ["prompt", "--id", aid, "--detach", "first"], sync_dir=sync, FAKE_OPENCODE_CMD="sleep 300"
     )
     p2 = _run_cli(
-        ["prompt", "--id", aid, "--detach", "second"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+        ["prompt", "--id", aid, "--detach", "second"], sync_dir=sync, FAKE_OPENCODE_CMD="sleep 300"
     )
     try:
         _wait_sync_reached(sync, "sc_observe", 2)
@@ -2686,12 +2776,12 @@ def test_linearizable_prompt_and_steer_exactly_one_runner(
     agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
     sync = tmp_path / "sync"
     p_prompt = _run_cli(
-        ["prompt", "--id", aid, "--detach", "primary"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+        ["prompt", "--id", aid, "--detach", "primary"], sync_dir=sync, FAKE_OPENCODE_CMD="sleep 300"
     )
     p_steer = _run_cli(
         ["prompt", "--id", aid, "--steer", "--detach", "redirect"],
         sync_dir=sync,
-        LUBKO_AGENT_CMD="sleep 300",
+        FAKE_OPENCODE_CMD="sleep 300",
     )
     try:
         _wait_sync_reached(sync, "sc_observe", 2)
@@ -2737,12 +2827,12 @@ def test_linearizable_two_concurrent_steers_exactly_one_runner(
     s1 = _run_cli(
         ["prompt", "--id", aid, "--steer", "--detach", "steer-one"],
         sync_dir=sync,
-        LUBKO_AGENT_CMD="sleep 300",
+        FAKE_OPENCODE_CMD="sleep 300",
     )
     s2 = _run_cli(
         ["prompt", "--id", aid, "--steer", "--detach", "steer-two"],
         sync_dir=sync,
-        LUBKO_AGENT_CMD="sleep 300",
+        FAKE_OPENCODE_CMD="sleep 300",
     )
     try:
         _wait_sync_reached(sync, "sc_observe", 2)
@@ -2784,7 +2874,7 @@ def test_reserved_runner_death_before_pid_recovery_single_replacement(
     agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
     sync = tmp_path / "sync"
     first = _run_cli(
-        ["prompt", "--id", aid, "--detach", "doomed"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+        ["prompt", "--id", aid, "--detach", "doomed"], sync_dir=sync, FAKE_OPENCODE_CMD="sleep 300"
     )
     try:
         _wait_sync_reached(sync, "sc_observe", 1)
@@ -2803,10 +2893,10 @@ def test_reserved_runner_death_before_pid_recovery_single_replacement(
         # Their own prompts ("recover-one"/"recover-two") must NOT replace the
         # already-accepted "doomed" prompt.
         r1 = _run_cli(
-            ["prompt", "--id", aid, "--detach", "recover-one"], LUBKO_AGENT_CMD="sleep 300"
+            ["prompt", "--id", aid, "--detach", "recover-one"], FAKE_OPENCODE_CMD="sleep 300"
         )
         r2 = _run_cli(
-            ["prompt", "--id", aid, "--detach", "recover-two"], LUBKO_AGENT_CMD="sleep 300"
+            ["prompt", "--id", aid, "--detach", "recover-two"], FAKE_OPENCODE_CMD="sleep 300"
         )
         rc1 = r1.wait(timeout=30)
         rc2 = r2.wait(timeout=30)
@@ -2859,7 +2949,7 @@ def test_stale_preclaim_death_recovery_steer_accepted(
     first = _run_cli(
         ["prompt", "--id", aid, "--detach", "doomed"],
         sync_dir=sync,
-        LUBKO_AGENT_CMD=echo_sleep,
+        FAKE_OPENCODE_CMD=echo_sleep,
     )
     try:
         _wait_sync_reached(sync, "sc_observe", 1)
@@ -2876,7 +2966,7 @@ def test_stale_preclaim_death_recovery_steer_accepted(
         # accepted "doomed" prompt and queuing the steer behind it.
         steer = _run_cli(
             ["prompt", "--id", aid, "--steer", "--detach", "recover-steer"],
-            LUBKO_AGENT_CMD=echo_sleep,
+            FAKE_OPENCODE_CMD=echo_sleep,
         )
         rc_steer = steer.wait(timeout=30)
         # Wait until the recovered replacement runner has claimed (live runner).
@@ -2902,14 +2992,14 @@ def test_stale_preclaim_death_recovery_steer_accepted(
         # and never spawns a competing runner.
         ordinary = _run_cli(
             ["prompt", "--id", aid, "--detach", "recover-ordinary"],
-            LUBKO_AGENT_CMD=echo_sleep,
+            FAKE_OPENCODE_CMD=echo_sleep,
         )
         rc_ordinary = ordinary.wait(timeout=30)
         # An ordinary retry while the recovered runner is live is rejected busy
         # and never spawns a competing runner.
         ordinary = _run_cli(
             ["prompt", "--id", aid, "--detach", "recover-ordinary"],
-            LUBKO_AGENT_CMD=echo_sleep,
+            FAKE_OPENCODE_CMD=echo_sleep,
         )
         rc_ordinary = ordinary.wait(timeout=30)
         # Wait for the recovered runner (doomed, then the steer) to exit, not
@@ -2945,10 +3035,10 @@ def test_linearizable_stress_no_runner_accumulation(
         agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
         sync = tmp_path / f"sync{i}"
         a = _run_cli(
-            ["prompt", "--id", aid, "--detach", "A"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+            ["prompt", "--id", aid, "--detach", "A"], sync_dir=sync, FAKE_OPENCODE_CMD="sleep 300"
         )
         b = _run_cli(
-            ["prompt", "--id", aid, "--detach", "B"], sync_dir=sync, LUBKO_AGENT_CMD="sleep 300"
+            ["prompt", "--id", aid, "--detach", "B"], sync_dir=sync, FAKE_OPENCODE_CMD="sleep 300"
         )
         try:
             _wait_sync_reached(sync, "sc_observe", 2)
