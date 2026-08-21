@@ -28,6 +28,8 @@ import os
 import signal
 import time
 from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from lubko.worker import group_has_members
@@ -38,16 +40,57 @@ if TYPE_CHECKING:
 KILL_GRACE_SECONDS: Final = 5.0
 GROUP_POLL_SECONDS: Final = 0.02
 
-TRACKED: dict[int, subprocess.Popen[bytes]] = {}
+
+@dataclass
+class _Tracked:
+    """A registered process owned with its exact spawn-time identity."""
+
+    proc: subprocess.Popen[bytes]
+    start_ticks: int | None
 
 
-def register(proc: subprocess.Popen[bytes]) -> None:
+TRACKED: dict[int, _Tracked] = {}
+
+
+def proc_start_ticks(pid: int) -> int | None:
+    """Return the process start time in clock ticks, or ``None`` when gone.
+
+    Args:
+        pid: Process to inspect.
+
+    Returns:
+        The start time in clock ticks, or ``None`` when unreadable/gone.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rest = stat[stat.rfind(")") + 1 :].split()
+    try:
+        return int(rest[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def register(proc: subprocess.Popen[bytes], *, start_ticks: int | None = None) -> None:
     """Track a spawned process so teardown can stop it deterministically.
+
+    The process is owned by its exact identity: PID plus start time in clock
+    ticks recorded at registration.  Teardown re-verifies the ticks before
+    signalling, so a registry entry left behind by a test whose process died
+    and whose PID the kernel reused can never cause an innocent new occupant
+    of that PID to be signalled.
 
     Args:
         proc: The spawned process to own.
+        start_ticks: Explicit recorded start ticks; defaults to reading the
+            live current value.  Tests use this to simulate a stale registry
+            entry deterministically.
     """
-    TRACKED[proc.pid] = proc
+    TRACKED[proc.pid] = _Tracked(
+        proc=proc,
+        start_ticks=proc_start_ticks(proc.pid) if start_ticks is None else start_ticks,
+    )
 
 
 def unregister(proc: subprocess.Popen[bytes]) -> None:
@@ -74,7 +117,7 @@ def live_pids() -> list[int]:
     Returns:
         The live tracked process IDs.
     """
-    return [pid for pid, proc in TRACKED.items() if proc.poll() is None]
+    return [pid for pid, tracked in TRACKED.items() if tracked.proc.poll() is None]
 
 
 def _process_group_of(pid: int) -> int | None:
@@ -159,7 +202,7 @@ def _wait_group_gone(pgid: int) -> None:
         time.sleep(GROUP_POLL_SECONDS)
 
 
-def _stop_one(proc: subprocess.Popen[bytes]) -> None:
+def _stop_one(tracked: _Tracked) -> bool:
     """Stop one tracked process deterministically and reap it.
 
     A tracked process is signalled with ``SIGTERM``, then ``SIGKILL`` while
@@ -172,10 +215,22 @@ def _stop_one(proc: subprocess.Popen[bytes]) -> None:
     would kill unrelated processes.  Only exact identities are ever touched;
     nothing uses process-name matching or broad ``pkill``.
 
+    The recorded start ticks are re-verified before any signal.  A registry
+    entry whose recorded ticks no longer match the current occupant of the
+    PID (the kernel reused the PID after the original died) is never
+    signalled; the caller reports it as a stale identity instead.
+
     Args:
-        proc: The tracked process to stop.
+        tracked: The tracked registry entry to stop.
+
+    Returns:
+        ``False`` when the identity was stale and nothing was signalled,
+        otherwise ``True``.
     """
+    proc = tracked.proc
     pid = proc.pid
+    if tracked.start_ticks is not None and proc_start_ticks(pid) != tracked.start_ticks:
+        return False
     pgid = _process_group_of(pid)
     _signal_exact(pid, pgid, signal.SIGTERM)
     deadline = time.monotonic() + KILL_GRACE_SECONDS
@@ -190,6 +245,7 @@ def _stop_one(proc: subprocess.Popen[bytes]) -> None:
             proc.wait(timeout=KILL_GRACE_SECONDS)
     if pgid is not None and pgid == pid:
         _wait_group_gone(pgid)
+    return True
 
 
 def teardown_tracked(*, fail_on_leak: bool = True) -> int:
@@ -206,14 +262,19 @@ def teardown_tracked(*, fail_on_leak: bool = True) -> int:
             live, meaning a test failed to own and stop its own process.
     """
     procs = list(TRACKED.values())
-    live = [proc for proc in procs if proc.poll() is None]
-    for proc in live:
-        _stop_one(proc)
-    for proc in procs:
-        TRACKED.pop(proc.pid, None)
+    live = [tracked for tracked in procs if tracked.proc.poll() is None]
+    stale = [tracked.proc.pid for tracked in live if not _stop_one(tracked)]
+    for tracked in procs:
+        TRACKED.pop(tracked.proc.pid, None)
+    if fail_on_leak and stale:
+        msg = (
+            "registry held stale identity/identities (PID reused since "
+            f"registration; never signalled): {', '.join(str(pid) for pid in stale)}"
+        )
+        raise AssertionError(msg)
     if fail_on_leak and live:
         msg = "test leaked process(es) that teardown had to stop: " + ", ".join(
-            str(proc.pid) for proc in live
+            str(tracked.proc.pid) for tracked in live
         )
         raise AssertionError(msg)
     return len(live)

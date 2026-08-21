@@ -768,10 +768,12 @@ def test_wait_for_replacement_rejects_transient_none_and_returns_observed_pid(
 
 
 def test_repeated_crashes_never_accumulate_workers(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """Repeated crashes back off and never accumulate processes or zombies."""
+    del jobs_db
     repo, first, _second = maintained_env
     with running_supervisor(supervisor_env):
         request_and_wait(first, repo)
@@ -887,10 +889,12 @@ def test_supervisor_restart_reconstructs_a_single_worker(
 
 
 def test_supervisor_takeover_stops_orphan_worker_by_exact_identity(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """A hard-killed supervisor's orphaned worker is taken over, never duplicated."""
+    del jobs_db
     repo, first, _second = maintained_env
     first_proc = start_supervisor(supervisor_env)
     try:
@@ -2549,10 +2553,12 @@ def test_read_status_returns_none_when_process_zombie(
 
 
 def test_read_status_returns_valid_for_live_supervisor(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """A status snapshot from the live supervisor is accepted."""
+    del jobs_db
     repo, first, _second = maintained_env
     with running_supervisor(supervisor_env):
         request_and_wait(first, repo)
