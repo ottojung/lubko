@@ -274,36 +274,37 @@ def _stop_one(tracked: _Tracked) -> bool:
     would kill unrelated processes.  Only exact identities are ever touched;
     nothing uses process-name matching or broad ``pkill``.
 
-    The recorded start ticks are re-verified before any signal.  A registry
-    entry whose recorded ticks no longer match the current occupant of the
-    PID (the kernel reused the PID after the original died), or whose
-    recorded ticks were never valid, is never signalled; the caller reports
-    it as a stale/unverifiable identity instead.
+    The recorded start ticks are re-verified immediately before **every**
+    signal — both the initial ``SIGTERM`` and the escalation ``SIGKILL``.
+    A registry entry whose recorded ticks no longer match the current
+    occupant of the PID (the kernel reused the PID after the original
+    died), or whose recorded ticks were never valid, is never signalled;
+    the caller reports it as a stale/unverifiable identity instead.
 
     Args:
         tracked: The tracked registry entry to stop.
 
     Returns:
         ``False`` when the identity was stale or unverifiable and nothing
-        was signalled, otherwise ``True``.
+        was signalled (including a KILL refused because the identity changed
+        after the TERM), otherwise ``True``.
     """
     proc = tracked.proc
     pid = proc.pid
-    if tracked.start_ticks is None:
-        # An identity without valid recorded ticks can never be verified;
-        # signalling it is never authorized, no matter who occupies the PID.
-        return False
-    if proc_start_ticks(pid) != tracked.start_ticks:
+    if not signal_identity_checked(pid, tracked.start_ticks, signal.SIGTERM):
         return False
     pgid = _process_group_of(pid)
-    _signal_exact(pid, pgid, signal.SIGTERM)
     deadline = time.monotonic() + KILL_GRACE_SECONDS
     while time.monotonic() < deadline:
         if proc.poll() is not None and _group_clear(pgid, pid):
             break
         time.sleep(GROUP_POLL_SECONDS)
-    if _still_active(proc, pgid):
-        _signal_exact(pid, pgid, signal.SIGKILL)
+    if not _still_active(proc, pgid):
+        return True
+    # Re-verify immediately before the KILL: if the identity changed after
+    # the TERM (PID reused), the new occupant must never be hit.
+    if not signal_identity_checked(pid, tracked.start_ticks, signal.SIGKILL):
+        return False
     if proc.poll() is None:
         with suppress(Exception):
             proc.wait(timeout=KILL_GRACE_SECONDS)

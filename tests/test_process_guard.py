@@ -7,17 +7,53 @@ signals the pytest/shared process group, and fails loudly when a test leaks.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
 from tests import _process_guard as guard
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 SLEEP_BIN: str = shutil.which("sleep") or "/bin/sleep"
+
+TERM_IGNORE_SCRIPT: Final = """
+import os, signal, sys, time
+from pathlib import Path
+
+def handler(_signum: int, _frame: object) -> None:
+    Path(sys.argv[1]).write_text(f"{os.getpid()}:term")
+
+signal.signal(signal.SIGTERM, handler)
+sys.stdout.write(f"ready {os.getpid()}\\n")
+sys.stdout.flush()
+time.sleep(300)
+"""
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
+    """Wait until a predicate holds.
+
+    Args:
+        predicate: Condition to await.
+        timeout: Maximum seconds to wait.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    failure = AssertionError("condition not met within timeout")
+    raise failure
 
 
 def spawn_sleep_leader() -> tuple[subprocess.Popen[bytes], int]:
@@ -149,6 +185,72 @@ def test_register_fails_closed_for_live_process_without_ticks(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+
+
+def test_teardown_never_kills_identity_reused_after_term(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A KILL is refused when ticks change between TERM and KILL.
+
+    The subject is a dedicated process that ignores SIGTERM and records its
+    delivery, so the escalation path is exercised deterministically.  The
+    TERM-time identity check matches the registration identity (proving the
+    TERM hit the original occupant); the tick seam then changes before the
+    KILL revalidation.  Teardown must refuse the KILL and report the stale
+    identity — never kill the changed/reused occupant — and the test cleans
+    up explicitly afterwards.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    term_marker = tmp_path / "term-delivered.marker"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", TERM_IGNORE_SCRIPT, str(term_marker)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        # Wait until the subject has installed its SIGTERM handler, so the
+        # TERM is deterministically delivered to a live ignoring occupant.
+        assert proc.stdout is not None
+        ready = proc.stdout.readline().decode()
+        assert ready.startswith("ready "), f"subject never became ready: {ready!r}"
+        real = guard.proc_start_ticks(proc.pid)
+        assert real is not None
+        guard.register(proc)
+        calls = {"n": 0}
+
+        def shifting_ticks(_pid: int) -> int | None:
+            # First read authorizes the TERM against the true identity;
+            # every later read simulates the PID having been reused.
+            calls["n"] += 1
+            return real if calls["n"] == 1 else real + 1
+
+        monkeypatch.setattr(guard, "proc_start_ticks", shifting_ticks)
+        with pytest.raises(AssertionError, match="never signalled"):
+            guard.teardown_tracked()
+        # TERM was delivered to the original identity...
+        while not term_marker.exists():
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert term_marker.exists(), "TERM was never delivered"
+        assert term_marker.read_text(encoding="utf-8") == f"{proc.pid}:term"
+        # ...and the KILL was never delivered to the changed identity.
+        assert pid_live(proc.pid)
+    finally:
+        monkeypatch.undo()
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+        if proc.stdout is not None:
+            proc.stdout.close()
+    assert proc.pid not in guard.TRACKED
 
 
 def test_register_ignores_already_terminal_process() -> None:

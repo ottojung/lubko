@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import pytest
 
@@ -201,42 +201,65 @@ def _stop_nested_pytest(scenario: _Scenario) -> None:
 def _retire_marker_descendants(marker: Path) -> list[str]:
     """Fail-closed retire every marker-recorded descendant identity.
 
-    Each recorded identity is re-verified against current start ticks
-    immediately before every signal; unresolved or reused identities are
-    never signalled and are reported instead.  Used only on the forced wedge
-    path, before the owner itself may be retired.
+    Marker coverage is validated positively: a missing/unreadable/malformed
+    marker, an entry with missing or invalid ticks, an identity that no
+    longer matches its PID occupant, or a descendant not proven gone are all
+    reported as problems.  Identities are re-verified against current start
+    ticks immediately before every signal; unresolved ones are never
+    signalled.  Used only on the forced wedge path, before the owner itself
+    may be retired.
 
     Args:
         marker: Marker file with ``[{"pid": ..., "ticks": ...}]`` entries.
 
     Returns:
-        Human-readable problems for identities that could not be retired.
+        Human-readable problems; empty only when every recorded descendant
+        is positively proven gone.
     """
-    problems: list[str] = []
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return [f"marker file missing: {marker}; descendant coverage unproven"]
     except (OSError, ValueError):
-        return problems
+        return [f"marker file malformed: {marker}; descendant coverage unproven"]
     if not isinstance(payload, list):
-        return problems
+        return ["marker payload is not a list; descendant coverage unproven"]
+
+    problems: list[str] = []
     for entry in payload:
-        if not isinstance(entry, dict):
+        identity = _valid_identity(entry)
+        if identity is None:
+            problems.append(f"marker entry {entry!r} has missing/invalid identity")
             continue
-        pid = entry.get("pid")
-        ticks = entry.get("ticks")
-        if not isinstance(pid, int) or not isinstance(ticks, int) or ticks <= 0:
+        pid, ticks = identity
+        if guard.proc_start_ticks(pid) != ticks:
+            problems.append(f"descendant pid {pid} identity unresolved/reused; never signalled")
             continue
         for sig in (signal.SIGTERM, signal.SIGKILL):
             if _wait_gone(pid, 5.0):
                 break
             guard.signal_identity_checked(pid, ticks, sig)
-        if _wait_gone(pid, 5.0):
-            continue
-        if guard.proc_start_ticks(pid) != ticks:
-            problems.append(f"descendant pid {pid} identity unresolved; not signalled")
-        else:
+        if not _wait_gone(pid, 5.0):
             problems.append(f"descendant pid {pid} did not retire")
     return problems
+
+
+def _valid_identity(entry: object) -> tuple[int, int] | None:
+    """Return a validated ``(pid, ticks)`` pair from a raw marker entry.
+
+    Args:
+        entry: One raw marker entry.
+
+    Returns:
+        The validated pair, or ``None`` when malformed or out of range.
+    """
+    if not isinstance(entry, dict):
+        return None
+    pid = entry.get("pid")
+    ticks = entry.get("ticks")
+    if not isinstance(pid, int) or not isinstance(ticks, int) or ticks <= 0:
+        return None
+    return pid, ticks
 
 
 @dataclass
@@ -287,11 +310,15 @@ def owned_run(
 def _retire_wedged_owner(handle: OwnedRun, problems: list[str]) -> None:
     """Retire a wedged owner fail-closed after its recorded descendants.
 
-    Descendants are retired first: killing the subreaper owner before them
-    could strand adopted session-leader grandchildren under container PID 1.
-    The owner is signalled only under its registration-time PID+start-ticks
-    identity, re-verified immediately before every TERM/KILL; an unresolved
-    or reused identity is never signalled and is reported instead.
+    Descendant marker coverage is a POSITIVE prerequisite to owner
+    retirement: a missing/malformed marker, any invalid/missing-tick or
+    unresolved/reused descendant identity, or any descendant not proven gone
+    blocks ALL owner signalling — killing the subreaper owner before its
+    adopted session-leader descendants could strand them under container
+    PID 1.  Only once every recorded descendant is proven gone is the owner
+    signalled under its registration-time PID+start-ticks identity,
+    re-verified immediately before every TERM/KILL; an unresolved or reused
+    owner identity is never signalled and is reported instead.
 
     Args:
         handle: The owned-run handle whose owner wedged.
@@ -299,6 +326,11 @@ def _retire_wedged_owner(handle: OwnedRun, problems: list[str]) -> None:
     """
     owner = handle.owner
     problems.extend(_retire_marker_descendants(handle.scenario.marker))
+    if problems:
+        # Descendant containment is unresolved: the subreaper owner must
+        # stay alive and untouched so nothing can leak under PID 1.
+        problems.append("owner left unsignalled: descendant containment unresolved")
+        return
     tracked = guard.TRACKED.get(owner.pid)
     ticks = tracked.start_ticks if tracked is not None else None
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -739,6 +771,106 @@ CANONICAL_SUITE_ARGS: Final = (
     "-p",
     "no:cacheprovider",
 )
+
+
+def test_wedged_owner_not_signalled_while_descendant_unresolved(
+    tmp_path: Path,
+) -> None:
+    """An unresolved live descendant blocks ALL owner signalling.
+
+    Deterministic wedge: a duck-typed owner never exits, and its marker
+    records a live descendant whose start ticks do not match
+    (unresolved/reused).  The finalizer must refuse to signal both the
+    unresolved descendant and the owner itself, and must raise loudly
+    instead of silently passing.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    before = _ambient_digest()
+    innocent_owner = subprocess.Popen(
+        ["/bin/sleep", "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    innocent_descendant = subprocess.Popen(
+        ["/bin/sleep", "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        descendant_ticks = guard.proc_start_ticks(innocent_descendant.pid)
+        assert descendant_ticks is not None
+        _run_wedge_scenario(
+            _Scenario(tmp_path, "wedge"),
+            innocent_owner,
+            innocent_descendant,
+            descendant_ticks + 1,
+        )
+        assert _proc_state(innocent_owner.pid) is not None
+        assert _proc_state(innocent_descendant.pid) is not None
+    finally:
+        for proc in (innocent_owner, innocent_descendant):
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=10)
+    assert isolation.ambient_sentinel_alive()
+    assert _ambient_digest() == before
+
+
+def _run_wedge_scenario(
+    scenario: _Scenario,
+    innocent_owner: subprocess.Popen[bytes],
+    innocent_descendant: subprocess.Popen[bytes],
+    recorded_descendant_ticks: int,
+) -> None:
+    """Drive wedged-owner convergence with an unresolved live descendant.
+
+    Args:
+        scenario: Scenario artifacts (marker/result paths).
+        innocent_owner: Live process whose PID stands in for the wedged owner.
+        innocent_descendant: Live unresolved descendant recorded in the marker.
+        recorded_descendant_ticks: Deliberately wrong ticks for the marker.
+    """
+    scenario.marker.write_text(
+        json.dumps([{"pid": innocent_descendant.pid, "ticks": recorded_descendant_ticks}]),
+        encoding="utf-8",
+    )
+    handles: list[OwnedRun] = []
+
+    class WedgedOwner:
+        """Duck-typed Popen stand-in that never exits."""
+
+        pid = innocent_owner.pid
+
+        @staticmethod
+        def poll() -> int | None:
+            return None
+
+        @staticmethod
+        def wait(timeout: float | None = None) -> int:
+            raise subprocess.TimeoutExpired(cmd="wedged-owner", timeout=timeout or 0.0)
+
+    def start() -> subprocess.Popen[bytes]:
+        return cast("subprocess.Popen[bytes]", WedgedOwner())
+
+    with (
+        pytest.raises(AssertionError, match="did not converge"),
+        owned_run(scenario, start) as handle,
+    ):
+        handles.append(handle)
+
+    assert handles[0].owner.poll() is None
+    # Neither the unresolved descendant nor the owner-pid occupant was hit.
+    assert _proc_state(innocent_descendant.pid) is not None
+    assert _proc_state(innocent_owner.pid) is not None
+    # The registry entry stays because the owner was never proven terminal;
+    # forget it here so the test leaves no registry residue behind.
+    guard.unregister(handles[0].owner)
 
 
 def test_repeated_repository_suite_under_owner_preserves_ambient(
