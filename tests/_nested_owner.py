@@ -77,21 +77,23 @@ def _become_subreaper() -> bool:
     return result == 0
 
 
-def _signal_group_checked(pid: int, ticks: int | None, sig: signal.Signals) -> bool:
+def _signal_group_checked(pid: int, ticks: int, sig: signal.Signals) -> bool:
     """Signal an exact group only while its recorded identity still matches.
+
+    Identity verification is mandatory: a signal is only ever authorized by
+    a valid recorded tick value that still matches the live occupant of the
+    PID.  Missing or unreadable ticks never authorize a signal.
 
     Args:
         pid: Exact PID (and expected group leader) to signal.
-        ticks: Recorded start ticks; ``None`` disables verification.
+        ticks: Recorded start ticks; must be valid and current.
         sig: Signal to deliver.
 
     Returns:
         ``True`` when the signal was delivered.
     """
-    if ticks is not None:
-        current = _proc_start_ticks(pid)
-        if current != ticks:
-            return False
+    if ticks <= 0 or _proc_start_ticks(pid) != ticks:
+        return False
     with contextlib.suppress(ProcessLookupError):
         os.killpg(pid, sig)
     return True
@@ -125,12 +127,12 @@ def _observe(entry_pid: int, result: dict[str, object]) -> bool:
     return seen_alive
 
 
-def _stop_exact(entry_pid: int, entry_ticks: int | None, result: dict[str, object]) -> bool:
+def _stop_exact(entry_pid: int, entry_ticks: int, result: dict[str, object]) -> bool:
     """Stop a live survivor by its exact verified group (TERM, then KILL).
 
     Args:
         entry_pid: Exact PID (and expected group leader) to stop.
-        entry_ticks: Recorded start ticks for identity verification.
+        entry_ticks: Recorded start ticks; must be valid and current.
         result: Result dictionary updated in place.
 
     Returns:
@@ -173,7 +175,7 @@ def _reap_exact(entry_pid: int, result: dict[str, object]) -> None:
     result["contained"] = False
 
 
-def _contain(entry_pid: int, entry_ticks: int | None, result: dict[str, object]) -> None:
+def _contain(entry_pid: int, entry_ticks: int, result: dict[str, object]) -> None:
     """Synchronously own and reap one recorded descendant identity.
 
     Observes the process without ever accepting a reparent under container
@@ -212,6 +214,7 @@ def main() -> int:
         "subreaper": _become_subreaper(),
         "observed_ppid_1": False,
         "identity_mismatch": False,
+        "unresolved_ticks": False,
         "contained": True,
     }
     proc = subprocess.Popen(
@@ -248,15 +251,19 @@ def main() -> int:
         ticks = entry.get("ticks")
         if not isinstance(pid, int):
             continue
-        tick_value = ticks if isinstance(ticks, int) else None
-        if tick_value is not None:
-            current = _proc_start_ticks(pid)
-            if current is not None and current != tick_value:
-                # A different live process occupies the PID: never signal it.
-                result["identity_mismatch"] = True
-                result["contained"] = False
-                continue
-        _contain(pid, tick_value, result)
+        if not isinstance(ticks, int) or ticks <= 0:
+            # Missing or invalid recorded ticks: containment is unresolved
+            # and no signal is ever authorized for this identity.
+            result["unresolved_ticks"] = True
+            result["contained"] = False
+            continue
+        current = _proc_start_ticks(pid)
+        if current is not None and current != ticks:
+            # A different live process occupies the PID: never signal it.
+            result["identity_mismatch"] = True
+            result["contained"] = False
+            continue
+        _contain(pid, ticks, result)
 
     args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
     return 0 if result["contained"] is True else 1

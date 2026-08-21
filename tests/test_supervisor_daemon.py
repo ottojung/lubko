@@ -44,14 +44,13 @@ from lubko.state import cli_root_dir, rollback_state_path
 from lubko.supervisor import Settings, SupervisorDaemon
 from lubko.supervisor import main as supervisor_main
 from lubko.worker import group_has_members
+from tests import _pg
 from tests import _process_guard as guard
 from tests.test_cli import make_repo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from uuid import UUID
-
-    from tests import _pg
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
@@ -823,6 +822,241 @@ def test_database_outage_restart_backs_off_until_readiness(
         wait_until(status_ready, timeout=60.0)
         probe_id = insert_pending_job(jobs_db, str(tmp_path), "echo recovered")
         wait_until(lambda: read_status_of(jobs_db, probe_id) == "succeeded", timeout=60.0)
+
+
+@pytest.fixture
+def second_pg_cluster(tmp_path: Path) -> Iterator[_pg.PgCluster]:
+    """Start a second independent pytest-owned PostgreSQL cluster.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Yields:
+        The running second cluster.
+    """
+    binaries = _pg.postgres_binaries()
+    if binaries is None:
+        pytest.skip("PostgreSQL server binaries not available on this host")
+    root = tmp_path / "pg-second"
+    data_dir = root / "data"
+    socket_dir = root / "sock"
+    socket_dir.mkdir(parents=True)
+    port = _pg.free_port()
+    env = dict(os.environ)
+    lib = _pg.postgres_lib_dir(Path(binaries["postgres"]).parent)
+    if lib is not None:
+        env["LD_LIBRARY_PATH"] = lib
+    subprocess.run(
+        [binaries["initdb"], "-D", str(data_dir), "-U", "postgres", "--auth=trust"],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    cluster = _pg.PgCluster(binaries, data_dir, socket_dir, port, env)
+    cluster.start()
+    try:
+        yield cluster
+    finally:
+        cluster.stop()
+
+
+def _apply_jobs_baseline(conninfo: str) -> None:
+    """Apply the canonical baseline on a fresh ``lubko.jobs`` table.
+
+    Args:
+        conninfo: Connection string of the target cluster.
+    """
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+
+
+def _stack_b_environment(
+    tmp_path: Path,
+    supervisor_env: dict[str, str],
+    cluster: _pg.PgCluster,
+    xdg_b: Path,
+) -> dict[str, str]:
+    """Build the full environment for the independent second stack.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        supervisor_env: The stack-A environment to derive from.
+        cluster: The second PostgreSQL cluster.
+        xdg_b: The pytest-owned XDG root for stack B.
+
+    Returns:
+        The environment for stack B's supervisor and its worker.
+    """
+    conf_b = tmp_path / "stack-b" / "database.conf"
+    conf_b.parent.mkdir(parents=True, exist_ok=True)
+    conf_b.write_text(
+        f"host={cluster.socket_dir}\n"
+        f"port={cluster.port}\n"
+        "dbname=postgres\n"
+        "user=postgres\n"
+        "password=local-trust\n",
+        encoding="utf-8",
+    )
+    conf_b.chmod(0o600)
+    env_b = dict(supervisor_env)
+    env_b["LUBKO_DATABASE_CONFIG"] = str(conf_b)
+    for env_key in (
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_BIN_HOME",
+    ):
+        env_b[env_key] = str(xdg_b / env_key.removeprefix("XDG_").lower())
+    return env_b
+
+
+def _with_stack_b_env(
+    monkeypatch: pytest.MonkeyPatch,
+    env_b: dict[str, str],
+    action: Callable[[], object],
+) -> None:
+    """Run ``action`` with stack B's XDG root authoritative.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        env_b: The stack-B environment.
+        action: The callable to run.
+    """
+    with monkeypatch.context() as m:
+        for env_key, value in env_b.items():
+            if env_key.startswith("XDG_"):
+                m.setenv(env_key, value)
+        action()
+
+
+@pytest.fixture
+def stack_a(
+    jobs_db: str,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> tuple[Path, str, dict[str, str], str]:
+    """Bundle the stack-A repo, commit, environment, and queue connection.
+
+    Args:
+        jobs_db: Baseline queue connection for stack A's readiness probe.
+        maintained_env: The two-commit repository.
+        supervisor_env: The stack-A environment.
+
+    Returns:
+        The ``(repo, first_commit, env, conninfo)`` quadruple.
+    """
+    repo, first, _second = maintained_env
+    return repo, first, supervisor_env, jobs_db
+
+
+def _prepare_stack_b(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supervisor_env: dict[str, str],
+    cluster: _pg.PgCluster,
+) -> tuple[Path, str, dict[str, str]]:
+    """Build repo, CLI root, and environment for the independent stack B.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+        supervisor_env: The stack-A environment to derive from.
+        cluster: The second PostgreSQL cluster.
+
+    Returns:
+        The ``(repo, first_commit, env)`` triple for stack B.
+    """
+    _apply_jobs_baseline(cluster.conninfo())
+    env_b = _stack_b_environment(tmp_path, supervisor_env, cluster, tmp_path / "stack-b" / "xdg")
+    repo_b, first_b, _second_b = make_repo(tmp_path / "repo-b")
+    with monkeypatch.context() as m:
+        for env_key, value in env_b.items():
+            if env_key.startswith("XDG_"):
+                m.setenv(env_key, value)
+        cli.build_cli_root(repo_b, first_b, "uv", 60.0)
+    return repo_b, first_b, env_b
+
+
+def test_two_simultaneous_owned_stacks_never_cross_talk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stack_a: tuple[Path, str, dict[str, str], str],
+    second_pg_cluster: _pg.PgCluster,
+) -> None:
+    """Two simultaneous cluster+supervisor+worker stacks stay fully isolated.
+
+    Each stack lives in its own pytest-owned XDG root and its own PostgreSQL
+    cluster.  Both supervisors run concurrently with exactly one worker each;
+    status surfaces, workers, and queues never cross; and teardown retires
+    every process by exact identity with nothing left alive or reparented to
+    PID 1.
+    """
+    repo_a, first_a, supervisor_env, conninfo_a = stack_a
+
+    # Independent baselines: stack A's queue is refreshed by its fixture.
+    repo_b, first_b, env_b = _prepare_stack_b(
+        tmp_path, monkeypatch, supervisor_env, second_pg_cluster
+    )
+
+    proc_a = start_supervisor(supervisor_env)
+    proc_b = start_supervisor(env_b)
+
+    def read_b() -> supervise.SupervisorStatus | None:
+        status: supervise.SupervisorStatus | None = None
+
+        def read() -> None:
+            nonlocal status
+            status = supervise.read_status()
+
+        _with_stack_b_env(monkeypatch, env_b, read)
+        return status
+
+    try:
+        request_and_wait(first_a, repo_a)
+        _with_stack_b_env(
+            monkeypatch,
+            env_b,
+            lambda: request_and_wait(first_b, repo_b),
+        )
+
+        pid_a = worker_pid()
+        assert pid_a is not None
+        status_a = supervise.read_status()
+        assert status_a is not None
+        assert status_a.ready is True
+        assert status_a.commit == first_a
+        assert len(direct_children(status_a.supervisor_pid)) == 1
+
+        status_b = read_b()
+        assert status_b is not None
+        assert status_b.child is not None
+        pid_b = status_b.child.pid
+        assert pid_a != pid_b
+        assert status_b.ready is True
+        assert status_b.commit == first_b
+        assert len(direct_children(status_b.supervisor_pid)) == 1
+
+        # Queue isolation: each worker consumes only its own cluster's queue.
+        probe_a = insert_pending_job(conninfo_a, str(tmp_path), "echo stack-a")
+        wait_until(
+            lambda: read_status_of(conninfo_a, probe_a) == "succeeded",
+            timeout=60.0,
+        )
+        probe_b = insert_pending_job(second_pg_cluster.conninfo(), str(tmp_path), "echo stack-b")
+        wait_until(
+            lambda: read_status_of(second_pg_cluster.conninfo(), probe_b) == "succeeded",
+            timeout=60.0,
+        )
+    finally:
+        stop_supervisor(proc_a)
+        stop_supervisor(proc_b)
+
+    # Exact cleanup: no test-owned process survives, so none can reparent.
+    assert not process_alive(pid_a)
+    assert not process_alive(pid_b)
 
 
 def test_live_worker_db_outage_is_not_duplicated(

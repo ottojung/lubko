@@ -333,3 +333,133 @@ def test_repeated_nested_isolation_runs_leave_ambient_untouched(
         assert _read_result(scenario.result)["contained"] is True
         assert isolation.ambient_sentinel_alive()
         assert _ambient_digest() == digest_before
+
+
+def test_owner_refuses_missing_marker_ticks_and_never_signals(
+    tmp_path: Path,
+) -> None:
+    """A marker entry without valid ticks is unresolved containment failure.
+
+    The independent owner must not signal an identity whose recorded start
+    ticks are missing: an innocent live occupant of that PID stays untouched
+    and the owner reports unresolved containment (nonzero exit).
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    marker = tmp_path / "missing-ticks.marker.json"
+    result = tmp_path / "missing-ticks.result.json"
+    pidfile = tmp_path / "missing-ticks.pid"
+    innocent = subprocess.Popen(
+        ["/bin/sleep", "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        # Deliberately omit "ticks" from the marker entry.
+        marker.write_text(json.dumps([{"pid": innocent.pid}]), encoding="utf-8")
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "tests._nested_owner",
+                "--marker",
+                str(marker),
+                "--result",
+                str(result),
+                "--pidfile",
+                str(pidfile),
+                "--deadline",
+                "30",
+                "--",
+                sys.executable,
+                "-c",
+                "pass",
+            ],
+            cwd=REPO_ROOT,
+            env=dict(os.environ),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert done.returncode == 1
+        payload = _read_result(result)
+        assert payload["unresolved_ticks"] is True
+        assert payload["contained"] is False
+        assert payload["observed_ppid_1"] is False
+        assert innocent.poll() is None
+    finally:
+        if innocent.poll() is None:
+            innocent.kill()
+            innocent.wait(timeout=10)
+
+
+# Canonical selection for in-suite repository stress: the whole repository
+# test suite except the stress harness itself, which is excluded because a
+# nested session spawning further nested sessions would recurse unboundedly.
+CANONICAL_SUITE_ARGS: Final = (
+    "tests",
+    "--ignore=tests/test_isolation_stress.py",
+    "-q",
+    "--no-header",
+    "-p",
+    "no:cacheprovider",
+)
+
+
+def test_repeated_repository_suite_under_owner_preserves_ambient(
+    tmp_path: Path,
+) -> None:
+    """Two nested runs of the canonical repository suite keep ambient intact.
+
+    Each run executes the entire suite (minus this stress harness) under the
+    independent exact-identity owner.  After each run the ambient sentinel
+    worker must still be alive and the ambient production-like state tree
+    must be byte-for-byte identical to before the suite ever started.
+
+    Args:
+        tmp_path: Pytest temporary directory for owner artifacts.
+    """
+    assert isolation.ambient_sentinel_alive()
+    digest_before = _ambient_digest()
+    for iteration in range(2):
+        marker = tmp_path / f"suite-{iteration}.marker.json"
+        result = tmp_path / f"suite-{iteration}.result.json"
+        pidfile = tmp_path / f"suite-{iteration}.pid"
+        owner = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests._nested_owner",
+                "--marker",
+                str(marker),
+                "--result",
+                str(result),
+                "--pidfile",
+                str(pidfile),
+                "--deadline",
+                "3600",
+                "--",
+                sys.executable,
+                "-m",
+                "pytest",
+                *CANONICAL_SUITE_ARGS,
+            ],
+            cwd=REPO_ROOT,
+            env=dict(os.environ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            assert owner.wait(timeout=3600) == 0, result.read_text()
+            contained = _read_result(result)
+            assert contained["contained"] is True
+            assert contained["observed_ppid_1"] is False
+        finally:
+            for path in (marker, result, pidfile):
+                path.unlink(missing_ok=True)
+        assert isolation.ambient_sentinel_alive()
+        assert _ambient_digest() == digest_before
