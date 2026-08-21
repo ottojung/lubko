@@ -532,7 +532,12 @@ class _Scenario:
             env_overrides={"NESTED_MODE": mode},
         )
 
-    def run_module(self, module: Path, deadline: float = 120.0) -> subprocess.Popen[bytes]:
+    def run_module(
+        self,
+        module: Path,
+        deadline: float = 120.0,
+        env_overrides: dict[str, str] | None = None,
+    ) -> subprocess.Popen[bytes]:
         """Start an owned nested pytest run of an arbitrary generated module.
 
         Public harness entry point so same-package regressions can drive
@@ -544,6 +549,7 @@ class _Scenario:
         Args:
             module: Generated test module to run.
             deadline: Owner-enforced wall-clock limit for the nested run.
+            env_overrides: Additional environment for the nested run.
 
         Returns:
             The independent owner process.
@@ -551,6 +557,7 @@ class _Scenario:
         return self._start_owner(
             [str(module), "-q", "--no-header", "-p", "no:cacheprovider"],
             deadline=deadline,
+            env_overrides=env_overrides,
         )
 
     def run_isolation_module(self, deadline: float = 300.0) -> subprocess.Popen[bytes]:
@@ -925,6 +932,108 @@ def test_forced_outer_failure_converges_without_pid_1_orphans(tmp_path: Path) ->
     assert _ambient_digest() == before
 
 
+NONLEADER_MODULE: Final = """
+import os, signal, subprocess, sys, time
+
+sys.path.insert(0, "__REPO_ROOT__")
+
+from tests import _process_guard as guard
+
+
+def test_nonleader_survivor() -> None:
+    '''Register a non-group-leader sleeper plus an unregistered sibling.
+
+    Both share the nested pytest's process group.  Containment of the
+    registered survivor must therefore use an exact-PID signal: a shared
+    group signal would kill the unregistered sibling (and the owner).
+    '''
+    survivor = subprocess.Popen(
+        ["/bin/sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    sibling = subprocess.Popen(
+        ["/bin/sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    assert os.getpgid(survivor.pid) != survivor.pid
+    guard.register(survivor)
+    with open(os.environ["NESTED_SIDECAR"], "w") as handle:
+        handle.write(str(survivor.pid) + " " + str(sibling.pid) + "\\n")
+    time.sleep(300)
+""".replace("__REPO_ROOT__", str(REPO_ROOT))
+
+
+def test_nonleader_survivor_contained_exactly_without_shared_group_signal(
+    tmp_path: Path,
+) -> None:
+    """A non-leader survivor is killed by exact PID; siblings stay alive.
+
+    After abrupt nested-pytest death the owner must contain the registered
+    non-group-leader descendant by revalidated exact-PID signalling — never
+    by signalling its shared group, which still contains the unregistered
+    innocent sibling (and would reach the owner itself).
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    before = _ambient_digest()
+    scenario = _Scenario(tmp_path, "nonleader")
+    sidecar = tmp_path / "nonleader.sidecar"
+    module = tmp_path / "nonleader.py"
+    module.write_text(NONLEADER_MODULE, encoding="utf-8")
+    with owned_run(
+        scenario,
+        partial(
+            scenario.run_module,
+            module,
+            env_overrides={"NESTED_SIDECAR": str(sidecar)},
+        ),
+    ) as handle:
+        deadline = time.monotonic() + 60.0
+        while not sidecar.exists() and time.monotonic() < deadline:
+            if handle.owner.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert sidecar.exists(), scenario.log.read_text(errors="replace")
+        entries, unproven = _read_marker_entries(scenario.marker)
+        while (unproven or not entries) and time.monotonic() < deadline:
+            if handle.owner.poll() is not None:
+                break
+            time.sleep(0.05)
+            entries, unproven = _read_marker_entries(scenario.marker)
+        assert entries
+        assert not unproven
+        # Abruptly kill only the nested pytest.
+        identity = _read_pidfile(scenario.pidfile)
+        assert identity is not None
+        os.kill(identity[0], signal.SIGKILL)
+        assert handle.owner.wait(timeout=60) == 0
+
+    survivor_pid_text, sibling_pid_text = sidecar.read_text().split()
+    survivor_pid = int(survivor_pid_text)
+    sibling_pid = int(sibling_pid_text)
+    # After nested-pytest death BOTH processes are adopted descendants of
+    # the subreaper; the lifetime rule requires the owner to contain every
+    # one of them before returning — registered or not.
+    wait_gone_deadline = time.monotonic() + 30.0
+    while time.monotonic() < wait_gone_deadline and (
+        _proc_state(survivor_pid) is not None or _proc_state(sibling_pid) is not None
+    ):
+        time.sleep(0.05)
+    assert _proc_state(survivor_pid) in {None, "Z"}
+    assert _proc_state(sibling_pid) in {None, "Z"}
+    payload = _assert_containment(scenario.result)
+    assert payload["survivor_seen"] is True
+    assert isolation.ambient_sentinel_alive()
+    assert _ambient_digest() == before
+
+
 def test_repeated_nested_isolation_runs_leave_ambient_untouched(
     tmp_path: Path,
 ) -> None:
@@ -1069,8 +1178,13 @@ def test_owner_fails_closed_on_unproven_marker_coverage(
     result = tmp_path / "coverage.result.json"
     marker = tmp_path / "coverage.marker.json"
     marker.write_text(marker_body, encoding="utf-8")
-    rc = _nested_owner.main(
+    # Run the owner in an independent subprocess: the outer pytest process
+    # must never acquire PR_SET_CHILD_SUBREAPER itself.
+    done = subprocess.run(
         [
+            sys.executable,
+            "-m",
+            "tests._nested_owner",
             "--marker",
             str(marker),
             "--result",
@@ -1084,8 +1198,14 @@ def test_owner_fails_closed_on_unproven_marker_coverage(
             "-c",
             "pass",
         ],
+        cwd=REPO_ROOT,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
-    assert rc == 1
+    assert done.returncode == 1
     payload = _read_result(result)
     assert payload["contained"] is False
 
@@ -1103,8 +1223,12 @@ def test_owner_fails_closed_when_child_removes_marker(tmp_path: Path) -> None:
     """
     result = tmp_path / "removed-marker.result.json"
     marker = tmp_path / "removed-marker.marker.json"
-    rc = _nested_owner.main(
+    # Independent subprocess: the outer pytest must not become a subreaper.
+    done = subprocess.run(
         [
+            sys.executable,
+            "-m",
+            "tests._nested_owner",
             "--marker",
             str(marker),
             "--result",
@@ -1118,11 +1242,186 @@ def test_owner_fails_closed_when_child_removes_marker(tmp_path: Path) -> None:
             "-c",
             f"import os; os.unlink({str(marker)!r})",
         ],
+        cwd=REPO_ROOT,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
     )
-    assert rc == 1
+    assert done.returncode == 1
     payload = _read_result(result)
     assert payload["coverage_unproven"] is True
     assert payload["contained"] is False
+
+
+def _wait_for_child_of(nested_pid: int | None, timeout: float) -> int | None:
+    """Wait until a live direct child of ``nested_pid`` appears.
+
+    Args:
+        nested_pid: Parent PID from the owner pidfile, if known yet.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        The discovered child PID, or ``None`` on timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if nested_pid is not None:
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    stat = (entry / "stat").read_bytes()
+                except OSError:
+                    continue
+                close = stat.rfind(b")")
+                if close == -1:
+                    continue
+                fields = stat[close + 2 :].split()
+                if len(fields) >= 4 and int(fields[1]) == nested_pid:
+                    return int(entry.name)
+        time.sleep(0.05)
+    return None
+
+
+def _start_torn_coverage_owner(
+    module: Path,
+    result: Path,
+    marker: Path,
+    pidfile: Path,
+    log: Path,
+) -> subprocess.Popen[bytes]:
+    """Start the independent owner around the torn-coverage subject.
+
+    Args:
+        module: Generated subject module.
+        result: Owner result path.
+        marker: Owner marker path.
+        pidfile: Owner pidfile path.
+        log: Log file for combined output.
+
+    Returns:
+        The owner process.
+    """
+    env = dict(os.environ)
+    # Canonical automatic recording: registrations append to this marker;
+    # the generated subject then deliberately deletes it to prove that torn
+    # coverage never orphans a live descendant.
+    env[guard.OWNER_MARKER_ENV] = str(marker)
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "tests._nested_owner",
+            "--marker",
+            str(marker),
+            "--result",
+            str(result),
+            "--pidfile",
+            str(pidfile),
+            "--deadline",
+            "60",
+            "--",
+            sys.executable,
+            "-m",
+            "pytest",
+            str(module),
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=log.open("ab"),
+        stderr=subprocess.STDOUT,
+    )
+
+
+def test_owner_stays_alive_and_contains_despite_torn_coverage(tmp_path: Path) -> None:
+    """Torn/deleted coverage never orphans a live registered descendant.
+
+    The nested subject registers a session-leader sleeper (auto-recorded),
+    then deletes the owner marker, then blocks.  After an abrupt SIGKILL of
+    the nested pytest the owner must still discover the adopted descendant,
+    contain it by its exact identity, and only then exit — with unproven
+    coverage reported and no PID-1 transition ever observed.  Executed as
+    an independent subprocess so the outer pytest never becomes a
+    subreaper.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    before = _ambient_digest()
+    module = tmp_path / "torn_coverage_subject.py"
+    module.write_text(
+        f'''
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, {str(REPO_ROOT)!r})
+
+from tests import _process_guard as guard
+
+
+def test_register_then_delete_marker() -> None:
+    """Register a leader, delete the marker, and block forever."""
+    proc = subprocess.Popen(
+        ["/bin/sleep", "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(proc)
+    os.unlink(os.environ[{guard.OWNER_MARKER_ENV!r}])
+    time.sleep(300)
+''',
+        encoding="utf-8",
+    )
+    result = tmp_path / "torn.result.json"
+    marker = tmp_path / "torn.marker.json"
+    pidfile = tmp_path / "torn.pid"
+    log = tmp_path / "torn.log"
+    owner = _start_torn_coverage_owner(module, result, marker, pidfile, log)
+    try:
+        deadline = time.monotonic() + 60.0
+        nested_pid: int | None = None
+        leader_pid: int | None = None
+        while time.monotonic() < deadline:
+            if nested_pid is None and pidfile.exists():
+                payload = json.loads(pidfile.read_text(encoding="utf-8"))
+                candidate = payload.get("pid")
+                if isinstance(candidate, int):
+                    nested_pid = candidate
+            leader_pid = _wait_for_child_of(nested_pid, timeout=1.0)
+            if leader_pid is not None:
+                break
+        assert leader_pid is not None, "registered descendant never appeared"
+        # Abruptly kill only the nested pytest; coverage was already torn.
+        assert nested_pid is not None
+        os.kill(nested_pid, signal.SIGKILL)
+        assert owner.wait(timeout=120) == 1
+        payload = _read_result(result)
+        assert payload["coverage_unproven"] is True
+        assert payload["contained"] is False
+        assert payload["observed_ppid_1"] is False
+        assert payload["survivor_seen"] is True
+        wait_gone_deadline = time.monotonic() + 10.0
+        while _proc_state(leader_pid) is not None and time.monotonic() < wait_gone_deadline:
+            time.sleep(0.05)
+        assert _proc_state(leader_pid) in {None, "Z"}
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=10)
+    assert isolation.ambient_sentinel_alive()
+    assert _ambient_digest() == before
 
 
 def test_retire_marker_descendants_accepts_already_absent(tmp_path: Path) -> None:

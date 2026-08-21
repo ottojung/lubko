@@ -80,30 +80,49 @@ def _become_subreaper() -> bool:
     return result == 0
 
 
-def _signal_group_checked(pid: int, ticks: int, sig: signal.Signals) -> bool:
-    """Signal an exact group only while its recorded identity still matches.
+def _signal_exact_or_group(
+    pid: int,
+    ticks: int,
+    sig: signal.Signals,
+    owned_group: int | None = None,
+) -> bool:
+    """Signal one descendant using the shared guard's ownership semantics.
 
-    Identity verification is mandatory: a signal is only ever authorized by
-    a valid recorded tick value that still matches the live occupant of the
-    PID.  Missing or unreadable ticks never authorize a signal.
+    The PID+start-ticks identity is re-verified immediately before every
+    signal.  When ``owned_group`` names a dedicated group whose ownership
+    was established (while the leader's identity was valid) before an
+    earlier TERM, that group is signalled even if the leader itself has
+    since exited.  Otherwise a session/process-group leader's whole
+    dedicated group is signalled; a non-leader receives an exact-PID signal
+    only, never its shared group.
 
     Args:
-        pid: Exact PID (and expected group leader) to signal.
-        ticks: Recorded start ticks; must be valid and current.
+        pid: Exact PID to signal.
+        ticks: Recorded start ticks; must currently match.
         sig: Signal to deliver.
+        owned_group: A previously-proven dedicated group, if any.
 
     Returns:
         ``True`` when the signal was delivered.
     """
-    if ticks <= 0 or _proc_start_ticks(pid) != ticks:
+    current = _proc_start_ticks(pid)
+    if ticks <= 0 or current is None or current != ticks:
         return False
     with contextlib.suppress(ProcessLookupError):
-        os.killpg(pid, sig)
-    return True
+        if owned_group is not None:
+            os.killpg(owned_group, sig)
+            return True
+        pgid = os.getpgid(pid)
+        if pgid == pid:
+            os.killpg(pgid, sig)
+        else:
+            os.kill(pid, sig)
+        return True
+    return False
 
 
-def _observe(entry_pid: int, result: dict[str, object]) -> bool:
-    """Observe the process until it is gone, zombie, or the grace expires.
+def _observe(entry_pid: int, result: dict[str, object]) -> str | None:
+    """Observe the process until it exits, becomes zombie, or grace expires.
 
     Every observation asserts the parent is never container PID 1.
 
@@ -112,43 +131,89 @@ def _observe(entry_pid: int, result: dict[str, object]) -> bool:
         result: Result dictionary updated in place.
 
     Returns:
-        ``True`` when the process was seen alive during the window.
+        The last observed state letter, or ``None`` when truly absent.
     """
     deadline = time.monotonic() + GRACE_SECONDS
-    seen_alive = False
+    state_letter: str | None = None
     while time.monotonic() < deadline:
         state = _pid_state_ppid(entry_pid)
         if state is None:
-            break
-        seen_alive = True
-        state_letter, parent_pid = state
+            return None
+        state_letter = state[0]
+        parent_pid = state[1]
         if parent_pid == 1:
             result["observed_ppid_1"] = True
         if state_letter == "Z":
             break
         time.sleep(POLL_SECONDS)
-    return seen_alive
+    return state_letter
 
 
-def _stop_exact(entry_pid: int, entry_ticks: int, result: dict[str, object]) -> bool:
-    """Stop a live survivor by its exact verified group (TERM, then KILL).
+def _escalate(
+    entry_pid: int,
+    entry_ticks: int,
+    owned_group: int | None,
+    result: dict[str, object],
+) -> bool:
+    """Deliver the escalation KILL by exact/group ownership rules.
+
+    An already-proven dedicated group is signalled even when its leader has
+    since exited; a non-leader PID is revalidated (PID plus start ticks)
+    immediately before its exact-PID KILL and never receives shared-group
+    signalling.
 
     Args:
-        entry_pid: Exact PID (and expected group leader) to stop.
-        entry_ticks: Recorded start ticks; must be valid and current.
+        entry_pid: Exact PID of the survivor.
+        entry_ticks: Recorded start ticks.
+        owned_group: Dedicated group proven owned before TERM, if any.
         result: Result dictionary updated in place.
 
     Returns:
-        ``False`` when the identity no longer matches and nothing signalled.
+        ``True`` when containment may continue; ``False`` when the identity
+        went unresolved and nothing was signalled.
     """
-    state = _pid_state_ppid(entry_pid)
-    if state is None or state[0] == "Z":
+    if owned_group is not None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(owned_group, signal.SIGKILL)
         return True
-    if not _signal_group_checked(entry_pid, entry_ticks, signal.SIGTERM):
-        # The live occupant no longer matches the recorded identity.
+    if not _signal_exact_or_group(entry_pid, entry_ticks, signal.SIGKILL):
         result["identity_mismatch"] = True
         result["contained"] = False
         return False
+    return True
+
+
+def _contain(entry_pid: int, entry_ticks: int, result: dict[str, object]) -> None:
+    """Synchronously own and reap one recorded descendant identity.
+
+    Mirrors the shared guard's ownership semantics: dedicated-group
+    ownership is established while the identity is verifiable, before the
+    TERM; escalation KILL preserves already-proven group ownership across
+    leader exit; non-leader PIDs are revalidated (PID plus start ticks)
+    immediately before their exact-PID KILL and never receive shared-group
+    signalling.
+
+    Args:
+        entry_pid: The recorded exact PID.
+        entry_ticks: The recorded start ticks.
+        result: Result dictionary updated in place.
+    """
+    pgid: int | None = None
+    with contextlib.suppress(ProcessLookupError):
+        pgid = os.getpgid(entry_pid)
+    owned_group = pgid if pgid == entry_pid else None
+
+    seen = _observe(entry_pid, result)
+    if not seen:
+        return
+    # Aggregation: multiple entries must never overwrite a prior true.
+    result["survivor_seen"] = True
+
+    if not _signal_exact_or_group(entry_pid, entry_ticks, signal.SIGTERM):
+        # The live occupant no longer matches the recorded identity.
+        result["identity_mismatch"] = True
+        result["contained"] = False
+        return
     stop = time.monotonic() + GRACE_SECONDS
     while time.monotonic() < stop:
         current = _pid_state_ppid(entry_pid)
@@ -156,18 +221,13 @@ def _stop_exact(entry_pid: int, entry_ticks: int, result: dict[str, object]) -> 
             break
         time.sleep(POLL_SECONDS)
     current = _pid_state_ppid(entry_pid)
-    if current is not None and current[0] != "Z":
-        _signal_group_checked(entry_pid, entry_ticks, signal.SIGKILL)
-    return True
+    if (
+        current is not None
+        and current[0] != "Z"
+        and not _escalate(entry_pid, entry_ticks, owned_group, result)
+    ):
+        return
 
-
-def _reap_exact(entry_pid: int, result: dict[str, object]) -> None:
-    """Reap an adopted descendant by exact PID until it is gone.
-
-    Args:
-        entry_pid: Exact PID to reap.
-        result: Result dictionary updated in place.
-    """
     reap_deadline = time.monotonic() + GRACE_SECONDS
     while time.monotonic() < reap_deadline:
         with contextlib.suppress(ChildProcessError):
@@ -178,25 +238,36 @@ def _reap_exact(entry_pid: int, result: dict[str, object]) -> None:
     result["contained"] = False
 
 
-def _contain(entry_pid: int, entry_ticks: int, result: dict[str, object]) -> None:
-    """Synchronously own and reap one recorded descendant identity.
+def _adopted_children(owner_pid: int) -> list[int]:
+    """Enumerate direct adopted children of the subreaper owner.
 
-    Observes the process without ever accepting a reparent under container
-    PID 1; stops a survivor by its exact verified group, then reaps it by
-    exact PID once it is our adopted child.
+    After the nested command dies, every orphaned descendant — at any depth
+    — reparents directly to the nearest subreaper, so a single PPID scan
+    discovers them all without trusting marker coverage.
 
     Args:
-        entry_pid: The recorded exact PID.
-        entry_ticks: The recorded start ticks, if any.
-        result: Result dictionary updated in place.
+        owner_pid: The owner process whose adopted children to enumerate.
+
+    Returns:
+        Their PIDs.
     """
-    if not _observe(entry_pid, result):
-        result["survivor_seen"] = False
-        return
-    result["survivor_seen"] = True
-    if not _stop_exact(entry_pid, entry_ticks, result):
-        return
-    _reap_exact(entry_pid, result)
+    found: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_bytes()
+        except OSError:
+            continue
+        close = stat.rfind(b")")
+        if close == -1:
+            continue
+        fields = stat[close + 2 :].split()
+        if len(fields) < 4:
+            continue
+        if int(fields[1]) == owner_pid:
+            found.append(int(entry.name))
+    return found
 
 
 def main(
@@ -209,7 +280,11 @@ def main(
     Fails closed: without proven subreaper ownership the nested command is
     never spawned, and marker coverage that is missing, unreadable,
     malformed, not a list, or contains non-object entries reports a
-    containment failure instead of silently passing.
+    containment failure instead of silently passing.  After the nested
+    command exits, the owner repeatedly scans its adopted-descendant tree —
+    reaping zombies and containing verifiable live children by the shared
+    exact/group rules — until a full pass observes no adopted children; it
+    never retires while a live/unreaped descendant exists.
 
     Args:
         argv: Argument vector; defaults to ``sys.argv[1:]``.
@@ -230,6 +305,7 @@ def main(
         "observed_ppid_1": False,
         "identity_mismatch": False,
         "unresolved_ticks": False,
+        "survivor_seen": False,
         "contained": True,
     }
     if (become_subreaper or _become_subreaper)() is False:
@@ -280,8 +356,83 @@ def main(
     for entry in entries:
         _process_entry(entry, result)
 
+    _converge_adopted_tree(args, result)
+
     args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
     return 0 if result["contained"] is True else 1
+
+
+def _converge_adopted_tree(args: argparse.Namespace, result: dict[str, object]) -> None:
+    """Repeat discovery/containment until the adopted tree converges empty.
+
+    The lifetime invariant: after the nested pytest exits, repeatedly
+    enumerate the owner's direct adopted children (deeper descendants
+    reparent to the subreaper when their intermediate parent is killed),
+    reap zombies, and contain live children by exact PID+start-ticks with
+    dedicated-group semantics; then rescan.  The owner may return only
+    after a rescan finds zero children.  If a live child has unverifiable
+    ticks or cannot be retired, diagnostics are persisted but the owner
+    stays alive, keeps rescanning, and never orphans that child to PID 1.
+
+    Args:
+        args: Parsed CLI arguments (result path for durable diagnostics).
+        result: Result dictionary updated in place.
+    """
+    while True:
+        progressed = False
+        stuck: list[int] = []
+        for child_pid in _adopted_children(os.getpid()):
+            outcome = _handle_adopted_child(child_pid, result)
+            if outcome == "gone":
+                progressed = True
+            elif outcome == "stuck":
+                stuck.append(child_pid)
+        if not stuck:
+            break
+        if not progressed:
+            # Unresolvable stall: persist diagnostics but never retire the
+            # subreaper while a live/unreaped descendant exists.  Keep
+            # rescanning on a bounded sleep so a later independent retirement
+            # still converges the tree to empty.
+            result["stalled_descendants"] = stuck
+            result["contained"] = False
+            args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+            time.sleep(POLL_SECONDS * 50)
+
+
+def _handle_adopted_child(child_pid: int, result: dict[str, object]) -> str:
+    """Contain one discovered adopted child of the subreaper.
+
+    Args:
+        child_pid: Exact PID of the discovered child.
+        result: Result dictionary updated in place.
+
+    Returns:
+        ``"gone"`` when the child made a terminal transition or was already
+        absent; ``"stuck"`` when it is live/unreaped and could not be
+        retired this pass.
+    """
+    state = _pid_state_ppid(child_pid)
+    if state is None:
+        return "gone"
+    if state[0] == "Z":
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(child_pid, os.WNOHANG)
+        return "gone" if _pid_state_ppid(child_pid) is None else "stuck"
+    child_ticks = _proc_start_ticks(child_pid)
+    if child_ticks is None or child_ticks <= 0:
+        # An unverifiable live child must not be signalled, and the owner
+        # must not retire underneath it.
+        result["unresolved_ticks"] = True
+        result["contained"] = False
+        return "stuck"
+    before = _pid_state_ppid(child_pid)
+    result["survivor_seen"] = True
+    _contain(child_pid, child_ticks, result)
+    after = _pid_state_ppid(child_pid)
+    if before != after or (after is not None and after[0] == "Z"):
+        return "progressed"
+    return "stuck"
 
 
 def _read_marker(marker: Path) -> tuple[list[dict[str, object]], bool]:
