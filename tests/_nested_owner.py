@@ -379,17 +379,23 @@ def _converge_adopted_tree(args: argparse.Namespace, result: dict[str, object]) 
         result: Result dictionary updated in place.
     """
     while True:
+        children = _adopted_children(os.getpid())
+        if not children:
+            # A fresh scan found zero adopted children: retirement is legal.
+            break
         progressed = False
         stuck: list[int] = []
-        for child_pid in _adopted_children(os.getpid()):
+        for child_pid in children:
             outcome = _handle_adopted_child(child_pid, result)
-            if outcome == "gone":
-                progressed = True
-            elif outcome == "stuck":
+            if outcome == "stuck":
                 stuck.append(child_pid)
-        if not stuck:
-            break
-        if not progressed:
+            else:
+                # "gone" or "progressed": something transitioned, so the
+                # tree MUST be rescanned — killing an intermediate parent
+                # exposes deeper descendants only on the next reparent
+                # transition to this subreaper.
+                progressed = True
+        if stuck and not progressed:
             # Unresolvable stall: persist diagnostics but never retire the
             # subreaper while a live/unreaped descendant exists.  Keep
             # rescanning on a bounded sleep so a later independent retirement
@@ -398,6 +404,10 @@ def _converge_adopted_tree(args: argparse.Namespace, result: dict[str, object]) 
             result["contained"] = False
             args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
             time.sleep(POLL_SECONDS * 50)
+        elif stuck:
+            # Progress was made but some children are still live: rescan
+            # after a bounded pause so newly exposed descendants appear.
+            time.sleep(POLL_SECONDS * 10)
 
 
 def _handle_adopted_child(child_pid: int, result: dict[str, object]) -> str:
