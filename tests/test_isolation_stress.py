@@ -1034,6 +1034,160 @@ def test_nonleader_survivor_contained_exactly_without_shared_group_signal(
     assert _ambient_digest() == before
 
 
+GRANDCHILD_CHAIN_MODULE: Final = """
+import os, subprocess, sys, time
+
+sys.path.insert(0, "__REPO_ROOT__")
+
+from tests import _process_guard as guard
+
+MIDDLE = '''
+import os, signal, subprocess, sys, time
+from pathlib import Path
+
+def handler(_signum, _frame):
+    Path(sys.argv[1] + ".mid-ignored").write_text("ignored")
+
+signal.signal(signal.SIGTERM, handler)
+GC = (
+    "import os, signal, sys, time"
+    ";from pathlib import Path"
+    ";signal.signal(signal.SIGTERM, signal.SIG_IGN)"
+    ";Path(sys.argv[1] + '.gc').write_text(str(os.getpid()))"
+    ";time.sleep(300)"
+)
+grandchild = subprocess.Popen(
+    [sys.executable, "-c", GC, sys.argv[1]],
+)
+Path(sys.argv[1] + ".mid").write_text(str(os.getpid()))
+time.sleep(300)
+'''
+
+
+def test_chain() -> None:
+    '''Register a non-leader middle process that ignores TERM.
+
+    The middle process carries its own grandchild, which is NOT a direct
+    child of the nested pytest and only becomes adopted after the middle is
+    contained — forcing a rescan before the owner may retire.
+    '''
+    middle = subprocess.Popen(
+        [sys.executable, "-c", MIDDLE, os.environ["NESTED_SIDECAR"]],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    guard.register(middle)
+    time.sleep(300)
+""".replace("__REPO_ROOT__", str(REPO_ROOT))
+
+
+def test_owner_rescans_until_grandchild_chain_converges(tmp_path: Path) -> None:
+    """Two-level descendant chains converge before the owner retires.
+
+    The registered middle process (a non-leader that ignores TERM) carries
+    its own grandchild.  Containing the middle exposes the grandchild to
+    the subreaper only afterwards, so the owner must rescan: it may exit
+    only once a fresh scan finds zero adopted children, and neither level
+    may ever be observed under PID 1.  Executed as an independent
+    subprocess so the outer pytest never becomes a subreaper.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    before = _ambient_digest()
+    module = tmp_path / "grandchild_chain.py"
+    module.write_text(GRANDCHILD_CHAIN_MODULE, encoding="utf-8")
+    result = tmp_path / "chain.result.json"
+    marker = tmp_path / "chain.marker.json"
+    pidfile = tmp_path / "chain.pid"
+    sidecar_base = tmp_path / "chain"
+    log = tmp_path / "chain.log"
+    owner = _start_torn_coverage_owner(
+        module,
+        artifacts=(result, marker, pidfile, log),
+        deadline="120",
+        extra_env={"NESTED_SIDECAR": str(sidecar_base)},
+    )
+    try:
+        _wait_for_files(
+            [sidecar_base.with_suffix(".mid"), sidecar_base.with_suffix(".gc")],
+            owner,
+            timeout=60.0,
+        )
+        _wait_marker_coverage(marker, owner, timeout=30.0)
+        # Abruptly kill only the nested pytest.
+        identity = _read_pidfile(pidfile)
+        assert identity is not None
+        os.kill(identity[0], signal.SIGKILL)
+        assert owner.wait(timeout=120) == 0
+
+        mid_pid = int(sidecar_base.with_suffix(".mid").read_text())
+        grandchild_pid = int(sidecar_base.with_suffix(".gc").read_text())
+        wait_gone_deadline = time.monotonic() + 10.0
+        while (
+            _proc_state(mid_pid) is not None or _proc_state(grandchild_pid) is not None
+        ) and time.monotonic() < wait_gone_deadline:
+            time.sleep(0.05)
+        # Both levels are gone/reaped; neither was ever orphaned to PID 1.
+        assert _proc_state(mid_pid) in {None, "Z"}
+        assert _proc_state(grandchild_pid) in {None, "Z"}
+        payload = _read_result(result)
+        assert payload["contained"] is True
+        assert payload["observed_ppid_1"] is False
+        assert payload["survivor_seen"] is True
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=10)
+    assert isolation.ambient_sentinel_alive()
+    assert _ambient_digest() == before
+
+
+def _wait_for_files(paths: list[Path], owner: subprocess.Popen[bytes], timeout: float) -> None:
+    """Wait until every path exists (or the owner exits).
+
+    Args:
+        paths: Files to await.
+        owner: Owner process whose early exit aborts waiting.
+        timeout: Maximum seconds to wait.
+    """
+    deadline = time.monotonic() + timeout
+    remaining = list(paths)
+    while remaining and time.monotonic() < deadline:
+        if owner.poll() is not None:
+            break
+        remaining = [path for path in remaining if not path.exists()]
+        time.sleep(0.05)
+    assert not remaining
+    for path in paths:
+        assert path.exists(), f"file never appeared: {path}"
+
+
+def _wait_marker_coverage(
+    marker: Path,
+    owner: subprocess.Popen[bytes],
+    timeout: float,
+) -> None:
+    """Wait until the marker holds proven non-empty identity coverage.
+
+    Args:
+        marker: Marker path to poll.
+        owner: Owner process whose early exit aborts waiting.
+        timeout: Maximum seconds to wait.
+    """
+    deadline = time.monotonic() + timeout
+    entries, unproven = _read_marker_entries(marker)
+    while (unproven or not entries) and time.monotonic() < deadline:
+        if owner.poll() is not None:
+            break
+        time.sleep(0.05)
+        entries, unproven = _read_marker_entries(marker)
+    assert entries
+    assert not unproven
+
+
 def test_repeated_nested_isolation_runs_leave_ambient_untouched(
     tmp_path: Path,
 ) -> None:
@@ -1287,28 +1441,30 @@ def _wait_for_child_of(nested_pid: int | None, timeout: float) -> int | None:
 
 def _start_torn_coverage_owner(
     module: Path,
-    result: Path,
-    marker: Path,
-    pidfile: Path,
-    log: Path,
+    *,
+    artifacts: tuple[Path, Path, Path, Path],
+    deadline: str = "60",
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.Popen[bytes]:
-    """Start the independent owner around the torn-coverage subject.
+    """Start the independent owner around a generated subject.
 
     Args:
         module: Generated subject module.
-        result: Owner result path.
-        marker: Owner marker path.
-        pidfile: Owner pidfile path.
-        log: Log file for combined output.
+        artifacts: Owner result, marker, pidfile, and log paths.
+        deadline: Owner-enforced wall-clock limit for the nested run.
+        extra_env: Additional environment entries (e.g. sidecar paths).
 
     Returns:
         The owner process.
     """
+    result, marker, pidfile, log = artifacts
     env = dict(os.environ)
     # Canonical automatic recording: registrations append to this marker;
-    # the generated subject then deliberately deletes it to prove that torn
-    # coverage never orphans a live descendant.
+    # the torn-coverage subject deliberately deletes it afterwards to prove
+    # that torn coverage never orphans a live descendant.
     env[guard.OWNER_MARKER_ENV] = str(marker)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.Popen(
         [
             sys.executable,
@@ -1321,7 +1477,7 @@ def _start_torn_coverage_owner(
             "--pidfile",
             str(pidfile),
             "--deadline",
-            "60",
+            deadline,
             "--",
             sys.executable,
             "-m",
@@ -1388,7 +1544,7 @@ def test_register_then_delete_marker() -> None:
     marker = tmp_path / "torn.marker.json"
     pidfile = tmp_path / "torn.pid"
     log = tmp_path / "torn.log"
-    owner = _start_torn_coverage_owner(module, result, marker, pidfile, log)
+    owner = _start_torn_coverage_owner(module, artifacts=(result, marker, pidfile, log))
     try:
         deadline = time.monotonic() + 60.0
         nested_pid: int | None = None
