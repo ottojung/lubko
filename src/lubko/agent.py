@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 Meta = dict[str, Any]
 
 # Implementation details (hidden from the user-facing interface).
-DEFAULT_MODEL: Final = "opencode-go/ox-alpha-free"
+AGENT_MODEL: Final = "opencode-go/ox-alpha-free"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
@@ -915,10 +915,7 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
     Returns:
         The command argv, or ``None`` when continuation is impossible.
     """
-    env_cmd = os.environ.get("LUBKO_AGENT_CMD")
-    if env_cmd:
-        return ["/bin/sh", "-c", env_cmd]
-    model = DEFAULT_MODEL
+    model = AGENT_MODEL
     variant = meta.get("variant") or DEFAULT_VARIANT
     cwd = meta.get("cwd") or str(Path.cwd())
     if is_continue:
@@ -1241,7 +1238,7 @@ def _wait_for_invocation_exit(
     Returns:
         The invocation's return code.
     """
-    if not is_continue and not os.environ.get("LUBKO_AGENT_CMD"):
+    if not is_continue:
         deadline = time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
         while time.time() < deadline and proc.poll() is None:
             sid = discover_session_id(aid)
@@ -2260,7 +2257,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
             if meta.get("steer_queue")
             else None
         ),
-        "model": DEFAULT_MODEL,
+        "model": AGENT_MODEL,
         "variant": meta.get("variant"),
         "log": str(agent_dir(aid) / "output.log"),
     }
