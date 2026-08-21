@@ -2988,3 +2988,181 @@ def test_shutdown_withholds_drain_sentinel_when_group_proof_fails(
     assert not drain_sentinel_path(settings.worker_incarnation).exists()
     # The job was retained: its row stays recoverable, never terminalized.
     assert read_status(jobs_db, job_id) == "running"
+
+
+def _inject_pre_release_failure(monkeypatch: pytest.MonkeyPatch, fail: str) -> None:
+    """Inject the pre-release failure selected by ``fail``.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        fail: ``"ticks"`` (start-time ticks unavailable for job processes),
+            ``"persist"`` (deterministic identity persistence error), or any
+            other value (no pre-release injection; used with ``"release"``).
+    """
+    if fail == "ticks":
+        real_ticks = health.proc_start_ticks
+
+        def no_job_ticks(pid: int) -> int | None:
+            return real_ticks(pid) if pid == os.getpid() else None
+
+        monkeypatch.setattr(worker_module, "proc_start_ticks", no_job_ticks)
+    elif fail == "persist":
+
+        def failing_persist(*_args: object, **_kwargs: object) -> None:
+            exc = psycopg.DataError("injected deterministic persistence failure")
+            exc.sqlstate = "22P05"
+            raise exc
+
+        monkeypatch.setattr(worker_module, "_persist_process", failing_persist)
+
+
+def _run_nonconverging_abort_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    fail: str,
+) -> None:
+    """Prove a nonconverging abort blocks the caller until the child is reaped.
+
+    Fault injection: ``abort_gated_start`` reports failure without doing
+    anything, and the injected wrapper's ``poll()`` keeps reporting live (an
+    unkillable/D-state direct child). The worker must block synchronously
+    — no terminalized row, no further release attempts — while the child is
+    live; only once the real poll reports it terminal may convergence reap it
+    and finalize failed. The main thread observes the blocked intermediate
+    state deterministically, then ends the injection.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        jobs_db: PostgreSQL connection string.
+        pg_cluster: The isolated PostgreSQL cluster.
+        tmp_path: Per-test scratch directory.
+        fail: Which failure to inject: ``"ticks"``, ``"persist"``, or
+            ``"release"``.
+    """
+    fail_release = fail == "release"
+    expected_stderr = {
+        "ticks": "unable to record exact process identity",
+        "persist": "unable to record process identity",
+        "release": "unable to release gated start",
+    }[fail]
+    max_release_calls = 1 if fail_release else 0
+    sentinel = tmp_path / "ran"
+    job_id = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys; open(sys.argv[1], 'w').close()",
+            str(sentinel),
+        ],
+    )
+    settings = supervisor_settings(f"nonconv-{uuid4().hex[:8]}")
+    abort_calls = {"n": 0}
+    # Simulates an unkillable/D-state direct child: while ``hold`` is active
+    # the injected wrapper's ``poll()`` reports still-live, so the worker's
+    # convergence loop must block (it cannot reap the child). The gate is
+    # never closed and no signal is delivered by the injected abort itself.
+    injection: dict[str, object] = {"hold": True, "proc": None}
+    release_calls: list[int] = []
+    real_release = worker_module.release_gate
+    real_poll = subprocess.Popen.poll
+
+    def fake_poll(self: subprocess.Popen[bytes]) -> int | None:
+        if injection["hold"] and self is injection["proc"]:
+            return None
+        return real_poll(self)
+
+    def fake_abort(
+        _proc: subprocess.Popen[bytes],
+        _pgid: int,
+        _stdout_path: Path,
+        _stderr_path: Path,
+        _gate_fd: int,
+    ) -> bool:
+        abort_calls["n"] += 1
+        injection["proc"] = _proc
+        return False
+
+    def recording_release(gate_fd_: int) -> bool:
+        release_calls.append(gate_fd_)
+        if fail_release:
+            return False
+        return real_release(gate_fd_)
+
+    monkeypatch.setattr(subprocess.Popen, "poll", fake_poll)
+    monkeypatch.setattr(worker_module, "abort_gated_start", fake_abort)
+    monkeypatch.setattr(worker_module, "release_gate", recording_release)
+    _inject_pre_release_failure(monkeypatch, fail)
+
+    with supervisor_running(settings, make_database_config(pg_cluster), jobs_db):
+        wait_until(lambda: read_status(jobs_db, job_id) == "running")
+        wait_until(lambda: abort_calls["n"] >= 1)
+        # The caller is BLOCKED on the live direct child: no terminal row and
+        # no release fall-through while the nonconvergence persists.
+        for _ in range(10):
+            assert read_status(jobs_db, job_id) == "running"
+            assert len(release_calls) <= max_release_calls
+            time.sleep(0.02)
+        # Let the direct child become terminal: end the injected liveness so
+        # the real poll() reports the SIGKILLed wrapper; the worker's local
+        # ownership loop then reaps it and converges by construction.
+        injection["hold"] = False
+        wait_until(lambda: read_status(jobs_db, job_id) == "failed")
+
+    payload = read_root(jobs_db, job_id)
+    assert payload["state"]["status"] == "failed"
+    assert expected_stderr in str(payload.get("result", {}).get("stderr", ""))
+    # The user program NEVER ran and no fall-through release happened.
+    assert not sentinel.exists()
+    assert len(release_calls) <= max_release_calls
+
+
+def test_nonconverging_abort_blocks_on_missing_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """Missing ticks + nonconverging abort: block, converge, then fail."""
+    _run_nonconverging_abort_scenario(
+        monkeypatch,
+        jobs_db,
+        pg_cluster,
+        tmp_path,
+        "ticks",
+    )
+
+
+def test_nonconverging_abort_blocks_on_persistence_error(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """Persistence error + nonconverging abort: block, converge, then fail."""
+    _run_nonconverging_abort_scenario(
+        monkeypatch,
+        jobs_db,
+        pg_cluster,
+        tmp_path,
+        "persist",
+    )
+
+
+def test_nonconverging_abort_blocks_after_failed_release(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """Failed release + nonconverging abort: block, converge, then fail once."""
+    _run_nonconverging_abort_scenario(
+        monkeypatch,
+        jobs_db,
+        pg_cluster,
+        tmp_path,
+        "release",
+    )

@@ -1494,6 +1494,30 @@ def abort_gated_start(
     return False
 
 
+def await_gated_group_gone(gated: GatedSpawn) -> None:
+    """Block until the unreleased gated wrapper is terminal and reaped.
+
+    Stronger gated-wrapper invariant: before a successful release,
+    ``_start_gate.py`` is this process's DIRECT child, started with
+    ``start_new_session=True``, and is childless. While
+    ``gated.proc.poll()`` is ``None`` the PID cannot be reused and its
+    dedicated process group is provably ours, so repeatedly SIGKILLing that
+    exact group is authorized. This synchronously blocks — there is no
+    timeout return while the pre-release child remains live. Once the direct
+    child is terminal and reaped, the original unreleased childless group is
+    gone by construction; the numeric PGID is deliberately never polled or
+    signalled afterwards, because it could later be reused by a stranger.
+
+    Args:
+        gated: Handles and exact identity of the gated start to converge.
+    """
+    while gated.proc.poll() is None:
+        _signal_group(gated.pgid, signal.SIGKILL)
+        time.sleep(0.05)
+    with suppress(subprocess.TimeoutExpired):
+        gated.proc.wait(timeout=5)
+
+
 def _signal_group(pgid: int, sig: int) -> None:
     """Send a signal to an exact process group, ignoring an already-gone group.
 
@@ -3011,6 +3035,88 @@ class Supervisor:
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
         self._publish_health_force()
 
+    @staticmethod
+    def _abort_and_converge(gated: GatedSpawn, job_id: UUID) -> None:
+        """Abort the gated start and block until its wrapper is reaped.
+
+        A nonconverging ``abort_gated_start`` must NEVER fall back to normal
+        flow with a live untracked gated group: this worker locally owns the
+        still-gated childless direct child and synchronously blocks — with no
+        timeout return — until it is terminal and reaped, at which point the
+        original unreleased group is gone by construction.
+
+        Args:
+            gated: Handles and exact identity of the gated start.
+            job_id: Identifier of the affected job (for diagnostics).
+        """
+        if abort_gated_start(
+            gated.proc, gated.pgid, gated.stdout_path, gated.stderr_path, gated.gate_fd
+        ):
+            return
+        LOGGER.error(
+            "gated start abort did not converge for job %s (exact group %d); "
+            "locally owning the live child until it is reaped",
+            job_id,
+            gated.pgid,
+        )
+        await_gated_group_gone(gated)
+
+    def _pre_release_failure(
+        self,
+        conn: JobsConnection,
+        job_id: UUID,
+        gated: GatedSpawn,
+    ) -> str | None:
+        """Obtain and durably persist the exact identity before any release.
+
+        Fail-closed ordering: valid positive start-time ticks must be obtained
+        and durably persisted BEFORE any release. On any failure the exact
+        gated wrapper is converged (terminal and reaped) first — including on
+        the connectivity re-raise path — so no error path can leave a live
+        untracked gated group behind and no failed persistence can ever reach
+        :func:`release_gate`.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job_id: Identifier of the claimed job.
+            gated: Handles and exact identity of the gated start.
+
+        Returns:
+            The final stderr message when the start failed after convergence
+            (the caller must finalize failed), or ``None`` when persistence
+            succeeded.
+
+        Raises:
+            psycopg.Error: When persisting the identity fails with a
+                connectivity error (raised only after exact-group convergence).
+        """
+        start_ticks = proc_start_ticks(gated.proc.pid)
+        if start_ticks is not None and start_ticks > 0:
+            try:
+                _persist_process(conn, job_id, gated.proc.pid, gated.pgid, start_ticks)
+            except psycopg.Error as exc:
+                connectivity = self._is_connectivity_error(exc)
+                self._abort_and_converge(gated, job_id)
+                if connectivity:
+                    raise
+                LOGGER.exception(
+                    "unable to persist process identity for job %s (SQLSTATE %s)",
+                    job_id,
+                    exc.sqlstate or "N/A",
+                )
+                return "unable to record process identity; job not started"
+            return None
+        # No durable exact identity exists, so this worker itself must own the
+        # childless gated child to convergence before anything else.
+        self._abort_and_converge(gated, job_id)
+        LOGGER.error(
+            "unable to obtain exact start-time ticks for job %s (pid %d); "
+            "gated start aborted without executing user code",
+            job_id,
+            gated.proc.pid,
+        )
+        return "unable to record exact process identity; job not started"
+
     def _activate_gated_job(
         self,
         conn: JobsConnection,
@@ -3024,7 +3130,7 @@ class Supervisor:
 
         Fail-closed ordering: valid positive start-time ticks must be obtained
         and durably persisted BEFORE any release; a persist or release failure
-        aborts the exact gated group and finalizes the job failed so no user
+        converges the exact gated group and finalizes the job failed so no user
         side effect survives and a failed start can never later look like a
         normally completed user command.
 
@@ -3037,85 +3143,35 @@ class Supervisor:
 
         Returns:
             The :class:`ActiveJob` for normal supervision, or ``None`` when the
-            start failed and was already finalized as such.
-
-        Raises:
-            psycopg.Error: When persisting the identity fails with a
-                connectivity error.
+            start failed and was finalized as such. Every failure path first
+            converges the exact gated wrapper (terminal and reaped), so no
+            untracked live group ever outlives this call.
         """
-        proc = gated.proc
-        pgid = gated.pgid
-        stdout_path = gated.stdout_path
-        stderr_path = gated.stderr_path
-        gate_fd = gated.gate_fd
-        start_ticks = proc_start_ticks(proc.pid)
-        failure: str | None = None
-        if start_ticks is not None and start_ticks > 0:
-            try:
-                _persist_process(conn, job_id, proc.pid, pgid, start_ticks)
-            except psycopg.Error as exc:
-                # The exact identity was not durably recorded, so the user
-                # program must never run: abort the exact (still gated,
-                # childless) group. A persistent identity row for a
-                # never-executed process would otherwise let a replacement
-                # claim the same job only to find a stranger-owned group.
-                aborted = abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd)
-                if self._is_connectivity_error(exc):
-                    raise
-                if aborted:
-                    LOGGER.exception(
-                        "unable to persist process identity for job %s (SQLSTATE %s)",
-                        job_id,
-                        exc.sqlstate or "N/A",
-                    )
-                    failure = "unable to record process identity; job not started"
-        elif abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd):
-            LOGGER.error(
-                "unable to obtain exact start-time ticks for job %s (pid %d); "
-                "gated start aborted without executing user code",
-                job_id,
-                proc.pid,
-            )
-            failure = "unable to record exact process identity; job not started"
-        else:
-            LOGGER.error(
-                "unable to obtain exact start-time ticks for job %s (pid %d) "
-                "and the gated group could not be proven gone; retaining the "
-                "running row for exact-identity recovery",
-                job_id,
-                proc.pid,
-            )
+        failure = self._pre_release_failure(conn, job_id, gated)
         if failure is None:
             # The exact identity is durably recorded. Release the gate so the
             # wrapper execs the user argv on the exact same PID, after which
             # normal supervision applies. A failed release is a start failure:
-            # abort the exact gated group instead of letting the job later look
-            # like a normally completed user command.
-            if release_gate(gate_fd):
+            # converge the live child first, then finalize failed.
+            if release_gate(gated.gate_fd):
                 return ActiveJob(
                     id=job_id,
                     cwd=job_spec.cwd,
                     process=job_spec.process,
-                    proc=proc,
-                    pid=proc.pid,
-                    pgid=pgid,
+                    proc=gated.proc,
+                    pid=gated.proc.pid,
+                    pgid=gated.pgid,
                     started_mono=time.monotonic(),
                     claimed_at=claim_mono,
                 )
-            if abort_gated_start(proc, pgid, stdout_path, stderr_path, gate_fd):
-                LOGGER.error(
-                    "failed to release the start gate for job %s (pid %d); "
-                    "gated start aborted without executing user code",
-                    job_id,
-                    proc.pid,
-                )
-                failure = "unable to release gated start; job not started"
-        if failure is None:
-            # Blocking ownership failure somewhere above: the exact gated group
-            # could not be proven member-free. Never terminalize or untrack —
-            # the running row keeps the persisted identity recoverable by
-            # emergency recovery.
-            return None
+            self._abort_and_converge(gated, job_id)
+            LOGGER.error(
+                "failed to release the start gate for job %s (pid %d); "
+                "gated start aborted without executing user code",
+                job_id,
+                gated.proc.pid,
+            )
+            failure = "unable to release gated start; job not started"
         self._finalize_immediate(
             job_id,
             JobResult(
