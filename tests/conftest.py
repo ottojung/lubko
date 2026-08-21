@@ -97,6 +97,13 @@ def _isolated_lubko_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     # the ambient job identity is cleared: a test is only queue-invoked when it
     # deliberately sets the variable itself.
     monkeypatch.delenv("LUBKO_JOB_ID", raising=False)
+    # The same applies to the runner identity markers. A test-spawned process
+    # inherits ``os.environ``, so ambient LUBKO_AGENT_ID / LUBKO_RUNNER_GEN
+    # values (e.g. when the suite itself runs inside a Lubko job) would make
+    # unrelated helper processes look like live runners of an arbitrary agent
+    # and generation. Exact-identity tests must set these themselves.
+    monkeypatch.delenv("LUBKO_AGENT_ID", raising=False)
+    monkeypatch.delenv("LUBKO_RUNNER_GEN", raising=False)
     return root
 
 
