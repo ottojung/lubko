@@ -319,6 +319,47 @@ time.sleep(300)
             proc.wait(timeout=10)
 
 
+def test_signal_identity_checked_never_signals_shared_group() -> None:
+    """The public signal primitive is exact-PID for non-leaders.
+
+    Two children share the test process's group; signalling one by its
+    verified PID+start-ticks identity must leave the sibling and the test
+    process alive.  Both subjects are cleaned up explicitly.
+
+    """
+    target = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    sibling = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert os.getpgid(target.pid) == os.getpgrp()
+        assert os.getpgid(sibling.pid) == os.getpgrp()
+        ticks = guard.proc_start_ticks(target.pid)
+        assert ticks is not None
+        delivered = guard.signal_identity_checked(target.pid, ticks, signal.SIGKILL)
+        assert delivered is True
+        wait_until(lambda: not pid_live(target.pid), timeout=10.0)
+        # Exact-PID only: the shared-group sibling and pytest survive.
+        assert pid_live(sibling.pid)
+        assert pid_live(os.getpid())
+        # A stale identity authorizes nothing.
+        assert guard.signal_identity_checked(sibling.pid, (ticks or 0) + 1, signal.SIGKILL) is False
+        assert pid_live(sibling.pid)
+    finally:
+        for proc in (target, sibling):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+
+
 def test_register_ignores_already_terminal_process() -> None:
     """An already-terminal (reaped) Popen is harmless and not registered."""
     proc = subprocess.Popen(
