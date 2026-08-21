@@ -127,20 +127,40 @@ def test_teardown_never_signals_reused_pid_identity() -> None:
     assert innocent.pid not in guard.TRACKED
 
 
-def test_register_fails_closed_without_spawn_ticks() -> None:
+def test_register_fails_closed_for_live_process_without_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A live registration whose ticks cannot be read is refused outright."""
     proc = subprocess.Popen(
         [SLEEP_BIN, "300"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
-    # Fully reap the child so /proc/<pid> is gone and its start ticks are
-    # unreadable, simulating the fail-closed path deterministically.
-    proc.kill()
-    proc.wait(timeout=10)
-    with pytest.raises(AssertionError, match="unverifiable identity"):
-        guard.register(proc)
+    try:
+        monkeypatch.setattr(guard, "proc_start_ticks", lambda _pid: None)
+        with pytest.raises(AssertionError, match="unverifiable identity"):
+            guard.register(proc)
+        assert guard.tracked_pids() == ()
+        # The live process was never owned and never signalled.
+        assert pid_live(proc.pid)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_register_ignores_already_terminal_process() -> None:
+    """An already-terminal (reaped) Popen is harmless and not registered."""
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "0"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert proc.wait(timeout=10) == 0
+    guard.register(proc)
     assert guard.tracked_pids() == ()
 
 
