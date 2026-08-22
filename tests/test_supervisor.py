@@ -3137,6 +3137,10 @@ def _run_nonconverging_abort_scenario(
         for _ in range(10):
             assert read_status(jobs_db, job_id) == "running"
             assert len(release_calls) <= max_release_calls
+            if connectivity_error:
+                # Outage handling cannot begin before local direct-child
+                # convergence: the re-raise is strictly after the hold.
+                assert supervisor.conn is not None
             time.sleep(0.02)
         # Let the direct child become terminal: end the injected liveness so
         # the real poll() reports the SIGKILLed wrapper; the worker's local
@@ -3145,21 +3149,47 @@ def _run_nonconverging_abort_scenario(
         # deterministic path finalize failed.
         injection["hold"] = False
         if connectivity_error:
-            wait_until(lambda: supervisor.conn is None)
+            _wait_for_outage_evidence(supervisor, jobs_db, job_id)
         else:
             wait_until(lambda: read_status(jobs_db, job_id) == "failed")
 
     payload = read_root(jobs_db, job_id)
     if connectivity_error:
-        # Re-raise happens only after convergence; the row stays running and
-        # exactly recoverable — never terminalized by the error path.
-        assert payload["state"]["status"] == "running"
+        # The connectivity path re-raised after convergence without ever
+        # deterministic-finalizing: any terminal state came from later stale
+        # recovery. Prove this start failure never wrote its own result.
+        result = payload.get("result") or {}
+        assert "unable to record process identity" not in str(result.get("stderr", ""))
     else:
         assert payload["state"]["status"] == "failed"
         assert expected_stderr in str(payload.get("result", {}).get("stderr", ""))
     # The user program NEVER ran and no fall-through release happened.
     assert not sentinel.exists()
     assert len(release_calls) <= max_release_calls
+
+
+def _wait_for_outage_evidence(supervisor: Supervisor, jobs_db: str, job_id: UUID) -> None:
+    """Deterministically prove outage handling ran after convergence.
+
+    A ``None`` connection is transient (the outage loop reconnects), so the
+    wait accepts either direct observation of it OR stale recovery
+    terminalizing the row — which only ever runs from outage handling after a
+    reconnect. Either observation proves the connectivity path re-raised only
+    after the gated child was converged and reaped.
+
+    Args:
+        supervisor: The running supervisor under observation.
+        jobs_db: PostgreSQL connection string.
+        job_id: The affected job identifier.
+    """
+    saw_outage = False
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline and not saw_outage:
+        if supervisor.conn is None or read_status(jobs_db, job_id) == "failed":
+            saw_outage = True
+        else:
+            time.sleep(0.02)
+    assert saw_outage
 
 
 def test_nonconverging_abort_blocks_on_missing_ticks(
