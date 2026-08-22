@@ -2467,7 +2467,7 @@ def worker_without_persist_command(tmp_path: Path) -> list[str]:
     wrapper = tmp_path / "worker_no_persist.py"
     wrapper.write_text(
         "from lubko import worker\n"
-        "worker._persist_process = lambda _conn, _job_id, _pid, _pgid: None\n"
+        "worker._persist_process = lambda _conn, _job_id, _pid, _pgid, _ticks: None\n"
         "worker.main()\n",
         encoding="utf-8",
     )

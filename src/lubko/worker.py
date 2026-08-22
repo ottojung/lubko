@@ -63,6 +63,7 @@ import tempfile
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 from uuid import uuid4
@@ -70,6 +71,7 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import tuple_row
 
+from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config
 from lubko.health import (
     WorkerHealth,
@@ -90,6 +92,7 @@ from lubko.protocol import (
     build_output_window_payload,
     parse_payload,
 )
+from lubko.state import state_root
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -140,6 +143,11 @@ LOGGER: Final = logging.getLogger(__name__)
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_PROCESS_POLL_INTERVAL_SECONDS: Final = 0.1
 DEFAULT_CANCEL_GRACE_SECONDS: Final = 5.0
+#: Bounded finalization overhead the outer lifecycle authority must let the
+#: worker keep before it may treat a still-alive worker as wedged and issue an
+#: emergency SIGKILL. The outer wait deadline is ``max(stop_grace,
+#: cancel_grace + this)`` so the two timers can never race.
+DRAIN_OVERHEAD_SLACK_SECONDS: Final = 2.0
 DEFAULT_LEASE_DURATION_SECONDS: Final = 30.0
 DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS: Final = 5.0
 DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS: Final = 10.0
@@ -906,30 +914,46 @@ def _output_update_params(job_id: UUID, output: dict[str, dict[str, Any]]) -> di
 # ---------------------------------------------------------------------------
 
 
-def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) -> None:
+def _persist_process(
+    conn: JobsConnection,
+    job_id: UUID,
+    pid: int,
+    pgid: int,
+    start_ticks: int,
+) -> None:
     """Persist the exact process identity of a running job.
 
-    The identity is written into ``payload.state.process_pid`` and
-    ``payload.state.process_pgid``, keeping the two-column table invariant.
+    The identity is written into ``payload.state.process_pid``,
+    ``payload.state.process_pgid`` and ``payload.state.process_start_time_ticks``,
+    keeping the two-column table invariant. The start-time ticks make later
+    emergency recovery PID-reuse-safe: a persisted group id that has been
+    recycled by an unrelated process no longer matches the recorded command and
+    is never signalled.
 
     Args:
         conn: Open PostgreSQL connection.
         job_id: Identifier of the running job.
         pid: Exact process ID of the spawned process.
         pgid: Exact process group ID of the spawned process.
+        start_ticks: Valid positive start-time ticks of the exact process,
+            obtained before the start gate was released.
     """
     set_chain = _jsonb_set_chain(
         "payload::jsonb",
         [
             ("state,process_pid", "to_jsonb(%s::int)"),
             ("state,process_pgid", "to_jsonb(%s::int)"),
+            (
+                "state,process_start_time_ticks",
+                "to_jsonb(%s::bigint)",
+            ),
             ("state,updated_at", UTC_ISO_SQL),
         ],
     )
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
             "UPDATE lubko.jobs\nSET payload = " + set_chain + "::text\nWHERE id = %s\n",
-            (pid, pgid, job_id),
+            (pid, pgid, start_ticks, job_id),
         )
 
 
@@ -991,6 +1015,265 @@ def group_has_members(pgid: int) -> bool:
     return True
 
 
+def drain_sentinel_dir() -> Path:
+    """Return the directory holding per-incarnation drain acknowledgement files.
+
+    Returns:
+        The drain sentinel directory under the Lubko worker state root.
+    """
+    return state_root() / "worker" / "drain"
+
+
+def drain_sentinel_path(incarnation: str) -> Path:
+    """Return the exact drain-sentinel path for an incarnation.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token).
+
+    Returns:
+        The sentinel file path.
+    """
+    return drain_sentinel_dir() / f"{incarnation}.drained"
+
+
+def write_drain_sentinel(incarnation: str) -> None:
+    """Atomically record that this worker has drained every owned group.
+
+    The sentinel is the explicit acknowledgement the outer lifecycle authority
+    observes: once present (and matching the incarnation), no command process
+    group owned by this worker can still be alive, so the worker may be reaped
+    or forgotten without leaking a side-effecting process.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token).
+    """
+    path = drain_sentinel_path(incarnation)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(f"{incarnation}\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def drain_sentinel_matches(incarnation: str) -> bool:
+    """Return whether a present drain sentinel exactly matches the incarnation.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token) to verify.
+
+    Returns:
+        ``True`` only when the sentinel exists and carries the exact token.
+    """
+    try:
+        return drain_sentinel_path(incarnation).read_text(encoding="utf-8").strip() == incarnation
+    except OSError:
+        return False
+
+
+def _owned_running_groups(conn: JobsConnection, incarnation: str) -> list[tuple[int, int | None]]:
+    """Return the exact (process group id, start-time ticks) of owned commands.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        incarnation: The worker incarnation (lifecycle token) to match.
+
+    Returns:
+        Pairs of the exact process group id and the persisted command start-time
+        ticks (``None`` when the legacy row never recorded ticks) for every
+        running command owned by the incarnation.
+    """
+    groups: list[tuple[int, int | None]] = []
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT id, (payload::jsonb)->'state'->>'process_pgid',\n"
+            "       (payload::jsonb)->'state'->>'process_start_time_ticks'\n"
+            "FROM lubko.jobs\n"
+            "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(inc)s\n"
+            "    AND (payload::jsonb)->'state'->>'process_pgid' IS NOT NULL\n",
+            {"inc": incarnation},
+        )
+        for row in cursor.fetchall():
+            pgid = row[1]
+            start_ticks = row[2]
+            if pgid is None:
+                continue
+            try:
+                pgid_i = int(str(pgid))
+            except ValueError:
+                continue
+            start_i: int | None = None
+            if start_ticks is not None:
+                try:
+                    start_i = int(str(start_ticks))
+                except ValueError:
+                    start_i = None
+            groups.append((pgid_i, start_i))
+    return groups
+
+
+class GroupReclaimDecision(Enum):
+    """Disposition of one persisted owned command group during recovery.
+
+    Attributes:
+        GONE: The group has no live members, so it is already safely reaped and
+            recovery has converged for it (no signal, no obligation).
+        RECLAIM: The group has live members and its persisted start-time ticks
+            are valid/positive and exactly match the live leader's ticks, so it
+            is provably our command and safe to signal.
+        UNRESOLVED: The group has live members but its exact identity cannot be
+            proven — missing, malformed, unreadable, or mismatched persisted
+            start-time ticks. It must NOT be signalled, and it remains a durable
+            blocking obligation until it is proven dead/recovered by some other
+            means (e.g. the unrelated process exits) so the orchestrator holds
+            rather than handing off sole-consumer authority alongside a
+            potentially stranger-owned group.
+    """
+
+    GONE = auto()
+    RECLAIM = auto()
+    UNRESOLVED = auto()
+
+
+def _group_reclaim_decision(pgid: int, start_ticks: int | None) -> GroupReclaimDecision:
+    """Decide how to treat one persisted owned command group during recovery.
+
+    A live group may be signalled only when it has members and its persisted
+    ``process_start_time_ticks`` is valid/positive and exactly matches the live
+    group leader's start-time ticks. Anything the persisted identity cannot
+    prove is treated as unresolved (never signalled) so a recycled or stranger
+    group is never killed, but it still blocks retirement until it converges.
+
+    Args:
+        pgid: The persisted process group id.
+        start_ticks: The persisted command start-time ticks, ``None`` for a
+            legacy row that never recorded them.
+
+    Returns:
+        The :class:`GroupReclaimDecision` for this group.
+    """
+    if not group_has_members(pgid):
+        return GroupReclaimDecision.GONE
+    if not isinstance(start_ticks, int) or start_ticks <= 0:
+        # Missing (legacy/None) or malformed/non-positive ticks: we cannot prove
+        # the live group is our command, so never signal it — but it is still
+        # alive, so it remains a durable blocking obligation.
+        return GroupReclaimDecision.UNRESOLVED
+    live_ticks = proc_start_ticks(pgid)
+    if live_ticks is None:
+        # The leader's identity is unreadable; fail closed rather than risk a
+        # mis-signal, but keep the group as a blocking obligation.
+        return GroupReclaimDecision.UNRESOLVED
+    if live_ticks != start_ticks:
+        # The persisted group id has been recycled by an unrelated process (or
+        # the wrong command): it is not ours, so never signal it. It stays a
+        # blocking obligation until the stranger's group exits and converges.
+        return GroupReclaimDecision.UNRESOLVED
+    return GroupReclaimDecision.RECLAIM
+
+
+@dataclass(frozen=True)
+class ReclaimedGroups:
+    """Exact-owned command groups after an emergency recovery pass.
+
+    Attributes:
+        reaped: Exact process-group ids that were signalled and proven dead.
+        surviving: Exact process-group ids that were proven ours, signalled,
+            but could not be proven dead within the cancel grace. These are a
+            durable blocking obligation: the orchestrator must not clear the
+            retired worker's sole-consumer authority or spawn a replacement
+            until they are proven dead/recovered.
+        unresolved: Exact process-group ids that have live members but whose
+            exact identity could not be proven (missing/malformed/unreadable/
+            mismatched persisted start-time ticks). They are never signalled,
+            but remain a durable blocking obligation exactly like ``surviving``:
+            the orchestrator must hold and retry rather than clear authority or
+            start a replacement.
+    """
+
+    reaped: list[int]
+    surviving: list[int]
+    unresolved: list[int]
+
+
+def _terminate_one_group(pgid: int, cancel_grace_seconds: float) -> bool:
+    """Ask one exact process group to terminate, then SIGKILL and reap it.
+
+    Args:
+        pgid: Exact process group id to terminate.
+        cancel_grace_seconds: Grace before escalating to SIGKILL.
+
+    Returns:
+        ``True`` only when the group is proven to have no surviving members
+        after the SIGKILL + reap wait, so the caller knows it is safe to treat
+        the recovery as complete.
+    """
+    _signal_group(pgid, signal.SIGTERM)
+    term_deadline = time.monotonic() + cancel_grace_seconds
+    while time.monotonic() < term_deadline and group_has_members(pgid):
+        time.sleep(0.05)
+    if group_has_members(pgid):
+        _signal_group(pgid, signal.SIGKILL)
+    reap_deadline = time.monotonic() + cancel_grace_seconds
+    while time.monotonic() < reap_deadline and group_has_members(pgid):
+        time.sleep(0.05)
+    return not group_has_members(pgid)
+
+
+def recover_owned_job_groups(
+    conn: JobsConnection,
+    incarnation: str,
+    cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
+) -> ReclaimedGroups:
+    """Terminate any live command process group still owned by an incarnation.
+
+    This is the exact-ownership emergency recovery used after a maintained
+    worker was force-killed while it still owned command process groups (a
+    wedged worker whose own graceful drain never ran). Every acting target is an
+    exact process group id persisted in the job row (``state.process_pgid``) for
+    a ``running`` command whose ``worker_incarnation`` matches, so no
+    process-name match or broad ``pkill``/``killall`` is ever used.
+
+    A live group is signalled only when its persisted ``process_start_time_ticks``
+    is valid/positive and exactly matches the live leader's start-time ticks
+    (see :func:`_group_reclaim_decision`): this makes recovery PID-reuse-safe
+    and fail-closed. A group whose exact identity cannot be proven — missing,
+    malformed, unreadable, or mismatched ticks while it still has members — is
+    never signalled and is reported as ``unresolved`` so the orchestrator holds
+    rather than handing off sole-consumer authority alongside a possibly
+    stranger-owned group. A group with no live members has already converged.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        incarnation: The worker incarnation (lifecycle token) whose groups to
+            recover.
+        cancel_grace_seconds: Grace before escalating to SIGKILL.
+
+    Returns:
+        A :class:`ReclaimedGroups` describing which exact groups were reaped,
+        which verified-ours groups survived the cancel grace, and which live
+        groups could not be identity-verified (unresolved).
+    """
+    groups = _owned_running_groups(conn, incarnation)
+    if not groups:
+        return ReclaimedGroups(reaped=[], surviving=[], unresolved=[])
+    reaped: list[int] = []
+    surviving: list[int] = []
+    unresolved: list[int] = []
+    for pgid, start_ticks in groups:
+        decision = _group_reclaim_decision(pgid, start_ticks)
+        if decision is GroupReclaimDecision.GONE:
+            continue
+        if decision is GroupReclaimDecision.RECLAIM:
+            if _terminate_one_group(pgid, cancel_grace_seconds):
+                reaped.append(pgid)
+            else:
+                surviving.append(pgid)
+        else:
+            unresolved.append(pgid)
+    return ReclaimedGroups(reaped=reaped, surviving=surviving, unresolved=unresolved)
+
+
 def _wait_for_session(pid: int) -> int:
     """Wait until a spawned process establishes its own session and group.
 
@@ -1028,8 +1311,12 @@ def _cleanup_output_files(stdout_path: Path, stderr_path: Path) -> None:
     stderr_path.unlink(missing_ok=True)
 
 
-def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
-    """Start a job as a new session and process group leader.
+#: Path of the tiny dedicated start-gate wrapper exec'd by :func:`spawn_job`.
+_START_GATE_WRAPPER: Final = Path(__file__).with_name("_start_gate.py")
+
+
+def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
+    """Start a job behind a persist-before-exec START GATE.
 
     The job's required ``process`` argv is executed directly as the new
     process; the worker never invokes a shell, so argv elements are passed to
@@ -1041,41 +1328,202 @@ def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
     identify its owning queue row deterministically without depending on the
     timing of any later database write.
 
+    The wrapper (not the user program) is the dedicated session/process-group
+    leader. It inherits a gate file descriptor and blocks on it before exec'ing
+    the user argv, so ``Popen`` returns while the wrapper is still gated. The
+    caller must durably persist the exact process identity (PID/PGID/start-time
+    ticks) and then call :func:`release_gate` on the returned gate write end.
+    Only then does the wrapper exec the user code on the exact same PID. If the
+    worker dies before releasing, the kernel closes the gate write end, the
+    wrapper reads EOF, and it exits WITHOUT executing any user code — so a
+    forced SIGKILL in the spawn->persist window can never leave a user side
+    effect running with no durable identity to recover it. The gate is not
+    implemented with ``preexec_fn``: that would let ``Popen`` return only after
+    the child had already run, defeating the gate.
+
     Args:
         job: Claimed job to execute.
 
     Returns:
-        The running process, its capture file paths, and its process group ID.
+        The running gated process, its capture file paths, its process group
+        ID, and the worker-side write end of the start gate.
 
     Raises:
         OSError: If the process cannot be started.
     """
-    argv = list(job.process)
     env = dict(os.environ)
     env[JOB_ID_ENV] = str(job.id)
     stdout_fd, stdout_name = tempfile.mkstemp()
     stderr_fd, stderr_name = tempfile.mkstemp()
     stdout_path = Path(stdout_name)
     stderr_path = Path(stderr_name)
+    gate_read_fd, gate_write_fd = os.pipe()
+    # The read end must survive the wrapper's exec, so it must not be
+    # close-on-exec. Declaring it in ``pass_fds`` makes ``subprocess`` clear the
+    # close-on-exec flag on the child side of the fork, so the wrapper blocks on
+    # it across the exec boundary. The descriptor number is passed to the
+    # wrapper through the environment (not ``argv``) because a Python launcher
+    # re-exec can shift ``argv`` and would otherwise misalign the argument.
+    env["LUBKO_START_GATE_FD"] = str(gate_read_fd)
     try:
         proc = subprocess.Popen(
-            argv,
+            [sys.executable, os.fspath(_START_GATE_WRAPPER), *job.process],
             cwd=job.cwd,
             stdin=subprocess.DEVNULL,
             stdout=stdout_fd,
             stderr=stderr_fd,
             start_new_session=True,
             env=env,
+            pass_fds=(gate_read_fd,),
         )
     except OSError:
+        os.close(gate_read_fd)
+        os.close(gate_write_fd)
         os.close(stdout_fd)
         os.close(stderr_fd)
         _cleanup_output_files(stdout_path, stderr_path)
         raise
+    # The wrapper holds the read end; the worker must not keep a copy of it.
+    os.close(gate_read_fd)
     os.close(stdout_fd)
     os.close(stderr_fd)
     pgid = _wait_for_session(proc.pid)
-    return proc, stdout_path, stderr_path, pgid
+    return proc, stdout_path, stderr_path, pgid, gate_write_fd
+
+
+def release_gate(gate_fd: int) -> bool:
+    """Release a gated start so the wrapper execs the user argv.
+
+    Writes the single release control byte and closes the worker's gate write
+    end. The wrapper reads the byte and execs the user program on the exact
+    same PID whose identity the caller has already durably persisted. If this
+    process dies before closing, the kernel closes the write end and the
+    wrapper reads EOF and exits without executing any user code.
+
+    A failure to write the release byte is reported, never silently swallowed:
+    the caller must treat it as a start failure and abort the gated start so
+    the job does not later look like a normally completed user command.
+
+    Args:
+        gate_fd: The worker-side write end of the start gate pipe.
+
+    Returns:
+        ``True`` when the release byte was written (the wrapper will exec the
+        user argv); ``False`` when the write failed, in which case the wrapper
+        can never be released by this handle.
+    """
+    try:
+        os.write(gate_fd, GATE_RELEASE_BYTE)
+    except OSError:
+        with suppress(OSError):
+            os.close(gate_fd)
+        return False
+    with suppress(OSError):
+        os.close(gate_fd)
+    return True
+
+
+@dataclass(frozen=True)
+class GatedSpawn:
+    """Handles and exact identity of one gated start produced by ``spawn_job``.
+
+    Attributes:
+        proc: The gated wrapper process.
+        pgid: Exact process group id of the gated wrapper.
+        stdout_path: Capture file for standard output.
+        stderr_path: Capture file for standard error.
+        gate_fd: The worker-side write end of the start gate pipe.
+    """
+
+    proc: subprocess.Popen[bytes]
+    pgid: int
+    stdout_path: Path
+    stderr_path: Path
+    gate_fd: int
+
+
+def abort_gated_start(
+    proc: subprocess.Popen[bytes],
+    pgid: int,
+    stdout_path: Path,
+    stderr_path: Path,
+    gate_fd: int,
+) -> bool:
+    """Abort a gated start using ONLY its exact direct-child identity.
+
+    Used when the exact process identity could not be obtained or durably
+    persisted, or when the gate release itself failed: the gate is closed
+    WITHOUT the release byte so the wrapper exits on EOF. The dedicated group
+    is SIGKILLed only WHILE the exact ``Popen`` remains live — before a
+    successful release it is this process's own childless session leader, so
+    the group is provably ours. Once the direct child becomes terminal and is
+    reaped, the original unreleased childless group is gone by construction
+    and the numeric PGID is deliberately NEVER used again as proof or target,
+    because it could already have been reused by an unrelated process.
+
+    Args:
+        proc: The gated wrapper process.
+        pgid: Exact process group id of the wrapper (used only while the
+            wrapper itself is still live).
+        stdout_path: Capture file for standard output.
+        stderr_path: Capture file for standard error.
+        gate_fd: The worker-side write end of the start gate pipe.
+
+    Returns:
+        ``True`` when the direct child is terminal, reaped, and the capture
+        files were removed (the unreleased group is gone by construction);
+        ``False`` when the child remained live after the bounded first attempt,
+        in which case :func:`await_gated_group_gone` owns it until reap.
+    """
+    # Close the gate WITHOUT releasing: the wrapper reads EOF and exits.
+    with suppress(OSError):
+        os.close(gate_fd)
+    deadline = time.monotonic() + 5.0
+    while proc.poll() is None and time.monotonic() < deadline:
+        _signal_group(pgid, signal.SIGKILL)
+        time.sleep(0.02)
+    if proc.poll() is not None:
+        with suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+        return True
+    LOGGER.error(
+        "gated wrapper %d (exact group %d) stayed live through the bounded "
+        "abort attempt; handing to the blocking direct-child convergence loop",
+        proc.pid,
+        pgid,
+    )
+    return False
+
+
+def await_gated_group_gone(gated: GatedSpawn) -> None:
+    """Block until the unreleased gated wrapper is terminal and reaped.
+
+    Stronger gated-wrapper invariant: before a successful release,
+    ``_start_gate.py`` is this process's DIRECT child, started with
+    ``start_new_session=True``, and is childless. While
+    ``gated.proc.poll()`` is ``None`` the PID cannot be reused and its
+    dedicated process group is provably ours, so repeatedly SIGKILLing that
+    exact group is authorized. This synchronously blocks — there is no
+    timeout return while the pre-release child remains live. Once the direct
+    child is terminal and reaped, the original unreleased childless group is
+    gone by construction; the numeric PGID is deliberately never polled or
+    signalled afterwards, because it could later be reused by a stranger.
+
+    Args:
+        gated: Handles and exact identity of the gated start to converge.
+    """
+    while gated.proc.poll() is None:
+        _signal_group(gated.pgid, signal.SIGKILL)
+        time.sleep(0.05)
+    with suppress(subprocess.TimeoutExpired):
+        gated.proc.wait(timeout=5)
+    # The direct child is reaped: the original unreleased childless group is
+    # gone by construction. Clean up captures now; never touch the numeric
+    # PGID again (it may already be reused by an unrelated process).
+    gated.stdout_path.unlink(missing_ok=True)
+    gated.stderr_path.unlink(missing_ok=True)
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -2526,10 +2974,6 @@ class Supervisor:
             claimed: The claimed job.
             claim_mono: Monotonic time captured immediately before the claim
                 database operation commits (never at commit time).
-
-        Raises:
-            psycopg.Error: When persisting the process identity fails with a
-                connectivity error.
         """
         conn = self.conn
         if conn is None:
@@ -2560,7 +3004,7 @@ class Supervisor:
             self._finalize_immediate(claimed.id, failure)
             return
         try:
-            proc, stdout_path, stderr_path, pgid = spawn_job(job_spec)
+            proc, stdout_path, stderr_path, pgid, gate_fd = spawn_job(job_spec)
         except OSError as exc:
             LOGGER.warning("unable to start job %s: %s", claimed.id, exc)
             self._finalize_immediate(
@@ -2574,34 +3018,179 @@ class Supervisor:
                 ),
             )
             return
-
-        job = ActiveJob(
-            id=claimed.id,
-            cwd=job_spec.cwd,
-            process=job_spec.process,
+        gated = GatedSpawn(
             proc=proc,
-            pid=proc.pid,
             pgid=pgid,
-            started_mono=time.monotonic(),
-            claimed_at=time.time(),
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            gate_fd=gate_fd,
         )
+
+        # Fail closed BEFORE any release and activate only on success.
+        job = self._activate_gated_job(
+            conn,
+            claimed.id,
+            job_spec,
+            gated,
+            claim_mono=claim_mono,
+        )
+        if job is None:
+            return
         job.stdout = OutputStream(path=stdout_path)
         job.stderr = OutputStream(path=stderr_path)
         job.last_heartbeat_at = claim_mono
         self.active[claimed.id] = job
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
         self._publish_health_force()
-        try:
-            _persist_process(conn, job.id, job.pid, job.pgid)
-        except psycopg.Error as exc:
-            if self._is_connectivity_error(exc):
-                raise
-            LOGGER.exception(
-                "unable to persist process identity for job %s (SQLSTATE %s)",
-                job.id,
-                exc.sqlstate or "N/A",
+
+    @staticmethod
+    def _abort_and_converge(gated: GatedSpawn, job_id: UUID) -> None:
+        """Abort the gated start and block until its wrapper is reaped.
+
+        A nonconverging ``abort_gated_start`` must NEVER fall back to normal
+        flow with a live untracked gated group: this worker locally owns the
+        still-gated childless direct child and synchronously blocks — with no
+        timeout return — until it is terminal and reaped, at which point the
+        original unreleased group is gone by construction.
+
+        Args:
+            gated: Handles and exact identity of the gated start.
+            job_id: Identifier of the affected job (for diagnostics).
+        """
+        if abort_gated_start(
+            gated.proc, gated.pgid, gated.stdout_path, gated.stderr_path, gated.gate_fd
+        ):
+            return
+        LOGGER.error(
+            "gated start abort did not converge for job %s (exact group %d); "
+            "locally owning the live child until it is reaped",
+            job_id,
+            gated.pgid,
+        )
+        await_gated_group_gone(gated)
+
+    def _pre_release_failure(
+        self,
+        conn: JobsConnection,
+        job_id: UUID,
+        gated: GatedSpawn,
+    ) -> str | None:
+        """Obtain and durably persist the exact identity before any release.
+
+        Fail-closed ordering: valid positive start-time ticks must be obtained
+        and durably persisted BEFORE any release. On any failure the exact
+        gated wrapper is converged (terminal and reaped) first — including on
+        the connectivity re-raise path — so no error path can leave a live
+        untracked gated group behind and no failed persistence can ever reach
+        :func:`release_gate`.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job_id: Identifier of the claimed job.
+            gated: Handles and exact identity of the gated start.
+
+        Returns:
+            The final stderr message when the start failed after convergence
+            (the caller must finalize failed), or ``None`` when persistence
+            succeeded.
+
+        Raises:
+            psycopg.Error: When persisting the identity fails with a
+                connectivity error (raised only after exact-group convergence).
+        """
+        start_ticks = proc_start_ticks(gated.proc.pid)
+        if start_ticks is not None and start_ticks > 0:
+            try:
+                _persist_process(conn, job_id, gated.proc.pid, gated.pgid, start_ticks)
+            except psycopg.Error as exc:
+                connectivity = self._is_connectivity_error(exc)
+                self._abort_and_converge(gated, job_id)
+                if connectivity:
+                    raise
+                LOGGER.exception(
+                    "unable to persist process identity for job %s (SQLSTATE %s)",
+                    job_id,
+                    exc.sqlstate or "N/A",
+                )
+                return "unable to record process identity; job not started"
+            return None
+        # No durable exact identity exists, so this worker itself must own the
+        # childless gated child to convergence before anything else.
+        self._abort_and_converge(gated, job_id)
+        LOGGER.error(
+            "unable to obtain exact start-time ticks for job %s (pid %d); "
+            "gated start aborted without executing user code",
+            job_id,
+            gated.proc.pid,
+        )
+        return "unable to record exact process identity; job not started"
+
+    def _activate_gated_job(
+        self,
+        conn: JobsConnection,
+        job_id: UUID,
+        job_spec: Job,
+        gated: GatedSpawn,
+        *,
+        claim_mono: float,
+    ) -> ActiveJob | None:
+        """Persist the exact identity, release the gate, and build the active job.
+
+        Fail-closed ordering: valid positive start-time ticks must be obtained
+        and durably persisted BEFORE any release; a persist or release failure
+        converges the exact gated group and finalizes the job failed so no user
+        side effect survives and a failed start can never later look like a
+        normally completed user command.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job_id: Identifier of the claimed job.
+            job_spec: The claimed job specification.
+            gated: Handles and exact identity of the gated start to activate.
+            claim_mono: Monotonic claim instant carried onto the active job.
+
+        Returns:
+            The :class:`ActiveJob` for normal supervision, or ``None`` when the
+            start failed and was finalized as such. Every failure path first
+            converges the exact gated wrapper (terminal and reaped), so no
+            untracked live group ever outlives this call.
+        """
+        failure = self._pre_release_failure(conn, job_id, gated)
+        if failure is None:
+            # The exact identity is durably recorded. Release the gate so the
+            # wrapper execs the user argv on the exact same PID, after which
+            # normal supervision applies. A failed release is a start failure:
+            # converge the live child first, then finalize failed.
+            if release_gate(gated.gate_fd):
+                return ActiveJob(
+                    id=job_id,
+                    cwd=job_spec.cwd,
+                    process=job_spec.process,
+                    proc=gated.proc,
+                    pid=gated.proc.pid,
+                    pgid=gated.pgid,
+                    started_mono=time.monotonic(),
+                    claimed_at=claim_mono,
+                )
+            self._abort_and_converge(gated, job_id)
+            LOGGER.error(
+                "failed to release the start gate for job %s (pid %d); "
+                "gated start aborted without executing user code",
+                job_id,
+                gated.proc.pid,
             )
-            request_stop(job, STOP_REASON_PERSIST)
+            failure = "unable to release gated start; job not started"
+        self._finalize_immediate(
+            job_id,
+            JobResult(
+                status="failed",
+                exit_code=EXECUTION_ERROR_EXIT_CODE,
+                stdout="",
+                stderr=failure,
+                cancellation_note=None,
+            ),
+        )
+        return None
 
     def _finalize_immediate(self, job_id: UUID, result: JobResult) -> None:
         """Finalize a job that failed before or during spawning.
@@ -2806,8 +3395,26 @@ class Supervisor:
         for job in list(self.active.values()):
             if not job.completed and not job.term_sent:
                 request_stop(job, STOP_REASON_SHUTDOWN)
-        self._drain_active_groups()
-        self._finalize_all_for_shutdown()
+        if not self._drain_active_groups():
+            # Positive post-SIGKILL proof failed for at least one exact active
+            # group. This is NOT a clean drain: never emit the sentinel, never
+            # terminalize/untrack those jobs (their running rows keep the exact
+            # persisted identity recoverable by emergency recovery), and fail
+            # loudly in the log so the outer authority holds instead of reaping.
+            surviving = [job.pgid for job in self.active.values() if group_has_members(job.pgid)]
+            LOGGER.error(
+                "shutdown cannot prove groups %s member-free; withholding the "
+                "drain sentinel and retaining their jobs for exact-identity "
+                "recovery",
+                surviving,
+            )
+            self._finalize_all_for_shutdown(retain_groups=surviving)
+        else:
+            try:
+                write_drain_sentinel(self.settings.worker_incarnation)
+            except OSError:
+                LOGGER.debug("could not write drain sentinel", exc_info=True)
+            self._finalize_all_for_shutdown()
         self._cleanup_all_files()
         if self.conn is not None:
             with suppress(Exception):
@@ -2819,8 +3426,15 @@ class Supervisor:
         except OSError:
             LOGGER.debug("failed to write shutdown health snapshot", exc_info=True)
 
-    def _drain_active_groups(self) -> None:
-        """Wait for every active process group to exit, escalating to SIGKILL."""
+    def _drain_active_groups(self) -> bool:
+        """Wait for every active process group to exit, escalating to SIGKILL.
+
+        Returns:
+            ``True`` only when every active job's exact group is positively
+            proven member-free after the escalation; ``False`` when any exact
+            group still has members after the final SIGKILL pass, so no clean
+            drain may be claimed.
+        """
         deadline = time.monotonic() + self.settings.cancel_grace_seconds
         while time.monotonic() < deadline:
             all_gone = all(
@@ -2835,6 +3449,7 @@ class Supervisor:
         for job in self.active.values():
             with suppress(Exception):
                 job.proc.wait(timeout=self.settings.cancel_grace_seconds)
+        return all(not group_has_members(job.pgid) for job in self.active.values())
 
     def _observe_and_escalate(self, job: ActiveJob, now: float) -> bool:
         """Poll one child, escalate its in-flight stop, and report whether it is gone.
@@ -2872,20 +3487,28 @@ class Supervisor:
                 signal_kill(job)
         return job.completed and not group_has_members(job.pgid)
 
-    def _finalize_all_for_shutdown(self) -> None:
+    def _finalize_all_for_shutdown(self, *, retain_groups: list[int] | None = None) -> None:
         """Finalize every tracked job when PostgreSQL is available.
 
         Connectivity errors are re-raised so the caller can handle outage
         before continuing shutdown.  Deterministic per-job errors are logged
-        and the job is quarantined, preserving lease/row safety.
+        and the job is quarantined, preserving lease/row safety. Jobs whose
+        exact group could not be proven member-free (``retain_groups``) are
+        retained in the active set and their rows stay recoverable: they are
+        never terminalized or untracked here.
+
+        Args:
+            retain_groups: Exact group ids that failed post-SIGKILL proof;
+                their jobs are retained instead of finalized.
 
         Raises:
             psycopg.Error: When the error is a connectivity issue.
         """
         if self.conn is None:
             return
+        retained_ids = set(retain_groups or [])
         for job in list(self.active.values()):
-            if job.finalized:
+            if job.finalized or job.pgid in retained_ids:
                 continue
             if not job.completed and job.stop_reason is None:
                 job.stop_reason = STOP_REASON_SHUTDOWN

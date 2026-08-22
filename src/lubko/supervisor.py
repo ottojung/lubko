@@ -75,7 +75,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+import psycopg
+
 from lubko import cli, deployctl, lifecycle, supervise
+from lubko import worker as worker_mod
+from lubko.config import load_database_config
 from lubko.durable import remove_durable
 from lubko.health import (
     interpret_worker_health,
@@ -302,6 +306,89 @@ def _child_to_meta(child: WorkerChild, repo: str) -> WorkerMeta:
         started_at=child.spawned_at,
         stopped_at=None,
     )
+
+
+class OwnedGroupRecoveryError(Exception):
+    """Raised when owned command-group recovery could not be completed.
+
+    This is a durable *blocking* obligation, not a recoverable warning: when the
+    retired worker left command groups alive and they cannot be reaped because
+    the database configuration is missing, the database is unreachable, or the
+    recovery query fails, the supervisor must not clear the retired child or
+    spawn a replacement. Callers let this propagate so the next daemon tick
+    retries the same exact orphan rather than handing off sole-consumer
+    authority alongside stale side-effecting process groups.
+    """
+
+
+def recover_owned_groups(incarnation: str) -> None:
+    """Recover any command group still owned by a retired worker incarnation.
+
+    After a worker is stopped or force-killed, any command process group it
+    owned must be terminated and reaped by its exact persisted process-group
+    id (``state.process_pgid``), never by process-name matching or a broad
+    kill. This is a durable blocking obligation: a missing database
+    configuration, an unreachable database, a recovery query failure, or a
+    verified-ours group that survives the recovery pass raises
+    :class:`OwnedGroupRecoveryError` so the caller preserves the retired
+    child and does not spawn a replacement alongside a still-live
+    side-effecting group. Only exact identities are ever signalled, and the
+    recovery pass proves each target is genuinely dead before it is treated
+    as reclaimed.
+
+    Args:
+        incarnation: The retired worker's lifecycle token (incarnation).
+
+    Raises:
+        OwnedGroupRecoveryError: If the recovery could not be completed, or
+            if a verified-ours group survived the recovery pass.
+    """
+    if not incarnation:
+        return
+    try:
+        database = load_database_config()
+    except (OSError, ValueError) as exc:
+        msg = f"cannot load database config to recover owned groups for {incarnation}"
+        raise OwnedGroupRecoveryError(msg) from exc
+    try:
+        conn = psycopg.connect(
+            database.conninfo(),
+            connect_timeout=5,
+        )
+        conn.autocommit = True
+    except (psycopg.Error, OSError) as exc:
+        msg = f"cannot connect to recover owned groups for {incarnation}"
+        raise OwnedGroupRecoveryError(msg) from exc
+    try:
+        result = worker_mod.recover_owned_job_groups(
+            conn, incarnation, worker_mod.DEFAULT_CANCEL_GRACE_SECONDS
+        )
+    except psycopg.Error as exc:
+        msg = f"error recovering owned groups for incarnation {incarnation}"
+        raise OwnedGroupRecoveryError(msg) from exc
+    finally:
+        with suppress(Exception):
+            conn.close()
+    if result.surviving:
+        msg = (
+            f"owned command group(s) {result.surviving} still alive after "
+            f"recovery for incarnation {incarnation}; holding without "
+            "clearing authority or spawning a replacement"
+        )
+        raise OwnedGroupRecoveryError(msg)
+    if result.unresolved:
+        msg = (
+            f"owned command group(s) {result.unresolved} could not be "
+            f"identity-verified during recovery for incarnation {incarnation}; "
+            "holding without clearing authority or spawning a replacement"
+        )
+        raise OwnedGroupRecoveryError(msg)
+    if result.reaped:
+        LOGGER.info(
+            "recovered %d owned command group(s) for incarnation %s",
+            len(result.reaped),
+            incarnation,
+        )
 
 
 class SupervisorDaemon:
@@ -661,12 +748,8 @@ class SupervisorDaemon:
                 )
                 if not lifecycle.stop_worker(meta, self.settings.stop_grace_seconds):
                     now = time.monotonic()
-                    write_state(
-                        replace(
-                            read_state(),
-                            next_attempt_at=now + self._backoff_seconds(read_state().restart_count),
-                        )
-                    )
+                    next_backoff = now + self._backoff_seconds(read_state().restart_count)
+                    write_state(replace(read_state(), next_attempt_at=next_backoff))
                     self._message = (
                         f"could not stop the recorded maintained worker pid {meta.pid}; "
                         "holding without starting a worker"
@@ -676,6 +759,13 @@ class SupervisorDaemon:
                         meta.pid,
                     )
                     return
+                # The adopted worker may have left command groups alive. If it
+                # proved a clean drain the groups are already gone and no
+                # emergency recovery is required; otherwise recovery is a durable
+                # blocking obligation — a DB/config/SQL failure must not let us
+                # spawn a replacement alongside stale groups.
+                if not (meta.token and worker_mod.drain_sentinel_matches(meta.token)):
+                    recover_owned_groups(meta.token or "")
         child = self._spawn_worker(commit)
         now = time.monotonic()
         if child is None:
@@ -840,19 +930,35 @@ class SupervisorDaemon:
             return True
         meta = _child_to_meta(child, _runtime_dir(state.commit))
         stopped = lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
-        if self.proc is not None:
-            with suppress(Exception):
-                self.proc.wait(timeout=self.settings.stop_grace_seconds)
-            self.proc = None
-        if stopped:
-            write_state(replace(state, child=None))
-            LOGGER.info("retired worker child pid=%d", child.pid)
-        else:
+        # A live exact worker that stop_worker could not authorize or stop (e.g.
+        # a wrong/absent lifecycle token, or PID reuse) must not be signalled
+        # and must not be reported retired. Hold immediately: do NOT attempt
+        # owned-group recovery (it is keyed by the same token we could not
+        # authorize) and do NOT clear the child identity or hand off
+        # sole-consumer authority. The next daemon tick retries the same exact
+        # orphan rather than spawning a duplicate consumer.
+        if not stopped:
             LOGGER.error(
                 "could not confirm stop of worker pid %d; preserving child identity for retry",
                 child.pid,
             )
-        return stopped
+            return False
+        # The worker is confirmed dead. A wedged worker that was force-killed can
+        # leave command process groups alive. If the worker proved a clean drain
+        # the groups are already gone and no emergency recovery is required (and
+        # no database round-trip that could fail). Otherwise recovery is a
+        # durable blocking obligation: a DB/config/SQL failure or a surviving/
+        # unresolved group raises, which preserves the retired child and prevents
+        # spawning a replacement alongside stale groups.
+        if not (child.token and worker_mod.drain_sentinel_matches(child.token)):
+            recover_owned_groups(child.token)
+        if self.proc is not None:
+            with suppress(Exception):
+                self.proc.wait(timeout=self.settings.stop_grace_seconds)
+            self.proc = None
+        write_state(replace(state, child=None))
+        LOGGER.info("retired worker child pid=%d", child.pid)
+        return True
 
     def _clear_child(self, _now: float) -> None:
         """Forget a child that exited after an intentional retirement.
