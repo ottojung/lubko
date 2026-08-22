@@ -39,6 +39,7 @@ import pytest
 
 from lubko import cli, lifecycle, supervise
 from lubko import deployctl as dc
+from lubko import supervisor as supervisor_module
 from lubko.state import cli_root_dir, rollback_state_path
 from lubko.supervisor import Settings, SupervisorDaemon
 from lubko.supervisor import main as supervisor_main
@@ -2778,7 +2779,7 @@ def test_reconcile_takeover_stops_reparented_orphan(
             recover_calls.append(token)
             assert token == _TEST_ORPHAN_INCARNATION
 
-        monkeypatch.setattr(daemon, "_recover_owned_groups", fake_recover)
+        monkeypatch.setattr(supervisor_module, "recover_owned_groups", fake_recover)
 
         daemon.reconcile(0.0)
 

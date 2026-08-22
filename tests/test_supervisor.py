@@ -1063,6 +1063,19 @@ def test_original_bug_processless_job_not_heartbeated_after_outage(
         return REAL_FINISH_JOB(conn, job_id, result)
 
     monkeypatch.setattr("lubko.worker.finish_job", _finish_connectivity_outage)
+    # The gated start makes an unspawnable argv a post-spawn exec failure, so
+    # the "fails BEFORE spawn" scenario this #74 regression requires is
+    # injected explicitly: spawn_job refuses the marked job before any process
+    # exists (no identity is ever persisted), while other jobs spawn normally.
+    real_spawn_job = worker_module.spawn_job
+    refusal = "simulated pre-spawn refusal"
+
+    def _refuse_marked_spawn(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
+        if job.process and job.process[0] == "/nonexistent/lubko-no-such-bin":
+            raise OSError(refusal)
+        return real_spawn_job(job)
+
+    monkeypatch.setattr(worker_module, "spawn_job", _refuse_marked_spawn)
 
     settings = _issue74_settings()
     db = make_database_config(pg_cluster)
@@ -1174,6 +1187,18 @@ def test_retry_terminations_handles_double_terminalization_failure(
         return REAL_FINISH_JOB(conn, job_id, result)
 
     monkeypatch.setattr("lubko.worker.finish_job", _finish_raise)
+    # The gated start makes an unspawnable argv a post-spawn exec failure, so
+    # the "fails BEFORE spawn" scenario this regression requires is injected
+    # explicitly: spawn_job refuses the marked job before any process exists.
+    real_spawn_job = worker_module.spawn_job
+    refusal = "simulated pre-spawn refusal"
+
+    def _refuse_marked_spawn(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
+        if job.process and job.process[0] == "/nonexistent/lubko-no-such-bin":
+            raise OSError(refusal)
+        return real_spawn_job(job)
+
+    monkeypatch.setattr(worker_module, "spawn_job", _refuse_marked_spawn)
 
     settings = _issue74_settings()
     db = make_database_config(pg_cluster)
