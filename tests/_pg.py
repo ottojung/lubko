@@ -94,9 +94,9 @@ class PgCluster:
     def _refuse_stale_pre_stop(self) -> None:
         """Fail closed when the recorded PID is live but its ticks mismatch.
 
-        ``pg_ctl stop`` signals whatever occupies the recorded postmaster
-        PID, so a reused/stale identity must be refused **before** invoking
-        it.  A fully absent occupant is safe to hand to ``pg_ctl``.
+        Any shutdown signalling targets whatever occupies the recorded
+        postmaster PID, so a reused/stale identity must be refused before
+        anything is signalled.  A fully absent occupant is safe to skip.
 
         Raises:
             AssertionError: When a live occupant does not match the recorded
@@ -113,32 +113,66 @@ class PgCluster:
         if ticks is None or ticks <= 0 or current != ticks:
             msg = (
                 f"postgres postmaster pid {pid} identity stale/reused; "
-                "refusing pg_ctl stop against an unverified occupant"
+                "refusing shutdown against an unverified occupant"
             )
             raise AssertionError(msg)
+
+    def _signal_postmaster(self, sig: int) -> bool:
+        """Signal the postmaster only under its exact verified identity.
+
+        The recorded start ticks are re-read immediately before signalling;
+        a session/group leader's dedicated group is signalled (taking its
+        backends with it), a non-leader receives an exact-PID signal only.
+
+        Args:
+            sig: Signal to deliver.
+
+        Returns:
+            ``True`` when delivered; ``False`` when the identity went stale.
+        """
+        pid = self.postmaster_pid
+        ticks = self.postmaster_start_ticks
+        if pid is None or ticks is None or proc_start_ticks(pid) != ticks:
+            return False
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            return False
+        with suppress(ProcessLookupError):
+            if pgid == pid:
+                os.killpg(pgid, sig)
+            else:
+                os.kill(pid, sig)
+        return True
 
     def stop(self) -> None:
         """Stop the cluster and confirm the exact postmaster is gone.
 
-        Identity is validated **before** any ``pg_ctl stop`` (which would
-        signal the recorded PID), and again immediately before any forced
-        signal; a stale/reused or unverifiable PID fails closed instead of
-        being signalled.
+        Immediate shutdown is performed by an exact PID+start-ticks signal
+        at the signal point (never through ``pg_ctl``, which would signal
+        whatever numeric PID occupies the postmaster pidfile), followed by
+        exact escalation and reap verification.  A stale/reused or
+        unverifiable identity fails closed instead of being signalled.
+
+        Raises:
+            AssertionError: When the identity is unrecorded or goes stale
+                between observation and the signalling point.
         """
         self._refuse_stale_pre_stop()
-        subprocess.run(
-            [
-                self.binaries["pg_ctl"],
-                "-D",
-                str(self.data_dir),
-                "-m",
-                "immediate",
-                "stop",
-            ],
-            env=self.env,
-            check=False,
-            capture_output=True,
-        )
+        pid = self.postmaster_pid
+        ticks = self.postmaster_start_ticks
+        if pid is None or ticks is None:
+            msg = "postmaster identity unrecorded; refusing unverified shutdown"
+            raise AssertionError(msg)
+        if not self._signal_postmaster(signal.SIGQUIT):
+            msg = f"postmaster pid {pid} identity went stale at signal point"
+            raise AssertionError(msg)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and process_live(pid):
+            time.sleep(0.05)
+        if process_live(pid) and not self._signal_postmaster(signal.SIGKILL):
+            msg = f"postmaster pid {pid} identity went stale at escalation"
+            raise AssertionError(msg)
         self.assert_postmaster_gone()
 
     def assert_postmaster_gone(self) -> None:

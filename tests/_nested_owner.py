@@ -83,7 +83,7 @@ def _become_subreaper() -> bool:
 def _signal_exact_or_group(
     pid: int,
     ticks: int,
-    sig: signal.Signals,
+    sig: int,
     owned_group: int | None = None,
 ) -> bool:
     """Signal one descendant using the shared guard's ownership semantics.
@@ -274,6 +274,7 @@ def main(
     argv: list[str] | None = None,
     *,
     become_subreaper: Callable[[], bool] | None = None,
+    signal_exact: Callable[[int, int, int], bool] | None = None,
 ) -> int:
     """Run the nested command, then contain and reap its recorded identities.
 
@@ -289,6 +290,8 @@ def main(
     Args:
         argv: Argument vector; defaults to ``sys.argv[1:]``.
         become_subreaper: Injectable subreaper setup for tests.
+        signal_exact: Injectable exact-identity signalling for tests
+            (returns False to simulate a gone/stale incarnation).
 
     Returns:
         ``0`` when containment is positively proven, otherwise ``1``.
@@ -305,6 +308,7 @@ def main(
         "observed_ppid_1": False,
         "identity_mismatch": False,
         "unresolved_ticks": False,
+        "timeout_signal_refused": None,
         "survivor_seen": False,
         "contained": True,
     }
@@ -330,10 +334,17 @@ def main(
         env=dict(os.environ),
         stdin=subprocess.DEVNULL,
     )
+    # Establish the nested pytest's exact identity immediately after spawn:
+    # the timeout path may only signal this captured (pid, start_ticks).
+    nested_ticks = _proc_start_ticks(proc.pid)
+    if nested_ticks is not None and nested_ticks <= 0:
+        nested_ticks = None
     args.pidfile.write_text(
-        json.dumps({"pid": proc.pid, "ticks": _proc_start_ticks(proc.pid)}),
+        json.dumps({"pid": proc.pid, "ticks": nested_ticks}),
         encoding="utf-8",
     )
+    if nested_ticks is None:
+        return _wait_unverifiable_child(args, proc, result)
     status: int | None = None
     hard_deadline = time.monotonic() + args.deadline
     timed_out = False
@@ -342,9 +353,21 @@ def main(
             status = proc.wait(timeout=POLL_SECONDS)
         except subprocess.TimeoutExpired:
             if time.monotonic() > hard_deadline:
-                proc.kill()
-                timed_out = True
-                status = proc.wait()
+                # Timeout signalling is authorized only by the captured
+                # spawn-time (pid, start_ticks) identity, revalidated by
+                # the exact signalling helper.  A gone/stale incarnation
+                # fails closed without pretending cleanup succeeded.
+                signaller = signal_exact or _signal_exact_or_group
+                if not signaller(proc.pid, nested_ticks, signal.SIGKILL):
+                    # Identity stale/reused at the signal point: never
+                    # signal, never exit while the child may still be live —
+                    # keep waiting for a natural end (the loop re-polls).
+                    result["timeout_signal_refused"] = f"identity stale pid={proc.pid}"
+                    result["contained"] = False
+                    timed_out = True
+                else:
+                    timed_out = True
+                    status = proc.wait()
     result["returncode"] = status
     result["timed_out"] = timed_out
 
@@ -360,6 +383,42 @@ def main(
 
     args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
     return 0 if result["contained"] is True else 1
+
+
+def _wait_unverifiable_child(
+    args: argparse.Namespace,
+    proc: subprocess.Popen[bytes],
+    result: dict[str, object],
+) -> int:
+    """Wait for a naturally-ending child whose identity was unverifiable.
+
+    The child is live but its start ticks could not be captured, so no
+    timeout signal is ever authorized.  The owner stays alive — never
+    exiting while the child may still run and orphan to PID 1 — until the
+    child ends naturally, then runs normal marker processing plus
+    adopted-tree convergence before returning failure.
+
+    Args:
+        args: Parsed CLI arguments (marker/result paths).
+        proc: The spawned nested command.
+        result: Result dictionary updated in place.
+
+    Returns:
+        ``1``: containment cannot be positively proven.
+    """
+    result["timeout_signal_refused"] = "identity unverifiable at spawn"
+    result["contained"] = False
+    status: int | None = None
+    while status is None:
+        try:
+            status = proc.wait(timeout=POLL_SECONDS * 250)
+        except subprocess.TimeoutExpired:
+            args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+            time.sleep(POLL_SECONDS * 50)
+    _converge_adopted_tree(args, result)
+    result["returncode"] = status
+    args.result.write_text(json.dumps(result, sort_keys=True) + "\n", encoding="utf-8")
+    return 1
 
 
 def _converge_adopted_tree(args: argparse.Namespace, result: dict[str, object]) -> None:

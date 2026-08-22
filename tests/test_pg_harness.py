@@ -7,6 +7,9 @@ was never verifiable: teardown fails closed instead.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import signal
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -18,6 +21,26 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 SLEEP_BIN: str = "/bin/sleep"
+
+
+def kill_verified(proc: subprocess.Popen[bytes], spawn_ticks: int) -> None:
+    """Force-kill a test-owned process by its captured exact identity.
+
+    Start ticks are captured immediately before signalling; an already
+    terminal process is a no-op and a stale identity is never signalled.
+
+    Args:
+        proc: The test-owned process to stop.
+        spawn_ticks: Start ticks captured right after spawn.
+    """
+    if proc.poll() is not None:
+        return
+    assert _pg.proc_start_ticks(proc.pid) == spawn_ticks, (
+        f"pid {proc.pid} identity stale/reused at cleanup; KILL refused"
+    )
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=10)
 
 
 @pytest.fixture
@@ -67,6 +90,8 @@ def test_start_records_exact_postmaster_identity(
     """``start()`` records the postmaster's PID and current start ticks."""
     cluster, pidfile = fake_cluster
     proc = _spawn_sleeper()
+    spawn_ticks = _pg.proc_start_ticks(proc.pid)
+    assert spawn_ticks is not None
     try:
         pidfile.write_text(f"{proc.pid}\n", encoding="utf-8")
         ticks = _pg.proc_start_ticks(proc.pid)
@@ -81,19 +106,18 @@ def test_start_records_exact_postmaster_identity(
         assert cluster.postmaster_start_ticks == ticks
     finally:
         if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=10)
+            kill_verified(proc, spawn_ticks)
 
 
-def test_stop_refuses_pg_ctl_before_signalling_stale_identity(
+def test_stop_refuses_signalling_stale_identity(
     monkeypatch: pytest.MonkeyPatch,
     fake_cluster: tuple[_pg.PgCluster, Path],
 ) -> None:
-    """``pg_ctl stop`` is never invoked when the recorded identity is stale.
+    """A stale recorded identity authorizes no shutdown signal at all.
 
-    ``pg_ctl stop`` signals whatever occupies the recorded postmaster PID,
-    so a live occupant with mismatched recorded ticks must be refused
-    before pg_ctl runs at all.
+    The immediate-shutdown path signals only the exact verified
+    PID+start-ticks incarnation, so a live occupant with mismatched
+    recorded ticks must never be signalled.
 
     Args:
         monkeypatch: Pytest monkeypatch fixture.
@@ -101,25 +125,24 @@ def test_stop_refuses_pg_ctl_before_signalling_stale_identity(
     """
     cluster, _pidfile = fake_cluster
     innocent = _spawn_sleeper()
+    innocent_ticks = _pg.proc_start_ticks(innocent.pid)
+    assert innocent_ticks is not None
     invoked: list[list[str]] = []
 
     def record_run(command: list[str], **_kwargs: object) -> None:
         invoked.append(command)
 
     try:
-        ticks = _pg.proc_start_ticks(innocent.pid)
-        assert ticks is not None
         cluster.postmaster_pid = innocent.pid
-        cluster.postmaster_start_ticks = ticks + 1
+        cluster.postmaster_start_ticks = innocent_ticks + 1
         monkeypatch.setattr("subprocess.run", record_run)
-        with pytest.raises(AssertionError, match="refusing pg_ctl stop"):
+        with pytest.raises(AssertionError, match="identity stale/reused"):
             cluster.stop()
         assert not invoked
         assert _pg.process_live(innocent.pid)
     finally:
         if innocent.poll() is None:
-            innocent.kill()
-            innocent.wait(timeout=10)
+            kill_verified(innocent, innocent_ticks)
 
 
 def test_teardown_refuses_force_kill_on_stale_postmaster_identity(
@@ -128,20 +151,19 @@ def test_teardown_refuses_force_kill_on_stale_postmaster_identity(
     """A live PID with mismatched recorded ticks is never signalled."""
     cluster, _pidfile = fake_cluster
     innocent = _spawn_sleeper()
+    innocent_ticks = _pg.proc_start_ticks(innocent.pid)
+    assert innocent_ticks is not None
     try:
-        ticks = _pg.proc_start_ticks(innocent.pid)
-        assert ticks is not None
         # Simulate kernel PID reuse: recorded ticks differ from the live
         # occupant of the PID while pg_ctl could not stop it.
         cluster.postmaster_pid = innocent.pid
-        cluster.postmaster_start_ticks = ticks + 1
+        cluster.postmaster_start_ticks = innocent_ticks + 1
         with pytest.raises(AssertionError, match="refusing to signal"):
             cluster.assert_postmaster_gone()
         assert _pg.process_live(innocent.pid)
     finally:
         if innocent.poll() is None:
-            innocent.kill()
-            innocent.wait(timeout=10)
+            kill_verified(innocent, innocent_ticks)
 
 
 def test_teardown_refuses_force_kill_without_recorded_ticks(
@@ -150,6 +172,8 @@ def test_teardown_refuses_force_kill_without_recorded_ticks(
     """An unverifiable (ticks-less) identity authorizes no signal."""
     cluster, _pidfile = fake_cluster
     innocent = _spawn_sleeper()
+    innocent_ticks = _pg.proc_start_ticks(innocent.pid)
+    assert innocent_ticks is not None
     try:
         cluster.postmaster_pid = innocent.pid
         cluster.postmaster_start_ticks = None
@@ -158,8 +182,7 @@ def test_teardown_refuses_force_kill_without_recorded_ticks(
         assert _pg.process_live(innocent.pid)
     finally:
         if innocent.poll() is None:
-            innocent.kill()
-            innocent.wait(timeout=10)
+            kill_verified(innocent, innocent_ticks)
 
 
 def test_teardown_force_kills_verified_live_identity(
@@ -169,6 +192,8 @@ def test_teardown_force_kills_verified_live_identity(
     """A verified live postmaster is still force-killed on teardown."""
     cluster, _pidfile = fake_cluster
     proc = _spawn_sleeper()
+    spawn_ticks = _pg.proc_start_ticks(proc.pid)
+    assert spawn_ticks is not None
     try:
         ticks = _pg.proc_start_ticks(proc.pid)
         assert ticks is not None
@@ -186,5 +211,4 @@ def test_teardown_force_kills_verified_live_identity(
         proc.wait(timeout=10)
     finally:
         if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=10)
+            kill_verified(proc, spawn_ticks)

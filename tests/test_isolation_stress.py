@@ -1378,6 +1378,8 @@ def test_owner_refuses_missing_marker_ticks_and_never_signals(
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    innocent_ticks = guard.proc_start_ticks(innocent.pid)
+    assert innocent_ticks is not None
     try:
         # Deliberately omit "ticks" from the marker record.
         marker.write_text(
@@ -1416,8 +1418,7 @@ def test_owner_refuses_missing_marker_ticks_and_never_signals(
         assert innocent.poll() is None
     finally:
         if innocent.poll() is None:
-            innocent.kill()
-            innocent.wait(timeout=10)
+            kill_verified(innocent, innocent_ticks)
 
 
 def test_owner_fails_closed_when_subreaper_setup_fails(tmp_path: Path) -> None:
@@ -1555,6 +1556,25 @@ def test_owner_fails_closed_when_child_removes_marker(tmp_path: Path) -> None:
     payload = _read_result(result)
     assert payload["coverage_unproven"] is True
     assert payload["contained"] is False
+
+
+def kill_verified(proc: subprocess.Popen[bytes], spawn_ticks: int) -> None:
+    """Force-kill a test-owned process by its SPAWN-TIME exact identity.
+
+    The stored spawn-time start ticks are revalidated immediately before
+    the signal; a reused occupant of the PID is never signalled, and an
+    already-terminal process is a no-op.
+
+    Args:
+        proc: The test-owned process to stop.
+        spawn_ticks: Start ticks captured right after spawn.
+    """
+    if proc.poll() is not None:
+        return
+    assert guard.signal_identity_checked(proc.pid, spawn_ticks, signal.SIGKILL), (
+        f"pid {proc.pid} identity stale/reused at cleanup; KILL refused"
+    )
+    proc.wait(timeout=10)
 
 
 def _wait_for_child_of(nested_pid: int | None, timeout: float) -> int | None:
@@ -1740,10 +1760,11 @@ def test_retire_marker_descendants_accepts_already_absent(tmp_path: Path) -> Non
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    ticks = guard.proc_start_ticks(gone.pid)
-    assert ticks is not None
-    gone.kill()
+    gone_ticks = guard.proc_start_ticks(gone.pid)
+    assert gone_ticks is not None
+    kill_verified(gone, gone_ticks)
     gone.wait(timeout=10)
+    ticks = gone_ticks
     # Fully reaped: /proc entry is truly absent while its old ticks remain
     # recorded in the marker.
     marker = tmp_path / "absent.marker.json"
@@ -1830,6 +1851,8 @@ def test_wedged_owner_not_signalled_while_descendant_unresolved(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    owner_spawn_ticks = guard.proc_start_ticks(innocent_owner.pid)
+    assert owner_spawn_ticks is not None
     innocent_descendant = subprocess.Popen(
         ["/bin/sleep", "60"],
         stdin=subprocess.DEVNULL,
@@ -1837,9 +1860,9 @@ def test_wedged_owner_not_signalled_while_descendant_unresolved(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    descendant_ticks = guard.proc_start_ticks(innocent_descendant.pid)
+    assert descendant_ticks is not None
     try:
-        descendant_ticks = guard.proc_start_ticks(innocent_descendant.pid)
-        assert descendant_ticks is not None
         _run_wedge_scenario(
             _Scenario(tmp_path, "wedge"),
             innocent_owner,
@@ -1849,10 +1872,13 @@ def test_wedged_owner_not_signalled_while_descendant_unresolved(
         assert _proc_state(innocent_owner.pid) is not None
         assert _proc_state(innocent_descendant.pid) is not None
     finally:
-        for proc in (innocent_owner, innocent_descendant):
-            if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=10)
+        if innocent_owner.poll() is None:
+            assert guard.signal_identity_checked(
+                innocent_owner.pid, owner_spawn_ticks, signal.SIGKILL
+            ), "owner-pid occupant identity stale/reused at cleanup"
+            innocent_owner.wait(timeout=10)
+        if innocent_descendant.poll() is None:
+            kill_verified(innocent_descendant, descendant_ticks)
     assert isolation.ambient_sentinel_alive()
     assert _ambient_digest() == before
 
