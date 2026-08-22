@@ -238,6 +238,7 @@ def supervisor_env(
     """
     env = dict(os.environ)
     env["LUBKO_DATABASE_CONFIG"] = str(_database_config_file(pg_cluster, tmp_path))
+    env["LUBKO_SERVER"] = "alpha-server"
     env["LUBKO_SUPERVISOR_POLL_SECONDS"] = "0.1"
     env["LUBKO_SUPERVISOR_BACKOFF_BASE_SECONDS"] = "0.2"
     env["LUBKO_SUPERVISOR_BACKOFF_MAX_SECONDS"] = "2.0"
@@ -392,7 +393,7 @@ def shell_command_argv(command: str) -> list[str]:
 
 
 def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v3 pending command job running a shell snippet.
+    """Insert a protocol v4 pending command job running a shell snippet.
 
     Args:
         conninfo: PostgreSQL connection string.
@@ -403,8 +404,9 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "pending"},
     })
@@ -1855,7 +1857,7 @@ def deploy_deploy_args(repo: Path, fake_uv: Path) -> list[str]:
 
 
 def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> UUID:
-    """Insert a protocol v3 pending command job executing argv directly.
+    """Insert a protocol v4 pending command job executing argv directly.
 
     Args:
         conninfo: PostgreSQL connection string.
@@ -1866,8 +1868,9 @@ def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> U
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })

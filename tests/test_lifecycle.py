@@ -36,6 +36,17 @@ from tests import _pg
 from tests import _process_guard as guard
 from tests.test_cli import fake_uv_sync, make_repo
 
+
+@pytest.fixture(autouse=True)
+def _probe_server_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every lifecycle test and spawned daemon an explicit server identity.
+
+    Protocol v4 has no implicit or default server: probes are addressed to the
+    configured ``LUBKO_SERVER`` identity, and worker subprocesses inherit it.
+    """
+    monkeypatch.setenv("LUBKO_SERVER", "probe-server")
+
+
 MARKER: Final = "test-marker"
 STALE_MARKER: Final = "stale"
 OTHER_MARKER: Final = "other-marker"
@@ -2525,9 +2536,9 @@ def probe_claimed_by(
             conn, probe_id, expected_worker_id, worker_pid, timeout_seconds
         )
     finally:
-        request_cancel(conn, probe_id)
+        request_cancel(conn, probe_id, server=lifecycle._probe_server())
         lifecycle._wait_for_probe_terminal(conn, probe_id, timeout_seconds)
-        delete_job_and_chunks(conn, probe_id)
+        delete_job_and_chunks(conn, probe_id, server=lifecycle._probe_server())
         conn.close()
     return outcome
 
@@ -2854,10 +2865,10 @@ def test_probe_job_independent_of_sys_executable_and_runtime_path(
                 assert outcome is True, "exact worker must claim the probe proving queue-roundtrip"
             finally:
                 with suppress(psycopg.Error):
-                    request_cancel(conn, probe_id)
+                    request_cancel(conn, probe_id, server=lifecycle._probe_server())
                 lifecycle._wait_for_probe_terminal(conn, probe_id, 10.0)
                 with suppress(psycopg.Error):
-                    delete_job_and_chunks(conn, probe_id)
+                    delete_job_and_chunks(conn, probe_id, server=lifecycle._probe_server())
 
             with conn.cursor(row_factory=tuple_row) as cursor:
                 cursor.execute(

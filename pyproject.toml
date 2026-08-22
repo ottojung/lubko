@@ -48,7 +48,12 @@ strict = true
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
+# S608: worker.py builds every query from compile-time constant string
+# literals plus the fixed, Final-declared SERVER_MATCH_SQL routing fragment;
+# all values are bound parameters, so the string construction carries no
+# external data.
 "src/lubko/worker.py" = [
+    "hardcoded-sql-expression",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]

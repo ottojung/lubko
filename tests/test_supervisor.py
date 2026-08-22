@@ -32,7 +32,12 @@ import pytest
 from lubko import health
 from lubko import worker as worker_module
 from lubko.config import DatabaseConfig
-from lubko.protocol import OUTPUT_CHUNK_MAX_BYTES
+from lubko.protocol import (
+    OUTPUT_CHUNK_MAX_BYTES,
+    ProtocolError,
+    parse_chunk_payload,
+    parse_payload,
+)
 from lubko.worker import (
     CHUNK_ORDER_INDEX_NAME,
     CHUNK_OWNER_INDEX_NAME,
@@ -91,16 +96,20 @@ create index if not exists jobs_queue_idx
 """
 
 
-def supervisor_settings(worker_id: str = "test-supervisor") -> Settings:
+def supervisor_settings(
+    worker_id: str = "test-supervisor", server: str = "alpha-server"
+) -> Settings:
     """Build fast-timing supervisor settings for integration tests.
 
     Args:
         worker_id: Worker identifier to record.
+        server: Execution-server identity the daemon owns.
 
     Returns:
         Settings with fast lease and publication timing.
     """
     return Settings(
+        server=server,
         worker_id=worker_id,
         poll_interval_seconds=0.05,
         process_poll_interval_seconds=0.02,
@@ -201,34 +210,39 @@ def shell_command_argv(command: str) -> list[str]:
     return [shutil.which("sh") or "/bin/sh", "-c", command]
 
 
-def insert_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v3 pending command job running a shell snippet.
+def insert_job(conninfo: str, cwd: str, command: str, server: str = "alpha-server") -> UUID:
+    """Insert a protocol v4 pending command job running a shell snippet.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
         command: Shell snippet, executed by an explicit ``/bin/sh -c`` argv.
+        server: Execution server the job is addressed to.
 
     Returns:
         The job identifier.
     """
-    return insert_process_job(conninfo, cwd, shell_command_argv(command))
+    return insert_process_job(conninfo, cwd, shell_command_argv(command), server=server)
 
 
-def insert_process_job(conninfo: str, cwd: str, process: list[str]) -> UUID:
-    """Insert a protocol v3 pending command job executing argv directly.
+def insert_process_job(
+    conninfo: str, cwd: str, process: list[str], server: str = "alpha-server"
+) -> UUID:
+    """Insert a protocol v4 pending command job executing argv directly.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
         process: Non-empty argv array to execute directly.
+        server: Execution server the job is addressed to.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": server,
         "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })
@@ -428,8 +442,9 @@ def test_worker_role_can_operate_on_a_fresh_install(
         verify_jobs_table_invariant(conn)
         verify_protocol_schema(conn)
         chunk_payload = json.dumps({
-            "v": 3,
+            "v": 4,
             "type": "output_chunk",
+            "server": "alpha-server",
             "thread": str(uuid4()),
             "stream": "stdout",
             "sequence": 0,
@@ -495,8 +510,9 @@ def test_worker_role_can_run_gc_cleanup(
 
     # Insert a terminal root with chunks as the worker role.
     terminal_payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": str(tmp_path), "process": ["echo", "done"]},
         "state": {
             "status": "succeeded",
@@ -513,8 +529,9 @@ def test_worker_role_can_run_gc_cleanup(
     terminal_id = cast("UUID", row[0])
 
     chunk_payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "output_chunk",
+        "server": "alpha-server",
         "thread": str(terminal_id),
         "stream": "stdout",
         "sequence": 0,
@@ -528,6 +545,7 @@ def test_worker_role_can_run_gc_cleanup(
 
     # collect_transport must succeed as the worker role (needs DELETE).
     settings = Settings(
+        server="alpha-server",
         worker_id="test-worker",
         poll_interval_seconds=0.05,
         process_poll_interval_seconds=0.01,
@@ -670,7 +688,7 @@ def test_independent_cancellation(jobs_db: str, pg_cluster: _pg.PgCluster, tmp_p
         wait_until(lambda: read_status(jobs_db, first) == "running")
         wait_until(lambda: read_status(jobs_db, second) == "running")
         with psycopg.connect(jobs_db) as conn:
-            status = request_cancel(conn, first)
+            status = request_cancel(conn, first, server="alpha-server")
         assert status == "running"
         wait_until(lambda: read_status(jobs_db, first) == "cancelled")
         assert read_status(jobs_db, second) == "running"
@@ -785,8 +803,9 @@ def test_claim_rejects_request_without_process_without_harming_others(
 ) -> None:
     """A v3 request missing request.process fails cleanly without harming others."""
     bad_payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": str(tmp_path)},
         "state": {"status": "pending"},
     })
@@ -837,31 +856,28 @@ def test_process_argv_passes_shell_metacharacters_literally(
 def test_legacy_v2_payloads_are_rejected_as_unsupported_version(
     jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
 ) -> None:
-    """A v2 payload carrying request.command is rejected, not executed."""
+    """Legacy payloads are refused at every layer, never executed.
+
+    Post-cutover the database itself rejects a v2 row (the routing-aware shape
+    check requires protocol v4 server routing), and the payload parser rejects
+    the version outright, so there is no path on which legacy work is claimed.
+    """
     v2_payload = json.dumps({
         "v": 2,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": str(tmp_path), "command": "echo v2-only"},
         "state": {"status": "pending"},
     })
-    with psycopg.connect(jobs_db) as conn:
-        row = conn.execute(
-            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
-            (v2_payload,),
-        ).fetchone()
-    assert row is not None
-    job_id = cast("UUID", row[0])
-    healthy = insert_job(jobs_db, str(tmp_path), "echo healthy")
+    with psycopg.connect(jobs_db) as conn, pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (v2_payload,))
+    with pytest.raises(ProtocolError, match="unsupported protocol version"):
+        parse_payload(v2_payload)
 
+    # A healthy v4 job runs normally alongside the refusal.
+    healthy = insert_job(jobs_db, str(tmp_path), "echo healthy")
     with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
         wait_until(lambda: read_status(jobs_db, healthy) == "succeeded")
-        wait_until(lambda: read_status(jobs_db, job_id) == "failed")
-
-    payload = read_root(jobs_db, job_id)
-    assert payload["state"]["status"] == "failed"
-    assert payload["result"]["exit_code"] == 2
-    assert "unsupported protocol version" in payload["result"]["stderr"]
-    assert "invalid job payload" in payload["result"]["stderr"]
     assert read_status(jobs_db, healthy) == "succeeded"
 
 
@@ -949,7 +965,7 @@ def test_processless_claimed_job_terminal_write_fails_is_not_reexecuted(
     another job is active.  A genuinely active job keeps heartbeating alongside.
     """
 
-    def _fail_finish(_conn: object, _job_id: object, _result: object) -> str:
+    def _fail_finish(_conn: object, _job_id: object, _result: object, **_kw: object) -> str:
         msg = "simulated deterministic finalization failure"
         raise psycopg.DataError(msg)
 
@@ -1052,7 +1068,9 @@ def test_original_bug_processless_job_not_heartbeated_after_outage(
     # so any claim-batch ordering cannot abort A's startup when B fails.
     active_id = insert_job(jobs_db, str(tmp_path), "sleep 30")
 
-    def _finish_connectivity_outage(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
+    def _finish_connectivity_outage(
+        conn: JobsConnection, job_id: UUID, result: JobResult, *, server: str
+    ) -> str:
         # Only B's immediate finalization fails as a transient outage; every
         # other write (including A's and any shutdown finalization) is real so
         # the supervisor behaves normally around the failure.
@@ -1060,7 +1078,7 @@ def test_original_bug_processless_job_not_heartbeated_after_outage(
             exc = psycopg.OperationalError("simulated transient outage")
             exc.sqlstate = "08006"
             raise exc
-        return REAL_FINISH_JOB(conn, job_id, result)
+        return REAL_FINISH_JOB(conn, job_id, result, server=server)
 
     monkeypatch.setattr("lubko.worker.finish_job", _finish_connectivity_outage)
     # The gated start makes an unspawnable argv a post-spawn exec failure, so
@@ -1172,7 +1190,10 @@ def test_retry_terminations_handles_double_terminalization_failure(
 
     quarantine_calls: list[UUID] = []
 
-    def _quarantine_fail_once_then_succeed(_conn: object, job_id: UUID, _reason: str) -> bool:
+    def _quarantine_fail_once_then_succeed(
+        _conn: object, job_id: UUID, _reason: str, *, server: str
+    ) -> bool:
+        assert server == "alpha-server"
         quarantine_calls.append(job_id)
         # The first (immediate-finalization) call fails so the row is kept
         # locally for retry; the retry then converges.
@@ -1180,11 +1201,11 @@ def test_retry_terminations_handles_double_terminalization_failure(
 
     monkeypatch.setattr("lubko.worker._quarantine_job", _quarantine_fail_once_then_succeed)
 
-    def _finish_raise(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
+    def _finish_raise(conn: JobsConnection, job_id: UUID, result: JobResult, *, server: str) -> str:
         if job_id == processless_id:
             msg = "simulated deterministic finalization failure"
             raise psycopg.DataError(msg)
-        return REAL_FINISH_JOB(conn, job_id, result)
+        return REAL_FINISH_JOB(conn, job_id, result, server=server)
 
     monkeypatch.setattr("lubko.worker.finish_job", _finish_raise)
     # The gated start makes an unspawnable argv a post-spawn exec failure, so
@@ -1247,8 +1268,9 @@ def _insert_owned_running_row(
     job_id = uuid4()
     lease = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": "/workspace", "process": ["sleep", "30"]},
         "state": {
             "status": "running",
@@ -1348,8 +1370,9 @@ def test_cleanup_deletes_root_and_all_owned_chunks(
 
     orphan_id = UUID("11111111-1111-1111-1111-111111111111")
     orphan_payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "output_chunk",
+        "server": "alpha-server",
         "thread": str(job_id),
         "stream": "stderr",
         "sequence": 999,
@@ -1365,7 +1388,7 @@ def test_cleanup_deletes_root_and_all_owned_chunks(
         )
 
     with psycopg.connect(jobs_db) as conn:
-        delete_job_and_chunks(conn, job_id)
+        delete_job_and_chunks(conn, job_id, server="alpha-server")
 
     assert count_rows(jobs_db, job_id) == 0
 
@@ -1414,7 +1437,14 @@ def _publish_on_connection(conninfo: str, job: ActiveJob, results: list[bool]) -
     conn = psycopg.connect(conninfo)
     try:
         results.append(
-            publish_output(conn, job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+            publish_output(
+                conn,
+                job,
+                [OUTPUT_STREAM_STDOUT],
+                time.monotonic(),
+                server="alpha-server",
+                force=True,
+            )
         )
     finally:
         conn.close()
@@ -1429,7 +1459,7 @@ def _delete_job_and_chunks_on_connection(conninfo: str, job_id: UUID) -> None:
     """
     conn = psycopg.connect(conninfo)
     try:
-        delete_job_and_chunks(conn, job_id)
+        delete_job_and_chunks(conn, job_id, server="alpha-server")
     finally:
         conn.close()
 
@@ -1566,6 +1596,7 @@ def _with_short_lease(settings: Settings) -> Settings:
         Settings with a 1-second lease and 0.2-second safety margin.
     """
     return Settings(
+        server="alpha-server",
         worker_id=settings.worker_id,
         poll_interval_seconds=settings.poll_interval_seconds,
         process_poll_interval_seconds=settings.process_poll_interval_seconds,
@@ -1882,6 +1913,7 @@ def _run_delayed_batch_lease_scenario(
     # path; the separate heartbeat test covers the real refresh/commit path.
     monkeypatch.setattr(worker_module.Supervisor, "_refresh_leases", lambda *_args: None)
     settings = Settings(
+        server="alpha-server",
         worker_id="orig",
         poll_interval_seconds=0.05,
         process_poll_interval_seconds=0.05,
@@ -2189,6 +2221,7 @@ def test_bounded_claim_batch_still_drains_an_endless_queue(
     job_ids = [insert_job(jobs_db, str(tmp_path), "echo ok") for _ in range(count)]
     settings = supervisor_settings()
     settings = Settings(
+        server="alpha-server",
         worker_id=settings.worker_id,
         poll_interval_seconds=settings.poll_interval_seconds,
         process_poll_interval_seconds=settings.process_poll_interval_seconds,
@@ -2218,8 +2251,9 @@ def test_claim_rejects_unparseable_job_without_affecting_others(
 ) -> None:
     """An unparseable claimed job fails cleanly while others keep running."""
     bad_payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": ""},
         "state": {"status": "pending"},
     })
@@ -2863,7 +2897,9 @@ def test_quarantine_pending_excluded_from_publish_and_finalize(
             raise exc
         return True
 
-    def _quarantine_always_pending(_conn: JobsConnection, _job_id: UUID, _reason: str) -> bool:
+    def _quarantine_always_pending(
+        _conn: JobsConnection, _job_id: UUID, _reason: str, **_kwargs: object
+    ) -> bool:
         return False
 
     supervisor = Supervisor(supervisor_settings(), make_database_config(pg_cluster))
@@ -3047,6 +3083,25 @@ def _inject_pre_release_failure(monkeypatch: pytest.MonkeyPatch, fail: str) -> N
         monkeypatch.setattr(worker_module, "_persist_process", failing_persist)
 
 
+def _observe_outage_entry(monkeypatch: pytest.MonkeyPatch, outage_entered: threading.Event) -> None:
+    """Record outage-entry transitions on ``outage_entered``.
+
+    A test-local wrapper of the existing outage-entry transition is the exact,
+    stable observable for the connectivity scenario: the supervisor's own
+    ``conn`` attribute is only transiently None because reconnection is
+    immediate.
+    """
+    real_enter_outage = (
+        worker_module.Supervisor._enter_outage  # ruff: ignore[private-member-access] -- monkeypatching the exact transition under test is materially clearer than adding production observability hooks
+    )
+
+    def outage_recording_enter(self: worker_module.Supervisor) -> None:
+        outage_entered.set()
+        real_enter_outage(self)
+
+    monkeypatch.setattr(worker_module.Supervisor, "_enter_outage", outage_recording_enter)
+
+
 def _run_nonconverging_abort_scenario(
     monkeypatch: pytest.MonkeyPatch,
     jobs_db: str,
@@ -3127,9 +3182,19 @@ def _run_nonconverging_abort_scenario(
     monkeypatch.setattr(subprocess.Popen, "poll", fake_poll)
     monkeypatch.setattr(worker_module, "abort_gated_start", fake_abort)
     monkeypatch.setattr(worker_module, "release_gate", recording_release)
+    outage_entered = threading.Event()
+    if connectivity_error:
+        # The scenario must observe that the connectivity re-raise entered
+        # outage handling WITHOUT terminalizing the row. The periodic lease-
+        # recovery pass is orthogonal to that invariant and would otherwise
+        # race the blocked-convergence window by recovering the expired-lease
+        # row mid-scenario, so it is suppressed here; the post-scenario assert
+        # proves the row stayed running (exactly recoverable) on its own.
+        monkeypatch.setattr(worker_module.Supervisor, "_run_recovery", lambda *_a: None)
+        _observe_outage_entry(monkeypatch, outage_entered)
     _inject_pre_release_failure(monkeypatch, fail)
 
-    with supervisor_running(settings, make_database_config(pg_cluster), jobs_db) as supervisor:
+    with supervisor_running(settings, make_database_config(pg_cluster), jobs_db):
         wait_until(lambda: read_status(jobs_db, job_id) == "running")
         wait_until(lambda: abort_calls["n"] >= 1)
         # The caller is BLOCKED on the live direct child: no terminal row and
@@ -3145,7 +3210,7 @@ def _run_nonconverging_abort_scenario(
         # deterministic path finalize failed.
         injection["hold"] = False
         if connectivity_error:
-            wait_until(lambda: supervisor.conn is None)
+            wait_until(outage_entered.is_set)
         else:
             wait_until(lambda: read_status(jobs_db, job_id) == "failed")
 
@@ -3224,3 +3289,274 @@ def test_nonconverging_abort_blocks_on_connectivity_error(
         tmp_path,
         "connectivity",
     )
+
+
+def test_two_servers_claim_only_their_own_jobs(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A daemon claims and executes only jobs addressed to its own server.
+
+    Two jobs are submitted to the same queue, addressed to different
+    execution servers. While only the alpha daemon runs, the alpha job is
+    executed to completion while the beta job stays pending untouched; the
+    beta job completes only once a beta-addressed daemon exists.
+    """
+    alpha_id = insert_job(jobs_db, str(tmp_path), "sleep 0.3", server="alpha-server")
+    beta_id = insert_job(jobs_db, str(tmp_path), "sleep 0.3", server="beta-server")
+
+    with supervisor_running(
+        supervisor_settings(server="alpha-server"), make_database_config(pg_cluster), jobs_db
+    ):
+        wait_until(lambda: read_status(jobs_db, alpha_id) == "succeeded")
+        for _ in range(10):
+            assert read_status(jobs_db, beta_id) == "pending"
+            time.sleep(0.02)
+
+    assert read_status(jobs_db, alpha_id) == "succeeded"
+    assert read_status(jobs_db, beta_id) == "pending"
+
+    with supervisor_running(
+        supervisor_settings(worker_id="beta-supervisor", server="beta-server"),
+        make_database_config(pg_cluster),
+        jobs_db,
+    ):
+        wait_until(lambda: read_status(jobs_db, beta_id) == "succeeded")
+
+    assert read_status(jobs_db, beta_id) == "succeeded"
+    payload = read_root(jobs_db, beta_id)
+    assert payload["server"] == "beta-server"
+
+
+def test_two_servers_run_concurrently_without_cross_claiming(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Two daemons with distinct identities run concurrently on one queue.
+
+    Both daemons run simultaneously against the same database. Each job is
+    executed exactly once by its owning server; no job is ever claimed,
+    heartbeated, or terminalized by the wrong daemon.
+    """
+    alpha_id = insert_job(jobs_db, str(tmp_path), "sleep 1", server="alpha-server")
+    beta_id = insert_job(jobs_db, str(tmp_path), "sleep 1", server="beta-server")
+
+    config = make_database_config(pg_cluster)
+    with (
+        supervisor_running(supervisor_settings(server="alpha-server"), config, jobs_db),
+        supervisor_running(
+            supervisor_settings(worker_id="beta-supervisor", server="beta-server"), config, jobs_db
+        ),
+    ):
+        wait_until(lambda: read_status(jobs_db, alpha_id) == "running")
+        wait_until(lambda: read_status(jobs_db, beta_id) == "running")
+        wait_until(lambda: read_status(jobs_db, alpha_id) == "succeeded")
+        wait_until(lambda: read_status(jobs_db, beta_id) == "succeeded")
+
+    alpha_payload = read_root(jobs_db, alpha_id)
+    beta_payload = read_root(jobs_db, beta_id)
+    assert alpha_payload["server"] == "alpha-server"
+    assert beta_payload["server"] == "beta-server"
+    assert alpha_payload["state"]["worker_id"] == "test-supervisor"
+    assert beta_payload["state"]["worker_id"] == "beta-supervisor"
+
+
+def test_cancel_refuses_wrong_server_identity(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """A cancellation addressed to the wrong server never touches the row."""
+    beta_id = insert_job(jobs_db, str(tmp_path), "sleep 30", server="beta-server")
+
+    with supervisor_running(
+        supervisor_settings(server="alpha-server"), make_database_config(pg_cluster), jobs_db
+    ):
+        for _ in range(10):
+            assert read_status(jobs_db, beta_id) == "pending"
+            time.sleep(0.02)
+        with (
+            psycopg.connect(jobs_db) as conn,
+            pytest.raises(ValueError, match="belongs to server 'beta-server'"),
+        ):
+            request_cancel(conn, beta_id, server="alpha-server")
+        assert read_status(jobs_db, beta_id) == "pending"
+
+    with supervisor_running(
+        supervisor_settings(worker_id="beta-supervisor", server="beta-server"),
+        make_database_config(pg_cluster),
+        jobs_db,
+    ):
+        wait_until(lambda: read_status(jobs_db, beta_id) == "running")
+
+
+def test_output_publication_is_isolated_per_server(jobs_db: str, tmp_path: Path) -> None:
+    """Output publication only ever touches and stamps its own server's rows.
+
+    A running root addressed to beta is invisible to an alpha daemon's
+    publication (no chunks inserted, no live-tail update); publication for the
+    beta identity succeeds and every immutable chunk carries exactly the
+    beta server identity.
+    """
+    beta_id = insert_job(jobs_db, str(tmp_path), "sleep 30", server="beta-server")
+    with psycopg.connect(jobs_db) as conn:
+        claimed = worker_module.claim_jobs(conn, supervisor_settings(server="beta-server"), 1)
+    assert len(claimed) == 1
+    job = _publish_job_for(beta_id, str(tmp_path))
+    job.stdout.path.write_bytes(b"x" * 9000)
+
+    with psycopg.connect(jobs_db) as conn:
+        assert (
+            worker_module.publish_output(
+                conn,
+                job,
+                list(worker_module.OUTPUT_STREAMS),
+                time.monotonic(),
+                server="alpha-server",
+                force=True,
+            )
+            is False
+        )
+    with psycopg.connect(jobs_db) as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM lubko.jobs "
+            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
+            "AND lower((payload::jsonb)->>'thread') = lower(%s)",
+            (str(beta_id),),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 0
+    payload = read_root(jobs_db, beta_id)
+    assert payload.get("output") is None
+
+    with psycopg.connect(jobs_db) as conn:
+        assert (
+            worker_module.publish_output(
+                conn,
+                job,
+                list(worker_module.OUTPUT_STREAMS),
+                time.monotonic(),
+                server="beta-server",
+                force=True,
+            )
+            is True
+        )
+    payload = read_root(jobs_db, beta_id)
+    assert payload["output"]["stdout"]["tail"] == "x" * 4000
+    with psycopg.connect(jobs_db) as conn:
+        rows = conn.execute(
+            "SELECT payload::jsonb FROM lubko.jobs "
+            "WHERE (payload::jsonb)->>'type' = 'output_chunk' "
+            "AND lower((payload::jsonb)->>'thread') = lower(%s)",
+            (str(beta_id),),
+        ).fetchall()
+    assert len(rows) == 3
+    for row in rows:
+        chunk = parse_chunk_payload(row[0])
+        assert isinstance(chunk, object)
+        assert chunk.server == "beta-server"
+
+
+def test_offline_and_nonexistent_servers_leave_jobs_pending(
+    jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
+) -> None:
+    """Jobs addressed to offline or nonexistent servers stay pending untouched.
+
+    While only the alpha daemon runs, both a beta-addressed job (its daemon is
+    offline) and a ghost-addressed job (no daemon will ever exist for that
+    identity) remain pending; neither is claimed, failed, or mutated.
+    """
+    beta_id = insert_job(jobs_db, str(tmp_path), "echo beta", server="beta-server")
+    ghost_id = insert_job(jobs_db, str(tmp_path), "echo ghost", server="ghost-server")
+
+    with supervisor_running(supervisor_settings(), make_database_config(pg_cluster), jobs_db):
+        for _ in range(10):
+            assert read_status(jobs_db, beta_id) == "pending"
+            assert read_status(jobs_db, ghost_id) == "pending"
+            time.sleep(0.02)
+
+    assert read_status(jobs_db, beta_id) == "pending"
+    assert read_status(jobs_db, ghost_id) == "pending"
+
+
+def test_delete_job_and_chunks_is_isolated_per_server(jobs_db: str, tmp_path: Path) -> None:
+    """Wrong-server cleanup fails closed; correct-server cleanup removes only its own rows.
+
+    An alpha-identity cleanup against a beta-addressed root raises ValueError
+    and leaves the foreign root and every foreign chunk untouched. The
+    alpha-identity cleanup of an alpha root removes that root, its owned
+    chunks, and its same-server orphan chunks — never the beta rows.
+    """
+    alpha_id = insert_job(jobs_db, str(tmp_path), "sleep 30", server="alpha-server")
+    beta_id = insert_job(jobs_db, str(tmp_path), "sleep 30", server="beta-server")
+
+    def chunk_payload(root_id: UUID, server: str, sequence: int) -> str:
+        return json.dumps({
+            "v": 4,
+            "type": "output_chunk",
+            "server": server,
+            "thread": str(root_id),
+            "stream": "stdout",
+            "sequence": sequence,
+            "start": 0,
+            "end": 5,
+            "value": "chunk",
+            "previous": None,
+        })
+
+    with psycopg.connect(jobs_db) as conn:
+        for sequence in range(2):
+            for root_id, server in ((alpha_id, "alpha-server"), (beta_id, "beta-server")):
+                conn.execute(
+                    "INSERT INTO lubko.jobs (payload) VALUES (%s)",
+                    (chunk_payload(root_id, server, sequence),),
+                )
+
+    with (
+        psycopg.connect(jobs_db) as conn,
+        pytest.raises(ValueError, match="belongs to server 'beta-server'"),
+    ):
+        delete_job_and_chunks(conn, beta_id, server="alpha-server")
+    assert count_rows(jobs_db, beta_id) == 3
+
+    with psycopg.connect(jobs_db) as conn:
+        delete_job_and_chunks(conn, alpha_id, server="alpha-server")
+
+    assert count_rows(jobs_db, alpha_id) == 0
+    assert count_rows(jobs_db, beta_id) == 3
+    payload = read_root(jobs_db, beta_id)
+    assert payload["server"] == "beta-server"
+
+
+def test_delete_missing_root_still_cleans_same_server_orphans(jobs_db: str) -> None:
+    """An already-missing root's same-server orphan chunks are still removed."""
+    dangling_alpha = uuid4()
+    dangling_beta = uuid4()
+    with psycopg.connect(jobs_db) as conn:
+        for root_id, server in ((dangling_alpha, "alpha-server"), (dangling_beta, "beta-server")):
+            conn.execute(
+                "INSERT INTO lubko.jobs (payload) VALUES (%s)",
+                (
+                    json.dumps({
+                        "v": 4,
+                        "type": "output_chunk",
+                        "server": server,
+                        "thread": str(root_id),
+                        "stream": "stdout",
+                        "sequence": 0,
+                        "start": 0,
+                        "end": 5,
+                        "value": "orphan",
+                        "previous": None,
+                    }),
+                ),
+            )
+
+    with psycopg.connect(jobs_db) as conn:
+        delete_job_and_chunks(conn, dangling_alpha, server="alpha-server")
+
+    with psycopg.connect(jobs_db) as conn:
+        remaining = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT (payload::jsonb)->>'thread' FROM lubko.jobs "
+                "WHERE (payload::jsonb)->>'type' = 'output_chunk'"
+            ).fetchall()
+        }
+    assert remaining == {str(dangling_beta)}

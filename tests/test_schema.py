@@ -1,6 +1,7 @@
 """Tests enforcing the two-column transport invariant and the protocol v3 migrations."""
 
 import contextlib
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -404,26 +405,86 @@ def as_protocol_connection(conn: _QueuedConnection) -> psycopg.Connection[tuple[
     return cast("psycopg.Connection[tuple[object, ...]]", conn)
 
 
-def test_verify_protocol_schema_accepts_migrated_shape() -> None:
-    """A table with the type-aware constraint and chunk indexes passes."""
-    conn = as_protocol_connection(
-        _QueuedConnection([
-            [(TYPE_AWARE_CONSTRAINT_NAME,), ("jobs_payload_is_json_object",)],
-            [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,), ("jobs_queue_idx",)],
-        ])
+def _v4_shape_constraint_def() -> str:
+    """Return a realistic ``pg_get_constraintdef`` of the v4 shape constraint.
+
+    The text mirrors how PostgreSQL normalizes the canonical baseline
+    definition (spacing and cast suffixes included), so verification must be
+    robust against normalization rather than matching source formatting.
+    """
+    return (
+        "CHECK ((CASE WHEN ((payload)::jsonb ->> 'type'::text) = 'command' THEN "
+        "(((((payload)::jsonb -> 'v'::text)) = '4'::jsonb) AND "
+        "jsonb_typeof((payload)::jsonb -> 'request'::text) = 'object' AND "
+        "(((payload)::jsonb -> 'state'::text) ->> 'status'::text) IS NOT NULL AND "
+        "jsonb_typeof((payload)::jsonb -> 'server'::text) = 'string'::text AND "
+        "((payload)::jsonb ->> 'server'::text) <> ''::text) "
+        "WHEN ((payload)::jsonb ->> 'type'::text) = 'output_chunk' THEN true ELSE true END))"
     )
+
+
+def _v3_catalog_batches() -> list[list[tuple[str, ...]]]:
+    """Return the catalog batches of a pre-cutover v3 schema.
+
+    Same catalog query order as the canonical batches, but the type-aware
+    constraint definition predates server-routing enforcement.
+    """
+    return [
+        [
+            (TYPE_AWARE_CONSTRAINT_NAME, "CHECK (((payload)::jsonb ->> 'type'::text) = 'x')"),
+            ("jobs_payload_is_json_object", "CHECK (true)"),
+        ],
+        [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,), ("jobs_queue_idx",)],
+    ]
+
+
+def _v4_catalog_batches() -> list[list[tuple[str, ...]]]:
+    """Return the catalog batches of a canonical migrated v4 schema.
+
+    ``verify_protocol_schema`` runs two catalog reads in a fixed order:
+    ``pg_constraint`` (with definitions) and ``pg_indexes``.
+
+    Returns:
+        One queued row batch per catalog query, each modeling the canonical
+        baseline applied by ``migrations/0001_two_column_protocol.sql``.
+    """
+    return [
+        [
+            (TYPE_AWARE_CONSTRAINT_NAME, _v4_shape_constraint_def()),
+            ("jobs_payload_is_json_object", "CHECK (true)"),
+        ],
+        [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,), ("jobs_queue_idx",)],
+    ]
+
+
+def test_verify_protocol_schema_accepts_migrated_shape() -> None:
+    """A migrated table with the canonical v4 baseline shape passes verification."""
+    conn = as_protocol_connection(_QueuedConnection(_v4_catalog_batches()))
 
     verify_protocol_schema(conn)
 
 
+def test_verify_protocol_schema_rejects_pre_v4_serverless_constraint() -> None:
+    """A table still carrying the pre-v4 (serverless) shape constraint is refused.
+
+    The cutover gate must detect a same-named constraint whose definition does
+    not enforce the required top-level server field, even though PostgreSQL
+    normalizes spacing and casts in ``pg_get_constraintdef`` output.
+    """
+    conn = as_protocol_connection(_QueuedConnection(_v3_catalog_batches()))
+
+    with pytest.raises(SchemaInvariantError, match="0003_protocol_v4_server_routing"):
+        verify_protocol_schema(conn)
+
+
 def test_verify_protocol_schema_rejects_missing_type_aware_constraint() -> None:
     """A table without the type-aware constraint is refused."""
-    conn = as_protocol_connection(
-        _QueuedConnection([
-            [("jobs_payload_is_json_object",), ("jobs_payload_has_status",)],
-            [(CHUNK_OWNER_INDEX_NAME,), (CHUNK_ORDER_INDEX_NAME,)],
-        ])
-    )
+    batches = _v4_catalog_batches()
+    batches[0] = [
+        ("jobs_payload_is_json_object", "CHECK (true)"),
+        ("jobs_payload_has_status", "CHECK (true)"),
+    ]
+    conn = as_protocol_connection(_QueuedConnection(batches))
 
     with pytest.raises(SchemaInvariantError, match=TYPE_AWARE_CONSTRAINT_NAME):
         verify_protocol_schema(conn)
@@ -431,22 +492,22 @@ def test_verify_protocol_schema_rejects_missing_type_aware_constraint() -> None:
 
 def test_verify_protocol_schema_rejects_missing_chunk_indexes() -> None:
     """A table without the chunk ownership/ordering indexes is refused."""
-    conn = as_protocol_connection(
-        _QueuedConnection([
-            [(TYPE_AWARE_CONSTRAINT_NAME,)],
-            [("jobs_queue_idx",)],
-        ])
-    )
+    batches = _v4_catalog_batches()
+    batches[1] = [("jobs_queue_idx",)]
+    conn = as_protocol_connection(_QueuedConnection(batches))
 
     with pytest.raises(SchemaInvariantError, match="index jobs_chunk"):
         verify_protocol_schema(conn)
 
 
 def test_verify_protocol_schema_rejects_non_canonical_shape() -> None:
-    """A two-column table lacking the canonical output-chunk shape is refused."""
+    """A two-column table lacking the canonical v4 output-chunk shape is refused."""
     conn = as_protocol_connection(
         _QueuedConnection([
-            [("jobs_payload_has_status",), ("jobs_payload_is_json_object",)],
+            [
+                ("jobs_payload_has_status", "CHECK (true)"),
+                ("jobs_payload_is_json_object", "CHECK (true)"),
+            ],
             [("jobs_queue_idx",)],
         ])
     )
@@ -596,3 +657,292 @@ def test_gc_migration_upgrades_existing_install(
         conn.execute("REVOKE SELECT, INSERT, UPDATE ON lubko.jobs FROM lubko_worker")
         conn.execute("REVOKE USAGE ON SCHEMA lubko FROM lubko_worker")
         conn.execute("DROP ROLE IF EXISTS lubko_worker")
+
+
+# ---------------------------------------------------------------------------
+# Migration 0003: protocol v4 server-routing cutover
+# ---------------------------------------------------------------------------
+
+CUTOVER_MIGRATION: Final = MIGRATIONS_DIR / "0003_protocol_v4_server_routing.sql"
+
+V3_SHAPE_CONSTRAINT_SQL: Final = """
+    constraint jobs_payload_type_shape check (
+        case
+            when (payload::jsonb)->>'type' = 'command' then
+                jsonb_typeof((payload::jsonb)->'request') = 'object'
+                and (((payload::jsonb)->'state'->>'status') is not null)
+            when (payload::jsonb)->>'type' = 'output_chunk' then
+                jsonb_typeof((payload::jsonb)->'value') = 'string'
+                and (((payload::jsonb)->>'thread') is not null)
+                and (((payload::jsonb)->>'stream') in ('stdout', 'stderr'))
+                and (((payload::jsonb)->>'sequence') ~ '^[0-9]+$')
+                and (((payload::jsonb)->>'start') ~ '^[0-9]+$')
+                and (((payload::jsonb)->>'end') ~ '^[0-9]+$')
+            else true
+        end
+    )
+"""
+
+V3_COMMAND_PAYLOAD: Final = (
+    '{"v":3,"type":"command",'
+    '"request":{"cwd":"/workspace","process":["echo","hi"]},'
+    '"state":{"status":"pending"}}'
+)
+
+V4_COMMAND_PAYLOAD: Final = (
+    '{"v":4,"type":"command","server":"alpha-server",'
+    '"request":{"cwd":"/workspace","process":["echo","hi"]},'
+    '"state":{"status":"pending"}}'
+)
+
+
+def _create_v3_table(conn: psycopg.Connection[tuple[object, ...]]) -> None:
+    """Create a table carrying the pre-cutover v3 shape constraint."""
+    conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+    conn.execute(
+        "CREATE TABLE lubko.jobs ("
+        "id uuid primary key default gen_random_uuid(),"
+        "payload text not null" + V3_SHAPE_CONSTRAINT_SQL + ")"
+    )
+
+
+def test_cutover_migration_requires_truncate_first(pg_cluster: _pg.PgCluster) -> None:
+    """Applying 0003 against a table still holding v3 rows fails fast.
+
+    The server-required CHECK validation must refuse rows without a routing
+    identity so the transport can never be half-upgraded; the supported order
+    is quiesce, truncate, then apply.
+    """
+    conninfo = pg_cluster.conninfo()
+    sql = CUTOVER_MIGRATION.read_text(encoding="utf-8")
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        _create_v3_table(conn)
+        conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (V3_COMMAND_PAYLOAD,))
+
+    with (
+        psycopg.connect(conninfo, autocommit=True) as conn,
+        pytest.raises(psycopg.Error, match="server"),
+    ):
+        conn.execute(sql)
+
+
+def test_cutover_migration_upgrades_existing_v3_table(pg_cluster: _pg.PgCluster) -> None:
+    """An existing v3 table is cut over by truncating and then applying 0003.
+
+    The documented sequence is exercised end to end against real PostgreSQL:
+    quiesce/drain, TRUNCATE the old rows away, apply 0003, and prove the
+    upgraded table both verifies as canonical protocol v4 shape and enforces
+    the required non-empty server field at the database level.
+    """
+    conninfo = pg_cluster.conninfo()
+    sql = CUTOVER_MIGRATION.read_text(encoding="utf-8")
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        _create_v3_table(conn)
+        conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (V3_COMMAND_PAYLOAD,))
+        # The destructive row cutover: no legacy row is converted or preserved.
+        conn.execute("TRUNCATE lubko.jobs")
+
+    with psycopg.connect(conninfo, autocommit=True) as conn:
+        conn.execute(sql)
+    with psycopg.connect(conninfo) as conn:
+        # A real pre-v4 installation already carried the chunk indexes from
+        # its original baseline; re-applying the (now v4, idempotent) baseline
+        # restores exactly those objects on the upgraded table. The
+        # create-table statement is a no-op because the table exists with its
+        # new constraint.
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+
+    # The verifier accepts the upgraded table.
+    with psycopg.connect(conninfo) as conn:
+        verify_jobs_table_invariant(conn)
+        verify_protocol_schema(conn)
+        # A fresh v4 round trip works...
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
+            (V4_COMMAND_PAYLOAD,),
+        ).fetchone()
+        assert row is not None
+        # ...and unaddressed payloads are rejected by the database itself.
+        for bad in (
+            V3_COMMAND_PAYLOAD,
+            (
+                '{"v":4,"type":"command","server":"",'
+                '"request":{"cwd":"/x","process":["ls"]},"state":{"status":"pending"}}'
+            ),
+        ):
+            with pytest.raises(psycopg.errors.CheckViolation), conn.transaction():
+                conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (bad,))
+
+    # Re-applying 0003 proves idempotency.
+    with psycopg.connect(conninfo) as conn:
+        conn.execute(sql)
+    with psycopg.connect(conninfo) as conn:
+        verify_protocol_schema(conn)
+
+
+def test_fresh_baseline_enforces_server_field(jobs_db: str) -> None:
+    """A fresh-install baseline table rejects payloads without a server field."""
+    for bad in (
+        V3_COMMAND_PAYLOAD,
+        '{"v":4,"type":"output_chunk","thread":"'
+        + "0" * 8
+        + "-0000-4000-8000-000000000000"
+        + '","stream":"stdout","sequence":0,"start":0,"end":1,"value":"x","previous":null}',
+    ):
+        with (
+            psycopg.connect(jobs_db) as conn,
+            pytest.raises(psycopg.errors.CheckViolation),
+            conn.transaction(),
+        ):
+            conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (bad,))
+
+
+def test_fresh_baseline_rejects_legacy_rows_even_with_server(jobs_db: str) -> None:
+    """Legacy v2/v3-shaped rows are refused even when they carry a server.
+
+    The canonical v4 binding enforces the actual protocol version as a JSON
+    number, so a v2/v3 command or output_chunk payload cannot enter the table
+    by merely adding a ``server`` field, and a string ``"4"`` version is not
+    aliased onto the numeric protocol version.
+    """
+    for bad in (
+        # v2 command with a legacy request.command field plus a valid server.
+        (
+            '{"v":2,"type":"command","server":"alpha-server",'
+            '"request":{"cwd":"/x","command":"echo hi"},"state":{"status":"pending"}}'
+        ),
+        # v3 command with full v4 shape except the numeric version.
+        (
+            '{"v":3,"type":"command","server":"alpha-server",'
+            '"request":{"cwd":"/x","process":["ls"]},"state":{"status":"pending"}}'
+        ),
+        # String-aliased version is not a protocol version.
+        (
+            '{"v":"4","type":"command","server":"alpha-server",'
+            '"request":{"cwd":"/x","process":["ls"]},"state":{"status":"pending"}}'
+        ),
+        # Legacy output_chunk with a server but no v4 version.
+        (
+            '{"v":3,"type":"output_chunk","server":"alpha-server","thread":"'
+            + "0" * 8
+            + "-0000-4000-8000-000000000000"
+            + '","stream":"stdout","sequence":0,"start":0,"end":1,'
+            '"value":"x","previous":null}'
+        ),
+    ):
+        with (
+            psycopg.connect(jobs_db) as conn,
+            pytest.raises(psycopg.errors.CheckViolation),
+            conn.transaction(),
+        ):
+            conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (bad,))
+
+
+def test_cutover_refuses_non_v4_rows_even_with_server(pg_cluster: _pg.PgCluster) -> None:
+    """Applying 0003 fails fast while non-v4 rows remain, server included.
+
+    The pre-validation diagnostic counts command/output_chunk payloads that
+    lack a non-empty server string OR the numeric protocol version 4, so an
+    old v2/v3 row that happens to carry a server still blocks the cutover
+    until the destructive truncate runs.
+    """
+    conninfo = pg_cluster.conninfo()
+    sql = CUTOVER_MIGRATION.read_text(encoding="utf-8")
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        _create_v3_table(conn)
+        conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s)",
+            (
+                (
+                    '{"v":3,"type":"command","server":"alpha-server",'
+                    '"request":{"cwd":"/x","process":["ls"]},"state":{"status":"pending"}}'
+                ),
+            ),
+        )
+
+    with (
+        psycopg.connect(conninfo, autocommit=True) as conn,
+        pytest.raises(psycopg.Error, match="version 4"),
+    ):
+        conn.execute(sql)
+
+
+def test_refused_cutover_leaves_v3_schema_state_intact(pg_cluster: _pg.PgCluster) -> None:
+    """A refused pre-cutover apply leaves the original v3 schema untouched.
+
+    The migration's nonconforming-row preflight runs before any destructive or
+    schema-changing DDL inside one explicit transaction, so an incorrect apply
+    against a table that still holds v3 rows raises without dropping the v3
+    constraint, without adding a NOT VALID v4 constraint, and without
+    rebuilding the queue index — no half-upgraded state is possible even under
+    ordinary autocommit execution.
+    """
+    conninfo = pg_cluster.conninfo()
+    sql = CUTOVER_MIGRATION.read_text(encoding="utf-8")
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        _create_v3_table(conn)
+        conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (V3_COMMAND_PAYLOAD,))
+
+    with psycopg.connect(conninfo) as conn:
+        before_constraint = conn.execute(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = 'lubko.jobs'::regclass AND conname = %s",
+            ("jobs_payload_type_shape",),
+        ).fetchone()
+        before_indexes = conn.execute(
+            "SELECT indexname FROM pg_indexes "
+            "WHERE schemaname = 'lubko' AND tablename = 'jobs' ORDER BY indexname"
+        ).fetchall()
+    assert before_constraint is not None
+    assert "server" not in before_constraint[0]
+
+    with (
+        psycopg.connect(conninfo, autocommit=True) as conn,
+        pytest.raises(psycopg.Error, match="server"),
+    ):
+        conn.execute(sql)
+
+    with psycopg.connect(conninfo) as conn:
+        after_constraint = conn.execute(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = 'lubko.jobs'::regclass AND conname = %s",
+            ("jobs_payload_type_shape",),
+        ).fetchone()
+        after_indexes = conn.execute(
+            "SELECT indexname FROM pg_indexes "
+            "WHERE schemaname = 'lubko' AND tablename = 'jobs' ORDER BY indexname"
+        ).fetchall()
+    assert after_constraint == before_constraint
+    assert after_indexes == before_indexes
+    # The original row is still there and still accepted by the intact v3 shape.
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute("SELECT count(*) FROM lubko.jobs").fetchone()
+    assert row is not None
+    assert row[0] == 1
+
+
+@pytest.mark.parametrize(
+    "server_value",
+    [123, True, None, {"name": "x"}, ["alpha"], 1.5],
+)
+def test_fresh_baseline_rejects_non_string_server(server_value: object, jobs_db: str) -> None:
+    """The DB enforces server as a JSON string, not merely text-coercible.
+
+    A JSON number, boolean, null, object, or array in the server field violates
+    ``jobs_payload_type_shape`` even when its ``->>`` text rendering would be
+    non-empty, so a daemon's ``->>``-based claim predicate can never alias a
+    malformed value onto its configured identity.
+    """
+    payload = json.dumps({
+        "v": 4,
+        "type": "command",
+        "server": server_value,
+        "request": {"cwd": "/x", "process": ["ls"]},
+        "state": {"status": "pending"},
+    })
+    with psycopg.connect(jobs_db) as conn, pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("INSERT INTO lubko.jobs (payload) VALUES (%s)", (payload,))

@@ -40,16 +40,18 @@ if TYPE_CHECKING:
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 
 
-def make_settings(*, worker_id: str = "test-worker") -> Settings:
+def make_settings(*, worker_id: str = "test-worker", server: str = "alpha-server") -> Settings:
     """Build short-interval worker settings for integration tests.
 
     Args:
         worker_id: Worker identifier to record.
+        server: Configured execution-server identity.
 
     Returns:
         Settings with fast lease timing.
     """
     return Settings(
+        server=server,
         worker_id=worker_id,
         poll_interval_seconds=0.05,
         process_poll_interval_seconds=0.01,
@@ -89,20 +91,28 @@ def shell_command_argv(command: str) -> list[str]:
     return [shutil.which("sh") or "/bin/sh", "-c", command]
 
 
-def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v3 pending command job running a shell snippet.
+def insert_pending_job(
+    conninfo: str,
+    cwd: str,
+    command: str,
+    *,
+    server: str = "alpha-server",
+) -> UUID:
+    """Insert a protocol v4 pending command job running a shell snippet.
 
     Args:
         conninfo: PostgreSQL connection string.
         cwd: Working directory for the job.
         command: Shell snippet, executed by an explicit ``/bin/sh -c`` argv.
+        server: Target execution-server identity.
 
     Returns:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": server,
         "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "pending"},
     })
@@ -127,8 +137,9 @@ def insert_running_without_lease(conninfo: str, cwd: str, command: str) -> UUID:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {
             "status": "running",
@@ -219,7 +230,7 @@ def test_stale_job_is_recovered_after_worker_disappears(
 
     age_lease(db, job_id)
     with psycopg.connect(db) as conn:
-        recovered = recover_stale_jobs(conn)
+        recovered = recover_stale_jobs(conn, make_settings().server)
 
     assert [job for job, _payload in recovered] == [job_id]
     payload = read_job(db, job_id)
@@ -242,7 +253,7 @@ def test_non_stale_running_job_is_not_recovered(db: str, tmp_path: Path) -> None
     assert claimed.id == job_id
 
     with psycopg.connect(db) as conn:
-        recovered = recover_stale_jobs(conn)
+        recovered = recover_stale_jobs(conn, make_settings().server)
 
     assert recovered == []
     assert read_job(db, job_id)["state"]["status"] == "running"
@@ -256,7 +267,7 @@ def test_running_job_without_lease_is_left_for_manual_repair(
     job_id = insert_running_without_lease(db, str(tmp_path), "sleep 30")
 
     with psycopg.connect(db) as conn:
-        recovered = recover_stale_jobs(conn)
+        recovered = recover_stale_jobs(conn, make_settings().server)
 
     assert recovered == []
     assert read_job(db, job_id)["state"]["status"] == "running"
@@ -278,7 +289,7 @@ def test_recovery_is_atomic_across_concurrent_workers(
 
     def recover() -> None:
         with psycopg.connect(db) as conn:
-            row_ids = [job for job, _payload in recover_stale_jobs(conn)]
+            row_ids = [job for job, _payload in recover_stale_jobs(conn, make_settings().server)]
             recovered.append(row_ids)
 
     workers = [threading.Thread(target=recover) for _ in range(3)]
@@ -355,6 +366,7 @@ def test_worker_crash_is_recovered_by_replacement_worker(
     conf.chmod(0o600)
     env = dict(os.environ)
     env["LUBKO_DATABASE_CONFIG"] = str(conf)
+    env["LUBKO_SERVER"] = "alpha-server"
     env["LUBKO_POLL_INTERVAL_SECONDS"] = "0.05"
     env["LUBKO_PROCESS_POLL_INTERVAL_SECONDS"] = "0.01"
     env["LUBKO_LEASE_DURATION_SECONDS"] = "1.0"
@@ -412,3 +424,26 @@ def test_claim_records_lease_and_incarnation_into_the_future(
         ).fetchone()
     assert row is not None
     assert lease > row[0]
+
+
+def test_stale_recovery_is_isolated_per_server(db: str, tmp_path: Path) -> None:
+    """Lease recovery only ever touches rows of the caller's own server.
+
+    A running beta-addressed job with a long-expired lease is invisible to an
+    alpha daemon's recovery pass and stays running untouched; the same pass
+    run for the beta identity recovers exactly that row.
+    """
+    job_id = insert_pending_job(db, str(tmp_path), "sleep 30", server="beta-server")
+    with psycopg.connect(db) as conn:
+        claimed = claim_job(conn, make_settings(server="beta-server"))
+    assert claimed is not None
+    age_lease(db, job_id)
+
+    with psycopg.connect(db) as conn:
+        assert recover_stale_jobs(conn, make_settings().server) == []
+    assert read_job(db, job_id)["state"]["status"] == "running"
+
+    with psycopg.connect(db) as conn:
+        recovered = recover_stale_jobs(conn, make_settings(server="beta-server").server)
+    assert [job for job, _payload in recovered] == [job_id]
+    assert read_job(db, job_id)["state"]["status"] == "failed"

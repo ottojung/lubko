@@ -187,6 +187,7 @@ def _queue_root(conn: _RecordingConnection, job_id: UUID) -> None:
 
 def make_settings(  # ruff: ignore[too-many-arguments]
     *,
+    server: str = "alpha-server",
     process_poll_interval_seconds: float = 0.02,
     cancel_grace_seconds: float = 1.0,
     lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS,
@@ -202,6 +203,7 @@ def make_settings(  # ruff: ignore[too-many-arguments]
         Worker settings for tests.
     """
     return Settings(
+        server=server,
         worker_id="test-worker",
         poll_interval_seconds=1.0,
         process_poll_interval_seconds=process_poll_interval_seconds,
@@ -454,8 +456,9 @@ def test_claim_job_marks_job_running_and_only_command_rows() -> None:
     conn = _RecordingConnection()
     job_id = uuid4()
     claimed_payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": "/workspace", "process": ["echo", "hi"]},
         "state": {"status": "running"},
     })
@@ -475,16 +478,30 @@ def test_claim_job_marks_job_running_and_only_command_rows() -> None:
     assert "'pending'" in sql
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "(payload::jsonb)->>'type' = 'command'" in sql
-    assert "payload::jsonb" in sql
+    assert "jsonb_typeof((payload::jsonb)->'server') = 'string'" in sql
+    assert "(payload::jsonb)->>'server' = %(server)s" in sql
     assert "::text" in sql
     assert "{state,worker_incarnation}" in sql
     assert "{state,lease_expires_at}" in sql
     assert "make_interval" in sql
     assert isinstance(params, dict)
+    assert params["server"] == settings.server
     assert params["worker_id"] == settings.worker_id
     assert params["worker_incarnation"] == settings.worker_incarnation
     assert params["lease_duration_seconds"] == settings.lease_duration_seconds
     assert params["limit"] == 1
+
+
+def test_claim_jobs_only_claims_configured_server_rows() -> None:
+    """The claim predicate is scoped to the daemon's configured server identity."""
+    conn = _RecordingConnection()
+    settings = make_settings(server="alpha-server")
+
+    claim_jobs(as_db(conn), settings, 8)
+
+    _sql, params = conn.executions[0]
+    assert isinstance(params, dict)
+    assert params["server"] == "alpha-server"
 
 
 def test_claim_jobs_returns_nothing_on_empty_queue() -> None:
@@ -517,7 +534,7 @@ def test_request_cancel_cancels_pending_job_without_spawning() -> None:
     conn.rows = [("cancelled",)]
     job_id = uuid4()
 
-    status = request_cancel(as_db(conn), job_id)
+    status = request_cancel(as_db(conn), job_id, server="alpha-server")
 
     assert status == "cancelled"
     sql, params = conn.executions[0]
@@ -526,7 +543,8 @@ def test_request_cancel_cancels_pending_job_without_spawning() -> None:
     assert "payload::jsonb" in sql
     assert "::text" in sql
     assert "'pending'" in sql
-    assert params == (job_id,)
+    assert "(payload::jsonb)->>'server'" in sql
+    assert params == {"job_id": job_id, "server": "alpha-server"}
     assert len(conn.executions) == 1
 
 
@@ -536,22 +554,23 @@ def test_request_cancel_marks_running_job() -> None:
     conn.rows = [None, ("running",)]
     job_id = uuid4()
 
-    status = request_cancel(as_db(conn), job_id)
+    status = request_cancel(as_db(conn), job_id, server="alpha-server")
 
     assert status == "running"
     sql, params = conn.executions[1]
     assert "cancel_requested_at" in sql
     assert "'running'" in sql
-    assert params == (job_id,)
+    assert "(payload::jsonb)->>'server'" in sql
+    assert params == {"job_id": job_id, "server": "alpha-server"}
 
 
 def test_request_cancel_leaves_terminal_job_unchanged() -> None:
     """Cancelling an already terminal job is a harmless no-op."""
     conn = _RecordingConnection()
-    conn.rows = [None, None, ("succeeded",)]
+    conn.rows = [None, None, ("alpha-server", "succeeded")]
     job_id = uuid4()
 
-    status = request_cancel(as_db(conn), job_id)
+    status = request_cancel(as_db(conn), job_id, server="alpha-server")
 
     assert status == "succeeded"
     updates = [sql for sql, _ in conn.executions if "UPDATE" in sql]
@@ -629,9 +648,11 @@ def test_recover_stale_jobs_marks_failed_with_diagnostic() -> None:
     """recover_stale_jobs atomically fails expired-lease running command rows."""
     conn = _RecordingConnection()
     job_id = uuid4()
+    settings = make_settings()
     recovered_payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": "/workspace", "process": ["sleep", "30"]},
         "state": {
             "status": "failed",
@@ -642,7 +663,7 @@ def test_recover_stale_jobs_marks_failed_with_diagnostic() -> None:
     })
     conn.rows = [(job_id, recovered_payload)]
 
-    recovered = recover_stale_jobs(as_db(conn))
+    recovered = recover_stale_jobs(as_db(conn), settings.server)
 
     assert recovered == [(job_id, recovered_payload)]
     sql, params = conn.executions[0]
@@ -654,14 +675,15 @@ def test_recover_stale_jobs_marks_failed_with_diagnostic() -> None:
     assert "'failed'" in sql
     assert "{state,recovered_at}" in sql
     assert "recovery_note" in sql
-    assert params == {"limit": 100}
+    assert "(payload::jsonb)->>'server'" in sql
+    assert params == {"server": "alpha-server", "limit": 100}
 
 
 def test_recover_stale_jobs_returns_empty_when_none_stale() -> None:
     """An empty recovery scan returns no rows."""
     conn = _RecordingConnection()
 
-    recovered = recover_stale_jobs(as_db(conn))
+    recovered = recover_stale_jobs(as_db(conn), make_settings().server)
 
     assert recovered == []
     assert len(conn.executions) == 1
@@ -680,7 +702,7 @@ def test_finish_job_persists_success_result() -> None:
         cancellation_note=None,
     )
 
-    status = finish_job(as_db(conn), job_id, result)
+    status = finish_job(as_db(conn), job_id, result, server="alpha-server")
 
     assert status == "succeeded"
     sql, params = conn.executions[0]
@@ -707,7 +729,7 @@ def test_finish_job_persists_cancellation_result() -> None:
         cancellation_note="cancelled by request",
     )
 
-    status = finish_job(as_db(conn), job_id, result)
+    status = finish_job(as_db(conn), job_id, result, server="alpha-server")
 
     assert status == "cancelled"
     sql, params = conn.executions[0]
@@ -718,23 +740,43 @@ def test_finish_job_persists_cancellation_result() -> None:
 
 
 def test_delete_job_and_chunks_uses_explicit_ownership() -> None:
-    """Cleanup deletes the root first, then every owned chunk by thread."""
+    """Cleanup is server-scoped: root first, then every owned chunk by thread."""
     conn = _RecordingConnection()
     job_id = uuid4()
 
-    delete_job_and_chunks(as_db(conn), job_id)
+    delete_job_and_chunks(as_db(conn), job_id, server="alpha-server")
 
-    root_sql, root_params = conn.executions[0]
+    select_sql, _select_params = conn.executions[0]
+    assert select_sql.startswith("SELECT")
+    assert "(payload::jsonb)->>'server'" in select_sql
+    root_sql, root_params = conn.executions[1]
     assert root_sql.startswith("DELETE")
     assert "output_chunk" not in root_sql
+    assert "jsonb_typeof((payload::jsonb)->'server') = 'string'" in root_sql
     assert isinstance(root_params, dict)
     assert root_params["job_id"] == job_id
-    chunk_sql, chunk_params = conn.executions[1]
+    assert root_params["server"] == "alpha-server"
+    chunk_sql, chunk_params = conn.executions[2]
     assert chunk_sql.startswith("DELETE")
     assert "output_chunk" in chunk_sql
     assert "thread" in chunk_sql
+    assert "jsonb_typeof((payload::jsonb)->'server') = 'string'" in chunk_sql
     assert isinstance(chunk_params, dict)
     assert chunk_params["thread"] == str(job_id)
+    assert chunk_params["server"] == "alpha-server"
+
+
+def test_delete_job_and_chunks_fails_closed_on_foreign_server() -> None:
+    """A root belonging to another server is never deleted; cleanup raises."""
+    conn = _RecordingConnection()
+    conn.rows = [("beta-server",)]
+    job_id = uuid4()
+
+    with pytest.raises(ValueError, match="belongs to server 'beta-server'"):
+        delete_job_and_chunks(as_db(conn), job_id, server="alpha-server")
+
+    deletes = [sql for sql, _params in conn.executions if sql.lstrip().startswith("DELETE")]
+    assert deletes == []
 
 
 def test_publish_output_writes_bounded_tail_for_short_output(
@@ -746,7 +788,14 @@ def test_publish_output_writes_bounded_tail_for_short_output(
     conn = _RecordingConnection()
     _queue_root(conn, job.id)
 
-    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+    publish_output(
+        as_db(conn),
+        job,
+        [OUTPUT_STREAM_STDOUT],
+        time.monotonic(),
+        server="alpha-server",
+        force=True,
+    )
 
     assert job.stdout.tail_text == "hello world"
     assert job.stdout.tail_start == 0
@@ -772,7 +821,14 @@ def test_publish_output_archives_immutable_chunks(tmp_path: Path) -> None:
     conn = _RecordingConnection()
     _queue_root(conn, job.id)
 
-    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+    publish_output(
+        as_db(conn),
+        job,
+        [OUTPUT_STREAM_STDOUT],
+        time.monotonic(),
+        server="alpha-server",
+        force=True,
+    )
 
     assert job.stdout.tail_text == "x" * OUTPUT_TAIL_MAX_BYTES
     assert job.stdout.tail_start == 5000
@@ -811,7 +867,14 @@ def test_publish_output_rotation_never_shortens_the_live_tail(
     def write_and_publish(size: int) -> None:
         job.stdout.path.write_bytes(b"y" * size)
         _queue_root(conn, job.id)
-        publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+        publish_output(
+            as_db(conn),
+            job,
+            [OUTPUT_STREAM_STDOUT],
+            time.monotonic(),
+            server="alpha-server",
+            force=True,
+        )
         observed_lengths.append(len(job.stdout.tail_text))
         assert job.stdout.tail_end == size
 
@@ -843,7 +906,14 @@ def test_publish_output_failed_transaction_does_not_advance_state(
     _queue_root(failing, job.id)
 
     with pytest.raises(psycopg.Error):
-        publish_output(as_db(failing), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+        publish_output(
+            as_db(failing),
+            job,
+            [OUTPUT_STREAM_STDOUT],
+            time.monotonic(),
+            server="alpha-server",
+            force=True,
+        )
 
     assert job.stdout.published_size == 0
     assert not job.stdout.tail_text
@@ -853,7 +923,14 @@ def test_publish_output_failed_transaction_does_not_advance_state(
 
     conn = _RecordingConnection()
     _queue_root(conn, job.id)
-    publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+    publish_output(
+        as_db(conn),
+        job,
+        [OUTPUT_STREAM_STDOUT],
+        time.monotonic(),
+        server="alpha-server",
+        force=True,
+    )
     assert job.stdout.tail_end == 9000
     assert job.stdout.sequence == 3
 
@@ -865,7 +942,14 @@ def test_publish_output_retains_root_before_any_chunk_insert(tmp_path: Path) -> 
     conn = _RecordingConnection()
     _queue_root(conn, job.id)
 
-    result = publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+    result = publish_output(
+        as_db(conn),
+        job,
+        [OUTPUT_STREAM_STDOUT],
+        time.monotonic(),
+        server="alpha-server",
+        force=True,
+    )
 
     assert result is True
     sqls = [sql for sql, _ in conn.executions]
@@ -883,7 +967,14 @@ def test_publish_output_skips_when_root_row_is_already_gone(tmp_path: Path) -> N
     job.stdout.path.write_bytes(b"x" * 9000)
     conn = _RecordingConnection()
 
-    result = publish_output(as_db(conn), job, [OUTPUT_STREAM_STDOUT], time.monotonic(), force=True)
+    result = publish_output(
+        as_db(conn),
+        job,
+        [OUTPUT_STREAM_STDOUT],
+        time.monotonic(),
+        server="alpha-server",
+        force=True,
+    )
 
     assert result is False
     assert [sql for sql, _ in conn.executions if sql.startswith("INSERT")] == []
@@ -897,7 +988,8 @@ def test_publish_output_skips_when_root_row_is_already_gone(tmp_path: Path) -> N
 def test_settings_reads_lease_and_output_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Lease, publication, and fairness settings come from the environment."""
+    """Lease, publication, server, and fairness settings come from the environment."""
+    monkeypatch.setenv("LUBKO_SERVER", "env-server")
     monkeypatch.setenv("LUBKO_LEASE_DURATION_SECONDS", "12.5")
     monkeypatch.setenv("LUBKO_LEASE_REFRESH_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS", "4.5")
@@ -915,10 +1007,12 @@ def test_settings_reads_lease_and_output_environment(
     assert settings.claim_batch_limit == 16
     assert settings.lease_safety_margin_seconds == pytest.approx(3.5)
     assert settings.db_operation_timeout_seconds == pytest.approx(8.5)
+    assert settings.server == "env-server"
 
 
-def test_settings_defaults_and_incarnation() -> None:
+def test_settings_defaults_and_incarnation(monkeypatch: pytest.MonkeyPatch) -> None:
     """Settings default to the documented values and have a non-empty incarnation."""
+    monkeypatch.setenv("LUBKO_SERVER", "default-server")
     first = Settings.from_environment()
     second = Settings.from_environment()
 
@@ -927,16 +1021,30 @@ def test_settings_defaults_and_incarnation() -> None:
     assert first.lease_recovery_interval_seconds == DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
     assert first.worker_incarnation
     assert second.worker_incarnation
+    assert first.server == "default-server"
     if os.environ.get("LUBKO_LIFECYCLE_TOKEN"):
         assert first.worker_incarnation == second.worker_incarnation
     else:
         assert first.worker_incarnation != second.worker_incarnation
 
 
+def test_settings_rejects_empty_server() -> None:
+    """A daemon refuses to start without a configured server identity."""
+    with pytest.raises(ValueError, match="LUBKO_SERVER"):
+        Settings(
+            server="",
+            worker_id="w",
+            poll_interval_seconds=1.0,
+            process_poll_interval_seconds=0.1,
+            cancel_grace_seconds=5.0,
+        )
+
+
 def test_settings_rejects_refresh_at_least_lease() -> None:
     """A refresh interval at or above the lease duration is refused."""
     with pytest.raises(ValueError, match="smaller than"):
         Settings(
+            server="alpha-server",
             worker_id="w",
             poll_interval_seconds=1.0,
             process_poll_interval_seconds=0.1,
@@ -951,6 +1059,7 @@ def test_settings_rejects_unsafe_lease_margin() -> None:
     """A lease safety margin at or above the lease duration is refused."""
     with pytest.raises(ValueError, match="LEASE_SAFETY_MARGIN"):
         Settings(
+            server="alpha-server",
             worker_id="w",
             poll_interval_seconds=1.0,
             process_poll_interval_seconds=0.1,
@@ -966,6 +1075,7 @@ def test_settings_rejects_claim_batch_limit_zero() -> None:
     """A zero claim batch limit is refused."""
     with pytest.raises(ValueError, match="CLAIM_BATCH_LIMIT"):
         Settings(
+            server="alpha-server",
             worker_id="w",
             poll_interval_seconds=1.0,
             process_poll_interval_seconds=0.1,

@@ -1,6 +1,6 @@
 # Lubko transport protocol and database binding specification
 
-Status: authoritative for protocol v3.
+Status: authoritative for protocol v4.
 
 ## The two-column invariant
 
@@ -26,11 +26,17 @@ constraint jobs_payload_has_version     check ((payload::jsonb) ? 'v')
 constraint jobs_payload_type_shape      check (
     case
         when (payload::jsonb)->>'type' = 'command' then
-            jsonb_typeof((payload::jsonb)->'request') = 'object'
+            ((payload::jsonb)->'v') = '4'::jsonb
+            and jsonb_typeof((payload::jsonb)->'request') = 'object'
             and (((payload::jsonb)->'state'->>'status') is not null)
+            and coalesce(jsonb_typeof((payload::jsonb)->'server'), '') = 'string'
+            and coalesce((payload::jsonb)->>'server', '') <> ''
         when (payload::jsonb)->>'type' = 'output_chunk' then
-            jsonb_typeof((payload::jsonb)->'value') = 'string'
+            ((payload::jsonb)->'v') = '4'::jsonb
+            and jsonb_typeof((payload::jsonb)->'value') = 'string'
             and (((payload::jsonb)->>'thread') is not null)
+            and coalesce(jsonb_typeof((payload::jsonb)->'server'), '') = 'string'
+            and coalesce((payload::jsonb)->>'server', '') <> ''
             and (((payload::jsonb)->>'stream') in ('stdout', 'stderr'))
             and (((payload::jsonb)->>'sequence') ~ '^[0-9]+$')
             and (((payload::jsonb)->>'start') ~ '^[0-9]+$')
@@ -42,10 +48,12 @@ constraint jobs_payload_type_shape      check (
 
 The SQL constraint is deliberately generic; it does not encode `request.process`
 or the legacy-field prohibition. Those rules are enforced by the payload parser
-(`src/lubko/protocol.py`): a v3 `command` request must carry a process array,
-and carrying the legacy `command`/`args` keys is rejected. Because the v2 → v3
-breaking change is content-only, the physical two-column table does not change
-between versions.
+(`src/lubko/protocol.py`): a v4 `command` request must carry a process array,
+and carrying the legacy `command`/`args` keys is rejected. The required
+non-empty top-level `server` field, however, is enforced by both the parser and
+the SQL constraint: there is **no implicit or default server**. Because the v3
+to v4 breaking change is content-only, the physical two-column table does not
+change between versions.
 
 `command` rows carry a runnable lifecycle; immutable `output_chunk` rows carry
 explicit ownership and offset shape. Chunk rows never carry fake command
@@ -54,11 +62,11 @@ lifecycle state. Claim and lease-recovery queries operate only on
 
 ## Startup schema verification
 
-The v3 worker verifies more than the two-column invariant before starting. It
+The v4 worker verifies more than the two-column invariant before starting. It
 also requires the type-aware `jobs_payload_type_shape` constraint and the chunk
 ownership/ordering indexes to be present, because immutable `output_chunk`
 publication is impossible without them. Any table lacking this canonical
-protocol v3 shape is refused at startup with a clear diagnostic pointing at
+protocol v4 shape is refused at startup with a clear diagnostic pointing at
 the idempotent baseline `migrations/0001_two_column_protocol.sql`. This keeps
 output publication from failing at runtime on a table that cannot represent
 immutable chunks.
@@ -75,7 +83,11 @@ create table lubko.jobs (
 );
 
 create index jobs_queue_idx
-    on lubko.jobs (((payload::jsonb)->'state'->>'status'), ((payload::jsonb)->'state'->>'created_at'))
+    on lubko.jobs (
+        ((payload::jsonb)->>'server'),
+        ((payload::jsonb)->'state'->>'status'),
+        ((payload::jsonb)->'state'->>'created_at')
+    )
     where ((payload::jsonb)->>'type') = 'command';
 
 create index jobs_chunk_owner_idx
@@ -107,23 +119,51 @@ access contract.
 ## Versioning
 
 - `payload.v` is a required integer protocol version.
-- Version `3` is the current binding. Within a version, fields may be added
+- Version `4` is the current binding. Within a version, fields may be added
   additively. Breaking changes (renaming or removing fields, changing types or
   semantics) require a new version and a new worker generation.
-- **The v2 → v3 cutover is destructive and requires no DDL.** Version `2` is
-  unsupported: its `request.command` shell-string and `request.args` argv forms
-  are not accepted by any v3 parser, builder, or worker, and there is **no
-  compatibility path and no migration**. Because the two-column transport
-  schema is identical for v2 and v3, the cutover runs entirely in place against
-  the live queue. A valid procedure is: quiesce new submissions, let any
-  in-flight v2 work become durably terminal, bring up and prove the v3
-  supervisor/worker, then `truncate lubko.jobs` while quiescent (discarding
-  every old root `command` row and its `output_chunk` history), and prove a
-  fresh v3 round trip. Truncating before the first v3 start is also valid; the
-  requirement is only that the end state is an empty transport. No v2 row is
-  transformed, migrated, or preserved, and no existing table is altered.
-- A v3 worker rejects any payload whose version it does not understand; the job
+- **The v3 → v4 cutover is destructive.** Version `3` is unsupported: v4
+  parsers, builders, and workers accept only payloads carrying a required
+  non-empty top-level `server` string field, which v3 rows lack; there is **no
+  compatibility path and no data migration**. The two-column transport schema
+  itself does not change between versions — only the payload-shape constraint
+  and the routing-aware queue index do — so the cutover replaces the constraint
+  via `migrations/0003_protocol_v4_server_routing.sql`. A valid procedure is:
+  quiesce new submissions, let any in-flight work become durably terminal,
+  `truncate lubko.jobs` while quiescent (the row cutover is destructive: every
+  old root `command` row and its `output_chunk` history is discarded, and there
+  is no default server), apply the migration (drop + recreate + validate the
+  constraint and rebuild the queue index), then start the daemon with its
+  configured server identity and prove a fresh v4 round trip. Applying the
+  migration against a table that still holds nonconforming rows fails fast with
+  an explicit diagnostic instead of leaving the transport half-upgraded;
+  truncating first is what makes validation trivially succeed.
+- A v4 worker rejects any payload whose version it does not understand; the job
   is failed with a diagnostic instead of being stuck in the queue.
+
+## Server routing
+
+Protocol v4 introduces explicit execution-server routing. Every daemon runs
+with exactly one configured non-empty server identity (`LUBKO_SERVER`; it
+refuses to start without one), and every valid payload carries that identity:
+
+- **Claims** select only `pending` `command` rows whose `server` exactly equals
+  the daemon's identity. Jobs addressed to other servers stay pending,
+  untouched, indefinitely.
+- **Output publication** stamps each inserted chunk and live-tail update with
+  the daemon's server and retains the root with both a row-level lock and an
+  exact server match, so a daemon can never mutate another server's row.
+- **Cancellation** requires the expected server identity in its CAS predicate:
+  a row whose server differs is never touched and the request fails loudly.
+- **Finalization, heartbeat, lease recovery, and GC** are likewise guarded by
+  the exact server match, so two daemons configured with different servers can
+  share one physical queue without ever executing, mutating, or collecting each
+  other's jobs.
+
+The match is a strict text equality against a JSON **string**; the SQL
+predicates check `jsonb_typeof((payload::jsonb)->'server') = 'string'` before
+comparing, so a row with `server: 123` can never alias-match `"123"`. There is
+no implicit or default server anywhere in the system.
 
 ## Context-safety contract
 
@@ -135,9 +175,9 @@ output window, independent of chunk rotation. Literally arbitrary SQL is not
 bounded; the guarantee covers Lubko's row representation and documented
 workflows.
 
-## Protocol v3 payload kinds
+## Protocol v4 payload kinds
 
-Version 3 defines exactly two kinds:
+Version 4 defines exactly two kinds:
 
 - `command` — a runnable root job;
 - `output_chunk` — an immutable, explicitly owned historical output chunk.
@@ -148,8 +188,9 @@ A `command` payload is a JSON object:
 
 ```json
 {
-  "v": 3,
+  "v": 4,
   "type": "command",
+  "server": "alpha-server",
   "request": {
     "cwd": "/workspace/project",
     "process": ["git", "status", "--short"]
@@ -165,8 +206,9 @@ live output window:
 
 ```json
 {
-  "v": 3,
+  "v": 4,
   "type": "command",
+  "server": "alpha-server",
   "request": { "cwd": "/workspace/project", "process": ["ls", "/etc"] },
   "state": { "status": "running", "...": "..." },
   "output": {
@@ -193,6 +235,14 @@ invisible to a normal `SELECT` of the root job. Overlap between the live tail
 and the latest immutable chunk is intentional and represented unambiguously by
 byte offsets.
 
+#### `server` — routing identity
+
+Required non-empty string on every `command` and `output_chunk` payload. It
+names the execution server that owns and may execute the row. There is no
+implicit or default server: submitters must name the target server explicitly,
+and a daemon claims only rows whose `server` exactly equals its configured
+identity (see [Server routing](#server-routing)).
+
 #### `request` — immutable submission
 
 Required object.
@@ -202,13 +252,13 @@ Required object.
 | `cwd`     | string          | yes      | absolute working directory for the job |
 | `process` | non-empty array of non-empty strings | yes | argv executed directly, never through a shell |
 
-`process` is the **only** executable field in protocol v3. The worker executes
+`process` is the **only** executable field in protocol v4. The worker executes
 its elements verbatim as the child process argv in `cwd`; it never interprets
 them with a shell, so shell metacharacters are passed to the program literally.
 To obtain shell semantics the submitter must select a shell interpreter
 explicitly, for example `"process": ["/bin/sh", "-c", "<snippet>"]`.
 
-The legacy v2 request fields `command` and `args` are **forbidden** in v3. A v3
+The legacy v2 request fields `command` and `args` remain **forbidden**. A v4
 payload carrying either key is rejected outright — even when a valid
 `request.process` is also present — never silently ignored. Other unknown
 additive fields may be retained additively within a version, but `command` and
@@ -266,8 +316,9 @@ table:
 
 ```json
 {
-  "v": 3,
+  "v": 4,
   "type": "output_chunk",
+  "server": "alpha-server",
   "thread": "<ROOT JOB UUID>",
   "stream": "stdout",
   "sequence": 17,
@@ -471,6 +522,7 @@ The worker behavior is configurable through environment variables:
 
 | Variable                                | Default | Meaning                                          |
 | --------------------------------------- | ------- | ------------------------------------------------ |
+| `LUBKO_SERVER`                          | — (required) | execution-server identity; claims only jobs addressed to it |
 | `LUBKO_LEASE_DURATION_SECONDS`          | `30`    | how far in the future a claim or heartbeat pushes the lease deadline |
 | `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`  | `5`     | how often the worker heartbeats its running jobs  |
 | `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS` | `10`    | how often a worker runs the stale-job recovery pass |
@@ -498,20 +550,27 @@ invariant comment. The baseline is idempotent and safe to apply more than
 once. There is no older schema, no staging table, and no rollback path: the
 two-column table is the only supported binding, and the worker refuses to
 start against any other shape. After the table exists, submit jobs in protocol
-v3 JSON form:
+v4 JSON form, addressed to a specific server (there is no default):
 
 ```sql
 insert into lubko.jobs (payload)
-values ('{"v":3,"type":"command","request":{"cwd":"...","process":["git","status"]},"state":{"status":"pending"}}');
+values ('{"v":4,"type":"command","server":"alpha-server","request":{"cwd":"...","process":["git","status"]},"state":{"status":"pending"}}');
 ```
 
-Upgrading an existing transport from v2 is a destructive cutover that needs
-**no schema change**: the two-column table is identical in v2 and v3, and the
-v3 worker does not understand v2 rows. Run it against the live queue: quiesce
-new submissions, let any in-flight v2 work become durably terminal, bring up
-and prove the v3 supervisor/worker, then `truncate lubko.jobs` while quiescent
-(discarding every old root `command` row and `output_chunk` history), and prove
-a fresh v3 round trip. Truncating before the first v3 start is equally valid;
-only the end state matters. Old v2 contents are discarded; there is no protocol-data
-drain/migration path, and no v2 row is transformed or preserved. Only the payload protocol
-version changes; the physical schema stays the canonical two-column table.
+The job runs only on the daemon whose configured `LUBKO_SERVER` identity is
+`alpha-server`; jobs addressed to other servers stay pending untouched.
+
+Upgrading an existing transport from v3 is a destructive cutover that replaces
+the payload-shape constraint via
+`migrations/0003_protocol_v4_server_routing.sql`: v4 rejects every v3 payload,
+because v3 rows carry no required top-level `server` routing identity. Run it
+against the live queue: quiesce new submissions, let any in-flight v3 work
+become durably terminal, `truncate lubko.jobs` while quiescent (discarding
+every old root `command` row and `output_chunk` history — truncating before
+applying is **required**; applying against nonconforming rows fails fast with
+an explicit diagnostic), apply the migration, start each daemon with its
+configured `LUBKO_SERVER` identity, and prove a fresh v4 round trip.
+Old v3 contents are discarded; there is no protocol-data drain/migration path,
+and no v3 row is transformed or preserved. Only the payload protocol version
+and the shape constraint change; the physical schema stays the canonical
+two-column table.

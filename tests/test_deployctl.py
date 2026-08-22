@@ -1615,8 +1615,9 @@ def insert_running_job(conninfo: str, cwd: str, command: str) -> object:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "running"},
     })
@@ -2419,6 +2420,7 @@ def worker_env_with(token: str) -> dict[str, str]:
     """
     env = lifecycle.worker_env(token)
     env["LUBKO_WORKER_ID"] = "e2e-worker"
+    env["LUBKO_SERVER"] = "alpha-server"
     env.update(WORKER_TIMINGS)
     return env
 
@@ -2486,8 +2488,9 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "pending"},
     })
@@ -2512,8 +2515,9 @@ def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> o
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })
