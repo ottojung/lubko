@@ -110,9 +110,6 @@ convention = "google"
 "tests/test_lifecycle.py" = [
     "private-member-access",
 ]
-"tests/test_worker.py" = [
-    "private-member-access",
-]
 
 [tool.ruff.format]
 preview = true

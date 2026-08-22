@@ -3215,7 +3215,7 @@ class Supervisor:
         deliberately not read and the producer is backpressured. A completed or
         terminating job whose spool is full is not drained past the bound; instead
         the supervisor publishes and trims the captured bytes to free bounded
-        room and drains more (see :meth:`_finalize_completed_job_bounded`), so a
+        room and drains more (see :meth:`finalize_completed_job_bounded`), so a
         job's final output is captured completely without ever exceeding the
         bound.
 
@@ -3702,7 +3702,7 @@ class Supervisor:
             psycopg.Error: When a database error is a connectivity issue.
         """
         try:
-            self._finalize_completed_job_bounded(job)
+            self.finalize_completed_job_bounded(job)
         except psycopg.Error as exc:
             if self._is_connectivity_error(exc):
                 raise
@@ -3875,7 +3875,7 @@ class Supervisor:
             return False
         return outcome == "ok"
 
-    def _finalize_completed_job_bounded(self, job: ActiveJob) -> None:
+    def finalize_completed_job_bounded(self, job: ActiveJob) -> None:
         """Bounded publish/trim/drain finalization for one completed job.
 
         The physical spool bound is always enforced. The cycle drains each
@@ -4660,7 +4660,7 @@ class Supervisor:
             # represents the full output of a terminating job without growing the
             # disk or silently discarding.
             try:
-                self._finalize_completed_job_bounded(job)
+                self.finalize_completed_job_bounded(job)
             except psycopg.Error as exc:
                 if self._is_connectivity_error(exc):
                     raise

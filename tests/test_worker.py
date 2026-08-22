@@ -2048,7 +2048,7 @@ def test_bounded_finalizer_publishes_trims_and_continues_to_eof(
     supervisor.active[job.id] = job
 
     try:
-        supervisor._finalize_completed_job_bounded(job)
+        supervisor.finalize_completed_job_bounded(job)
 
         assert job.finalized is True
         assert job.id not in supervisor.active
