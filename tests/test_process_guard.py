@@ -7,6 +7,7 @@ signals the pytest/shared process group, and fails loudly when a test leaks.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
@@ -95,6 +96,25 @@ def pid_live(pid: int) -> bool:
     return fields[0] not in {b"Z", b"X"}
 
 
+def verified_kill(proc: subprocess.Popen[bytes], spawn_ticks: int) -> None:
+    """Force-kill a test-owned subject by its SPAWN-TIME exact identity.
+
+    Revalidates the stored start ticks immediately before the signal; a
+    reused occupant of the PID is never signalled.
+
+    Args:
+        proc: The test-owned subject.
+        spawn_ticks: Start ticks captured right after spawn.
+    """
+    if proc.poll() is not None:
+        return
+    assert guard.proc_start_ticks(proc.pid) == spawn_ticks, (
+        f"pid {proc.pid} identity stale/reused at cleanup; KILL refused"
+    )
+    assert guard.signal_identity_checked(proc.pid, spawn_ticks, signal.SIGKILL)
+    proc.wait(timeout=10)
+
+
 def test_teardown_stops_leaked_registered_process() -> None:
     """A leaked registered process is stopped by exact group and reported."""
     proc, pid = spawn_sleep_leader()
@@ -148,9 +168,10 @@ def test_teardown_never_signals_reused_pid_identity() -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    innocent_spawn_ticks = guard.proc_start_ticks(innocent.pid)
+    assert innocent_spawn_ticks is not None
     try:
-        current = guard.proc_start_ticks(innocent.pid)
-        assert current is not None
+        current = innocent_spawn_ticks
         guard.register(innocent, start_ticks=current - 1)
         with pytest.raises(AssertionError, match="never signalled"):
             guard.teardown_tracked()
@@ -173,6 +194,8 @@ def test_register_fails_closed_for_live_process_without_ticks(
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    proc_spawn_ticks = guard.proc_start_ticks(proc.pid)
+    assert proc_spawn_ticks is not None
     try:
         monkeypatch.setattr(guard, "proc_start_ticks", lambda _pid: None)
         with pytest.raises(AssertionError, match="unverifiable identity"):
@@ -181,9 +204,9 @@ def test_register_fails_closed_for_live_process_without_ticks(
         # The live process was never owned and never signalled.
         assert pid_live(proc.pid)
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=10)
+        # Undo the seam first so cleanup revalidation reads real ticks.
+        monkeypatch.undo()
+        verified_kill(proc, proc_spawn_ticks)
 
 
 def test_teardown_never_kills_identity_reused_after_term(
@@ -212,8 +235,12 @@ def test_teardown_never_kills_identity_reused_after_term(
         stderr=subprocess.DEVNULL,
         # Deliberately NOT a session/group leader: the escalation gate under
         # test authorizes a KILL of the live PID itself only while its
-        # recorded start-ticks identity matches.
+        # recorded start-ticks identity matches.  (A dedicated-group owner
+        # escalates by proven group ownership instead — covered by the
+        # leader-exit regression.)
     )
+    subject_spawn_ticks = guard.proc_start_ticks(proc.pid)
+    assert subject_spawn_ticks is not None
     try:
         # Wait until the subject has installed its SIGTERM handler, so the
         # TERM is deterministically delivered to a live ignoring occupant.
@@ -246,7 +273,12 @@ def test_teardown_never_kills_identity_reused_after_term(
     finally:
         monkeypatch.undo()
         if proc.poll() is None:
-            proc.kill()
+            # Non-leader: exact-PID cleanup only, never the shared group.
+            assert guard.proc_start_ticks(proc.pid) == subject_spawn_ticks, (
+                "subject identity stale/reused at cleanup; KILL refused"
+            )
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(proc.pid, signal.SIGKILL)
             proc.wait(timeout=10)
         if proc.stdout is not None:
             proc.stdout.close()
@@ -423,6 +455,8 @@ def test_teardown_never_signals_parent_process_group() -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    sibling_spawn_ticks = guard.proc_start_ticks(sibling.pid)
+    assert sibling_spawn_ticks is not None
     try:
         assert os.getpgid(leaked.pid) == os.getpgrp()
         assert os.getpgid(sibling.pid) == os.getpgrp()
@@ -433,6 +467,4 @@ def test_teardown_never_signals_parent_process_group() -> None:
         assert pid_live(sibling.pid)
         assert pid_live(os.getpid())
     finally:
-        if sibling.poll() is None:
-            sibling.kill()
-            sibling.wait(timeout=10)
+        verified_kill(sibling, sibling_spawn_ticks)
