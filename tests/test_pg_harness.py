@@ -7,8 +7,6 @@ was never verifiable: teardown fails closed instead.
 
 from __future__ import annotations
 
-import contextlib
-import os
 import signal
 import subprocess
 from typing import TYPE_CHECKING
@@ -16,6 +14,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tests import _pg
+from tests import _process_guard as _guard
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -32,14 +31,16 @@ def kill_verified(proc: subprocess.Popen[bytes], spawn_ticks: int) -> None:
     Args:
         proc: The test-owned process to stop.
         spawn_ticks: Start ticks captured right after spawn.
+
+    Raises:
+        AssertionError: If the identity is stale/reused at cleanup and the
+            KILL is refused.
     """
     if proc.poll() is not None:
         return
-    assert _pg.proc_start_ticks(proc.pid) == spawn_ticks, (
-        f"pid {proc.pid} identity stale/reused at cleanup; KILL refused"
-    )
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(proc.pid, signal.SIGKILL)
+    if not _guard.signal_identity_checked(proc.pid, spawn_ticks, signal.SIGKILL):
+        msg = f"pid {proc.pid} identity stale/reused at cleanup; KILL refused"
+        raise AssertionError(msg)
     proc.wait(timeout=10)
 
 
@@ -107,6 +108,33 @@ def test_start_records_exact_postmaster_identity(
     finally:
         if proc.poll() is None:
             kill_verified(proc, spawn_ticks)
+
+
+def test_stop_succeeds_without_signalling_when_already_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_cluster: tuple[_pg.PgCluster, Path],
+) -> None:
+    """A recorded postmaster already truly absent needs no signal at all.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        fake_cluster: The harness shell and pidfile path.
+    """
+    cluster, _pidfile = fake_cluster
+    gone = _spawn_sleeper()
+    gone_ticks = _pg.proc_start_ticks(gone.pid)
+    assert gone_ticks is not None
+    kill_verified(gone, gone_ticks)
+    cluster.postmaster_pid = gone.pid
+    cluster.postmaster_start_ticks = gone_ticks
+
+    def fail_signal(_pid: int, _ticks: int, _sig: int) -> bool:
+        failure = AssertionError("no signal may be delivered for an absent postmaster")
+        raise failure
+
+    monkeypatch.setattr(cluster, "_signal_postmaster", fail_signal)
+    cluster.stop()
+    assert _pg.process_live(gone.pid) is False
 
 
 def test_stop_refuses_signalling_stale_identity(

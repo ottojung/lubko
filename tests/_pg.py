@@ -160,6 +160,10 @@ class PgCluster:
         """
         self._refuse_stale_pre_stop()
         pid = self.postmaster_pid
+        if pid is not None and proc_start_ticks(pid) is None:
+            # Already truly gone before teardown: succeed without signalling.
+            self.assert_postmaster_gone()
+            return
         ticks = self.postmaster_start_ticks
         if pid is None or ticks is None:
             msg = "postmaster identity unrecorded; refusing unverified shutdown"
@@ -183,16 +187,14 @@ class PgCluster:
         while time.monotonic() < deadline and process_live(pid):
             time.sleep(0.05)
         if process_live(pid):
-            # Exact-identity revalidation immediately before any forced
-            # signal: a stale/reused PID must never be signalled.
-            if not self._identity_is_current():
+            # Exact-identity revalidation via the one canonical signalling
+            # helper: a stale/reused PID must never be signalled.
+            if not self._signal_postmaster(signal.SIGKILL):
                 msg = (
                     f"postgres postmaster pid {pid} identity stale/unverifiable; "
                     "refusing to signal an unverified occupant"
                 )
                 raise AssertionError(msg)
-            with suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
             deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline and process_live(pid):
                 time.sleep(0.05)
