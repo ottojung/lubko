@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import copy
 import fcntl
 import json
 import os
@@ -33,6 +34,7 @@ from itertools import starmap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 
+from lubko.durable import write_text_durable
 from lubko.worker import group_has_members
 
 if TYPE_CHECKING:
@@ -186,12 +188,10 @@ def write_meta(aid: str, meta: Meta) -> None:
     """
     directory = agent_dir(aid)
     directory.mkdir(parents=True, exist_ok=True)
-    tmp = directory / "meta.json.tmp"
-    path = directory / "meta.json"
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(meta, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    tmp.replace(path)
+    # Crash-durable replace: fsync of file contents and the directory entry so
+    # reconciled metadata can never be lost or half-written on power failure.
+    payload = json.dumps(meta, indent=2, sort_keys=True) + "\n"
+    write_text_durable(directory / "meta.json", payload)
 
 
 def update_meta(aid: str, fn: Callable[[Meta], None]) -> None:
@@ -724,6 +724,73 @@ def derive_state(meta: Meta | None) -> str:
     if meta.get("finished_at"):
         return str(state)  # runner finalized it
     return "unknown"
+
+
+DISAPPEARED_NOTE: Final = "runner/model process disappeared without a captured exit status"
+
+
+def _reconcile_dead_invocation(m: Meta) -> None:
+    """Reconcile metadata that claims a running invocation nothing can justify.
+
+    Runs under the per-agent metadata lock. When the recorded agent and runner
+    identities are both gone (checked by exact identity: PID + start ticks +
+    environment marker, so PID reuse never fools this) and no reservation is
+    genuinely in flight, the durable record converges to an explicit terminal
+    state. A stale-but-recoverable ``reserved`` reservation is deliberately
+    left alone: it is justified by the protocol and recovered by the next
+    caller under a fresh generation.
+
+    The reconciliation is idempotent: once reconciled the state is no longer
+    ``running`` and ``active_runner`` is false, so repeated calls are no-ops.
+    The old process identities are preserved for diagnostics; ``exit_code`` /
+    ``exit_signal`` remain unset exactly because the process disappeared
+    without a captured return code, distinguishing this from a normal model
+    exit (exit code set) or a signal crash (signal set).
+
+    Args:
+        m: Agent metadata under the lock.
+    """
+    if not m.get("active_runner") and m.get("state") != "running":
+        return  # already terminal/reconciled; nothing to converge
+    if is_genuinely_running(m):
+        return
+    if not m.get("pid"):
+        # Launched but the runner has not recorded its identity yet; give the
+        # exact startup window the same grace derive_state grants it.
+        launched = m.get("started_at") or m.get("created_at") or 0
+        if time.time() - launched < PID_START_WINDOW_SECONDS:
+            return
+    if m.get("state") == "running":
+        _finalize_terminal(m, None, None, "failed", DISAPPEARED_NOTE)
+    _set_active_runner(m, value=False)
+
+
+def reconcile_meta(aid: str) -> bool:
+    """Reconcile an agent's durable metadata after process disappearance.
+
+    Idempotent, PID-reuse safe convergence pass: if the durable record still
+    claims an active running invocation whose exact processes are provably
+    gone, it is rewritten to an explicit terminal state under the per-agent
+    lock. Safe to call any number of times from any number of observers.
+
+    The metadata is only rewritten when reconciliation actually changes it, so
+    hot polling paths (log follow ticks) never pay a needless fsync per tick.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when the durable record was changed and rewritten.
+    """
+    current = read_meta(aid)
+    if current is None:
+        return False
+    candidate = copy.deepcopy(current)
+    _reconcile_dead_invocation(candidate)
+    if candidate == current:
+        return False
+    update_meta(aid, _reconcile_dead_invocation)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2169,6 +2236,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not aid:
         _err(f"{PROG}: status: an agent ID is required")
         return EXIT_USAGE
+    # Reconcile before reporting: a status observation must converge durable
+    # metadata instead of leaving a dead invocation recorded as running. This
+    # is idempotent and PID-reuse safe (exact-identity checks inside).
+    reconcile_meta(aid)
     meta = read_meta(aid)
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
@@ -2729,12 +2800,24 @@ def _drain_and_stop(handle: BinaryIO, normalizer: _LogNormalizer) -> None:
 def _terminal_or_unknown(aid: str) -> bool:
     """Return whether the agent is terminal, unknown, or deleted.
 
+    Before deciding, the durable record is reconciled: a runner/model process
+    that disappeared mid-invocation must converge ``meta.json`` to an explicit
+    terminal state instead of being observed as a stale ``unknown`` that leaves
+    ``state=running / active_runner=true`` behind. Reconciliation rewrites only
+    on an actual change, so follow polling ticks stay fsync-free when healthy.
+
     Args:
         aid: Lubko agent ID.
 
     Returns:
         ``True`` when streaming should stop.
     """
+    meta = read_meta(aid)
+    if meta is None:
+        return True
+    # Reconcile first so the decision below never returns a stale unknown for
+    # a provably dead invocation without also converging the durable record.
+    reconcile_meta(aid)
     meta = read_meta(aid)
     if meta is None:
         return True
@@ -2876,6 +2959,11 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 meta = current
                 break
             time.sleep(0.25)
+        else:
+            # The runner never finalized: converge the durable record instead
+            # of returning while metadata still claims a running invocation.
+            reconcile_meta(aid)
+            meta = read_meta(aid) or meta
         break
 
     return exit_code_for(meta)

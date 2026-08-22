@@ -19,6 +19,7 @@ from typing import Any, BinaryIO, Final, cast
 import pytest
 
 from lubko import agent
+from lubko.durable import write_text_durable
 from tests import _process_guard as guard
 
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
@@ -3171,3 +3172,316 @@ def test_active_runner_requires_live_identity_or_reservation(tmp_path: Path) -> 
         assert agent.active_runner_justified(inactive) is True
     finally:
         kill_proc(live)
+
+
+def _dead_invocation_meta(
+    aid: str,
+    state_dir: Path,
+    proc: subprocess.Popen[bytes],
+) -> agent.Meta:
+    """Build running metadata whose process is then killed (exact identity).
+
+    Args:
+        aid: Agent ID.
+        state_dir: State root recorded as cwd.
+        proc: Process to record and then kill.
+
+    Returns:
+        Metadata that still claims a running invocation, though the exact
+        process is provably gone.
+    """
+    meta = meta_for_process(aid, proc, str(state_dir))
+    kill_proc(proc)
+    wait_until(lambda: agent.pid_alive(proc.pid) is False)
+    meta["active_runner"] = True
+    meta["started_at"] = time.time()
+    return meta
+
+
+def test_reconcile_after_runner_death_converges_idempotently(state_dir: Path) -> None:
+    """A dead runner/model process converges durable metadata exactly once."""
+    aid = "aaaaaaaa"
+    proc = spawn_marked_process(aid)
+    try:
+        meta = _dead_invocation_meta(aid, state_dir, proc)
+        agent.write_meta(aid, meta)
+        agent.reconcile_meta(aid)
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        # Disappeared without a captured return code: no code, no signal.
+        assert after["exit_code"] is None
+        assert after["exit_signal"] is None
+        assert agent.DISAPPEARED_NOTE in str(after.get("error"))
+        assert after["finished_at"] is not None
+        assert after["active_runner"] is False
+        assert after["runner_reservation"] is None
+        # Diagnostics preserved.
+        assert after["pid"] == proc.pid
+        snapshot = dict(after)
+        # Idempotent: repeated reconciliation is a no-op.
+        agent.reconcile_meta(aid)
+        agent.reconcile_meta(aid)
+        assert agent.read_meta(aid) == snapshot
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_reconcile_is_pid_reuse_safe(state_dir: Path) -> None:
+    """An unrelated process reusing the recorded PID never blocks reconciliation."""
+    aid = "bbbbbbbb"
+    unrelated = spawn_marked_process("other-agent")
+    try:
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["state"] = "running"
+        meta["active_runner"] = True
+        # Record the live reused PID with a start time that cannot match it.
+        meta["pid"] = unrelated.pid
+        meta["pgid"] = unrelated.pid
+        meta["start_time"] = 1
+        meta["runner_pid"] = unrelated.pid
+        meta["runner_start_time"] = 1
+        meta["started_at"] = time.time() - 3600
+        agent.write_meta(aid, meta)
+        agent.reconcile_meta(aid)
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        assert after["active_runner"] is False
+    finally:
+        kill_proc(unrelated)
+
+
+def test_status_reconciles_durable_metadata_after_disappearance(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``status`` itself reconciles the persisted metadata, idempotently."""
+    aid = "cccccccc"
+    proc = spawn_marked_process(aid)
+    try:
+        agent.write_meta(aid, _dead_invocation_meta(aid, state_dir, proc))
+        rc = agent.main(["status", "--id", aid, "--json"])
+        capsys.readouterr()
+        assert rc == agent.EXIT_OK
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        assert after["active_runner"] is False
+        # A second status call converges to the identical durable record.
+        rc2 = agent.main(["status", "--id", aid, "--json"])
+        capsys.readouterr()
+        assert rc2 == agent.EXIT_OK
+        again = agent.read_meta(aid)
+        assert again == after
+        assert derive_status_state(again) != "running"
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def derive_status_state(meta: agent.Meta | None) -> str | None:
+    """Return the effective status state for reconciliation assertions.
+
+    Args:
+        meta: Agent metadata or ``None``.
+
+    Returns:
+        The effective state, or ``None`` without metadata.
+    """
+    if meta is None:
+        return None
+    return str(agent.derive_state(meta))
+
+
+def test_reconcile_leaves_stale_reserved_reservation_recoverable(state_dir: Path) -> None:
+    """Reconciliation must not consume a recoverable reserved reservation."""
+    aid = "dddddddd"
+    meta = agent.idle_meta(aid, str(state_dir), None)
+    meta["state"] = "running"
+    meta["active_runner"] = True
+    meta["pending_prompt"] = "original prompt"
+    meta["runner_gen"] = 4
+    meta["runner_reservation"] = {
+        "gen": 4,
+        "owner_pid": 999999,
+        "owner_start_ticks": None,
+        "state": "reserved",
+        "reserved_at": time.time(),
+        "mode": "continue",
+    }
+    agent.write_meta(aid, meta)
+    agent.reconcile_meta(aid)
+    after = agent.read_meta(aid)
+    assert after is not None
+    res = after["runner_reservation"]
+    assert isinstance(res, dict)
+    assert res["state"] == "reserved"
+    assert res["mode"] == "continue"
+    assert after["pending_prompt"] == "original prompt"
+
+
+def test_first_invocation_crash_recovers_as_new_session(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first-invocation crash (no native session) deterministically retries as new."""
+    aid = "eeeeeeee"
+    proc = spawn_marked_process(aid)
+    try:
+        meta = _dead_invocation_meta(aid, state_dir, proc)
+        meta["native_session_id"] = None
+        agent.write_meta(aid, meta)
+        agent.reconcile_meta(aid)
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
+        assert agent.main(["prompt", "--id", aid, "--detach", "retry"]) == agent.EXIT_OK
+        assert spawned == ["new"]
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_continuation_crash_recovers_without_second_new_session(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continuation crash recovers as continue; a second new session never starts."""
+    aid = "0f0f0f0f"
+    proc = spawn_marked_process(aid)
+    try:
+        meta = _dead_invocation_meta(aid, state_dir, proc)
+        meta["native_session_id"] = "sess-xyz"
+        agent.write_meta(aid, meta)
+        agent.reconcile_meta(aid)
+        monkeypatch.setattr(agent, "discover_session_id", lambda _aid: "sess-xyz")
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode, **_k: spawned.append(mode))
+        assert agent.main(["prompt", "--id", aid, "--detach", "continue work"]) == agent.EXIT_OK
+        assert spawned == ["continue"]
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_write_meta_is_crash_durable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Metadata writes go through the crash-durable writer."""
+    calls: list[Path] = []
+
+    def spy(path: Path, text: str) -> None:
+        calls.append(path)
+        write_text_durable(path, text)
+
+    monkeypatch.setattr(agent, "write_text_durable", spy)
+    meta = agent.idle_meta("abcdef01", str(tmp_path), None)
+    agent.write_meta("abcdef01", meta)
+    assert agent.read_meta("abcdef01") == meta
+    assert calls == [agent.agent_dir("abcdef01") / "meta.json"]
+
+
+def test_attached_follow_converges_durable_metadata_without_status(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Disappearance during attached follow converges metadata without ``status``.
+
+    The normal attached lifecycle path (``stream_log_until_terminal`` /
+    ``_terminal_or_unknown``) must reconcile the durable record itself: it may
+    never observe a dead invocation as ``unknown``, stop following, and leave
+    ``state=running / active_runner=true`` behind.
+    """
+    aid = "1a2b3c4d"
+    proc = spawn_marked_process(aid)
+    try:
+        agent.write_meta(aid, _dead_invocation_meta(aid, state_dir, proc))
+        agent.stream_log_until_terminal(aid, follow_lines=1)
+        capsys.readouterr()
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        assert after["active_runner"] is False
+        assert after["exit_code"] is None
+        assert after["exit_signal"] is None
+        assert agent.DISAPPEARED_NOTE in str(after.get("error"))
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_wait_converges_durable_metadata_after_runner_death(state_dir: Path) -> None:
+    """``wait`` reconciles when the runner dies without finalizing."""
+    aid = "2b3c4d5e"
+    proc = spawn_marked_process(aid)
+    try:
+        agent.write_meta(aid, _dead_invocation_meta(aid, state_dir, proc))
+        rc = agent.main(["wait", "--timeout", "5", aid])
+        assert rc == agent.EXIT_ERROR  # failed exit mapping, not success
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        assert after["active_runner"] is False
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_reconcile_writes_only_when_state_changes(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconciliation rewrites durable metadata only on an actual change."""
+    aid = "3c4d5e6f"
+    proc = spawn_marked_process(aid)
+    try:
+        stale = _dead_invocation_meta(aid, state_dir, proc)
+        agent.write_meta(aid, stale)
+        writes: list[Path] = []
+
+        def spy(path: Path, text: str) -> None:
+            writes.append(path)
+            write_text_durable(path, text)
+
+        monkeypatch.setattr(agent, "write_text_durable", spy)
+        assert agent.reconcile_meta(aid) is True
+        converged = agent.read_meta(aid)
+        assert converged is not None
+        assert converged["state"] == "failed"
+        writes.clear()
+        # Already converged: repeated calls are pure reads, no rewrite.
+        assert agent.reconcile_meta(aid) is False
+        assert agent.reconcile_meta(aid) is False
+        assert writes == []
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
+
+
+def test_terminal_or_unknown_reconciles_before_decision(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The shared observation boundary never returns unknown without converging."""
+    aid = "4d5e6f70"
+    proc = spawn_marked_process(aid)
+    try:
+        meta = _dead_invocation_meta(aid, state_dir, proc)
+        meta.pop("pid")
+        meta["pgid"] = None
+        meta["started_at"] = time.time() - 3600  # past the startup grace window
+        agent.write_meta(aid, meta)
+        # Without reconciliation this derives to a stale "unknown"; following
+        # must still converge the durable record through the same boundary.
+        assert agent.derive_state(agent.read_meta(aid)) == "unknown"
+        agent.stream_log_until_terminal(aid, follow_lines=1)
+        capsys.readouterr()
+        after = agent.read_meta(aid)
+        assert after is not None
+        assert after["state"] == "failed"
+        assert after["active_runner"] is False
+    finally:
+        with contextlib.suppress(Exception):
+            kill_proc(proc)
