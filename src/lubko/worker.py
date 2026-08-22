@@ -2003,23 +2003,18 @@ def spawn_job(
     try:
         pgid = _prepare_capture_fds(proc, stdout_w, stderr_w, stdout_r, stderr_r)
     except BaseException:
-        # Kill the whole process GROUP (the session leader's pgid equals its
-        # pid), not just the leader: a child that forked descendants which share
-        # the group must have every member terminated, otherwise a grandchild
-        # would survive orphaned. Killing the unreleased gated wrapper makes it
-        # exit without executing user code; the kernel reaps the leader via
-        # proc.wait; the group's other members are reaped by PID 1 (tini).
-        with suppress(OSError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        try:
-            proc.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            # The reap timing out must never skip the local cleanup below; the
-            # inability to prove the group dead is surfaced instead.
-            LOGGER.exception(
-                "could not prove process group %d dead after post-spawn failure",
-                proc.pid,
-            )
+        # The unreleased gated wrapper is this process's exact DIRECT child in
+        # its own childless dedicated group. Keep synchronous local ownership:
+        # SIGKILL the exact group ONLY while the direct child is still live,
+        # and block — never returning or re-raising on a reap timeout while it
+        # remains live — until the child is actually reaped. Once reaped, the
+        # original unreleased group is gone by construction and its numeric
+        # PGID is deliberately never probed or signalled again, because it
+        # could already have been reused by an unrelated process.
+        while proc.poll() is None:
+            with suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            time.sleep(0.02)
         for capture_fd in (
             gate_write_fd,
             stdout_r,

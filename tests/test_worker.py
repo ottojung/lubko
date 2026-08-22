@@ -2093,14 +2093,15 @@ def test_disappeared_spool_fails_closed_without_recreation(tmp_path: Path) -> No
             os.close(write_end)
 
 
-def test_post_popen_reap_timeout_still_cleans_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_post_popen_setup_failure_cleans_up_after_exact_convergence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A reap timeout after post-Popen failure never skips local cleanup.
+    """Post-Popen setup failure cleans up only after exact direct-child convergence.
 
-    ``proc.wait`` timing out must leave every capture fd closed, both spool
-    files removed, and the exact group killed — while surfacing that group
-    death could not be proven instead of swallowing it.
+    With ``wait`` permanently timing out, ``spawn_job`` must still converge the
+    unreleased gated wrapper synchronously — never escaping through a timeout
+    while the direct child remains live — before closing every gate/capture
+    descriptor, removing both spool files, and failing closed.
     """
 
     def timing_out_wait(self: subprocess.Popen[bytes], timeout: float | None = None) -> int:
@@ -2118,12 +2119,28 @@ def test_post_popen_reap_timeout_still_cleans_up(
 
     monkeypatch.setattr(fcntl, "fcntl", failing_fcntl)
 
+    # Record the spool files spawn_job creates so their removal can be proven.
+    created: list[Path] = []
+    original_mkstemp = tempfile.mkstemp
+
+    def _recording_mkstemp() -> tuple[int, str]:
+        fd, name = original_mkstemp()
+        created.append(Path(name))
+        os.close(fd)
+        return (fd, name)
+
+    monkeypatch.setattr(tempfile, "mkstemp", _recording_mkstemp)
+
     fd_baseline = len(list(Path("/proc/self/fd").iterdir()))
-    with caplog.at_level("ERROR"), pytest.raises(OSError, match="fcntl"):
+    with pytest.raises(OSError, match="fcntl"):
         spawn_job(Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30))
-    assert any("could not prove process group" in r.message for r in caplog.records)
-    # Cleanup ran unconditionally despite the reap timeout: no fd leaked.
+
+    # Convergence happened BEFORE cleanup/raise: poll-based ownership reaped the
+    # exact child despite the permanently timing-out wait, no descriptor
+    # leaked, and both spool files were removed.
     assert len(list(Path("/proc/self/fd").iterdir())) == fd_baseline
+    for capture_path in created:
+        assert not capture_path.exists()
 
 
 def test_running_capture_failure_retains_ownership_until_group_gone(
@@ -2314,3 +2331,66 @@ def test_stderr_archival_rotation_stress_chunk_order_offsets_and_tail(
     assert job.stderr.tail_text.endswith(total[-64:])
     # Stdout was never touched by this stderr-only workload.
     assert not job.stdout.tail_text
+
+
+def test_post_popen_failure_owns_exact_child_until_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-Popen capture-setup failure owns the exact child until it is reaped.
+
+    The unreleased gated wrapper is the worker's direct child in its own
+    childless dedicated group. Even with reap ``wait`` held nonterminal through
+    injected timeouts, ``spawn_job`` must not return or raise while that exact
+    direct child is still live: it keeps signalling only while the child is
+    unreaped, converges synchronously, and never signals the numeric PGID again
+    after the reap. Gate/capture fds and spool files are closed as part of the
+    convergence, and no user code runs.
+    """
+    real_poll = subprocess.Popen.poll
+
+    polls = {"n": 0}
+    hold_polls = 6
+
+    def staged_poll(self: subprocess.Popen[bytes]) -> int | None:
+        polls["n"] += 1
+        if polls["n"] <= hold_polls:
+            # Hold this exact direct child un-reaped through the first polls.
+            return None
+        return real_poll(self)
+
+    def timing_out_wait(self: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired(self.args, timeout or 0)
+
+    real_killpg = os.killpg
+    kill_events: list[tuple[int, int]] = []
+
+    def recording_killpg(pgid: int, sig: int) -> None:
+        kill_events.append((polls["n"], sig))
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(subprocess.Popen, "poll", staged_poll)
+    monkeypatch.setattr(subprocess.Popen, "wait", timing_out_wait)
+    monkeypatch.setattr(os, "killpg", recording_killpg)
+
+    real_fcntl = fcntl.fcntl
+
+    def failing_fcntl(_fd: int, cmd: int, arg: int = 0) -> int:
+        if cmd == fcntl.F_SETFL:
+            msg = "injected fcntl failure"
+            raise OSError(msg)
+        return real_fcntl(_fd, cmd, arg)
+
+    monkeypatch.setattr(fcntl, "fcntl", failing_fcntl)
+
+    fd_baseline = len(list(Path("/proc/self/fd").iterdir()))
+    with pytest.raises(OSError, match="fcntl"):
+        spawn_job(Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30))
+
+    # Signalling happened ONLY while the exact child was held un-reaped; after
+    # the release (reap allowed) the numeric PGID was never touched again.
+    assert kill_events
+    assert {sig for _n, sig in kill_events} == {signal.SIGKILL}
+    assert {n for n, _sig in kill_events} <= set(range(1, hold_polls + 1))
+    assert polls["n"] > hold_polls, "spawn must poll past the hold before raising"
+    # The convergence closed every descriptor and removed the spool files.
+    assert len(list(Path("/proc/self/fd").iterdir())) == fd_baseline
