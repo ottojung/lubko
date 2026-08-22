@@ -24,10 +24,13 @@ a broad process kill.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import time
 from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from lubko.worker import group_has_members
@@ -36,18 +39,146 @@ if TYPE_CHECKING:
     import subprocess
 
 KILL_GRACE_SECONDS: Final = 5.0
+OWNER_MARKER_ENV: Final = "LUBKO_TEST_OWNER_MARKER"
 GROUP_POLL_SECONDS: Final = 0.02
 
-TRACKED: dict[int, subprocess.Popen[bytes]] = {}
+
+@dataclass
+class _Tracked:
+    """A registered process owned with its exact spawn-time identity."""
+
+    proc: subprocess.Popen[bytes]
+    start_ticks: int | None
 
 
-def register(proc: subprocess.Popen[bytes]) -> None:
+TRACKED: dict[int, _Tracked] = {}
+
+
+def _record_to_owner_marker(pid: int, ticks: int) -> None:
+    """Append a successfully-registered identity to the stress-owner marker.
+
+    Canonical automatic recording for nested stress runs: when the
+    ``LUBKO_TEST_OWNER_MARKER`` environment variable is present (set by the
+    independent owner's starter), every successful registration appends its
+    exact ``{pid, ticks}`` identity as one JSON line before returning, so
+    the owner can contain descendants even after an abrupt nested-pytest
+    death.  Ordinary tests without the variable are unaffected.  The append
+    is a single O_APPEND write of one newline-terminated line: a reader can
+    therefore distinguish a complete record from a torn partial write and
+    must treat any partial trailing line as unproven coverage.
+
+    Args:
+        pid: The registered process PID.
+        ticks: The captured start ticks.
+
+    Raises:
+        AssertionError: If the identity cannot be recorded while the marker
+            variable is set: registration must guarantee record-before-return.
+    """
+    raw = os.environ.get(OWNER_MARKER_ENV)
+    if not raw:
+        return
+    line = (json.dumps({"pid": pid, "ticks": ticks}, sort_keys=True) + "\n").encode()
+    try:
+        fd = os.open(raw, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    except OSError as error:
+        msg = f"cannot open owner marker {raw} to record pid {pid}: {error}"
+        raise AssertionError(msg) from error
+    try:
+        os.write(fd, line)
+    except OSError as error:
+        msg = f"cannot append pid {pid} to owner marker {raw}: {error}"
+        raise AssertionError(msg) from error
+    finally:
+        os.close(fd)
+
+
+def proc_start_ticks(pid: int) -> int | None:
+    """Return the process start time in clock ticks, or ``None`` when gone.
+
+    Args:
+        pid: Process to inspect.
+
+    Returns:
+        The start time in clock ticks, or ``None`` when unreadable/gone.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    rest = stat[stat.rfind(")") + 1 :].split()
+    try:
+        return int(rest[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def register(proc: subprocess.Popen[bytes], *, start_ticks: int | None = None) -> None:
     """Track a spawned process so teardown can stop it deterministically.
+
+    The process is owned by its exact identity: PID plus start time in clock
+    ticks recorded at registration.  Teardown re-verifies the ticks before
+    signalling, so a registry entry left behind by a test whose process died
+    and whose PID the kernel reused can never cause an innocent new occupant
+    of that PID to be signalled.
+
+    An already-terminal (reaped) ``Popen`` is harmless and is not registered.
 
     Args:
         proc: The spawned process to own.
+        start_ticks: Explicit recorded start ticks; defaults to reading the
+            live current value.  Tests use this to simulate a stale or
+            unverifiable registry entry deterministically.
+
+    Raises:
+        AssertionError: If the process is still live but its start ticks
+            cannot be read: a live identity that cannot be verified is never
+            registered, so teardown can never be tempted into signalling an
+            unverified PID.
     """
-    TRACKED[proc.pid] = proc
+    if start_ticks is None:
+        if proc.poll() is not None:
+            # Already terminal and reaped: there is nothing left to own.
+            return
+        resolved = proc_start_ticks(proc.pid)
+    else:
+        resolved = start_ticks
+    if resolved is None:
+        msg = (
+            f"cannot register live pid {proc.pid}: start ticks unreadable; "
+            "refusing to own an unverifiable identity"
+        )
+        raise AssertionError(msg)
+    TRACKED[proc.pid] = _Tracked(proc=proc, start_ticks=resolved)
+    _record_to_owner_marker(proc.pid, resolved)
+
+
+def signal_identity_checked(pid: int, ticks: int | None, sig: int) -> bool:
+    """Signal an exact process only while its recorded identity still matches.
+
+    The start-ticks identity is re-read immediately before signalling: a
+    signal is delivered only when ``ticks`` is valid and still matches the
+    live occupant of ``pid``.  A session/process-group leader's whole
+    dedicated group is signalled; any other process is signalled by exact
+    PID only, never its shared group.
+
+    Args:
+        pid: Exact PID to signal.
+        ticks: Recorded start ticks authorizing the signal.
+        sig: Signal to deliver.
+
+    Returns:
+        ``True`` when the signal was delivered, ``False`` when the identity
+        was unresolved, stale, or already gone (nothing was signalled).
+    """
+    current = proc_start_ticks(pid)
+    if ticks is None or ticks <= 0 or current is None or current != ticks:
+        return False
+    pgid = _process_group_of(pid)
+    if pgid is None:
+        return False
+    _signal_exact(pid, pgid, sig)
+    return True
 
 
 def unregister(proc: subprocess.Popen[bytes]) -> None:
@@ -57,6 +188,19 @@ def unregister(proc: subprocess.Popen[bytes]) -> None:
         proc: The reaped process to forget.
     """
     TRACKED.pop(proc.pid, None)
+
+
+def register_unverifiable(proc: subprocess.Popen[bytes]) -> None:
+    """Insert a registry entry with no valid recorded start ticks.
+
+    This exists so regressions can prove teardown's fail-closed behaviour
+    deterministically: an entry without verifiable ticks is never signalled,
+    no matter which live process occupies its PID.
+
+    Args:
+        proc: The process to track without a verifiable identity.
+    """
+    TRACKED[proc.pid] = _Tracked(proc=proc, start_ticks=None)
 
 
 def tracked_pids() -> tuple[int, ...]:
@@ -74,7 +218,7 @@ def live_pids() -> list[int]:
     Returns:
         The live tracked process IDs.
     """
-    return [pid for pid, proc in TRACKED.items() if proc.poll() is None]
+    return [pid for pid, tracked in TRACKED.items() if tracked.proc.poll() is None]
 
 
 def _process_group_of(pid: int) -> int | None:
@@ -159,7 +303,7 @@ def _wait_group_gone(pgid: int) -> None:
         time.sleep(GROUP_POLL_SECONDS)
 
 
-def _stop_one(proc: subprocess.Popen[bytes]) -> None:
+def _stop_one(tracked: _Tracked) -> bool:
     """Stop one tracked process deterministically and reap it.
 
     A tracked process is signalled with ``SIGTERM``, then ``SIGKILL`` while
@@ -172,24 +316,70 @@ def _stop_one(proc: subprocess.Popen[bytes]) -> None:
     would kill unrelated processes.  Only exact identities are ever touched;
     nothing uses process-name matching or broad ``pkill``.
 
+    The recorded start ticks are re-verified immediately before **every**
+    signal directed at the registered PID itself — both the initial
+    ``SIGTERM`` and the escalation ``SIGKILL`` for a non-leader PID.  A
+    registry entry whose recorded ticks no longer match the current
+    occupant of the PID (the kernel reused the PID after the original
+    died), or whose recorded ticks were never valid, is never signalled;
+    the caller reports it as a stale/unverifiable identity instead.
+
+    Dedicated-group ownership is established while the leader's identity is
+    still verifiable, before the TERM is delivered.  If the leader then
+    exits on TERM while a child of its proven dedicated group survives, the
+    escalation SIGKILL goes to that already-owned group even though the
+    leader's ``/proc`` entry is gone: an owned group is never abandoned.  A
+    shared (never-owned) group or a group whose ownership was never
+    established is still never signalled.
+
     Args:
-        proc: The tracked process to stop.
+        tracked: The tracked registry entry to stop.
+
+    Returns:
+        ``False`` when the identity was stale or unverifiable and nothing
+        was signalled (including a KILL refused because the identity changed
+        after the TERM), otherwise ``True``.
     """
+    proc = tracked.proc
     pid = proc.pid
     pgid = _process_group_of(pid)
-    _signal_exact(pid, pgid, signal.SIGTERM)
+    owned_group: int | None = None
+    if (
+        tracked.start_ticks is not None
+        and pgid is not None
+        and proc_start_ticks(pid) == tracked.start_ticks
+    ):
+        # Ownership of the dedicated group is established now, while the
+        # leader's exact identity is verified — before any signal.
+        owned_group = pgid if pgid == pid else None
+        _signal_exact(pid, pgid, signal.SIGTERM)
+    else:
+        # Stale/unverifiable identity (or already gone): never signal.
+        return False
     deadline = time.monotonic() + KILL_GRACE_SECONDS
     while time.monotonic() < deadline:
         if proc.poll() is not None and _group_clear(pgid, pid):
             break
         time.sleep(GROUP_POLL_SECONDS)
     if _still_active(proc, pgid):
-        _signal_exact(pid, pgid, signal.SIGKILL)
+        if owned_group is not None:
+            # The dedicated group was provably owned before TERM; signal it
+            # on escalation even if the leader itself has since exited.
+            with suppress(ProcessLookupError):
+                os.killpg(owned_group, signal.SIGKILL)
+        # Re-verify immediately before a KILL aimed at the live PID itself:
+        # if the identity changed after the TERM (PID reused), the new
+        # occupant must never be hit.
+        elif not signal_identity_checked(pid, tracked.start_ticks, signal.SIGKILL):
+            return False
     if proc.poll() is None:
         with suppress(Exception):
             proc.wait(timeout=KILL_GRACE_SECONDS)
-    if pgid is not None and pgid == pid:
+    if owned_group is not None:
+        _wait_group_gone(owned_group)
+    elif pgid == pid:
         _wait_group_gone(pgid)
+    return True
 
 
 def teardown_tracked(*, fail_on_leak: bool = True) -> int:
@@ -206,14 +396,19 @@ def teardown_tracked(*, fail_on_leak: bool = True) -> int:
             live, meaning a test failed to own and stop its own process.
     """
     procs = list(TRACKED.values())
-    live = [proc for proc in procs if proc.poll() is None]
-    for proc in live:
-        _stop_one(proc)
-    for proc in procs:
-        TRACKED.pop(proc.pid, None)
+    live = [tracked for tracked in procs if tracked.proc.poll() is None]
+    stale = [tracked.proc.pid for tracked in live if not _stop_one(tracked)]
+    for tracked in procs:
+        TRACKED.pop(tracked.proc.pid, None)
+    if fail_on_leak and stale:
+        msg = (
+            "registry held stale or unverifiable identity/identities "
+            "(PID reuse or missing ticks; never signalled): " + ", ".join(str(pid) for pid in stale)
+        )
+        raise AssertionError(msg)
     if fail_on_leak and live:
         msg = "test leaked process(es) that teardown had to stop: " + ", ".join(
-            str(proc.pid) for proc in live
+            str(tracked.proc.pid) for tracked in live
         )
         raise AssertionError(msg)
     return len(live)
