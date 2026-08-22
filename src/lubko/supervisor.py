@@ -75,7 +75,20 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+import psycopg
+
 from lubko import cli, deployctl, lifecycle, supervise
+from lubko import worker as worker_mod
+from lubko.config import load_database_config
+from lubko.durable import remove_durable
+from lubko.health import (
+    interpret_worker_health,
+    prune_old_incarnation_artifacts,
+    publish_current_surfaces,
+    read_worker_health,
+    read_worker_health_by_incarnation,
+    worker_health_payload,
+)
 from lubko.supervise import (
     INTENT_RUN,
     MODE_RUN,
@@ -289,10 +302,93 @@ def _child_to_meta(child: WorkerChild, repo: str) -> WorkerMeta:
         repo=repo,
         git_commit=None,
         worker_id=child.worker_id,
-        log_path=str(lifecycle.worker_log_path()),
+        log_path=str(lifecycle.worker_log_path(child.token)),
         started_at=child.spawned_at,
         stopped_at=None,
     )
+
+
+class OwnedGroupRecoveryError(Exception):
+    """Raised when owned command-group recovery could not be completed.
+
+    This is a durable *blocking* obligation, not a recoverable warning: when the
+    retired worker left command groups alive and they cannot be reaped because
+    the database configuration is missing, the database is unreachable, or the
+    recovery query fails, the supervisor must not clear the retired child or
+    spawn a replacement. Callers let this propagate so the next daemon tick
+    retries the same exact orphan rather than handing off sole-consumer
+    authority alongside stale side-effecting process groups.
+    """
+
+
+def recover_owned_groups(incarnation: str) -> None:
+    """Recover any command group still owned by a retired worker incarnation.
+
+    After a worker is stopped or force-killed, any command process group it
+    owned must be terminated and reaped by its exact persisted process-group
+    id (``state.process_pgid``), never by process-name matching or a broad
+    kill. This is a durable blocking obligation: a missing database
+    configuration, an unreachable database, a recovery query failure, or a
+    verified-ours group that survives the recovery pass raises
+    :class:`OwnedGroupRecoveryError` so the caller preserves the retired
+    child and does not spawn a replacement alongside a still-live
+    side-effecting group. Only exact identities are ever signalled, and the
+    recovery pass proves each target is genuinely dead before it is treated
+    as reclaimed.
+
+    Args:
+        incarnation: The retired worker's lifecycle token (incarnation).
+
+    Raises:
+        OwnedGroupRecoveryError: If the recovery could not be completed, or
+            if a verified-ours group survived the recovery pass.
+    """
+    if not incarnation:
+        return
+    try:
+        database = load_database_config()
+    except (OSError, ValueError) as exc:
+        msg = f"cannot load database config to recover owned groups for {incarnation}"
+        raise OwnedGroupRecoveryError(msg) from exc
+    try:
+        conn = psycopg.connect(
+            database.conninfo(),
+            connect_timeout=5,
+        )
+        conn.autocommit = True
+    except (psycopg.Error, OSError) as exc:
+        msg = f"cannot connect to recover owned groups for {incarnation}"
+        raise OwnedGroupRecoveryError(msg) from exc
+    try:
+        result = worker_mod.recover_owned_job_groups(
+            conn, incarnation, worker_mod.DEFAULT_CANCEL_GRACE_SECONDS
+        )
+    except psycopg.Error as exc:
+        msg = f"error recovering owned groups for incarnation {incarnation}"
+        raise OwnedGroupRecoveryError(msg) from exc
+    finally:
+        with suppress(Exception):
+            conn.close()
+    if result.surviving:
+        msg = (
+            f"owned command group(s) {result.surviving} still alive after "
+            f"recovery for incarnation {incarnation}; holding without "
+            "clearing authority or spawning a replacement"
+        )
+        raise OwnedGroupRecoveryError(msg)
+    if result.unresolved:
+        msg = (
+            f"owned command group(s) {result.unresolved} could not be "
+            f"identity-verified during recovery for incarnation {incarnation}; "
+            "holding without clearing authority or spawning a replacement"
+        )
+        raise OwnedGroupRecoveryError(msg)
+    if result.reaped:
+        LOGGER.info(
+            "recovered %d owned command group(s) for incarnation %s",
+            len(result.reaped),
+            incarnation,
+        )
 
 
 class SupervisorDaemon:
@@ -311,6 +407,7 @@ class SupervisorDaemon:
         self._next_db_check_at = 0.0
         self._message: str | None = None
         self._ownership_fd: int | None = None
+        self._start_time_ticks: int = 0
 
     def run(self) -> None:
         """Run the supervisor loop until a shutdown signal arrives.
@@ -328,11 +425,12 @@ class SupervisorDaemon:
         self._acquire_ownership()
         try:
             self._write_pidfile()
+            self._invalidate_stale_status()
             self._install_signal_handlers()
             self._write_status("starting")
             while not self._stopping:
                 try:
-                    self._tick(time.monotonic())
+                    self.reconcile(time.monotonic())
                 except Exception:
                     LOGGER.exception("supervisor tick failed; continuing")
                 self._write_status()
@@ -345,12 +443,15 @@ class SupervisorDaemon:
     # Tick / decision
     # ------------------------------------------------------------------
 
-    def _tick(self, now: float) -> None:
-        """Run one supervision decision.
+    def reconcile(self, now: float) -> None:
+        """Run one deterministic supervisor reconciliation cycle.
 
-        Args:
-            now: Monotonic time at the start of the turn.
+        Derives the intended action from durable mission/desired state,
+        handles crash recovery, retires stale children, and ensures the
+        correct worker is running.  Called once per poll interval from
+        :meth:`run`.
         """
+        self._message = None
         desired = read_desired()
         state = read_state()
         action, commit = self._derive_action(state)
@@ -363,7 +464,14 @@ class SupervisorDaemon:
             self._apply_desired(desired)
             return
         if state.child is not None and not self._child_alive(state):
-            if state.intent != INTENT_RUN:
+            child_meta = _child_to_meta(state.child, _runtime_dir(state.commit))
+            if lifecycle.worker_alive(child_meta):
+                LOGGER.info(
+                    "worker pid=%d alive but reparented (not our direct child); "
+                    "proceeding to exact retirement",
+                    state.child.pid,
+                )
+            elif state.intent != INTENT_RUN:
                 self._clear_child(now)
             else:
                 self._handle_crash(state, now)
@@ -607,8 +715,23 @@ class SupervisorDaemon:
         state = read_state()
         if state.child is not None and self._child_alive(state) and state.commit == commit:
             return
-        if state.child is not None:
-            self._retire_child()
+        if state.child is not None and not self._retire_child():
+            now = time.monotonic()
+            write_state(
+                replace(
+                    read_state(),
+                    next_attempt_at=now + self._backoff_seconds(read_state().restart_count),
+                )
+            )
+            self._message = (
+                f"could not stop recorded worker pid {state.child.pid}; "
+                "holding without starting a worker"
+            )
+            LOGGER.error(
+                "could not stop recorded worker pid %d; holding",
+                state.child.pid,
+            )
+            return
         state = read_state()
         meta = lifecycle.read_meta()
         if meta is not None and lifecycle.worker_alive(meta):
@@ -625,12 +748,8 @@ class SupervisorDaemon:
                 )
                 if not lifecycle.stop_worker(meta, self.settings.stop_grace_seconds):
                     now = time.monotonic()
-                    write_state(
-                        replace(
-                            read_state(),
-                            next_attempt_at=now + self._backoff_seconds(read_state().restart_count),
-                        )
-                    )
+                    next_backoff = now + self._backoff_seconds(read_state().restart_count)
+                    write_state(replace(read_state(), next_attempt_at=next_backoff))
                     self._message = (
                         f"could not stop the recorded maintained worker pid {meta.pid}; "
                         "holding without starting a worker"
@@ -640,6 +759,13 @@ class SupervisorDaemon:
                         meta.pid,
                     )
                     return
+                # The adopted worker may have left command groups alive. If it
+                # proved a clean drain the groups are already gone and no
+                # emergency recovery is required; otherwise recovery is a durable
+                # blocking obligation — a DB/config/SQL failure must not let us
+                # spawn a replacement alongside stale groups.
+                if not (meta.token and worker_mod.drain_sentinel_matches(meta.token)):
+                    recover_owned_groups(meta.token or "")
         child = self._spawn_worker(commit)
         now = time.monotonic()
         if child is None:
@@ -683,6 +809,18 @@ class SupervisorDaemon:
         cancelled, awaited terminal, and removed, so a failed probe never
         leaves a row or process behind and never shortens availability.
 
+        The candidate's health snapshot is read by its exact incarnation
+        (not through the stable ``health.json`` symlink, which may still
+        point to the old confirmed worker).  The snapshot's PID and
+        start-time ticks are cross-checked against the recorded child
+        identity so a stale candidate snapshot cannot masquerade as the
+        confirmed worker.
+
+        The stable health/log symlinks are published only after the queue
+        roundtrip succeeds and the identity cross-check passes — so a
+        retiring old worker or a stale candidate can never move the
+        stable read surface.
+
         Args:
             now: Monotonic time.
         """
@@ -690,51 +828,137 @@ class SupervisorDaemon:
         child = state.child
         if child is None or not self._child_alive(state):
             return
-        if state.ready:
-            return
-        if state.next_readiness_at is not None and now < state.next_readiness_at:
+        if state.ready or (state.next_readiness_at is not None and now < state.next_readiness_at):
             return
         probe_cwd = _runtime_dir(state.commit)
-        if lifecycle.verify_worker_consumes_queue(
+        ready, reason = self._check_readiness(child, probe_cwd)
+        if not ready:
+            self._record_not_ready(state, now, child.pid, reason)
+            return
+        try:
+            publish_current_surfaces(child.token)
+        except OSError:
+            self._record_not_ready(state, now, child.pid, "stable symlink publication failed")
+            return
+        write_state(replace(state, ready=True, next_readiness_at=None))
+        LOGGER.info("worker child pid=%d proven to consume the queue", child.pid)
+        lifecycle.append_deploy_log(
+            f"supervisor verified worker pid={child.pid} consumes the queue"
+        )
+        prune_old_incarnation_artifacts(child.token)
+
+    def _check_readiness(
+        self,
+        child: supervise.WorkerChild,
+        probe_cwd: str,
+    ) -> tuple[bool, str]:
+        """Verify queue consumption and health identity cross-check.
+
+        Args:
+            child: The worker child identity.
+            probe_cwd: Working directory for the queue probe.
+
+        Returns:
+            A ``(ready, reason)`` tuple.
+        """
+        if not lifecycle.verify_worker_consumes_queue(
             child.worker_id, probe_cwd, child.pid, self.settings.probe_timeout_seconds
         ):
-            write_state(replace(state, ready=True, next_readiness_at=None))
-            LOGGER.info("worker child pid=%d proven to consume the queue", child.pid)
-            lifecycle.append_deploy_log(
-                f"supervisor verified worker pid={child.pid} consumes the queue"
+            return False, "queue consumption not proven"
+        snapshot = read_worker_health_by_incarnation(child.token)
+        if snapshot is None:
+            return False, f"no health snapshot for incarnation {child.token}"
+        if snapshot.pid != child.pid:
+            return False, f"snapshot PID {snapshot.pid} != child PID {child.pid}"
+        if snapshot.start_time_ticks != child.start_time_ticks:
+            return (
+                False,
+                f"snapshot ticks {snapshot.start_time_ticks} != child {child.start_time_ticks}",
             )
-        else:
-            write_state(
-                replace(
-                    state,
-                    ready=False,
-                    next_readiness_at=now + self.settings.readiness_interval_seconds,
-                )
-            )
-            LOGGER.warning(
-                "worker child pid=%d not yet proven to consume the queue; will retry",
-                child.pid,
-            )
+        if snapshot.worker_incarnation != child.token:
+            inc, tok = snapshot.worker_incarnation, child.token
+            return (False, f"snapshot incarnation {inc!r} != child token {tok!r}")
+        eff = interpret_worker_health(snapshot)
+        return (True, "ok") if eff.live else (False, f"worker health not live: {eff.reason}")
 
-    def _retire_child(self) -> None:
-        """Stop the current worker child by exact identity and forget it.
+    def _record_not_ready(
+        self,
+        state: supervise.SupervisorState,
+        now: float,
+        child_pid: int,
+        reason: str,
+    ) -> None:
+        """Record a not-ready probe result and schedule a retry.
 
-        The child is never restarted after retirement: the caller has decided
-        the transition was intentional.
+        Args:
+            state: Current daemon state.
+            now: Monotonic time.
+            child_pid: PID of the worker child.
+            reason: Why readiness was not confirmed.
+        """
+        write_state(
+            replace(
+                state,
+                ready=False,
+                next_readiness_at=now + self.settings.readiness_interval_seconds,
+            )
+        )
+        LOGGER.warning(
+            "worker child pid=%d not ready: %s; will retry",
+            child_pid,
+            reason,
+        )
+
+    def _retire_child(self) -> bool:
+        """Stop the current worker child by exact identity.
+
+        ``stop_worker`` performs full identity verification (PID, start-time
+        ticks, PGID, SID, lifecycle token) before signalling so a reparented
+        or reused PID is never mis-signalled.
+
+        When the stop cannot be confirmed the durable child identity is
+        preserved so the next daemon tick can retry the same exact orphan
+        rather than losing track of it and spawning a duplicate consumer.
+
+        Returns:
+            ``True`` when the child was successfully retired (or was already
+            dead); ``False`` when the stop could not be confirmed.
         """
         state = read_state()
         child = state.child
         if child is None:
-            return
-        if self._child_alive(state):
-            meta = _child_to_meta(child, _runtime_dir(state.commit))
-            lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
+            return True
+        meta = _child_to_meta(child, _runtime_dir(state.commit))
+        stopped = lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
+        # A live exact worker that stop_worker could not authorize or stop (e.g.
+        # a wrong/absent lifecycle token, or PID reuse) must not be signalled
+        # and must not be reported retired. Hold immediately: do NOT attempt
+        # owned-group recovery (it is keyed by the same token we could not
+        # authorize) and do NOT clear the child identity or hand off
+        # sole-consumer authority. The next daemon tick retries the same exact
+        # orphan rather than spawning a duplicate consumer.
+        if not stopped:
+            LOGGER.error(
+                "could not confirm stop of worker pid %d; preserving child identity for retry",
+                child.pid,
+            )
+            return False
+        # The worker is confirmed dead. A wedged worker that was force-killed can
+        # leave command process groups alive. If the worker proved a clean drain
+        # the groups are already gone and no emergency recovery is required (and
+        # no database round-trip that could fail). Otherwise recovery is a
+        # durable blocking obligation: a DB/config/SQL failure or a surviving/
+        # unresolved group raises, which preserves the retired child and prevents
+        # spawning a replacement alongside stale groups.
+        if not (child.token and worker_mod.drain_sentinel_matches(child.token)):
+            recover_owned_groups(child.token)
         if self.proc is not None:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
             self.proc = None
         write_state(replace(state, child=None))
         LOGGER.info("retired worker child pid=%d", child.pid)
+        return True
 
     def _clear_child(self, _now: float) -> None:
         """Forget a child that exited after an intentional retirement.
@@ -891,20 +1115,17 @@ class SupervisorDaemon:
             or socket.gethostname()
         )
         env["LUBKO_WORKER_ID"] = worker_id
-        log_path = lifecycle.worker_log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with log_path.open("ab") as log:
-                proc = subprocess.Popen(
-                    [str(executable)],
-                    cwd=str(cli.cli_commit_dir(commit)),
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                    close_fds=True,
-                    env=env,
-                )
+            proc = subprocess.Popen(
+                [str(executable)],
+                cwd=str(cli.cli_commit_dir(commit)),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+                env=env,
+            )
         except OSError:
             LOGGER.exception("could not start the worker for commit %s", commit)
             return None
@@ -1022,12 +1243,23 @@ class SupervisorDaemon:
         LOGGER.info("supervisor shutting down")
         if read_state().child is not None:
             self._retire_child()
-        supervise.supervisor_pid_path().unlink(missing_ok=True)
+        remove_durable(supervise.supervisor_pid_path())
         self._write_status("stopped")
         LOGGER.info("supervisor stopped")
 
     @staticmethod
-    def _write_pidfile() -> None:
+    def _invalidate_stale_status() -> None:
+        """Remove any stale status snapshot left by a previous incarnation.
+
+        After the ownership lock and pidfile are established, the old status
+        may still carry ``ready=true`` for a dead supervisor.  Removing the
+        file ensures that ``read_status()`` returns ``None`` until this
+        incarnation publishes its own fresh snapshot.
+        """
+        with suppress(OSError):
+            supervise.status_path().unlink(missing_ok=True)
+
+    def _write_pidfile(self) -> None:
         """Record our exact identity, refusing to double-run a live daemon.
 
         The process-level ownership lock acquired in :meth:`run` already held
@@ -1046,7 +1278,8 @@ class SupervisorDaemon:
             )
             LOGGER.error(msg)
             raise SystemExit(1)
-        write_supervisor_pid(os.getpid(), proc_start_ticks(os.getpid()) or 0)
+        self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
+        write_supervisor_pid(os.getpid(), self._start_time_ticks)
 
     def _write_status(self, message: str | None = None) -> None:
         """Publish the machine-readable status snapshot.
@@ -1071,10 +1304,12 @@ class SupervisorDaemon:
             self._message = "corrupt supervised-deployment state; holding without a worker"
         if rollback is not None:
             mission = rollback.status
+        worker_health = worker_health_payload(read_worker_health())
         write_status(
             SupervisorStatus(
                 schema_version=SCHEMA_VERSION,
                 supervisor_pid=os.getpid(),
+                supervisor_start_time_ticks=self._start_time_ticks,
                 started_at=self._started_at,
                 applied_generation=state.applied_generation,
                 mode=state.mode,
@@ -1088,6 +1323,7 @@ class SupervisorDaemon:
                 db_ready=db_ready,
                 ready=state.ready if state.child is not None else None,
                 message=self._message if message is None else message,
+                worker_health=worker_health,
             )
         )
 

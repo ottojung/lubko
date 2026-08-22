@@ -135,6 +135,7 @@ def pending_state(
         previous_retiring=previous_retiring,
         previous_meta=worker_meta(old, pid=100, repo=repo),
         new_meta=worker_meta(new, pid=200, repo=repo),
+        supervisor_owned=False,
     )
 
 
@@ -728,6 +729,7 @@ def test_status_keeps_live_supervised_pending_mission(
         "read_state",
         lambda: _supervisor_child_state(state.commit, state.generation),
     )
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: True)
     monkeypatch.setattr(dc, "_read_state", lambda: current[0])
     monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
     monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
@@ -815,6 +817,7 @@ def test_status_rolls_back_supervised_mission_after_deadline(
         "read_state",
         lambda: _supervisor_child_state(state.commit, state.generation),
     )
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: True)
     monkeypatch.setattr(dc, "_read_state", lambda: next(states))
     monkeypatch.setattr(dc, "read_meta", lambda: state.previous_meta)
     monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
@@ -1487,6 +1490,7 @@ def test_deploy_locked_persists_retirement_marker_before_stopping_previous(
     monkeypatch.setattr(dc, "stop_worker", record_stop)
     monkeypatch.setattr(dc, "_release_gate", lambda _writer: None)
     monkeypatch.setattr(dc, "_close_gate", lambda _writer: None)
+    monkeypatch.setattr(dc, "_abort_gated_candidate", lambda _gated: None)
     monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _meta: True)
 
     def fake_gated(_options: dc.Options, _commit: str) -> dc.GatedWorker:
@@ -1911,6 +1915,11 @@ def test_prepare_locked_rolls_back_when_watchdog_fork_fails(
 
     monkeypatch.setattr(dc, "_close_gate", record_close)
 
+    def record_abort(gated: dc.GatedWorker) -> None:
+        closed.append(gated.gate_writer)
+
+    monkeypatch.setattr(dc, "_abort_gated_candidate", record_abort)
+
     def record_rollback(state: dc.RollbackState) -> bool:
         rolled_back.append(state)
         return True
@@ -1964,6 +1973,11 @@ def test_abort_mission_closes_gate_and_restores_without_stopping_previous(
         closed.append(fd)
 
     monkeypatch.setattr(dc, "_close_gate", record_close)
+
+    def record_abort(gated: dc.GatedWorker) -> None:
+        closed.append(gated.gate_writer)
+
+    monkeypatch.setattr(dc, "_abort_gated_candidate", record_abort)
 
     def record_checkout(_repo: Path, commit: str, _timeout: float, *, force: bool) -> bool:
         restored.append((commit, force))
@@ -2453,7 +2467,7 @@ def worker_without_persist_command(tmp_path: Path) -> list[str]:
     wrapper = tmp_path / "worker_no_persist.py"
     wrapper.write_text(
         "from lubko import worker\n"
-        "worker._persist_process = lambda _conn, _job_id, _pid, _pgid: None\n"
+        "worker._persist_process = lambda _conn, _job_id, _pid, _pgid, _ticks: None\n"
         "worker.main()\n",
         encoding="utf-8",
     )
@@ -2894,8 +2908,8 @@ def test_end_to_end_cancelled_checkout_leaves_previous_worker_running(
             str(repo),
             deployctl_args(repo, fake_uv, json.dumps({"type": "checkout", "commit": second})),
         )
-        wait_until(_preparing_mission, timeout=60.0)
         with psycopg.connect(jobs_db) as conn:
+            wait_until(_preparing_mission, timeout=60.0)
             conn.execute(
                 "UPDATE lubko.jobs\n"
                 "SET payload = jsonb_set("
@@ -3100,3 +3114,233 @@ def test_end_to_end_full_deployment_stays_hermetic(
     assert state_root().is_relative_to(test_tmp)
     resolved_home = Path(os.environ["XDG_STATE_HOME"]).resolve()
     assert resolved_home.is_relative_to(test_tmp)
+
+
+# ---------------------------------------------------------------------------
+# #61 gated-candidate abort reap regression
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_locked_pg_failure_reaps_gated_candidate(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_prepare_locked with postgres failure reaps the exact gated candidate.
+
+    Exercises the real ``_prepare_locked(supervised=False)`` path through to
+    ``_candidate_identity`` which calls ``_spawn_gated_candidate`` (real
+    ``subprocess.Popen`` with ``start_new_session=True``).  The gated shim
+    blocks on a pipe gate; when ``check_postgres`` fails *after* candidate
+    creation the production branch must close the gate and synchronously reap
+    the exact child.  A leaked or reparented candidate proves the abort path
+    is broken.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    repo, first, second = make_repo(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+
+    token = secrets.token_hex(16)
+    old = spawn_maintained_worker(worker_env_with(token))
+    old_meta = real_meta(old, repo, first, token)
+    write_meta(old_meta)
+
+    captured_gated: list[dc.GatedWorker] = []
+    original_spawn = dc._spawn_gated_candidate
+
+    def tracking_spawn(options: dc.Options, commit: str) -> dc.GatedWorker:
+        gated = original_spawn(options, commit)
+        guard.register(gated.proc)
+        captured_gated.append(gated)
+        return gated
+
+    monkeypatch.setattr(dc, "_spawn_gated_candidate", tracking_spawn)
+    monkeypatch.setattr(dc, "check_postgres", lambda _timeout: False)
+    monkeypatch.setattr(
+        dc,
+        "run_validation",
+        lambda _repo, _uv, _timeout: ValidationReport(ok=True, detail=""),
+    )
+
+    try:
+        with pytest.raises(dc.DeployCtlError, match="PostgreSQL"):
+            dc._prepare_locked(make_options(repo), second, supervised=False)
+
+        assert len(captured_gated) == 1
+        gated = captured_gated[0]
+        pid = gated.proc.pid
+        # Do NOT call poll()/wait() — that would repair the bug inside the
+        # test.  returncode is set only by waitpid which the production
+        # _abort_gated_candidate must have performed.
+        assert gated.proc.returncode is not None, (
+            f"gated candidate {pid} was not reaped by _prepare_locked abort path"
+        )
+        assert not Path(f"/proc/{pid}").exists(), (
+            f"gated candidate {pid} still in /proc after abort"
+        )
+        assert isolation.ambient_sentinel_alive()
+    finally:
+        for g in captured_gated:
+            if g.proc.poll() is None:
+                guard.unregister(g.proc)
+                kill_proc(g.proc)
+        kill_proc(old)
+
+
+def test_abort_gated_candidate_raises_on_post_escalation_wait_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_abort_gated_candidate translates final wait timeout to DeployCtlError.
+
+    When ``stop_worker`` reports success but the child handle still does not
+    reap within the second grace period the helper must raise a descriptive
+    ``DeployCtlError`` rather than letting ``subprocess.TimeoutExpired`` leak.
+    Both pre- and post-escalation waits time out; stop_worker is mocked True.
+    """
+    dummy = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(dummy)
+    original_wait = dummy.wait
+
+    def timed_out_wait(timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired(cmd=dummy.args, timeout=0.0 if timeout is None else timeout)
+
+    try:
+        gated = dc.GatedWorker(
+            proc=dummy,
+            gate_writer=9,
+            meta=worker_meta("a" * 40, pid=dummy.pid, repo="/r"),
+        )
+        monkeypatch.setattr(dc, "_close_gate", lambda _writer: None)
+        monkeypatch.setattr(dc, "stop_worker", lambda _meta, _grace: True)
+        monkeypatch.setattr(dummy, "wait", timed_out_wait)
+
+        with pytest.raises(dc.DeployCtlError, match="reaping timed out"):
+            dc._abort_gated_candidate(gated)
+    finally:
+        monkeypatch.setattr(dummy, "wait", original_wait)
+        if dummy.poll() is None:
+            guard.unregister(dummy)
+            kill_proc(dummy)
+
+
+# ---------------------------------------------------------------------------
+# Unit regressions: supervisor-owned mission invariants (#91)
+# ---------------------------------------------------------------------------
+
+
+def test_stale_child_identity_not_considered_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded supervisor child whose exact identity is dead returns inactive.
+
+    After a hard-killed supervisor the durable state.json may still carry a
+    child record that is no longer live.  ``_supervised_mission_active`` must
+    prove the child's exact PID and start-time ticks are alive before treating
+    the mission as active.
+    """
+    state = pending_state()
+    stale_child = supervise.WorkerChild(
+        pid=4242,
+        pgid=4242,
+        sid=4242,
+        start_time_ticks=42_424_242,
+        token=f"stale-{4242}-token",
+        worker_id="stale-worker",
+        spawned_at=1.0,
+    )
+    supervisor_state = replace(
+        supervise.fresh_state(),
+        mode=supervise.MODE_RUN,
+        commit=state.commit,
+        applied_generation=state.generation,
+        child=stale_child,
+    )
+    monkeypatch.setattr(supervise, "read_state", lambda: supervisor_state)
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: False)
+
+    assert dc._supervised_mission_active(state) is False
+
+
+def test_supervised_mission_never_triggers_legacy_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervisor-owned mission is never legacy-rolled-back while supervisor absent.
+
+    The watchdog must never take the legacy direct worker retire/restore path
+    for a supervisor-owned mission: when the supervisor is temporarily absent,
+    the watchdog fails closed and leaves the durable mission state unchanged so
+    a replacement supervisor can resume the candidate.
+    """
+    state = replace(pending_state(), supervisor_owned=True, deadline=time.time() - 1)
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
+    states = iter((state, rolled_back))
+    calls: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        calls.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    dc._watchdog_main(lock_timeout_seconds=1.0)
+
+    assert calls == [], "supervisor-owned mission must not trigger legacy rollback"
+
+
+def test_supervisor_restart_gap_preserves_supervised_mission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervisor gap preserves a pending supervised mission unchanged.
+
+    When the supervisor is temporarily absent during a pending mission, the
+    watchdog leaves the durable state unchanged.  A replacement supervisor can
+    then resume the candidate without any rollback or state mutation.
+    """
+    state = replace(pending_state(), supervisor_owned=True)
+    dc._write_state(state)
+    calls: list[dc.RollbackState] = []
+    write_calls: list[dc.RollbackState] = []
+    read_count = 0
+
+    def read_once() -> dc.RollbackState | None:
+        nonlocal read_count
+        read_count += 1
+        if read_count > 2:
+            return replace(state, status=dc.STATUS_CONFIRMED)
+        return state
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", read_once)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        calls.append(value)
+        return True
+
+    def record_write(value: dc.RollbackState) -> None:
+        write_calls.append(value)
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+    monkeypatch.setattr(dc, "_write_state", record_write)
+    monkeypatch.setattr(dc, "deploy_lock", lambda _timeout: _NoopDeployLock())
+
+    dc._watchdog_main(lock_timeout_seconds=1.0)
+
+    assert calls == [], "supervisor-owned mission must not trigger rollback during gap"
+    assert write_calls == [], "no state mutation should occur during supervisor gap"

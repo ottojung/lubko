@@ -40,18 +40,22 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 SCHEMA_VERSION: Final = 1
+
+SUPERVISOR_RUNTIME_COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}\n\Z")
 
 STAT_MIN_FIELDS: Final = 20
 STAT_STARTTIME_FIELD_INDEX: Final = 19
@@ -256,10 +260,17 @@ class SupervisorState:
 
 @dataclass(frozen=True, slots=True)
 class SupervisorStatus:
-    """Machine-readable observation of the running supervisor."""
+    """Machine-readable observation of the running supervisor.
+
+    ``supervisor_start_time_ticks`` is the exact start time of the supervisor
+    process in clock ticks, persisted alongside ``supervisor_pid`` so that
+    ``read_status()`` can bind the snapshot to the exact current incarnation
+    and reject stale, dead, replaced, or PID-reused snapshots.
+    """
 
     schema_version: int
     supervisor_pid: int
+    supervisor_start_time_ticks: int
     started_at: float
     applied_generation: int
     mode: str
@@ -273,6 +284,7 @@ class SupervisorStatus:
     db_ready: bool | None
     ready: bool | None
     message: str | None
+    worker_health: dict[str, object] | None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -283,6 +295,7 @@ class SupervisorStatus:
         return {
             "schema_version": self.schema_version,
             "supervisor_pid": self.supervisor_pid,
+            "supervisor_start_time_ticks": self.supervisor_start_time_ticks,
             "started_at": self.started_at,
             "applied_generation": self.applied_generation,
             "mode": self.mode,
@@ -301,6 +314,7 @@ class SupervisorStatus:
             "db_ready": self.db_ready,
             "ready": self.ready,
             "message": self.message,
+            "worker_health": self.worker_health,
         }
 
     @classmethod
@@ -333,6 +347,7 @@ class SupervisorStatus:
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
             supervisor_pid=_optional_int(data.get("supervisor_pid")) or 0,
+            supervisor_start_time_ticks=_optional_int(data.get("supervisor_start_time_ticks")) or 0,
             started_at=_optional_float(data.get("started_at")) or 0.0,
             applied_generation=_optional_int(data.get("applied_generation")) or 0,
             mode=_optional_string(data.get("mode")) or MODE_IDLE,
@@ -346,6 +361,7 @@ class SupervisorStatus:
             db_ready=_optional_bool(data.get("db_ready")),
             ready=_optional_bool(data.get("ready")),
             message=_optional_string(data.get("message")),
+            worker_health=_optional_dict(data.get("worker_health")),
         )
 
 
@@ -397,6 +413,21 @@ def supervisor_pid_path() -> Path:
         The ``supervisor.pid`` path.
     """
     return supervisor_dir() / "supervisor.pid"
+
+
+def supervisor_runtime_override_path() -> Path:
+    """Return the path of the temporary supervisor-runtime override pointer.
+
+    This is a plain text file containing exactly one 40-hex commit followed
+    by a newline.  The stable ``lubko-supervisor`` shell launcher reads it
+    to choose which runtime the *supervisor daemon itself* runs from, while
+    ``cli/current``, ``desired.json``, and the confirmed worker commit
+    remain untouched.
+
+    Returns:
+        The ``supervisor-runtime`` path (no extension, plain text).
+    """
+    return supervisor_dir() / "supervisor-runtime"
 
 
 def supervisor_log_path() -> Path:
@@ -513,12 +544,17 @@ def _read_json(path: Path) -> dict[str, object] | None:
 
 
 def write_desired(desired: SupervisorDesired) -> None:
-    """Atomically persist a desired intent.
+    """Crash-durably persist a desired intent.
 
     Args:
         desired: Intent to store.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    _write_json(desired_path(), desired.to_dict())
+    write_json_durable(desired_path(), desired.to_dict())
 
 
 def read_desired() -> SupervisorDesired | None:
@@ -540,12 +576,21 @@ def read_desired() -> SupervisorDesired | None:
 
 
 def write_state(state: SupervisorState) -> None:
-    """Atomically persist the daemon's durable state.
+    """Crash-durably persist the daemon's durable state.
+
+    This is recovery authority: the applied generation and mode decide which
+    worker the daemon owns after a restart, so the write must be confirmed
+    durable before any dependent lifecycle action proceeds.
 
     Args:
         state: State to store.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    _write_json(state_path(), state.to_dict())
+    write_json_durable(state_path(), state.to_dict())
 
 
 def read_state() -> SupervisorState:
@@ -589,7 +634,12 @@ def fresh_state() -> SupervisorState:
 
 
 def write_status(status: SupervisorStatus) -> None:
-    """Atomically persist the machine-readable status.
+    """Persist the machine-readable status as a lightweight atomic write.
+
+    ``status.json`` is observation-only health/status: it is never used as
+    recovery authority (the live identity binding in ``supervisor.pid`` plus
+    ``state.json`` already decide liveness), so it stays a low-overhead atomic
+    write and is intentionally *not* routed through the crash-durable primitive.
 
     Args:
         status: Status to store.
@@ -600,8 +650,15 @@ def write_status(status: SupervisorStatus) -> None:
 def read_status() -> SupervisorStatus | None:
     """Load the machine-readable status.
 
+    The status is only returned when its persisted identity matches the current
+    supervisor incarnation: the recorded ``supervisor_pid`` and ``started_at``
+    must agree with the daemon identity file (``supervisor.pid``), and that
+    exact process must be a live, non-zombie ``lubko-supervisor``.  This
+    prevents stale, dead, replaced, or PID-reused snapshots from ever
+    appearing ready.
+
     Returns:
-        The parsed status, or ``None`` when absent or malformed.
+        The parsed status, or ``None`` when absent, malformed, or stale.
     """
     data = _read_json(status_path())
     if data is None:
@@ -609,17 +666,60 @@ def read_status() -> SupervisorStatus | None:
     status = SupervisorStatus.from_dict(data)
     if status.schema_version != SCHEMA_VERSION:
         return None
+    if status.supervisor_pid == 0:
+        return None
+    if not _status_identity_matches(status):
+        return None
     return status
 
 
+def _status_identity_matches(status: SupervisorStatus) -> bool:
+    """Return whether the status identity matches the live supervisor process.
+
+    Three-way binding is required: the status snapshot's own ``supervisor_pid``
+    and ``supervisor_start_time_ticks`` must agree with the daemon identity
+    file (``supervisor.pid``), and that exact process must be a live, non-zombie
+    ``lubko-supervisor``.  When the identity file is missing, stale, the process
+    is dead/replaced, or the PID was reused with a different start time, the
+    status snapshot is treated as stale.
+
+    Args:
+        status: Parsed status to validate.
+
+    Returns:
+        ``True`` when the identity is the current live supervisor incarnation.
+    """
+    recorded = read_supervisor_pid()
+    if recorded is None:
+        return False
+    pid, ticks = recorded
+    return (
+        pid == status.supervisor_pid
+        and status.supervisor_start_time_ticks == ticks
+        and ticks != 0
+        and not _process_is_zombie(pid)
+        and proc_start_ticks(pid) == ticks
+        and ("lubko-supervisor" in _read_cmdline(pid) or "lubko.supervisor" in _read_cmdline(pid))
+    )
+
+
 def write_supervisor_pid(pid: int, start_time_ticks: int) -> None:
-    """Persist the daemon's exact identity for detection by the CLIs.
+    """Crash-durably persist the daemon's exact identity for detection by the CLIs.
+
+    The identity file is recovery authority: it is the exact live supervisor
+    incarnation that every status/health reader binds against, so the write
+    must be confirmed durable.
 
     Args:
         pid: The daemon's process ID.
         start_time_ticks: The daemon's start time in clock ticks.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable.
     """
-    _write_json(
+    write_json_durable(
         supervisor_pid_path(),
         {"schema_version": SCHEMA_VERSION, "pid": pid, "start_time_ticks": start_time_ticks},
     )
@@ -863,6 +963,24 @@ def _process_is_zombie(pid: int) -> bool:
     return fields[STAT_STATE_FIELD_INDEX] in {b"Z", b"X"}
 
 
+def child_alive(child: WorkerChild) -> bool:
+    """Return whether the recorded child identity is genuinely alive.
+
+    The exact PID and start time must match a live non-zombie process.  This
+    is a lightweight liveness check used by external observers (e.g. the
+    deployctl watchdog) that cannot verify the parent relationship.
+
+    Args:
+        child: Exact child identity recorded by the supervisor.
+
+    Returns:
+        ``True`` when the process is live and its start time matches.
+    """
+    if _process_is_zombie(child.pid):
+        return False
+    return proc_start_ticks(child.pid) == child.start_time_ticks
+
+
 def _read_cmdline(pid: int) -> str:
     """Read the joined command line of a live process.
 
@@ -974,6 +1092,18 @@ def _optional_bool(value: object | None) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def _optional_dict(value: object | None) -> dict[str, object] | None:
+    """Return a dictionary value or ``None``.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        The dictionary, or ``None``.
+    """
+    return value if isinstance(value, dict) else None
+
+
 def _child_to_dict(child: WorkerChild) -> dict[str, object]:
     """Serialize one worker child identity.
 
@@ -1027,3 +1157,73 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
         worker_id=worker_id,
         spawned_at=_optional_float(data.get("spawned_at")) or 0.0,
     )
+
+
+# ---------------------------------------------------------------------------
+# Supervisor-runtime override (plain-text 40-hex commit pointer)
+# ---------------------------------------------------------------------------
+
+
+def read_supervisor_runtime_override() -> str | None:
+    """Read the supervisor-runtime override commit, if present and valid.
+
+    The override is a plain text file containing exactly one 40-hex commit
+    followed by a newline.  The stable ``lubko-supervisor`` shell launcher
+    reads it to choose which runtime the daemon runs from; ``cli/current``
+    and ``desired.json`` remain untouched.
+
+    Returns:
+        The 40-hex commit, or ``None`` when absent or malformed.
+    """
+    path = supervisor_runtime_override_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not SUPERVISOR_RUNTIME_COMMIT_RE.fullmatch(raw):
+        return None
+    return raw[:40]
+
+
+def write_supervisor_runtime_override(commit: str) -> None:
+    """Crash-durably publish the supervisor-runtime override pointer.
+
+    The file contains exactly one 40-hex commit followed by a newline.  It is
+    recovery authority: the ``lubko-supervisor`` launcher reads it to choose
+    which runtime the daemon starts from, so the write must be confirmed
+    durable before the staged runtime is treated as active.
+
+    Args:
+        commit: Exact 40-hex commit the supervisor launcher should run.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_bytes_durable` when it cannot be confirmed
+        durable.
+    """
+    write_bytes_durable(supervisor_runtime_override_path(), f"{commit}\n".encode())
+
+
+def clear_supervisor_runtime_override() -> bool:
+    """Crash-durably remove the supervisor-runtime override pointer if present.
+
+    Only regular files are removed: symlinks, directories, and other special
+    entries are never silently deleted. The removal is authoritative state
+    cleanup, so it is routed through :func:`lubko.durable.remove_durable` to
+    fsync the parent directory and fail closed when the removal cannot be
+    confirmed.
+
+    Returns:
+        ``True`` when the override was present and removed, ``False``
+        when it was already absent.
+
+    Note:
+        Fails closed: the underlying :func:`lubko.durable.remove_durable`
+        raises :class:`DurabilityError` when the removal cannot be confirmed
+        durable.
+    """
+    path = supervisor_runtime_override_path()
+    if not path.is_file() or path.is_symlink():
+        return False
+    remove_durable(path)
+    return True

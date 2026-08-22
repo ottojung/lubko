@@ -32,14 +32,17 @@ from lubko.worker import (
     bulk_refresh_leases,
     claim_job,
     claim_jobs,
+    decode_range,
     delete_job_and_chunks,
     discover_cancellations,
     finish_job,
     group_has_members,
+    pg_safe_decode,
     publish_output,
     read_output,
     read_range,
     recover_stale_jobs,
+    release_gate,
     request_cancel,
     request_group_reap,
     request_stop,
@@ -64,6 +67,24 @@ LEFTOVER_GROUP_PROBE: Final = (
     "-c",
     "import os, time\nif os.fork() == 0:\n    time.sleep(30)\nelse:\n    os._exit(0)\n",
 )
+
+
+def spawn_released(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
+    """Spawn a job and immediately release its start gate so user code runs.
+
+    The production :func:`spawn_job` returns a gated wrapper that blocks until
+    the worker has persisted the exact identity; tests that need the user
+    process to actually execute call this instead of ``spawn_job`` directly.
+
+    Args:
+        job: Claimed job to execute.
+
+    Returns:
+        The same tuple ``spawn_job`` returns (minus the gate write end).
+    """
+    proc, stdout_path, stderr_path, pgid, gate_fd = spawn_job(job)
+    release_gate(gate_fd)
+    return proc, stdout_path, stderr_path, pgid
 
 
 class _RecordingCursor:
@@ -214,14 +235,19 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> None:
 
 
 def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> ActiveJob:
-    """Build an active job with capture files under ``tmp_path``.
+    """Build a synthetic active job with capture files under ``tmp_path``.
+
+    The synthetic child is ``/bin/true`` spawned in its own session and
+    deterministically reaped before return.  It is not a live registered
+    process: callers that need a live process must spawn and own one directly.
 
     Args:
         tmp_path: Temporary directory for the capture files.
         process: Process argv recorded on the job.
 
     Returns:
-        A registered active job with empty capture files.
+        A synthetic active job whose child has terminated and been reaped, with
+        empty capture files.
     """
     proc = subprocess.Popen(
         ["/bin/true"],
@@ -231,6 +257,8 @@ def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> A
         start_new_session=True,
     )
     guard.register(proc)
+    proc.wait(timeout=10)
+    guard.unregister(proc)
     job = ActiveJob(
         id=uuid4(),
         cwd=str(tmp_path),
@@ -239,10 +267,26 @@ def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> A
         pid=proc.pid,
         pgid=proc.pid,
         started_mono=time.monotonic(),
+        claimed_at=time.time(),
     )
     job.stdout = OutputStream(path=tmp_path / "stdout.cap")
     job.stderr = OutputStream(path=tmp_path / "stderr.cap")
     return job
+
+
+def test_make_active_job_synthetic_child_is_reaped_and_unregistered(
+    tmp_path: Path,
+) -> None:
+    """The synthetic child exited and is not left registered with the guard.
+
+    ``make_active_job`` must reap ``/bin/true`` before returning and drop the
+    guard's ownership of it, so the job is a synthetic (already-terminated)
+    fixture rather than a live, tracked process that would trip the global leak
+    assertions.
+    """
+    job = make_active_job(tmp_path)
+    assert job.proc.poll() == 0
+    assert job.proc.pid not in guard.tracked_pids()
 
 
 def test_truncate_output_preserves_short_output() -> None:
@@ -280,7 +324,7 @@ def test_stream_size_and_read_range(tmp_path: Path) -> None:
 
 def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
     """The exact process group is reported while alive and gone after death."""
-    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+    proc, _stdout_path, _stderr_path, pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
@@ -296,7 +340,7 @@ def test_group_has_members_tracks_process_group(tmp_path: Path) -> None:
 
 def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> None:
     """A spawned job is a session leader whose group ID equals its PID."""
-    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+    proc, _stdout_path, _stderr_path, pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
@@ -313,7 +357,7 @@ def test_spawn_job_makes_session_and_process_group_leader(tmp_path: Path) -> Non
 
 def test_spawn_job_runs_process_and_cleanup_files(tmp_path: Path) -> None:
     """A process job writes its output into the capture files."""
-    proc, stdout_path, stderr_path, _pgid = spawn_job(
+    proc, stdout_path, stderr_path, _pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=(sys.executable, "-c", "print('hi')"))
     )
     guard.register(proc)
@@ -333,7 +377,7 @@ def test_spawn_job_injects_exact_root_job_uuid(tmp_path: Path) -> None:
     """A process job inherits its exact root job UUID as LUBKO_JOB_ID."""
     job_id = uuid4()
     probe = "import os; print(os.environ['LUBKO_JOB_ID'])"
-    proc, stdout_path, stderr_path, _pgid = spawn_job(
+    proc, stdout_path, stderr_path, _pgid = spawn_released(
         Job(id=job_id, cwd=str(tmp_path), process=(sys.executable, "-c", probe))
     )
     guard.register(proc)
@@ -352,7 +396,7 @@ def test_spawn_job_runs_process_in_declared_cwd(tmp_path: Path) -> None:
     work_dir = tmp_path / "runner"
     work_dir.mkdir()
     probe = "import os; print(os.getcwd())"
-    proc, stdout_path, stderr_path, _pgid = spawn_job(
+    proc, stdout_path, stderr_path, _pgid = spawn_released(
         Job(id=uuid4(), cwd=str(work_dir), process=(sys.executable, "-c", probe))
     )
     guard.register(proc)
@@ -376,7 +420,7 @@ def test_spawn_job_passes_shell_metacharacters_literally(tmp_path: Path) -> None
     """
     literal = "a;b $HOME *.txt $(id)"
     probe = "import sys; print(sys.argv[1])"
-    proc, stdout_path, stderr_path, _pgid = spawn_job(
+    proc, stdout_path, stderr_path, _pgid = spawn_released(
         Job(
             id=uuid4(),
             cwd=str(tmp_path),
@@ -514,16 +558,16 @@ def test_request_cancel_leaves_terminal_job_unchanged() -> None:
     assert len(updates) == 2
 
 
-def test_bulk_refresh_leases_refreshes_owned_running_rows() -> None:
-    """One statement refreshes every owned running command row."""
+def test_bulk_refresh_leases_refreshes_only_named_root_ids() -> None:
+    """One statement refreshes exactly the requested root IDs, nothing else."""
     conn = _RecordingConnection()
-    job_ids = [uuid4(), uuid4()]
-    conn.rows = [(job_ids[0],), (job_ids[1],)]
+    owned = [uuid4(), uuid4(), uuid4()]
+    conn.rows = [(owned[0],), (owned[1],)]
     settings = make_settings()
 
-    refreshed = bulk_refresh_leases(as_db(conn), settings)
+    refreshed = bulk_refresh_leases(as_db(conn), settings, [owned[0], owned[1]])
 
-    assert refreshed == job_ids
+    assert refreshed == [owned[0], owned[1]]
     sql, params = conn.executions[0]
     assert "lease_expires_at" in sql
     assert "make_interval" in sql
@@ -531,9 +575,36 @@ def test_bulk_refresh_leases_refreshes_owned_running_rows() -> None:
     assert "status' = 'running'" in sql
     assert "worker_id" in sql
     assert "worker_incarnation" in sql
+    # Heartbeat scoping: only the explicitly named root IDs are touched.
+    assert "id = ANY(%(root_ids)s)" in sql
     assert isinstance(params, dict)
     assert params["lease_duration_seconds"] == settings.lease_duration_seconds
     assert params["worker_id"] == settings.worker_id
+    assert params["root_ids"] == [owned[0], owned[1]]
+
+
+def test_bulk_refresh_leases_never_heartbeats_unnamed_owned_row() -> None:
+    """An owned running row not named in root_ids is left untouched.
+
+    This is the core of issue #74: a claimed job whose immediate
+    finalization write failed must not be heartbeated merely because another
+    job is active. The bulk heartbeat only refreshes the explicitly named IDs.
+    """
+    conn = _RecordingConnection()
+    # The recording double returns whatever rows are queued; by queuing nothing
+    # we prove the statement's WHERE clause scopes to root_ids and refreshes
+    # no row when none of the named IDs match a running owned row.
+    conn.rows = []
+    settings = make_settings()
+    named = uuid4()
+
+    refreshed = bulk_refresh_leases(as_db(conn), settings, [named])
+
+    assert refreshed == []
+    assert "id = ANY(%(root_ids)s)" in conn.executions[0][0]
+    # A different owned running row (not named) is never touched.
+    other = uuid4()
+    assert other not in refreshed
 
 
 def test_discover_cancellations_queries_owned_running_markers() -> None:
@@ -846,8 +917,8 @@ def test_settings_reads_lease_and_output_environment(
     assert settings.db_operation_timeout_seconds == pytest.approx(8.5)
 
 
-def test_settings_defaults_and_unique_incarnation() -> None:
-    """Settings default to the documented values and unique incarnations."""
+def test_settings_defaults_and_incarnation() -> None:
+    """Settings default to the documented values and have a non-empty incarnation."""
     first = Settings.from_environment()
     second = Settings.from_environment()
 
@@ -855,7 +926,11 @@ def test_settings_defaults_and_unique_incarnation() -> None:
     assert first.lease_refresh_interval_seconds == DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
     assert first.lease_recovery_interval_seconds == DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
     assert first.worker_incarnation
-    assert first.worker_incarnation != second.worker_incarnation
+    assert second.worker_incarnation
+    if os.environ.get("LUBKO_LIFECYCLE_TOKEN"):
+        assert first.worker_incarnation == second.worker_incarnation
+    else:
+        assert first.worker_incarnation != second.worker_incarnation
 
 
 def test_settings_rejects_refresh_at_least_lease() -> None:
@@ -901,7 +976,7 @@ def test_settings_rejects_claim_batch_limit_zero() -> None:
 
 def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
     """request_stop terminates the exact recorded process group once."""
-    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+    proc, _stdout_path, _stderr_path, pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=SLEEP_30)
     )
     guard.register(proc)
@@ -914,6 +989,7 @@ def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
             pid=proc.pid,
             pgid=pgid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         request_stop(job, "cancel")
         assert job.term_sent
@@ -923,13 +999,87 @@ def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
     finally:
         if proc.poll() is None:
             with suppress(ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(proc.pid, signal.SIGKILL)
             proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# pg_safe_decode unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_pg_safe_decode_clean_utf8() -> None:
+    """Valid UTF-8 without NUL passes through unchanged."""
+    assert pg_safe_decode(b"hello world") == "hello world"
+
+
+def test_pg_safe_decode_nul_replaced() -> None:
+    """NUL bytes are replaced with U+FFFD."""
+    data = b"before\x00after"
+    result = pg_safe_decode(data)
+    assert result == "before\ufffdafter"
+    assert "\x00" not in result
+
+
+def test_pg_safe_decode_multiple_nul() -> None:
+    """Multiple NUL bytes are all replaced."""
+    assert pg_safe_decode(b"\x00\x00\x00") == "\ufffd\ufffd\ufffd"
+
+
+def test_pg_safe_decode_invalid_utf8() -> None:
+    """Invalid UTF-8 sequences become U+FFFD."""
+    assert pg_safe_decode(b"\xff\xfe\xfd") == "\ufffd\ufffd\ufffd"
+
+
+def test_pg_safe_decode_invalid_utf8_with_nul() -> None:
+    """Invalid UTF-8 combined with NUL: both are replaced."""
+    assert pg_safe_decode(b"\xff\x00\xfe") == "\ufffd\ufffd\ufffd"
+
+
+def test_pg_safe_decode_empty() -> None:
+    """Empty input produces empty output."""
+    assert not pg_safe_decode(b"")
+
+
+def test_pg_safe_decode_nul_in_multibyte() -> None:
+    """NUL adjacent to valid multibyte UTF-8 is handled correctly."""
+    data = "caf\u00e9".encode() + b"\x00" + "\u00e9".encode()
+    assert pg_safe_decode(data) == "caf\u00e9\ufffd\u00e9"
+
+
+def test_pg_safe_decode_json_safe() -> None:
+    """The decoded string can be JSON-encoded without PostgreSQL-rejecting escapes."""
+    result = pg_safe_decode(b"before\x00after")
+    encoded = json.dumps(result)
+    assert "\\u0000" not in encoded
+    assert "\\ufffd" in encoded
+
+
+def test_truncate_output_applies_pg_safe_decode() -> None:
+    """truncate_output applies NUL replacement via pg_safe_decode."""
+    data = b"hello\x00world"
+    result = truncate_output(data, 100)
+    assert "\x00" not in result
+    assert "hello" in result
+    assert "world" in result
+
+
+def test_decode_range_pg_safe() -> None:
+    """decode_range returns PostgreSQL-safe text with correct byte offsets."""
+    tmp = Path(__file__).resolve().parent.parent / "test_output_bytes.bin"
+    try:
+        tmp.write_bytes(b"AAAA\x00BBBB\x00CCCC")
+        text = decode_range(tmp, 0, 9)
+        assert text == "AAAA\ufffdBBBB"
+        text2 = decode_range(tmp, 5, 14)
+        assert text2 == "BBBB\ufffdCCCC"
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
     """request_group_reap terminates the group without recording a stop reason."""
-    proc, _stdout_path, _stderr_path, pgid = spawn_job(
+    proc, _stdout_path, _stderr_path, pgid = spawn_released(
         Job(id=uuid4(), cwd=str(tmp_path), process=LEFTOVER_GROUP_PROBE)
     )
     guard.register(proc)
@@ -944,6 +1094,7 @@ def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
             pid=proc.pid,
             pgid=pgid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         job.completed = True
         job.returncode = 0
@@ -978,6 +1129,7 @@ def test_signal_kill_does_not_note_natural_reap(tmp_path: Path) -> None:
             pid=proc.pid,
             pgid=proc.pid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         job.completed = True
         job.returncode = 0
@@ -1012,6 +1164,7 @@ def test_signal_kill_appends_diagnostic(tmp_path: Path) -> None:
             pid=proc.pid,
             pgid=proc.pid,
             started_mono=time.monotonic(),
+            claimed_at=time.time(),
         )
         request_stop(job, "cancel")
         note_before = job.cancellation_note

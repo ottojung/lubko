@@ -28,6 +28,7 @@ import os
 import secrets
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -41,9 +42,16 @@ from psycopg.rows import tuple_row
 
 from lubko import cli, supervise, toolchain
 from lubko.config import load_database_config
+from lubko.durable import remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
-from lubko.worker import JOB_ID_ENV, delete_job_and_chunks, group_has_members, request_cancel
+from lubko.worker import (
+    DEFAULT_CANCEL_GRACE_SECONDS,
+    JOB_ID_ENV,
+    delete_job_and_chunks,
+    drain_sentinel_matches,
+    request_cancel,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -64,6 +72,11 @@ STATE_PENDING: Final = "pending"
 LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
 
 DEFAULT_STOP_GRACE_SECONDS: Final = 5.0
+#: Bounded finalization overhead the outer stop must grant the worker before it
+#: may treat a still-alive worker as wedged and issue an emergency SIGKILL. The
+#: outer wait is ``max(grace, cancel_grace + this)`` so the two equal/default
+#: timers can never race worker cleanup.
+STOP_DRAIN_OVERHEAD_SLACK_SECONDS: Final = 2.0
 DEFAULT_POSTGRES_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_LOCK_TIMEOUT_SECONDS: Final = 30.0
 DEFAULT_VALIDATION_TIMEOUT_SECONDS: Final = 1200.0
@@ -231,12 +244,22 @@ def meta_path() -> Path:
     return worker_state_dir() / "meta.json"
 
 
-def worker_log_path() -> Path:
-    """Return the stable path of the maintained worker's log.
+def worker_log_path(incarnation: str | None = None) -> Path:
+    """Return the log path for a worker incarnation.
+
+    When ``incarnation`` is provided, returns the per-incarnation file path
+    so metadata advertises a truthful single-writer log location.  When
+    ``incarnation`` is ``None``, returns the stable ``worker.log`` path
+    (a supervisor-owned symlink target or a legacy direct-logging path).
+
+    Args:
+        incarnation: Worker incarnation identifier, or ``None``.
 
     Returns:
         The worker log path.
     """
+    if incarnation is not None:
+        return worker_state_dir() / "logs" / f"worker-{incarnation}.log"
     return worker_state_dir() / "worker.log"
 
 
@@ -338,6 +361,12 @@ def process_identity(pid: int) -> ProcessIdentity | None:
 def process_has_token(pid: int, token: str) -> bool:
     """Return whether a process environment carries the lifecycle token.
 
+    ``/proc/<pid>/environ`` is NUL-separated; a naive substring check on the
+    raw bytes could falsely accept a *different* environment variable whose
+    value or key happens to contain ``LUBKO_LIFECYCLE_TOKEN=<token>`` as a
+    prefix or infix (e.g. ``X_LUBKO_LIFECYCLE_TOKEN=<token>``).  Instead we
+    split on NUL and require exact ``KEY=VALUE`` equality on one entry.
+
     Args:
         pid: Process ID to inspect.
         token: Expected lifecycle token.
@@ -345,12 +374,12 @@ def process_has_token(pid: int, token: str) -> bool:
     Returns:
         ``True`` when the token marker is present in the process environment.
     """
-    marker = f"{LIFECYCLE_MARKER_VAR}={token}".encode()
+    expected = f"{LIFECYCLE_MARKER_VAR}={token}".encode()
     try:
         environ = (Path("/proc") / str(pid) / "environ").read_bytes()
     except OSError:
         return False
-    return marker in environ
+    return any(entry == expected for entry in environ.split(b"\0"))
 
 
 def identity_matches(meta: WorkerMeta, identity: ProcessIdentity) -> bool:
@@ -461,16 +490,21 @@ def _optional_str(value: object | None) -> str | None:
 
 
 def write_meta(meta: WorkerMeta) -> None:
-    """Atomically persist worker lifecycle metadata.
+    """Crash-durably persist worker lifecycle metadata.
+
+    ``meta.json`` is recovery authority for the maintained worker: it records
+    the live worker identity the supervisor reconciles against, so the write
+    must be confirmed durable before any dependent lifecycle action proceeds.
 
     Args:
         meta: Worker metadata to persist.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    directory = worker_state_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    tmp_path = directory / "meta.json.tmp"
-    tmp_path.write_text(json.dumps(meta.to_dict(), indent=2, sort_keys=True) + "\n")
-    tmp_path.replace(meta_path())
+    write_json_durable(meta_path(), meta.to_dict())
 
 
 def read_meta() -> WorkerMeta | None:
@@ -741,28 +775,31 @@ def spawn_worker(
     """Start the worker detached from the invoking shell.
 
     The worker becomes its own session and process group leader, with stdin
-    disconnected and both output streams appended to the stable worker log.
+    disconnected and both output streams directed to ``/dev/null``.  The
+    worker owns its own ``RotatingFileHandler`` for ``worker.log`` so there
+    is exactly one writer; the parent never opens the worker log file.
 
     Args:
         repo: Repository checkout to run the worker from.
         uv_path: Path to the ``uv`` executable.
-        log_path: Stable path of the worker log.
+        log_path: Stable path of the worker log (unused, kept for interface
+            compatibility; the worker owns its own log).
         env: Environment for the worker, including the lifecycle token.
 
     Returns:
         The started worker process.
     """
-    with log_path.open("ab") as log:
-        return subprocess.Popen(
-            _worker_command(uv_path),
-            cwd=repo,
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            env=env,
-        )
+    del log_path
+    return subprocess.Popen(
+        _worker_command(uv_path),
+        cwd=repo,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
 
 
 def _credential_environment_variable(name: str) -> bool:
@@ -836,40 +873,145 @@ def _signal_group(pgid: int, sig: int) -> None:
         os.killpg(pgid, sig)
 
 
-def stop_worker(meta: WorkerMeta, grace_seconds: float) -> bool:
-    """Terminate the recorded worker using its exact process group identity.
+def _worker_process_alive(meta: WorkerMeta) -> bool:
+    """Return whether the exact recorded worker process instance is still alive.
 
-    Sends ``SIGTERM`` to the exact recorded process group, waits up to
-    ``grace_seconds``, then sends ``SIGKILL`` while members remain. Identity is
-    revalidated at every step so a recycled process can never be signalled.
+    Unlike :func:`worker_alive`, this does not require the lifecycle token in
+    the process environment. Liveness is decided purely by exact process
+    identity (PID, process group, session, and start-time ticks), which is
+    sufficient and PID-reuse-safe: a recycled PID would carry different
+    start-time ticks and is therefore not treated as alive.
+
+    This is the predicate the retirement state machine must use to decide
+    whether a planned stop has actually completed. Requiring the token here
+    would let a live worker whose environment lacks the marker be mis-reported
+    as already stopped, which would let retirement claim success and hand off
+    sole-consumer authority while the worker — and every command process group
+    it owns — were still alive.
 
     Args:
         meta: Recorded worker metadata.
-        grace_seconds: Grace period before force-killing.
 
     Returns:
-        ``True`` when the worker is no longer alive afterwards.
+        ``True`` when a live process matches every recorded identity field.
     """
-    if not worker_alive(meta):
-        return True
+    if meta.pid is None:
+        return False
+    identity = process_identity(meta.pid)
+    if identity is None:
+        return False
+    return identity_matches(meta, identity)
+
+
+def stop_worker(
+    meta: WorkerMeta,
+    grace_seconds: float,
+    *,
+    cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
+) -> bool:
+    """Terminate the recorded worker without leaking owned command groups.
+
+    The worker deliberately starts every command as its own session/process
+    group, so killing the worker process never kills its active command groups.
+    A planned transition must therefore let the worker drain its own groups
+    first. This function asks the worker to drain (``SIGTERM`` to its exact
+    process group) and then observes the worker's explicit safe-to-reap
+    boundary — either the worker process exits, or it writes a drain sentinel
+    proving every owned group is dead — before considering retirement complete.
+
+    Retirement is reported successful only once the exact worker process
+    instance is genuinely gone. The wait floor is ``max(grace_seconds,
+    cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS)`` so the
+    equal/default outer and inner timers can never race: the worker always gets
+    its full cancel grace plus bounded finalization overhead before an emergency
+    SIGKILL is even possible.
+
+    Only if the worker ignores ``SIGTERM`` (wedged) is an emergency SIGKILL sent
+    to the worker group. Owned command groups that survive a wedged worker must
+    be recovered by exact process-group identity elsewhere (see
+    :func:`recover_owned_job_groups`); this function never broad-kills and never
+    reports success while the worker process is still alive.
+
+    Args:
+        meta: Recorded worker metadata.
+        grace_seconds: Intended grace period before the emergency force-kill.
+        cancel_grace_seconds: The worker's own command cancel grace, used to
+            bound how long the worker is given to drain before it can be
+            considered wedged.
+
+    Returns:
+        ``True`` when the exact worker process is no longer alive afterwards
+        (or was already gone / reused). ``False`` when the exact process
+        instance is alive but cannot be authorized for a signal because it does
+        not carry our lifecycle token (including when none was recorded), so
+        retirement is not claimed.
+    """
     if meta.pid is None:
         return True
     identity = process_identity(meta.pid)
-    if identity is None:
+    if identity is None or not identity_matches(meta, identity):
+        # The exact worker process is gone or its identity changed (a recycled
+        # PID can never be mis-signalled). Nothing to stop; retirement succeeds.
         return True
+    if meta.token is None or not process_has_token(meta.pid, meta.token):
+        # The exact process instance is alive but does NOT carry our lifecycle
+        # token: it is a live, unowned process (a wrong token, or none at all —
+        # never ours). Signal authorization requires the exact lifecycle token,
+        # so an absent token is treated identically to a mismatched one: we must
+        # not signal a process we do not own, and we must not report retirement
+        # as successful, so the caller holds rather than handing off
+        # sole-consumer authority. This is distinct from the dead/reused case
+        # above, where no live process matches the recorded identity and
+        # retirement genuinely succeeds.
+        return False
+    start = time.monotonic()
+    kill_floor = start + cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS
+    wait_deadline = start + max(
+        grace_seconds,
+        cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS,
+    )
+    # 1. Ask the worker to drain its owned command process groups.
     _signal_group(identity.pgid, signal.SIGTERM)
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not worker_alive(meta):
-            return True
-        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+    # 2. Wait for the worker's explicit safe-to-reap boundary.
+    if _wait_for_drain(meta, wait_deadline):
+        return True
+    # 3. Emergency: the worker ignored SIGTERM and never drained. Never fire the
+    #    SIGKILL before the worker's own cancel grace plus finalization slack.
+    if time.monotonic() < kill_floor:
+        time.sleep(kill_floor - time.monotonic())
     _signal_group(identity.pgid, signal.SIGKILL)
     deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        if not group_has_members(identity.pgid):
-            return True
+    while time.monotonic() < deadline and _worker_process_alive(meta):
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
-    return not group_has_members(identity.pgid)
+    return not _worker_process_alive(meta)
+
+
+def _wait_for_drain(meta: WorkerMeta, wait_deadline: float) -> bool:
+    """Wait until the worker exits or proves its owned groups are drained.
+
+    Returns ``True`` once the exact worker process instance is gone or its
+    drain sentinel is present (and the worker has then also exited). ``False``
+    means the worker neither drained nor exited before the deadline (it is
+    wedged). Liveness is decided by exact process identity
+    (:func:`_worker_process_alive`), never by the token environment, so a live
+    worker is never mistakenly reported as already stopped.
+
+    Args:
+        meta: Recorded worker metadata.
+        wait_deadline: Monotonic deadline for the wait.
+
+    Returns:
+        ``True`` when the worker reached a safe-to-reap boundary.
+    """
+    while time.monotonic() < wait_deadline:
+        if not _worker_process_alive(meta):
+            return True
+        if meta.token is not None and drain_sentinel_matches(meta.token):
+            while time.monotonic() < wait_deadline and _worker_process_alive(meta):
+                time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+            return not _worker_process_alive(meta)
+        time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1375,6 +1517,29 @@ def _prepare_maintained_cli(options: DeployOptions, commit: str) -> bool:
     return True
 
 
+def _clear_stale_supervisor_override(confirmed_commit: str) -> None:
+    """Clear the supervisor-runtime override after a successful CLI activation.
+
+    The override is a temporary bootstrap pin: it directs the stable
+    ``lubko-supervisor`` launcher to a specific sealed runtime on the next
+    container restart.  Once any CLI activation succeeds, the override has
+    served its purpose and must be removed unconditionally — regardless of
+    whether the override target matches the newly confirmed commit — so a
+    stale override (e.g. staged for B, later activation moves to C) can
+    never pin an obsolete supervisor runtime on the next restart.
+
+    Args:
+        confirmed_commit: The newly confirmed commit that ``cli/current``
+            now selects (used only for the deploy log entry).
+    """
+    override = supervise.read_supervisor_runtime_override()
+    if override is not None:
+        supervise.clear_supervisor_runtime_override()
+        append_deploy_log(
+            f"cleared supervisor-runtime override: commit {confirmed_commit} is now confirmed"
+        )
+
+
 def _activate_maintained_cli(commit: str) -> bool:
     """Activate the confirmed CLI commit, preserving the prior coherent CLI.
 
@@ -1386,6 +1551,12 @@ def _activate_maintained_cli(commit: str) -> bool:
     never garbage-collected, so the global CLIs remain usable even though they
     are temporarily behind the worker; the next status/checkout still repairs
     the pointer idempotently.
+
+    When a supervisor-runtime override was staged by ``lubko-deploy bootstrap``
+    and CLI activation succeeds, the override is unconditionally cleared so
+    future upgrades never pin an obsolete supervisor runtime — even when the
+    override target differs from the newly confirmed commit (e.g. bootstrap
+    staged B, later activation confirmed C).
 
     Args:
         commit: Exact commit to activate.
@@ -1402,6 +1573,7 @@ def _activate_maintained_cli(commit: str) -> bool:
             if attempt < CLI_ACTIVATION_ATTEMPTS - 1:
                 time.sleep(CLI_ACTIVATION_RETRY_SECONDS)
             continue
+        _clear_stale_supervisor_override(commit)
         cli.gc_cli_roots((commit,))
         return True
     _err(f"error: maintained CLI activation failed: {last_error}")
@@ -1467,7 +1639,6 @@ def _deploy_direct(
     previous: WorkerMeta | None,
     state: str,
     commit: str,
-    log_file: Path,
 ) -> WorkerMeta:
     """Start the replacement worker directly, bypassing the external supervisor.
 
@@ -1481,7 +1652,6 @@ def _deploy_direct(
         previous: Previously recorded worker metadata, or ``None``.
         state: Effective state of the previous worker.
         commit: Exact commit to deploy.
-        log_file: Stable worker log path.
 
     Returns:
         The maintained metadata of the started worker.
@@ -1496,7 +1666,7 @@ def _deploy_direct(
 
     _out("starting replacement worker ...")
     try:
-        proc = spawn_worker(options.repo, options.uv_path, log_file, env)
+        proc = spawn_worker(options.repo, options.uv_path, worker_log_path(token), env)
     except OSError as exc:
         _err(f"could not start the replacement worker: {exc}")
         raise DeployAbortedError from None
@@ -1517,7 +1687,7 @@ def _deploy_direct(
         repo=str(options.repo),
         git_commit=commit,
         worker_id=worker_id,
-        log_path=str(log_file),
+        log_path=str(worker_log_path(token)),
         started_at=time.time(),
         stopped_at=None,
     )
@@ -1594,12 +1764,13 @@ def _complete_deploy_handoff(
     Raises:
         DeployAbortedError: If the worker handoff cannot complete.
     """
-    log_file = worker_log_path()
     if supervise.supervisor_running():
         new_meta = _deploy_through_supervisor(options, commit)
+        log_file = worker_log_path(new_meta.token)
         _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     elif options.bootstrap or options.direct_spawn:
-        new_meta = _deploy_direct(options, previous, state, commit, log_file)
+        new_meta = _deploy_direct(options, previous, state, commit)
+        log_file = worker_log_path(new_meta.token)
         supervise.request_run(
             commit,
             repo=str(options.repo),
@@ -1724,16 +1895,16 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
-        path.unlink(missing_ok=True)
+        remove_durable(path)
         return
     if not isinstance(data, dict):
-        path.unlink(missing_ok=True)
+        remove_durable(path)
         return
     try:
         new_meta = WorkerMeta.from_dict(data.get("new_meta") or {})
         previous_meta = WorkerMeta.from_dict(data.get("previous_meta") or {})
     except (KeyError, TypeError, ValueError):
-        path.unlink(missing_ok=True)
+        remove_durable(path)
         return
     if (
         data.get("status") == STATE_PENDING
@@ -1754,7 +1925,7 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
             "repair refuses to adopt a different process"
         )
         raise _AdoptionError(msg)
-    path.unlink(missing_ok=True)
+    remove_durable(path)
 
 
 def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
@@ -1770,7 +1941,7 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     probe_payload = json.dumps({
         "v": 3,
         "type": "command",
-        "request": {"cwd": cwd, "process": [sys.executable, "-c", "import time; time.sleep(60)"]},
+        "request": {"cwd": cwd, "process": ["/usr/bin/sleep", "60"]},
         "state": {"status": "pending"},
     })
     with conn.cursor() as cursor:
@@ -2116,7 +2287,7 @@ def _adoption_candidate(
         repo=str(options.repo),
         git_commit=commit,
         worker_id=worker_id,
-        log_path=str(worker_log_path()),
+        log_path=str(worker_log_path(process_env.get(LIFECYCLE_MARKER_VAR))),
         started_at=time.time(),
         stopped_at=None,
     ), worker_id
@@ -2329,7 +2500,7 @@ def _recover_locked(options: DeployOptions) -> int:
     env = worker_env(token)
     worker_id = env.get("LUBKO_WORKER_ID") or socket.gethostname()
     try:
-        proc = spawn_worker(options.repo, options.uv_path, worker_log_path(), env)
+        proc = spawn_worker(options.repo, options.uv_path, worker_log_path(token), env)
     except OSError as exc:
         _err(f"could not start the recovery worker: {exc}")
         return EXIT_ERROR
@@ -2862,7 +3033,7 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
             )
         )
     if mission is None:
-        rollback_state_path().unlink(missing_ok=True)
+        remove_durable(rollback_state_path())
         append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
     elif mission.status == deployctl.STATUS_PENDING and mission.generation < generation:
         deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)
@@ -2875,8 +3046,190 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+
+
+def bootstrap_cmd(args: argparse.Namespace) -> int:
+    """Materialize a target runtime and stage a supervisor-runtime override.
+
+    This is the narrow bootstrap path for the pre-fix live state where an
+    old supervisor (running buggy probe code) cannot confirm readiness for
+    a new commit.  The command:
+
+    1. builds and seals the target commit's immutable CLI runtime;
+    2. publishes a plain-text supervisor-runtime override so the *stable*
+       ``lubko-supervisor`` launcher will execute the new code on the next
+       container/environment restart;
+    3. updates the ``lubko-supervisor`` launcher script to carry the
+       override-checking logic;
+    4. preserves the currently confirmed worker runtime (``cli/current``)
+       and all other runtimes for rollback.
+
+    The command does **not** modify ``cli/current``, ``desired.json``,
+    ``worker/meta.json``, or any other confirmed-worker state.  It does
+    **not** kill the running supervisor.  After a successful run the
+    operator restarts the container/environment; the launcher starts the
+    new supervisor code which reads the existing confirmed desired intent
+    and restores exactly one worker for the confirmed commit.  A normal
+    ``lubko-deploy deploy <target>`` can then confirm the target and
+    advance ``cli/current``.
+
+    Safe if interrupted: every step is idempotent.  If interrupted before
+    the override is published the old state is unchanged; if interrupted
+    after the override is published the next restart uses the new
+    supervisor code while the confirmed worker commit is untouched.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        A process exit code.
+    """
+    commit = args.commit
+    if not cli.is_valid_commit_name(commit):
+        _err(f"commit must be exactly 40 hexadecimal characters, got: {commit!r}")
+        return EXIT_ERROR
+    if not supervise.supervisor_running():
+        _err(
+            "the external supervisor is not running; "
+            "use 'lubko-deploy migrate' for cold pre-supervisor state"
+        )
+        return EXIT_ERROR
+    try:
+        uv_path = resolve_uv(args.uv)
+    except UvResolutionError as exc:
+        _err(str(exc))
+        return EXIT_ERROR
+    try:
+        with deploy_lock(args.lock_timeout):
+            return _bootstrap_locked(commit, args.repo, uv_path, args.cli_timeout)
+    except LockTimeoutError:
+        _err("another deployment is already running; refusing to race")
+        return EXIT_ERROR
+
+
+def _bootstrap_locked(
+    commit: str,
+    repo: Path,
+    uv_path: str,
+    cli_timeout: float,
+) -> int:
+    """Run the bootstrap preparation under the deployment lock.
+
+    Every step is idempotent: re-running after a partial failure or
+    interruption completes the remaining steps without disturbing the
+    confirmed worker commit, desired intent, or ``cli/current``.
+
+    Args:
+        commit: Exact 40-hex target commit.
+        repo: Repository checkout containing the commit.
+        uv_path: Resolved ``uv`` executable.
+        cli_timeout: Timeout for building the CLI environment.
+
+    Returns:
+        A process exit code.
+    """
+    confirmed = cli.current_commit()
+    if confirmed == commit:
+        _out(f"commit {commit} is already the confirmed CLI commit; nothing to bootstrap")
+        return EXIT_OK
+
+    _out(f"bootstrap: materializing sealed runtime for {commit} ...")
+    try:
+        cli.build_cli_root(repo, commit, uv_path, cli_timeout)
+    except cli.CliError as exc:
+        _err(f"could not build the CLI environment for {commit}: {exc}")
+        return EXIT_ERROR
+
+    if not cli.runtime_is_usable(commit):
+        _err(f"runtime for {commit} is not usable after build; refusing to stage override")
+        return EXIT_ERROR
+
+    _out("bootstrap: installing lubko-supervisor launcher ...")
+    bin_home = _resolve_bin_home()
+    try:
+        install_supervisor_launcher(bin_home)
+    except OSError as exc:
+        _err(f"could not install the lubko-supervisor launcher: {exc}")
+        _err("refusing to continue without a verified launcher")
+        return EXIT_ERROR
+
+    _out(f"bootstrap: publishing supervisor-runtime override for {commit} ...")
+    supervise.write_supervisor_runtime_override(commit)
+
+    append_deploy_log(
+        f"bootstrap: staged supervisor-runtime override for {commit}"
+        + (f" (confirmed commit remains {confirmed})" if confirmed else "")
+    )
+    _out(f"bootstrap complete: supervisor-runtime override staged for {commit}")
+    if confirmed is not None:
+        _out(f"confirmed commit remains {confirmed}")
+    _out("")
+    _out("next steps:")
+    _out("  1. restart the container/environment to load the new supervisor code")
+    _out("  2. the new supervisor will restore the confirmed worker from desired state")
+    _out("  3. run 'lubko-deploy deploy <target>' to confirm the target and advance cli/current")
+    return EXIT_OK
+
+
+def _resolve_bin_home() -> Path:
+    """Return the user bin directory."""
+    explicit = os.environ.get("XDG_BIN_HOME")
+    if explicit:
+        return Path(explicit)
+    return Path.home() / ".local" / "bin"
+
+
+def install_supervisor_launcher(bin_home: Path) -> None:
+    """Install the lubko-supervisor launcher with override-checking logic.
+
+    Only the supervisor launcher is written; all other launchers resolve
+    through ``cli/current`` as before.  The installation is verified after
+    writing: exact byte content must match the expected source and the
+    executable mode bit must be set, so a partial write, truncated file,
+    or permission error is detected before the override pointer is
+    published.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Raises:
+        OSError: If the directory is missing, the write fails, or
+            verification fails.
+    """
+    if not bin_home.is_dir():
+        msg = f"bin directory {bin_home} does not exist"
+        raise OSError(msg)
+    target = bin_home / "lubko-supervisor"
+    temporary = bin_home / "lubko-supervisor.tmp"
+    expected_bytes = cli.launcher_source("lubko-supervisor").encode("utf-8")
+    temporary.write_bytes(expected_bytes)
+    temporary.chmod(0o755)
+    temporary.replace(target)
+    actual_bytes = target.read_bytes()
+    if actual_bytes != expected_bytes:
+        msg = f"launcher content mismatch after installation: {target}"
+        raise OSError(msg)
+    try:
+        mode = target.stat().st_mode
+    except OSError as exc:
+        msg = f"launcher {target} is not accessible after installation: {exc}"
+        raise OSError(msg) from exc
+    if not stat.S_ISREG(mode):
+        msg = f"launcher {target} is not a regular file after installation"
+        raise OSError(msg)
+    if not (mode & stat.S_IXUSR):
+        msg = f"launcher {target} is not executable after installation"
+        raise OSError(msg)
+
+
 def log_cmd(lines: int) -> int:
     """Show the tail of the maintained worker log.
+
+    Resolves through the stable ``worker.log`` symlink (supervisor path) or
+    reads the per-incarnation file from metadata (legacy path).
 
     Args:
         lines: Number of trailing lines to show.
@@ -2884,10 +3237,16 @@ def log_cmd(lines: int) -> int:
     Returns:
         A process exit code.
     """
-    path = worker_log_path()
-    if not path.is_file():
-        _out("no worker log yet")
-        return EXIT_OK
+    stable = worker_log_path()
+    if stable.is_symlink() or stable.is_file():
+        path = stable
+    else:
+        meta = read_meta()
+        if meta is not None and meta.log_path:
+            path = Path(meta.log_path)
+        else:
+            _out("no worker log yet")
+            return EXIT_OK
     try:
         text = path.read_text()
     except OSError as exc:
@@ -3089,6 +3448,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="deploy lock wait timeout in seconds (default: 30)",
     )
 
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap",
+        help=(
+            "materialize a target runtime and stage a supervisor-runtime override "
+            "for the next container restart"
+        ),
+    )
+    bootstrap_parser.add_argument(
+        "--commit",
+        required=True,
+        help="exact 40-hex commit to bootstrap the supervisor onto",
+    )
+    bootstrap_parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="repository checkout the commit belongs to (default: current directory)",
+    )
+    bootstrap_parser.add_argument(
+        "--uv",
+        default=None,
+        help="uv executable (default: uv on PATH, then the recorded Lubko toolchain path)",
+    )
+    bootstrap_parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="deploy lock wait timeout in seconds (default: 30)",
+    )
+    bootstrap_parser.add_argument(
+        "--cli-timeout",
+        type=float,
+        default=DEFAULT_CLI_TIMEOUT_SECONDS,
+        help="maintained CLI environment build timeout in seconds (default: 600)",
+    )
+
     repair_parser = subparsers.add_parser(
         "repair",
         help="adopt an independently known recovery worker and reconcile coherent lifecycle state",
@@ -3219,6 +3614,7 @@ def main(argv: list[str] | None = None) -> int:
         "deploy": deploy_cmd,
         "restart": restart_cmd,
         "migrate": migrate_cmd,
+        "bootstrap": bootstrap_cmd,
         "repair": repair_cmd,
         "recover": recover_cmd,
         "log": lambda namespace: log_cmd(namespace.lines),

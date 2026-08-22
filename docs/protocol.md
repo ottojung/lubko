@@ -91,12 +91,12 @@ create index jobs_chunk_order_idx
 
 `lubko_worker` is the stable role the worker connects as (see the README
 database configuration) and must hold the privileges it needs to claim, cancel,
-poll, publish output (including inserting immutable `output_chunk` rows), and
-finalize jobs:
+poll, publish output (including inserting immutable `output_chunk` rows),
+finalize jobs, and collect transport garbage:
 
 ```sql
 grant usage on schema lubko to lubko_worker;
-grant select, insert, update on table lubko.jobs to lubko_worker;
+grant select, insert, update, delete on table lubko.jobs to lubko_worker;
 ```
 
 The baseline migration `migrations/0001_two_column_protocol.sql` applies these
@@ -335,6 +335,46 @@ statements still run in one transaction, so a crash rolls back the whole
 cleanup. This also removes orphaned chunks whose `previous` chain became
 incomplete because of a crash or corruption.
 
+#### Automatic transport garbage collection
+
+The worker periodically collects terminal command rows and their owned output
+chunks after a configurable safe retention window (`LUBKO_GC_RETENTION_SECONDS`,
+default 3600). Abandoned running rows first go through existing lease recovery;
+pending and running rows are never collected. Three bounded phases run in
+separate transactions each cycle:
+
+**Phase 1 — Mark** (one transaction): A bounded batch of terminal `command`
+rows whose `finished_at` is older than the retention window and whose `status`
+is one of `succeeded`, `failed`, or `cancelled` is selected with `FOR UPDATE
+SKIP LOCKED` and atomically marked with `state.gc = true`. Publication
+explicitly refuses GC-marked roots (`WHERE ... IS DISTINCT FROM 'true'`), so
+no new `output_chunk` rows can be created for them after the mark commits.
+Unknown or future status values are retained, not collected.
+
+**Phase 2 — Chunk drain + root finalization** (one transaction per batch):
+For each GC-marked root, a bounded batch of its owned chunks (via `thread`) is
+deleted using `FOR UPDATE SKIP LOCKED`, capped at `LUBKO_GC_BATCH_LIMIT` rows.
+This keeps rows, transaction size, and lock duration bounded even when a single
+root owns millions of chunks. After bounded chunk deletion, if no chunks remain
+for a root, the root row itself is deleted. The root only disappears after its
+chunks are drained, which preserves the root-first publication-safety invariant:
+the `gc` flag prevents new chunks, and the root is removed once all chunks from
+the marking snapshot are gone.
+
+**Phase 3 — Orphan cleanup** (one transaction): A bounded anti-join `SELECT`
+(with `LIMIT` and `FOR UPDATE ... SKIP LOCKED`) finds `output_chunk` rows
+whose owning root `command` row is absent. The comparison is cast-free
+(`root.id::text = thread`), so malformed, empty, or non-UUID thread text
+never causes a cast error regardless of planner predicate reordering. Matched
+rows are deleted in one bounded `DELETE`. This pass is safe without root-first
+ordering: the owning root is already gone, so no concurrent publication can
+create new chunks for it.
+
+All three phases run every `LUBKO_GC_INTERVAL_SECONDS` (default 60) and log
+only aggregate counts of roots marked, chunks deleted, and orphans cleaned,
+never job contents or secrets. The pass is idempotent under multiple workers
+and restarts.
+
 ### Timestamps
 
 Timestamps are canonical UTC ISO-8601 with microseconds and a trailing `Z`,
@@ -438,6 +478,9 @@ The worker behavior is configurable through environment variables:
 | `LUBKO_CLAIM_BATCH_LIMIT`               | `8`     | maximum claiming work in one supervisor turn (a fairness bound, never a concurrency cap) |
 | `LUBKO_LEASE_SAFETY_MARGIN_SECONDS`     | `5`     | how long before lease expiry the daemon terminates an owned group during an outage |
 | `LUBKO_DB_OPERATION_TIMEOUT_SECONDS`    | `15`    | statement/connect timeout bounding database operations |
+| `LUBKO_GC_RETENTION_SECONDS`            | `3600`  | how long to keep terminal command rows and owned chunks before GC |
+| `LUBKO_GC_INTERVAL_SECONDS`             | `60`    | how often the transport garbage collection pass runs  |
+| `LUBKO_GC_BATCH_LIMIT`                  | `100`   | maximum terminal roots collected in one GC pass       |
 
 The refresh interval must be smaller than the lease duration so a healthy
 worker's lease never expires between heartbeats; the worker refuses to start

@@ -9,6 +9,8 @@ description: Orchestrate development work inside the isolated Lubko workspace th
 
 Lubko is a remote development execution environment. ChatGPT acts as the **orchestrator**; it does not connect to the development shell directly. Instead it submits jobs to a PostgreSQL queue hosted in Supabase, a Lubko worker inside the development container executes them, and the results come back through the same queue.
 
+For Supabase MCP calls, use project `kaqtahkvizqhgnxnstzy` directly. Do not discover or enumerate Supabase projects first; send Lubko SQL requests to this project and receive/poll their results from the same project.
+
 The flow, in one line:
 
 ```text
@@ -65,7 +67,7 @@ Substantial queued work normally invokes **`lubko-agent`** rather than a long im
 ## Core orchestration rules
 
 - **Supabase is the transport.** Commands in and results out all go through `lubko.jobs`; never bypass the queue to touch the container directly.
-- **Use `lubko-agent` for substantial work.** Anything needing judgment, context, iteration, or more than a couple of obvious shell commands belongs in a managed agent.
+- **Use `lubko-agent` for substantial work.** Anything needing judgment, context, iteration, or more than a couple of obvious shell commands belongs in a managed agent, except code review itself, which is an orchestrator responsibility.
 - **Use direct shell for tiny deterministic observations.** `pwd`, `git status --short`, reading one short file, printing a version, checking a path.
 - **Do not rush healthy agents, but do not assume a running agent is making progress.** Agents absolutely can get stuck. For any long-running agent, run a direct `lubko-agent status --id <ID>` health check at least every 5 minutes; use the CPU/process evidence and a focused log tail to distinguish *alive* from *usefully progressing*. Steer, stop, or kill genuinely stalled agents, but never nag an agent solely because time has elapsed.
 - **Use as many agents as useful.** There is no general agent-count limit; the constraints are exclusive write trees/branches and clear, non-conflicting responsibilities.
@@ -73,8 +75,8 @@ Substantial queued work normally invokes **`lubko-agent`** rather than a long im
 - **Poll grouped.** When several root jobs are outstanding, poll all outstanding root UUIDs together in one bounded `where id in (...)` query, never one at a time.
 - **Never passively wait.** Outstanding work requires another bounded observation/polling step in the current turn; a single outstanding root job still needs polling, never a passive pause.
 - **Do not end early.** If the requested workflow is incomplete and nonterminal root jobs remain, another bounded observation step is required; stop early only for a genuine blocker surfaced explicitly.
-- **Push work branches early and keep them pushed; open draft PRs early** so the human owner can watch progress and correct course cheaply.
-- **Review independently.** Read the resulting diff and trace important execution paths yourself instead of relaying an agent's summary.
+- **Push work branches early and keep them pushed; open draft PRs early.** PRs are not only for human observability: they are the canonical review surface for the orchestrator's GitHub plugin. Open the PR as soon as there is a reviewable commit so the plugin can return a useful diff while the work is still cheap to correct.
+- **All code review is orchestrator-only and GitHub-plugin-based.** The orchestrator must review the PR diff itself using the GitHub plugin. Never delegate code review to a `lubko-agent` agent, and never treat an agent's review or summary as satisfying the review requirement.
 - **Tests are evidence, not proof.** Green checks do not imply invariants were preserved.
 - **Deployment is separate and explicit.** Commit, push, and deploy are distinct ordered steps; deploy only when asked, via the managed tool.
 - **Iterate until the task is actually complete.**
@@ -98,11 +100,12 @@ ChatGPT is responsible for:
 7. reading stdout, stderr, and exit code from the bounded live output tail;
 8. using the preassigned Lubko agent ID for `prompt`/`status`/`log`;
 9. observing and steering that agent through `lubko-agent` commands;
-10. independently verifying important repository results where appropriate;
-11. iterating until the requested task is actually complete;
-12. never ending the turn while work remains outstanding: every unfinished future-dependent state must have an executable next observation step, and normal completion is illegal while the requested workflow is incomplete and root jobs are non-terminal.
+10. performing all code review itself through the GitHub plugin, against an open PR diff, rather than delegating review to agents;
+11. independently verifying important repository results where appropriate;
+12. iterating until the requested task is actually complete;
+13. never ending the turn while work remains outstanding: every unfinished future-dependent state must have an executable next observation step, and normal completion is illegal while the requested workflow is incomplete and root jobs are non-terminal.
 
-Keep the orchestrator role disciplined: decide *what* should happen, specify *constraints*, delegate the *how*, then verify the *result* independently. Do not ask the user to manually execute commands or inspect output when Lubko can perform them itself. Do not stop merely because a task requires several steps; use an agent when the work benefits from reasoning, continuity, iteration, or multiple commands.
+Keep the orchestrator role disciplined: decide *what* should happen, specify *constraints*, delegate the *how*, then verify and review the *result* independently. Implementation, investigation, tests, and documentation may be delegated to agents; code review may not. Do not ask the user to manually execute commands or inspect output when Lubko can perform them itself. Do not stop merely because a task requires several steps; use an agent when the work benefits from reasoning, continuity, iteration, or multiple commands, except for the orchestrator-owned code-review step.
 
 ---
 
@@ -274,7 +277,7 @@ set payload = (
 where id = '<job-id>' and (payload::jsonb)->'state'->>'status' = 'pending';
 ```
 
-Cancellation is only accepted while the job is `pending` or `running`; already terminal jobs are unchanged. If accepted before the worker finalizes the job, cancellation wins and the final status is `cancelled`, with accumulated output retained in `payload.output` / `payload.result.stdout` and a diagnostic in `payload.result.cancellation_note`.
+Cancellation is only accepted while a job is `pending` or `running`; already terminal jobs are unchanged. If accepted before the worker finalizes the job, cancellation wins and the final status is `cancelled`, with accumulated output retained in `payload.output` / `payload.result.stdout` and a diagnostic in `payload.result.cancellation_note`.
 
 When a running job is cancelled, the worker uses the job's recorded `payload.state.process_pgid` and signals only that exact process group: `SIGTERM`, then `SIGKILL` after a bounded grace period while members remain. It never uses `pkill`, `killall`, or process-name matching, and it never signals a process group after the tracked process is known to be fully gone. Cancelling or failing one job never affects unrelated jobs.
 
@@ -385,7 +388,7 @@ DONE := requested final condition verified
         AND no workflow-owned root jobs remain non-terminal
 ```
 
-The completion predicate must include whatever independent verification the user's request requires (for example reading the diff, running the full validation, confirming an exact deployed commit).
+The completion predicate must include whatever independent verification the user's request requires (for example reviewing the PR diff through the GitHub plugin, running the full validation, confirming an exact deployed commit).
 
 ## Narration must correspond to an operation
 
@@ -395,11 +398,11 @@ Narration such as "waiting for the worker transition" can sound like active orch
 
 # Prefer `lubko-agent` for substantial work
 
-`lubko-agent` is the preferred high-level interface for substantial development work. Use it aggressively for tasks that involve reasoning, multiple steps, code changes, investigation, iteration, or potentially long execution; prefer it over manually composing long shell command sequences.
+`lubko-agent` is the preferred high-level interface for substantial development work, **except code review**. Use it aggressively for tasks that involve reasoning, multiple steps, code changes, investigation, iteration, or potentially long execution; prefer it over manually composing long shell command sequences. Code review is intentionally excluded: the orchestrator performs every code review itself through the GitHub plugin against an open PR.
 
 It is safer and more reliable than ad-hoc shell orchestration because it provides: a stable caller-chosen Lubko agent ID; an explicit working directory; persistent session identity across separate Supabase jobs; a clear status model; process-group-aware lifecycle control; durable logs; exact-session continuation; deterministic stop and kill; cleanup and deletion; separation between the orchestrator and agent-runtime implementation details; and strong security and ethical policies while still being broadly empowered inside the isolated container.
 
-The sharpest failures have come from work that needed reasoning but was executed as a series of short, stateless shell commands: each command re-inspects the world from zero, accumulates no context, and cannot iterate. Substantial multi-step work — implementing an issue, refactoring, investigating a test failure, writing a migration, reviewing a subsystem — reliably produces better results through a managed agent session.
+The sharpest failures have come from work that needed reasoning but was executed as a series of short, stateless shell commands: each command re-inspects the world from zero, accumulates no context, and cannot iterate. Substantial multi-step work — implementing an issue, refactoring, investigating a test failure, writing a migration, analyzing a subsystem — reliably produces better results through a managed agent session.
 
 The orchestrator should therefore favor an agent for tasks such as:
 
@@ -408,7 +411,7 @@ implement a feature
 fix a bug
 refactor code
 understand an unfamiliar subsystem
-review a repository
+investigate a repository
 investigate test failures
 add tests
 update several related files
@@ -420,6 +423,8 @@ prepare a patch
 inspect and repair CI-related code locally
 perform a multi-step Git operation
 ```
+
+Do **not** put code review in this list. A `lubko-agent` may produce implementation notes or explain its own changes, but those outputs are not code review and cannot substitute for the orchestrator's GitHub-plugin review.
 
 Direct shell commands are still appropriate for tiny, deterministic observations or mechanical actions such as:
 
@@ -435,9 +440,9 @@ run one already-known command
 
 Two useful defaults:
 
-> **If the task needs judgment, context, iteration, or more than a couple of obvious shell commands, use `lubko-agent`.**
+> **If the task needs judgment, context, iteration, or more than a couple of obvious shell commands, use `lubko-agent` — unless the task is code review.**
 
-> **Use direct shell commands for observation. Use managed agents for work.**
+> **Use direct shell commands for observation. Use managed agents for implementation work. Use the GitHub plugin, as the orchestrator, for code review.**
 
 ---
 
@@ -538,7 +543,7 @@ Typical output:
 ```text
 ID        STATE      P  AGE  CWD                    TITLE
 8e064622  succeeded  2  2m   /workspace/project     fix parser
-a13f09c2  running    1  1m   /workspace/project-a   review storage
+a13f09c2  running    1  1m   /workspace/project-a   inspect storage
 ```
 
 Use it to recover context after losing track of an agent ID, to check which sessions are still running, or to get a quick summary of recent sessions. Possible states include `idle`, `running`, `succeeded`, `failed`, `stopped`, `killed`, `unknown`; `idle` means a session was created but has never received a prompt. Do not assume a finished agent should be deleted immediately — a completed session may be useful for follow-up prompts.
@@ -655,7 +660,7 @@ Rules:
 - **Do not nag solely because time elapsed.** A quiet long-running agent that is still consuming CPU and converging is healthy; interrupting it on a schedule destroys the reasoning it is doing. Only intervene when the evidence shows a genuine stall or a concrete problem.
 - **Steer, stop, or kill genuinely stalled agents.** Once the evidence shows a real stall, do not keep waiting and polling forever: redirect it with a focused `--steer`, or if the task is abandoned, `stop` it and escalate to `kill` only when graceful stopping is insufficient.
 - Use a blocking `wait` only when you are confident no intermediate steering is useful — the timeout stops *waiting*, not the agent. For genuinely long or uncertain tasks, poll `status` and occasionally read the log instead of blocking.
-- Stopping is a decision that the task is no longer wanted, not a pause button. Prefer a steering prompt for course correction and reserve `stop`/`kill` for abandoned tasks.
+- Stopping is a decision that the task is no longer wanted, not a pause button. Prefer a steering prompt for course correction and reserve `stop`/`kill` for abandoned work.
 
 ---
 
@@ -686,7 +691,7 @@ The contract is about polling, not submission order: if more jobs are still bein
 
    ```sh
    lubko-agent new --id <AGENT_B> --cwd /workspace/project-b &&
-   lubko-agent prompt --id <AGENT_B> 'Review subsystem B and fix the identified problem. Run validation.'
+   lubko-agent prompt --id <AGENT_B> 'Investigate subsystem B and fix the identified problem. Run validation.'
    ```
 
    Those two root jobs both run at the same time while their corresponding agents work.
@@ -806,15 +811,17 @@ git diff --stat
 git diff
 ```
 
-Run relevant tests independently when needed.
+Run relevant tests independently when needed. These observations are useful for repository state and validation, but they are **not the code-review step**. For code review, push the branch, open or update its PR, and have the orchestrator inspect the PR diff through the GitHub plugin.
 
 ## 6. Continue the same agent if necessary
 
-If verification finds a problem, send another exact-session prompt rather than unnecessarily creating a new agent:
+If verification or orchestrator review finds a problem, send the implementation agent another exact-session prompt rather than asking it to review itself or unnecessarily creating a new agent:
 
 ```sh
-lubko-agent prompt --id a13f09c2 'Address the review findings, rerun the affected tests, and report the final state.'
+lubko-agent prompt --id a13f09c2 'Address the orchestrator review findings, rerun the affected tests, and report the final state.'
 ```
+
+After the fix is pushed, the orchestrator reviews the updated PR diff again through the GitHub plugin.
 
 ## 7. Keep or delete the session
 
@@ -828,23 +835,24 @@ lubko-agent delete a13f09c2
 
 # Parallel agents and branch reconciliation
 
-Use multiple agents in parallel when work can be separated cleanly. Independent implementation, acceptance-test, research, documentation, and review agents often produce a better result faster than one agent doing every role sequentially. **There is no general limit on the number of agents**; the constraints are exclusive write trees/branches and clear, non-conflicting responsibilities.
+Use multiple agents in parallel when work can be separated cleanly. Independent implementation, acceptance-test, research, and documentation agents often produce a better result faster than one agent doing every role sequentially. **There is no general limit on the number of agents**; the constraints are exclusive write trees/branches and clear, non-conflicting responsibilities. Code review is deliberately not an agent role: the orchestrator reviews through the GitHub plugin.
 
 The preferred pattern:
 
 1. clone the repository into separate temporary directories, for example `/tmp/lubko-<task>-core` and `/tmp/lubko-<task>-acceptance`;
 2. create a dedicated Git branch in each clone;
 3. give each agent a narrow, non-overlapping responsibility and its own working directory;
-4. keep independent acceptance/review agents from inspecting the implementation branch when independence is valuable;
+4. keep independent acceptance agents from inspecting the implementation branch when independence is valuable;
 5. let the agents work concurrently without rushing them merely because they are quiet;
 6. freeze each useful result as a commit;
-7. create a fresh reconciliation clone/branch and combine the commits semantically rather than resolving conflicts with blind `ours`/`theirs` choices;
-8. run the checks and independent acceptance tests on the combined result;
-9. perform an orchestrator review of the final reconciled revision.
+7. push useful branches and open draft PRs early, so the GitHub plugin has a durable review surface and useful diff while work is still in progress;
+8. create a fresh reconciliation clone/branch and combine the commits semantically rather than resolving conflicts with blind `ours`/`theirs` choices;
+9. run the checks and independent acceptance tests on the combined result;
+10. open or update the integration PR and perform the required orchestrator code review of the final reconciled revision through the GitHub plugin.
 
 ## Isolation: separate clones/worktrees and branches
 
-The most productive work on this system ran **multiple agents in parallel, each in its own clone with its own branch**: an implementation branch at a dedicated clone path, a docs branch in a separate clone, an acceptance branch in a separate clone, an integration branch in a separate clone, plus a final read-only review agent.
+The most productive work on this system ran **multiple agents in parallel, each in its own clone with its own branch**: an implementation branch at a dedicated clone path, a docs branch in a separate clone, an acceptance branch in a separate clone, and an integration branch in a separate clone. The final code review is performed by the orchestrator through the GitHub plugin, not by another agent.
 
 The single most common source of cross-agent corruption is **two write-heavy agents in the same working tree**. One agent's `git checkout`, `git reset`, or uncommitted edit silently destroys or masks another's.
 
@@ -852,7 +860,7 @@ Rules:
 
 - For parallel write work, always give each agent its own clone (`git clone` to a distinct path) and its own branch. Never point two write-capable agents at the same tree.
 - When agents share a repository checkout, use `git worktree add` so each branch gets its own directory with the same isolation.
-- An independent reviewer may share the tree only if it is read-only and the tree is committed first.
+- Do not create a read-only reviewer agent. Code review is not delegated; it belongs to the orchestrator using the GitHub plugin.
 - Treat each clone as disposable. The durable artifact is the branch you push and reconcile; the working tree is scratch space.
 
 ## Separate responsibilities
@@ -861,14 +869,15 @@ Give independent agents separate responsibilities. The cleanest outcomes come fr
 
 - one **implementation** agent that owns the production code change;
 - one **acceptance** agent that independently designs black-box tests against the required contract, without reading the implementation;
-- one **docs/review** agent that updates documentation and/or performs a read-only review focused on soundness;
-- the **orchestrator**, which reconciles branches and verifies invariants.
+- one **docs** agent when documentation can usefully proceed independently;
+- the **orchestrator**, which reconciles branches, verifies invariants, and performs all code review through the GitHub plugin.
 
 Rules:
 
-- Assign disjoint filesystems and disjoint responsibilities. An acceptance agent should not be told "verify the implementation"; it should be given the *contract* and asked to test the *behavior*. A reviewer should be told to review, not to fix — or told to fix only concrete bugs it finds, never to "improve" freely.
+- Assign disjoint filesystems and disjoint responsibilities. An acceptance agent should not be told "verify the implementation"; it should be given the *contract* and asked to test the *behavior*.
+- **Never assign a code-review mandate to an agent.** An agent may implement fixes requested by the orchestrator, but it must not be used as the reviewer and its opinion does not satisfy the review requirement.
 - Put every agent's mandate in the initial prompt, including what it must *not* do. The cost of a wrong responsibility split is usually only discovered at reconciliation, which is the most expensive time to find it.
-- The orchestrator keeps the map: which branch, which base commit, which responsibility, which agent ID.
+- The orchestrator keeps the map: which branch, which base commit, which responsibility, which agent ID, and which PR is the review surface.
 
 ## General parallel-agent rules
 
@@ -877,7 +886,8 @@ Rules:
 - give each an explicit `--cwd`;
 - avoid sending two write-heavy agents into the same files unless intentional;
 - use explicit IDs for every `status`, `prompt`, `log`, `wait`, `stop`, `kill`, and `delete` operation;
-- observe parallel agents together with bounded multi-job polling.
+- observe parallel agents together with bounded multi-job polling;
+- never designate any agent as the code reviewer.
 
 ---
 
@@ -892,6 +902,8 @@ Rules:
 - When you run the acceptance suite against the reconciled branch, treat failures as first-class evidence about the implementation, not as a test bug to suppress.
 - If a test encodes an assumption you actually want to reject, change the *test* deliberately and document why — do not silently mark it to skip.
 
+Independent acceptance is distinct from code review. Acceptance agents may design and run tests; they do not review the implementation. The orchestrator alone reviews the code through the GitHub plugin.
+
 ---
 
 # Prompt-writing guidance
@@ -905,7 +917,7 @@ A strong agent prompt usually contains:
 5. **Local instructions** — tell the agent to read and obey `AGENTS.md`, `CONTRIBUTING.md`, or equivalent repository guidance.
 6. **Validation** — tests, linters, type checking, builds, or other required checks.
 7. **Completion criteria** — what counts as done.
-8. **Non-goals / negative requirements** — explicitly what the agent must not do: "do not deploy", "do not push", "do not expose credentials", "do not close the issue yourself", "do not touch unrelated files", "do not expand scope into a sibling issue", "do not edit a file another agent owns".
+8. **Non-goals / negative requirements** — explicitly what the agent must not do: "do not deploy", "do not push", "do not expose credentials", "do not close the issue yourself", "do not touch unrelated files", "do not expand scope into a sibling issue", "do not edit a file another agent owns", **"do not perform code review; the orchestrator reviews through the GitHub plugin."**
 
 Example:
 
@@ -920,9 +932,9 @@ Keep the public behavior unchanged except for the requested architecture change.
 
 Run every validation command required by AGENTS.md.
 
-Do not deploy, push, or modify unrelated files.
+Do not deploy, push, perform code review, or modify unrelated files.
 
-When done, summarize the implementation, files changed, and validation results.
+When done, summarize the implementation, files changed, and validation results for the orchestrator.
 ```
 
 The prompts that produce the best work are long on *constraint* and short on *how-to*. The agent is capable of investigating details itself; do not over-specify low-level steps unless they are genuine requirements.
@@ -932,6 +944,7 @@ Additional rules:
 - Name the invariants the agent must preserve, drawn from the project's own design docs: for example atomic, exactly-once state transitions; precise process signaling; no credentials in logs, commits, or process environments; and git state changed only on the agent's own branch.
 - Ask agents to report early, risky findings: *"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end."* Do not require agents to finish before communicating.
 - Ask agents to commit incrementally on their branch as they go, and to keep the branch pushed. A branch with frequent, logical commits is far easier to reconcile and salvage than one last-minute commit.
+- Ask agents to open or prepare a PR early when they are responsible for Git publication, but do not ask them to review that PR. The PR exists so the orchestrator's GitHub plugin can inspect the diff.
 
 ---
 
@@ -955,6 +968,8 @@ git remote -v
 find . -maxdepth 2 -type f | sort
 ```
 
+Those observations do not replace code review. Code review happens against the PR through the GitHub plugin.
+
 ---
 
 # Clean working trees and known base commits
@@ -965,15 +980,15 @@ Rules:
 
 - Cut every branch from a known, clean, tested base — a real commit SHA, not "whatever the tree looked like."
 - Before launching an implementation agent, ensure its clone is on a known commit with a clean tree, and put the base commit in the prompt: *"Baseline is <sha>, tests green; reconcile from there."* Record the base in your own state so reconciliation can verify it.
-- After an agent finishes, verify `git status --short` shows only intended changes, the intended commits exist on the branch, and the tree was not force-reset or squashed without your knowledge. A clean, committed branch is the contract your acceptance and review steps depend on.
+- After an agent finishes, verify `git status --short` shows only intended changes, the intended commits exist on the branch, and the tree was not force-reset or squashed without your knowledge. A clean, committed branch is the contract your acceptance and orchestrator-review steps depend on.
 
 ---
 
 # Verification and code review
 
-The orchestrator remains responsible for the final answer to the user. After substantial agent work, verify important results instead of blindly repeating the agent's summary.
+The orchestrator remains responsible for the final answer to the user. After substantial agent work, verify important objective results instead of blindly repeating the agent's summary, and perform the actual code review yourself through the GitHub plugin.
 
-Useful checks:
+Useful objective-state checks include:
 
 ```sh
 git status -sb
@@ -981,7 +996,7 @@ git diff --stat
 git diff
 ```
 
-Then run repository-required validation when appropriate. Do not report a development change as complete when required checks are known to be failing unless the failure is explicitly explained.
+Then run repository-required validation when appropriate. Do not report a development change as complete when required checks are known to be failing unless the failure is explicitly explained. These shell checks are useful evidence, but **they do not satisfy the code-review requirement**; review is performed from the PR diff through the GitHub plugin.
 
 ## Tests are evidence, not proof
 
@@ -989,9 +1004,9 @@ The orchestrator has repeatedly found hard bugs that passing tests did not catch
 
 Rules:
 
-- After an agent reports success, do not merely relay its summary. Read the diff.
+- After an agent reports success, do not merely relay its summary. Push the branch, ensure there is an open PR, and inspect the PR diff through the GitHub plugin.
 - Check the invariants that matter to this codebase: atomic and exactly-once state transitions, precise process signaling, no credentials in environments or logs, and no destructive action before durable state exists.
-- Tests passing is necessary, not sufficient. Treat automated tests as **evidence, not proof**. When you read the diff and find a discrepancy with an invariant, that is a bug until proven otherwise — even if the tests pass. Investigate to closure before reconciliation.
+- Tests passing is necessary, not sufficient. Treat automated tests as **evidence, not proof**. When the orchestrator reads the PR diff and finds a discrepancy with an invariant, that is a bug until proven otherwise — even if the tests pass. Investigate to closure before reconciliation.
 - Run the full checks: agents have repeatedly reported success on a subset of checks while the full suite failed. Put the exact full command list in every implementation and acceptance prompt, and independently re-run the full suite after reconciliation on the integrated branch.
 
 For the Lubko repository itself, `AGENTS.md` currently requires:
@@ -1003,11 +1018,20 @@ uv run mypy .
 uv run pytest
 ```
 
-## Code review is a first-class orchestrator step
+## Code review is an orchestrator-only GitHub-plugin step
 
-Review is not optional polish to add after the checks pass. It is a required orchestrator step before merging: do not merge a branch that has not been reviewed, even if the checks pass. Review is the cheapest place to catch the class of bugs tests miss.
+Review is not optional polish to add after the checks pass. It is a required **orchestrator** step before merging, and it must be performed through the **GitHub plugin** against an open PR.
 
-For a dedicated read-only review pass, follow [`docs/skills/review.md`](skills/review.md). In particular:
+Hard rules:
+
+- **Every code review is performed by the orchestrator.** Do not create, prompt, or rely on a `lubko-agent` agent to review code.
+- **Use the GitHub plugin as the review interface.** Inspect the PR's changed files and diff/patch, trace important execution paths, and compare the change against the task contract and repository invariants.
+- **An agent's self-review, second-agent review, review summary, or "looks good" report does not count.** Agents can implement fixes, run tests, investigate, and explain their work; the review judgment remains with the orchestrator.
+- **Open PRs early because review depends on them.** The GitHub plugin can return a useful canonical diff once work is published to a PR. Do not wait until implementation is "finished" to create the PR; open it as soon as there is a reviewable commit, then review incrementally as the diff evolves.
+- **Re-review after material updates.** If review findings cause new commits, inspect the updated PR diff through the GitHub plugin before merging.
+- Human review is welcome as additional evidence, but it does not replace the orchestrator's required review step.
+
+For the review checklist, follow [`docs/skills/review.md`](skills/review.md) **as the orchestrator**, using the GitHub plugin to inspect the PR. Do not instantiate a reviewer agent to follow that skill. In particular:
 
 - establish the actual task contract;
 - read tests as evidence rather than as proof;
@@ -1022,7 +1046,7 @@ For a dedicated read-only review pass, follow [`docs/skills/review.md`](skills/r
 
 Code modification and deployment are separate operations. If the user asks only to modify code, do not automatically replace a running service, worker, daemon, or deployment.
 
-When the user asks to inspect changes before deployment: modify the repository (preferably with a managed agent), run checks, inspect and summarize the diff, then stop. Deploy only when requested. Explicitly include `do not deploy` in an agent prompt when this distinction matters.
+When the user asks to inspect changes before deployment: modify the repository (preferably with a managed agent), run checks, push/open the PR, perform the orchestrator's GitHub-plugin review, summarize the diff, then stop. Deploy only when requested. Explicitly include `do not deploy` in an agent prompt when this distinction matters.
 
 ## Commit, push, and deploy are distinct, ordered steps
 
@@ -1031,12 +1055,12 @@ These three operations have different blast radius, and conflating them has caus
 Treat them as strictly ordered, separable steps:
 
 1. **Commit** — durable local history on a branch. Cheap, reversible, safe.
-2. **Push** — publishes commits to a remote. **Push non-default work branches early and keep them pushed**; the remote branch is the durable copy and survives a lost or recycled clone. Open a **draft PR early** so the work is visible to the human owner from day one. A push to the **default branch (`main`/`master`) is different**: it requires establishing user intent at task start, unless the user already specified it.
+2. **Push** — publishes commits to a remote. **Push non-default work branches early and keep them pushed**; the remote branch is the durable copy and survives a lost or recycled clone. Open a **draft PR early** as soon as there is a reviewable commit: this makes work visible and gives the orchestrator's GitHub plugin the canonical diff it needs for review. A push to the **default branch (`main`/`master`) is different**: it requires establishing user intent at task start, unless the user already specified it.
 3. **Deploy** — replaces the running service/worker/daemon. Highest blast radius; only via the project's managed deploy tool, on explicit instruction, and from a reviewed, validated checkout at an exact commit.
 
 Publication (pushing a change) is not deployment. Pushing makes work visible for review; deploying replaces the running system. Name the target of each action in prompts: "Commit and push the change" is one instruction; "Deploy the already-pushed commit" is a different instruction — in practice it is given as a separate agent session whose sole job is to verify the checkout at the exact commit and run the managed deployment. Match that separation.
 
-The orchestrator must also not deploy implicitly. Deploying is its own explicit step, performed through the project's managed deploy tool (never through manual process-tree manipulation), from a checkout that passed the full validation, and after verifying the target commit is exactly the commit you intend to run.
+The orchestrator must also not deploy implicitly. Deploying is its own explicit step, performed through the project's managed deploy tool (never through manual process-tree manipulation), from a checkout that passed the full validation and the orchestrator's GitHub-plugin code review, and after verifying the target commit is exactly the commit you intend to run.
 
 ---
 
@@ -1176,15 +1200,16 @@ Reconcile in this order:
 3. Build an integration branch from the most trusted component.
 4. Cherry-pick or merge the other components one at a time, running the full checks after each addition so you can attribute any breakage.
 5. Resolve conflicts explicitly; never resolve with a blind `git checkout --theirs` or a forced overwrite.
-6. Only after the integrated branch is green do you consider the main branch or a merge.
+6. Push the integration branch and open/update its PR early enough for the GitHub plugin to expose the evolving diff.
+7. Only after the integrated branch is green **and the orchestrator has reviewed the integration PR through the GitHub plugin** do you consider the main branch or a merge.
 
-When you read the diff during reconciliation and find a discrepancy with an invariant, investigate it to closure before proceeding. A "fixed" conflict that reintroduces a bug is worse than no fix.
+When the orchestrator reviews the integration PR diff and finds a discrepancy with an invariant, investigate it to closure before proceeding. A "fixed" conflict that reintroduces a bug is worse than no fix.
 
 ---
 
 # Git and GitHub branch and PR management
 
-Parallel agent work only pays off if the Git history it produces is easy to reconcile, review, and share. GitHub pull requests are the primary observability tool for the human owner: every open, update, and merge of a PR is a durable, human-visible record of what happened. Use them by default for substantial changes; only trivial emergency fixes may skip the ceremony. GitHub issues are the complementary durable backlog for important-but-non-critical findings discovered along the way.
+Parallel agent work only pays off if the Git history it produces is easy to reconcile, review, and share. GitHub pull requests are the primary observability **and code-review** tool for the orchestrator and human owner: every open, update, review comment, and merge is a durable, human-visible record of what happened, and the PR diff is what the GitHub plugin reviews. Use PRs by default for substantial changes; only trivial emergency fixes may skip the ceremony. GitHub issues are the complementary durable backlog for important-but-non-critical findings discovered along the way.
 
 ## Name branches after the task
 
@@ -1206,43 +1231,47 @@ Ask agents to commit in small, logical, self-contained commits as they go, not i
 
 Push non-default work branches as soon as there is something to see, and keep them pushed as work proceeds. A pushed branch survives a lost or recycled clone; an unpushed branch exists only in one disposable working tree. Never treat the clone as the durable copy — the remote branch is the durable copy.
 
-## Open draft PRs early for observability
+## Open draft PRs early for review and observability
 
-Open a **draft PR** as soon as the branch exists, even if it is mostly empty. This makes the work visible to the human owner from day one: they can watch progress, object early to a wrong direction, and see which branches are active. A draft PR is cheap to update and costs nothing to leave open; discovering a wrong direction after two weeks of agent work is expensive.
+Open a **draft PR as soon as there is a reviewable commit**. Do not wait for implementation to be complete. GitHub cannot create a PR with no commits relative to its base, so "early" means immediately after the first meaningful commit.
 
-## PRs as the human-visible activity log
+This is operationally necessary, not just cosmetic: **all code review is performed by the orchestrator through the GitHub plugin, and the PR gives that plugin the stable changed-file set and useful diff/patch it needs.** An early PR lets the orchestrator review incrementally, catch a wrong direction while it is cheap to fix, and re-review only the evolving change rather than reconstructing history at the end.
 
-Treat the PR as the human-visible record of the work. The commit history, the diff, and the comments on the PR are what the human owner (and any later collaborator) will read to understand what happened. Write PR descriptions that say what changed and why, keep discussion on the PR rather than in private agent state, and let the PR tell the story of the task.
+A draft PR is also the human-visible activity log: the owner can watch progress, object early to a wrong direction, and see which branches are active. Keep pushing new commits to the same PR as the work develops.
+
+## PRs as the human-visible activity log and orchestrator review surface
+
+Treat the PR as both the human-visible record of the work and the orchestrator's canonical code-review surface. The commit history, the diff, and the comments on the PR are what the human owner (and any later collaborator) will read to understand what happened, while the GitHub plugin gives the orchestrator the changed files and diff it must review. Write PR descriptions that say what changed and why, keep discussion on the PR rather than in private agent state, and let the PR tell the story of the task.
 
 ## Keep implementation, acceptance, and docs branches separate
 
-Do not fold acceptance tests and documentation into the implementation branch by default. Keep the implementation branch, the acceptance branch, and the docs branch separate, each opened as its own PR or combined into one integration PR, so each part is independently reviewable and mergeable.
+Do not fold acceptance tests and documentation into the implementation branch by default. Keep the implementation branch, the acceptance branch, and the docs branch separate, each opened as its own PR or combined into one integration PR, so each part is independently visible and mergeable. This separation does **not** create separate review-agent roles: the orchestrator reviews whichever PR will be merged, using the GitHub plugin.
 
 ## Reconcile into an integration branch
 
-Follow the [Reconciliation and integration branches](#reconciliation-and-integration-branches) procedure when several branches contribute to one change. The Git-specific part: propose the integrated result for merge **via a PR, never as a direct push to the default branch**.
+Follow the [Reconciliation and integration branches](#reconciliation-and-integration-branches) procedure when several branches contribute to one change. The Git-specific part: propose the integrated result for merge **via a PR, never as a direct push to the default branch**. That integration PR is the final review surface for the orchestrator's GitHub-plugin code review.
 
 ## Cherry-pick vs merge vs rebase
 
 - Prefer **cherry-pick** when you are assembling a single coherent change from multiple branches and you want only the accepted commits — for example layering docs commits onto an implementation branch while leaving the docs branch untouched.
 - Prefer **merge** when you want to preserve the full, branch-shaped history of two long-lived lines of work.
-- Prefer **rebase** when the branch's history needs to be linearized onto a newer base for review — but rebase rewrites history, so only do it on branches that are not yet shared/reviewed (or via a PR's squash/rebase merge on GitHub). Do not rebase a branch that other agents or the human owner are already reading.
+- Prefer **rebase** when the branch's history needs to be linearized onto a newer base for review — but rebase rewrites history, so only do it on branches that are not yet shared/reviewed (or via a PR's squash/rebase merge on GitHub). Do not rebase a branch that the human owner or orchestrator is already reviewing.
 
 ## Updating PRs after review
 
-Respond to review comments by pushing new commits to the same PR branch, not by closing and reopening. Keep each review cycle as additional commits (amend only pre-review commits); this lets reviewers see exactly what changed in response to their feedback. Never force-push away the reviewed history while review is in flight.
+Respond to orchestrator or human review comments by pushing new commits to the same PR branch, not by closing and reopening. Keep each review cycle as additional commits (amend only pre-review commits); this lets the orchestrator use the GitHub plugin to see exactly what changed in response to findings. Never force-push away the reviewed history while review is in flight. After material updates, the orchestrator must inspect the updated PR diff again before merge.
 
 ## Resolve conflicts semantically
 
-Resolve conflicts according to the canonical rule in [Reconciliation and integration branches](#reconciliation-and-integration-branches). After resolving, rerun the full checks on the merged state.
+Resolve conflicts according to the canonical rule in [Reconciliation and integration branches](#reconciliation-and-integration-branches). After resolving, rerun the full checks and re-review the resulting PR diff through the GitHub plugin.
 
 ## Review before merge
 
-Do not merge a branch that has not been reviewed, even if the checks pass. Review is the cheapest place to catch the class of bugs tests miss. For hard concurrency/lifecycle/soundness work, run a dedicated read-only review pass — by a reviewer agent and, where possible, by the human owner — before merging. Code review is a first-class orchestrator step; the review checklist lives in `docs/skills/review.md`.
+Do not merge a branch that has not been reviewed, even if the checks pass. **The required code review is performed by the orchestrator through the GitHub plugin against the PR diff. Never delegate this review to a `lubko-agent` agent.** For hard concurrency/lifecycle/soundness work, the orchestrator should perform a dedicated, careful pass using the checklist in `docs/skills/review.md`; human-owner review is useful additional evidence when available.
 
 ## Merge regular changes
 
-Once a PR has been reviewed and the checks are green on the integrated branch, merge it — do not leave finished branches dangling forever. A merged PR closes the loop and is the cleanest possible record: "this change was reviewed and landed." Hiding a completed change in an unmerged branch buries it.
+Once a PR has been reviewed by the orchestrator through the GitHub plugin and the checks are green on the integrated branch, merge it — do not leave finished branches dangling forever. A merged PR closes the loop and is the cleanest possible record: "this change was reviewed and landed." Hiding a completed change in an unmerged branch buries it.
 
 ## Keep experimental and "wisdom" PRs separate
 
@@ -1254,11 +1283,11 @@ After a PR is merged, delete the branch on the remote and locally, and clean up 
 
 ## Never casually force-push
 
-The reviewed PR history is the record both the human owner and later reviewers depend on. Never force-push over it — rewriting or deleting commits that reviewers (or the human owner) have already seen silently invalidates their review and corrupts the activity log. Force-push only in the rare, genuinely necessary cases: fixing a branch that leaked a secret, or rewinding an accidental push to the wrong branch — and always say so on the PR first. When the default branch is protected (it should be), a force-push is not even possible; rely on the PR's normal merge instead.
+The reviewed PR history is the record both the human owner and orchestrator depend on. Never force-push over it — rewriting or deleting commits that have already been reviewed silently invalidates that review and corrupts the activity log. Force-push only in the rare, genuinely necessary cases: fixing a branch that leaked a secret, or rewinding an accidental push to the wrong branch — and always say so on the PR first. When the default branch is protected (it should be), a force-push is not even possible; rely on the PR's normal merge instead.
 
 ## Opening and merging PRs is the default
 
-Opening and merging GitHub PRs is the default for substantial changes because it is the observability mechanism the human owner relies on: every open, push, review comment, and merge is durable and human-visible, and nothing real happens to the repository history outside a PR. Trivial emergency fixes — a one-line hotfix to a breaking typo, a reverted bad merge — may go directly to the default branch when speed matters more than ceremony. Everything else flows through a PR. Direct pushes to the default branch (`main`/`master`) require establishing user intent at task start, unless the user already specified it.
+Opening and merging GitHub PRs is the default for substantial changes because it is both the observability mechanism the human owner relies on and the review surface the orchestrator's GitHub plugin requires: every open, push, review comment, and merge is durable and human-visible, and nothing real happens to the repository history outside a PR. Trivial emergency fixes — a one-line hotfix to a breaking typo, a reverted bad merge — may go directly to the default branch when speed matters more than ceremony. Everything else flows through a PR. Direct pushes to the default branch (`main`/`master`) require establishing user intent at task start, unless the user already specified it.
 
 ---
 
@@ -1283,12 +1312,13 @@ Create the issue as soon as the finding appears, mid-task if that is when it sho
 
 # Share partial findings early
 
-The most useful findings arrive *before* the task completes: a reviewer flagging a soundness concern while the implementation was still in flight, an acceptance agent reporting a contract ambiguity mid-way, an orchestrator noticing a base-commit mismatch between branches while both were still running. Early findings changed direction cheaply.
+The most useful findings arrive *before* the task completes: the orchestrator flagging a soundness concern while implementation was still in flight, an acceptance agent reporting a contract ambiguity mid-way, or the orchestrator noticing a base-commit mismatch between branches while both were still running. Early findings changed direction cheaply.
 
 Rules:
 
 - Ask agents to report early, risky findings in their prompt: *"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end."*
-- When the orchestrator spots something mid-flight, share it immediately with the affected agent via a steering prompt, even if it means the agent re-plans. A stopped-wrong task is cheaper than a finished-wrong task.
+- Open the PR early enough that the orchestrator can use the GitHub plugin to surface code-review findings while implementation is still in flight.
+- When the orchestrator spots something mid-flight, share it immediately with the affected implementation agent via a steering prompt, even if it means the agent re-plans. A stopped-wrong task is cheaper than a finished-wrong task.
 - Keep partial progress durable: ask agents to commit incrementally on their branch, not only at the end.
 
 ---
@@ -1321,10 +1351,11 @@ Each of these has happened. Name the failure mode when you see it forming.
 - **Passive waiting** — deciding to "wait" for an outstanding job without scheduling another polling/status call, so the orchestration turn ends in an intermediate state. Avoid: apply the [liveness invariants](#orchestrator-liveness-and-completion-invariants); every unfinished future-dependent state needs an executable next observation step.
 - **Two write agents on a shared tree** — one agent's `git checkout`, `git reset --hard`, or broad edit destroyed another agent's in-flight work. Avoid: always give writers separate clones and branches; before launching any agent, know which trees are exclusively owned by whom.
 - **Rushing or stopping active agents** — agents stopped because they seemed slow had often been doing exactly the right reading, and repeatedly prompting a healthy agent pushed it toward premature completion. Avoid: inspect status and the log before touching an agent; distinguish progress from stuck; prefer a steering prompt with acceptance criteria; reserve stop/kill for abandoned work.
+- **Delegating code review to agents** — a second agent's "review" can look independent while still being outside the orchestrator's required GitHub review path, and it deprives the orchestrator of direct responsibility for the merge decision. Avoid: open the PR early, inspect its diff through the GitHub plugin yourself, and use agents only to implement fixes or run independent acceptance tests.
 - **Self-referential tests** — acceptance tests written from the implementation encoded its assumptions and passed while behavior violated the contract. Avoid: write tests from the contract, not the code.
-- **Test-only production knobs** — sub-second timing, fake output paths, and confirmation timeouts have crept into production code as environment variables "for the tests." Avoid: in review, ask whether every knob and branch is reachable and meaningful in production.
+- **Test-only production knobs** — sub-second timing, fake output paths, and confirmation timeouts have crept into production code as environment variables "for the tests." Avoid: in orchestrator review, ask whether every knob and branch is reachable and meaningful in production.
 - **Stale docs** — documentation drifted from behavior after refactors, and an agent then built on the stale text. Avoid: treat docs as a deliverable in the same change that changes behavior; update them in the same reconciliation pass; when docs and code disagree, code is not automatically right — resolve the discrepancy deliberately.
-- **Multiple deployment authorities** — more than one actor believing it can deploy is a latent accident. Avoid: exactly one authority — the orchestrator — decides to deploy, and only via the managed deploy tool from a validated checkout. No agent deploys unless its prompt explicitly says so.
+- **Multiple deployment authorities** — more than one actor believing it can deploy is a latent accident. Avoid: exactly one authority — the orchestrator — decides to deploy, and only via the managed deploy tool from a validated, reviewed checkout. No agent deploys unless its prompt explicitly says so.
 - **Destructive actions before durable rollback state** — delete/stop/overwrite first, then discover the replacement is broken with no recorded previous state. Avoid: any destructive action (replacing a worker, deleting a branch, resetting a tree, dropping schema) is only safe when durable rollback state exists first and you can restore it. If you cannot say what will restore the old state, do not destroy.
 - **Output bloat and truncated evidence** — full logs and full dumps were truncated by an output limit, so conclusions were drawn from incomplete output. Avoid: keep commands focused; prefer log tails and `git diff --stat`; when output is truncated, run a narrower follow-up rather than guessing.
 - **Trusting a report of green** — "tests passed" has been reported for subsets, for the wrong branch, or for stale trees. Avoid: independent re-run on the reconciled branch is the only trustworthy green.
@@ -1435,9 +1466,9 @@ Recurring scheduled orchestrators must additionally follow [`docs/skills/schedul
 
 Lubko exists to make ChatGPT an effective development orchestrator.
 
-Be proactive. Use Supabase as transport. Use `lubko-agent` as the preferred abstraction for substantial work. Generate agent IDs up front and keep them explicit. Inspect status and logs yourself. Let agents think — do not rush them. Steer agents with explicit follow-up prompts. Verify important results yourself. Use direct shell commands for small observations and deterministic checks. Use as many agents as useful, with exclusive write trees/branches and non-conflicting responsibilities. Poll all outstanding root jobs together in one bounded query. Never end a turn while requested work is still outstanding; every unfinished future-dependent state needs an executable next observation step. Reconcile branches deliberately on a fresh integration branch. Make code review a first-class step before merge. Treat PRs as the human-visible activity log, and open them early. Capture non-critical findings as issues; fix blockers before merge. Iterate until the task is actually complete.
+Be proactive. Use Supabase as transport. Use `lubko-agent` as the preferred abstraction for substantial implementation, investigation, testing, and documentation work. Generate agent IDs up front and keep them explicit. Inspect status and logs yourself. Let agents think — do not rush them. Steer agents with explicit follow-up prompts. Verify important results yourself. Use direct shell commands for small observations and deterministic checks. Use as many agents as useful, with exclusive write trees/branches and non-conflicting responsibilities. Poll all outstanding root jobs together in one bounded query. Never end a turn while requested work is still outstanding; every unfinished future-dependent state needs an executable next observation step. Reconcile branches deliberately on a fresh integration branch. **Open PRs early, because they are the GitHub-plugin review surface. Perform every code review yourself as the orchestrator through that plugin; never delegate review to a `lubko-agent`.** Treat tests as evidence, not proof. Capture non-critical findings as issues; fix blockers before merge. Iterate until the task is actually complete.
 
-Do not turn routine development operations back into instructions for the user when Lubko can perform them directly. The development container is intentionally disposable and highly permissive; the host server is protected by the Lubko isolation boundary. Within that boundary, make full use of managed agents and the development environment.
+Do not turn routine development operations back into instructions for the user when Lubko can perform them directly. The development container is intentionally disposable and highly permissive; the host server is protected by the Lubko isolation boundary. Within that boundary, make full use of managed agents and the development environment — while keeping code review with the orchestrator.
 
 ---
 
@@ -1445,7 +1476,7 @@ Do not turn routine development operations back into instructions for the user w
 
 | Situation | Do | Avoid |
 | --------- | -- | ----- |
-| Substantial work | launch an agent with a precise prompt | long improvised shell scripts |
+| Substantial implementation/investigation work | launch an agent with a precise prompt | long improvised shell scripts |
 | Tiny deterministic observation | direct shell command | spinning up an agent |
 | Agent looks slow | check status, then a log tail | stopping or nagging it |
 | Course correction | a steering prompt with acceptance criteria | frequent steering |
@@ -1453,16 +1484,16 @@ Do not turn routine development operations back into instructions for the user w
 | Several outstanding jobs | poll all outstanding root UUIDs together in one bounded query | polling parallel jobs one-by-one |
 | Work is still outstanding | make another bounded observation/polling step in the current turn | ending the turn to "wait" passively |
 | Stalled work | inspect the exact agent/job status and log, then continue or report a blocker | replacing polling with prose such as "waiting for it to finish" |
-| Acceptance | contract-based tests, independent agent | tests derived from the implementation |
-| Verification | read the diff, review invariants, full checks | trusting a report of green |
-| Code review | run a read-only review pass before merge; see `docs/skills/review.md` | merging unreviewed work |
-| Reconcile | deliberate integration branch, checks after each step | blind merge, forced resolves |
-| Branches/PRs | push work branches early and keep them pushed; draft PR early; review before merge; merge when green | unpushed branches, unmerged dangling branches, force-pushed review history |
+| Acceptance | contract-based tests, independent acceptance agent | tests derived from the implementation |
+| Verification | objective state checks + full validation | trusting a report of green |
+| Code review | orchestrator reviews the open PR diff with the GitHub plugin; follow `docs/skills/review.md` | delegating review to `lubko-agent`, accepting an agent review, or merging unreviewed work |
+| Reconcile | deliberate integration branch, checks after each step, integration PR reviewed by orchestrator | blind merge, forced resolves |
+| Branches/PRs | push work branches early and keep them pushed; open draft PR immediately after the first reviewable commit so the plugin has a useful diff; re-review after material updates | unpushed branches, late/no PR, unmerged dangling branches, force-pushed review history |
 | Base commits | cut branches from a known, clean, tested SHA | cutting from a drifted tree |
 | Blockers/correctness bugs | fix before merge, on the current PR | merging known-correctness bugs |
 | Important non-critical findings | open an issue with context, rationale, evidence, and a link to the branch/commit; postpone | expanding the current task / losing the finding in logs or chat |
 | GitHub issue ownership | one editable status comment; update it at least every 5 minutes; use GitHub `updated_at`; inherit after 10 minutes stale | inferring ownership from agent or command activity |
 | Commit/push/deploy | separate, explicit, in order; push work branches early; direct push to the default branch only with established user intent | conflating any two |
-| Deployment | only when asked, via the managed tool, then a real smoke | implicit deploy, manual signals |
+| Deployment | only when asked, via the managed tool, from a validated and orchestrator-reviewed commit, then a real smoke | implicit deploy, manual signals |
 | Secrets | design them out; verify by absence | printing/dumping values |
 | Destructive action | only after durable rollback state exists | delete-then-hope |

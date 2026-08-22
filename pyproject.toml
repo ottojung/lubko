@@ -78,6 +78,11 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
+"src/lubko/_start_gate.py" = [
+    "start-process-with-no-shell",
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
 "src/lubko/install.py" = [
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",

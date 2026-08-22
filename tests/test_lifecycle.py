@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import psycopg
 import pytest
+from psycopg.rows import tuple_row
 
 from lubko import cli, lifecycle, supervise, toolchain
 from lubko import deployctl as dc
@@ -667,7 +668,11 @@ def test_deploy_success_replaces_worker(
         assert meta.state == lifecycle.STATE_RUNNING
         assert meta.pid == spawned[0].pid
         assert meta.git_commit == GIT_SHA
-        assert lifecycle.worker_log_path().is_file()
+        assert meta.log_path
+        log_p = Path(meta.log_path)
+        assert log_p.parent.name == "logs"
+        assert log_p.name.startswith("worker-")
+        assert log_p.name.endswith(".log")
         out = capsys.readouterr().out
         assert "deployed git commit" in out
         assert GIT_SHA in out
@@ -1107,6 +1112,7 @@ def test_restore_after_handoff_failure_keeps_fully_converged_candidate(
         lambda: supervise.SupervisorStatus(
             schema_version=supervise.SCHEMA_VERSION,
             supervisor_pid=1,
+            supervisor_start_time_ticks=1,
             started_at=0.0,
             applied_generation=2,
             mode=supervise.MODE_RUN,
@@ -1128,6 +1134,7 @@ def test_restore_after_handoff_failure_keeps_fully_converged_candidate(
             db_ready=True,
             ready=True,
             message=None,
+            worker_health=None,
         ),
     )
     requested: list[object] = []
@@ -1158,6 +1165,7 @@ def test_restore_after_handoff_failure_rolls_back_when_cli_stale(
         lambda: supervise.SupervisorStatus(
             schema_version=supervise.SCHEMA_VERSION,
             supervisor_pid=1,
+            supervisor_start_time_ticks=1,
             started_at=0.0,
             applied_generation=2,
             mode=supervise.MODE_RUN,
@@ -1179,6 +1187,7 @@ def test_restore_after_handoff_failure_rolls_back_when_cli_stale(
             db_ready=True,
             ready=True,
             message=None,
+            worker_health=None,
         ),
     )
     requested: list[tuple[str, str, str]] = []
@@ -1689,7 +1698,11 @@ def test_stop_worker_refuses_wrong_marker(
         meta = meta_for_process(proc, tmp_path)
         forged = replace(meta, token=OTHER_MARKER)
         assert not lifecycle.worker_alive(forged)
-        assert lifecycle.stop_worker(forged, 0.2)
+        # The exact process is alive but carries a different lifecycle token, so
+        # it is a live, unowned process: retirement is refused (reported False)
+        # and the process must NOT be signalled.
+        stopped = lifecycle.stop_worker(forged, 0.2)
+        assert stopped is False
         assert proc.poll() is None
     finally:
         kill_proc(proc)
@@ -2730,3 +2743,131 @@ def test_repair_refuses_a_foreground_worker(
             proc.kill()
         proc.wait(timeout=5)
         guard.unregister(proc)
+
+
+def test_process_has_token_rejects_adjacent_env_key() -> None:
+    """A different env key containing the token substring is never accepted.
+
+    ``/proc/<pid>/environ`` is NUL-separated; a naive ``marker in environ``
+    byte-substring check would accept ``X_LUBKO_LIFECYCLE_TOKEN=<token>``
+    because the expected ``LUBKO_LIFECYCLE_TOKEN=<token>`` appears as a
+    suffix of the adjacent entry's bytes.  The function must parse NUL-
+    separated entries and require exact ``KEY=VALUE`` equality.
+    """
+    token = uuid4().hex
+    wrong_key_env = dict(os.environ)
+    wrong_key_env["X_LUBKO_LIFECYCLE_TOKEN"] = token
+    wrong_proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=wrong_key_env,
+    )
+    guard.register(wrong_proc)
+    try:
+        assert not lifecycle.process_has_token(wrong_proc.pid, token)
+    finally:
+        if wrong_proc.poll() is None:
+            wrong_proc.kill()
+        wrong_proc.wait(timeout=5)
+        guard.unregister(wrong_proc)
+
+    exact_env = dict(os.environ)
+    exact_env[lifecycle.LIFECYCLE_MARKER_VAR] = token
+    exact_proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=exact_env,
+    )
+    guard.register(exact_proc)
+    try:
+        assert lifecycle.process_has_token(exact_proc.pid, token)
+    finally:
+        if exact_proc.poll() is None:
+            exact_proc.kill()
+        exact_proc.wait(timeout=5)
+        guard.unregister(exact_proc)
+
+
+def test_probe_job_independent_of_sys_executable_and_runtime_path(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readiness probe must not depend on sys.executable or the runtime dir.
+
+    Production proved that ``lifecycle._insert_probe_job`` uses
+    ``[sys.executable, -c, sleep]`` and a still-running supervisor loses
+    readiness after its immutable runtime directory is pruned.  The probe
+    process must be a static binary independent of the supervisor runtime
+    path.  This test both inspects the probe payload (unit) and runs the
+    probe through a real worker (E2E) to prove the exact-worker
+    queue-roundtrip proof, cancellation, terminal wait, cleanup, and
+    process isolation are preserved.
+    """
+    del jobs_db
+    conf = write_database_config(tmp_path, pg_cluster)
+    monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(conf))
+    conn = psycopg.connect(load_database_config().conninfo(), autocommit=True)
+    try:
+        probe_id = lifecycle._insert_probe_job(conn, str(tmp_path))
+        assert probe_id is not None
+
+        with conn.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(
+                "SELECT (payload::jsonb)->'request'->'process' FROM lubko.jobs WHERE id = %s",
+                (probe_id,),
+            )
+            row = cursor.fetchone()
+        assert row is not None
+        process_argv = row[0]
+        assert isinstance(process_argv, list)
+        assert len(process_argv) >= 2
+
+        assert sys.executable not in process_argv, (
+            f"probe process must not reference sys.executable ({sys.executable!r}); "
+            "the readiness probe must be independent of the supervisor runtime path"
+        )
+
+        runtime_dir = Path(sys.prefix)
+        for element in process_argv:
+            assert str(runtime_dir) not in str(element), (
+                f"probe process element {element!r} references the runtime directory "
+                f"({runtime_dir!r}); the readiness probe must be independent of the "
+                "supervisor runtime path"
+            )
+
+        worker = spawn_real_worker(conf)
+        try:
+            try:
+                outcome = lifecycle._wait_for_probe_claim(
+                    conn, probe_id, REPAIR_WORKER_ID, worker.pid, 10.0
+                )
+                assert outcome is True, "exact worker must claim the probe proving queue-roundtrip"
+            finally:
+                with suppress(psycopg.Error):
+                    request_cancel(conn, probe_id)
+                lifecycle._wait_for_probe_terminal(conn, probe_id, 10.0)
+                with suppress(psycopg.Error):
+                    delete_job_and_chunks(conn, probe_id)
+
+            with conn.cursor(row_factory=tuple_row) as cursor:
+                cursor.execute(
+                    "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
+                    (probe_id,),
+                )
+                terminal_row = cursor.fetchone()
+            assert terminal_row is None, "probe row must be deleted after terminal, proving cleanup"
+            assert worker.poll() is None, "worker must still be alive after probe lifecycle"
+        finally:
+            kill_proc(worker)
+    finally:
+        conn.close()

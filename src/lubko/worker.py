@@ -17,11 +17,12 @@ runs a small non-blocking turn whenever one fires: a PostgreSQL notification (a
 job was submitted or a running job was cancelled — wakeups only; the durable
 scans they trigger remain authoritative), a child exit, a graceful-shutdown
 request, or a genuine timer deadline (stale-lease recovery, lease refresh,
-output publication, child observation/escalation, reconnect). Claiming and
-cancellation discovery are wake-driven and never run on a fixed idle tick. Each
-turn services running jobs (observe exits, escalate cancellations, publish
-changed output tails/chunks, finalize completed jobs), refreshes leases and
-runs recovery housekeeping, then claims and starts more pending jobs. There is
+transport garbage collection, output publication, child observation/escalation,
+reconnect). Claiming and cancellation discovery are wake-driven and never run
+on a fixed idle tick. Each turn services running jobs (observe exits, escalate
+cancellations, publish changed output tails/chunks, finalize completed jobs),
+refreshes leases, runs recovery housekeeping, retries pending terminalizations,
+collects transport garbage, then claims and starts more pending jobs. There is
 no application-level concurrency limit; the ``active`` registry is unbounded
 and only the number of claims performed in a single supervisor turn is bounded
 for fairness.
@@ -32,6 +33,12 @@ any worker running a recovery pass atomically marks the abandoned job
 ``failed`` with a clear diagnostic rather than re-executing it. Recovery is
 atomic across many workers and never steals a genuinely live job, whose lease
 is continuously refreshed.
+
+Transport garbage collection removes terminal command rows and their owned
+output chunks after a configurable safe retention window.  Abandoned running
+rows first go through lease recovery; pending and running rows are never
+collected.  Root-first deletion serializes with concurrent output publication,
+and bounded batches ensure the pass never monopolizes the connection.
 
 During a database outage the supervisor stops claiming new jobs but keeps the
 in-memory registry, keeps reaping/observing child processes locally, retries
@@ -51,6 +58,7 @@ no new chunk rows. Archiving never shortens the live tail. See
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -58,10 +66,12 @@ import select
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 from uuid import uuid4
@@ -69,7 +79,18 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import tuple_row
 
+from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config
+from lubko.health import (
+    WorkerHealth,
+    configure_worker_logging,
+    install_worker_exception_hooks,
+    interpret_worker_health,
+    proc_start_ticks,
+    read_worker_health,
+    worker_under_lifecycle,
+    write_worker_health,
+)
 from lubko.protocol import (
     OUTPUT_CHUNK_MAX_BYTES,
     OUTPUT_TAIL_MAX_BYTES,
@@ -79,25 +100,73 @@ from lubko.protocol import (
     build_output_window_payload,
     parse_payload,
 )
+from lubko.state import state_root
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
     from uuid import UUID
 
     from lubko.config import DatabaseConfig
 
 JobsConnection = psycopg.Connection[tuple[Any, ...]]
 
+
+def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None) -> bool:
+    """Classify a database error as a connectivity issue vs. a per-job deterministic failure.
+
+    Connectivity errors require entering outage handling and reconnecting.
+    Per-job deterministic errors (for example data representation failures)
+    are logged and the offending job is quarantined, but the connection
+    remains usable and other jobs are unaffected.
+
+    Classification rules (applied in order):
+
+    * SQLSTATE class ``08`` (connection exception) is always connectivity.
+    * An ``OperationalError`` on a broken or closed connection is always
+      connectivity, regardless of whether a SQLSTATE is populated (real
+      server shutdowns/failovers can surface as OperationalError with a
+      non-08 SQLSTATE while the connection is already unusable).
+    * Everything else (including server-side ``DataError``,
+      ``ProgrammingError``, ``IntegrityError``) is a per-job deterministic
+      failure.
+
+    Args:
+        exc: The caught psycopg exception.
+        conn: The current database connection, or ``None``.
+
+    Returns:
+        ``True`` when the error indicates a lost/unusable connection.
+    """
+    sqlstate = exc.sqlstate
+    if sqlstate is not None and sqlstate.startswith("08"):
+        return True
+    return (
+        isinstance(exc, psycopg.OperationalError)
+        and conn is not None
+        and (conn.broken or conn.closed)
+    )
+
+
 LOGGER: Final = logging.getLogger(__name__)
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_PROCESS_POLL_INTERVAL_SECONDS: Final = 0.1
 DEFAULT_CANCEL_GRACE_SECONDS: Final = 5.0
+#: Bounded finalization overhead the outer lifecycle authority must let the
+#: worker keep before it may treat a still-alive worker as wedged and issue an
+#: emergency SIGKILL. The outer wait deadline is ``max(stop_grace,
+#: cancel_grace + this)`` so the two timers can never race.
+DRAIN_OVERHEAD_SLACK_SECONDS: Final = 2.0
 DEFAULT_LEASE_DURATION_SECONDS: Final = 30.0
 DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS: Final = 5.0
 DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS: Final = 10.0
 DEFAULT_OUTPUT_PUBLICATION_INTERVAL_SECONDS: Final = 1.0
+DEFAULT_HEALTH_PUBLISH_INTERVAL_SECONDS: Final = 1.0
 DEFAULT_CLAIM_BATCH_LIMIT: Final = 8
 DEFAULT_LEASE_SAFETY_MARGIN_SECONDS: Final = 5.0
 DEFAULT_DB_OPERATION_TIMEOUT_SECONDS: Final = 15.0
+DEFAULT_GC_RETENTION_SECONDS: Final = 3600.0
+DEFAULT_GC_INTERVAL_SECONDS: Final = 60.0
+DEFAULT_GC_BATCH_LIMIT: Final = 100
 LEASE_RECOVERY_LIMIT: Final = 100
 CANCEL_DISCOVERY_LIMIT: Final = 100
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
@@ -133,6 +202,9 @@ STOP_REASON_SHUTDOWN: Final = "shutdown"
 STOP_REASON_LEASE: Final = "lease"
 STOP_REASON_ROW_LOST: Final = "row_lost"
 STOP_REASON_PERSIST: Final = "persist"
+STOP_REASON_QUARANTINE: Final = "quarantine"
+QUARANTINE_MAX_RETRIES: Final = 5
+QUARANTINE_RETRY_BASE_SECONDS: Final = 0.5
 JOB_ID_ENV: Final = "LUBKO_JOB_ID"
 
 
@@ -219,6 +291,7 @@ class ActiveJob:
     pid: int
     pgid: int
     started_mono: float
+    claimed_at: float
     stdout: OutputStream = field(init=False)
     stderr: OutputStream = field(init=False)
     completed: bool = False
@@ -232,7 +305,30 @@ class ActiveJob:
     lease_evicted: bool = False
     row_lost: bool = False
     finalized: bool = False
+    quarantined: bool = False
+    quarantine_pending: bool = False
+    quarantine_retries: int = 0
+    quarantine_next_retry_at: float = 0.0
+    # Conservative monotonic origin of the last committed lease event (the claim
+    # grant or a bulk refresh), captured before that database operation, never
+    # at commit time and never at spawn. Drives lease-safety eviction so a
+    # process can never outlive its database lease.
     last_heartbeat_at: float = 0.0
+
+
+@dataclass(slots=True)
+class _RetryTerminalization:
+    """Backoff bookkeeping for a job awaiting terminalization retry.
+
+    A claimed job whose immediate finalization write failed is kept locally
+    owned for retry so it stays represented.  Its lease is intentionally NOT
+    refreshed (it is not heartbeated merely because an unrelated job happens to
+    be active); it is left free to expire and be safely recovered as failed
+    rather than being silently dropped as an orphan.
+    """
+
+    retries: int = 0
+    next_retry_at: float = 0.0
 
 
 class SchemaInvariantError(RuntimeError):
@@ -248,27 +344,41 @@ class Settings:
     pass marks the abandoned job failed. The lease duration must comfortably
     exceed the refresh interval so a healthy long-running job is never stolen.
     ``claim_batch_limit`` is a fairness bound on how much claiming work one
-    supervisor turn performs, never a cap on concurrent jobs.
+    supervisor turn performs, never a cap on concurrent jobs.  Transport
+    garbage collection removes terminal rows and owned chunks after
+    ``gc_retention_seconds``, running in bounded batches every
+    ``gc_interval_seconds``.
     """
 
     worker_id: str
     poll_interval_seconds: float
     process_poll_interval_seconds: float
     cancel_grace_seconds: float
-    worker_incarnation: str = field(default_factory=lambda: uuid4().hex)
+    worker_incarnation: str = field(
+        default_factory=lambda: os.environ.get("LUBKO_LIFECYCLE_TOKEN", uuid4().hex)
+    )
     lease_duration_seconds: float = DEFAULT_LEASE_DURATION_SECONDS
     lease_refresh_interval_seconds: float = DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
     lease_recovery_interval_seconds: float = DEFAULT_LEASE_RECOVERY_INTERVAL_SECONDS
     output_publication_interval_seconds: float = DEFAULT_OUTPUT_PUBLICATION_INTERVAL_SECONDS
+    health_publish_interval_seconds: float = DEFAULT_HEALTH_PUBLISH_INTERVAL_SECONDS
     claim_batch_limit: int = DEFAULT_CLAIM_BATCH_LIMIT
     lease_safety_margin_seconds: float = DEFAULT_LEASE_SAFETY_MARGIN_SECONDS
     db_operation_timeout_seconds: float = DEFAULT_DB_OPERATION_TIMEOUT_SECONDS
+    gc_retention_seconds: float = DEFAULT_GC_RETENTION_SECONDS
+    gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
+    gc_batch_limit: int = DEFAULT_GC_BATCH_LIMIT
 
     def __post_init__(self) -> None:
-        """Validate lease timing so a live worker's lease never expires idle.
+        """Validate lease timing so a live worker's lease never expires idle."""
+        self._validate_lease_timing()
+        self._validate_output_and_gc()
+
+    def _validate_lease_timing(self) -> None:
+        """Validate lease-related settings are consistent.
 
         Raises:
-            ValueError: If any lease timing or fairness value is unusable.
+            ValueError: If any lease timing value is unusable.
         """
         if self.lease_duration_seconds <= 0:
             msg = "LUBKO_LEASE_DURATION_SECONDS must be positive"
@@ -294,14 +404,33 @@ class Settings:
                 "than LUBKO_LEASE_DURATION_SECONDS"
             )
             raise ValueError(msg)
+
+    def _validate_output_and_gc(self) -> None:
+        """Validate output publication and GC settings.
+
+        Raises:
+            ValueError: If any output or GC value is unusable.
+        """
         if self.output_publication_interval_seconds <= 0:
             msg = "LUBKO_OUTPUT_PUBLICATION_INTERVAL_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.health_publish_interval_seconds <= 0:
+            msg = "LUBKO_HEALTH_PUBLISH_INTERVAL_SECONDS must be positive"
             raise ValueError(msg)
         if self.claim_batch_limit <= 0:
             msg = "LUBKO_CLAIM_BATCH_LIMIT must be positive"
             raise ValueError(msg)
         if self.db_operation_timeout_seconds <= 0:
             msg = "LUBKO_DB_OPERATION_TIMEOUT_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.gc_retention_seconds < 0:
+            msg = "LUBKO_GC_RETENTION_SECONDS must be non-negative"
+            raise ValueError(msg)
+        if self.gc_interval_seconds <= 0:
+            msg = "LUBKO_GC_INTERVAL_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.gc_batch_limit <= 0:
+            msg = "LUBKO_GC_BATCH_LIMIT must be positive"
             raise ValueError(msg)
 
     @classmethod
@@ -355,6 +484,12 @@ class Settings:
                     str(DEFAULT_OUTPUT_PUBLICATION_INTERVAL_SECONDS),
                 )
             ),
+            health_publish_interval_seconds=float(
+                os.getenv(
+                    "LUBKO_HEALTH_PUBLISH_INTERVAL_SECONDS",
+                    str(DEFAULT_HEALTH_PUBLISH_INTERVAL_SECONDS),
+                )
+            ),
             claim_batch_limit=int(
                 os.getenv("LUBKO_CLAIM_BATCH_LIMIT", str(DEFAULT_CLAIM_BATCH_LIMIT))
             ),
@@ -370,6 +505,19 @@ class Settings:
                     str(DEFAULT_DB_OPERATION_TIMEOUT_SECONDS),
                 )
             ),
+            gc_retention_seconds=float(
+                os.getenv(
+                    "LUBKO_GC_RETENTION_SECONDS",
+                    str(DEFAULT_GC_RETENTION_SECONDS),
+                )
+            ),
+            gc_interval_seconds=float(
+                os.getenv(
+                    "LUBKO_GC_INTERVAL_SECONDS",
+                    str(DEFAULT_GC_INTERVAL_SECONDS),
+                )
+            ),
+            gc_batch_limit=int(os.getenv("LUBKO_GC_BATCH_LIMIT", str(DEFAULT_GC_BATCH_LIMIT))),
         )
 
 
@@ -381,12 +529,15 @@ class Settings:
 def truncate_output(data: bytes, limit: int) -> str:
     """Decode output while retaining at most the newest ``limit`` bytes.
 
+    The canonical :func:`pg_safe_decode` conversion is used so the result is
+    always safe for PostgreSQL ``text`` / ``jsonb``.
+
     Args:
         data: Raw process output.
         limit: Maximum number of bytes to retain.
 
     Returns:
-        UTF-8 text, replacing invalid byte sequences.
+        UTF-8 text, replacing invalid byte sequences and NUL.
 
     Raises:
         ValueError: If ``limit`` is too small for the truncation marker.
@@ -399,7 +550,7 @@ def truncate_output(data: bytes, limit: int) -> str:
         payload = TRUNCATION_MARKER + data[-(limit - len(TRUNCATION_MARKER)) :]
     else:
         payload = data
-    return payload.decode("utf-8", errors="replace")
+    return pg_safe_decode(payload)
 
 
 def read_output(path: Path) -> bytes:
@@ -442,8 +593,33 @@ def read_range(path: Path, start: int, end: int) -> bytes:
         return fh.read(end - start)
 
 
+def pg_safe_decode(data: bytes) -> str:
+    r"""Decode arbitrary bytes into a string that is safe for PostgreSQL text/jsonb.
+
+    Invalid UTF-8 byte sequences are replaced with U+FFFD (the standard
+    replacement character), and U+0000 (NUL) is replaced with U+FFFD.
+    PostgreSQL's ``text`` / ``jsonb`` representation rejects the JSON escape
+    sequence for U+0000 (``\\u0000``), so NUL must never survive into protocol
+    text.
+
+    The replacement is purely textual; raw byte offsets used for chunking and
+    live-tail windowing are computed before decoding and are never affected.
+
+    Args:
+        data: Arbitrary captured output bytes.
+
+    Returns:
+        UTF-8 text safe for PostgreSQL ``text`` / ``jsonb``.
+    """
+    return data.decode("utf-8", errors="replace").replace("\x00", "\ufffd")
+
+
 def decode_range(path: Path, start: int, end: int) -> str:
-    """Decode the bytes in ``[start, end)`` as UTF-8 text with replacement.
+    """Decode the bytes in ``[start, end)`` as PostgreSQL-safe UTF-8 text.
+
+    The canonical conversion uses :func:`pg_safe_decode`: invalid UTF-8 byte
+    sequences become U+FFFD and NUL (U+0000) is replaced with U+FFFD so the
+    result is always safe for PostgreSQL ``text`` / ``jsonb``.
 
     Args:
         path: Capture file for the stream.
@@ -453,7 +629,7 @@ def decode_range(path: Path, start: int, end: int) -> str:
     Returns:
         The decoded text.
     """
-    return read_range(path, start, end).decode("utf-8", errors="replace")
+    return pg_safe_decode(read_range(path, start, end))
 
 
 def output_window_text(path: Path, max_chars: int) -> tuple[str, int, int]:
@@ -539,7 +715,9 @@ def publish_output(
         cursor.execute(
             "SELECT id\n"
             "FROM lubko.jobs\n"
-            "WHERE id = %(job_id)s AND (payload::jsonb)->>'type' = 'command'\n"
+            "WHERE id = %(job_id)s\n"
+            "    AND (payload::jsonb)->>'type' = 'command'\n"
+            "    AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
             "FOR UPDATE\n",
             {"job_id": job.id},
         )
@@ -747,30 +925,46 @@ def _output_update_params(job_id: UUID, output: dict[str, dict[str, Any]]) -> di
 # ---------------------------------------------------------------------------
 
 
-def _persist_process(conn: JobsConnection, job_id: UUID, pid: int, pgid: int) -> None:
+def _persist_process(
+    conn: JobsConnection,
+    job_id: UUID,
+    pid: int,
+    pgid: int,
+    start_ticks: int,
+) -> None:
     """Persist the exact process identity of a running job.
 
-    The identity is written into ``payload.state.process_pid`` and
-    ``payload.state.process_pgid``, keeping the two-column table invariant.
+    The identity is written into ``payload.state.process_pid``,
+    ``payload.state.process_pgid`` and ``payload.state.process_start_time_ticks``,
+    keeping the two-column table invariant. The start-time ticks make later
+    emergency recovery PID-reuse-safe: a persisted group id that has been
+    recycled by an unrelated process no longer matches the recorded command and
+    is never signalled.
 
     Args:
         conn: Open PostgreSQL connection.
         job_id: Identifier of the running job.
         pid: Exact process ID of the spawned process.
         pgid: Exact process group ID of the spawned process.
+        start_ticks: Valid positive start-time ticks of the exact process,
+            obtained before the start gate was released.
     """
     set_chain = _jsonb_set_chain(
         "payload::jsonb",
         [
             ("state,process_pid", "to_jsonb(%s::int)"),
             ("state,process_pgid", "to_jsonb(%s::int)"),
+            (
+                "state,process_start_time_ticks",
+                "to_jsonb(%s::bigint)",
+            ),
             ("state,updated_at", UTC_ISO_SQL),
         ],
     )
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
             "UPDATE lubko.jobs\nSET payload = " + set_chain + "::text\nWHERE id = %s\n",
-            (pid, pgid, job_id),
+            (pid, pgid, start_ticks, job_id),
         )
 
 
@@ -832,6 +1026,265 @@ def group_has_members(pgid: int) -> bool:
     return True
 
 
+def drain_sentinel_dir() -> Path:
+    """Return the directory holding per-incarnation drain acknowledgement files.
+
+    Returns:
+        The drain sentinel directory under the Lubko worker state root.
+    """
+    return state_root() / "worker" / "drain"
+
+
+def drain_sentinel_path(incarnation: str) -> Path:
+    """Return the exact drain-sentinel path for an incarnation.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token).
+
+    Returns:
+        The sentinel file path.
+    """
+    return drain_sentinel_dir() / f"{incarnation}.drained"
+
+
+def write_drain_sentinel(incarnation: str) -> None:
+    """Atomically record that this worker has drained every owned group.
+
+    The sentinel is the explicit acknowledgement the outer lifecycle authority
+    observes: once present (and matching the incarnation), no command process
+    group owned by this worker can still be alive, so the worker may be reaped
+    or forgotten without leaking a side-effecting process.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token).
+    """
+    path = drain_sentinel_path(incarnation)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(f"{incarnation}\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def drain_sentinel_matches(incarnation: str) -> bool:
+    """Return whether a present drain sentinel exactly matches the incarnation.
+
+    Args:
+        incarnation: The worker incarnation (lifecycle token) to verify.
+
+    Returns:
+        ``True`` only when the sentinel exists and carries the exact token.
+    """
+    try:
+        return drain_sentinel_path(incarnation).read_text(encoding="utf-8").strip() == incarnation
+    except OSError:
+        return False
+
+
+def _owned_running_groups(conn: JobsConnection, incarnation: str) -> list[tuple[int, int | None]]:
+    """Return the exact (process group id, start-time ticks) of owned commands.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        incarnation: The worker incarnation (lifecycle token) to match.
+
+    Returns:
+        Pairs of the exact process group id and the persisted command start-time
+        ticks (``None`` when the legacy row never recorded ticks) for every
+        running command owned by the incarnation.
+    """
+    groups: list[tuple[int, int | None]] = []
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT id, (payload::jsonb)->'state'->>'process_pgid',\n"
+            "       (payload::jsonb)->'state'->>'process_start_time_ticks'\n"
+            "FROM lubko.jobs\n"
+            "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(inc)s\n"
+            "    AND (payload::jsonb)->'state'->>'process_pgid' IS NOT NULL\n",
+            {"inc": incarnation},
+        )
+        for row in cursor.fetchall():
+            pgid = row[1]
+            start_ticks = row[2]
+            if pgid is None:
+                continue
+            try:
+                pgid_i = int(str(pgid))
+            except ValueError:
+                continue
+            start_i: int | None = None
+            if start_ticks is not None:
+                try:
+                    start_i = int(str(start_ticks))
+                except ValueError:
+                    start_i = None
+            groups.append((pgid_i, start_i))
+    return groups
+
+
+class GroupReclaimDecision(Enum):
+    """Disposition of one persisted owned command group during recovery.
+
+    Attributes:
+        GONE: The group has no live members, so it is already safely reaped and
+            recovery has converged for it (no signal, no obligation).
+        RECLAIM: The group has live members and its persisted start-time ticks
+            are valid/positive and exactly match the live leader's ticks, so it
+            is provably our command and safe to signal.
+        UNRESOLVED: The group has live members but its exact identity cannot be
+            proven — missing, malformed, unreadable, or mismatched persisted
+            start-time ticks. It must NOT be signalled, and it remains a durable
+            blocking obligation until it is proven dead/recovered by some other
+            means (e.g. the unrelated process exits) so the orchestrator holds
+            rather than handing off sole-consumer authority alongside a
+            potentially stranger-owned group.
+    """
+
+    GONE = auto()
+    RECLAIM = auto()
+    UNRESOLVED = auto()
+
+
+def _group_reclaim_decision(pgid: int, start_ticks: int | None) -> GroupReclaimDecision:
+    """Decide how to treat one persisted owned command group during recovery.
+
+    A live group may be signalled only when it has members and its persisted
+    ``process_start_time_ticks`` is valid/positive and exactly matches the live
+    group leader's start-time ticks. Anything the persisted identity cannot
+    prove is treated as unresolved (never signalled) so a recycled or stranger
+    group is never killed, but it still blocks retirement until it converges.
+
+    Args:
+        pgid: The persisted process group id.
+        start_ticks: The persisted command start-time ticks, ``None`` for a
+            legacy row that never recorded them.
+
+    Returns:
+        The :class:`GroupReclaimDecision` for this group.
+    """
+    if not group_has_members(pgid):
+        return GroupReclaimDecision.GONE
+    if not isinstance(start_ticks, int) or start_ticks <= 0:
+        # Missing (legacy/None) or malformed/non-positive ticks: we cannot prove
+        # the live group is our command, so never signal it — but it is still
+        # alive, so it remains a durable blocking obligation.
+        return GroupReclaimDecision.UNRESOLVED
+    live_ticks = proc_start_ticks(pgid)
+    if live_ticks is None:
+        # The leader's identity is unreadable; fail closed rather than risk a
+        # mis-signal, but keep the group as a blocking obligation.
+        return GroupReclaimDecision.UNRESOLVED
+    if live_ticks != start_ticks:
+        # The persisted group id has been recycled by an unrelated process (or
+        # the wrong command): it is not ours, so never signal it. It stays a
+        # blocking obligation until the stranger's group exits and converges.
+        return GroupReclaimDecision.UNRESOLVED
+    return GroupReclaimDecision.RECLAIM
+
+
+@dataclass(frozen=True)
+class ReclaimedGroups:
+    """Exact-owned command groups after an emergency recovery pass.
+
+    Attributes:
+        reaped: Exact process-group ids that were signalled and proven dead.
+        surviving: Exact process-group ids that were proven ours, signalled,
+            but could not be proven dead within the cancel grace. These are a
+            durable blocking obligation: the orchestrator must not clear the
+            retired worker's sole-consumer authority or spawn a replacement
+            until they are proven dead/recovered.
+        unresolved: Exact process-group ids that have live members but whose
+            exact identity could not be proven (missing/malformed/unreadable/
+            mismatched persisted start-time ticks). They are never signalled,
+            but remain a durable blocking obligation exactly like ``surviving``:
+            the orchestrator must hold and retry rather than clear authority or
+            start a replacement.
+    """
+
+    reaped: list[int]
+    surviving: list[int]
+    unresolved: list[int]
+
+
+def _terminate_one_group(pgid: int, cancel_grace_seconds: float) -> bool:
+    """Ask one exact process group to terminate, then SIGKILL and reap it.
+
+    Args:
+        pgid: Exact process group id to terminate.
+        cancel_grace_seconds: Grace before escalating to SIGKILL.
+
+    Returns:
+        ``True`` only when the group is proven to have no surviving members
+        after the SIGKILL + reap wait, so the caller knows it is safe to treat
+        the recovery as complete.
+    """
+    _signal_group(pgid, signal.SIGTERM)
+    term_deadline = time.monotonic() + cancel_grace_seconds
+    while time.monotonic() < term_deadline and group_has_members(pgid):
+        time.sleep(0.05)
+    if group_has_members(pgid):
+        _signal_group(pgid, signal.SIGKILL)
+    reap_deadline = time.monotonic() + cancel_grace_seconds
+    while time.monotonic() < reap_deadline and group_has_members(pgid):
+        time.sleep(0.05)
+    return not group_has_members(pgid)
+
+
+def recover_owned_job_groups(
+    conn: JobsConnection,
+    incarnation: str,
+    cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
+) -> ReclaimedGroups:
+    """Terminate any live command process group still owned by an incarnation.
+
+    This is the exact-ownership emergency recovery used after a maintained
+    worker was force-killed while it still owned command process groups (a
+    wedged worker whose own graceful drain never ran). Every acting target is an
+    exact process group id persisted in the job row (``state.process_pgid``) for
+    a ``running`` command whose ``worker_incarnation`` matches, so no
+    process-name match or broad ``pkill``/``killall`` is ever used.
+
+    A live group is signalled only when its persisted ``process_start_time_ticks``
+    is valid/positive and exactly matches the live leader's start-time ticks
+    (see :func:`_group_reclaim_decision`): this makes recovery PID-reuse-safe
+    and fail-closed. A group whose exact identity cannot be proven — missing,
+    malformed, unreadable, or mismatched ticks while it still has members — is
+    never signalled and is reported as ``unresolved`` so the orchestrator holds
+    rather than handing off sole-consumer authority alongside a possibly
+    stranger-owned group. A group with no live members has already converged.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        incarnation: The worker incarnation (lifecycle token) whose groups to
+            recover.
+        cancel_grace_seconds: Grace before escalating to SIGKILL.
+
+    Returns:
+        A :class:`ReclaimedGroups` describing which exact groups were reaped,
+        which verified-ours groups survived the cancel grace, and which live
+        groups could not be identity-verified (unresolved).
+    """
+    groups = _owned_running_groups(conn, incarnation)
+    if not groups:
+        return ReclaimedGroups(reaped=[], surviving=[], unresolved=[])
+    reaped: list[int] = []
+    surviving: list[int] = []
+    unresolved: list[int] = []
+    for pgid, start_ticks in groups:
+        decision = _group_reclaim_decision(pgid, start_ticks)
+        if decision is GroupReclaimDecision.GONE:
+            continue
+        if decision is GroupReclaimDecision.RECLAIM:
+            if _terminate_one_group(pgid, cancel_grace_seconds):
+                reaped.append(pgid)
+            else:
+                surviving.append(pgid)
+        else:
+            unresolved.append(pgid)
+    return ReclaimedGroups(reaped=reaped, surviving=surviving, unresolved=unresolved)
+
+
 def _wait_for_session(pid: int) -> int:
     """Wait until a spawned process establishes its own session and group.
 
@@ -869,8 +1322,12 @@ def _cleanup_output_files(stdout_path: Path, stderr_path: Path) -> None:
     stderr_path.unlink(missing_ok=True)
 
 
-def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
-    """Start a job as a new session and process group leader.
+#: Path of the tiny dedicated start-gate wrapper exec'd by :func:`spawn_job`.
+_START_GATE_WRAPPER: Final = Path(__file__).with_name("_start_gate.py")
+
+
+def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
+    """Start a job behind a persist-before-exec START GATE.
 
     The job's required ``process`` argv is executed directly as the new
     process; the worker never invokes a shell, so argv elements are passed to
@@ -882,41 +1339,202 @@ def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int]:
     identify its owning queue row deterministically without depending on the
     timing of any later database write.
 
+    The wrapper (not the user program) is the dedicated session/process-group
+    leader. It inherits a gate file descriptor and blocks on it before exec'ing
+    the user argv, so ``Popen`` returns while the wrapper is still gated. The
+    caller must durably persist the exact process identity (PID/PGID/start-time
+    ticks) and then call :func:`release_gate` on the returned gate write end.
+    Only then does the wrapper exec the user code on the exact same PID. If the
+    worker dies before releasing, the kernel closes the gate write end, the
+    wrapper reads EOF, and it exits WITHOUT executing any user code — so a
+    forced SIGKILL in the spawn->persist window can never leave a user side
+    effect running with no durable identity to recover it. The gate is not
+    implemented with ``preexec_fn``: that would let ``Popen`` return only after
+    the child had already run, defeating the gate.
+
     Args:
         job: Claimed job to execute.
 
     Returns:
-        The running process, its capture file paths, and its process group ID.
+        The running gated process, its capture file paths, its process group
+        ID, and the worker-side write end of the start gate.
 
     Raises:
         OSError: If the process cannot be started.
     """
-    argv = list(job.process)
     env = dict(os.environ)
     env[JOB_ID_ENV] = str(job.id)
     stdout_fd, stdout_name = tempfile.mkstemp()
     stderr_fd, stderr_name = tempfile.mkstemp()
     stdout_path = Path(stdout_name)
     stderr_path = Path(stderr_name)
+    gate_read_fd, gate_write_fd = os.pipe()
+    # The read end must survive the wrapper's exec, so it must not be
+    # close-on-exec. Declaring it in ``pass_fds`` makes ``subprocess`` clear the
+    # close-on-exec flag on the child side of the fork, so the wrapper blocks on
+    # it across the exec boundary. The descriptor number is passed to the
+    # wrapper through the environment (not ``argv``) because a Python launcher
+    # re-exec can shift ``argv`` and would otherwise misalign the argument.
+    env["LUBKO_START_GATE_FD"] = str(gate_read_fd)
     try:
         proc = subprocess.Popen(
-            argv,
+            [sys.executable, os.fspath(_START_GATE_WRAPPER), *job.process],
             cwd=job.cwd,
             stdin=subprocess.DEVNULL,
             stdout=stdout_fd,
             stderr=stderr_fd,
             start_new_session=True,
             env=env,
+            pass_fds=(gate_read_fd,),
         )
     except OSError:
+        os.close(gate_read_fd)
+        os.close(gate_write_fd)
         os.close(stdout_fd)
         os.close(stderr_fd)
         _cleanup_output_files(stdout_path, stderr_path)
         raise
+    # The wrapper holds the read end; the worker must not keep a copy of it.
+    os.close(gate_read_fd)
     os.close(stdout_fd)
     os.close(stderr_fd)
     pgid = _wait_for_session(proc.pid)
-    return proc, stdout_path, stderr_path, pgid
+    return proc, stdout_path, stderr_path, pgid, gate_write_fd
+
+
+def release_gate(gate_fd: int) -> bool:
+    """Release a gated start so the wrapper execs the user argv.
+
+    Writes the single release control byte and closes the worker's gate write
+    end. The wrapper reads the byte and execs the user program on the exact
+    same PID whose identity the caller has already durably persisted. If this
+    process dies before closing, the kernel closes the write end and the
+    wrapper reads EOF and exits without executing any user code.
+
+    A failure to write the release byte is reported, never silently swallowed:
+    the caller must treat it as a start failure and abort the gated start so
+    the job does not later look like a normally completed user command.
+
+    Args:
+        gate_fd: The worker-side write end of the start gate pipe.
+
+    Returns:
+        ``True`` when the release byte was written (the wrapper will exec the
+        user argv); ``False`` when the write failed, in which case the wrapper
+        can never be released by this handle.
+    """
+    try:
+        os.write(gate_fd, GATE_RELEASE_BYTE)
+    except OSError:
+        with suppress(OSError):
+            os.close(gate_fd)
+        return False
+    with suppress(OSError):
+        os.close(gate_fd)
+    return True
+
+
+@dataclass(frozen=True)
+class GatedSpawn:
+    """Handles and exact identity of one gated start produced by ``spawn_job``.
+
+    Attributes:
+        proc: The gated wrapper process.
+        pgid: Exact process group id of the gated wrapper.
+        stdout_path: Capture file for standard output.
+        stderr_path: Capture file for standard error.
+        gate_fd: The worker-side write end of the start gate pipe.
+    """
+
+    proc: subprocess.Popen[bytes]
+    pgid: int
+    stdout_path: Path
+    stderr_path: Path
+    gate_fd: int
+
+
+def abort_gated_start(
+    proc: subprocess.Popen[bytes],
+    pgid: int,
+    stdout_path: Path,
+    stderr_path: Path,
+    gate_fd: int,
+) -> bool:
+    """Abort a gated start using ONLY its exact direct-child identity.
+
+    Used when the exact process identity could not be obtained or durably
+    persisted, or when the gate release itself failed: the gate is closed
+    WITHOUT the release byte so the wrapper exits on EOF. The dedicated group
+    is SIGKILLed only WHILE the exact ``Popen`` remains live — before a
+    successful release it is this process's own childless session leader, so
+    the group is provably ours. Once the direct child becomes terminal and is
+    reaped, the original unreleased childless group is gone by construction
+    and the numeric PGID is deliberately NEVER used again as proof or target,
+    because it could already have been reused by an unrelated process.
+
+    Args:
+        proc: The gated wrapper process.
+        pgid: Exact process group id of the wrapper (used only while the
+            wrapper itself is still live).
+        stdout_path: Capture file for standard output.
+        stderr_path: Capture file for standard error.
+        gate_fd: The worker-side write end of the start gate pipe.
+
+    Returns:
+        ``True`` when the direct child is terminal, reaped, and the capture
+        files were removed (the unreleased group is gone by construction);
+        ``False`` when the child remained live after the bounded first attempt,
+        in which case :func:`await_gated_group_gone` owns it until reap.
+    """
+    # Close the gate WITHOUT releasing: the wrapper reads EOF and exits.
+    with suppress(OSError):
+        os.close(gate_fd)
+    deadline = time.monotonic() + 5.0
+    while proc.poll() is None and time.monotonic() < deadline:
+        _signal_group(pgid, signal.SIGKILL)
+        time.sleep(0.02)
+    if proc.poll() is not None:
+        with suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        stdout_path.unlink(missing_ok=True)
+        stderr_path.unlink(missing_ok=True)
+        return True
+    LOGGER.error(
+        "gated wrapper %d (exact group %d) stayed live through the bounded "
+        "abort attempt; handing to the blocking direct-child convergence loop",
+        proc.pid,
+        pgid,
+    )
+    return False
+
+
+def await_gated_group_gone(gated: GatedSpawn) -> None:
+    """Block until the unreleased gated wrapper is terminal and reaped.
+
+    Stronger gated-wrapper invariant: before a successful release,
+    ``_start_gate.py`` is this process's DIRECT child, started with
+    ``start_new_session=True``, and is childless. While
+    ``gated.proc.poll()`` is ``None`` the PID cannot be reused and its
+    dedicated process group is provably ours, so repeatedly SIGKILLing that
+    exact group is authorized. This synchronously blocks — there is no
+    timeout return while the pre-release child remains live. Once the direct
+    child is terminal and reaped, the original unreleased childless group is
+    gone by construction; the numeric PGID is deliberately never polled or
+    signalled afterwards, because it could later be reused by a stranger.
+
+    Args:
+        gated: Handles and exact identity of the gated start to converge.
+    """
+    while gated.proc.poll() is None:
+        _signal_group(gated.pgid, signal.SIGKILL)
+        time.sleep(0.05)
+    with suppress(subprocess.TimeoutExpired):
+        gated.proc.wait(timeout=5)
+    # The direct child is reaped: the original unreleased childless group is
+    # gone by construction. Clean up captures now; never touch the numeric
+    # PGID again (it may already be reused by an unrelated process).
+    gated.stdout_path.unlink(missing_ok=True)
+    gated.stderr_path.unlink(missing_ok=True)
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -1104,16 +1722,25 @@ def request_cancel(conn: JobsConnection, job_id: UUID) -> str:
     return str(row[0])
 
 
-def bulk_refresh_leases(conn: JobsConnection, settings: Settings) -> list[UUID]:
-    """Refresh the lease of every running command row owned by this worker.
+def bulk_refresh_leases(
+    conn: JobsConnection, settings: Settings, root_ids: Collection[UUID]
+) -> list[UUID]:
+    """Refresh the lease of the given owned running command rows.
 
-    One statement updates all owned running command rows in a single atomic
-    JSON compare-and-swap, keeping heartbeats efficient under many concurrent
-    jobs.
+    One statement updates only the explicitly listed root IDs in a single
+    atomic JSON compare-and-swap, keeping heartbeats efficient under many
+    concurrent jobs while never touching a row the worker does not locally own.
+    The caller is responsible for passing exactly the locally-owned active or
+    retry-owned root IDs; this scoping is what guarantees an orphaned owned row
+    (for example a claimed job whose immediate finalization write failed) is
+    never heartbeated merely because another job is active.
 
     Args:
         conn: Open PostgreSQL connection.
         settings: Worker runtime settings.
+        root_ids: The exact root IDs whose lease should be refreshed. Rows whose
+            ID is not in this collection are left untouched even if they are
+            owned by this worker.
 
     Returns:
         The IDs of the rows whose lease was refreshed.
@@ -1133,15 +1760,56 @@ def bulk_refresh_leases(conn: JobsConnection, settings: Settings) -> list[UUID]:
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
             "    AND (payload::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"
             "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"
+            "    AND id = ANY(%(root_ids)s)\n"
             "RETURNING id\n",
             {
                 "lease_duration_seconds": settings.lease_duration_seconds,
                 "worker_id": settings.worker_id,
                 "worker_incarnation": settings.worker_incarnation,
+                "root_ids": list(root_ids),
             },
         )
         rows = cursor.fetchall()
     return [row[0] for row in rows]
+
+
+def apply_lease_refresh(
+    active: dict[UUID, ActiveJob],
+    refreshed: set[UUID],
+    refresh_mono: float,
+) -> None:
+    """Advance the local lease deadline only for rows whose refresh committed.
+
+    The local lease-safety deadline is advanced exclusively for the job
+    identifiers returned by a *committed* bulk refresh, and it is anchored to
+    ``refresh_mono`` (the monotonic time captured before the refresh database
+    operation, never at commit time) so the deadline never exceeds the database
+    lease.  A refresh that fails to commit never yields a refreshed set, so
+    this function is never invoked with one and a missed heartbeat can never
+    silently extend a job's safe lifetime.
+
+    Only locally-owned active jobs that were eligible for a heartbeat in the
+    first place are considered; quarantined, row-lost, lease-evicted, and
+    finalized jobs are intentionally skipped even when not in ``refreshed``,
+    because they were never part of the refresh and must not be stopped as if a
+    stale recovery had taken their row.
+
+    Args:
+        active: The supervisor's active job registry.
+        refreshed: Identifiers whose lease was refreshed and committed.
+        refresh_mono: Monotonic time captured before the refresh committed.
+    """
+    for job_id, job in list(active.items()):
+        if job.finalized or job.quarantined or job.row_lost or job.lease_evicted:
+            continue
+        if job_id in refreshed:
+            job.last_heartbeat_at = refresh_mono
+        else:
+            # The row is no longer running (for example it was recovered by
+            # another worker): never let the live process continue.
+            LOGGER.warning("job %s is no longer running in the database; stopping it", job_id)
+            job.row_lost = True
+            request_stop(job, STOP_REASON_ROW_LOST)
 
 
 def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUID]:
@@ -1363,6 +2031,70 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
     return _read_job_status(conn, job_id)
 
 
+def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str) -> bool:
+    """Terminalize a job that hit a deterministic database error.
+
+    Writes a ``failed`` terminal status directly, bypassing the normal
+    finalization path so publication/finalization data errors cannot block
+    terminalization. Only non-terminal rows are updated: already-terminal
+    rows are left untouched.
+
+    A connectivity error during the terminalization attempt is re-raised
+    so the caller can enter outage handling; a different deterministic
+    error is logged and returns ``False`` so the caller can retry later.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        job_id: Identifier of the job to quarantine.
+        reason: PostgreSQL-safe diagnostic text (no NUL bytes).
+
+    Returns:
+        ``True`` when the row was successfully terminalized or was already
+        terminal (durable).  ``False`` when the terminalization write
+        failed and must be retried.
+
+    Raises:
+        psycopg.Error: When the error is a connectivity issue.
+    """
+    safe_reason = reason.replace("\x00", "\ufffd")
+    try:
+        with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = (\n"
+                "  jsonb_set(\n"
+                "    jsonb_set(\n"
+                "      jsonb_set(\n"
+                "        jsonb_set(payload::jsonb, '{state,status}', to_jsonb('failed'::text)),\n"
+                "        '{state,finished_at}', " + UTC_ISO_SQL + "\n"
+                "      ),\n"
+                "      '{state,updated_at}', " + UTC_ISO_SQL + "\n"
+                "    ),\n"
+                "    '{state,quarantine_reason}', to_jsonb(%(reason)s::text)\n"
+                "  )\n"
+                ")::text\n"
+                "WHERE id = %(job_id)s\n"
+                "  AND (payload::jsonb)->>'type' = 'command'\n"
+                "  AND (payload::jsonb)->'state'->>'status'\n"
+                "      NOT IN ('succeeded','failed','cancelled')\n"
+                "RETURNING id\n",
+                {"job_id": job_id, "reason": safe_reason},
+            )
+            cursor.fetchone()
+    except psycopg.Error as exc:
+        if _is_connectivity_error_check(exc, conn):
+            raise
+        LOGGER.exception(
+            "quarantine terminalization for job %s failed (SQLSTATE %s)",
+            job_id,
+            exc.sqlstate or "N/A",
+        )
+        return False
+    # RETURNING found no row: either already terminal or type mismatch.
+    # Either way the row is safe — nothing more to write.
+    return True
+
+
 def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
     """Delete a root job and every output chunk explicitly owned by it.
 
@@ -1398,6 +2130,172 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
             "    AND (payload::jsonb)->>'thread' = %(thread)s\n",
             {"thread": str(job_id)},
         )
+
+
+def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UUID], int, int]:
+    """Collect terminal command rows, their owned chunks, and orphan chunks.
+
+    Three bounded phases run in separate transactions, each with ``FOR UPDATE
+    SKIP LOCKED`` so multiple workers/restarts converge safely:
+
+    **Phase 1 — Mark** (one transaction): A bounded batch of terminal
+    ``command`` rows whose ``finished_at`` is older than the retention window
+    is selected and atomically marked with ``state.gc = true``.  Publication
+    explicitly refuses GC-marked roots, so no new ``output_chunk`` rows can be
+    created for them after the mark commits.  Only rows with
+    ``status IN ('succeeded', 'failed', 'cancelled')`` are eligible; unknown
+    or future statuses are retained.  Abandoned ``running`` rows are handled
+    by :func:`recover_stale_jobs`.
+
+    **Phase 2 — Chunk drain + root finalization** (one transaction per batch):
+    For each GC-marked root, a bounded batch of its owned chunks (via
+    ``thread``) is deleted using ``FOR UPDATE SKIP LOCKED``, capped at
+    ``gc_batch_limit`` rows.  This keeps rows/transaction/lock duration
+    bounded even when a single root owns millions of chunks.  After bounded
+    chunk deletion, if no chunks remain for a root, the root row itself is
+    deleted.  The root only disappears after its chunks are drained, which
+    preserves the documented root-first/publication-safety invariant: the
+    ``gc`` flag prevents new chunks, and the root is removed once all chunks
+    from the marking snapshot are gone.
+
+    **Phase 3 — Orphan cleanup** (one transaction): A bounded anti-join
+    ``SELECT`` (with ``LIMIT`` and ``FOR UPDATE ... SKIP LOCKED``) finds
+    ``output_chunk`` rows whose owning root ``command`` row is absent.  The
+    comparison is cast-free and case-normalized (``lower(root.id::text) =
+    lower(thread)``), so malformed, empty, or non-UUID thread text never
+    causes a cast error regardless of planner predicate reordering, and
+    uppercase canonical UUIDs match correctly.  Matched rows are deleted in
+    one bounded ``DELETE``.  This pass is safe without root-first ordering:
+    the owning root is already gone, so no concurrent publication can create
+    new chunks for it.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        settings: Worker runtime settings.
+
+    Returns:
+        A ``(roots_marked, chunks_deleted, orphans_deleted)`` triple.
+    """
+    roots_marked: list[UUID] = []
+    roots_deleted = 0
+    total_chunks = 0
+    total_orphans = 0
+
+    # --- Phase 1: mark terminal roots as GC ---
+    # The retention cutoff is pre-computed in a CTE so the main query string
+    # contains no concatenation and passes hardcoded-sql-expression.
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "WITH gc_params AS (\n"
+            "    SELECT to_char(\n"
+            "        now() at time zone 'utc'\n"
+            "        - make_interval(secs => %(gc_retention_seconds)s),\n"
+            '        \'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\'\n'
+            "    ) AS cutoff\n"
+            ")\n"
+            "UPDATE lubko.jobs\n"
+            "SET payload = jsonb_set(payload::jsonb, '{state,gc}', to_jsonb(true))::text\n"
+            "WHERE id IN (\n"
+            "    SELECT id\n"
+            "    FROM lubko.jobs, gc_params\n"
+            "    WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "        AND (payload::jsonb)->'state'->>'status'\n"
+            "            IN ('succeeded', 'failed', 'cancelled')\n"
+            "        AND (payload::jsonb)->'state'->>'finished_at' IS NOT NULL\n"
+            "        AND ((payload::jsonb)->'state'->>'finished_at') < gc_params.cutoff\n"
+            "        AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
+            "    ORDER BY ((payload::jsonb)->'state'->>'finished_at'), id\n"
+            "    FOR UPDATE SKIP LOCKED\n"
+            "    LIMIT %(limit)s\n"
+            ")\n"
+            "RETURNING id\n",
+            {
+                "gc_retention_seconds": settings.gc_retention_seconds,
+                "limit": settings.gc_batch_limit,
+            },
+        )
+        roots_marked = [row[0] for row in cursor.fetchall()]
+
+    # --- Phase 2: bounded chunk drain + root finalization ---
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT id\n"
+            "FROM lubko.jobs\n"
+            "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "    AND ((payload::jsonb)->'state'->>'gc') = 'true'\n"
+            "ORDER BY id\n"
+            "FOR UPDATE SKIP LOCKED\n"
+            "LIMIT %(limit)s\n",
+            {"limit": settings.gc_batch_limit},
+        )
+        gc_roots = [row[0] for row in cursor.fetchall()]
+        for root_id in gc_roots:
+            # Bounded chunk deletion for this root.  lower() normalises
+            # case so uppercase-UUID thread chunks are matched correctly.
+            cursor.execute(
+                "DELETE FROM lubko.jobs\n"
+                "WHERE id IN (\n"
+                "    SELECT id\n"
+                "    FROM lubko.jobs\n"
+                "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
+                "        AND lower((payload::jsonb)->>'thread') = lower(%(thread)s)\n"
+                "    FOR UPDATE SKIP LOCKED\n"
+                "    LIMIT %(limit)s\n"
+                ")\n",
+                {"thread": str(root_id), "limit": settings.gc_batch_limit},
+            )
+            total_chunks += cursor.rowcount
+            # Delete root only if no chunks remain.
+            cursor.execute(
+                "SELECT NOT EXISTS (\n"
+                "    SELECT 1\n"
+                "    FROM lubko.jobs\n"
+                "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
+                "        AND lower((payload::jsonb)->>'thread') = lower(%(thread)s)\n"
+                ")\n",
+                {"thread": str(root_id)},
+            )
+            no_chunks = cursor.fetchone()
+            if no_chunks is not None and no_chunks[0]:
+                cursor.execute(
+                    "DELETE FROM lubko.jobs\nWHERE id = %(job_id)s\n",
+                    {"job_id": root_id},
+                )
+                roots_deleted += cursor.rowcount
+
+    # --- Phase 3: bounded orphan cleanup ---
+    # Cast-free, case-normalized comparison: lower(root.id::text) = lower(thread).
+    # No ::uuid cast is attempted on the thread value, and lower() normalises
+    # case so uppercase canonical UUIDs match.  Malformed, empty, or non-UUID
+    # text simply never matches any root.id text.  This is intrinsically safe
+    # regardless of planner predicate reordering.
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT chunk.id\n"
+            "FROM lubko.jobs AS chunk\n"
+            "WHERE chunk.payload::jsonb->>'type' = 'output_chunk'\n"
+            "    AND NOT EXISTS (\n"
+            "        SELECT 1\n"
+            "        FROM lubko.jobs AS root\n"
+            "        WHERE lower(root.id::text) =\n"
+            "            lower(chunk.payload::jsonb->>'thread')\n"
+            "            AND root.payload::jsonb->>'type' = 'command'\n"
+            "    )\n"
+            "LIMIT %(limit)s\n"
+            "FOR UPDATE OF chunk SKIP LOCKED\n",
+            {"limit": settings.gc_batch_limit},
+        )
+        orphan_ids = [row[0] for row in cursor.fetchall()]
+        if orphan_ids:
+            cursor.execute(
+                "DELETE FROM lubko.jobs\nWHERE id = ANY(%(ids)s)\n",
+                {"ids": orphan_ids},
+            )
+            total_orphans += len(orphan_ids)
+
+    if roots_deleted:
+        LOGGER.info("gc deleted %d root(s)", roots_deleted)
+    return roots_marked, total_chunks, total_orphans
 
 
 def verify_jobs_table_invariant(conn: JobsConnection) -> None:
@@ -1611,6 +2509,7 @@ class Supervisor:
         self.settings = settings
         self.database = database
         self.active: dict[UUID, ActiveJob] = {}
+        self._retry_terminations: dict[UUID, _RetryTerminalization] = {}
         self.conn: JobsConnection | None = None
         self._stopping = False
         self._next_recovery_at = 0.0
@@ -1620,6 +2519,16 @@ class Supervisor:
         self._listen_ready = False
         self._wake_r: int | None = None
         self._wake_w: int | None = None
+        self._next_gc_at = 0.0
+        self._started_at = time.time()
+        self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
+        self._db_connected_at: float | None = None
+        self._db_error_at: float | None = None
+        self._last_completed_job_id: str | None = None
+        self._last_completed_at: float | None = None
+        self._last_completed_status: str | None = None
+        self._next_health_publish_at = 0.0
+        self._health_force = True
 
     def request_shutdown(self) -> None:
         """Request a graceful shutdown from another thread or a signal handler.
@@ -1769,7 +2678,7 @@ class Supervisor:
                 if not job.completed and not job.term_sent
             )
         else:
-            deadlines.append(self._next_recovery_at)
+            deadlines.extend((self._next_recovery_at, self._next_gc_at))
             if self.active:
                 deadlines.append(self._next_lease_refresh_at)
                 interval = self.settings.output_publication_interval_seconds
@@ -1793,8 +2702,17 @@ class Supervisor:
             return
         try:
             self._tick(time.monotonic())
-        except psycopg.Error:
-            self._enter_outage()
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                self._enter_outage()
+            else:
+                LOGGER.critical(
+                    "unexpected non-connectivity database error "
+                    "(SQLSTATE %s); stopping supervisor: %s",
+                    exc.sqlstate or "N/A",
+                    exc,
+                )
+                self._stopping = True
 
     def run(self) -> None:
         """Run the supervisor until a graceful shutdown is requested.
@@ -1807,14 +2725,31 @@ class Supervisor:
         raced the reconnect is ever missed. The first connection is verified
         against the two-column transport and protocol shape invariants; a
         violated invariant is fatal.
+
+        Connection-level failures (lost/unusable connection) enter outage
+        handling and trigger reconnection.  Per-job deterministic data/SQL
+        errors are caught locally within the db-phase methods so one bad
+        job never poisons the entire worker or triggers a reconnect loop.
+
+        Any unexpected ``psycopg.Error`` that escapes the per-job boundaries
+        and reaches this outer catch is classified:
+
+        * Connectivity errors (class 08 or broken/closed connection) enter
+          outage handling and reconnection.
+        * Non-connectivity errors are unexpected at this level and indicate
+          a global programming or schema fault.  The supervisor logs the
+          real exception/SQLSTATE and stops, deferring recovery to the
+          external process supervisor's crash-loop backoff.
         """
         self._install_wakeup_pipe()
         self._install_child_signal_handler()
         self._connect()
         if self.conn is not None:
             self._listen()
+        self._publish_health(force=True)
         while not self._stopping:
             self._loop_once()
+            self._publish_health()
         self._shutdown()
         self._close_wakeup_pipe()
 
@@ -1893,6 +2828,10 @@ class Supervisor:
             )
         self._publish_all(now)
         self._finalize_completed()
+        self._retry_terminalizations()
+        if now >= self._next_gc_at:
+            self._run_gc()
+            self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
         if self._durable_scan_pending and not self._stopping:
             self._durable_scan_pending = False
             cancellations = self._discover_cancellations()
@@ -1926,6 +2865,7 @@ class Supervisor:
                 LOGGER.info("database connection restored")
                 self._next_recovery_at = 0.0
                 self._next_lease_refresh_at = 0.0
+                self._next_gc_at = 0.0
             else:
                 self._next_reconnect_at = time.monotonic() + max(
                     self.settings.poll_interval_seconds, 0.5
@@ -1947,24 +2887,106 @@ class Supervisor:
                 job.row_lost = True
                 request_stop(job, STOP_REASON_ROW_LOST)
 
-    def _refresh_leases(self) -> None:
-        """Refresh every owned running lease in one bulk statement."""
+    def _run_gc(self) -> None:
+        """Run the transport garbage collection pass.
+
+        Three-phase staged GC: mark terminal roots, drain their chunks in
+        bounded batches, finalize root deletion, then clean orphan chunks.
+        Abandoned ``running`` rows go through lease recovery first.
+        ``pending`` and ``running`` rows are never collected.
+        """
         conn = self.conn
         if conn is None:
             return
-        refreshed = set(bulk_refresh_leases(conn, self.settings))
+        roots, chunks, orphans = collect_transport(conn, self.settings)
+        if roots or chunks or orphans:
+            LOGGER.info(
+                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)",
+                len(roots),
+                chunks,
+                orphans,
+            )
+
+    def _heartbeat_root_ids(self) -> set[UUID]:
+        """Return the root IDs whose lease is refreshed this turn.
+
+        Only explicitly locally-owned running or completed-but-not-finalized
+        jobs tracked in the active registry are eligible.  This is what prevents
+        an orphaned owned row (for example a claimed job whose immediate
+        finalization write failed and which is not locally tracked) from being
+        heartbeated merely because another job is active.  Retry-owned jobs are
+        handled by a separate terminalization-retry mechanism and are
+        intentionally NOT heartbeated: their lease is left free to expire and be
+        safely recovered as failed, with no uncertain re-execution.
+
+        Returns:
+            The set of root IDs to refresh.
+        """
+        return {
+            job.id
+            for job in self.active.values()
+            if not job.finalized
+            and not job.quarantined
+            and not job.row_lost
+            and not job.lease_evicted
+        }
+
+    def _refresh_leases(self) -> None:
+        """Refresh only the locally-owned active leases in one bulk statement.
+
+        The refresh origin is captured immediately before the refresh database
+        operation, never at commit time, so the local lease-safety deadline is
+        anchored to a conservative monotonic instant that cannot exceed the
+        database lease. Only the explicitly eligible locally-owned root IDs are
+        refreshed (see :meth:`_heartbeat_root_ids`), and the local deadline is
+        advanced exclusively for the identifiers actually returned by a
+        *committed* refresh. A refresh that fails to commit (for example a
+        connectivity error that escapes to outage handling) leaves
+        ``last_heartbeat_at`` untouched, so a missed heartbeat can never
+        silently extend a job's safe lifetime.
+        """
+        conn = self.conn
+        if conn is None:
+            return
+        refresh_mono = time.monotonic()
+        eligible = self._heartbeat_root_ids()
+        refreshed = set(bulk_refresh_leases(conn, self.settings, eligible))
+        apply_lease_refresh(self.active, refreshed, refresh_mono)
+
+    def _retry_terminalizations(self) -> None:
+        """Retry the terminalization writes for jobs whose immediate finalization failed.
+
+        A claimed job whose immediate finalization DB write failed is kept
+        locally owned here so it remains represented for retry.  Its lease is
+        intentionally NOT refreshed: the row is left free to expire and be
+        safely recovered as failed (no uncertain re-execution) while this
+        mechanism races to terminalize it directly.  The terminalization is
+        retried
+        with exponential backoff; if every attempt fails the supervisor stops
+        for external recovery rather than retrying forever at process-poll rate.
+        """
+        conn = self.conn
+        if conn is None or not self._retry_terminations:
+            return
         now = time.monotonic()
-        for job_id, job in list(self.active.items()):
-            if job.finalized:
+        for job_id in list(self._retry_terminations):
+            state = self._retry_terminations[job_id]
+            if now < state.next_retry_at:
                 continue
-            if job_id in refreshed:
-                job.last_heartbeat_at = now
-            elif not job.completed:
-                # The row is no longer running (for example it was recovered by
-                # another worker): never let the live process continue.
-                LOGGER.warning("job %s is no longer running in the database; stopping it", job_id)
-                job.row_lost = True
-                request_stop(job, STOP_REASON_ROW_LOST)
+            if state.retries >= QUARANTINE_MAX_RETRIES:
+                LOGGER.critical(
+                    "terminalization retry for job %s failed after %d retries; "
+                    "stopping supervisor for external recovery",
+                    job_id,
+                    state.retries,
+                )
+                self._stopping = True
+                return
+            if _quarantine_job(conn, job_id, f"retry terminalization for {job_id}"):
+                self._retry_terminations.pop(job_id, None)
+            else:
+                state.retries += 1
+                state.next_retry_at = now + QUARANTINE_RETRY_BASE_SECONDS * (2**state.retries)
 
     def _discover_cancellations(self) -> list[UUID]:
         """Terminate any owned running job whose cancellation marker was set.
@@ -1987,49 +3009,187 @@ class Supervisor:
                 request_stop(job, STOP_REASON_CANCEL)
         return cancelled
 
-    def _publish_all(self, now: float) -> None:
-        """Publish changed output tails/chunks of running jobs, throttled."""
+    def _changed_streams(self, job: ActiveJob, now: float) -> list[str]:
+        """Return stream names with changed output since last publication."""
+        interval = self.settings.output_publication_interval_seconds
+        changed: list[str] = []
+        for name in OUTPUT_STREAMS:
+            stream = getattr(job, name)
+            if now - stream.published_at < interval:
+                continue
+            try:
+                size = stream_size(stream.path)
+            except OSError:
+                continue
+            if size != stream.published_size:
+                changed.append(name)
+        return changed
+
+    def _publish_job_output(self, job: ActiveJob, now: float) -> None:
+        """Publish changed output for one job, quarantining deterministic errors.
+
+        Args:
+            job: The active job to publish.
+            now: Monotonic time.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
+        """
         conn = self.conn
         if conn is None:
             return
-        interval = self.settings.output_publication_interval_seconds
+        changed = self._changed_streams(job, now)
+        if not changed:
+            return
+        try:
+            published = publish_output(conn, job, changed, now)
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "publishing output for job %s failed (SQLSTATE %s)",
+                job.id,
+                exc.sqlstate or "N/A",
+            )
+            if _quarantine_job(conn, job.id, f"publication error: {exc}"):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
+            request_stop(job, STOP_REASON_QUARANTINE)
+            return
+        if not published:
+            job.row_lost = True
+            request_stop(job, STOP_REASON_ROW_LOST)
+
+    def _publish_all(self, now: float) -> None:
+        """Publish changed output tails/chunks of running jobs, throttled.
+
+        Connectivity errors are re-raised so the main loop enters outage
+        handling.  Deterministic per-job data/SQL errors are quarantined so
+        the offending job does not poison publication of unrelated jobs.
+        Quarantined and quarantine-pending jobs are skipped — only the
+        bounded quarantine retry owner may touch DB state until convergence.
+        """
+        if self.conn is None:
+            return
         for job in list(self.active.values()):
-            if job.completed or job.finalized:
+            if (
+                not job.completed
+                and not job.finalized
+                and not job.quarantined
+                and not job.quarantine_pending
+            ):
+                self._publish_job_output(job, now)
+
+    def _cleanup_quarantined_jobs(self) -> None:
+        """Untrack quarantined jobs and retry quarantine-pending jobs with backoff.
+
+        After durable quarantine the row is already terminal; once the owned
+        process group is dead we clean capture files and remove the job from
+        the active registry without re-entering publication/finalization.
+
+        For quarantine-pending jobs (terminalization write previously failed)
+        whose process group has exited, we retry the safe quarantine
+        terminalization with exponential backoff.  After
+        ``QUARANTINE_MAX_RETRIES`` exhausted attempts we log CRITICAL and
+        stop the supervisor so the external crash-loop backoff owns further
+        recovery — we never retry at process-poll rate forever.
+        """
+        conn = self.conn
+        now = time.monotonic()
+        for job in list(self.active.values()):
+            if job.quarantined and job.completed and not group_has_members(job.pgid):
+                cleanup_job(job)
+                job.finalized = True
+                self.active.pop(job.id, None)
                 continue
-            changed: list[str] = []
-            for name in OUTPUT_STREAMS:
-                stream = getattr(job, name)
-                if now - stream.published_at < interval:
+            if (
+                job.quarantine_pending
+                and job.completed
+                and not group_has_members(job.pgid)
+                and conn is not None
+            ):
+                if now < job.quarantine_next_retry_at:
                     continue
-                try:
-                    size = stream_size(stream.path)
-                except OSError:
-                    continue
-                if size == stream.published_size:
-                    continue
-                changed.append(name)
-            if changed and not publish_output(conn, job, changed, now):
-                job.row_lost = True
-                request_stop(job, STOP_REASON_ROW_LOST)
+                if job.quarantine_retries >= QUARANTINE_MAX_RETRIES:
+                    LOGGER.critical(
+                        "quarantine terminalization for job %s failed after %d "
+                        "retries; stopping supervisor for external recovery",
+                        job.id,
+                        job.quarantine_retries,
+                    )
+                    self._stopping = True
+                    return
+                if _quarantine_job(conn, job.id, f"quarantine retry for {job.id}"):
+                    job.quarantined = True
+                    job.quarantine_pending = False
+                    cleanup_job(job)
+                    job.finalized = True
+                    self.active.pop(job.id, None)
+                else:
+                    job.quarantine_retries += 1
+                    delay = QUARANTINE_RETRY_BASE_SECONDS * (2**job.quarantine_retries)
+                    job.quarantine_next_retry_at = now + delay
+
+    def _try_finalize_one_completed(self, job: ActiveJob) -> None:
+        """Attempt final publication and finalization for one completed job.
+
+        Args:
+            job: The completed active job.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
+        """
+        conn = self.conn
+        if conn is None:
+            return
+        try:
+            published = publish_output(
+                conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True
+            )
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "publishing final output for job %s failed (SQLSTATE %s)",
+                job.id,
+                exc.sqlstate or "N/A",
+            )
+            if _quarantine_job(conn, job.id, f"final publication error: {exc}"):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
+            request_stop(job, STOP_REASON_QUARANTINE)
+            return
+        if not published:
+            self._untrack_lost_job(job)
+            return
+        if self._finalize_one(job):
+            job.finalized = True
+            self.active.pop(job.id, None)
 
     def _finalize_completed(self) -> None:
-        """Publish final output and finalize every job whose process is fully gone."""
+        """Publish final output and finalize every job whose process is fully gone.
+
+        Connectivity errors are re-raised so the main loop enters outage
+        handling.  Deterministic per-job data/SQL errors are quarantined so
+        the offending job does not poison finalization of unrelated jobs.
+        Quarantined and quarantine-pending jobs are excluded from normal
+        publication/finalization — only the bounded quarantine retry owner
+        may touch DB state until convergence.
+        """
         conn = self.conn
         if conn is None:
             return
+        self._cleanup_quarantined_jobs()
         for job in list(self.active.values()):
             if not (job.completed and not job.finalized):
                 continue
+            if job.quarantined or job.quarantine_pending:
+                continue
             if group_has_members(job.pgid):
-                # Background members of the exact process group are still being
-                # reaped; finalizing (and untracking) now would leak them.
                 continue
-            if not publish_output(conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True):
-                self._untrack_lost_job(job)
-                continue
-            if self._finalize_one(job):
-                job.finalized = True
-                self.active.pop(job.id, None)
+            self._try_finalize_one_completed(job)
 
     def _untrack_lost_job(self, job: ActiveJob) -> None:
         """Untrack a completed job whose root row was deleted concurrently.
@@ -2048,11 +3208,21 @@ class Supervisor:
     def _finalize_one(self, job: ActiveJob) -> bool:
         """Persist the terminal state of one completed job.
 
+        Connectivity errors are re-raised so the main loop enters outage
+        handling.  Deterministic per-job data/SQL errors are quarantined so
+        the offending job does not block finalization of unrelated jobs.
+        ``last_completed_*`` health fields are only updated after the
+        terminal DB finalization succeeds, so a failed persist never poisons
+        the health snapshot.
+
         Args:
             job: The completed active job.
 
         Returns:
             ``True`` when the job was finalized and its capture files removed.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
         """
         conn = self.conn
         if conn is None:
@@ -2066,16 +3236,33 @@ class Supervisor:
         )
         try:
             final_status = finish_job(conn, job.id, result)
-        except psycopg.Error:
-            LOGGER.exception("finalizing job %s failed", job.id)
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "finalizing job %s failed (SQLSTATE %s)",
+                job.id,
+                exc.sqlstate or "N/A",
+            )
+            if _quarantine_job(conn, job.id, f"finalization error: {exc}"):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
+            request_stop(job, STOP_REASON_QUARANTINE)
             return False
+        duration_seconds = time.monotonic() - job.started_mono
         LOGGER.info(
-            "finished job %s with status %s and exit code %d",
+            "finished job %s with status %s exit_code=%d duration=%.3fs",
             job.id,
             final_status,
             result.exit_code,
+            duration_seconds,
         )
+        self._last_completed_job_id = str(job.id)
+        self._last_completed_at = time.time()
+        self._last_completed_status = final_status
         cleanup_job(job)
+        self._publish_health_force()
         return True
 
     def _claim_batch(self) -> int:
@@ -2085,6 +3272,12 @@ class Supervisor:
         in one turn; it is never a cap on the number of simultaneously active
         jobs.
 
+        The claim timestamp is captured immediately before the claim database
+        operation commits and threaded into every started job so the local
+        lease-safety deadline is bound to the committed lease grant, never to
+        the (possibly delayed) spawn. The claim-to-spawn delay therefore
+        consumes lease budget instead of extending it.
+
         Returns:
             How many jobs were claimed this turn (a full batch signals a
             demonstrable queue backlog to the caller).
@@ -2092,20 +3285,30 @@ class Supervisor:
         conn = self.conn
         if conn is None or self._stopping:
             return 0
+        claim_mono = time.monotonic()
         claimed = claim_jobs(conn, self.settings, self.settings.claim_batch_limit)
         for claimed_job in claimed:
-            self._start_job(claimed_job)
+            self._start_job(claimed_job, claim_mono)
         return len(claimed)
 
-    def _start_job(self, claimed: ClaimedJob) -> None:
+    def _start_job(self, claimed: ClaimedJob, claim_mono: float) -> None:
         """Start one claimed job as a process group and register it.
 
         If the process cannot be started (for example because the operating
         system refused to spawn it), the job fails clearly and independently
         while the daemon stays alive to supervise the jobs that did start.
 
+        The local lease-safety deadline is anchored to ``claim_mono``: the
+        monotonic time captured immediately before the claim database operation
+        commits (never at commit time). Anchoring to the claim (rather than to
+        the spawn that follows it) means any delay between claiming and spawning
+        consumes lease budget and never creates extra lease time a recovery
+        worker could legitimately treat as live.
+
         Args:
             claimed: The claimed job.
+            claim_mono: Monotonic time captured immediately before the claim
+                database operation commits (never at commit time).
         """
         conn = self.conn
         if conn is None:
@@ -2136,7 +3339,7 @@ class Supervisor:
             self._finalize_immediate(claimed.id, failure)
             return
         try:
-            proc, stdout_path, stderr_path, pgid = spawn_job(job_spec)
+            proc, stdout_path, stderr_path, pgid, gate_fd = spawn_job(job_spec)
         except OSError as exc:
             LOGGER.warning("unable to start job %s: %s", claimed.id, exc)
             self._finalize_immediate(
@@ -2150,48 +3353,225 @@ class Supervisor:
                 ),
             )
             return
-
-        job = ActiveJob(
-            id=claimed.id,
-            cwd=job_spec.cwd,
-            process=job_spec.process,
+        gated = GatedSpawn(
             proc=proc,
-            pid=proc.pid,
             pgid=pgid,
-            started_mono=time.monotonic(),
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            gate_fd=gate_fd,
         )
+
+        # Fail closed BEFORE any release and activate only on success.
+        job = self._activate_gated_job(
+            conn,
+            claimed.id,
+            job_spec,
+            gated,
+            claim_mono=claim_mono,
+        )
+        if job is None:
+            return
         job.stdout = OutputStream(path=stdout_path)
         job.stderr = OutputStream(path=stderr_path)
-        job.last_heartbeat_at = time.monotonic()
+        job.last_heartbeat_at = claim_mono
         self.active[claimed.id] = job
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
-        try:
-            _persist_process(conn, job.id, job.pid, job.pgid)
-        except psycopg.Error:
-            LOGGER.exception("unable to persist process identity for job %s", job.id)
-            request_stop(job, STOP_REASON_PERSIST)
+        self._publish_health_force()
+
+    @staticmethod
+    def _abort_and_converge(gated: GatedSpawn, job_id: UUID) -> None:
+        """Abort the gated start and block until its wrapper is reaped.
+
+        A nonconverging ``abort_gated_start`` must NEVER fall back to normal
+        flow with a live untracked gated group: this worker locally owns the
+        still-gated childless direct child and synchronously blocks — with no
+        timeout return — until it is terminal and reaped, at which point the
+        original unreleased group is gone by construction.
+
+        Args:
+            gated: Handles and exact identity of the gated start.
+            job_id: Identifier of the affected job (for diagnostics).
+        """
+        if abort_gated_start(
+            gated.proc, gated.pgid, gated.stdout_path, gated.stderr_path, gated.gate_fd
+        ):
+            return
+        LOGGER.error(
+            "gated start abort did not converge for job %s (exact group %d); "
+            "locally owning the live child until it is reaped",
+            job_id,
+            gated.pgid,
+        )
+        await_gated_group_gone(gated)
+
+    def _pre_release_failure(
+        self,
+        conn: JobsConnection,
+        job_id: UUID,
+        gated: GatedSpawn,
+    ) -> str | None:
+        """Obtain and durably persist the exact identity before any release.
+
+        Fail-closed ordering: valid positive start-time ticks must be obtained
+        and durably persisted BEFORE any release. On any failure the exact
+        gated wrapper is converged (terminal and reaped) first — including on
+        the connectivity re-raise path — so no error path can leave a live
+        untracked gated group behind and no failed persistence can ever reach
+        :func:`release_gate`.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job_id: Identifier of the claimed job.
+            gated: Handles and exact identity of the gated start.
+
+        Returns:
+            The final stderr message when the start failed after convergence
+            (the caller must finalize failed), or ``None`` when persistence
+            succeeded.
+
+        Raises:
+            psycopg.Error: When persisting the identity fails with a
+                connectivity error (raised only after exact-group convergence).
+        """
+        start_ticks = proc_start_ticks(gated.proc.pid)
+        if start_ticks is not None and start_ticks > 0:
+            try:
+                _persist_process(conn, job_id, gated.proc.pid, gated.pgid, start_ticks)
+            except psycopg.Error as exc:
+                connectivity = self._is_connectivity_error(exc)
+                self._abort_and_converge(gated, job_id)
+                if connectivity:
+                    raise
+                LOGGER.exception(
+                    "unable to persist process identity for job %s (SQLSTATE %s)",
+                    job_id,
+                    exc.sqlstate or "N/A",
+                )
+                return "unable to record process identity; job not started"
+            return None
+        # No durable exact identity exists, so this worker itself must own the
+        # childless gated child to convergence before anything else.
+        self._abort_and_converge(gated, job_id)
+        LOGGER.error(
+            "unable to obtain exact start-time ticks for job %s (pid %d); "
+            "gated start aborted without executing user code",
+            job_id,
+            gated.proc.pid,
+        )
+        return "unable to record exact process identity; job not started"
+
+    def _activate_gated_job(
+        self,
+        conn: JobsConnection,
+        job_id: UUID,
+        job_spec: Job,
+        gated: GatedSpawn,
+        *,
+        claim_mono: float,
+    ) -> ActiveJob | None:
+        """Persist the exact identity, release the gate, and build the active job.
+
+        Fail-closed ordering: valid positive start-time ticks must be obtained
+        and durably persisted BEFORE any release; a persist or release failure
+        converges the exact gated group and finalizes the job failed so no user
+        side effect survives and a failed start can never later look like a
+        normally completed user command.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job_id: Identifier of the claimed job.
+            job_spec: The claimed job specification.
+            gated: Handles and exact identity of the gated start to activate.
+            claim_mono: Monotonic claim instant carried onto the active job.
+
+        Returns:
+            The :class:`ActiveJob` for normal supervision, or ``None`` when the
+            start failed and was finalized as such. Every failure path first
+            converges the exact gated wrapper (terminal and reaped), so no
+            untracked live group ever outlives this call.
+        """
+        failure = self._pre_release_failure(conn, job_id, gated)
+        if failure is None:
+            # The exact identity is durably recorded. Release the gate so the
+            # wrapper execs the user argv on the exact same PID, after which
+            # normal supervision applies. A failed release is a start failure:
+            # converge the live child first, then finalize failed.
+            if release_gate(gated.gate_fd):
+                return ActiveJob(
+                    id=job_id,
+                    cwd=job_spec.cwd,
+                    process=job_spec.process,
+                    proc=gated.proc,
+                    pid=gated.proc.pid,
+                    pgid=gated.pgid,
+                    started_mono=time.monotonic(),
+                    claimed_at=claim_mono,
+                )
+            self._abort_and_converge(gated, job_id)
+            LOGGER.error(
+                "failed to release the start gate for job %s (pid %d); "
+                "gated start aborted without executing user code",
+                job_id,
+                gated.proc.pid,
+            )
+            failure = "unable to release gated start; job not started"
+        self._finalize_immediate(
+            job_id,
+            JobResult(
+                status="failed",
+                exit_code=EXECUTION_ERROR_EXIT_CODE,
+                stdout="",
+                stderr=failure,
+                cancellation_note=None,
+            ),
+        )
+        return None
 
     def _finalize_immediate(self, job_id: UUID, result: JobResult) -> None:
         """Finalize a job that failed before or during spawning.
 
+        Connectivity errors are re-raised so the main loop enters outage
+        handling.  Deterministic per-job errors attempt quarantine
+        terminalization directly so the row does not remain non-terminal
+        indefinitely.
+
         Args:
             job_id: The job identifier.
             result: The failure result.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
         """
         conn = self.conn
         if conn is None:
             return
         try:
             finish_job(conn, job_id, result)
-        except psycopg.Error:
-            LOGGER.exception("unable to finalize job %s", job_id)
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
+            LOGGER.exception(
+                "unable to finalize job %s (SQLSTATE %s)",
+                job_id,
+                exc.sqlstate or "N/A",
+            )
+            if not _quarantine_job(conn, job_id, f"immediate finalization error: {exc}"):
+                # Both the finalization and the quarantine terminalization writes
+                # failed: keep the claimed job locally owned for retry so it stays
+                # represented.  Its lease is intentionally NOT refreshed, so it is
+                # never heartbeated merely because another job is active, and it
+                # is free to expire and be safely recovered as failed rather than
+                # being silently orphaned.
+                self._retry_terminations.setdefault(job_id, _RetryTerminalization())
 
     def _enforce_lease_safety(self) -> None:
         """Terminate owned groups whose lease can no longer be refreshed in time.
 
-        The local lease deadline is derived from the last successful heartbeat
-        so the process group is terminated before its database lease can expire
-        and another worker could legitimately treat the job as abandoned.
+        The local lease deadline is derived from the last successful committed
+        heartbeat (anchored to the conservative monotonic origin captured
+        before that heartbeat's database operation) so the process group is
+        terminated before its database lease can expire and another worker could
+        legitimately treat the job as abandoned.
         """
         settings = self.settings
         now = time.monotonic()
@@ -2211,6 +3591,69 @@ class Supervisor:
                 )
                 job.lease_evicted = True
                 request_stop(job, STOP_REASON_LEASE)
+
+    # ------------------------------------------------------------------
+    # Health publishing
+    # ------------------------------------------------------------------
+
+    def _build_health(self, *, alive: bool = True, shutting_down: bool = False) -> WorkerHealth:
+        """Build a health snapshot from the current supervisor state.
+
+        Args:
+            alive: Whether the worker is alive.
+            shutting_down: Whether the worker is shutting down.
+
+        Returns:
+            A fresh health snapshot.
+        """
+        current_job_id: str | None = None
+        current_job_started_at: float | None = None
+        if self.active:
+            first_job = next(iter(self.active.values()))
+            current_job_id = str(first_job.id)
+            current_job_started_at = first_job.claimed_at
+        return WorkerHealth(
+            schema_version=1,
+            worker_id=self.settings.worker_id,
+            worker_incarnation=self.settings.worker_incarnation,
+            pid=os.getpid(),
+            start_time_ticks=self._start_time_ticks,
+            started_at=self._started_at,
+            published_at=time.time(),
+            alive=alive,
+            db_connected=self.conn is not None,
+            db_connected_at=self._db_connected_at,
+            db_error_at=self._db_error_at,
+            current_job_id=current_job_id,
+            current_job_started_at=current_job_started_at,
+            last_completed_job_id=self._last_completed_job_id,
+            last_completed_at=self._last_completed_at,
+            last_completed_status=self._last_completed_status,
+            shutting_down=shutting_down,
+        )
+
+    def _publish_health(self, *, force: bool = False) -> None:
+        """Write an atomic health snapshot, throttled unless forced.
+
+        Args:
+            force: Publish regardless of the throttle interval.
+        """
+        now = time.time()
+        if not force and now < self._next_health_publish_at:
+            return
+        health = self._build_health()
+        try:
+            write_worker_health(health)
+        except OSError:
+            LOGGER.debug("failed to write health snapshot", exc_info=True)
+        interval = self.settings.health_publish_interval_seconds
+        self._next_health_publish_at = now + interval
+        self._health_force = False
+
+    def _publish_health_force(self) -> None:
+        """Publish a health snapshot immediately."""
+        self._health_force = True
+        self._publish_health(force=True)
 
     def _connect(self) -> None:
         """Open and verify the supervisor's single database connection.
@@ -2232,6 +3675,8 @@ class Supervisor:
         except psycopg.Error:
             LOGGER.exception("database connection failed")
             self.conn = None
+            self._db_error_at = time.time()
+            self._publish_health_force()
             return
         try:
             verify_jobs_table_invariant(conn)
@@ -2244,6 +3689,20 @@ class Supervisor:
                 conn.close()
             raise
         self.conn = conn
+        self._db_connected_at = time.time()
+        LOGGER.info("database connection established")
+        self._publish_health_force()
+
+    def _is_connectivity_error(self, exc: psycopg.Error) -> bool:
+        """Classify a database error as a connectivity issue.
+
+        Delegates to :func:`_is_connectivity_error_check` with the current
+        connection.  See that function for the full classification rules.
+
+        Returns:
+            ``True`` when the error indicates a lost/unusable connection.
+        """
+        return _is_connectivity_error_check(exc, self.conn)
 
     def _enter_outage(self) -> None:
         """Transition into database outage handling, discarding the connection.
@@ -2257,7 +3716,9 @@ class Supervisor:
                 self.conn.close()
         self.conn = None
         self._listen_ready = False
+        self._db_error_at = time.time()
         self._next_reconnect_at = 0.0
+        self._publish_health_force()
 
     def _shutdown(self) -> None:
         """Gracefully terminate, reap, and finalize every tracked process group.
@@ -2271,16 +3732,46 @@ class Supervisor:
         for job in list(self.active.values()):
             if not job.completed and not job.term_sent:
                 request_stop(job, STOP_REASON_SHUTDOWN)
-        self._drain_active_groups()
-        self._finalize_all_for_shutdown()
+        if not self._drain_active_groups():
+            # Positive post-SIGKILL proof failed for at least one exact active
+            # group. This is NOT a clean drain: never emit the sentinel, never
+            # terminalize/untrack those jobs (their running rows keep the exact
+            # persisted identity recoverable by emergency recovery), and fail
+            # loudly in the log so the outer authority holds instead of reaping.
+            surviving = [job.pgid for job in self.active.values() if group_has_members(job.pgid)]
+            LOGGER.error(
+                "shutdown cannot prove groups %s member-free; withholding the "
+                "drain sentinel and retaining their jobs for exact-identity "
+                "recovery",
+                surviving,
+            )
+            self._finalize_all_for_shutdown(retain_groups=surviving)
+        else:
+            try:
+                write_drain_sentinel(self.settings.worker_incarnation)
+            except OSError:
+                LOGGER.debug("could not write drain sentinel", exc_info=True)
+            self._finalize_all_for_shutdown()
         self._cleanup_all_files()
         if self.conn is not None:
             with suppress(Exception):
                 self.conn.close()
             self.conn = None
+        health = self._build_health(alive=False, shutting_down=True)
+        try:
+            write_worker_health(health)
+        except OSError:
+            LOGGER.debug("failed to write shutdown health snapshot", exc_info=True)
 
-    def _drain_active_groups(self) -> None:
-        """Wait for every active process group to exit, escalating to SIGKILL."""
+    def _drain_active_groups(self) -> bool:
+        """Wait for every active process group to exit, escalating to SIGKILL.
+
+        Returns:
+            ``True`` only when every active job's exact group is positively
+            proven member-free after the escalation; ``False`` when any exact
+            group still has members after the final SIGKILL pass, so no clean
+            drain may be claimed.
+        """
         deadline = time.monotonic() + self.settings.cancel_grace_seconds
         while time.monotonic() < deadline:
             all_gone = all(
@@ -2295,6 +3786,7 @@ class Supervisor:
         for job in self.active.values():
             with suppress(Exception):
                 job.proc.wait(timeout=self.settings.cancel_grace_seconds)
+        return all(not group_has_members(job.pgid) for job in self.active.values())
 
     def _observe_and_escalate(self, job: ActiveJob, now: float) -> bool:
         """Poll one child, escalate its in-flight stop, and report whether it is gone.
@@ -2332,12 +3824,28 @@ class Supervisor:
                 signal_kill(job)
         return job.completed and not group_has_members(job.pgid)
 
-    def _finalize_all_for_shutdown(self) -> None:
-        """Finalize every tracked job when PostgreSQL is available."""
+    def _finalize_all_for_shutdown(self, *, retain_groups: list[int] | None = None) -> None:
+        """Finalize every tracked job when PostgreSQL is available.
+
+        Connectivity errors are re-raised so the caller can handle outage
+        before continuing shutdown.  Deterministic per-job errors are logged
+        and the job is quarantined, preserving lease/row safety. Jobs whose
+        exact group could not be proven member-free (``retain_groups``) are
+        retained in the active set and their rows stay recoverable: they are
+        never terminalized or untracked here.
+
+        Args:
+            retain_groups: Exact group ids that failed post-SIGKILL proof;
+                their jobs are retained instead of finalized.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue.
+        """
         if self.conn is None:
             return
+        retained_ids = set(retain_groups or [])
         for job in list(self.active.values()):
-            if job.finalized:
+            if job.finalized or job.pgid in retained_ids:
                 continue
             if not job.completed and job.stop_reason is None:
                 job.stop_reason = STOP_REASON_SHUTDOWN
@@ -2350,8 +3858,15 @@ class Supervisor:
                     time.monotonic(),
                     force=True,
                 )
-            except psycopg.Error:
-                LOGGER.exception("publishing shutdown output for job %s failed", job.id)
+            except psycopg.Error as exc:
+                if self._is_connectivity_error(exc):
+                    raise
+                LOGGER.exception(
+                    "publishing shutdown output for job %s failed (SQLSTATE %s)",
+                    job.id,
+                    exc.sqlstate or "N/A",
+                )
+                _quarantine_job(self.conn, job.id, f"shutdown publication error: {exc}")
                 continue
             if not retained:
                 self._untrack_lost_job(job)
@@ -2397,7 +3912,12 @@ def _finalize_status(job: ActiveJob) -> str:
     """
     if job.stop_reason in {STOP_REASON_CANCEL, STOP_REASON_SHUTDOWN}:
         return "cancelled"
-    if job.stop_reason in {STOP_REASON_LEASE, STOP_REASON_ROW_LOST, STOP_REASON_PERSIST}:
+    if job.stop_reason in {
+        STOP_REASON_LEASE,
+        STOP_REASON_ROW_LOST,
+        STOP_REASON_PERSIST,
+        STOP_REASON_QUARANTINE,
+    }:
         return "failed"
     if job.cancel_requested:
         return "cancelled"
@@ -2485,17 +4005,45 @@ def _stop_note(reason: str) -> str:
     return notes.get(reason, "stopped")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     """Run the Lubko worker supervisor.
+
+    Args:
+        argv: Command line arguments, or ``None`` to use ``sys.argv``.
+
+    Returns:
+        A process exit code.
 
     Raises:
         SystemExit: If the database configuration file cannot be loaded or the
             runtime settings are invalid.
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    parser = argparse.ArgumentParser(
+        prog="lubko-worker",
+        description=(
+            "Poll PostgreSQL for jobs, execute them concurrently, and supervise them safely."
+        ),
     )
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="print the current worker health snapshot and exit",
+    )
+    args = parser.parse_args(argv)
+
+    if args.health:
+        snapshot = read_worker_health()
+        if snapshot is None:
+            sys.stdout.write("worker: no health snapshot\n")
+            return 1
+        effective = interpret_worker_health(snapshot)
+        output = snapshot.to_dict()
+        output["_effective_live"] = effective.live
+        output["_effective_stale"] = effective.stale
+        output["_effective_reason"] = effective.reason
+        sys.stdout.write(json.dumps(output, sort_keys=True, indent=2) + "\n")
+        return 0
+
     try:
         database = load_database_config()
     except (OSError, ValueError):
@@ -2506,6 +4054,32 @@ def main() -> None:
     except ValueError:
         LOGGER.exception("invalid worker runtime settings")
         raise SystemExit(1) from None
+
+    if worker_under_lifecycle():
+        configure_worker_logging(settings.worker_incarnation)
+        install_worker_exception_hooks()
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    LOGGER.info(
+        "worker starting: worker_id=%s incarnation=%s pid=%d "
+        "poll=%.1fs process_poll=%.1fs "
+        "lease=%.1fs lease_refresh=%.1fs lease_recovery=%.1fs "
+        "output_pub=%.1fs claim_batch=%d health_pub=%.1fs",
+        settings.worker_id,
+        settings.worker_incarnation,
+        os.getpid(),
+        settings.poll_interval_seconds,
+        settings.process_poll_interval_seconds,
+        settings.lease_duration_seconds,
+        settings.lease_refresh_interval_seconds,
+        settings.lease_recovery_interval_seconds,
+        settings.output_publication_interval_seconds,
+        settings.claim_batch_limit,
+        settings.health_publish_interval_seconds,
+    )
     supervisor = Supervisor(settings, database)
 
     def _handle_shutdown(signum: int, _frame: object) -> None:
@@ -2515,6 +4089,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
     supervisor.run()
+    return 0
 
 
 if __name__ == "__main__":

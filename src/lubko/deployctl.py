@@ -38,6 +38,7 @@ from psycopg.rows import tuple_row
 
 from lubko import cli, supervise
 from lubko.config import load_database_config
+from lubko.durable import write_json_durable
 from lubko.lifecycle import (
     SCHEMA_VERSION,
     STATE_RUNNING,
@@ -66,7 +67,7 @@ if TYPE_CHECKING:
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
-ROLLBACK_SCHEMA_VERSION: Final = 2
+ROLLBACK_SCHEMA_VERSION: Final = 3
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
@@ -140,6 +141,7 @@ class RollbackState:
     previous_retiring: bool
     previous_meta: WorkerMeta
     new_meta: WorkerMeta
+    supervisor_owned: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize durable rollback state.
@@ -162,6 +164,7 @@ class RollbackState:
             "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
             "new_meta": self.new_meta.to_dict(),
+            "supervisor_owned": self.supervisor_owned,
         }
 
     @classmethod
@@ -200,6 +203,7 @@ class RollbackState:
                 previous_retiring=data.get("previous_retiring", False) is True,
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
+                supervisor_owned=_optional_bool(data.get("supervisor_owned")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervised deployment state is malformed"
@@ -227,17 +231,40 @@ def _optional_string(value: object | None) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _optional_bool(value: object | None) -> bool | None:
+    """Return a boolean value or ``None`` when absent.
+
+    ``None`` signals unknown lifecycle authority: the caller must fail closed
+    rather than granting legacy rollback permission.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        ``True``, ``False``, or ``None`` when the key is absent.
+    """
+    if isinstance(value, bool):
+        return value
+    return None
+
+
 def _write_state(state: RollbackState) -> None:
-    """Atomically persist rollback authority state.
+    """Crash-durably persist rollback authority state.
+
+    ``rollback.json`` is recovery authority: the supervised-deployment mission
+    generation is compared against the supervisor desired/applied state after a
+    restart, so the write must be confirmed durable before the mission is
+    treated as published.
 
     Args:
         state: State to store.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` from
+        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
+        durable, so callers must not advance a dependent action.
     """
-    path = rollback_state_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state.to_dict(), sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    write_json_durable(rollback_state_path(), state.to_dict())
 
 
 def _read_state() -> RollbackState | None:
@@ -329,19 +356,22 @@ def _supervised_mission_active(state: RollbackState) -> bool:
 
     In supervised mode the candidate identity lives in the supervisor's durable
     state, so a mission is active exactly when the supervisor tracks that exact
-    candidate commit as its live child at or after the mission generation.
+    candidate commit as its live child at or after the mission generation.  The
+    recorded child identity is independently verified: a stale ``state.json``
+    left by a hard-killed supervisor must not be mistaken for a live candidate.
 
     Args:
         state: Pending supervised-deployment mission.
 
     Returns:
-        ``True`` when the supervisor owns a live worker for ``state.commit``
-        that it began under this mission generation.
+        ``True`` when the supervisor owns a proven-live worker for
+        ``state.commit`` that it began under this mission generation.
     """
     supervisor_state = supervise.read_state()
     return (
         supervisor_state.commit == state.commit
         and supervisor_state.child is not None
+        and supervise.child_alive(supervisor_state.child)
         and supervisor_state.applied_generation >= state.generation
     )
 
@@ -604,7 +634,7 @@ def _spawn_gated_candidate(options: Options, commit: str) -> GatedWorker:
         repo=str(options.repo),
         git_commit=commit,
         worker_id=worker_id,
-        log_path=str(worker_log_path()),
+        log_path=str(worker_log_path(token)),
         started_at=time.time(),
         stopped_at=None,
     )
@@ -619,6 +649,53 @@ def _close_gate(gate_writer: int) -> None:
     """
     with suppress(OSError):
         os.close(gate_writer)
+
+
+_GATED_ABORT_GRACE_SECONDS: Final = 2.0
+
+
+def _abort_gated_candidate(gated: GatedWorker) -> None:
+    """Close the gate and synchronously reap the exact gated candidate.
+
+    The candidate is blocked reading from the gate pipe; closing it delivers
+    EOF so the shim exits.  A bounded wait follows so the child is reaped
+    before the caller proceeds (restoring checkout, rolling back state).
+    If the candidate fails to exit within the grace period the exact gated
+    metadata identity is escalated through :func:`stop_worker` which
+    revalidates PID / start-time-ticks / PGID / SID / token at every signal
+    step, so a recycled or reused PID is never signalled.  If the exact
+    retirement cannot be proven the caller is failed closed.
+
+    Args:
+        gated: The gated candidate to abort.
+
+    Raises:
+        DeployCtlError: If the candidate cannot be reaped within the
+            escalation bound.
+    """
+    _close_gate(gated.gate_writer)
+    proc = gated.proc
+    if proc.poll() is not None:
+        return
+    try:
+        proc.wait(timeout=_GATED_ABORT_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if not stop_worker(gated.meta, _GATED_ABORT_GRACE_SECONDS):
+        msg = (
+            f"gated candidate pid {gated.meta.pid} could not be reaped after "
+            "exact-identity escalation"
+        )
+        raise DeployCtlError(msg)
+    try:
+        proc.wait(timeout=_GATED_ABORT_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        msg = (
+            f"gated candidate pid {gated.meta.pid} survived exact-identity "
+            "escalation; reaping timed out"
+        )
+        raise DeployCtlError(msg) from None
 
 
 def _release_gate(gate_writer: int) -> None:
@@ -859,7 +936,7 @@ def _abort_mission(gated: GatedWorker | None, state: RollbackState) -> None:
         state: The pending rollback mission.
     """
     if gated is not None:
-        _close_gate(gated.gate_writer)
+        _abort_gated_candidate(gated)
     _checkout(
         Path(state.repo),
         state.previous_commit,
@@ -912,7 +989,7 @@ def _complete_handoff(
         _write_state(live)
         return live
     except DeployCtlError:
-        _close_gate(gated.gate_writer)
+        _abort_gated_candidate(gated)
         _rollback_locked(retiring)
         raise
 
@@ -948,7 +1025,7 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
         proc = spawn_worker(
             Path(state.repo),
             state.uv_path,
-            worker_log_path(),
+            worker_log_path(token),
             env,
         )
     except OSError:
@@ -967,7 +1044,7 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
         repo=state.repo,
         git_commit=state.previous_commit,
         worker_id=worker_id,
-        log_path=str(worker_log_path()),
+        log_path=str(worker_log_path(token)),
         started_at=time.time(),
         stopped_at=None,
     )
@@ -1097,9 +1174,21 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
         if state is None or state.status in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
             return
         if supervise.supervisor_running():
+            # While the supervisor is present, candidate liveness is a separate
+            # observation: only roll back after the deadline AND the exact child
+            # is no longer proven live.  A stale state.json child must not count
+            # as live.
             should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
                 state
             )
+        elif state.supervisor_owned is not False:
+            # Pending supervised missions and missions with unknown lifecycle
+            # authority must never enter the legacy direct rollback/worker
+            # lifecycle.  If the supervisor is temporarily absent, fail closed
+            # and leave the durable mission and desired generation untouched for
+            # the next supervisor incarnation.  ``None`` (unknown authority)
+            # fails closed identically to ``True``.
+            should_rollback = False
         else:
             should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
         if should_rollback:
@@ -1283,7 +1372,7 @@ def _prepare_locked(
     gated, new_meta = _candidate_identity(options, commit, supervised=supervised)
     if not check_postgres(options.postgres_timeout_seconds):
         if gated is not None:
-            _close_gate(gated.gate_writer)
+            _abort_gated_candidate(gated)
         _restore_previous_prep(options, previous_commit, commit)
         raise DeployCtlError("stable wrapper cannot reach PostgreSQL before handoff")
     state = RollbackState(
@@ -1301,6 +1390,7 @@ def _prepare_locked(
         previous_retiring=False,
         previous_meta=previous,
         new_meta=new_meta,
+        supervisor_owned=supervised,
     )
     if not supervised:
         _publish_legacy_mission(state, gated, options.lock_timeout_seconds)
@@ -1353,7 +1443,7 @@ def _publish_legacy_mission(
         _fork_watchdog(lock_timeout_seconds)
     except DeployCtlError:
         if gated is not None:
-            _close_gate(gated.gate_writer)
+            _abort_gated_candidate(gated)
         _rollback_locked(state)
         raise
 

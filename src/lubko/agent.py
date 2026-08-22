@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import copy
 import fcntl
 import json
 import os
@@ -33,6 +34,7 @@ from itertools import starmap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 
+from lubko.durable import write_text_durable
 from lubko.worker import group_has_members
 
 if TYPE_CHECKING:
@@ -42,8 +44,8 @@ if TYPE_CHECKING:
 Meta = dict[str, Any]
 
 # Implementation details (hidden from the user-facing interface).
-DEFAULT_MODEL: Final = "opencode-go/deepseek-v4-flash"
-DEFAULT_VARIANT: Final = "high"
+AGENT_MODEL: Final = "opencode-go/ox-alpha-free"
+DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
 STOP_REASONS: Final = frozenset({"stop", "kill"})
@@ -186,12 +188,10 @@ def write_meta(aid: str, meta: Meta) -> None:
     """
     directory = agent_dir(aid)
     directory.mkdir(parents=True, exist_ok=True)
-    tmp = directory / "meta.json.tmp"
-    path = directory / "meta.json"
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(meta, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    tmp.replace(path)
+    # Crash-durable replace: fsync of file contents and the directory entry so
+    # reconciled metadata can never be lost or half-written on power failure.
+    payload = json.dumps(meta, indent=2, sort_keys=True) + "\n"
+    write_text_durable(directory / "meta.json", payload)
 
 
 def update_meta(aid: str, fn: Callable[[Meta], None]) -> None:
@@ -243,8 +243,7 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "state": "idle",
         "cwd": cwd,
         "title": title,
-        "model": os.environ.get("LUBKO_MODEL", DEFAULT_MODEL),
-        "variant": os.environ.get("LUBKO_VARIANT", DEFAULT_VARIANT),
+        "variant": DEFAULT_VARIANT,
         "native_session_id": None,
         "pid": None,
         "pgid": None,
@@ -258,6 +257,8 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "intent": None,
         "stop_reason": None,
         "active_runner": False,
+        "runner_gen": 0,
+        "runner_reservation": None,
         "steer_queue": [],
         "steer_seq": 0,
         "prompt_count": 0,
@@ -322,7 +323,7 @@ def proc_cpu_seconds(pid: int | None) -> float | None:
     return ticks / ticks_per_second
 
 
-def _env_has_marker(pid: int, aid: str) -> bool:
+def env_has_marker(pid: int, aid: str) -> bool:
     """Return whether a process environment carries the exact agent marker.
 
     The marker is matched against whole NUL-separated environment entries so
@@ -362,7 +363,7 @@ def is_alive(meta: Meta) -> bool:
         return False
     if proc_start_ticks(pid) != meta.get("start_time"):
         return False
-    if not _env_has_marker(pid, meta.get("id", "")):
+    if not env_has_marker(pid, meta.get("id", "")):
         return False
     try:
         os.kill(pid, 0)
@@ -440,13 +441,258 @@ def runner_alive(meta: Meta) -> bool:
         return False
     if proc_start_ticks(int(pid)) != meta.get("runner_start_time"):
         return False
-    if not _env_has_marker(int(pid), meta.get("id", "")):
+    if not env_has_marker(int(pid), meta.get("id", "")):
         return False
     try:
         os.kill(int(pid), 0)
     except OSError:
         return False
     return True
+
+
+def pid_alive(pid: int | None) -> bool:
+    """Return whether a process ID still names a live process.
+
+    Args:
+        pid: Process ID to probe, or ``None``.
+
+    Returns:
+        ``True`` only when ``pid`` is a live process.
+    """
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except OSError:
+        return False
+    return True
+
+
+def _runner_marker_alive(aid: str, expected_gen: int) -> bool:
+    """Return whether a live runner for ``expected_gen`` exists for this agent.
+
+    A reserved-but-not-yet-claimed runner (or its children) is the only process
+    that sets both ``LUBKO_AGENT_ID`` and ``LUBKO_RUNNER_GEN`` for this agent,
+    so a marker carrying the *exact* generation proves a runner for the
+    current reservation is genuinely being brought up.  A stale process from an
+    older (or newer) generation must never justify the current reservation:
+    an alive old-generation runner that bailed without claiming must not block
+    recovery of a newer reservation.
+
+    Args:
+        aid: Exact agent ID whose marker to look for.
+        expected_gen: The runner reservation generation that must be proven.
+
+    Returns:
+        ``True`` when a live process with the exact agent and generation marker
+        exists.
+    """
+    agent_marker = f"LUBKO_AGENT_ID={aid}".encode()
+    gen_marker = f"LUBKO_RUNNER_GEN={expected_gen}".encode()
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return False
+    for entry in proc_root.iterdir():
+        name = entry.name
+        if not name.isdigit():
+            continue
+        try:
+            environ = (entry / "environ").read_bytes()
+        except OSError:
+            continue
+        fields = environ.split(b"\0")
+        if agent_marker in fields and gen_marker in fields:
+            return True
+    return False
+
+
+def _is_zombie(pid: int) -> bool:
+    """Return whether a live PID names a zombie (defunct) process.
+
+    A zombie can no longer do work, so it must never be trusted as a live
+    owner of a reservation.
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        ``True`` when the process is a zombie and cannot bring up a runner.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    rest = stat[stat.rfind(")") + 1 :].split()
+    if not rest:
+        return False
+    return rest[0] == "Z"
+
+
+def _owner_alive(owner: object, owner_ticks: object) -> bool:
+    """Return whether ``owner`` is still the exact live reservation owner.
+
+    A PID alone is not trusted: the process must be live (not a zombie), its
+    start time (ticks) must be readable, and it must match the recorded owner
+    identity.  Unavailable ticks or a zombie owner fail closed, so a reused PID
+    or a defunct owner can never justify the reservation.
+
+    Args:
+        owner: Recorded owner process ID, or ``None``.
+        owner_ticks: Recorded owner start time in clock ticks, or ``None``.
+
+    Returns:
+        ``True`` only when the live process is the exact recorded owner.
+    """
+    if not isinstance(owner, int) or not pid_alive(owner):
+        return False
+    if _is_zombie(owner):
+        return False
+    current = proc_start_ticks(owner)
+    if current is None:
+        return False
+    return current == owner_ticks
+
+
+def reservation_in_flight(meta: Meta) -> bool:
+    """Return whether a reserved runner is still being brought up.
+
+    A reservation is in flight when the runner's exact identity is already
+    proven live, or a reserved (not yet claimed) runner is still owned by the
+    exact live spawner (matching PID and start ticks), or a reserved runner
+    process exists but has not yet recorded its exact identity.
+
+    Args:
+        meta: Agent metadata.
+
+    Returns:
+        ``True`` while a reserved runner is expected to claim the agent.
+    """
+    if not meta.get("active_runner"):
+        return False
+    if runner_alive(meta):
+        return True
+    res = meta.get("runner_reservation")
+    if not isinstance(res, dict) or res.get("state") != "reserved":
+        return False
+    if _owner_alive(res.get("owner_pid"), res.get("owner_start_ticks")):
+        return True
+    return _runner_marker_alive(meta.get("id", "") or "", int(res.get("gen") or 0))
+
+
+def owned_by_me(meta: Meta, caller_pid: int) -> bool:
+    """Return whether the current runner reservation is owned by ``caller_pid``.
+
+    The reservation is owned by the caller only when its PID *and* its start
+    ticks both match.  Both the current and the recorded start ticks must be
+    valid (not ``None``) and equal, so a missing/unreadable tick record or a
+    reused PID that belongs to an unrelated process can never be mistaken for
+    the exact original owner.
+
+    Args:
+        meta: Agent metadata.
+        caller_pid: PID of the calling process.
+
+    Returns:
+        ``True`` when the live reservation names ``caller_pid`` as the exact
+        owner.
+    """
+    res = meta.get("runner_reservation")
+    if not isinstance(res, dict) or res.get("owner_pid") != caller_pid:
+        return False
+    recorded = res.get("owner_start_ticks")
+    current = proc_start_ticks(caller_pid)
+    return recorded is not None and current is not None and current == recorded
+
+
+def is_genuinely_running(meta: Meta) -> bool:
+    """Return whether the agent is really executing an invocation.
+
+    Genuinely running means a live agent invocation process, a proven-live
+    runner, or a reserved runner still being brought up.  A merely reserved
+    agent whose spawner died and whose runner never claimed is *not* genuinely
+    running and must be recoverable.
+
+    Args:
+        meta: Agent metadata, or ``None``.
+
+    Returns:
+        ``True`` when an invocation is genuinely in progress.
+    """
+    if not meta:
+        return False
+    if is_alive(meta):
+        return True
+    if runner_alive(meta):
+        return True
+    return reservation_in_flight(meta)
+
+
+def active_runner_justified(meta: Meta) -> bool:
+    """Return whether ``active_runner`` is backed by a real or reserved runner.
+
+    ``active_runner`` may be true only with a proven-live runner identity or an
+    explicit recoverable reservation.  This is the central invariant the
+    linearizable prompt protocol must preserve.
+
+    Args:
+        meta: Agent metadata.
+
+    Returns:
+        ``True`` when ``active_runner`` is justified.
+    """
+    if not meta.get("active_runner"):
+        return True
+    if runner_alive(meta):
+        return True
+    res = meta.get("runner_reservation")
+    # A ``reserved`` (not yet claimed) reservation is explicitly recoverable by
+    # another caller, so it justifies ``active_runner``; a ``claimed``
+    # reservation whose runner is no longer provably alive is stuck and must
+    # never justify a persistent ``active_runner``.
+    return isinstance(res, dict) and res.get("state") == "reserved"
+
+
+def _set_active_runner(meta: Meta, *, value: bool) -> None:
+    """Set ``active_runner`` and keep the reservation invariant consistent.
+
+    When the runner becomes inactive its reservation is dropped so a stale
+    reservation can never leave ``active_runner`` stuck true.
+
+    Args:
+        meta: Agent metadata under the metadata lock.
+        value: The new active-runner state.
+    """
+    meta["active_runner"] = value
+    if not value:
+        meta["runner_reservation"] = None
+
+
+def _test_sync(step: str) -> None:
+    """Pause for deterministic multiprocessing tests at a named boundary.
+
+    Only active when ``LUBKO_TEST_SYNC`` names a directory.  The caller writes
+    a ``.reached`` token and blocks until the test drops a ``.release`` file,
+    letting tests force exact interleavings of independent processes at the
+    vulnerable points of the prompt protocol.
+
+    Args:
+        step: Named synchronization point.
+    """
+    sync_dir = os.environ.get("LUBKO_TEST_SYNC")
+    if not sync_dir:
+        return
+    base = Path(sync_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid()
+    (base / f"{step}.{pid}.reached").touch()
+    # Record the exact start ticks so teardown can prove the reaching process
+    # is still the same identity and never signal a reused PID.
+    ticks = proc_start_ticks(pid)
+    if ticks is not None:
+        (base / f"{step}.{pid}.ticks").write_text(str(ticks))
+    release = base / f"{step}.release"
+    while not release.exists():
+        time.sleep(0.005)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +724,73 @@ def derive_state(meta: Meta | None) -> str:
     if meta.get("finished_at"):
         return str(state)  # runner finalized it
     return "unknown"
+
+
+DISAPPEARED_NOTE: Final = "runner/model process disappeared without a captured exit status"
+
+
+def _reconcile_dead_invocation(m: Meta) -> None:
+    """Reconcile metadata that claims a running invocation nothing can justify.
+
+    Runs under the per-agent metadata lock. When the recorded agent and runner
+    identities are both gone (checked by exact identity: PID + start ticks +
+    environment marker, so PID reuse never fools this) and no reservation is
+    genuinely in flight, the durable record converges to an explicit terminal
+    state. A stale-but-recoverable ``reserved`` reservation is deliberately
+    left alone: it is justified by the protocol and recovered by the next
+    caller under a fresh generation.
+
+    The reconciliation is idempotent: once reconciled the state is no longer
+    ``running`` and ``active_runner`` is false, so repeated calls are no-ops.
+    The old process identities are preserved for diagnostics; ``exit_code`` /
+    ``exit_signal`` remain unset exactly because the process disappeared
+    without a captured return code, distinguishing this from a normal model
+    exit (exit code set) or a signal crash (signal set).
+
+    Args:
+        m: Agent metadata under the lock.
+    """
+    if not m.get("active_runner") and m.get("state") != "running":
+        return  # already terminal/reconciled; nothing to converge
+    if is_genuinely_running(m):
+        return
+    if not m.get("pid"):
+        # Launched but the runner has not recorded its identity yet; give the
+        # exact startup window the same grace derive_state grants it.
+        launched = m.get("started_at") or m.get("created_at") or 0
+        if time.time() - launched < PID_START_WINDOW_SECONDS:
+            return
+    if m.get("state") == "running":
+        _finalize_terminal(m, None, None, "failed", DISAPPEARED_NOTE)
+    _set_active_runner(m, value=False)
+
+
+def reconcile_meta(aid: str) -> bool:
+    """Reconcile an agent's durable metadata after process disappearance.
+
+    Idempotent, PID-reuse safe convergence pass: if the durable record still
+    claims an active running invocation whose exact processes are provably
+    gone, it is rewritten to an explicit terminal state under the per-agent
+    lock. Safe to call any number of times from any number of observers.
+
+    The metadata is only rewritten when reconciliation actually changes it, so
+    hot polling paths (log follow ticks) never pay a needless fsync per tick.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when the durable record was changed and rewritten.
+    """
+    current = read_meta(aid)
+    if current is None:
+        return False
+    candidate = copy.deepcopy(current)
+    _reconcile_dead_invocation(candidate)
+    if candidate == current:
+        return False
+    update_meta(aid, _reconcile_dead_invocation)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -669,10 +982,7 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
     Returns:
         The command argv, or ``None`` when continuation is impossible.
     """
-    env_cmd = os.environ.get("LUBKO_AGENT_CMD")
-    if env_cmd:
-        return ["/bin/sh", "-c", env_cmd]
-    model = meta.get("model") or DEFAULT_MODEL
+    model = AGENT_MODEL
     variant = meta.get("variant") or DEFAULT_VARIANT
     cwd = meta.get("cwd") or str(Path.cwd())
     if is_continue:
@@ -761,12 +1071,50 @@ def runner(aid: str, mode: str) -> None:
     unexpected failure never leaves the agent stuck with a live invocation
     and no monitor.
 
+    The runner claims the exact runner reservation it was spawned for before
+    doing any work.  A runner whose generation does not match the live
+    reservation (for example a duplicate spawned before the protocol was
+    fixed, or a replacement that arrived after a takeover) bails immediately,
+    so a second runner can never execute the same invocation.
+
     Args:
         aid: Lubko agent ID.
         mode: Invocation mode (``new`` or ``continue``).
     """
     meta = read_meta(aid)
     if meta is None:
+        return
+    gen = int(os.environ.get("LUBKO_RUNNER_GEN") or "0")
+    claimed = {}
+
+    def claim(m: Meta) -> None:
+        res = m.get("runner_reservation")
+        if not isinstance(res, dict):
+            # No reservation: a production runner must never execute without an
+            # exact reserved generation.  Fail closed.
+            claimed["ok"] = False
+            return
+        if res.get("state") != "reserved":
+            # Already claimed or otherwise owned: a second runner must never
+            # execute.  (A genuinely live claimed runner is the only owner.)
+            claimed["ok"] = False
+            return
+        if gen == 0 or res.get("gen") != gen:
+            # Only the exact reserved generation may run.  A missing or zero
+            # generation, or a duplicate/stale replacement whose generation no
+            # longer matches, bails instead of double-executing.
+            claimed["ok"] = False
+            return
+        m["runner_pid"] = os.getpid()
+        m["runner_start_time"] = proc_start_ticks(os.getpid())
+        m["runner_reservation"] = {**res, "state": "claimed"}
+        m["active_runner"] = True
+        m["state"] = "running"
+        claimed["ok"] = True
+
+    _test_sync("runner_preclaim")
+    update_meta(aid, claim)
+    if not claimed.get("ok"):
         return
     directory = agent_dir(aid)
     directory.mkdir(parents=True, exist_ok=True)
@@ -824,7 +1172,7 @@ def _reclaim_prompt(aid: str) -> bool:
 
     def apply(m: Meta) -> None:
         if m.get("stop_reason") in STOP_REASONS:
-            m["active_runner"] = False
+            _set_active_runner(m, value=False)
             return
         if m.get("pending_prompt") or (m.get("steer_queue") or []):
             if (m.get("steer_queue") or []) and not m.get("pending_prompt"):
@@ -832,7 +1180,7 @@ def _reclaim_prompt(aid: str) -> bool:
             m["active_runner"] = True
             holder["busy"] = True
             return
-        m["active_runner"] = False
+        _set_active_runner(m, value=False)
 
     update_meta(aid, apply)
     return holder["busy"]
@@ -896,7 +1244,7 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
                 "cannot continue: underlying session not available",
             ),
         )
-        update_meta(aid, lambda m: m.update(active_runner=False))
+        update_meta(aid, lambda m: _set_active_runner(m, value=False))
         return None
     update_meta(aid, lambda m: _clear_pending(m, prompt))
     try:
@@ -919,7 +1267,7 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
             error = str(exc)
             log.write(f"LUBKO RUNNER: failed to start agent: {error}\n".encode("utf-8", "replace"))
             update_meta(aid, lambda m: _finalize_terminal(m, 127, None, "failed", error))
-            update_meta(aid, lambda m: m.update(active_runner=False))
+            update_meta(aid, lambda m: _set_active_runner(m, value=False))
             return None
 
         start = proc_start_ticks(proc.pid)
@@ -957,7 +1305,7 @@ def _wait_for_invocation_exit(
     Returns:
         The invocation's return code.
     """
-    if not is_continue and not os.environ.get("LUBKO_AGENT_CMD"):
+    if not is_continue:
         deadline = time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
         while time.time() < deadline and proc.poll() is None:
             sid = discover_session_id(aid)
@@ -1057,7 +1405,7 @@ def _drain_next(aid: str) -> str | None:
 
     def drain(m: Meta) -> None:
         if m.get("stop_reason") in STOP_REASONS:
-            m["active_runner"] = False
+            _set_active_runner(m, value=False)
             return
         if m.get("pending_prompt"):
             # A new invocation was queued while this one was running; run it
@@ -1066,7 +1414,7 @@ def _drain_next(aid: str) -> str | None:
             holder["prompt"] = m["pending_prompt"]
             return
         if not (m.get("steer_queue") or []):
-            m["active_runner"] = False
+            _set_active_runner(m, value=False)
             return
         item = _pop_into_pending(m, time.time())
         m["active_runner"] = True
@@ -1087,7 +1435,7 @@ def _finalize_abort() -> Callable[[Meta], None]:
         if m.get("state") != "running":
             return  # already finalized (e.g. by stop/kill)
         _finalize_terminal(m, None, None, "failed", "runner aborted unexpectedly")
-        m["active_runner"] = False
+        _set_active_runner(m, value=False)
 
     return finalize
 
@@ -1178,7 +1526,7 @@ def _mark_terminal(
 ) -> None:
     _finalize_terminal(meta, exit_code, exit_signal, state, None)
     meta["stop_reason"] = stop_reason
-    meta["active_runner"] = False
+    _set_active_runner(meta, value=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1232,17 +1580,32 @@ def _err(message: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def spawn_runner(aid: str, mode: str) -> None:
+def spawn_runner(aid: str, mode: str, *, gen: int | None = None) -> None:
     """Detach a background runner monitor for an agent.
 
     The runner is spawned with the exact agent marker set so its identity
-    can be verified later; no other environment entry is altered.
+    can be verified later; no other environment entry is altered.  The runner
+    generation it must claim is carried from the locked reservation decision
+    (``gen``) rather than reread from mutable metadata, so the spawned runner
+    claims exactly the reservation this caller reserved and never a competing
+    one.
 
     Args:
         aid: Lubko agent ID.
         mode: Invocation mode (``new`` or ``continue``).
+        gen: Exact reserved runner generation to carry into the runner, or
+            ``None`` to fall back to metadata (used only by direct callers).
     """
     script = Path(__file__).resolve()
+    env = _runner_env(aid)
+    if gen is not None:
+        env["LUBKO_RUNNER_GEN"] = str(int(gen))
+    else:
+        meta = read_meta(aid)
+        if meta:
+            res = meta.get("runner_reservation")
+            if isinstance(res, dict) and res.get("gen"):
+                env["LUBKO_RUNNER_GEN"] = str(int(res["gen"]))
     subprocess.Popen(
         [sys.executable, str(script), "_runner", aid, mode],
         stdin=subprocess.DEVNULL,
@@ -1250,7 +1613,7 @@ def spawn_runner(aid: str, mode: str) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
-        env=_runner_env(aid),
+        env=env,
     )
 
 
@@ -1310,6 +1673,12 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     behavior while the agent is currently running; on an idle, finished, or
     never-started agent it is exactly equivalent to an ordinary prompt.
 
+    Prompt submission and runner ownership form one atomic protocol under the
+    per-agent lock: a prompt that arrives while another invocation is genuinely
+    reserved or running is either serialized (steer) or explicitly rejected
+    (ordinary prompt on a busy agent) rather than silently overwriting the
+    pending prompt or spawning a second runner.
+
     Args:
         args: Parsed command arguments.
 
@@ -1328,13 +1697,15 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    state = derive_state(meta)
-    if state == "running":
-        if not args.steer:
-            _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
-            return EXIT_ERROR
-        return _steer_busy(args, prompt)
-    return _start_continuation(args, meta, prompt)
+    # An ordinary prompt on a genuinely busy agent is rejected; a steer is
+    # serialized.  A reserved agent whose runner never claimed (stale
+    # reservation) is not genuinely busy and is recovered below instead of
+    # being rejected, so an agent can never get stuck "running" forever.
+    running = derive_state(meta) == "running"
+    if running and not args.steer and (is_alive(meta) or reservation_in_flight(meta)):
+        _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
+        return EXIT_ERROR
+    return _dispatch_invocation(args, prompt)
 
 
 def _follow_attached(aid: str) -> int:
@@ -1354,38 +1725,335 @@ def _follow_attached(aid: str) -> int:
     return exit_code_for(read_meta(aid))
 
 
-def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> int:
-    """Start an invocation of an idle, finished, or never-started agent.
+def _interrupt_steer_if_needed(aid: str) -> None:
+    """Send SIGTERM to a live agent that is mid-steer, if applicable.
 
-    The first invocation of a fresh agent creates the underlying native session
-    (mode ``new``); later prompts continue that exact native session (mode
-    ``continue``). A prompt is refused only when a native session was previously
-    established and has genuinely disappeared; an agent that never established a
-    native session may always retry as a new session, even after a failed first
-    attempt. By default the invocation is followed and its exit status is
-    propagated; ``--detach`` returns immediately.
+    A reuse decision that interrupted the running invocation only matters when
+    the runner is still executing the agent under a ``steer`` intent; an agent
+    that has already finished or never entered the steer intent needs no
+    signal.
+
+    Args:
+        aid: Lubko agent ID.
+    """
+    current = read_meta(aid)
+    if current is None or current.get("intent") != "steer" or not is_alive(current):
+        return
+    send_signal_group(current, signal.SIGTERM)
+
+
+def _recover_stale_reservation(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    steer: bool,
+) -> bool:
+    """Recover a stale reserved runner, preserving the accepted pending prompt.
+
+    Returns ``True`` only when ``m`` holds a reserved runner whose spawner or
+    runner died before claiming its exact identity (nothing genuinely in
+    flight). The caller re-owns the reservation under a fresh generation so the
+    stale old generation is invalidated, and starts exactly one replacement
+    runner.
+
+    The already-accepted pending prompt is preserved and never overwritten. When
+    an accepted prompt exists:
+
+    * an ordinary recovery caller is explicitly rejected (its own prompt is
+      discarded with a busy disposition) while recovery of the original prompt
+      still proceeds; and
+    * a ``--steer`` recovery caller queues the steer deterministically behind
+      the recovered invocation using the existing steer semantics, is durably
+      accepted (the caller receives success), and still lets exactly one
+      replacement runner execute the original prompt.
+
+    When no accepted prompt survived, the recovery caller's prompt is the one to
+    run and is accepted; a stale/idle ``--steer`` is then equivalent to an
+    ordinary prompt. In every case the recovery caller's text is never silently
+    discarded behind a success code.
+
+    A concurrent second recovery caller acquires the lock after the first has
+    re-owned the reservation, observes it genuinely in flight, and is rejected
+    as busy (ordinary) or serialized as a queued steer (``--steer``) without
+    spawning a second replacement.
+
+    Args:
+        m: Agent metadata under the lock.
+        decision: Caller-owned mapping filled with the resulting action.
+        prompt: The new caller's prompt or steer.
+        steer: Whether the recovery caller is a ``--steer``.
+
+    Returns:
+        ``True`` when a stale reservation was recovered here.
+    """
+    res = m.get("runner_reservation")
+    if not (isinstance(res, dict) and res.get("state") == "reserved"):
+        return False
+    if reservation_in_flight(m):
+        return False
+    now = time.time()
+    caller_pid = os.getpid()
+    gen = int(m.get("runner_gen") or 0) + 1
+    take_mode = res.get("mode") or "new"
+    accepted = bool(m.get("pending_prompt"))
+    if accepted:
+        if steer:
+            # A --steer that discovers the same stale reservation queues the
+            # steer deterministically behind the recovered invocation using the
+            # existing steer semantics, is durably accepted (success), and lets
+            # exactly one replacement runner execute the original prompt. The
+            # accepted pending prompt is never overwritten.
+            _queue_steer(m, prompt, now)
+            decision["steer_accepted"] = True
+        else:
+            # An ordinary recovery caller must not overwrite the accepted prompt;
+            # its own prompt is explicitly rejected (busy) while recovery of the
+            # original prompt proceeds via the spawned replacement runner.
+            decision["recover_busy"] = True
+    else:
+        # No accepted prompt survived: the recovery caller's prompt is the one
+        # to run and is accepted. A stale/idle --steer is equivalent to an
+        # ordinary prompt here, so it simply owns the recovered invocation.
+        m["pending_prompt"] = prompt
+        m["last_prompt"] = _truncate(prompt, 500)
+        m["prompt_count"] = int(m.get("prompt_count") or 0) + 1
+    m["active_runner"] = True
+    m["runner_gen"] = gen
+    m["runner_reservation"] = {
+        "gen": gen,
+        "owner_pid": caller_pid,
+        "owner_start_ticks": proc_start_ticks(caller_pid),
+        "state": "reserved",
+        "reserved_at": now,
+        "mode": take_mode,
+    }
+    decision["action"] = "spawn"
+    decision["mode"] = take_mode
+    decision["gen"] = gen
+    return True
+
+
+def _resolve_session_mode(m: Meta) -> str | None:
+    """Return the native-session mode derived from the locked agent state.
+
+    The mode (``new`` or ``continue``) is resolved under the per-agent metadata
+    lock from the current agent state, never from a stale pre-lock observation.
+    A recorded underlying session that can no longer be discovered fails closed
+    (``None``), and otherwise the mode is ``continue`` when a native session is
+    recorded or discoverable and ``new`` otherwise.
+
+    Args:
+        m: Agent metadata under the lock.
+
+    Returns:
+        ``"new"``, ``"continue"``, or ``None`` when the session is gone.
+    """
+    recorded = m.get("native_session_id")
+    # Always rediscover under the lock: external session availability is the
+    # authority, and a stale discovery before the lock must never authorize a
+    # second ``new`` session.
+    discovered = discover_session_id(m.get("id", "")) or None
+    if recorded is not None and discovered is None:
+        # A recorded underlying session that can no longer be found must fail
+        # closed rather than silently starting a fresh one.
+        return None
+    return "continue" if (recorded or discovered) is not None else "new"
+
+
+def _decide_invocation(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    steer: bool,
+) -> None:
+    """Apply one linearizable prompt/steer transition atomically.
+
+    Runs under the per-agent metadata lock (via ``update_meta``). Mutates ``m``
+    in place and records the caller's next action in ``decision``. The full
+    decision order is documented on ``_dispatch_invocation``.
+
+    The native-session mode (``new`` or ``continue``) is derived here, under the
+    lock, from the current agent state rather than from a stale pre-lock
+    observation.  This closes the observe→lock TOCTOU: a caller that initially
+    sees no underlying session but loses the race to another invocation
+    continues the session that invocation established instead of reserving a
+    second ``new`` session from stale information.
+
+    Args:
+        m: Agent metadata under the lock.
+        decision: Caller-owned mapping filled with the resulting action.
+        prompt: Instruction to run or steer.
+        steer: Whether this is a steer rather than an ordinary prompt.
+    """
+    mode = _resolve_session_mode(m)
+    if mode is None:
+        decision["action"] = "error_session_gone"
+        return
+    _apply_locked_transition(m, decision, prompt=prompt, steer=steer, mode=mode)
+
+
+def _apply_locked_transition(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    steer: bool,
+    mode: str,
+) -> None:
+    """Apply the linearizable prompt/steer transition under the metadata lock.
+
+    Assumes the native-session ``mode`` has already been resolved under the lock
+    (see ``_resolve_session_mode``).  Mutates ``m`` in place and records the
+    caller's next action in ``decision``.
+
+    Args:
+        m: Agent metadata under the lock.
+        decision: Caller-owned mapping filled with the resulting action.
+        prompt: Instruction to run or steer.
+        steer: Whether this is a steer rather than an ordinary prompt.
+        mode: Resolved native-session mode (``new`` or ``continue``).
+    """
+    now = time.time()
+    caller_pid = os.getpid()
+    live_agent = is_alive(m)
+    live_runner = runner_alive(m)
+    in_flight = reservation_in_flight(m)
+
+    if live_agent:
+        if steer:
+            _queue_steer(m, prompt, now)
+            m["intent"] = "steer"
+            decision["action"] = "reuse"
+            decision["interrupt"] = True
+        else:
+            decision["action"] = "busy"
+        return
+
+    if live_runner:
+        if steer:
+            _queue_steer(m, prompt, now)
+            decision["action"] = "reuse"
+            decision["interrupt"] = False
+        elif m.get("pending_prompt"):
+            # An invocation is already accepted and awaiting this live runner;
+            # a second ordinary prompt must never overwrite it.  It is
+            # explicitly busy so exactly one prompt owns the runner.
+            decision["action"] = "busy"
+        else:
+            m["pending_prompt"] = prompt
+            m["state"] = "running"
+            m["last_activity_at"] = now
+            decision["action"] = "reuse"
+            decision["interrupt"] = False
+        return
+
+    if in_flight:
+        if steer:
+            _queue_steer(m, prompt, now)
+            decision["action"] = "reuse"
+            decision["interrupt"] = False
+        elif not owned_by_me(m, caller_pid):
+            decision["action"] = "busy"
+        else:
+            m["pending_prompt"] = prompt
+            decision["action"] = "reuse"
+        return
+
+    # A stale reserved runner (spawner or runner died before claiming its exact
+    # identity) is recovered here: the accepted pending prompt is preserved and
+    # exactly one replacement runner is started under a fresh generation.
+    if _recover_stale_reservation(m, decision, prompt=prompt, steer=steer):
+        return
+
+    # Nothing is genuinely in flight and no stale reservation to recover: own
+    # this transition (fresh start) and reserve exactly one runner. A steer
+    # that reaches here (idle, finished, or a stale reservation) is exactly
+    # equivalent to an ordinary prompt, so it sets the pending prompt and
+    # becomes the single reserved invocation.
+    gen = int(m.get("runner_gen") or 0) + 1
+    _begin_invocation(m, prompt, now)
+    m["active_runner"] = True
+    m["runner_gen"] = gen
+    m["runner_reservation"] = {
+        "gen": gen,
+        "owner_pid": caller_pid,
+        "owner_start_ticks": proc_start_ticks(caller_pid),
+        "state": "reserved",
+        "reserved_at": now,
+        "mode": mode,
+    }
+    decision["action"] = "spawn"
+    decision["mode"] = mode
+    decision["gen"] = gen
+
+
+def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
+    """Submit a prompt or steer as one atomic, linearizable protocol step.
+
+    Under the per-agent metadata lock the caller decides, in order:
+
+    * an invocation is genuinely executing (live agent process) — an ordinary
+      prompt is rejected (busy); a steer is queued and interrupts it;
+    * only a proven-live runner exists (between invocations) — the prompt is
+      queued for that runner and no second runner is spawned;
+    * a runner is reserved but not yet claimed — an ordinary prompt is rejected
+      (busy) so it cannot overwrite the pending prompt or spawn a competing
+      runner; a steer is queued deterministically;
+    * nothing is in flight (idle, finished, or a stale reservation) — the
+      caller reserves exactly one runner generation and spawns the single
+      runner authorized to execute this invocation.  A stale reservation
+      (spawner dead, runner never claimed) is taken over the same way, so
+      recovery never leaves the agent permanently running nor double-executes.
+
+    Only the process that holds the exact reservation may become the active
+    runner: the spawned runner claims its generation before doing any work,
+    and a second runner (whether from a race or a takeover that already
+    produced a replacement) bails instead of executing.
 
     Args:
         args: Parsed command arguments.
-        meta: Agent metadata.
-        prompt: Continuation instruction.
+        prompt: Instruction to run or steer.
 
     Returns:
         A process exit code.
     """
     aid = args.id or args.agent_id
+    steer = bool(args.steer)
 
-    recorded = meta.get("native_session_id")
-    discovered = discover_session_id(aid)
-    if recorded is not None and discovered is None:
+    meta = read_meta(aid)
+    if meta is None:
+        _err(f"{PROG}: unknown agent: {aid}")
+        return EXIT_NOT_FOUND
+
+    _test_sync("sc_observe")
+
+    decision: dict[str, object] = {}
+    update_meta(
+        aid,
+        lambda m: _decide_invocation(m, decision, prompt=prompt, steer=steer),
+    )
+    _test_sync("sc_decide")
+
+    action = decision.get("action")
+    if action == "error_session_gone":
         _err(f"{PROG}: cannot continue agent {aid}: its underlying session is not available")
         return EXIT_ERROR
-    mode = "continue" if (recorded or discovered) is not None else "new"
-
-    now = time.time()
-    update_meta(aid, lambda m: _begin_invocation(m, prompt, now))
-    if not _runner_will_pick_up(aid):
-        spawn_runner(aid, mode)
+    if action == "busy":
+        _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
+        return EXIT_ERROR
+    if action == "spawn":
+        spawn_runner(aid, str(decision["mode"]), gen=cast("int", decision["gen"]))
+        if decision.get("recover_busy"):
+            # A stale reserved runner was recovered (the accepted pending prompt
+            # is preserved and a replacement runner was started), but this
+            # caller's own prompt is explicitly rejected rather than silently
+            # accepted behind a success code.
+            _err(f"{PROG}: agent {aid} is recovering a reserved prompt; this prompt was rejected")
+            return EXIT_ERROR
+    elif action == "reuse" and decision.get("interrupt"):
+        _interrupt_steer_if_needed(aid)
 
     if args.detach:
         if args.json:
@@ -1395,78 +2063,6 @@ def _start_continuation(args: argparse.Namespace, meta: Meta, prompt: str) -> in
                 "Started agent " + aid + " in the background. Observe it with "
                 f"`{PROG} log {aid} --follow`."
             )
-        sys.stdout.flush()
-        return EXIT_OK
-    return _follow_attached(aid)
-
-
-def _runner_will_pick_up(aid: str) -> bool:
-    """Return whether a live runner will pick up a just-queued invocation.
-
-    A replacement runner is only skipped when a runner whose exact identity
-    is still alive will observe the new prompt.  Because the runner re-checks
-    for a concurrently queued prompt under the metadata lock before going
-    idle, an alive runner is guaranteed to reclaim the prompt, so no second
-    runner is spawned (which would double-execute the queue).
-
-    Args:
-        aid: Lubko agent ID.
-
-    Returns:
-        ``True`` when no replacement runner should be spawned.
-    """
-    meta = read_meta(aid)
-    if meta is None:
-        return True  # deleted; nothing left to monitor
-    if not meta.get("active_runner"):
-        return False
-    return runner_alive(meta)
-
-
-def _steer_busy(args: argparse.Namespace, prompt: str) -> int:
-    """Redirect a busy agent: queue the instruction and interrupt the run.
-
-    The running runner picks up the queued instruction as soon as the
-    interrupted invocation has exited. With ``--detach`` the command returns
-    immediately; otherwise it follows the resulting (steered) invocation and
-    propagates its exit status.
-
-    Args:
-        args: Parsed command arguments.
-        prompt: Steer instruction.
-
-    Returns:
-        A process exit code.
-    """
-    aid = args.id or args.agent_id
-    now = time.time()
-    spawn_needed = {"yes": False}
-
-    def apply(m: Meta) -> None:
-        _queue_steer(m, prompt, now)
-        alive = is_alive(m)
-        had_runner = bool(m.get("active_runner"))
-        m["active_runner"] = True
-        if alive:
-            m["intent"] = "steer"
-        elif not had_runner:
-            _pop_into_pending(m, now)
-            spawn_needed["yes"] = True
-
-    update_meta(aid, apply)
-    current = read_meta(aid)
-    if current is not None and current.get("intent") == "steer" and is_alive(current):
-        send_signal_group(current, signal.SIGTERM)
-    if spawn_needed["yes"]:
-        spawn_runner(aid, "continue")
-
-    if args.detach:
-        if args.json:
-            _out(json.dumps({"id": aid, "state": "running", "steer": True, "detached": True}))
-        else:
-            _out(aid)
-            detail = "starting now" if spawn_needed["yes"] else "interrupting current run"
-            _err(f"{PROG}: steer queued; {detail}")
         sys.stdout.flush()
         return EXIT_OK
     return _follow_attached(aid)
@@ -1640,6 +2236,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not aid:
         _err(f"{PROG}: status: an agent ID is required")
         return EXIT_USAGE
+    # Reconcile before reporting: a status observation must converge durable
+    # metadata instead of leaving a dead invocation recorded as running. This
+    # is idempotent and PID-reuse safe (exact-identity checks inside).
+    reconcile_meta(aid)
     meta = read_meta(aid)
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
@@ -1728,7 +2328,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
             if meta.get("steer_queue")
             else None
         ),
-        "model": meta.get("model"),
+        "model": AGENT_MODEL,
         "variant": meta.get("variant"),
         "log": str(agent_dir(aid) / "output.log"),
     }
@@ -2200,12 +2800,24 @@ def _drain_and_stop(handle: BinaryIO, normalizer: _LogNormalizer) -> None:
 def _terminal_or_unknown(aid: str) -> bool:
     """Return whether the agent is terminal, unknown, or deleted.
 
+    Before deciding, the durable record is reconciled: a runner/model process
+    that disappeared mid-invocation must converge ``meta.json`` to an explicit
+    terminal state instead of being observed as a stale ``unknown`` that leaves
+    ``state=running / active_runner=true`` behind. Reconciliation rewrites only
+    on an actual change, so follow polling ticks stay fsync-free when healthy.
+
     Args:
         aid: Lubko agent ID.
 
     Returns:
         ``True`` when streaming should stop.
     """
+    meta = read_meta(aid)
+    if meta is None:
+        return True
+    # Reconcile first so the decision below never returns a stale unknown for
+    # a provably dead invocation without also converging the durable record.
+    reconcile_meta(aid)
     meta = read_meta(aid)
     if meta is None:
         return True
@@ -2347,6 +2959,11 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 meta = current
                 break
             time.sleep(0.25)
+        else:
+            # The runner never finalized: converge the durable record instead
+            # of returning while metadata still claims a running invocation.
+            reconcile_meta(aid)
+            meta = read_meta(aid) or meta
         break
 
     return exit_code_for(meta)

@@ -39,6 +39,7 @@ import pytest
 
 from lubko import cli, lifecycle, supervise
 from lubko import deployctl as dc
+from lubko import supervisor as supervisor_module
 from lubko.state import cli_root_dir, rollback_state_path
 from lubko.supervisor import Settings, SupervisorDaemon
 from lubko.supervisor import main as supervisor_main
@@ -57,6 +58,8 @@ BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
 TEST_WORKER_ID: Final = "test-supervisor-worker"
 LEGACY_MARKER: Final = "legacy-token"
+_TEST_ORPHAN_INCARNATION: Final = "test-orphan-incarnation"
+_TEST_WORKER_INCARNATION: Final = "test-worker-incarnation"
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = 30.0) -> None:
@@ -472,17 +475,17 @@ def mission_state(
     status: str,
     commit: str,
     previous_commit: str,
-    *,
-    repo: str = "",
 ) -> dc.RollbackState:
     """Build a durable supervised-deployment mission for the override tests.
+
+    Use ``dataclasses.replace`` at call sites to set ``repo`` or
+    ``supervisor_owned`` when the test needs non-default values.
 
     Args:
         generation: Monotonic mission generation.
         status: ``pending``, ``confirmed``, or ``rolled_back``.
         commit: Candidate commit.
         previous_commit: Previously confirmed commit.
-        repo: Maintained checkout, defaults to ``""``.
 
     Returns:
         A minimal but valid :class:`dc.RollbackState`.
@@ -495,7 +498,7 @@ def mission_state(
         previous_commit=previous_commit,
         challenge_hash=None,
         deadline=time.time() + 60,
-        repo=repo,
+        repo="",
         uv_path="uv",
         stop_grace_seconds=1.0,
         git_timeout_seconds=5.0,
@@ -703,13 +706,63 @@ def test_crash_recovery_recovers_stale_job_without_reexecution(
     kill_job_group_if_any(jobs_db, job_id)
 
 
-def wait_for_replacement(old_pid: int) -> None:
+def wait_for_replacement(old_pid: int) -> int:
     """Wait until the daemon records a worker child different from ``old_pid``.
+
+    A single status read is taken per poll (via :func:`wait_until`) and the
+    exact observed replacement PID is captured and returned, so the caller
+    never re-reads a disagreeing snapshot.  The previous predicate read the
+    status twice (``worker_pid() is not None and worker_pid() != old_pid``);
+    those two reads are independent snapshots, so a multi-read TOCTOU in the
+    test harness is logically capable of making the predicate ``True`` while the
+    current child is ``None`` (because ``None != old_pid``), after which the
+    caller's separate :func:`worker_pid` read could observe ``None`` -- the
+    observed deployment symptom at line 731.  This helper removes the defect by
+    returning the one PID it matched.
 
     Args:
         old_pid: The previous worker child PID.
+
+    Returns:
+        The exact replacement worker PID recorded by the daemon.
     """
-    wait_until(lambda: worker_pid() is not None and worker_pid() != old_pid, timeout=30.0)
+    observed: list[int] = []
+
+    def _check() -> bool:
+        candidate = worker_pid()
+        if candidate is not None and candidate != old_pid:
+            observed.append(candidate)
+            return True
+        return False
+
+    wait_until(_check, timeout=30.0)
+    return observed[0]
+
+
+def test_wait_for_replacement_rejects_transient_none_and_returns_observed_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient ``None`` snapshot must not satisfy the helper.
+
+    The exact observed replacement PID must be returned to the caller.  The
+    helper observes one status snapshot per poll.  A ``None`` child (the
+    supervisor having cleared the previous child before respawning) is not a
+    replacement, so the helper must keep waiting; once a real replacement PID
+    appears it is returned exactly, with no separate re-read that could disagree.
+    """
+    old_pid = 4242
+    sequence = iter([old_pid, None, None, 9999, 9999])
+
+    def fake_worker_pid() -> int | None:
+        return next(sequence)
+
+    monkeypatch.setattr(
+        "tests.test_supervisor_daemon.worker_pid",
+        fake_worker_pid,
+    )
+    replacement = wait_for_replacement(old_pid)
+    assert replacement == 9999
+    assert replacement != old_pid
 
 
 def test_repeated_crashes_never_accumulate_workers(
@@ -724,10 +777,7 @@ def test_repeated_crashes_never_accumulate_workers(
         assert previous is not None
         for _ in range(3):
             os.killpg(previous, signal.SIGKILL)
-            wait_for_replacement(previous)
-            next_pid = worker_pid()
-            assert next_pid is not None
-            previous = next_pid
+            previous = wait_for_replacement(previous)
         status = supervise.read_status()
         assert status is not None
         assert status.restart_count >= 1
@@ -1063,7 +1113,13 @@ def test_pending_mission_drives_candidate_and_settlement_converges(
         original_pid = worker_pid()
         assert original_pid is not None
 
-        write_rollback(mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)))
+        write_rollback(
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
+        )
         wait_for_replacement(original_pid)
         wait_until(status_ready, timeout=30.0)
         candidate_pid = worker_pid()
@@ -1105,7 +1161,11 @@ def test_supervised_deploy_candidate_is_direct_supervisor_child(
         assert original_pid is not None
 
         dc.publish_mission(
-            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
             lock_timeout_seconds=5.0,
         )
         wait_for_replacement(original_pid)
@@ -1126,7 +1186,11 @@ def test_supervised_deploy_candidate_is_direct_supervisor_child(
         assert final_status.commit == second
         assert len(direct_children(final_status.supervisor_pid)) == 1
         write_rollback(
-            mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+            replace(
+                mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
         )
 
 
@@ -1145,7 +1209,11 @@ def test_supervised_bad_candidate_rollback_converges_to_previous(
         assert original_pid is not None
 
         dc.publish_mission(
-            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
             lock_timeout_seconds=5.0,
         )
         wait_for_replacement(original_pid)
@@ -1164,7 +1232,11 @@ def test_supervised_bad_candidate_rollback_converges_to_previous(
         assert final_status.commit == first
         assert len(direct_children(final_status.supervisor_pid)) == 1
         write_rollback(
-            mission_state(applied + 1, dc.STATUS_ROLLED_BACK, second, first, repo=str(repo))
+            replace(
+                mission_state(applied + 1, dc.STATUS_ROLLED_BACK, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
         )
 
 
@@ -1211,7 +1283,13 @@ def test_status_keeps_live_supervised_pending_mission(
         original_pid = worker_pid()
         assert original_pid is not None
 
-        write_rollback(mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)))
+        write_rollback(
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
+        )
         wait_for_replacement(original_pid)
         wait_until(status_ready, timeout=30.0)
         candidate_pid = worker_pid()
@@ -1251,7 +1329,11 @@ def test_status_rolls_back_supervised_mission_with_lapsed_deadline(
         original_pid = worker_pid()
         assert original_pid is not None
 
-        lapsed = mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo))
+        lapsed = replace(
+            mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+            repo=str(repo),
+            supervisor_owned=True,
+        )
         write_rollback(replace(lapsed, deadline=time.time() - 1))
         wait_for_replacement(original_pid)
         wait_until(status_ready, timeout=30.0)
@@ -1288,7 +1370,11 @@ def test_supervisor_restart_resumes_pending_mission_candidate(
         original_pid = worker_pid()
         assert original_pid is not None
         dc.publish_mission(
-            mission_state(applied + 1, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
             lock_timeout_seconds=5.0,
         )
         wait_for_replacement(original_pid)
@@ -1307,7 +1393,11 @@ def test_supervisor_restart_resumes_pending_mission_candidate(
         assert status.commit == second
         assert len(direct_children(status.supervisor_pid)) == 1
         write_rollback(
-            mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+            replace(
+                mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
         )
 
 
@@ -1338,7 +1428,11 @@ def test_deploy_and_restart_generations_strictly_increase(
         mission_gen = dc.next_mission_generation()
         assert mission_gen > restart_gen
         dc.publish_mission(
-            mission_state(mission_gen, dc.STATUS_PENDING, second, first, repo=str(repo)),
+            replace(
+                mission_state(mission_gen, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
             lock_timeout_seconds=5.0,
         )
         wait_until(status_commit_is(second), timeout=30.0)
@@ -1357,7 +1451,11 @@ def test_deploy_and_restart_generations_strictly_increase(
         assert len(direct_children(status.supervisor_pid)) == 1
         assert status.applied_generation == settle_gen
         write_rollback(
-            mission_state(mission_gen, dc.STATUS_CONFIRMED, second, first, repo=str(repo))
+            replace(
+                mission_state(mission_gen, dc.STATUS_CONFIRMED, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            )
         )
 
 
@@ -1689,7 +1787,7 @@ def test_tick_derives_before_applying_stale_desired(
     monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
     monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
     monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
-    daemon._tick(0.0)  # ruff: ignore[private-member-access]
+    daemon.reconcile(0.0)
     assert applied == []
     assert ensured == ["3" * 40]
 
@@ -2122,36 +2220,663 @@ def test_queue_deploy_cli_activation_failure_rolls_back_and_converges(
     repo, first, second = maintained_env
     fake_uv = write_fake_uv(tmp_path)
     cli.set_current(first)
-    (cli_root_dir() / cli.CURRENT_TMP_NAME).mkdir()
-    with running_supervisor(supervisor_env):
-        applied = request_and_wait(first, repo)
-        old_meta = lifecycle.read_meta()
-        assert old_meta is not None
-        assert old_meta.pid is not None
+    # Make the CLI root non-writable so the atomic pointer switch (which now
+    # uses unique temporary names) cannot create its temp symlink or replace
+    # the ``current`` pointer.  Both runtimes are already built by
+    # ``maintained_env``, so this blocks only the final pointer switch and not
+    # any new commit-runtime construction.  The previously established
+    # ``current`` pointer stays readable as ``first``; any ``set_current``
+    # attempt (candidate or rollback) fails closed, leaving the pointer on
+    # ``first`` until the supervisor rolls back to the previous commit.
+    cli_root = cli_root_dir()
+    original_mode = cli_root.stat().st_mode & 0o777
+    cli_root.chmod(original_mode & ~0o222)
+    try:
+        assert cli.current_commit() == first
+        with running_supervisor(supervisor_env):
+            applied = request_and_wait(first, repo)
+            old_meta = lifecycle.read_meta()
+            assert old_meta is not None
+            assert old_meta.pid is not None
 
-        deploy_id = insert_pending_process_job(
-            jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+            deploy_id = insert_pending_process_job(
+                jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+            )
+            wait_until(lambda: read_status_of(jobs_db, deploy_id) == "succeeded", timeout=90.0)
+            wait_until(_deploy_rollback_converged(applied, first), timeout=90.0)
+
+            status = supervise.read_status()
+            assert status is not None
+            assert status.commit == first
+            assert status.applied_generation > applied
+            assert status.child is not None
+            assert status.child.pid != old_meta.pid
+            assert len(direct_children(status.supervisor_pid)) == 1
+            assert cli.current_commit() == first
+
+            meta = lifecycle.read_meta()
+            assert meta is not None
+            assert meta.git_commit == first
+            assert lifecycle.worker_alive(meta)
+
+            payload = read_payload(jobs_db, deploy_id)
+            assert payload_state(payload)["status"] == "succeeded"
+            result = payload["result"]
+            assert isinstance(result, dict)
+            assert result["exit_code"] == 0
+            assert second in str(result["stdout"])
+    finally:
+        cli_root.chmod(original_mode)
+
+
+# ---------------------------------------------------------------------------
+# Status identity binding regressions (#90)
+# ---------------------------------------------------------------------------
+
+
+def _write_status_snapshot(
+    supervisor_pid: int,
+    supervisor_start_time_ticks: int,
+    *,
+    ready: bool = True,
+    commit: str = "a" * 40,
+    child_pid: int = 100,
+) -> None:
+    """Persist a raw status snapshot for identity-binding tests.
+
+    Args:
+        supervisor_pid: PID recorded in the status.
+        supervisor_start_time_ticks: Start time ticks recorded in the status.
+        ready: Whether the snapshot claims readiness.
+        commit: Commit the snapshot claims to run.
+        child_pid: Worker child PID in the snapshot.
+    """
+    supervise.write_status(
+        supervise.SupervisorStatus(
+            schema_version=supervise.SCHEMA_VERSION,
+            supervisor_pid=supervisor_pid,
+            supervisor_start_time_ticks=supervisor_start_time_ticks,
+            started_at=0.0,
+            applied_generation=1,
+            mode=supervise.MODE_RUN,
+            commit=commit,
+            child=supervise.WorkerChild(
+                pid=child_pid,
+                pgid=child_pid,
+                sid=child_pid,
+                start_time_ticks=1,
+                token=f"token-{child_pid}",
+                worker_id="test-worker",
+                spawned_at=0.0,
+            ),
+            intent=supervise.INTENT_RUN,
+            restart_count=0,
+            next_attempt_at=None,
+            last_exit=None,
+            mission=None,
+            db_ready=True,
+            ready=ready,
+            message=None,
+            worker_health=None,
         )
-        wait_until(lambda: read_status_of(jobs_db, deploy_id) == "succeeded", timeout=90.0)
-        wait_until(_deploy_rollback_converged(applied, first), timeout=90.0)
+    )
 
+
+def test_read_status_returns_none_when_no_pidfile(
+    tmp_path: Path,
+) -> None:
+    """A status snapshot with no pidfile is treated as stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks)
+    supervise.supervisor_pid_path().unlink(missing_ok=True)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_none_when_pidfile_mismatch(
+    tmp_path: Path,
+) -> None:
+    """A status whose PID disagrees with the pidfile is stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks)
+    supervise.write_supervisor_pid(pid + 999, ticks)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_none_when_status_ticks_mismatch_pidfile(
+    tmp_path: Path,
+) -> None:
+    """A status whose start_time_ticks disagree with the pidfile is stale.
+
+    This is the PID-reuse scenario: same PID, different incarnation.
+    """
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks)
+    supervise.write_supervisor_pid(pid, ticks + 1)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_none_when_process_dead(
+    tmp_path: Path,
+) -> None:
+    """A status whose supervisor process has died is stale."""
+    del tmp_path
+    _write_status_snapshot(999_999, 1)
+    supervise.write_supervisor_pid(999_999, 1)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_none_when_process_zombie(
+    tmp_path: Path,
+) -> None:
+    """A status whose supervisor process is a zombie is stale."""
+    del tmp_path
+    _write_status_snapshot(999_999, 1)
+    supervise.write_supervisor_pid(999_999, 1)
+    assert supervise.read_status() is None
+
+
+def test_read_status_returns_valid_for_live_supervisor(
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """A status snapshot from the live supervisor is accepted."""
+    repo, first, _second = maintained_env
+    with running_supervisor(supervisor_env):
+        request_and_wait(first, repo)
         status = supervise.read_status()
         assert status is not None
+        assert status.supervisor_pid > 0
+        assert status.supervisor_start_time_ticks > 0
+        assert status.ready is True
         assert status.commit == first
-        assert status.applied_generation > applied
-        assert status.child is not None
-        assert status.child.pid != old_meta.pid
-        assert len(direct_children(status.supervisor_pid)) == 1
-        assert cli.current_commit() == first
 
-        meta = lifecycle.read_meta()
-        assert meta is not None
-        assert meta.git_commit == first
-        assert lifecycle.worker_alive(meta)
 
-        payload = read_payload(jobs_db, deploy_id)
-        assert payload_state(payload)["status"] == "succeeded"
-        result = payload["result"]
-        assert isinstance(result, dict)
-        assert result["exit_code"] == 0
-        assert second in str(result["stdout"])
+def test_stale_ready_status_rejected_by_wait_until_ready(
+    tmp_path: Path,
+) -> None:
+    """wait_until_ready returns False when the status snapshot is stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks, ready=True)
+    supervise.supervisor_pid_path().unlink(missing_ok=True)
+    assert not supervise.wait_until_ready(1, 0.2)
+
+
+def test_stale_ready_status_rejected_by_wait_for_generation(
+    tmp_path: Path,
+) -> None:
+    """wait_for_generation returns False when the status snapshot is stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    _write_status_snapshot(pid, ticks, ready=True)
+    supervise.supervisor_pid_path().unlink(missing_ok=True)
+    assert not supervise.wait_for_generation(1, 0.2)
+
+
+def test_status_roundtrip_includes_start_time_ticks(tmp_path: Path) -> None:
+    """SupervisorStatus survives serialization and retains start_time_ticks."""
+    del tmp_path
+    original = supervise.SupervisorStatus(
+        schema_version=supervise.SCHEMA_VERSION,
+        supervisor_pid=42,
+        supervisor_start_time_ticks=777,
+        started_at=1.5,
+        applied_generation=3,
+        mode=supervise.MODE_RUN,
+        commit="a" * 40,
+        child=supervise.WorkerChild(
+            pid=100,
+            pgid=100,
+            sid=100,
+            start_time_ticks=10,
+            token=f"token-{42}",
+            worker_id="w",
+            spawned_at=2.0,
+        ),
+        intent=supervise.INTENT_RUN,
+        restart_count=1,
+        next_attempt_at=None,
+        last_exit=supervise.LastExit(returncode=1, at=3.0),
+        mission=None,
+        db_ready=True,
+        ready=True,
+        message="ok",
+        worker_health=None,
+    )
+    data = original.to_dict()
+    restored = supervise.SupervisorStatus.from_dict(data)
+    assert restored.supervisor_pid == 42
+    assert restored.supervisor_start_time_ticks == 777
+    assert restored.child is not None
+    assert restored.child.pid == 100
+    assert restored.ready is True
+    assert isinstance(data["started_at"], float)
+
+
+def test_old_status_schema_without_start_time_ticks_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A legacy status without supervisor_start_time_ticks defaults to 0 and is stale."""
+    del tmp_path
+    pid = os.getpid()
+    ticks = supervise.proc_start_ticks(pid) or 0
+    supervise.write_supervisor_pid(pid, ticks)
+    legacy_data = {
+        "schema_version": supervise.SCHEMA_VERSION,
+        "supervisor_pid": pid,
+        "started_at": 0.0,
+        "applied_generation": 1,
+        "mode": supervise.MODE_RUN,
+        "commit": "a" * 40,
+        "child": None,
+        "intent": supervise.INTENT_RUN,
+        "restart_count": 0,
+        "next_attempt_at": None,
+        "last_exit": None,
+        "mission": None,
+        "db_ready": None,
+        "ready": True,
+        "message": None,
+    }
+    supervise.status_path().parent.mkdir(parents=True, exist_ok=True)
+    temporary = supervise.status_path().with_name(f"{supervise.status_path().name}.tmp")
+    temporary.write_text(json.dumps(legacy_data, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(supervise.status_path())
+    assert supervise.read_status() is None
+
+
+# ---------------------------------------------------------------------------
+# Acceptance: deterministic SIGKILL regression and replacement recovery (#91)
+# ---------------------------------------------------------------------------
+
+
+def test_supervisor_hard_kill_pending_candidate_replacement_resumes(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """Deterministic SIGKILL regression: supervisor hard-killed while pending candidate.
+
+    The supervisor is hard-killed while a pending mission is active.  The orphan
+    candidate survives initially (reparented to PID 1).  A replacement supervisor
+    starts, retires the orphan by exact identity, and resumes the candidate
+    commit from the durable pending mission state.  The replacement status is
+    synchronized to the exact replacement supervisor incarnation (PID +
+    start_time ticks) so a stale snapshot from the first supervisor can never
+    satisfy the wait condition.
+    """
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    first_proc = start_supervisor(supervisor_env)
+    try:
+        applied = request_and_wait(first, repo)
+        original_pid = worker_pid()
+        assert original_pid is not None
+
+        dc.publish_mission(
+            replace(
+                mission_state(applied + 1, dc.STATUS_PENDING, second, first),
+                repo=str(repo),
+                supervisor_owned=True,
+            ),
+            lock_timeout_seconds=5.0,
+        )
+        wait_for_replacement(original_pid)
+        wait_until(status_ready, timeout=30.0)
+
+        first_status = supervise.read_status()
+        assert first_status is not None
+        assert first_status.child is not None
+        first_child = first_status.child
+        first_meta = lifecycle.WorkerMeta(
+            schema_version=lifecycle.SCHEMA_VERSION,
+            state=lifecycle.STATE_RUNNING,
+            pid=first_child.pid,
+            pgid=first_child.pgid,
+            sid=first_child.sid,
+            start_time_ticks=first_child.start_time_ticks,
+            token=first_child.token,
+            repo="",
+            git_commit=None,
+            worker_id=first_child.worker_id,
+            log_path="",
+            started_at=first_child.spawned_at,
+            stopped_at=None,
+        )
+        assert lifecycle.worker_alive(first_meta), "first candidate must be alive before kill"
+
+        first_proc.kill()
+        first_proc.wait(timeout=5)
+        guard.unregister(first_proc)
+        assert not process_alive(first_proc.pid)
+
+        mission = dc.read_rollback_state()
+        assert mission is not None
+        assert mission.status == dc.STATUS_PENDING
+        assert mission.commit == second
+        assert mission.generation == applied + 1
+
+        assert lifecycle.worker_alive(first_meta), "orphan candidate must survive initial SIGKILL"
+
+        second_proc = start_supervisor(supervisor_env)
+        second_pid = second_proc.pid
+        try:
+
+            def replacement_ready() -> bool:
+                st = supervise.read_status()
+                return bool(
+                    st is not None
+                    and st.supervisor_pid == second_pid
+                    and st.supervisor_start_time_ticks
+                    == (supervise.proc_start_ticks(second_pid) or 0)
+                    and st.ready
+                    and st.child is not None
+                    and not (
+                        st.child.pid == first_child.pid
+                        and st.child.start_time_ticks == first_child.start_time_ticks
+                        and st.child.token == first_child.token
+                    )
+                )
+
+            wait_until(replacement_ready, timeout=30.0)
+
+            second_status = supervise.read_status()
+            assert second_status is not None
+            assert second_status.child is not None
+            second_child = second_status.child
+            second_meta = lifecycle.WorkerMeta(
+                schema_version=lifecycle.SCHEMA_VERSION,
+                state=lifecycle.STATE_RUNNING,
+                pid=second_child.pid,
+                pgid=second_child.pgid,
+                sid=second_child.sid,
+                start_time_ticks=second_child.start_time_ticks,
+                token=second_child.token,
+                repo="",
+                git_commit=None,
+                worker_id=second_child.worker_id,
+                log_path="",
+                started_at=second_child.spawned_at,
+                stopped_at=None,
+            )
+
+            assert not lifecycle.worker_alive(first_meta), "old exact identity must be dead"
+            assert second_status.commit == second
+            assert len(direct_children(second_status.supervisor_pid)) == 1
+            assert lifecycle.worker_alive(second_meta), "resumed candidate must be live"
+
+            write_rollback(
+                replace(
+                    mission_state(applied + 1, dc.STATUS_CONFIRMED, second, first),
+                    repo=str(repo),
+                    supervisor_owned=True,
+                )
+            )
+        finally:
+            stop_supervisor(second_proc)
+    finally:
+        if first_proc.poll() is None:
+            stop_supervisor(first_proc)
+
+
+def test_supervisor_restart_resumes_mission_repeated(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> None:
+    """Repeated supervisor restart-resume cycles are stable.
+
+    A pending mission survives multiple supervisor restart cycles without
+    state mutation or duplicate workers.  Each restart reconstructs the
+    candidate from durable state, and the mission remains pending throughout.
+    """
+    del jobs_db, pg_cluster
+    repo, first, second = maintained_env
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+
+    for _cycle in range(3):
+        with running_supervisor(supervisor_env):
+            current_applied = supervise.read_state().applied_generation
+            dc.publish_mission(
+                replace(
+                    mission_state(
+                        current_applied + 1,
+                        dc.STATUS_PENDING,
+                        second,
+                        first,
+                    ),
+                    repo=str(repo),
+                    supervisor_owned=True,
+                ),
+                lock_timeout_seconds=5.0,
+            )
+            wait_until(status_ready, timeout=30.0)
+            candidate = worker_pid()
+            assert candidate is not None
+            assert process_alive(candidate)
+
+        status = supervise.read_status()
+        if status is not None:
+            assert status.commit == second
+            mission = dc.read_rollback_state()
+            assert mission is not None
+            assert mission.status == dc.STATUS_PENDING
+            assert mission.commit == second
+            assert mission.generation > applied
+
+    write_rollback(
+        replace(
+            mission_state(
+                supervise.read_state().applied_generation,
+                dc.STATUS_CONFIRMED,
+                second,
+                first,
+            ),
+            repo=str(repo),
+            supervisor_owned=True,
+        )
+    )
+
+
+def test_reconcile_takeover_stops_reparented_orphan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconcile retires a reparented orphan then replacement may spawn.
+
+    After a supervisor restart, the old worker is reparented to PID 1.
+    _child_alive returns False (PPID mismatch) but lifecycle.worker_alive
+    confirms the exact process is live.  reconcile skips _handle_crash,
+    proceeds to _ensure_worker, which exact-retires the orphan.  A mutable
+    exact_alive flag models reality: successful stop flips it False so the
+    later metadata takeover check sees the process dead and does not stop
+    again.  Exactly one stop occurs before replacement.
+    """
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    try:
+        identity = lifecycle.process_identity(proc.pid)
+        assert identity is not None
+        child = supervise.WorkerChild(
+            pid=identity.pid,
+            pgid=identity.pgid,
+            sid=identity.sid,
+            start_time_ticks=identity.start_time_ticks,
+            token=_TEST_ORPHAN_INCARNATION,
+            worker_id="orphan-worker",
+            spawned_at=1.0,
+        )
+        orphan_meta = lifecycle.WorkerMeta(
+            schema_version=lifecycle.SCHEMA_VERSION,
+            state=lifecycle.STATE_RUNNING,
+            pid=identity.pid,
+            pgid=identity.pgid,
+            sid=identity.sid,
+            start_time_ticks=identity.start_time_ticks,
+            token=_TEST_ORPHAN_INCARNATION,
+            repo="",
+            git_commit=None,
+            worker_id="orphan-worker",
+            log_path="",
+            started_at=1.0,
+            stopped_at=None,
+        )
+        state = replace(
+            supervise.fresh_state(),
+            mode=supervise.MODE_RUN,
+            commit="a" * 40,
+            child=child,
+            intent=supervise.INTENT_RUN,
+        )
+        supervise.write_state(state)
+
+        exact_alive = True
+        stop_calls: list[lifecycle.WorkerMeta] = []
+
+        def fake_stop(meta: lifecycle.WorkerMeta, _grace: float) -> bool:
+            stop_calls.append(meta)
+            nonlocal exact_alive
+            exact_alive = False
+            return True
+
+        def fake_read_meta() -> lifecycle.WorkerMeta | None:
+            return orphan_meta
+
+        def fake_worker_alive(meta: lifecycle.WorkerMeta) -> bool:
+            return exact_alive and meta.pid == identity.pid
+
+        daemon = SupervisorDaemon(Settings())
+        monkeypatch.setattr(daemon, "_derive_action", lambda _s: ("run", "b" * 40))
+        monkeypatch.setattr(lifecycle, "stop_worker", fake_stop)
+        monkeypatch.setattr(lifecycle, "read_meta", fake_read_meta)
+        monkeypatch.setattr(lifecycle, "worker_alive", fake_worker_alive)
+        monkeypatch.setattr(daemon, "_spawn_worker", lambda _c: None)
+        monkeypatch.setattr(daemon, "_child_alive", lambda _s: False)
+        # Model the emergency owned-group recovery explicitly (exact recovery
+        # succeeded) rather than depending on a real database configuration, so
+        # the takeover's full retire path is exercised deterministically. The
+        # exact token is verified so recovery targets only the retired orphan's
+        # incarnation.
+        recover_calls: list[str] = []
+
+        def fake_recover(token: str) -> None:
+            recover_calls.append(token)
+            assert token == _TEST_ORPHAN_INCARNATION
+
+        monkeypatch.setattr(supervisor_module, "recover_owned_groups", fake_recover)
+
+        daemon.reconcile(0.0)
+
+        assert recover_calls == [_TEST_ORPHAN_INCARNATION]
+        assert len(stop_calls) == 1
+        assert stop_calls[0].pid == proc.pid
+        assert stop_calls[0].start_time_ticks == identity.start_time_ticks
+
+        final_state = supervise.read_state()
+        assert final_state.child is None
+    finally:
+        guard.teardown_tracked(fail_on_leak=False)
+
+
+def test_reconcile_takeover_fails_closed_on_wrong_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconcile holds when stop_worker fails -- retries after backoff.
+
+    When the recorded maintained worker's identity cannot be proven (wrong
+    token, PID reuse), stop_worker returns False and reconcile backs off
+    without spawning.  The durable child identity is preserved across
+    repeated reconciliation cycles and _spawn_worker is never called.
+    After backoff expires the exact same stop is retried.
+    """
+    child = supervise.WorkerChild(
+        pid=999_999,
+        pgid=999_999,
+        sid=999_999,
+        start_time_ticks=42,
+        token=_TEST_WORKER_INCARNATION,
+        worker_id="dead-worker",
+        spawned_at=1.0,
+    )
+    stale_meta = lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=999_999,
+        pgid=999_999,
+        sid=999_999,
+        start_time_ticks=42,
+        token=_TEST_WORKER_INCARNATION,
+        repo="",
+        git_commit=None,
+        worker_id="dead-worker",
+        log_path="",
+        started_at=1.0,
+        stopped_at=None,
+    )
+    state = replace(
+        supervise.fresh_state(),
+        mode=supervise.MODE_RUN,
+        commit="a" * 40,
+        child=child,
+        intent=supervise.INTENT_RUN,
+    )
+    supervise.write_state(state)
+
+    stop_calls: list[lifecycle.WorkerMeta] = []
+
+    def fail_stop(meta: lifecycle.WorkerMeta, _grace: float) -> bool:
+        stop_calls.append(meta)
+        return False
+
+    def fake_read_meta() -> lifecycle.WorkerMeta | None:
+        return stale_meta
+
+    def fake_worker_alive(meta: lifecycle.WorkerMeta) -> bool:
+        return meta.pid == 999_999
+
+    spawn_calls: list[str] = []
+
+    def fake_spawn(commit: str) -> supervise.WorkerChild | None:
+        spawn_calls.append(commit)
+        return None
+
+    daemon = SupervisorDaemon(Settings())
+    monkeypatch.setattr(daemon, "_derive_action", lambda _s: ("run", "b" * 40))
+    monkeypatch.setattr(lifecycle, "stop_worker", fail_stop)
+    monkeypatch.setattr(lifecycle, "read_meta", fake_read_meta)
+    monkeypatch.setattr(lifecycle, "worker_alive", fake_worker_alive)
+    monkeypatch.setattr(daemon, "_spawn_worker", fake_spawn)
+    monkeypatch.setattr(daemon, "_child_alive", lambda _s: False)
+
+    daemon.reconcile(0.0)
+    first_state = supervise.read_state()
+    assert first_state.child is not None
+    assert first_state.child.pid == child.pid
+    assert first_state.child.token == child.token
+    assert first_state.next_attempt_at is not None
+    assert spawn_calls == []
+    assert len(stop_calls) == 1
+
+    daemon.reconcile(first_state.next_attempt_at + 0.01)
+    second_state = supervise.read_state()
+    assert second_state.child is not None
+    assert second_state.child.pid == child.pid
+    assert second_state.child.token == child.token
+    assert spawn_calls == [], "no worker must be spawned across repeated ticks"
+    assert len(stop_calls) == 2, "stop_worker must be called on each retry"

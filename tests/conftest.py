@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
+from lubko import deployctl as dc
+from lubko import lifecycle
 from tests import _isolation as isolation
 from tests import _pg
 from tests import _process_guard as guard
@@ -95,6 +97,13 @@ def _isolated_lubko_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     # the ambient job identity is cleared: a test is only queue-invoked when it
     # deliberately sets the variable itself.
     monkeypatch.delenv("LUBKO_JOB_ID", raising=False)
+    # The same applies to the runner identity markers. A test-spawned process
+    # inherits ``os.environ``, so ambient LUBKO_AGENT_ID / LUBKO_RUNNER_GEN
+    # values (e.g. when the suite itself runs inside a Lubko job) would make
+    # unrelated helper processes look like live runners of an arbitrary agent
+    # and generation. Exact-identity tests must set these themselves.
+    monkeypatch.delenv("LUBKO_AGENT_ID", raising=False)
+    monkeypatch.delenv("LUBKO_RUNNER_GEN", raising=False)
     return root
 
 
@@ -318,16 +327,64 @@ def _session_process_teardown() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def _process_teardown() -> Iterator[None]:
+def _process_teardown(
+    _isolated_lubko_state: Path,
+) -> Iterator[None]:
     """Own and deterministically stop every process a test creates.
+
+    Takes an explicit parameter dependency on ``_isolated_lubko_state`` so
+    pytest guarantees the test-owned XDG root is still authoritative during
+    cleanup.  The ``yield`` is inside ``try/finally`` so cleanup always
+    runs even when the test body raises.  After the guard stops tracked
+    processes, a bounded loop reads test-owned lifecycle metadata and
+    rollback state, verifies each recorded identity with
+    ``lifecycle.worker_alive(meta)``, and signals only exact verified
+    groups.  A late watchdog rollback candidate is caught in a second pass.
+
+    Args:
+        _isolated_lubko_state: The pytest-owned XDG root for this test.
 
     Yields:
         Nothing while one test runs.
     """
-    yield
-    stopped = guard.teardown_tracked()
-    if stopped:
-        LOGGER.debug("test teardown stopped %d leaked process(es)", stopped)
+    try:
+        yield
+    finally:
+        os.environ["XDG_STATE_HOME"] = str(_isolated_lubko_state / "state")
+        stopped = guard.teardown_tracked()
+        _cleanup_recorded_workers()
+        if stopped:
+            LOGGER.debug("test teardown stopped %d leaked process(es)", stopped)
+        isolation.CURRENT_TEST_TMP = None
+
+
+def _cleanup_recorded_workers() -> None:
+    """Read test-owned lifecycle meta/rollback, verify and signal exact identities.
+
+    Uses ``lifecycle.worker_alive(meta)`` which validates PID/start-ticks/
+    PGID/SID/token, and ``lifecycle.stop_worker(meta)`` for exact TERM/KILL/
+    group wait.  If a PENDING rollback mission exists it is disarmed before
+    killing the candidate so its watchdog cannot spawn another replacement.
+    """
+    isolation.assert_test_owned_state_root()
+    recorded: list[lifecycle.WorkerMeta] = []
+    meta = lifecycle.read_meta()
+    if meta is not None:
+        recorded.append(meta)
+    try:
+        state = dc.read_rollback_state()
+    except dc.DeployCtlError:
+        state = None
+    if state is not None:
+        recorded.append(state.new_meta)
+        if state.status == dc.STATUS_PENDING:
+            dc.archive_mission(state, dc.STATUS_ROLLED_BACK)
+    for rw in recorded:
+        if rw.pid is None:
+            continue
+        if not lifecycle.worker_alive(rw):
+            continue
+        lifecycle.stop_worker(rw, 5.0)
 
 
 @pytest.fixture(scope="module")
