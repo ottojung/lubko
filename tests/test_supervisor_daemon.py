@@ -2225,6 +2225,228 @@ def test_tick_derives_before_applying_stale_desired(
 
 
 # ---------------------------------------------------------------------------
+# Reboot-safe restart/backoff state (#151)
+# ---------------------------------------------------------------------------
+
+
+def _write_backing_off_state(
+    boot_id: str,
+    commit: str,
+    *,
+    child: supervise.WorkerChild | None = None,
+    restart_count: int = 3,
+    generation: int | None = None,
+) -> None:
+    """Persist durable supervisor state backing off in a huge pre-reboot domain.
+
+    Args:
+        boot_id: Boot identifier recorded for the state.
+        commit: Exact confirmed commit the state claims to run.
+        child: Optional stale recorded worker child.
+        restart_count: Consecutive-crash counter to persist.
+        generation: Applied generation; defaults to the current desired one.
+    """
+    desired = supervise.read_desired()
+    assert desired is not None
+    supervise.write_state(
+        replace(
+            supervise.fresh_state(),
+            applied_generation=desired.generation if generation is None else generation,
+            mode=supervise.MODE_RUN,
+            commit=commit,
+            child=child,
+            intent=supervise.INTENT_RUN,
+            restart_count=restart_count,
+            # Deliberately much larger than any plausible current-boot
+            # monotonic value: the pre-reboot clock domain.
+            next_attempt_at=10_000_000.0,
+            last_spawn_at=10_000_000.0 - 5.0,
+            ready=False,
+            next_readiness_at=None,
+            boot_id=boot_id,
+        )
+    )
+
+
+def _live_child() -> supervise.WorkerChild:
+    """Spawn a real live sleep process and return its exact child identity.
+
+    Returns:
+        A worker child identity bound to a genuinely live direct child of the
+        test process.
+    """
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "30"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "LUBKO_LIFECYCLE_TOKEN": "reboot-test-token"},
+    )
+    guard.register(proc)
+    identity = lifecycle.process_identity(proc.pid)
+    assert identity is not None
+    return supervise.WorkerChild(
+        pid=identity.pid,
+        pgid=identity.pgid,
+        sid=identity.sid,
+        start_time_ticks=identity.start_time_ticks,
+        token="reboot-test-token",  # ruff: ignore[hardcoded-password-func-arg]
+        worker_id=TEST_WORKER_ID,
+        spawned_at=time.time(),
+    )
+
+
+def test_reboot_with_no_child_converges_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-reboot backoff deadline never wedges a fresh-boot supervisor."""
+    commit = "a" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    _write_backing_off_state("pre-reboot-boot", commit, child=None)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "post-reboot-boot")
+    daemon = SupervisorDaemon(Settings())
+    supervisor_module.normalize_cross_boot_state()
+    state = supervise.read_state()
+    assert state.boot_id == "post-reboot-boot"
+    assert state.next_attempt_at is None
+    assert state.last_spawn_at is None
+    assert state.restart_count == 3
+    ensured: list[str] = []
+    monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    daemon.reconcile(100.0)
+    assert ensured == [commit]
+
+
+def test_same_boot_restart_preserves_bounded_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-boot daemon restart keeps the still-valid backoff deadline."""
+    commit = "b" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    _write_backing_off_state("same-boot", commit, child=None, restart_count=2)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "same-boot")
+    daemon = SupervisorDaemon(Settings())
+    supervisor_module.normalize_cross_boot_state()
+    state = supervise.read_state()
+    assert state.boot_id == "same-boot"
+    assert state.next_attempt_at == pytest.approx(10_000_000.0)
+    assert state.last_spawn_at == pytest.approx(10_000_000.0 - 5.0)
+    assert state.restart_count == 2
+    ensured: list[str] = []
+    monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    daemon.reconcile(1_000.0)
+    assert ensured == []
+    daemon.reconcile(10_000_000.5)
+    assert ensured == [commit]
+
+
+def test_reboot_with_stale_child_records_crash_then_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-reboot recorded child is crash-handled once, then replaced."""
+    commit = "c" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    stale_child = supervise.WorkerChild(
+        pid=999_999,
+        pgid=999_999,
+        sid=999_999,
+        start_time_ticks=42,
+        token="stale-token",  # ruff: ignore[hardcoded-password-func-arg]
+        worker_id=TEST_WORKER_ID,
+        spawned_at=10_000_000.0,
+    )
+    _write_backing_off_state("pre-reboot-boot", commit, child=stale_child, restart_count=1)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "post-reboot-boot")
+    daemon = SupervisorDaemon(Settings())
+    supervisor_module.normalize_cross_boot_state()
+    state = supervise.read_state()
+    assert state.child is not None
+    assert state.child.pid == stale_child.pid
+    assert state.next_attempt_at is None
+    ensured: list[str] = []
+    monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    daemon.reconcile(100.0)
+    state = supervise.read_state()
+    assert state.child is None
+    assert state.restart_count == 2
+    assert state.next_attempt_at is not None
+    assert state.next_attempt_at <= 100.0 + Settings().backoff_max_seconds
+    assert ensured == []
+    daemon.reconcile(state.next_attempt_at + 1.0 if state.next_attempt_at else 1e9)
+    assert ensured == [commit]
+
+
+def test_reboot_never_spawns_a_duplicate_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-reboot reconciliation spawns exactly one worker child."""
+    commit = "d" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    _write_backing_off_state("pre-reboot-boot", commit, child=None)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "post-reboot-boot")
+    daemon = SupervisorDaemon(Settings(backoff_base_seconds=0.05))
+    supervisor_module.normalize_cross_boot_state()
+    try:
+        spawned: list[supervise.WorkerChild] = []
+        live = _live_child()
+
+        def _fake_spawn(_commit: str) -> supervise.WorkerChild:
+            spawned.append(live)
+            return live
+
+        monkeypatch.setattr(daemon, "_spawn_worker", _fake_spawn)
+        monkeypatch.setattr(daemon, "_check_readiness", lambda _child, _cwd: (False, "deferred"))
+        now = 100.0
+        for _ in range(6):
+            daemon.reconcile(now)
+            time.sleep(0.06)
+            now += 1.0
+        assert len(spawned) == 1
+        state = supervise.read_state()
+        assert state.child is not None
+        assert state.child.pid == live.pid
+    finally:
+        guard.teardown_tracked(fail_on_leak=False)
+
+
+def test_reboot_restores_confirmed_commit_and_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-reboot convergence runs the intended confirmed commit, ready."""
+    commit = "e" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    _write_backing_off_state("pre-reboot-boot", commit, child=None)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "post-reboot-boot")
+    daemon = SupervisorDaemon(Settings(backoff_base_seconds=0.05))
+    supervisor_module.normalize_cross_boot_state()
+    live = _live_child()
+    monkeypatch.setattr(daemon, "_spawn_worker", lambda _commit: live)
+    monkeypatch.setattr(supervisor_module, "publish_current_surfaces", lambda _token: None)
+    monkeypatch.setattr(daemon, "_check_readiness", lambda _child, _cwd: (True, "ok"))
+    try:
+        now = time.monotonic()
+        daemon.reconcile(now)
+        state = supervise.read_state()
+        assert state.commit == commit
+        assert state.ready is False
+        assert state.child is not None
+        assert state.child.pid == live.pid
+        daemon.reconcile(now + Settings().readiness_interval_seconds + 1.0)
+        state = supervise.read_state()
+        assert state.commit == commit
+        assert state.ready is True
+        assert state.next_readiness_at is None
+    finally:
+        guard.teardown_tracked(fail_on_leak=False)
+
+
+# ---------------------------------------------------------------------------
 # Queue-invoked plain ``lubko-deploy deploy`` (#68)
 # ---------------------------------------------------------------------------
 

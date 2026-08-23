@@ -55,6 +55,8 @@ if TYPE_CHECKING:
 
 SCHEMA_VERSION: Final = 1
 
+BOOT_ID_PATH: Final = Path("/proc/sys/kernel/random/boot_id")
+
 SUPERVISOR_RUNTIME_COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}\n\Z")
 
 STAT_MIN_FIELDS: Final = 20
@@ -188,6 +190,7 @@ class SupervisorState:
     last_spawn_at: float | None
     ready: bool
     next_readiness_at: float | None
+    boot_id: str | None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the daemon state for storage.
@@ -213,6 +216,7 @@ class SupervisorState:
             "last_spawn_at": self.last_spawn_at,
             "ready": self.ready,
             "next_readiness_at": self.next_readiness_at,
+            "boot_id": self.boot_id,
         }
 
     @classmethod
@@ -255,6 +259,7 @@ class SupervisorState:
             last_spawn_at=_optional_float(data.get("last_spawn_at")),
             ready=data.get("ready", False) is True,
             next_readiness_at=_optional_float(data.get("next_readiness_at")),
+            boot_id=_optional_string(data.get("boot_id")),
         )
 
 
@@ -506,6 +511,29 @@ def acquire_supervisor_lock() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Boot identity
+# ---------------------------------------------------------------------------
+
+
+def current_boot_id() -> str | None:
+    """Return an identifier for the current boot, or ``None`` when unknown.
+
+    The kernel exposes a stable per-boot UUID in
+    ``/proc/sys/kernel/random/boot_id``; it changes across host/container
+    reboot and stays constant across daemon restarts within one boot. When the
+    identifier cannot be read the caller must assume the clock domain is
+    unverifiable and treat durable monotonic values as stale.
+
+    Returns:
+        The boot identifier string, or ``None``.
+    """
+    try:
+        return BOOT_ID_PATH.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Atomic storage
 # ---------------------------------------------------------------------------
 
@@ -630,6 +658,7 @@ def fresh_state() -> SupervisorState:
         last_spawn_at=None,
         ready=False,
         next_readiness_at=None,
+        boot_id=None,
     )
 
 
