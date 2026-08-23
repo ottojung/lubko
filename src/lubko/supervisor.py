@@ -391,6 +391,45 @@ def recover_owned_groups(incarnation: str) -> None:
         )
 
 
+def normalize_cross_boot_state() -> None:
+    """Neutralize monotonic-domain fields left over from a previous boot.
+
+    ``next_attempt_at``, ``last_spawn_at``, and ``next_readiness_at`` are
+    expressed in ``time.monotonic()`` coordinates, which are only meaningful
+    within one boot. Durable state records the boot identifier it was written
+    in; when it does not match the current boot (or cannot be proven to match,
+    because the boot identity is unreadable), those values would otherwise be
+    misread as deadlines in the new clock domain and could wedge the daemon
+    behind a prior-boot uptime value.
+
+    The restart counter, the last-exit record, and the recorded child identity
+    stay durable: the counter keeps crash-loop history bounded, and a stale
+    child is resolved by the ordinary reconciliation path, which classifies it
+    dead (or reparented) by exact identity and either crash-handles or retires
+    it — never duplicating a worker.
+    """
+    state = read_state()
+    boot_id = supervise.current_boot_id()
+    if state.boot_id == boot_id and boot_id is not None:
+        return
+    write_state(
+        replace(
+            state,
+            boot_id=boot_id,
+            next_attempt_at=None,
+            last_spawn_at=None,
+            next_readiness_at=None,
+            ready=False,
+        )
+    )
+    if state.boot_id is not None:
+        LOGGER.info(
+            "durable supervisor state predates this boot; reset monotonic "
+            "backoff/readiness deadlines for commit %s",
+            state.commit,
+        )
+
+
 class SupervisorDaemon:
     """One long-lived daemon that owns and restarts the maintained worker."""
 
@@ -426,6 +465,7 @@ class SupervisorDaemon:
         try:
             self._write_pidfile()
             self._invalidate_stale_status()
+            normalize_cross_boot_state()
             self._install_signal_handlers()
             self._write_status("starting")
             while not self._stopping:
