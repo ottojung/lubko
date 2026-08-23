@@ -29,7 +29,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -49,7 +49,7 @@ from tests import _process_guard as guard
 from tests.test_cli import make_repo
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from uuid import UUID
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
@@ -299,7 +299,7 @@ def running_supervisor(env: dict[str, str]) -> Iterator[subprocess.Popen[bytes]]
     """Run a supervisor daemon and guarantee deterministic teardown.
 
     Args:
-        env: Environment for the daemon.
+        env: Environment for the daemon (and its worker child).
 
     Yields:
         The daemon process.
@@ -309,6 +309,35 @@ def running_supervisor(env: dict[str, str]) -> Iterator[subprocess.Popen[bytes]]
         yield proc
     finally:
         stop_supervisor(proc)
+
+
+@contextmanager
+def _owned_supervisors(
+    startups: Sequence[Callable[[], subprocess.Popen[bytes]]],
+) -> Iterator[list[subprocess.Popen[bytes]]]:
+    """Start supervisors and unconditionally reap every created stack.
+
+    Orchestration invariant under review: a failure during a later startup,
+    during the test body, or during an earlier teardown must never leak an
+    already-running stack.  Every successful startup immediately registers
+    its teardown on an :class:`contextlib.ExitStack`, so all registered
+    callbacks run even when something else raises, and Python exception
+    chaining preserves each earlier failure as context.
+
+    Args:
+        startups: One zero-argument callable per stack, invoked in order.
+            A callable that raises aborts the remaining startups.
+
+    Yields:
+        The processes of every successfully started stack, in creation order.
+    """
+    with ExitStack() as stack:
+        started: list[subprocess.Popen[bytes]] = []
+        for start in startups:
+            proc = start()
+            started.append(proc)
+            stack.callback(stop_supervisor, proc)
+        yield started
 
 
 def request_and_wait(commit: str, repo: Path) -> int:
@@ -1001,8 +1030,8 @@ def test_two_simultaneous_owned_stacks_never_cross_talk(
         tmp_path, monkeypatch, supervisor_env, second_pg_cluster
     )
 
-    proc_a = start_supervisor(supervisor_env)
-    proc_b = start_supervisor(env_b)
+    pid_a: int | None = None
+    pid_b: int | None = None
 
     def read_b() -> supervise.SupervisorStatus | None:
         status: supervise.SupervisorStatus | None = None
@@ -1014,7 +1043,10 @@ def test_two_simultaneous_owned_stacks_never_cross_talk(
         _with_stack_b_env(monkeypatch, env_b, read)
         return status
 
-    try:
+    with _owned_supervisors([
+        lambda: start_supervisor(supervisor_env),
+        lambda: start_supervisor(env_b),
+    ]) as _stack_procs:
         request_and_wait(first_a, repo_a)
         _with_stack_b_env(
             monkeypatch,
@@ -1050,13 +1082,134 @@ def test_two_simultaneous_owned_stacks_never_cross_talk(
             lambda: read_status_of(second_pg_cluster.conninfo(), probe_b) == "succeeded",
             timeout=60.0,
         )
-    finally:
-        stop_supervisor(proc_a)
-        stop_supervisor(proc_b)
 
     # Exact cleanup: no test-owned process survives, so none can reparent.
+    # Both pids were captured inside the converged body, so they are bound.
+    assert pid_a is not None
+    assert pid_b is not None
     assert not process_alive(pid_a)
     assert not process_alive(pid_b)
+
+
+class _FakeSupervisor:
+    """Duck-typed supervisor handle recording teardown signals for regressions."""
+
+    def __init__(self) -> None:
+        self.terminated = False
+
+    @staticmethod
+    def poll() -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminated = True
+
+    @staticmethod
+    def wait(timeout: float | None = None) -> int:
+        del timeout
+        return 0
+
+
+def test_second_stack_startup_failure_still_stops_first_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed second startup must not leak the first, converged stack."""
+    first = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [cast("subprocess.Popen[bytes]", first)]
+    startup_attempts: list[int] = []
+    stopped: list[subprocess.Popen[bytes]] = []
+
+    def failing_second_start() -> subprocess.Popen[bytes]:
+        startup_attempts.append(1)
+        if len(startup_attempts) == 1:
+            return handles[0]
+        msg = "second stack startup exploded"
+        raise RuntimeError(msg)
+
+    def fake_stop(proc: subprocess.Popen[bytes]) -> None:
+        stopped.append(proc)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", fake_stop)
+
+    with (
+        pytest.raises(RuntimeError, match="second stack startup exploded"),
+        _owned_supervisors([failing_second_start, failing_second_start]),
+    ):
+        pass
+
+    assert len(startup_attempts) == 2
+    assert stopped == [handles[0]]
+
+
+def test_first_teardown_failure_still_converges_rest_and_surfaces_chained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing teardown never skips later stacks nor hides the failure."""
+    first = _FakeSupervisor()
+    second = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [
+        cast("subprocess.Popen[bytes]", first),
+        cast("subprocess.Popen[bytes]", second),
+    ]
+    stop_order: list[subprocess.Popen[bytes]] = []
+
+    def fake_stop(proc: subprocess.Popen[bytes]) -> None:
+        stop_order.append(proc)
+        if proc is handles[0]:
+            msg = "teardown wedged"
+            raise OSError(msg)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", fake_stop)
+    handles_iter = iter(handles)
+    startups: list[Callable[[], subprocess.Popen[bytes]]] = [
+        handles_iter.__next__,
+        handles_iter.__next__,
+    ]
+
+    body_ran = False
+    with (
+        pytest.raises(OSError, match="teardown wedged"),
+        _owned_supervisors(startups),
+    ):
+        body_ran = True
+
+    assert body_ran is True
+    # ExitStack unwinds LIFO, but every registered stack is still converged.
+    assert stop_order == [handles[1], handles[0]]
+
+
+def test_body_failure_with_failing_teardown_chains_both_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup that cannot converge chains loudly instead of masking the body."""
+    first = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [cast("subprocess.Popen[bytes]", first)]
+    stopped: list[subprocess.Popen[bytes]] = []
+
+    def always_wedged_stop(_proc: subprocess.Popen[bytes]) -> None:
+        stopped.append(handles[0])
+        msg = "teardown wedged"
+        raise OSError(msg)
+
+    def failing_body() -> None:
+        msg = "body assertion blew up"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", always_wedged_stop)
+
+    excinfo: pytest.ExceptionInfo[OSError]
+    with (
+        pytest.raises(OSError, match="teardown wedged") as excinfo,
+        _owned_supervisors([lambda: handles[0]]),
+    ):
+        failing_body()
+
+    assert stopped == handles
+    assert isinstance(excinfo.value.__context__, ValueError)
+    assert str(excinfo.value.__context__) == "body assertion blew up"
 
 
 def test_live_worker_db_outage_is_not_duplicated(
