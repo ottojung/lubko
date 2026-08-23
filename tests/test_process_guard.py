@@ -7,12 +7,14 @@ signals the pytest/shared process group, and fails loudly when a test leaks.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -469,6 +471,179 @@ def test_owner_marker_record_is_complete_before_register_returns(
             subject.wait(timeout=10)
     guard.unregister(subject)
     assert subject.pid not in guard.TRACKED
+
+
+def assert_marker_has_exactly(
+    marker: Path,
+    registered: list[tuple[subprocess.Popen[bytes], int]],
+) -> None:
+    """Assert the marker holds exactly one complete record per registration.
+
+    Args:
+        marker: The owner-marker JSONL file.
+        registered: The successfully-registered ``(proc, spawn_ticks)`` pairs.
+    """
+    lines = marker.read_text(encoding="utf-8").splitlines(keepends=True)
+    assert len(lines) == len(registered), lines
+    assert all(line.endswith("\n") for line in lines), lines
+    entries = [json.loads(line) for line in lines]
+    expected = sorted((proc.pid, guard.proc_start_ticks(proc.pid)) for proc, _ in registered)
+    assert sorted((e["pid"], e["ticks"]) for e in entries) == expected
+
+
+def make_torn_byte_writer(
+    key: tuple[int, int],
+    real_write: Callable[[int, bytes], int],
+) -> Callable[[int, bytes], int]:
+    """Build an ``os.write`` replacement emitting one byte per call.
+
+    Args:
+        key: ``(st_dev, st_ino)`` of the marker; other fds pass through.
+        real_write: The real ``os.write`` to delegate to.
+
+    Returns:
+        A write function forcing many short writes on the marker fd only.
+    """
+
+    def torn_write(fd: int, data: bytes) -> int:
+        stat = os.fstat(fd)
+        if (stat.st_dev, stat.st_ino) != key:
+            return real_write(fd, data)
+        written = 0
+        while written < len(data):
+            written += real_write(fd, data[written : written + 1])
+            time.sleep(0.0005)
+        return written
+
+    return torn_write
+
+
+def kill_by_exact_identity(registered: list[tuple[subprocess.Popen[bytes], int]]) -> None:
+    """Kill every still-live registered subject by its spawn-time identity.
+
+    Args:
+        registered: The ``(proc, spawn_ticks)`` pairs to clean up.
+    """
+    for proc, spawn_ticks in registered:
+        if proc.poll() is None:
+            assert guard.signal_identity_checked(
+                proc.pid,
+                spawn_ticks,
+                signal.SIGKILL,
+            )
+            proc.wait(timeout=10)
+    for proc, _ in registered:
+        guard.unregister(proc)
+
+
+def make_register_worker(
+    barrier: threading.Barrier,
+    registered: list[tuple[subprocess.Popen[bytes], int]],
+    errors: list[Exception],
+) -> Callable[[], None]:
+    """Build a thread body that spawns a subject and registers it concurrently.
+
+    Args:
+        barrier: Rendezvous so both writers overlap mid-recording.
+        registered: Collects ``(proc, spawn_ticks)`` for every spawned subject.
+        errors: Collects any failure raised by the registration.
+
+    Returns:
+        The thread target.
+    """
+
+    def target() -> None:
+        proc, _ = spawn_sleep_leader()
+        try:
+            barrier.wait(timeout=10)
+            guard.register(proc)
+        except (threading.BrokenBarrierError, AssertionError, OSError) as error:
+            errors.append(error)
+        finally:
+            registered.append((proc, guard.proc_start_ticks(proc.pid) or 0))
+
+    return target
+
+
+def run_two_threads(target: Callable[[], None]) -> None:
+    """Run ``target`` on two threads concurrently and await both.
+
+    Args:
+        target: The thread body to run twice.
+    """
+    threads = [threading.Thread(target=target) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+
+def test_concurrent_registrations_never_interleave_owner_marker_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent registrations assembled from short writes never interleave.
+
+    Two real subprocesses are registered concurrently while ``os.write`` is
+    forced to emit only one byte per call, so each logical marker record is
+    necessarily assembled from many partial writes and the writers overlap.
+    With the cross-process serialization in place both registrations must
+    succeed and the marker must contain exactly two complete, parseable,
+    newline-terminated JSONL records with the expected pid/ticks pairs.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    marker = tmp_path / "owner.marker.jsonl"
+    marker.touch()
+    key = (marker.stat().st_dev, marker.stat().st_ino)
+    registered: list[tuple[subprocess.Popen[bytes], int]] = []
+    errors: list[Exception] = []
+
+    monkeypatch.setenv(guard.OWNER_MARKER_ENV, str(marker))
+    monkeypatch.setattr(os, "write", make_torn_byte_writer(key, os.write))
+    run_two_threads(make_register_worker(threading.Barrier(2), registered, errors))
+    monkeypatch.undo()
+    try:
+        assert not errors, errors
+        assert len({proc.pid for proc, _ in registered}) == 2
+        assert_marker_has_exactly(marker, registered)
+    finally:
+        kill_by_exact_identity(registered)
+
+
+def test_owner_marker_fails_closed_when_lock_cannot_be_established(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recording fails loudly instead of appending unlocked.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    marker = tmp_path / "owner.marker.jsonl"
+    proc, pid = spawn_sleep_leader()
+    proc_spawn_ticks = guard.proc_start_ticks(pid)
+    assert proc_spawn_ticks is not None
+
+    def broken_flock(_fd: int, _operation: int) -> None:
+        msg = "no locks available"
+        raise OSError(msg)
+
+    monkeypatch.setenv(guard.OWNER_MARKER_ENV, str(marker))
+    monkeypatch.setattr(fcntl, "flock", broken_flock)
+    try:
+        with pytest.raises(AssertionError, match="cannot lock owner marker"):
+            guard.register(proc)
+        assert not marker.read_text(encoding="utf-8")
+    finally:
+        monkeypatch.undo()
+        if proc.poll() is None:
+            verified_kill(proc, proc_spawn_ticks)
+        guard.unregister(proc)
+    assert pid not in guard.TRACKED
 
 
 def test_teardown_never_signals_entries_without_valid_ticks() -> None:

@@ -24,6 +24,7 @@ a broad process kill.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -62,10 +63,14 @@ def _record_to_owner_marker(pid: int, ticks: int) -> None:
     independent owner's starter), every successful registration appends its
     exact ``{pid, ticks}`` identity as one JSON line before returning, so
     the owner can contain descendants even after an abrupt nested-pytest
-    death.  Ordinary tests without the variable are unaffected.  The append
-    is a single O_APPEND write of one newline-terminated line: a reader can
-    therefore distinguish a complete record from a torn partial write and
-    must treat any partial trailing line as unproven coverage.
+    death.  Ordinary tests without the variable are unaffected.  The whole
+    logical record is appended under an advisory exclusive ``flock`` held on
+    the marker across every partial write, so two concurrent registrations —
+    even in different processes — can never interleave their bytes into a
+    torn hybrid line: each logical append is serialized end to end.  The
+    newline-terminated line plus the complete-write loop mean a reader can
+    distinguish a complete record from a torn partial write and must treat
+    any partial trailing line as unproven coverage.
 
     Args:
         pid: The registered process PID.
@@ -74,6 +79,9 @@ def _record_to_owner_marker(pid: int, ticks: int) -> None:
     Raises:
         AssertionError: If the identity cannot be recorded while the marker
             variable is set: registration must guarantee record-before-return.
+            This includes failure to establish the cross-process lock: if the
+            serialization mechanism cannot be set up, recording fails loudly
+            rather than appending unlocked.
     """
     raw = os.environ.get(OWNER_MARKER_ENV)
     if not raw:
@@ -85,10 +93,19 @@ def _record_to_owner_marker(pid: int, ticks: int) -> None:
         msg = f"cannot open owner marker {raw} to record pid {pid}: {error}"
         raise AssertionError(msg) from error
     try:
-        _write_all(fd, line, pid, raw)
-    except OSError as error:
-        msg = f"cannot append pid {pid} to owner marker {raw}: {error}"
-        raise AssertionError(msg) from error
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as error:
+            msg = f"cannot lock owner marker {raw} to record pid {pid}: {error}"
+            raise AssertionError(msg) from error
+        try:
+            _write_all(fd, line, pid, raw)
+        except OSError as error:
+            msg = f"cannot append pid {pid} to owner marker {raw}: {error}"
+            raise AssertionError(msg) from error
+        finally:
+            with suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
 
