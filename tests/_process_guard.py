@@ -85,12 +85,42 @@ def _record_to_owner_marker(pid: int, ticks: int) -> None:
         msg = f"cannot open owner marker {raw} to record pid {pid}: {error}"
         raise AssertionError(msg) from error
     try:
-        os.write(fd, line)
+        _write_all(fd, line, pid, raw)
     except OSError as error:
         msg = f"cannot append pid {pid} to owner marker {raw}: {error}"
         raise AssertionError(msg) from error
     finally:
         os.close(fd)
+
+
+def _write_all(fd: int, data: bytes, pid: int, raw: str) -> None:
+    """Write every byte of ``data`` to the O_APPEND marker ``fd``.
+
+    Loops so a partial write cannot yield a torn record: ``register`` must
+    not return until the full newline-terminated identity is appended, or it
+    fails loudly.  Interruption is reported as a loud failure rather than
+    silently retried, so record-before-return is never silently relaxed.
+
+    Args:
+        fd: The marker file descriptor.
+        data: The complete JSONL line to append.
+        pid: The registered PID (for diagnostics).
+        raw: The marker path (for diagnostics).
+
+    Raises:
+        AssertionError: If the record could not be appended completely.
+    """
+    written = 0
+    while written < len(data):
+        try:
+            count = os.write(fd, data[written:])
+        except InterruptedError as error:
+            msg = f"interrupted writing pid {pid} to owner marker {raw}: {error}"
+            raise AssertionError(msg) from error
+        if count <= 0:
+            msg = f"short/zero write recording pid {pid} to owner marker {raw}"
+            raise AssertionError(msg)
+        written += count
 
 
 def proc_start_ticks(pid: int) -> int | None:

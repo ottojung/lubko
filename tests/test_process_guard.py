@@ -7,6 +7,7 @@ signals the pytest/shared process group, and fails loudly when a test leaks.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -411,6 +412,63 @@ def test_register_ignores_already_terminal_process() -> None:
     assert proc.wait(timeout=10) == 0
     guard.register(proc)
     assert guard.tracked_pids() == ()
+
+
+def test_owner_marker_record_is_complete_before_register_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A short write must be retried so the full record is durable first.
+
+    ``register`` appends the exact ``{pid, ticks}`` identity to the owner
+    marker before returning.  Forcing the first ``os.write`` to return only a
+    partial prefix proves record-before-return: a single partial write would
+    leave a torn line (unproven coverage), so the helper must loop until every
+    byte is appended, including the terminating newline, before ``register``
+    succeeds.
+    """
+    marker = tmp_path / "owner.marker.json"
+    subject = subprocess.Popen(
+        [SLEEP_BIN, "60"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    subject_spawn_ticks = guard.proc_start_ticks(subject.pid)
+    assert subject_spawn_ticks is not None
+
+    real_write = os.write
+    calls: dict[str, int] = {"n": 0, "short_bytes": 0}
+
+    def short_then_complete_write(fd: int, data: bytes) -> int:
+        if calls["n"] == 0:
+            calls["n"] = 1
+            calls["short_bytes"] = max(len(data) // 2, 1)
+            return real_write(fd, data[: calls["short_bytes"]])
+        return real_write(fd, data)
+
+    try:
+        monkeypatch.setenv(guard.OWNER_MARKER_ENV, str(marker))
+        monkeypatch.setattr(os, "write", short_then_complete_write)
+        guard.register(subject)
+        raw = marker.read_text(encoding="utf-8")
+        assert raw.endswith("\n")
+        entries = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        assert entries == [{"pid": subject.pid, "ticks": subject_spawn_ticks}]
+        assert calls["n"] == 1
+        assert calls["short_bytes"] > 0, "seam must actually force a short write"
+    finally:
+        monkeypatch.undo()
+        if subject.poll() is None:
+            assert guard.signal_identity_checked(
+                subject.pid,
+                subject_spawn_ticks,
+                signal.SIGKILL,
+            )
+            subject.wait(timeout=10)
+    guard.unregister(subject)
+    assert subject.pid not in guard.TRACKED
 
 
 def test_teardown_never_signals_entries_without_valid_ticks() -> None:
