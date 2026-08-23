@@ -2435,7 +2435,7 @@ def _cli_env(sync_dir: Path | None, **extra: str) -> dict[str, str]:
         # harness command.  Production code never sees FAKE_OPENCODE_CMD and
         # still builds the fixed `opencode run --model opencode-go/ox-alpha-free`
         # argv; only this fake reads it.
-        script = (
+        payload = (
             "#!" + sys.executable + "\n"
             "import os\n"
             "import sqlite3\n"
@@ -2466,8 +2466,24 @@ def _cli_env(sync_dir: Path | None, **extra: str) -> dict[str, str]:
             '_cmd = os.environ.get("FAKE_OPENCODE_CMD", "sleep 1")\n'
             'sys.exit(subprocess.call(["/bin/sh", "-c", _cmd]))\n'
         )
-        opencode.write_text(script)
-        opencode.chmod(0o755)
+        # The fake executable may be executing inside a live runner while
+        # another CLI invocation prepares its environment. Rewriting the file
+        # in place races that execution (OSError ETXTBSY) and could truncate a
+        # concurrently running script. The payload is invariant, so reuse an
+        # identical existing file; otherwise write to a fresh temporary file
+        # and atomically replace, which is safe against live executors.
+        if not opencode.exists() or opencode.read_text(encoding="utf-8") != payload:
+            fd, staged = tempfile.mkstemp(dir=fake_bin, prefix=".opencode-")
+            staged_path = Path(staged)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                staged_path.chmod(0o700)
+                staged_path.replace(opencode)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    staged_path.unlink()
+                raise
         env["FAKE_OPENCODE_CMD"] = fake_cmd
         env["XDG_DATA_HOME"] = str(fake_data)
         env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
@@ -2716,6 +2732,44 @@ def spawn_stale_marked_process(aid: str, gen: int) -> subprocess.Popen[bytes]:
     )
     guard.register(proc)
     return proc
+
+
+def test_cli_env_reprepare_while_fake_executable_is_live(tmp_path: Path) -> None:
+    """Preparing another CLI env cannot fail or corrupt a live fake executable.
+
+    Regression coverage for the ETXTBSY race: while a runner is executing the
+    fake ``opencode`` binary, ``_cli_env`` must be able to prepare further CLI
+    invocations without raising ``OSError`` (ETXTBSY) or truncating/corrupting
+    the executable the live process is running.
+    """
+    sync = tmp_path / "sync"
+    started = tmp_path / "started"
+    env = _cli_env(sync, FAKE_OPENCODE_CMD=f'touch "{started}"; sleep 300')
+    fake_bin = sync / "fake-opencode-bin"
+    opencode = fake_bin / "opencode"
+    original = opencode.read_bytes()
+    proc = subprocess.Popen(
+        [str(opencode), "run"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(proc)
+    try:
+        wait_until(started.exists, timeout=10)
+        # The fake executable is now genuinely executing. Repeatedly prepare
+        # further CLI environments exactly as concurrent prompt callers would.
+        for _ in range(16):
+            _cli_env(sync, FAKE_OPENCODE_CMD=f'touch "{started}"; sleep 300')
+            _cli_env(None, FAKE_OPENCODE_CMD="sleep 1")
+        assert opencode.read_bytes() == original
+        assert opencode.stat().st_mode & 0o111
+    finally:
+        _kill_runner(proc.pid)
+        proc.wait(timeout=10)
 
 
 def test_linearizable_two_concurrent_prompts_exactly_one_runner(
