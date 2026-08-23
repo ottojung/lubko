@@ -47,14 +47,34 @@ pointer update happen in one transaction. Publication first retains the root
 ``command`` row with a row-level lock, so a root deleted concurrently leaves
 no new chunk rows. Archiving never shortens the live tail. See
 :mod:`lubko.protocol` and ``docs/protocol.md``.
+
+The local on-disk stdout/stderr capture files are themselves bounded
+independently of how much output the child produces. Each job's standard
+output and standard error are captured through dedicated nonblocking pipes that
+the supervisor drains in its single nonblocking loop into a bounded on-disk
+spool file. The worker owns the flow-control boundary *before* any disk
+allocation: a producer faster than the drainer/trimmer fills the kernel pipe
+buffer and then blocks on ``write()``, so it is backpressured and the physical
+spool can never grow past ``LUBKO_OUTPUT_SPOOL_MAX_BYTES`` (plus the pipe
+buffer) regardless of how much the child wants to write. The worker never uses
+``RLIMIT_FSIZE``, so a job may still write arbitrarily large files of its own.
+Logical byte offsets, immutable chunks and the rolling tail are preserved:
+after every successful publication the durably archived prefix (everything
+before the live tail window) is discarded from the head of each capture file
+while logical offsets and the tail stay the same, so a job's steady-state
+spool stays near ``OUTPUT_TAIL_MAX_BYTES`` regardless of total output volume.
+A spool stat/read failure fails only the offending job (never the whole
+worker) rather than letting one job poison supervision.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
+import select
 import signal
 import socket
 import subprocess
@@ -65,7 +85,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, override
 from uuid import uuid4
 
 import psycopg
@@ -159,11 +179,31 @@ DEFAULT_DB_OPERATION_TIMEOUT_SECONDS: Final = 15.0
 DEFAULT_GC_RETENTION_SECONDS: Final = 3600.0
 DEFAULT_GC_INTERVAL_SECONDS: Final = 60.0
 DEFAULT_GC_BATCH_LIMIT: Final = 100
+# Configurable safe bound on the per-job local stdout/stderr disk spool.  The
+# on-disk capture files are trimmed to the rolling live tail after every
+# publication, so a job's steady-state spool stays near OUTPUT_TAIL_MAX_BYTES
+# regardless of total child output volume.  When a job's spool nevertheless
+# exceeds this bound (a database outage that prevents trimming, or a producer
+# faster than the bound) only that job is deterministically failed rather than
+# letting the spool grow without limit.
+DEFAULT_OUTPUT_SPOOL_MAX_BYTES: Final = 4 * 1024 * 1024
 LEASE_RECOVERY_LIMIT: Final = 100
 CANCEL_DISCOVERY_LIMIT: Final = 100
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
 STAT_MIN_FIELDS: Final = 3
 STAT_PGRP_FIELD_INDEX: Final = 2
+#: Maximum bytes drained from a capture pipe into a spool file per syscall.  The
+#: physical spool is bounded by ``output_spool_max_bytes``; this chunk is only
+#: the unit of a single read, never the bound.
+DRAIN_CHUNK: Final = 65536
+#: How long the bounded finalization cycle keeps waiting for end-of-file on a
+#: completed job's capture pipes before abandoning them. A job that forked a
+#: detached grandchild (a deployment helper) leaves that writer holding the
+#: pipe write end forever, so EOF never arrives on its own; after this grace
+#: everything already captured is published and the job is finalized. Only
+#: relevant once the job process itself is terminal: live producers are
+#: cancelled through their own process group, never through this path.
+DETACHED_CAPTURE_EOF_GRACE_SECONDS: Final = 5.0
 TRUNCATION_MARKER: Final = b"\n... [output truncated] ...\n"
 PROTOCOL_ERROR_EXIT_CODE: Final = 2
 EXECUTION_ERROR_EXIT_CODE: Final = 127
@@ -214,9 +254,46 @@ STOP_REASON_LEASE: Final = "lease"
 STOP_REASON_ROW_LOST: Final = "row_lost"
 STOP_REASON_PERSIST: Final = "persist"
 STOP_REASON_QUARANTINE: Final = "quarantine"
+STOP_REASON_SPOOL: Final = "spool"
 QUARANTINE_MAX_RETRIES: Final = 5
 QUARANTINE_RETRY_BASE_SECONDS: Final = 0.5
 JOB_ID_ENV: Final = "LUBKO_JOB_ID"
+
+
+class SpoolCaptureError(Exception):
+    """A capture spool file could not be stat/read, so the job must fail closed.
+
+    Raised when an active job's on-disk capture spool is unavailable (stat
+    failure, read failure, or disappearance) during draining, planning, or final
+    publication. The calling supervisor must fail the exact job closed as a
+    capture failure rather than assuming a zero-length stream or silently
+    omitting the affected stream from publication.
+
+    Args:
+        job_id: Identifier of the job whose spool is unavailable.
+        stream: Name of the affected capture stream.
+        path: Path of the unavailable capture spool file.
+    """
+
+    def __init__(self, job_id: object, stream: str, path: object) -> None:
+        """Store the offending job, stream, and spool path.
+
+        Args:
+            job_id: Identifier of the job whose spool is unavailable.
+            stream: Name of the affected capture stream.
+            path: Path of the unavailable capture spool file.
+        """
+        super().__init__(job_id, stream, path)
+        self.job_id = job_id
+        self.stream = stream
+        self.path = path
+
+    @override
+    def __str__(self) -> str:
+        """Return a human-readable description of the unavailable spool."""
+        return (
+            f"capture spool for job {self.job_id} stream {self.stream} ({self.path}) is unreadable"
+        )
 
 
 def _jsonb_set_chain(base: str, updates: list[tuple[str, str]]) -> str:
@@ -274,9 +351,27 @@ class JobResult:
 
 @dataclass(slots=True)
 class OutputStream:
-    """Per-stream capture and publication state for one active job."""
+    """Per-stream capture and publication state for one active job.
+
+    ``spool_start`` is the logical byte offset of the first byte currently held
+    in the on-disk capture file.  The worker drains the job's capture pipe into
+    the file and trims durably published prefixes from the head after every
+    publication, advancing ``spool_start`` so logical offsets
+    (``tail_start``/``tail_end``/chunk ``start``/``end``) stay stable even
+    though the physical file only ever retains the rolling live tail plus the
+    not-yet-archived gap.
+
+    ``fd`` is the read end of the capture pipe (``None`` once it has reached
+    end-of-file or been closed).  ``eof`` is set when the child's write end has
+    closed and all buffered bytes have been drained, after which no more output
+    can arrive for this stream.
+    """
 
     path: Path
+    fd: int | None = None
+    eof: bool = False
+    pending: bytearray = field(default_factory=bytearray)
+    spool_start: int = 0
     published_size: int = 0
     published_at: float = 0.0
     archived_upto: int = 0
@@ -315,6 +410,7 @@ class ActiveJob:
     cancellation_note: str | None = None
     lease_evicted: bool = False
     row_lost: bool = False
+    spool_evicted: bool = False
     finalized: bool = False
     quarantined: bool = False
     quarantine_pending: bool = False
@@ -383,6 +479,7 @@ class Settings:
     gc_retention_seconds: float = DEFAULT_GC_RETENTION_SECONDS
     gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     gc_batch_limit: int = DEFAULT_GC_BATCH_LIMIT
+    output_spool_max_bytes: int = DEFAULT_OUTPUT_SPOOL_MAX_BYTES
 
     def __post_init__(self) -> None:
         """Validate lease timing so a live worker's lease never expires idle.
@@ -399,6 +496,7 @@ class Settings:
             raise ValueError(msg)
         self._validate_lease_timing()
         self._validate_output_and_gc()
+        self._validate_spool()
 
     def _validate_lease_timing(self) -> None:
         """Validate lease-related settings are consistent.
@@ -457,6 +555,16 @@ class Settings:
             raise ValueError(msg)
         if self.gc_batch_limit <= 0:
             msg = "LUBKO_GC_BATCH_LIMIT must be positive"
+            raise ValueError(msg)
+
+    def _validate_spool(self) -> None:
+        """Validate the per-job local spool bound.
+
+        Raises:
+            ValueError: If the bound is unusable.
+        """
+        if self.output_spool_max_bytes <= 0:
+            msg = "LUBKO_OUTPUT_SPOOL_MAX_BYTES must be positive"
             raise ValueError(msg)
 
     @classmethod
@@ -544,6 +652,12 @@ class Settings:
                 )
             ),
             gc_batch_limit=int(os.getenv("LUBKO_GC_BATCH_LIMIT", str(DEFAULT_GC_BATCH_LIMIT))),
+            output_spool_max_bytes=int(
+                os.getenv(
+                    "LUBKO_OUTPUT_SPOOL_MAX_BYTES",
+                    str(DEFAULT_OUTPUT_SPOOL_MAX_BYTES),
+                )
+            ),
         )
 
 
@@ -619,6 +733,303 @@ def read_range(path: Path, start: int, end: int) -> bytes:
         return fh.read(end - start)
 
 
+def drain_capture_stream(
+    stream: OutputStream, bound: int, aggregate_used: int | None = None
+) -> str:
+    """Drain a job's capture pipe into its bounded spool file.
+
+    The supervisor's single nonblocking loop calls this for each stream that
+    still has a live read end. Output is appended to the on-disk spool file
+    only while the per-job bound has room: when the spool already reaches the
+    bound the pipe is deliberately *not* read, so the producer blocks on
+    ``write()`` and is backpressured before any further disk allocation. This
+    is the flow-control boundary that makes the physical spool provably bounded,
+    and the bound is never disabled — not after the producer exits and not
+    during shutdown.
+
+    Bytes already read from the pipe are never discarded. They are held in the
+    stream's bounded in-memory ``pending`` buffer and retried on the next drain;
+    the buffer is itself bounded by the spool bound, so backpressure never lets
+    it grow without limit and the worker never loses output it has already
+    taken ownership of. The retained bytes obey exactly the same current
+    aggregate on-disk room accounting as fresh pipe reads: a partial write that
+    landed a prefix before failing can leave a suffix in ``pending`` while the
+    prefix has filled the spool to the bound, so the retry flush of ``pending``
+    is limited to the currently available aggregate room and never appends
+    beyond the bound — when no room exists the bounded/full condition is
+    reported so the caller can publish+trim and retry. When a spool write fails
+    the read bytes stay in
+    ``pending`` and ``"error"`` is returned so the owning job can be failed
+    closed with every already-read byte still represented, never silently
+    dropped. A spool stat failure is reported as ``"error"`` so the owning job
+    fails closed rather than assuming a zero-length stream.
+
+    When the spool is full and a stream is still non-end-of-file (an exited
+    producer that wrote more than the bound, or a terminating producer still
+    flushing), the caller must durably publish and trim the captured bytes to
+    free bounded room, then drain again — never read past the bound.
+
+    Args:
+        stream: The stream whose pipe to drain.
+        bound: Maximum physical spool size in bytes for this job (aggregate
+            across both streams). Always enforced.
+        aggregate_used: Bytes already on disk for this job's both streams; when
+            ``None`` the stream's own on-disk size is used (single-stream drains).
+
+    Returns:
+        ``"ok"`` when bytes were drained, ``"full"`` when the spool is at its
+        bound and reading was withheld (the producer is now backpressured),
+        ``"eof"`` when no more output can arrive, or ``"error"`` when an OS
+        error was encountered and the owning job must be failed closed.
+    """
+    if stream.eof:
+        return "eof"
+    try:
+        size = stream.path.stat().st_size
+    except OSError:
+        return "error"
+    used = aggregate_used if aggregate_used is not None else size
+    # Pending bytes already taken from the pipe obey exactly the same current
+    # aggregate on-disk room accounting as fresh pipe reads: a partial-write-
+    # then-error can leave a retained suffix in ``pending`` after the successful
+    # prefix filled the spool, and unconditionally flushing that suffix here
+    # would append past the bound. The pending flush may consume at most the
+    # currently available aggregate disk room and never appends beyond the
+    # bound — when no room exists the bounded/full condition is reported so the
+    # caller can publish+trim and retry.
+    disk_room = max(0, bound - used)
+    if stream.pending:
+        status, landed = _retry_pending_flush(stream, disk_room)
+        if status != "ok":
+            return status
+        # Account for exactly the bytes that landed on disk: with a
+        # caller-supplied aggregate, re-statting only this stream's own file
+        # would drop the sibling stream's contribution from the total.
+        used += landed
+        disk_room = max(0, bound - used)
+    if stream.fd is None:
+        stream.eof = True
+        return "eof"
+    return "full" if disk_room <= 0 else _read_capture_chunk(stream, disk_room)
+
+
+def _retry_pending_flush(stream: OutputStream, disk_room: int) -> tuple[str, int]:
+    """Retry retained pending bytes against the currently available disk room.
+
+    A partial-write-then-error can leave a suffix in ``pending`` after its
+    successful prefix filled the spool; this flush appends at most the current
+    aggregate disk room so retained bytes never land beyond the bound.
+
+    Args:
+        stream: The stream whose pending buffer to flush.
+        disk_room: Currently available aggregate on-disk room under the bound.
+
+    Returns:
+        A ``(status, landed)`` pair: ``status`` is ``"ok"`` when every retained
+        byte landed within ``disk_room`` (``landed`` counts them), ``"full"``
+        when disk room was exhausted while a suffix is still retained (the
+        caller must publish+trim before retrying), or ``"error"`` when the
+        spool write genuinely failed; ``landed`` is nonzero only for ``"ok"``.
+    """
+    if disk_room <= 0:
+        return ("full", 0)
+    pending_before = len(stream.pending)
+    if not _flush_pending(stream, disk_room):
+        return ("error", 0)
+    if stream.pending:
+        # The flush consumed all available disk room; the benignly retained
+        # suffix must wait until publication/trim frees bounded room.
+        return ("full", 0)
+    return ("ok", pending_before)
+
+
+def _read_capture_chunk(stream: OutputStream, room: int) -> str:
+    """Read one bounded chunk from the pipe and flush it to the spool.
+
+    Args:
+        stream: The stream whose pipe to read.
+        room: Bytes still available under the per-job bound.
+
+    Returns:
+        ``"ok"`` when bytes were drained, ``"eof"`` when the write end closed,
+        or ``"error"`` when the read or spool write failed.
+    """
+    fd = stream.fd
+    if fd is None:
+        return "eof"
+    try:
+        data = os.read(fd, min(room, DRAIN_CHUNK))
+    except BlockingIOError:
+        return "ok"
+    except OSError:
+        return "error"
+    if not data:
+        return _finish_capture_stream(stream)
+    stream.pending += data
+    return "ok" if _flush_pending(stream) else "error"
+
+
+def _finish_capture_stream(stream: OutputStream) -> str:
+    """Close a stream's read end and mark EOF once pending is flushed.
+
+    Args:
+        stream: The stream whose pipe reached end-of-file.
+
+    Returns:
+        ``"eof"`` when the stream is fully drained, or ``"error"`` when a
+        residual pending-buffer write failed.
+    """
+    fd = stream.fd
+    if fd is not None:
+        with suppress(OSError):
+            os.close(fd)
+    stream.fd = None
+    if stream.pending and not _flush_pending(stream):
+        return "error"
+    stream.eof = True
+    return "eof"
+
+
+def _flush_pending(stream: OutputStream, limit: int | None = None) -> bool:
+    """Append the stream's in-memory pending bytes to its on-disk spool file.
+
+    The buffered bytes are written through the exact byte-counted append seam
+    :func:`_spill_append`, which opens the spool with ``O_APPEND`` and consumes
+    only the bytes it successfully wrote: any prefix it landed is removed from
+    the in-memory buffer while the unwritten suffix is retained, so a partial
+    write or a mid-write ``OSError`` never loses output already taken from the
+    pipe and never duplicates the bytes that did land. A genuine write failure
+    (the seam wrote nothing and left the buffer intact) returns ``False`` so the
+    caller can retry or fail the job closed without ever discarding output
+    already read from the pipe.
+
+    Args:
+        stream: The stream whose pending buffer to flush.
+        limit: Maximum number of pending bytes to append in this flush, so a
+            retained suffix can never be written past the currently available
+            aggregate spool room; ``None`` appends the whole buffer.
+
+    Returns:
+        ``True`` when the flush made progress (the buffer is now empty or holds
+        only a benignly retained suffix to retry on the next drain),
+        ``False`` when the spool write genuinely failed and the buffer must be
+        retained intact for a closed failure.
+    """
+    if not stream.pending:
+        return True
+    # Always hand the seam a separate copy so its in-place consumption can
+    # never double-consume from the real buffer; exactly ``written`` bytes are
+    # then removed from ``pending`` once, below.
+    data = bytearray(stream.pending if limit is None else stream.pending[:limit])
+    before = len(stream.pending)
+    written = _spill_append(stream.path, data)
+    del stream.pending[:written]
+    # A zero-byte, unchanged buffer means the seam hit a hard write error
+    # (for example the spool could not be opened); nothing was consumed, so the
+    # caller must treat this as a failure rather than retry an empty buffer.
+    return not (written == 0 and len(stream.pending) == before)
+
+
+def _spill_append(path: Path, data: bytearray) -> int:
+    """Append as much of ``data`` to ``path`` as the OS accepts.
+
+    The spool is opened with ``O_APPEND`` (and deliberately *without*
+    ``O_CREAT``: the spool is pre-created at spawn time, so an open failure
+    here means the active spool disappeared and the caller must fail the job
+    closed rather than silently recreating a fresh empty one) so the worker,
+    the file's sole writer,
+    can never interleave or lose bytes, and the write advances only as far as
+    the kernel accepts. The successfully written prefix is removed from ``data``
+    in place; the unwritten suffix is left in ``data`` for the caller to retry,
+    so a short write or an ``OSError`` mid-flush loses and duplicates nothing: a
+    benign partial write retains exactly the not-yet-written suffix, and a hard
+    error leaves ``data`` holding only the bytes written before the failure (or
+    none, on an open failure) so the caller can detect the partial / failed
+    flush and retain precisely the bytes it still owes the spool.
+
+    Args:
+        path: The spool file to append to.
+        data: In-memory bytes to append; the written prefix is consumed in place.
+
+    Returns:
+        The number of bytes consumed from ``data``.
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND, 0o600)
+    except OSError:
+        return 0
+    try:
+        total = 0
+        while total < len(data):
+            try:
+                written = os.write(fd, bytes(data[total:]))
+            except OSError:
+                break
+            if written <= 0:
+                break
+            total += written
+    finally:
+        with suppress(OSError):
+            os.close(fd)
+    del data[:total]
+    return total
+
+
+def _poll_readable(fds: list[int]) -> set[int]:
+    """Return the subset of ``fds`` that are currently readable.
+
+    Uses ``select.poll``, which supports arbitrary file-descriptor numbers
+    (including valid descriptors well beyond the legacy ``select``
+    ``FD_SETSIZE`` limit) so a high-numbered capture fd is never misclassified
+    as bad. A closed or otherwise invalid descriptor surfaces as ``POLLNVAL``
+    rather than raising, which the caller treats as a bad-fd probe; a descriptor
+    that ``poll`` cannot even register still raises and is handled the same way.
+
+    Args:
+        fds: Candidate read descriptors.
+
+    Returns:
+        The set of descriptors reporting readable readiness.
+
+    Raises:
+        OSError: If ``poll`` cannot register or poll one of the descriptors.
+    """
+    readable: set[int] = set()
+    if not fds:
+        return readable
+    poller = select.poll()
+    for fd in fds:
+        poller.register(fd, select.POLLIN | select.POLLPRI)
+    for fd, flags in poller.poll(0):
+        if flags & select.POLLNVAL:
+            # A bad fd among many must not poison the whole worker: surface it
+            # so the caller probes each candidate individually and isolates the
+            # exact offending job.
+            msg = f"bad capture fd {fd} reported by poll"
+            raise OSError(msg)
+        readable.add(fd)
+    return readable
+
+
+def _is_bad_fd(fd: int) -> bool:
+    """Return whether ``fd`` is not a pollable capture descriptor.
+
+    ``select.poll`` reports an invalid descriptor as ``POLLNVAL`` rather than
+    raising, so a valid high-numbered fd (which ``select.select`` would reject
+    with ``ValueError``) is correctly recognised as healthy, while a closed or
+    reused descriptor is reported as bad.
+
+    Args:
+        fd: The descriptor to probe.
+
+    Returns:
+        ``True`` when the descriptor is bad and must be failed closed.
+    """
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return any(flags & select.POLLNVAL for _fd, flags in poller.poll(0))
+
+
 def pg_safe_decode(data: bytes) -> str:
     r"""Decode arbitrary bytes into a string that is safe for PostgreSQL text/jsonb.
 
@@ -658,24 +1069,27 @@ def decode_range(path: Path, start: int, end: int) -> str:
     return pg_safe_decode(read_range(path, start, end))
 
 
-def output_window_text(path: Path, max_chars: int) -> tuple[str, int, int]:
+def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[str, int, int]:
     """Return the newest at most ``max_chars`` bytes as decoded text.
 
     Byte offsets are used for the window bounds and decoding is UTF-8 with
     replacement, so offsets are deterministic even when a window starts inside
-    a multi-byte sequence.
+    a multi-byte sequence. ``base`` is the logical offset of the first physical
+    byte in the file (``OutputStream.spool_start``); the returned ``start`` and
+    ``end`` are logical offsets and the physical read is translated by ``base``.
 
     Args:
         path: Capture file for the stream.
         max_chars: Maximum number of bytes to retain in the window.
+        base: Logical offset of the file's first physical byte.
 
     Returns:
-        A ``(text, start, end)`` tuple where ``end`` is the current file size.
+        A ``(text, start, end)`` tuple where ``end`` is the logical file size.
     """
-    size = stream_size(path)
+    size = stream_size(path) + base
     window = min(size, max_chars)
     start = size - window
-    return decode_range(path, start, size), start, size
+    return decode_range(path, start - base, size - base), start, size
 
 
 def archive_target(size: int) -> int:
@@ -767,7 +1181,83 @@ def publish_output(  # ruff: ignore[too-many-arguments] -- server and force comp
         )
     for name, plan in plans.items():
         _apply_plan(getattr(job, name), plan, now)
+    _trim_published(job, plans)
     return True
+
+
+def _rewrite_head(path: Path, drop: int) -> None:
+    """Drop the first ``drop`` bytes from a capture file in place.
+
+    The remainder is staged into a same-directory temporary file so a write
+    failure (or any error mid-stage) leaves the original spool byte-for-byte
+    intact, and the staged content is swapped onto the live path with an atomic
+    ``os.replace``. Readers (including concurrent publications) therefore never
+    observe a partially rewritten head, and a failed replacement leaves both the
+    bytes and the caller's logical offset unchanged so the next publication
+    recomputes the same drop and retries exactly that stream. The file only ever
+    holds a bounded suffix of the stream once the prefix has been archived into
+    immutable chunks, so rewriting the small remainder is cheap and the new
+    content is identical to the bytes that were not dropped.
+
+    Args:
+        path: Capture file for the stream.
+        drop: Number of leading bytes to remove (must be non-negative).
+    """
+    if drop <= 0:
+        return
+    with path.open("rb") as fh:
+        fh.seek(drop)
+        remainder = fh.read()
+    # Stage in the same directory so the final swap is a rename on one
+    # filesystem (atomic and never observable half-done). A failure before the
+    # replace leaves the original fully intact and the temp file is cleaned up.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".rewrite.tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(remainder)
+            fh.flush()
+            os.fsync(fh.fileno())
+        Path(tmp).replace(path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _trim_published(job: ActiveJob, plans: dict[str, _StreamPlan]) -> None:
+    """Discard durably published prefixes from a job's on-disk spool files.
+
+    Each published stream's live tail window starts at ``plan.tail_start``; every
+    byte strictly before that offset has been archived into immutable
+    ``output_chunk`` rows (and the live tail itself is recomputed from the file
+    on the next publication), so it is safe to remove from the local spool.
+    ``spool_start`` advances by exactly the number of bytes removed so logical
+    offsets stay consistent.
+
+    The head discard is always safe without touching the job's process group:
+    the child writes to a capture *pipe*, not to the spool file, so the worker
+    is the file's sole writer.  There is no concurrent ``O_APPEND`` producer to
+    race the rewrite, and the supervisor never issues ``SIGSTOP``/``SIGCONT``
+    for capture compaction, avoiding unsafe mixed-group stop/resume semantics.
+
+    Args:
+        job: The active job whose published streams to trim.
+        plans: The committed publication plans keyed by stream name.
+    """
+    drops = {name: plan.tail_start - getattr(job, name).spool_start for name, plan in plans.items()}
+    if all(drop <= 0 for drop in drops.values()):
+        return
+    for name, drop in drops.items():
+        if drop <= 0:
+            continue
+        stream = getattr(job, name)
+        # Rewrite the head first; only advance the in-memory logical offset
+        # after the on-disk rewrite succeeds, so the stream's (file, offset)
+        # pair stays coherent even when one stream's rewrite raises: the next
+        # publication recomputes the drop from the unchanged offset and retries
+        # exactly that stream, leaving the offending job isolated and its state
+        # consistent rather than half-trimmed.
+        _rewrite_head(stream.path, drop)
+        stream.spool_start = plans[name].tail_start
 
 
 def _full_windows(job: ActiveJob, plans: dict[str, _StreamPlan]) -> dict[str, dict[str, Any]]:
@@ -827,20 +1317,31 @@ def _plan_streams(
 
     Returns:
         The plans keyed by stream name.
+
+    Raises:
+        SpoolCaptureError: When an active stream's capture spool cannot be
+            stat/read, so the exact job can be failed closed rather than
+            publishing an omitted stream.
     """
     plans: dict[str, _StreamPlan] = {}
     for name in stream_names:
         stream = getattr(job, name)
         try:
-            size = stream_size(stream.path)
-        except OSError:
-            continue
+            size = stream.spool_start + stream.path.stat().st_size
+            tail_text, tail_start, tail_end = output_window_text(
+                stream.path, OUTPUT_TAIL_MAX_BYTES, base=stream.spool_start
+            )
+            chunks, archived_upto, last_chunk, sequence = _plan_chunks(
+                job.id, name, stream, tail_end, server
+            )
+        except OSError as exc:
+            # Never silently omit a stream: a stat/read/disappearance failure on
+            # an active job's spool must surface as a capture failure that fails
+            # the exact job closed, not as a partial publication of only the
+            # other stream.
+            raise SpoolCaptureError(job.id, name, stream.path) from exc
         if not force and size == stream.published_size:
             continue
-        tail_text, tail_start, tail_end = output_window_text(stream.path, OUTPUT_TAIL_MAX_BYTES)
-        chunks, archived_upto, last_chunk, sequence = _plan_chunks(
-            job.id, name, stream, tail_end, server
-        )
         plans[name] = _StreamPlan(
             size=size,
             tail_text=tail_text,
@@ -887,7 +1388,11 @@ def _plan_chunks(
     while target - archived_upto >= OUTPUT_CHUNK_MAX_BYTES:
         chunk_start = archived_upto
         chunk_end = chunk_start + OUTPUT_CHUNK_MAX_BYTES
-        value = decode_range(stream.path, chunk_start, chunk_end)
+        value = decode_range(
+            stream.path,
+            chunk_start - stream.spool_start,
+            chunk_end - stream.spool_start,
+        )
         chunk_id = uuid4()
         chunk_payload = json.dumps(
             build_output_chunk_payload(
@@ -965,6 +1470,128 @@ def _output_update_params(
 # ---------------------------------------------------------------------------
 # Process helpers
 # ---------------------------------------------------------------------------
+
+
+_CLAIM_JOBS_TEMPLATE: Final = """\
+WITH next AS (
+    SELECT id
+    FROM lubko.jobs
+    WHERE (payload::jsonb)->>'type' = 'command'
+        AND (payload::jsonb)->'state'->>'status' = 'pending'
+    ORDER BY (payload::jsonb)->'state'->>'created_at', id
+    FOR UPDATE SKIP LOCKED
+    LIMIT %(limit)s
+)
+UPDATE lubko.jobs AS job
+SET payload = __SET_CHAIN__::text
+FROM next
+WHERE job.id = next.id
+RETURNING job.id, job.payload
+"""
+
+_RECOVER_STALE_JOBS_TEMPLATE: Final = """\
+WITH stale AS (
+    SELECT id
+    FROM lubko.jobs
+    WHERE (payload::jsonb)->>'type' = 'command'
+        AND (payload::jsonb)->'state'->>'status' = 'running'
+        AND (payload::jsonb)->'state'->>'lease_expires_at' IS NOT NULL
+        AND ((payload::jsonb)->'state'->>'lease_expires_at') < __ISO_NOW__
+    ORDER BY id
+    FOR UPDATE SKIP LOCKED
+    LIMIT %(limit)s
+)
+UPDATE lubko.jobs AS job
+SET payload = __SET_CHAIN__::text
+FROM stale
+WHERE job.id = stale.id
+RETURNING job.id, job.payload
+"""
+
+
+def _claim_jobs_sql(set_chain: str) -> str:
+    """Compose the bounded claiming ``UPDATE`` statement.
+
+    The SQL is assembled from internal constant literals and the prebuilt
+    ``jsonb_set`` chain; the chain is slotted into the template with a string
+    replacement (never by concatenating a query fragment into a ``SELECT``-bearing
+    string) so no external input reaches the query and the template stays a safe
+    constant. The only runtime inputs are bound parameters.
+
+    Args:
+        set_chain: The prebuilt ``jsonb_set`` chain for the claim state.
+
+    Returns:
+        The full claiming statement text.
+    """
+    return _CLAIM_JOBS_TEMPLATE.replace("__SET_CHAIN__", set_chain)
+
+
+def _recover_stale_jobs_sql(set_chain: str) -> str:
+    """Compose the bounded lease-recovery ``UPDATE`` statement.
+
+    As with :func:`_claim_jobs_sql`, the statement is built only from the
+    internal template and the prebuilt chain; the only runtime inputs are bound
+    parameters.
+
+    Args:
+        set_chain: The prebuilt ``jsonb_set`` chain for the failed state.
+
+    Returns:
+        The full recovery statement text.
+    """
+    return _RECOVER_STALE_JOBS_TEMPLATE.replace("__SET_CHAIN__", set_chain).replace(
+        "__ISO_NOW__", UTC_ISO_TEXT_SQL
+    )
+
+
+def _streams_at_eof(job: ActiveJob) -> bool:
+    """Return whether both of a job's capture streams have reached EOF.
+
+    Args:
+        job: The active job to inspect.
+
+    Returns:
+        ``True`` when stdout and stderr are both at end-of-file.
+    """
+    return job.stdout.eof and job.stderr.eof
+
+
+def _spool_used_bytes(job: ActiveJob) -> int | None:
+    """Return a job's combined on-disk spool usage across both streams.
+
+    Args:
+        job: The active job to inspect.
+
+    Returns:
+        The summed byte sizes of both spool files, or ``None`` when either
+        stat fails (the caller then cannot prove room was freed).
+    """
+    used = 0
+    for name in OUTPUT_STREAMS:
+        stream = getattr(job, name)
+        try:
+            used += stream.path.stat().st_size
+        except OSError:
+            return None
+    return used
+
+
+def _spool_shrank(job: ActiveJob, used_before: int | None) -> bool:
+    """Return whether a durable publish+trim reduced the on-disk spool usage.
+
+    Args:
+        job: The active job whose spool usage is compared.
+        used_before: Combined spool size observed before publication, or
+            ``None`` when it could not be measured.
+
+    Returns:
+        ``True`` when the combined spool usage measurably decreased.
+    """
+    if used_before is None:
+        return False
+    used_after = _spool_used_bytes(job)
+    return used_after is not None and used_after < used_before
 
 
 def _persist_process(
@@ -1368,13 +1995,23 @@ def _cleanup_output_files(stdout_path: Path, stderr_path: Path) -> None:
 _START_GATE_WRAPPER: Final = Path(__file__).with_name("_start_gate.py")
 
 
-def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
-    """Start a job behind a persist-before-exec START GATE.
+def spawn_job(
+    job: Job,
+) -> tuple[subprocess.Popen[bytes], Path, Path, int, int, int, int]:
+    """Start a job behind a persist-before-exec START GATE with pipe capture.
 
     The job's required ``process`` argv is executed directly as the new
     process; the worker never invokes a shell, so argv elements are passed to
     the executable literally. The job is started as a new session so
     cancellation can signal the exact process group.
+
+    Standard output and standard error are captured through dedicated pipes.
+    The child writes to the pipe write ends; the supervisor drains the read
+    ends into bounded on-disk spool files (see :func:`drain_capture_stream`).
+    Because a pipe backpressures its writer, a producer faster than the
+    drainer/trimmer is throttled before it can allocate unbounded disk; the
+    worker never relies on ``RLIMIT_FSIZE`` and never stops an unrelated job's
+    file writes.
 
     The exact root job UUID is injected into the child environment as
     ``LUBKO_JOB_ID`` before the child execs, so every process of the job can
@@ -1394,24 +2031,54 @@ def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
     implemented with ``preexec_fn``: that would let ``Popen`` return only after
     the child had already run, defeating the gate.
 
+    Every operating-system resource allocated before the child starts is closed
+    on any failure: a broken ``os.pipe`` closes the partial pipe ends and spool
+    files, and a failure during the post-``Popen`` setup (closing the write
+    ends, marking the read ends nonblocking, waiting for the session) kills and
+    reaps the exact spawned child, closes its capture pipe read ends, and
+    removes its spool files so no resource leaks into the supervisor.
+
     Args:
         job: Claimed job to execute.
 
     Returns:
-        The running gated process, its capture file paths, its process group
-        ID, and the worker-side write end of the start gate.
+        The running gated process, its spool file paths, its process group ID,
+        the worker-side write end of the start gate, and the read ends of its
+        stdout/stderr capture pipes (in that order).
 
     Raises:
-        OSError: If the process cannot be started.
+        OSError: If the process or its capture pipes cannot be started.
     """
     env = dict(os.environ)
     env[JOB_ID_ENV] = str(job.id)
-    stdout_fd, stdout_name = tempfile.mkstemp()
-    stderr_fd, stderr_name = tempfile.mkstemp()
-    stdout_path = Path(stdout_name)
-    stderr_path = Path(stderr_name)
-    gate_read_fd, gate_write_fd = os.pipe()
-    # The read end must survive the wrapper's exec, so it must not be
+    stdout_path = _make_spool_file()
+    try:
+        stderr_path = _make_spool_file()
+    except OSError:
+        stdout_path.unlink(missing_ok=True)
+        raise
+    # Sentinels so the partial-cleanup loops below are always defined; any fd
+    # not yet created keeps the invalid value and is skipped by os.close.
+    stdout_r = stdout_w = stderr_r = stderr_w = -1
+    gate_read_fd = gate_write_fd = -1
+    try:
+        gate_read_fd, gate_write_fd = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+        stderr_r, stderr_w = os.pipe()
+    except OSError:
+        for capture_fd in (
+            gate_read_fd,
+            gate_write_fd,
+            stdout_r,
+            stdout_w,
+            stderr_r,
+            stderr_w,
+        ):
+            with suppress(OSError):
+                os.close(capture_fd)
+        _cleanup_output_files(stdout_path, stderr_path)
+        raise
+    # The gate read end must survive the wrapper's exec, so it must not be
     # close-on-exec. Declaring it in ``pass_fds`` makes ``subprocess`` clear the
     # close-on-exec flag on the child side of the fork, so the wrapper blocks on
     # it across the exec boundary. The descriptor number is passed to the
@@ -1423,25 +2090,58 @@ def spawn_job(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
             [sys.executable, os.fspath(_START_GATE_WRAPPER), *job.process],
             cwd=job.cwd,
             stdin=subprocess.DEVNULL,
-            stdout=stdout_fd,
-            stderr=stderr_fd,
+            stdout=stdout_w,
+            stderr=stderr_w,
             start_new_session=True,
             env=env,
             pass_fds=(gate_read_fd,),
         )
     except OSError:
-        os.close(gate_read_fd)
-        os.close(gate_write_fd)
-        os.close(stdout_fd)
-        os.close(stderr_fd)
+        for capture_fd in (
+            gate_read_fd,
+            gate_write_fd,
+            stdout_r,
+            stdout_w,
+            stderr_r,
+            stderr_w,
+        ):
+            with suppress(OSError):
+                os.close(capture_fd)
         _cleanup_output_files(stdout_path, stderr_path)
         raise
-    # The wrapper holds the read end; the worker must not keep a copy of it.
-    os.close(gate_read_fd)
-    os.close(stdout_fd)
-    os.close(stderr_fd)
-    pgid = _wait_for_session(proc.pid)
-    return proc, stdout_path, stderr_path, pgid, gate_write_fd
+    # The wrapper holds the gate read end; the worker must not keep a copy.
+    with suppress(OSError):
+        os.close(gate_read_fd)
+    # Post-Popen setup: any failure here must kill the exact child we already
+    # spawned and close every resource, otherwise the supervisor leaks a live
+    # process and open file descriptors.
+    try:
+        pgid = _prepare_capture_fds(proc, stdout_w, stderr_w, stdout_r, stderr_r)
+    except BaseException:
+        # The unreleased gated wrapper is this process's exact DIRECT child in
+        # its own childless dedicated group. Keep synchronous local ownership:
+        # SIGKILL the exact group ONLY while the direct child is still live,
+        # and block — never returning or re-raising on a reap timeout while it
+        # remains live — until the child is actually reaped. Once reaped, the
+        # original unreleased group is gone by construction and its numeric
+        # PGID is deliberately never probed or signalled again, because it
+        # could already have been reused by an unrelated process.
+        while proc.poll() is None:
+            with suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            time.sleep(0.02)
+        for capture_fd in (
+            gate_write_fd,
+            stdout_r,
+            stdout_w,
+            stderr_r,
+            stderr_w,
+        ):
+            with suppress(OSError):
+                os.close(capture_fd)
+        _cleanup_output_files(stdout_path, stderr_path)
+        raise
+    return proc, stdout_path, stderr_path, pgid, gate_write_fd, stdout_r, stderr_r
 
 
 def release_gate(gate_fd: int) -> bool:
@@ -1486,6 +2186,10 @@ class GatedSpawn:
         stdout_path: Capture file for standard output.
         stderr_path: Capture file for standard error.
         gate_fd: The worker-side write end of the start gate pipe.
+        stdout_read_fd: Read end of the stdout capture pipe, or ``None`` once
+            closed.
+        stderr_read_fd: Read end of the stderr capture pipe, or ``None`` once
+            closed.
     """
 
     proc: subprocess.Popen[bytes]
@@ -1493,6 +2197,8 @@ class GatedSpawn:
     stdout_path: Path
     stderr_path: Path
     gate_fd: int
+    stdout_read_fd: int | None = None
+    stderr_read_fd: int | None = None
 
 
 def abort_gated_start(
@@ -1577,6 +2283,62 @@ def await_gated_group_gone(gated: GatedSpawn) -> None:
     # PGID again (it may already be reused by an unrelated process).
     gated.stdout_path.unlink(missing_ok=True)
     gated.stderr_path.unlink(missing_ok=True)
+    for capture_fd_attr in ("stdout_read_fd", "stderr_read_fd"):
+        capture_fd = getattr(gated, capture_fd_attr)
+        if capture_fd is not None:
+            with suppress(OSError):
+                os.close(capture_fd)
+
+
+def _prepare_capture_fds(
+    proc: subprocess.Popen[bytes],
+    stdout_w: int,
+    stderr_w: int,
+    stdout_r: int,
+    stderr_r: int,
+) -> int:
+    """Close the parent's write ends and mark the read ends nonblocking.
+
+    Args:
+        proc: The spawned process whose session to await.
+        stdout_w: Parent write end for stdout.
+        stderr_w: Parent write end for stderr.
+        stdout_r: Parent read end for stdout.
+        stderr_r: Parent read end for stderr.
+
+    Returns:
+        The exact process group ID of the spawned child.
+    """
+    # The supervisor keeps only the read ends.  It must close the write ends in
+    # the parent: otherwise the pipe would never report end-of-file once the
+    # child exited (the supervisor would still hold a write end), and draining
+    # would hang.  The child closes them itself on exec via close-on-exec.
+    for write_fd in (stdout_w, stderr_w):
+        with suppress(OSError):
+            os.close(write_fd)
+    # Nonblocking read ends so the single supervisor loop can drain many jobs
+    # without ever blocking on one slow producer.
+    for read_fd in (stdout_r, stderr_r):
+        flags = fcntl.fcntl(read_fd, fcntl.F_GETFL)
+        fcntl.fcntl(read_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    return _wait_for_session(proc.pid)
+
+
+def _make_spool_file() -> Path:
+    """Create an empty on-disk capture spool file for one stream.
+
+    ``tempfile.mkstemp`` returns an open file descriptor; the spool is written
+    later through its own ``O_APPEND`` handle, so the descriptor it hands back
+    is closed immediately to avoid leaking it. A creation failure propagates as
+    ``OSError`` with no partial file left behind.
+
+    Returns:
+        The path of the created, empty spool file.
+    """
+    fd, name = tempfile.mkstemp()
+    with suppress(OSError):
+        os.close(fd)
+    return Path(name)
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -2620,6 +3382,8 @@ class Supervisor:
             now: Monotonic time at the start of the turn.
         """
         self._service_processes()
+        self._drain_captures()
+        self._enforce_spool_bounds()
         if self._stopping:
             return
         if self.conn is None:
@@ -2668,6 +3432,195 @@ class Supervisor:
             self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
         if not self._stopping:
             self._claim_batch()
+
+    def _drain_captures(self, bound: int | None = None) -> None:
+        """Drain every active job's capture pipes into their bounded spools.
+
+        The single nonblocking supervisor loop services all jobs through
+        ``poll``; a producer faster than the drainer/trimmer fills the kernel
+        pipe buffer and then blocks on ``write()``, so it is backpressured
+        before any unbounded disk allocation occurs. A spool stat/read/select
+        error fails only the offending job (never the whole worker), and a bad
+        capture fd among many jobs is isolated to exactly that job so its
+        siblings keep draining.
+
+        The bound is an aggregate per-job limit across both streams, so each
+        stream's room is computed against the job's combined on-disk usage. The
+        physical spool never exceeds this bound: when it is full the pipe is
+        deliberately not read and the producer is backpressured. A completed or
+        terminating job whose spool is full is not drained past the bound; instead
+        the supervisor publishes and trims the captured bytes to free bounded
+        room and drains more (see :meth:`finalize_completed_job_bounded`), so a
+        job's final output is captured completely without ever exceeding the
+        bound.
+
+        Args:
+            bound: Per-job aggregate spool bound in bytes, or ``None`` for the
+                configured default. Always enforced.
+        """
+        if bound is None:
+            bound = self.settings.output_spool_max_bytes
+        candidates = self._drain_candidates()
+        if not candidates:
+            return
+        rlist = [stream.fd for _, _name, stream in candidates if stream.fd is not None]
+        try:
+            readable = _poll_readable(rlist)
+        except (OSError, ValueError):
+            # A bad fd among many jobs must not poison the whole worker: probe
+            # each fd individually and fail closed only the offending job,
+            # closing exactly that fd.  ``poll`` reports a closed/changed fd as
+            # ``POLLNVAL`` (and only raises for a descriptor it cannot even
+            # register), so both are treated as a bad-fd probe.
+            self.isolate_bad_fds(candidates)
+            return
+        if not readable:
+            return
+        for job, name, stream in candidates:
+            if stream.fd not in readable:
+                continue
+            self._drain_active_stream(job, name, stream, bound)
+
+    def _drain_candidates(self) -> list[tuple[ActiveJob, str, OutputStream]]:
+        """Collect the (job, stream name, stream) triples with a live capture fd.
+
+        A spool-evicted (fail-closed) job is never a candidate: its bad spool
+        is not re-read while local stop escalation owns its group.
+
+        Returns:
+            The drainable candidates.
+        """
+        candidates: list[tuple[ActiveJob, str, OutputStream]] = []
+        for job in list(self.active.values()):
+            if job.spool_evicted:
+                continue
+            for name in OUTPUT_STREAMS:
+                stream = getattr(job, name)
+                if stream.fd is None or stream.eof:
+                    continue
+                candidates.append((job, name, stream))
+        return candidates
+
+    @staticmethod
+    def isolate_bad_fds(candidates: list[tuple[ActiveJob, str, OutputStream]]) -> None:
+        """Find and fail closed exactly the jobs whose capture fd is bad.
+
+        Args:
+            candidates: The candidate ``(job, name, stream)`` triples that were
+                about to be polled.
+        """
+        for job, name, stream in candidates:
+            fd = stream.fd
+            if fd is None:
+                continue
+            if _is_bad_fd(fd):
+                LOGGER.error(
+                    "bad capture fd %d for job %s stream %s; failing closed",
+                    fd,
+                    job.id,
+                    name,
+                )
+                job.spool_evicted = True
+                with suppress(OSError):
+                    os.close(fd)
+                stream.fd = None
+                request_stop(job, STOP_REASON_SPOOL)
+
+    @staticmethod
+    def _drain_active_stream(job: ActiveJob, name: str, stream: OutputStream, bound: int) -> None:
+        """Drain one ready capture stream, failing the job closed on error.
+
+        The bound is an aggregate per-job limit, so this stream's room is
+        computed against the job's combined on-disk spool usage across both
+        streams.
+
+        Args:
+            job: The owning active job.
+            name: Stream name (for diagnostics).
+            stream: The stream whose pipe is ready to read.
+            bound: Maximum physical spool size in bytes for the whole job.
+        """
+        total = 0
+        for stream_name in OUTPUT_STREAMS:
+            other = getattr(job, stream_name)
+            try:
+                total += other.path.stat().st_size
+            except OSError:
+                # A spool stat failure must fail the exact job closed, never be
+                # assumed zero: assuming zero would under-count usage and could
+                # let a half-captured job finalize with missing output.
+                LOGGER.exception(
+                    "capture spool stat failed for job %s stream %s; failing closed",
+                    job.id,
+                    stream_name,
+                )
+                job.spool_evicted = True
+                request_stop(job, STOP_REASON_SPOOL)
+                return
+        status = drain_capture_stream(stream, bound, aggregate_used=total)
+        if status == "error":
+            LOGGER.error(
+                "spool failure for job %s stream %s; failing job closed",
+                job.id,
+                name,
+            )
+            job.spool_evicted = True
+            request_stop(job, STOP_REASON_SPOOL)
+
+    def _enforce_spool_bounds(self) -> None:
+        """Fail closed only jobs whose aggregate spool overshoots or stat fails.
+
+        The worker owns the flow-control boundary: capture pipes are drained
+        into the spool file only while the per-job aggregate has room, so a
+        producer is backpressured before the combined stdout+stderr spool can
+        exceed ``settings.output_spool_max_bytes``. This pass is a last-resort
+        backstop. A spool stat failure, or an actual aggregate overshoot that
+        slipped past backpressure, fails only the offending job (never the
+        whole worker) so one badly-behaving job cannot starve or crash the
+        others.
+        """
+        bound = self.settings.output_spool_max_bytes
+        for job in list(self.active.values()):
+            if job.completed:
+                continue
+            if self.spool_overflow(job, bound):
+                LOGGER.error(
+                    "terminating job %s: aggregate local stdout/stderr disk spool "
+                    "exceeds configured safe bound of %d bytes",
+                    job.id,
+                    bound,
+                )
+                job.spool_evicted = True
+                request_stop(job, STOP_REASON_SPOOL)
+
+    @staticmethod
+    def spool_overflow(job: ActiveJob, bound: int) -> bool:
+        """Return whether a job's combined stdout+stderr spool exceeds the bound.
+
+        The bound is an aggregate per-job limit, so both streams' on-disk
+        capture files are summed. A stat failure on either stream fails closed.
+
+        Args:
+            job: The active job to inspect.
+            bound: Maximum allowed aggregate physical spool size in bytes.
+
+        Returns:
+            ``True`` when the combined capture files exceed ``bound`` or a
+            spool stat fails (fail closed).
+        """
+        total = 0
+        for name in OUTPUT_STREAMS:
+            stream = getattr(job, name)
+            try:
+                total += stream.path.stat().st_size
+            except OSError:
+                LOGGER.exception(
+                    "spool stat failed for job %s stream %s; failing closed",
+                    job.id,
+                    name,
+                )
+                return True
+        return total > bound
 
     def _outage_phase(self) -> None:
         """Handle a database outage without losing ownership of active groups.
@@ -2822,7 +3775,12 @@ class Supervisor:
                 request_stop(job, STOP_REASON_CANCEL)
 
     def _changed_streams(self, job: ActiveJob, now: float) -> list[str]:
-        """Return stream names with changed output since last publication."""
+        """Return stream names with changed output since last publication.
+
+        Raises:
+            SpoolCaptureError: When a stream's spool cannot be stat-ed, so the
+                exact job can be failed closed instead of silently skipped.
+        """
         interval = self.settings.output_publication_interval_seconds
         changed: list[str] = []
         for name in OUTPUT_STREAMS:
@@ -2830,14 +3788,18 @@ class Supervisor:
             if now - stream.published_at < interval:
                 continue
             try:
-                size = stream_size(stream.path)
-            except OSError:
-                continue
+                size = stream.spool_start + stream.path.stat().st_size
+            except OSError as exc:
+                # A spool stat failure must enter the same exact-job fail-closed
+                # path as any other unreadable spool, never be treated as
+                # "unchanged" (which would silently skip publication of a half-
+                # captured stream).
+                raise SpoolCaptureError(job.id, name, stream.path) from exc
             if size != stream.published_size:
                 changed.append(name)
         return changed
 
-    def _publish_job_output(self, job: ActiveJob, now: float) -> None:
+    def publish_job_output(self, job: ActiveJob, now: float) -> None:
         """Publish changed output for one job, quarantining deterministic errors.
 
         Args:
@@ -2846,22 +3808,35 @@ class Supervisor:
 
         Raises:
             psycopg.Error: When the error is a connectivity issue.
+            OSError: When a spool trim/rewrite failure must quarantine the job.
         """
         conn = self.conn
         if conn is None:
             return
-        changed = self._changed_streams(job, now)
+        try:
+            changed = self._changed_streams(job, now)
+        except SpoolCaptureError:
+            # The spool is unreadable: fail the exact job closed rather than
+            # publishing a partial/omitted result for only the healthy stream.
+            self._fail_capture_closed(job)
+            return
         if not changed:
             return
         try:
             published = publish_output(conn, job, changed, now, server=self.settings.server)
-        except psycopg.Error as exc:
-            if self._is_connectivity_error(exc):
+        except SpoolCaptureError:
+            # The spool is unreadable: fail the exact job closed rather than
+            # publishing a partial/omitted result for only the healthy stream.
+            self._fail_capture_closed(job)
+            return
+        except (psycopg.Error, OSError) as exc:
+            if isinstance(exc, psycopg.Error) and self._is_connectivity_error(exc):
                 raise
+            sqlstate = exc.sqlstate if isinstance(exc, psycopg.Error) else "N/A"
             LOGGER.exception(
                 "publishing output for job %s failed (SQLSTATE %s)",
                 job.id,
-                exc.sqlstate or "N/A",
+                sqlstate,
             )
             if _quarantine_job(
                 conn, job.id, f"publication error: {exc}", server=self.settings.server
@@ -2881,8 +3856,10 @@ class Supervisor:
         Connectivity errors are re-raised so the main loop enters outage
         handling.  Deterministic per-job data/SQL errors are quarantined so
         the offending job does not poison publication of unrelated jobs.
-        Quarantined and quarantine-pending jobs are skipped — only the
-        bounded quarantine retry owner may touch DB state until convergence.
+        Quarantined, quarantine-pending, and spool-evicted (fail-closed) jobs
+        are skipped — only the bounded quarantine retry owner may touch DB
+        state until convergence, and a spool-evicted job's bad spool is never
+        re-read.
         """
         if self.conn is None:
             return
@@ -2892,8 +3869,9 @@ class Supervisor:
                 and not job.finalized
                 and not job.quarantined
                 and not job.quarantine_pending
+                and not job.spool_evicted
             ):
-                self._publish_job_output(job, now)
+                self.publish_job_output(job, now)
 
     def _cleanup_quarantined_jobs(self) -> None:
         """Untrack quarantined jobs and retry quarantine-pending jobs with backoff.
@@ -2948,48 +3926,439 @@ class Supervisor:
                     job.quarantine_next_retry_at = now + delay
 
     def _try_finalize_one_completed(self, job: ActiveJob) -> None:
-        """Attempt final publication and finalization for one completed job.
+        """Finalize a completed job, never exceeding the spool bound.
+
+        Drains only up to the aggregate per-job disk bound; when a stream is
+        still non-end-of-file only because the spool is full, durably publishes
+        the captured bytes and trims the head (after the DB commit) to free
+        bounded room, then drains more. Repeats until both streams reach EOF,
+        then performs the final publication and finalizes. Capture FDs are never
+        closed before EOF and the physical spool never exceeds the configured
+        bound.
 
         Args:
             job: The completed active job.
 
         Raises:
-            psycopg.Error: When the error is a connectivity issue.
+            psycopg.Error: When a database error is a connectivity issue.
         """
-        conn = self.conn
-        if conn is None:
-            return
         try:
-            published = publish_output(
-                conn,
-                job,
-                list(OUTPUT_STREAMS),
-                time.monotonic(),
-                server=self.settings.server,
-                force=True,
-            )
+            self.finalize_completed_job_bounded(job)
         except psycopg.Error as exc:
             if self._is_connectivity_error(exc):
                 raise
-            LOGGER.exception(
-                "publishing final output for job %s failed (SQLSTATE %s)",
-                job.id,
-                exc.sqlstate or "N/A",
-            )
+            # A deterministic per-job error was already quarantined inside the
+            # bounded finalizer; nothing further to do here.
+            LOGGER.exception("deterministic failure finalizing job %s", job.id)
+
+    def _fail_capture_closed(self, job: ActiveJob) -> None:
+        """Fail an exact job closed as a capture failure, without re-reading it.
+
+        Used when an active job's spool is unreadable (stat/read/disappearance
+        failure) during draining, planning, or final publication. The spool is
+        not re-read; the job is marked failed using the in-memory tail state
+        already published, its local resources are released, and it is removed
+        from the active registry so finalization never loops on the bad spool.
+
+        A job whose process group has not yet been proven fully terminated is
+        never terminalized or untracked here: exact local ownership is retained
+        (SIGTERM, then SIGKILL after the grace period) until observation proves
+        every group member is gone; only then does the bounded finalizer write
+        the fail-closed terminal row without re-reading the bad spool.
+
+        Args:
+            job: The active job whose capture spool is unavailable.
+
+        Raises:
+            psycopg.Error: When the error is a connectivity issue during the
+                terminal finalization write.
+        """
+        job.spool_evicted = True
+        request_stop(job, STOP_REASON_SPOOL)
+        if not (job.completed and not group_has_members(job.pgid)):
+            # Still running (or leftover group members alive): keep ownership
+            # until the stop escalation proves the exact group is gone.
+            return
+        conn = self.conn
+        if conn is None:
+            cleanup_job(job)
+            job.finalized = True
+            self.active.pop(job.id, None)
+            return
+        try:
+            finalized = self._finalize_one(job)
+        except psycopg.Error as exc:
+            if self._is_connectivity_error(exc):
+                raise
             if _quarantine_job(
-                conn, job.id, f"final publication error: {exc}", server=self.settings.server
+                conn,
+                job.id,
+                f"capture failure finalize error: {exc}",
+                server=self.settings.server,
             ):
                 job.quarantined = True
             else:
                 job.quarantine_pending = True
             request_stop(job, STOP_REASON_QUARANTINE)
             return
+        if finalized:
+            # _finalize_one already cleaned up the job; record the flag and
+            # drop it from the registry so nothing re-enters finalization.
+            job.finalized = True
+            self.active.pop(job.id, None)
+            return
+        cleanup_job(job)
+        job.finalized = True
+        self.active.pop(job.id, None)
+
+    @staticmethod
+    def _drain_completed_streams(job: ActiveJob, bound: int) -> bool:
+        """Drain each non-EOF stream up to the bound; report whether any progressed.
+
+        Drains only while the aggregate per-job disk bound has room, so the
+        physical spool is never exceeded. A spool stat failure raises
+        :class:`SpoolCaptureError` so the exact job is failed closed rather
+        than assuming zero.
+
+        Args:
+            job: The completed active job whose streams to drain.
+            bound: Maximum physical spool size in bytes (always enforced).
+
+        Returns:
+            ``True`` when at least one stream delivered bytes or reached EOF
+            this turn, ``False`` when no stream made real progress: a pipe
+            that is merely still open with no data available right now is not
+            progress, so the caller can apply its publish/trim and end-of-file
+            grace logic instead of spinning.
+
+        Raises:
+            SpoolCaptureError: When an active stream's capture spool is
+                unreadable, so the exact job can be failed closed.
+        """
+        made_progress = False
+        for name in OUTPUT_STREAMS:
+            stream = getattr(job, name)
+            if stream.fd is None or stream.eof:
+                continue
+            total = 0
+            for stream_name in OUTPUT_STREAMS:
+                other = getattr(job, stream_name)
+                try:
+                    total += other.path.stat().st_size
+                except OSError as exc:
+                    # A spool stat failure must fail the exact job closed, never
+                    # be assumed zero (which would risk finalizing a half-
+                    # captured job).
+                    raise SpoolCaptureError(job.id, name, other.path) from exc
+            size_before = stream.path.stat().st_size
+            was_eof = stream.eof
+            status = drain_capture_stream(stream, bound, aggregate_used=total)
+            if status == "error":
+                job.spool_evicted = True
+                request_stop(job, STOP_REASON_SPOOL)
+                return False
+            # ``"ok"`` covers both real drains and a pipe that is merely still
+            # open with no data available right now. Only landed bytes (spool
+            # growth) or an end-of-file transition are genuine progress:
+            # counting an empty non-blocking read as progress would let the
+            # bounded cycle spin forever on a completed job whose pipe write
+            # end is held open by a detached grandchild.
+            try:
+                size_after = stream.path.stat().st_size
+            except OSError as exc:
+                raise SpoolCaptureError(job.id, name, stream.path) from exc
+            if status == "eof" or (stream.eof and not was_eof) or size_after > size_before:
+                made_progress = True
+        return made_progress
+
+    def _publish_bounded(self, conn: JobsConnection, job: ActiveJob, now: float) -> str:
+        """Publish a completed job's bounded output and classify the outcome.
+
+        The publication is forced (ignoring the throttle interval) so the bounded
+        finalization cycle can free spool room whenever a stream is still
+        non-end-of-file only because the spool is full. A capture spool failure
+        is reported as ``"capture"`` so the caller fails the exact job closed; a
+        deterministic per-job publication error is quarantined and reported as
+        ``"quarantine"``; a lost root row is reported as ``"lost"``.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job: The completed active job whose output to publish.
+            now: Monotonic time of this publication pass.
+
+        Returns:
+            One of ``"ok"``, ``"lost"``, ``"capture"``, or ``"quarantine"``.
+
+        Raises:
+            psycopg.Error: When a database error is a connectivity issue.
+            OSError: When a local capture/file error escapes publication.
+        """
+        try:
+            published = publish_output(
+                conn, job, list(OUTPUT_STREAMS), now, server=self.settings.server, force=True
+            )
+        except SpoolCaptureError:
+            return "capture"
+        except (psycopg.Error, OSError) as exc:
+            if isinstance(exc, psycopg.Error) and self._is_connectivity_error(exc):
+                raise
+            if _quarantine_job(
+                conn, job.id, f"bounded publication error: {exc}", server=self.settings.server
+            ):
+                job.quarantined = True
+            else:
+                job.quarantine_pending = True
+            request_stop(job, STOP_REASON_QUARANTINE)
+            return "quarantine"
         if not published:
             self._untrack_lost_job(job)
+            return "lost"
+        return "ok"
+
+    def _publish_or_fail(self, conn: JobsConnection, job: ActiveJob, now: float) -> bool:
+        """Publish bounded output and fail the job closed on an unrecoverable outcome.
+
+        A ``"capture"`` outcome (an unreadable spool) fails the exact job closed;
+        a ``"quarantine"`` or ``"lost"`` outcome (a deterministic per-job error or
+        a vanished root row) stops finalization so the job is handled by its
+        quarantine/loss path. Only ``"ok"`` lets the caller continue draining or
+        finalize the job.
+
+        Args:
+            conn: Open PostgreSQL connection.
+            job: The completed active job whose output to publish.
+            now: Monotonic time of this publication pass.
+
+        Returns:
+            ``True`` when publication succeeded and finalization may continue,
+            ``False`` when the job was failed closed, quarantined, or lost.
+        """
+        outcome = self._publish_bounded(conn, job, now)
+        if outcome == "capture":
+            self._fail_capture_closed(job)
+            return False
+        return outcome == "ok"
+
+    def finalize_completed_job_bounded(self, job: ActiveJob) -> None:
+        """Bounded publish/trim/drain finalization for one completed job.
+
+        The physical spool bound is always enforced. The cycle drains each
+        non-EOF stream only up to the aggregate per-job disk bound; when a
+        stream is still non-EOF solely because the spool is full, it durably
+        publishes the captured bytes and trims the head (after the DB commit)
+        to free bounded room, then drains more. This repeats until both streams
+        reach end-of-file, after which the final publication finalizes the job.
+
+        Capture FDs are never closed before EOF, so every pipe-buffered byte is
+        represented. If the bounded cycle cannot reach EOF (for example the
+        database cannot make room), the exact job is failed closed rather than
+        growing the disk or silently discarding output.
+
+        Args:
+            job: The completed active job.
+        """
+        conn = self.conn
+        if conn is None:
+            return
+        if job.spool_evicted:
+            # The spool was already proven unreadable/over-bound while the job
+            # ran; fail closed from the in-memory tail state without ever
+            # re-reading the bad spool.
+            if self._finalize_one(job):
+                job.finalized = True
+                self.active.pop(job.id, None)
+            return
+        bound = self.settings.output_spool_max_bytes
+        if not self._bounded_finalization_cycle(job, conn, bound):
+            return
+        if not self._publish_or_fail(conn, job, time.monotonic()):
             return
         if self._finalize_one(job):
             job.finalized = True
             self.active.pop(job.id, None)
+
+    def _bounded_finalization_cycle(self, job: ActiveJob, conn: JobsConnection, bound: int) -> bool:
+        """Alternate bounded draining and durable publish+trim until both streams hit EOF.
+
+        A full/no-progress drain never short-circuits publication: whenever a
+        stream remains non-EOF only because the spool is at its bound, this
+        cycle forces a durable publish and trims the archived head to free
+        room, then continues draining to end-of-file. Only a genuine capture,
+        quarantine, loss, or provable no-room outcome stops the cycle.
+
+        A completed job's capture-pipe write end can be held open indefinitely
+        by a detached grandchild the job forked before exiting (deployment
+        helpers do this by design). Such a writer keeps the pipe non-EOF — and
+        possibly trickling bytes — forever, so after a bounded grace period
+        with no end-of-file the cycle drains one last time, durably publishes
+        everything already captured, and finalizes with that content instead
+        of spinning: every byte read from the pipe is still represented, the
+        physical spool stays within its bound, and the worker can never be
+        wedged past a terminal job by an unkillable foreign writer.
+
+        Args:
+            job: The completed active job whose output is being finalized.
+            conn: Open PostgreSQL connection.
+            bound: Maximum physical spool size in bytes (always enforced).
+
+        Returns:
+            ``True`` when both streams reached EOF — or the detached-writer
+            grace expired with everything captured durably published — so
+            finalization may proceed; ``False`` when the exact job was failed
+            closed or handed to its quarantine/loss path and the caller must
+            stop.
+        """
+        now = time.monotonic()
+        eof_deadline = now + DETACHED_CAPTURE_EOF_GRACE_SECONDS
+        for _ in range(100_000):
+            if _streams_at_eof(job):
+                return True
+            verdict = self._bounded_cycle_turn(job, conn, bound, eof_deadline, now)
+            if verdict == "eof":
+                return True
+            if verdict == "stop":
+                return False
+        # Could not reach EOF within the bounded cycle; fail the exact job
+        # closed instead of growing the disk or discarding output.
+        self._fail_capture_closed(job)
+        return False
+
+    def _bounded_cycle_turn(
+        self,
+        job: ActiveJob,
+        conn: JobsConnection,
+        bound: int,
+        eof_deadline: float,
+        now: float,
+    ) -> str:
+        """Run one bounded-finalization turn and classify what the caller must do.
+
+        Args:
+            job: The completed active job being finalized.
+            conn: Open PostgreSQL connection.
+            bound: Maximum physical spool size in bytes (always enforced).
+            eof_deadline: Monotonic time after which a still-open capture pipe
+                is treated as held by a detached writer and abandoned.
+            now: Cycle-start monotonic time used as the publication timestamp.
+
+        Returns:
+            ``"eof"`` when both streams reached EOF (or were abandoned within
+            contract) and finalization may proceed; ``"stop"`` when the job
+            was failed closed or handed to its quarantine/loss path; ``"wait"``
+            when the cycle should keep draining.
+        """
+        progressed = self._drain_completed_streams(job, bound)
+        used_before = _spool_used_bytes(job)
+        outcome = self._publish_bounded(conn, job, now)
+        if outcome == "capture":
+            self._fail_capture_closed(job)
+            return "stop"
+        if outcome != "ok":
+            # Quarantined or lost: the job is owned by its quarantine/loss
+            # path, so finalization must not continue here.
+            return "stop"
+        made_room = progressed or _spool_shrank(job, used_before)
+        if _streams_at_eof(job):
+            return "eof"
+        if time.monotonic() >= eof_deadline:
+            # A detached grandchild holds the pipe write end open: EOF will
+            # never arrive on its own. Everything read so far is durably
+            # published (the last pass was "ok"); abandon the pipe and
+            # finalize rather than wedge the worker forever.
+            return "eof" if self._abandon_open_capture_streams(job, bound) else "stop"
+        if not made_room and used_before is not None and used_before >= bound:
+            # A stream is still non-EOF, the spool sits at its bound, and a
+            # durable publish+trim freed no room: the bounded cycle cannot
+            # make progress. Fail the exact job closed instead of spinning or
+            # growing the disk.
+            self._fail_capture_closed(job)
+            return "stop"
+        if not made_room:
+            # Quiet open pipe with spool room: wait instead of hammering the
+            # database while the grace window runs out. A deliberate bounded
+            # drain must never outlive an active sibling job's lease, so keep
+            # the bulk heartbeat running across the wait.
+            self._refresh_leases_quietly()
+            time.sleep(0.05)
+        return "wait"
+
+    def _refresh_leases_quietly(self) -> None:
+        """Best-effort bulk lease refresh for long deliberate local drains.
+
+        Shutdown and bounded finalization can legitimately spend longer than a
+        lease interval draining one job's capture pipes while another active
+        job's row must stay lease-owned (otherwise stale recovery would
+        reclassify that still-cancelled job as failed). Connectivity failures
+        are swallowed here: the regular tick/outage path owns reconnects, and a
+        missed refresh never falsely extends a lease.
+        """
+        with suppress(psycopg.Error):
+            self._refresh_leases()
+
+    def _abandon_open_capture_streams(self, job: ActiveJob, bound: int) -> bool:
+        """Finalize the capture state of streams whose writers outlived the job.
+
+        Every remaining pipe byte is drained one last time into the bounded
+        spool; then any retained in-memory suffix is flushed only within the
+        proven current aggregate disk room — never past the configured bound.
+        A stream whose retained bytes cannot be durably represented within the
+        bound (no room and no trim possible at grace expiry) fails the exact
+        job closed instead of overshooting the bound or silently dropping the
+        bytes. When every open stream is drained within contract, the read end
+        is closed and the stream marked at end-of-file so finalization can
+        proceed.
+
+        Args:
+            job: The completed active job whose open capture streams are
+                abandoned.
+            bound: Maximum physical aggregate spool size in bytes (always
+                enforced).
+
+        Returns:
+            ``True`` when every open stream was drained, flushed within the
+            bound, and closed; ``False`` when retained bytes could not be
+            represented within the bound (the exact job was failed closed) or
+            a genuine spool write failure occurred.
+        """
+        with suppress(SpoolCaptureError):
+            self._drain_completed_streams(job, bound)
+
+        def _aggregate_used() -> int | None:
+            try:
+                return job.stdout.path.stat().st_size + job.stderr.path.stat().st_size
+            except OSError:
+                return None
+
+        used = _aggregate_used()
+        if used is None:
+            # The spool disappeared during abandonment: fail closed rather
+            # than assume zero and risk writing past an unknown physical size.
+            self._fail_capture_closed(job)
+            return False
+        for name in OUTPUT_STREAMS:
+            stream = getattr(job, name)
+            if stream.fd is None:
+                continue
+            if stream.pending:
+                current = _aggregate_used()
+                if current is None:
+                    self._fail_capture_closed(job)
+                    return False
+                room = max(0, bound - current)
+                if room == 0 or not _flush_pending(stream, min(room, len(stream.pending))):
+                    self._fail_capture_closed(job)
+                    return False
+                if stream.pending:
+                    # Even a bounded flush retained a suffix: those bytes
+                    # cannot be represented within the bound, so closing the
+                    # descriptor here would silently drop them.
+                    self._fail_capture_closed(job)
+                    return False
+            with suppress(OSError):
+                os.close(stream.fd)
+            stream.fd = None
+            stream.eof = True
+        return True
 
     def _finalize_completed(self) -> None:
         """Publish final output and finalize every job whose process is fully gone.
@@ -3181,7 +4550,7 @@ class Supervisor:
             self._finalize_immediate(claimed.id, failure)
             return
         try:
-            proc, stdout_path, stderr_path, pgid, gate_fd = spawn_job(job_spec)
+            proc, stdout_path, stderr_path, pgid, gate_fd, stdout_r, stderr_r = spawn_job(job_spec)
         except OSError as exc:
             LOGGER.warning("unable to start job %s: %s", claimed.id, exc)
             self._finalize_immediate(
@@ -3201,6 +4570,8 @@ class Supervisor:
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             gate_fd=gate_fd,
+            stdout_read_fd=stdout_r,
+            stderr_read_fd=stderr_r,
         )
 
         # Fail closed BEFORE any release and activate only on success.
@@ -3212,9 +4583,15 @@ class Supervisor:
             claim_mono=claim_mono,
         )
         if job is None:
+            # The gated start was aborted and finalized; close the capture fds
+            # and drop the spool files so nothing leaks.
+            for capture_fd in (stdout_r, stderr_r):
+                with suppress(OSError):
+                    os.close(capture_fd)
+            _cleanup_output_files(stdout_path, stderr_path)
             return
-        job.stdout = OutputStream(path=stdout_path)
-        job.stderr = OutputStream(path=stderr_path)
+        job.stdout = OutputStream(path=stdout_path, fd=stdout_r)
+        job.stderr = OutputStream(path=stderr_path, fd=stderr_r)
         job.last_heartbeat_at = claim_mono
         self.active[claimed.id] = job
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
@@ -3237,6 +4614,12 @@ class Supervisor:
         if abort_gated_start(
             gated.proc, gated.pgid, gated.stdout_path, gated.stderr_path, gated.gate_fd
         ):
+            # Converged: release the capture pipe read ends so no descriptor
+            # leaks from the aborted start.
+            for capture_fd in (gated.stdout_read_fd, gated.stderr_read_fd):
+                if capture_fd is not None:
+                    with suppress(OSError):
+                        os.close(capture_fd)
             return
         LOGGER.error(
             "gated start abort did not converge for job %s (exact group %d); "
@@ -3608,6 +4991,9 @@ class Supervisor:
     def _drain_active_groups(self) -> bool:
         """Wait for every active process group to exit, escalating to SIGKILL.
 
+        Capture pipes are drained each iteration so every job's final output is
+        captured into its spool file before finalization publishes it.
+
         Returns:
             ``True`` only when every active job's exact group is positively
             proven member-free after the escalation; ``False`` when any exact
@@ -3616,18 +5002,22 @@ class Supervisor:
         """
         deadline = time.monotonic() + self.settings.cancel_grace_seconds
         while time.monotonic() < deadline:
+            self._drain_captures()
+            self._refresh_leases_quietly()
             all_gone = all(
                 self._observe_and_escalate(job, time.monotonic()) for job in self.active.values()
             )
             if all_gone:
                 break
             time.sleep(0.05)
+        self._drain_captures()
         for job in self.active.values():
             if not self._observe_and_escalate(job, time.monotonic()):
                 signal_kill(job)
         for job in self.active.values():
             with suppress(Exception):
                 job.proc.wait(timeout=self.settings.cancel_grace_seconds)
+        self._drain_captures()
         return all(not group_has_members(job.pgid) for job in self.active.values())
 
     def _observe_and_escalate(self, job: ActiveJob, now: float) -> bool:
@@ -3692,36 +5082,19 @@ class Supervisor:
             if not job.completed and job.stop_reason is None:
                 job.stop_reason = STOP_REASON_SHUTDOWN
                 job.cancellation_note = _stop_note(STOP_REASON_SHUTDOWN)
+            # Bounded publish/trim/drain cycle: capture every pipe byte into the
+            # spool (never past the configured bound, never closing capture FDs
+            # before EOF) and then finalize. This guarantees a controlled shutdown
+            # represents the full output of a terminating job without growing the
+            # disk or silently discarding.
             try:
-                retained = publish_output(
-                    self.conn,
-                    job,
-                    list(OUTPUT_STREAMS),
-                    time.monotonic(),
-                    server=self.settings.server,
-                    force=True,
-                )
+                self.finalize_completed_job_bounded(job)
             except psycopg.Error as exc:
                 if self._is_connectivity_error(exc):
                     raise
-                LOGGER.exception(
-                    "publishing shutdown output for job %s failed (SQLSTATE %s)",
-                    job.id,
-                    exc.sqlstate or "N/A",
-                )
-                _quarantine_job(
-                    self.conn,
-                    job.id,
-                    f"shutdown publication error: {exc}",
-                    server=self.settings.server,
-                )
-                continue
-            if not retained:
-                self._untrack_lost_job(job)
-                continue
-            if self._finalize_one(job):
-                job.finalized = True
-                self.active.pop(job.id, None)
+                # Deterministic per-job error already quarantined inside the
+                # bounded finalizer.
+                LOGGER.exception("deterministic failure finalizing job %s", job.id)
 
     def _cleanup_all_files(self) -> None:
         """Remove every remaining temporary capture file."""
@@ -3765,6 +5138,7 @@ def _finalize_status(job: ActiveJob) -> str:
         STOP_REASON_ROW_LOST,
         STOP_REASON_PERSIST,
         STOP_REASON_QUARANTINE,
+        STOP_REASON_SPOOL,
     }:
         return "failed"
     if job.cancel_requested:
@@ -3820,11 +5194,16 @@ def signal_kill(job: ActiveJob) -> None:
 
 
 def cleanup_job(job: ActiveJob) -> None:
-    """Remove the temporary capture files of a finalized job.
+    """Remove the temporary capture files and close pipe ends of a finalized job.
 
     Args:
         job: The finalized active job.
     """
+    for stream in (job.stdout, job.stderr):
+        if stream.fd is not None:
+            with suppress(OSError):
+                os.close(stream.fd)
+            stream.fd = None
     job.stdout.path.unlink(missing_ok=True)
     job.stderr.path.unlink(missing_ok=True)
 
@@ -3849,6 +5228,10 @@ def _stop_note(reason: str) -> str:
             "unable to reach the database"
         ),
         STOP_REASON_PERSIST: "terminated because its process identity could not be recorded",
+        STOP_REASON_SPOOL: (
+            "terminated because its local stdout/stderr disk spool was "
+            "unavailable or exceeded the configured safe bound"
+        ),
     }
     return notes.get(reason, "stopped")
 

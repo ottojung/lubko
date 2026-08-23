@@ -48,6 +48,7 @@ from lubko.lifecycle import (
     append_deploy_log,
     check_postgres,
     deploy_lock,
+    detach_standard_streams,
     process_identity,
     read_meta,
     run_validation,
@@ -1229,6 +1230,10 @@ def _fork_watchdog(lock_timeout_seconds: float) -> None:
     os.closerange(3, int(os.sysconf("SC_OPEN_MAX")))
     with suppress(OSError):
         os.setsid()
+    # The watchdog outlives the job process that forked it: sever the
+    # inherited standard streams (capture-pipe write ends under worker-owned
+    # capture) exactly like every other detached deployment child.
+    detach_standard_streams(keep=set())
     try:
         _watchdog_main(lock_timeout_seconds)
     finally:
@@ -1503,6 +1508,7 @@ def _run_helper(options: Options, commit: str, job_id: object, writer: int) -> N
     """
     with suppress(OSError):
         os.setsid()
+    detach_standard_streams(keep={writer})
     try:
         try:
             with deploy_lock(options.lock_timeout_seconds):
