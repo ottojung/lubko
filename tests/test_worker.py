@@ -2442,6 +2442,139 @@ def test_bounded_finalizer_abandons_detached_pipe_writer_and_finalizes(
             os.waitpid(writer_pid, 0)
 
 
+def _abandon_build_job(
+    cwd: Path,
+    db: DatabaseConfig,
+    *,
+    bound: int,
+    payload: bytes = b"",
+) -> tuple[Supervisor, _RecordingConnection, ActiveJob, int, int]:
+    """Build a completed job at a given bound with a retained pending suffix.
+
+    The fixture models production: both spool files pre-created, stderr holding
+    90 on-disk bytes and stdout 5, a partial-write suffix ``XYZ`` still only in
+    memory, and a detached writer child keeping the stdout pipe non-EOF.
+
+    Returns:
+        ``(supervisor, conn, job, writer_pid, stderr_write)``: the supervisor
+        under test, its recording connection, the registered active job, the
+        detached writer child PID (reap via :func:`_abandon_cleanup`), and the
+        test-owned stderr write end to close afterwards.
+    """
+    settings = make_settings(output_spool_max_bytes=bound)
+    supervisor = Supervisor(settings, db)
+    conn = _RecordingConnection()
+    supervisor.conn = as_db(conn)
+    job = make_active_job(cwd)
+    conn.retained_root = (str(job.id),)
+    conn.status_result = ("running",)
+    stdout_read, writer_pid, _ = _pipe_with_detached_writer(payload)
+    stderr_read, stderr_write = os.pipe()
+    os.set_blocking(stderr_read, False)
+    job.stdout = OutputStream(path=job.stdout.path, fd=stdout_read)
+    job.stderr = OutputStream(path=job.stderr.path, fd=stderr_read)
+    job.stderr.path.write_bytes(b"S" * 90)
+    job.stdout.path.write_bytes(b"P" * 5)
+    job.stdout.pending += b"XYZ"
+    job.completed = True
+    supervisor.active[job.id] = job
+    return supervisor, conn, job, writer_pid, stderr_write
+
+
+def _abandon_cleanup(writer_pid: int, stderr_write: int) -> None:
+    """Reap the detached writer and close the test-owned stderr write end."""
+    with suppress(ProcessLookupError, OSError):
+        os.kill(writer_pid, signal.SIGKILL)
+    with suppress(ChildProcessError):
+        os.waitpid(writer_pid, 0)
+    with suppress(OSError):
+        os.close(stderr_write)
+
+
+def test_abandon_at_exact_bound_fails_closed_without_appending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Grace-expiry abandonment never appends retained pending past the bound.
+
+    With the aggregate spool sitting exactly at ``LUBKO_OUTPUT_SPOOL_MAX_BYTES``
+    and a partial-write suffix still only in ``pending`` when the detached-writer
+    grace expires, the abandonment must fail the exact job closed rather than
+    overshoot the bound or silently drop the suffix. The spill spy proves no
+    append occurs, the exact job is failed closed, and the read end is closed.
+    """
+    monkeypatch.setattr(worker, "DETACHED_CAPTURE_EOF_GRACE_SECONDS", 0.2)
+    db = DatabaseConfig(host="h", port=1, dbname="d", user="u", password=str(uuid4()))
+    no_room_dir = tmp_path / "no-room"
+    no_room_dir.mkdir()
+    supervisor, _conn, job, writer_pid, stderr_write = _abandon_build_job(
+        no_room_dir, db, bound=100
+    )
+    # Make the on-disk aggregate sit EXACTLY at the bound (95 + 5).
+    job.stderr.path.write_bytes(b"S" * 95)
+
+    writes: list[tuple[str, int]] = []
+    orig_spill = worker._spill_append
+
+    def spill_spy(path: Path, data: bytearray) -> int:
+        written = orig_spill(path, data)
+        writes.append((Path(path).name, written))
+        return written
+
+    monkeypatch.setattr(worker, "_spill_append", spill_spy)
+    try:
+        supervisor.finalize_completed_job_bounded(job)
+        assert writes == [], "abandonment appended despite zero aggregate room"
+        assert job.spool_evicted, "unrepresentable retained bytes must fail closed"
+        assert job.stdout.fd is None, "grace expiry must still close the read end"
+    finally:
+        monkeypatch.setattr(worker, "_spill_append", orig_spill)
+        _abandon_cleanup(writer_pid, stderr_write)
+
+
+def test_abandon_with_room_lands_pending_suffix_within_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With aggregate room available, the retained suffix lands exactly once.
+
+    The spill spy enforces the running physical aggregate stays within the
+    bound on every append; the suffix lands once, finalization proceeds to
+    end-of-file, and no retained byte is left in memory.
+    """
+    monkeypatch.setattr(worker, "DETACHED_CAPTURE_EOF_GRACE_SECONDS", 0.2)
+    db = DatabaseConfig(host="h", port=1, dbname="d", user="u", password=str(uuid4()))
+    room_dir = tmp_path / "room"
+    room_dir.mkdir()
+    supervisor, _conn, job, writer_pid, stderr_write = _abandon_build_job(room_dir, db, bound=200)
+
+    grown: dict[str, int] = {"stdout.cap": 5, "stderr.cap": 90}
+    orig_spill = worker._spill_append
+
+    def spill_spy(path: Path, data: bytearray) -> int:
+        written = orig_spill(path, data)
+        key = Path(path).name
+        grown[key] = grown.get(key, 0) + written
+        assert grown["stdout.cap"] + grown["stderr.cap"] <= 200, (
+            "physical aggregate must stay within the bound"
+        )
+        return written
+
+    monkeypatch.setattr(worker, "_spill_append", spill_spy)
+    try:
+        supervisor.finalize_completed_job_bounded(job)
+        assert grown["stdout.cap"] == 8, (
+            "the retained suffix must land exactly once, within the room"
+        )
+        assert job.stdout.eof
+        assert job.stderr.eof
+        assert job.stdout.fd is None
+        assert job.stderr.fd is None
+        assert not job.stdout.pending
+        assert job.stdout.tail_end == 8, "5 on-disk bytes + retained suffix must land"
+    finally:
+        monkeypatch.setattr(worker, "_spill_append", orig_spill)
+        _abandon_cleanup(writer_pid, stderr_write)
+
+
 def test_bounded_finalize_quiet_wait_keeps_active_sibling_lease_heartbeating(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

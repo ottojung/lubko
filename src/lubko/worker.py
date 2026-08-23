@@ -4299,29 +4299,61 @@ class Supervisor:
         """Finalize the capture state of streams whose writers outlived the job.
 
         Every remaining pipe byte is drained one last time into the bounded
-        spool and flushed durably; then the read end is closed and the stream
-        marked at end-of-file so finalization can proceed. Nothing already
-        read is lost: a failed final flush reports failure so the caller fails
-        the exact job closed instead.
+        spool; then any retained in-memory suffix is flushed only within the
+        proven current aggregate disk room — never past the configured bound.
+        A stream whose retained bytes cannot be durably represented within the
+        bound (no room and no trim possible at grace expiry) fails the exact
+        job closed instead of overshooting the bound or silently dropping the
+        bytes. When every open stream is drained within contract, the read end
+        is closed and the stream marked at end-of-file so finalization can
+        proceed.
 
         Args:
             job: The completed active job whose open capture streams are
                 abandoned.
-            bound: Maximum physical spool size in bytes (always enforced).
+            bound: Maximum physical aggregate spool size in bytes (always
+                enforced).
 
         Returns:
-            ``True`` when every open stream was drained, flushed, and closed;
-            ``False`` when a retained-byte flush failed and the job must be
-            failed closed.
+            ``True`` when every open stream was drained, flushed within the
+            bound, and closed; ``False`` when retained bytes could not be
+            represented within the bound (the exact job was failed closed) or
+            a genuine spool write failure occurred.
         """
         with suppress(SpoolCaptureError):
             self._drain_completed_streams(job, bound)
+
+        def _aggregate_used() -> int | None:
+            try:
+                return job.stdout.path.stat().st_size + job.stderr.path.stat().st_size
+            except OSError:
+                return None
+
+        used = _aggregate_used()
+        if used is None:
+            # The spool disappeared during abandonment: fail closed rather
+            # than assume zero and risk writing past an unknown physical size.
+            self._fail_capture_closed(job)
+            return False
         for name in OUTPUT_STREAMS:
             stream = getattr(job, name)
             if stream.fd is None:
                 continue
-            if stream.pending and not _flush_pending(stream):
-                return False
+            if stream.pending:
+                current = _aggregate_used()
+                if current is None:
+                    self._fail_capture_closed(job)
+                    return False
+                room = max(0, bound - current)
+                if room == 0 or not _flush_pending(stream, min(room, len(stream.pending))):
+                    self._fail_capture_closed(job)
+                    return False
+                if stream.pending:
+                    # Even a bounded flush retained a suffix: those bytes
+                    # cannot be represented within the bound, so closing the
+                    # descriptor here would silently drop them.
+                    self._fail_capture_closed(job)
+                    return False
             with suppress(OSError):
                 os.close(stream.fd)
             stream.fd = None
