@@ -393,8 +393,11 @@ def test_signal_identity_checked_never_signals_shared_group() -> None:
         # Exact-PID only: the shared-group sibling and pytest survive.
         assert pid_live(sibling.pid)
         assert pid_live(os.getpid())
-        # A stale identity authorizes nothing.
-        assert guard.signal_identity_checked(sibling.pid, (ticks or 0) + 1, signal.SIGKILL) is False
+        # A stale identity authorizes nothing: constructed to never match
+        # the live sibling's actual start ticks.
+        stale = sibling_ticks + 1
+        assert stale != sibling_ticks
+        assert guard.signal_identity_checked(sibling.pid, stale, signal.SIGKILL) is False
         assert pid_live(sibling.pid)
     finally:
         for proc, spawn_ticks in ((target, target_ticks), (sibling, sibling_ticks)):
