@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, supervise, toolchain
+from lubko import cli, protocol, supervise, toolchain
 from lubko.config import load_database_config
 from lubko.durable import remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
@@ -1928,6 +1928,29 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
     remove_durable(path)
 
 
+def _probe_server() -> str:
+    """Return the configured server identity a probe job must be addressed to.
+
+    The probe targets the local daemon, whose single configured server
+    identity comes from ``LUBKO_SERVER``; there is no implicit or default
+    server.
+
+    Returns:
+        The non-empty configured server identity.
+
+    Raises:
+        RuntimeError: If ``LUBKO_SERVER`` is unset or empty.
+    """
+    server = os.environ.get("LUBKO_SERVER", "")
+    if not server:
+        msg = (
+            "LUBKO_SERVER must name the target execution server for the probe "
+            "job; there is no implicit or default server"
+        )
+        raise RuntimeError(msg)
+    return server
+
+
 def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     """Insert one pending queue probe job.
 
@@ -1938,12 +1961,13 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     Returns:
         The probe job identifier, or ``None`` if the insert failed.
     """
-    probe_payload = json.dumps({
-        "v": 3,
-        "type": "command",
-        "request": {"cwd": cwd, "process": ["/usr/bin/sleep", "60"]},
-        "state": {"status": "pending"},
-    })
+    probe_payload = json.dumps(
+        protocol.build_payload(
+            server=_probe_server(),
+            cwd=cwd,
+            process=["/usr/bin/sleep", "60"],
+        )
+    )
     with conn.cursor() as cursor:
         cursor.execute(
             "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
@@ -2169,10 +2193,10 @@ def _verify_queue_roundtrip(
             )
         finally:
             with suppress(psycopg.Error):
-                request_cancel(conn, probe_id)
+                request_cancel(conn, probe_id, server=_probe_server())
             _wait_for_probe_terminal(conn, probe_id, timeout_seconds)
             with suppress(psycopg.Error):
-                delete_job_and_chunks(conn, probe_id)
+                delete_job_and_chunks(conn, probe_id, server=_probe_server())
         return outcome
     finally:
         conn.close()
@@ -2424,10 +2448,10 @@ def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool:
             return _wait_for_any_claim(conn, probe_id, timeout_seconds)
         finally:
             with suppress(psycopg.Error):
-                request_cancel(conn, probe_id)
+                request_cancel(conn, probe_id, server=_probe_server())
             _wait_for_probe_terminal(conn, probe_id, timeout_seconds)
             with suppress(psycopg.Error):
-                delete_job_and_chunks(conn, probe_id)
+                delete_job_and_chunks(conn, probe_id, server=_probe_server())
     finally:
         conn.close()
 

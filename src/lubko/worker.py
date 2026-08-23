@@ -171,6 +171,28 @@ JOBS_SCHEMA: Final = "lubko"
 JOBS_TABLE: Final = "jobs"
 JOBS_COLUMN_TYPES: Final = (("id", "uuid"), ("payload", "text"))
 TYPE_AWARE_CONSTRAINT_NAME: Final = "jobs_payload_type_shape"
+#: Whitespace-stripped fragments that only the protocol v4 (routing-aware)
+#: definition of ``jobs_payload_type_shape`` contains; a pre-cutover v3
+#: constraint of the same name lacks them and is refused at startup. Compared
+#: against ``pg_get_constraintdef`` output with all whitespace removed, so
+#: PostgreSQL normalization (extra parentheses and ``::text`` casts included)
+#: never defeats detection. The ``='4'::jsonb`` marker proves the constraint
+#: enforces the protocol version itself, not merely server presence.
+SERVER_ROUTING_CONSTRAINT_MARKERS: Final = (
+    "jsonb_typeof",
+    "->'server'",
+    "='string'",
+    "='4'::jsonb",
+)
+#: SQL predicate selecting rows whose top-level ``server`` is exactly the
+#: daemon's configured identity as a JSON *string*. The ``jsonb_typeof`` guard
+#: makes text-coercion aliases impossible: a row with ``server: 123`` (a JSON
+#: number) can never match a daemon configured with the string ``"123"``,
+#: mirroring the parser's strict string typing. In row-selection predicates a
+#: missing key yields NULL and therefore never matches.
+SERVER_MATCH_SQL: Final = (
+    "jsonb_typeof((payload::jsonb)->'server') = 'string'\n    AND (payload::jsonb)->>'server' = "
+)
 CHUNK_OWNER_INDEX_NAME: Final = "jobs_chunk_owner_idx"
 CHUNK_ORDER_INDEX_NAME: Final = "jobs_chunk_order_idx"
 UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
@@ -343,6 +365,10 @@ class Settings:
     poll_interval_seconds: float
     process_poll_interval_seconds: float
     cancel_grace_seconds: float
+    #: Configured execution-server identity of this daemon. Every claim,
+    #: mutation, publication, recovery, and GC pass is scoped to exactly this
+    #: server; a daemon refuses to start without a valid non-empty identity.
+    server: str = field(default_factory=lambda: os.environ.get("LUBKO_SERVER", ""))
     worker_incarnation: str = field(
         default_factory=lambda: os.environ.get("LUBKO_LIFECYCLE_TOKEN", uuid4().hex)
     )
@@ -359,7 +385,18 @@ class Settings:
     gc_batch_limit: int = DEFAULT_GC_BATCH_LIMIT
 
     def __post_init__(self) -> None:
-        """Validate lease timing so a live worker's lease never expires idle."""
+        """Validate lease timing so a live worker's lease never expires idle.
+
+        Raises:
+            ValueError: If the server identity is empty or any timing value
+                is unusable.
+        """
+        if not self.server:
+            msg = (
+                "LUBKO_SERVER must be a non-empty server identity; every daemon "
+                "owns exactly one configured server and refuses to start without it"
+            )
+            raise ValueError(msg)
         self._validate_lease_timing()
         self._validate_output_and_gc()
 
@@ -660,12 +697,13 @@ def archive_target(size: int) -> int:
     return size - OUTPUT_TAIL_MAX_BYTES + ARCHIVE_MARGIN_CHARS
 
 
-def publish_output(
+def publish_output(  # ruff: ignore[too-many-arguments] -- server and force complete the publication contract; splitting them hides intent
     conn: JobsConnection,
     job: ActiveJob,
     stream_names: list[str],
     now: float,
     *,
+    server: str,
     force: bool = False,
 ) -> bool:
     """Publish changed live tails and archive historical output for one job.
@@ -673,21 +711,25 @@ def publish_output(
     Immutable ``output_chunk`` rows are inserted and the root row's live-window
     metadata (including the ``previous`` pointer) is updated in one PostgreSQL
     transaction, so a crash can never leave the root pointing at nonexistent
-    history. The transaction first retains the root ``command`` row with a
-    row-level lock: when a concurrent root deletion has already committed, no
-    chunk row is inserted at all and publication returns ``False``, so
-    publication itself never leaves an explicitly owned orphan chunk. In-memory
-    publication state is only advanced after the transaction commits, so a
-    failed transaction never leaves the registry pointing at chunks that were
-    not inserted. The live tail itself is always recomputed as the newest
-    ``OUTPUT_TAIL_MAX_BYTES`` bytes of the capture file, so archiving is
-    observationally invisible to a normal root-row ``SELECT``.
+    history. Every inserted chunk carries the daemon's configured ``server``
+    identity. The transaction first retains the root ``command`` row with a
+    row-level lock (and only when its server matches): when a concurrent root
+    deletion has already committed, no chunk row is inserted at all and
+    publication returns ``False``, so publication itself never leaves an
+    explicitly owned orphan chunk. In-memory publication state is only advanced
+    after the transaction commits, so a failed transaction never leaves the
+    registry pointing at chunks that were not inserted. The live tail itself is
+    always recomputed as the newest ``OUTPUT_TAIL_MAX_BYTES`` bytes of the
+    capture file, so archiving is observationally invisible to a normal
+    root-row ``SELECT``.
 
     Args:
         conn: Open PostgreSQL connection.
         job: The active job whose output to publish.
         stream_names: Which streams to publish.
         now: Monotonic time of this publication pass.
+        server: The daemon's configured server identity stamped onto every
+            inserted chunk and required on the retained root row.
         force: Whether to publish regardless of the throttle interval.
 
     Returns:
@@ -695,7 +737,7 @@ def publish_output(
         publishing), ``False`` when the root row no longer exists and the
         planned publication was skipped.
     """
-    plans = _plan_streams(job, stream_names, force=force)
+    plans = _plan_streams(job, stream_names, server=server, force=force)
     if not plans:
         return True
     windows = _full_windows(job, plans)
@@ -706,9 +748,10 @@ def publish_output(
             "FROM lubko.jobs\n"
             "WHERE id = %(job_id)s\n"
             "    AND (payload::jsonb)->>'type' = 'command'\n"
+            "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "    AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
             "FOR UPDATE\n",
-            {"job_id": job.id},
+            {"job_id": job.id, "server": server},
         )
         if cursor.fetchone() is None:
             return False
@@ -720,7 +763,7 @@ def publish_output(
                 )
         cursor.execute(
             _output_update_sql(),
-            _output_update_params(job.id, output),
+            _output_update_params(job.id, output, server),
         )
     for name, plan in plans.items():
         _apply_plan(getattr(job, name), plan, now)
@@ -772,13 +815,14 @@ class _StreamPlan:
 
 
 def _plan_streams(
-    job: ActiveJob, stream_names: list[str], *, force: bool
+    job: ActiveJob, stream_names: list[str], *, server: str, force: bool
 ) -> dict[str, _StreamPlan]:
     """Compute publication plans for changed streams without mutating state.
 
     Args:
         job: The active job whose output to publish.
         stream_names: Which streams to publish.
+        server: The daemon's configured server identity stamped onto chunks.
         force: Whether to publish regardless of the throttle interval.
 
     Returns:
@@ -794,7 +838,9 @@ def _plan_streams(
         if not force and size == stream.published_size:
             continue
         tail_text, tail_start, tail_end = output_window_text(stream.path, OUTPUT_TAIL_MAX_BYTES)
-        chunks, archived_upto, last_chunk, sequence = _plan_chunks(job.id, name, stream, tail_end)
+        chunks, archived_upto, last_chunk, sequence = _plan_chunks(
+            job.id, name, stream, tail_end, server
+        )
         plans[name] = _StreamPlan(
             size=size,
             tail_text=tail_text,
@@ -819,6 +865,7 @@ def _plan_chunks(
     name: str,
     stream: OutputStream,
     tail_end: int,
+    server: str,
 ) -> tuple[tuple[tuple[UUID, str], ...], int, UUID | None, int]:
     """Compute the immutable chunks to archive for one stream.
 
@@ -827,6 +874,7 @@ def _plan_chunks(
         name: Stream name.
         stream: The stream's current publication state.
         tail_end: Current byte size of the stream (end of the live tail).
+        server: The daemon's configured server identity stamped onto chunks.
 
     Returns:
         The planned ``(chunks, archived_upto, last_chunk, sequence)`` tuple.
@@ -843,6 +891,7 @@ def _plan_chunks(
         chunk_id = uuid4()
         chunk_payload = json.dumps(
             build_output_chunk_payload(
+                server=server,
                 thread=job_id,
                 stream=name,
                 sequence=sequence,
@@ -893,20 +942,24 @@ def _output_update_sql() -> str:
         "jsonb_set(payload::jsonb, '{output}', %(output)s::jsonb), "
         "'{state,updated_at}', " + UTC_ISO_SQL + ")::text\n"
         "WHERE id = %(job_id)s AND (payload::jsonb)->>'type' = 'command'\n"
+        "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
     )
 
 
-def _output_update_params(job_id: UUID, output: dict[str, dict[str, Any]]) -> dict[str, object]:
+def _output_update_params(
+    job_id: UUID, output: dict[str, dict[str, Any]], server: str
+) -> dict[str, object]:
     """Build the parameters for :func:`_output_update_sql`.
 
     Args:
         job_id: The root job identifier.
         output: The full ``{stdout, stderr}`` window mapping.
+        server: The daemon's configured server identity guarding the update.
 
     Returns:
         The bound parameters.
     """
-    return {"job_id": job_id, "output": json.dumps(output)}
+    return {"job_id": job_id, "output": json.dumps(output), "server": server}
 
 
 # ---------------------------------------------------------------------------
@@ -1550,7 +1603,9 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
     Claiming locks pending rows with ``FOR UPDATE SKIP LOCKED`` and writes the
     mutable claim state with a compare-and-swap update of the JSON payload, so
     several workers can safely compete for the same queue and two daemons never
-    execute the same root job. Only ``command`` rows are claimed; immutable
+    execute the same root job. Only ``command`` rows whose top-level
+    ``server`` exactly equals the daemon's configured server identity are
+    claimed; jobs addressed to other servers stay pending, and immutable
     ``output_chunk`` rows are never claim candidates.
 
     The claim records the worker's incarnation and grants each job a lease by
@@ -1590,10 +1645,11 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
     )
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "WITH next AS (\n"  # ruff: ignore[hardcoded-sql-expression]
+            "WITH next AS (\n"
             "    SELECT id\n"
             "    FROM lubko.jobs\n"
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status' = 'pending'\n"
             "    ORDER BY (payload::jsonb)->'state'->>'created_at', id\n"
             "    FOR UPDATE SKIP LOCKED\n"
@@ -1605,6 +1661,7 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
             "WHERE job.id = next.id\n"
             "RETURNING job.id, job.payload\n",
             {
+                "server": settings.server,
                 "worker_id": settings.worker_id,
                 "worker_incarnation": settings.worker_incarnation,
                 "lease_duration_seconds": settings.lease_duration_seconds,
@@ -1629,25 +1686,28 @@ def claim_job(conn: JobsConnection, settings: Settings) -> ClaimedJob | None:
     return claimed[0] if claimed else None
 
 
-def request_cancel(conn: JobsConnection, job_id: UUID) -> str:
+def request_cancel(conn: JobsConnection, job_id: UUID, *, server: str) -> str:
     """Request cancellation of a job using the documented SQL contract.
 
     A pending job is cancelled immediately without ever being spawned. A
     running job has its ``state.cancel_requested_at`` marker set and is
-    terminated by the worker. An already terminal job is left unchanged. All
-    cancellation state lives inside the JSON ``payload``; no table column is
-    added.
+    terminated by the worker. An already terminal job is left unchanged. The
+    mutation requires the expected top-level ``server`` identity: a row whose
+    server differs is never touched and reports its unchanged terminal status.
+    All cancellation state lives inside the JSON ``payload``; no table column
+    is added.
 
     Args:
         conn: Open PostgreSQL connection.
         job_id: Identifier of the job to cancel.
+        server: Expected server identity of the job.
 
     Returns:
         The resulting status: ``cancelled``, ``running``, or the unchanged
         terminal status of an already completed job.
 
     Raises:
-        ValueError: If the job does not exist.
+        ValueError: If the job does not exist or belongs to another server.
     """
     pending_chain = _jsonb_set_chain(
         "payload::jsonb",
@@ -1672,9 +1732,10 @@ def request_cancel(conn: JobsConnection, job_id: UUID) -> str:
         cursor.execute(
             "UPDATE lubko.jobs\n"
             "SET payload = " + pending_chain + "::text\n"
-            "WHERE id = %s AND (payload::jsonb)->'state'->>'status' = 'pending'\n"
+            "WHERE id = %(job_id)s AND " + SERVER_MATCH_SQL + "%(server)s\n"
+            "    AND (payload::jsonb)->'state'->>'status' = 'pending'\n"
             "RETURNING (payload::jsonb)->'state'->>'status'\n",
-            (job_id,),
+            {"job_id": job_id, "server": server},
         )
         row = cursor.fetchone()
         if row is not None:
@@ -1691,9 +1752,10 @@ def request_cancel(conn: JobsConnection, job_id: UUID) -> str:
         cursor.execute(
             "UPDATE lubko.jobs\n"
             "SET payload = " + running_chain + "::text\n"
-            "WHERE id = %s AND (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "WHERE id = %(job_id)s AND " + SERVER_MATCH_SQL + "%(server)s\n"
+            "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
             "RETURNING (payload::jsonb)->'state'->>'status'\n",
-            (job_id,),
+            {"job_id": job_id, "server": server},
         )
         row = cursor.fetchone()
         if row is not None:
@@ -1701,14 +1763,18 @@ def request_cancel(conn: JobsConnection, job_id: UUID) -> str:
 
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
+            "SELECT (payload::jsonb)->>'server', (payload::jsonb)->'state'->>'status'\n"
+            "FROM lubko.jobs WHERE id = %s",
             (job_id,),
         )
         row = cursor.fetchone()
     if row is None:
         msg = f"job {job_id} not found"
         raise ValueError(msg)
-    return str(row[0])
+    if str(row[0]) != server:
+        msg = f"job {job_id} belongs to server {row[0]!r}, not {server!r}"
+        raise ValueError(msg)
+    return str(row[1])
 
 
 def bulk_refresh_leases(
@@ -1746,12 +1812,14 @@ def bulk_refresh_leases(
             "UPDATE lubko.jobs\n"
             "SET payload = " + set_chain + "::text\n"
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
             "    AND (payload::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"
             "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"
             "    AND id = ANY(%(root_ids)s)\n"
             "RETURNING id\n",
             {
+                "server": settings.server,
                 "lease_duration_seconds": settings.lease_duration_seconds,
                 "worker_id": settings.worker_id,
                 "worker_incarnation": settings.worker_incarnation,
@@ -1819,12 +1887,14 @@ def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUI
             "SELECT id\n"
             "FROM lubko.jobs\n"
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
             "    AND (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
             "    AND (payload::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"
             "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"
             "LIMIT %(limit)s\n",
             {
+                "server": settings.server,
                 "worker_id": settings.worker_id,
                 "worker_incarnation": settings.worker_incarnation,
                 "limit": CANCEL_DISCOVERY_LIMIT,
@@ -1852,6 +1922,8 @@ def _recovery_result_expression() -> str:
         "'recovery_note', to_jsonb("
         "'lease expired at ' || COALESCE("
         "(job.payload::jsonb)->'state'->>'lease_expires_at', '<none>') || "
+        "'; owning server ' || COALESCE("
+        "(job.payload::jsonb)->>'server', '<unknown>') || "
         "'; owning worker ' || COALESCE("
         "(job.payload::jsonb)->'state'->>'worker_id', '<unknown>') || "
         "' (incarnation ' || COALESCE("
@@ -1862,16 +1934,18 @@ def _recovery_result_expression() -> str:
     )
 
 
-def recover_stale_jobs(conn: JobsConnection) -> list[tuple[UUID, str]]:
+def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, str]]:
     """Atomically mark jobs whose lease has truly expired as failed.
 
     A job whose ``state.lease_expires_at`` is in the past is presumed abandoned
     by a crashed or unreachable worker. Recovery marks it ``failed`` with a
     clear diagnostic and never re-executes it, so two workers can never execute
-    the same job. Only ``command`` rows are considered; ``output_chunk`` rows
-    are never candidates for claim or lease recovery. Rows are locked with
-    ``FOR UPDATE SKIP LOCKED`` and the status transition is a single atomic
-    update, making the pass safe under many concurrent workers.
+    the same job. Only ``command`` rows belonging to the daemon's own
+    configured ``server`` are considered; rows of other servers are left to
+    their owning daemons, and ``output_chunk`` rows are never candidates for
+    claim or lease recovery. Rows are locked with ``FOR UPDATE SKIP LOCKED``
+    and the status transition is a single atomic update, making the pass safe
+    under many concurrent workers.
 
     A running job without a lease field is never selected: recovery acts only on
     leases that are present and expired, so pre-lease payloads are left for
@@ -1879,6 +1953,7 @@ def recover_stale_jobs(conn: JobsConnection) -> list[tuple[UUID, str]]:
 
     Args:
         conn: Open PostgreSQL connection.
+        server: The daemon's configured server identity scoping recovery.
 
     Returns:
         The ``(id, payload)`` pairs of the recovered jobs.
@@ -1895,10 +1970,11 @@ def recover_stale_jobs(conn: JobsConnection) -> list[tuple[UUID, str]]:
     )
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "WITH stale AS (\n"  # ruff: ignore[hardcoded-sql-expression]
+            "WITH stale AS (\n"
             "    SELECT id\n"
             "    FROM lubko.jobs\n"
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status' = 'running'\n"
             "        AND (payload::jsonb)->'state'->>'lease_expires_at' IS NOT NULL\n"
             "        AND ((payload::jsonb)->'state'->>'lease_expires_at') < "
@@ -1913,7 +1989,7 @@ def recover_stale_jobs(conn: JobsConnection) -> list[tuple[UUID, str]]:
             "FROM stale\n"
             "WHERE job.id = stale.id\n"
             "RETURNING job.id, job.payload\n",
-            {"limit": LEASE_RECOVERY_LIMIT},
+            {"server": server, "limit": LEASE_RECOVERY_LIMIT},
         )
         rows = cursor.fetchall()
     return [(row[0], str(row[1])) for row in rows]
@@ -1944,18 +2020,21 @@ def _read_job_status(conn: JobsConnection, job_id: UUID) -> str:
     return str(row[0])
 
 
-def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
+def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server: str) -> str:
     """Persist the final result of a job into its JSON payload.
 
     A cancellation request accepted before finalization wins over a natural
-    completion. Already terminal jobs are never rewritten. The rolling
-    ``output`` live tails written by publication remain in place. Only ``id``
-    and ``payload`` are touched, preserving the two-column table invariant.
+    completion. Already terminal jobs are never rewritten. The update is
+    scoped to the daemon's configured ``server`` so one server can never
+    finalize another server's in-flight row. The rolling ``output`` live tails
+    written by publication remain in place. Only ``id`` and ``payload`` are
+    touched, preserving the two-column table invariant.
 
     Args:
         conn: Open PostgreSQL connection.
         job_id: Identifier of the job being completed.
         result: Final job result.
+        server: The daemon's configured server identity guarding the update.
 
     Returns:
         The persisted final status.
@@ -2003,9 +2082,12 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
         cursor.execute(
             "UPDATE lubko.jobs\n"
             "SET payload = " + set_chain + "::text\n"
-            "WHERE id = %(job_id)s AND (payload::jsonb)->'state'->>'status' = 'running'\n"
+            "WHERE id = %(job_id)s AND (payload::jsonb)->>'type' = 'command'\n"
+            "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
+            "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
             "RETURNING (payload::jsonb)->'state'->>'status'\n",
             {
+                "server": server,
                 "status": result.status,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
@@ -2020,13 +2102,14 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult) -> str:
     return _read_job_status(conn, job_id)
 
 
-def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str) -> bool:
+def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str, *, server: str) -> bool:
     """Terminalize a job that hit a deterministic database error.
 
     Writes a ``failed`` terminal status directly, bypassing the normal
     finalization path so publication/finalization data errors cannot block
-    terminalization. Only non-terminal rows are updated: already-terminal
-    rows are left untouched.
+    terminalization. Only non-terminal rows of the daemon's own configured
+    ``server`` are updated: already-terminal rows and rows belonging to other
+    servers are left untouched.
 
     A connectivity error during the terminalization attempt is re-raised
     so the caller can enter outage handling; a different deterministic
@@ -2036,6 +2119,7 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str) -> bool:
         conn: Open PostgreSQL connection.
         job_id: Identifier of the job to quarantine.
         reason: PostgreSQL-safe diagnostic text (no NUL bytes).
+        server: The daemon's configured server identity guarding the update.
 
     Returns:
         ``True`` when the row was successfully terminalized or was already
@@ -2064,10 +2148,11 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str) -> bool:
                 ")::text\n"
                 "WHERE id = %(job_id)s\n"
                 "  AND (payload::jsonb)->>'type' = 'command'\n"
+                "  AND " + SERVER_MATCH_SQL + "%(server)s\n"
                 "  AND (payload::jsonb)->'state'->>'status'\n"
                 "      NOT IN ('succeeded','failed','cancelled')\n"
                 "RETURNING id\n",
-                {"job_id": job_id, "reason": safe_reason},
+                {"job_id": job_id, "reason": safe_reason, "server": server},
             )
             cursor.fetchone()
     except psycopg.Error as exc:
@@ -2084,7 +2169,7 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str) -> bool:
     return True
 
 
-def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
+def delete_job_and_chunks(conn: JobsConnection, job_id: UUID, *, server: str) -> None:
     """Delete a root job and every output chunk explicitly owned by it.
 
     Cleanup uses explicit ``thread`` ownership rather than trusting the
@@ -2092,6 +2177,13 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
     incomplete because of a crash or corruption are also removed. The root row
     is deleted first and the owned chunks in a separate statement, all within
     one transaction.
+
+    Every mutation is scoped to the expected top-level ``server`` identity:
+    the root deletion requires an exact JSON string server match, and the
+    owned-chunk deletion only removes chunks stamped with the same server. A
+    root belonging to another server is never touched and fails closed with
+    :class:`ValueError`; when the root is already missing, same-server orphan
+    chunks are still cleaned up.
 
     Deleting the root before the chunks serializes cleanup with concurrent
     output publication, which retains the root ``command`` row with a row-level
@@ -2107,17 +2199,34 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID) -> None:
     Args:
         conn: Open PostgreSQL connection.
         job_id: Identifier of the root job to delete.
+        server: Expected server identity of the root job and its chunks.
+
+    Raises:
+        ValueError: If the root row exists but belongs to another server;
+            nothing is deleted in that case.
     """
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
-            "DELETE FROM lubko.jobs\nWHERE id = %(job_id)s\n",
+            "SELECT (payload::jsonb)->>'server'\nFROM lubko.jobs\nWHERE id = %(job_id)s\n",
             {"job_id": job_id},
+        )
+        row = cursor.fetchone()
+        if row is not None and str(row[0]) != server:
+            msg = f"job {job_id} belongs to server {row[0]!r}, not {server!r}"
+            raise ValueError(msg)
+        cursor.execute(
+            "DELETE FROM lubko.jobs\n"
+            "WHERE id = %(job_id)s\n"
+            "    AND (payload::jsonb)->>'type' = 'command'\n"
+            "    AND " + SERVER_MATCH_SQL + "%(server)s\n",
+            {"job_id": job_id, "server": server},
         )
         cursor.execute(
             "DELETE FROM lubko.jobs\n"
             "WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
-            "    AND (payload::jsonb)->>'thread' = %(thread)s\n",
-            {"thread": str(job_id)},
+            "    AND lower((payload::jsonb)->>'thread') = lower(%(thread)s)\n"
+            "    AND " + SERVER_MATCH_SQL + "%(server)s\n",
+            {"thread": str(job_id), "server": server},
         )
 
 
@@ -2125,7 +2234,9 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     """Collect terminal command rows, their owned chunks, and orphan chunks.
 
     Three bounded phases run in separate transactions, each with ``FOR UPDATE
-    SKIP LOCKED`` so multiple workers/restarts converge safely:
+    SKIP LOCKED`` so multiple workers/restarts converge safely. Every phase is
+    scoped to the daemon's configured ``server`` identity so one server's
+    daemon never collects another server's transport rows.
 
     **Phase 1 — Mark** (one transaction): A bounded batch of terminal
     ``command`` rows whose ``finished_at`` is older than the retention window
@@ -2188,6 +2299,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    SELECT id\n"
             "    FROM lubko.jobs, gc_params\n"
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status'\n"
             "            IN ('succeeded', 'failed', 'cancelled')\n"
             "        AND (payload::jsonb)->'state'->>'finished_at' IS NOT NULL\n"
@@ -2199,6 +2311,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             ")\n"
             "RETURNING id\n",
             {
+                "server": settings.server,
                 "gc_retention_seconds": settings.gc_retention_seconds,
                 "limit": settings.gc_batch_limit,
             },
@@ -2211,11 +2324,12 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "SELECT id\n"
             "FROM lubko.jobs\n"
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
+            "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "    AND ((payload::jsonb)->'state'->>'gc') = 'true'\n"
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
             "LIMIT %(limit)s\n",
-            {"limit": settings.gc_batch_limit},
+            {"server": settings.server, "limit": settings.gc_batch_limit},
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
         for root_id in gc_roots:
@@ -2227,11 +2341,16 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 "    SELECT id\n"
                 "    FROM lubko.jobs\n"
                 "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
+                "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
                 "        AND lower((payload::jsonb)->>'thread') = lower(%(thread)s)\n"
                 "    FOR UPDATE SKIP LOCKED\n"
                 "    LIMIT %(limit)s\n"
                 ")\n",
-                {"thread": str(root_id), "limit": settings.gc_batch_limit},
+                {
+                    "server": settings.server,
+                    "thread": str(root_id),
+                    "limit": settings.gc_batch_limit,
+                },
             )
             total_chunks += cursor.rowcount
             # Delete root only if no chunks remain.
@@ -2240,9 +2359,10 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 "    SELECT 1\n"
                 "    FROM lubko.jobs\n"
                 "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
+                "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
                 "        AND lower((payload::jsonb)->>'thread') = lower(%(thread)s)\n"
                 ")\n",
-                {"thread": str(root_id)},
+                {"server": settings.server, "thread": str(root_id)},
             )
             no_chunks = cursor.fetchone()
             if no_chunks is not None and no_chunks[0]:
@@ -2263,6 +2383,8 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "SELECT chunk.id\n"
             "FROM lubko.jobs AS chunk\n"
             "WHERE chunk.payload::jsonb->>'type' = 'output_chunk'\n"
+            "    AND jsonb_typeof(chunk.payload::jsonb->'server') = 'string'\n"
+            "    AND chunk.payload::jsonb->>'server' = %(server)s\n"
             "    AND NOT EXISTS (\n"
             "        SELECT 1\n"
             "        FROM lubko.jobs AS root\n"
@@ -2272,7 +2394,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
-            {"limit": settings.gc_batch_limit},
+            {"server": settings.server, "limit": settings.gc_batch_limit},
         )
         orphan_ids = [row[0] for row in cursor.fetchall()]
         if orphan_ids:
@@ -2327,39 +2449,55 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
 
 
 def verify_protocol_schema(conn: JobsConnection) -> None:
-    """Assert that ``lubko.jobs`` carries the canonical protocol v3 shape.
+    """Assert that ``lubko.jobs`` carries the canonical protocol v4 shape.
 
-    The two-column invariant alone does not make a table usable by a v3
-    worker: immutable ``output_chunk`` publication requires the type-aware
-    ``jobs_payload_type_shape`` check constraint and the chunk
-    ownership/ordering indexes, which the single canonical baseline
-    ``migrations/0001_two_column_protocol.sql`` declares. The worker refuses to
+    The two-column invariant alone does not make a table usable by a v4
+    worker: immutable ``output_chunk`` publication and explicit multi-server
+    routing require the type-aware ``jobs_payload_type_shape`` check
+    constraint **in its v4 form** — enforcing the required non-empty top-level
+    ``server`` field — plus the chunk ownership/ordering indexes, which
+    ``migrations/0001_two_column_protocol.sql`` declares. An existing table
+    still carrying the pre-cutover v3 constraint (same name, no ``server``
+    enforcement) is refused exactly like a missing one. The worker refuses to
     start against any table lacking this shape so output publication can never
-    fail at runtime on a table that cannot represent immutable chunks.
+    fail at runtime on a table that cannot represent immutable chunks, and no
+    daemon ever runs against a transport that does not DB-enforce server
+    routing.
 
     Args:
         conn: Open PostgreSQL connection.
 
     Raises:
-        SchemaInvariantError: If the type-aware constraint or any required
-            output-chunk index is missing.
+        SchemaInvariantError: If the type-aware constraint (in its v4,
+            routing-aware form) or any required output-chunk index is missing.
     """
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT conname\n"
+            "SELECT conname, pg_get_constraintdef(oid)\n"
             "FROM pg_constraint\n"
             "WHERE conrelid = to_regclass(%s) AND contype = 'c'\n",
             (f"{JOBS_SCHEMA}.{JOBS_TABLE}",),
         )
-        constraints = {str(row[0]) for row in cursor.fetchall()}
+        constraints = {str(row[0]): str(row[1]) for row in cursor.fetchall()}
         cursor.execute(
             "SELECT indexname\nFROM pg_indexes\nWHERE schemaname = %s AND tablename = %s\n",
             (JOBS_SCHEMA, JOBS_TABLE),
         )
         indexes = {str(row[0]) for row in cursor.fetchall()}
     missing: list[str] = []
-    if TYPE_AWARE_CONSTRAINT_NAME not in constraints:
+    shape_def = constraints.get(TYPE_AWARE_CONSTRAINT_NAME)
+    if shape_def is None:
         missing.append(f"check constraint {TYPE_AWARE_CONSTRAINT_NAME}")
+    elif not all(m in "".join(shape_def.split()) for m in SERVER_ROUTING_CONSTRAINT_MARKERS):
+        msg = (
+            f"lubko.jobs carries a pre-v4 {TYPE_AWARE_CONSTRAINT_NAME} check "
+            f"constraint without server-routing enforcement. Apply the "
+            f"protocol v4 cutover migration "
+            f"migrations/0003_protocol_v4_server_routing.sql while quiescent, "
+            f"then truncate lubko.jobs (the v3 -> v4 row cutover is "
+            f"destructive; no legacy row is converted). {TWO_COLUMN_INVARIANT}"
+        )
+        raise SchemaInvariantError(msg)
     missing.extend(
         f"index {name}"
         for name in (CHUNK_OWNER_INDEX_NAME, CHUNK_ORDER_INDEX_NAME)
@@ -2368,12 +2506,14 @@ def verify_protocol_schema(conn: JobsConnection) -> None:
     if missing:
         detail = ", ".join(missing)
         msg = (
-            f"lubko.jobs lacks the canonical output-chunk schema shape required "
-            f"for immutable output publication: missing {detail}. Apply the "
-            f"canonical, idempotent baseline migration "
-            f"migrations/0001_two_column_protocol.sql (any v2 -> v3 cutover needs "
-            f"no DDL: the two-column table is identical for both versions). "
-            f"{TWO_COLUMN_INVARIANT}"
+            f"lubko.jobs lacks the canonical output-chunk schema shape "
+            f"required for immutable output publication and server routing: "
+            f"missing {detail}. Apply the canonical, idempotent baseline "
+            f"migration migrations/0001_two_column_protocol.sql (fresh "
+            f"installs) or the protocol v4 cutover migration "
+            f"migrations/0003_protocol_v4_server_routing.sql (existing v3 "
+            f"tables; then truncate lubko.jobs while quiescent — the row "
+            f"cutover is destructive). {TWO_COLUMN_INVARIANT}"
         )
         raise SchemaInvariantError(msg)
 
@@ -2555,7 +2695,7 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
-        recovered = recover_stale_jobs(conn)
+        recovered = recover_stale_jobs(conn, self.settings.server)
         for job_id, _payload in recovered:
             LOGGER.warning(
                 "recovered stale job %s: lease expired; marked failed rather than re-executed",
@@ -2661,7 +2801,9 @@ class Supervisor:
                 )
                 self._stopping = True
                 return
-            if _quarantine_job(conn, job_id, f"retry terminalization for {job_id}"):
+            if _quarantine_job(
+                conn, job_id, f"retry terminalization for {job_id}", server=self.settings.server
+            ):
                 self._retry_terminations.pop(job_id, None)
             else:
                 state.retries += 1
@@ -2712,7 +2854,7 @@ class Supervisor:
         if not changed:
             return
         try:
-            published = publish_output(conn, job, changed, now)
+            published = publish_output(conn, job, changed, now, server=self.settings.server)
         except psycopg.Error as exc:
             if self._is_connectivity_error(exc):
                 raise
@@ -2721,7 +2863,9 @@ class Supervisor:
                 job.id,
                 exc.sqlstate or "N/A",
             )
-            if _quarantine_job(conn, job.id, f"publication error: {exc}"):
+            if _quarantine_job(
+                conn, job.id, f"publication error: {exc}", server=self.settings.server
+            ):
                 job.quarantined = True
             else:
                 job.quarantine_pending = True
@@ -2790,7 +2934,9 @@ class Supervisor:
                     )
                     self._stopping = True
                     return
-                if _quarantine_job(conn, job.id, f"quarantine retry for {job.id}"):
+                if _quarantine_job(
+                    conn, job.id, f"quarantine retry for {job.id}", server=self.settings.server
+                ):
                     job.quarantined = True
                     job.quarantine_pending = False
                     cleanup_job(job)
@@ -2815,7 +2961,12 @@ class Supervisor:
             return
         try:
             published = publish_output(
-                conn, job, list(OUTPUT_STREAMS), time.monotonic(), force=True
+                conn,
+                job,
+                list(OUTPUT_STREAMS),
+                time.monotonic(),
+                server=self.settings.server,
+                force=True,
             )
         except psycopg.Error as exc:
             if self._is_connectivity_error(exc):
@@ -2825,7 +2976,9 @@ class Supervisor:
                 job.id,
                 exc.sqlstate or "N/A",
             )
-            if _quarantine_job(conn, job.id, f"final publication error: {exc}"):
+            if _quarantine_job(
+                conn, job.id, f"final publication error: {exc}", server=self.settings.server
+            ):
                 job.quarantined = True
             else:
                 job.quarantine_pending = True
@@ -2905,7 +3058,7 @@ class Supervisor:
             cancellation_note=job.cancellation_note,
         )
         try:
-            final_status = finish_job(conn, job.id, result)
+            final_status = finish_job(conn, job.id, result, server=self.settings.server)
         except psycopg.Error as exc:
             if self._is_connectivity_error(exc):
                 raise
@@ -2914,7 +3067,9 @@ class Supervisor:
                 job.id,
                 exc.sqlstate or "N/A",
             )
-            if _quarantine_job(conn, job.id, f"finalization error: {exc}"):
+            if _quarantine_job(
+                conn, job.id, f"finalization error: {exc}", server=self.settings.server
+            ):
                 job.quarantined = True
             else:
                 job.quarantine_pending = True
@@ -2989,6 +3144,28 @@ class Supervisor:
                     exit_code=PROTOCOL_ERROR_EXIT_CODE,
                     stdout="",
                     stderr=f"invalid job payload: {exc}",
+                    cancellation_note=None,
+                ),
+            )
+            return
+
+        if payload.server != self.settings.server:
+            LOGGER.warning(
+                "rejecting job %s addressed to server %r (this daemon is %r)",
+                claimed.id,
+                payload.server,
+                self.settings.server,
+            )
+            self._finalize_immediate(
+                claimed.id,
+                JobResult(
+                    status="failed",
+                    exit_code=PROTOCOL_ERROR_EXIT_CODE,
+                    stdout="",
+                    stderr=(
+                        f"job server {payload.server!r} does not match this daemon's "
+                        f"server {self.settings.server!r}"
+                    ),
                     cancellation_note=None,
                 ),
             )
@@ -3211,7 +3388,7 @@ class Supervisor:
         if conn is None:
             return
         try:
-            finish_job(conn, job_id, result)
+            finish_job(conn, job_id, result, server=self.settings.server)
         except psycopg.Error as exc:
             if self._is_connectivity_error(exc):
                 raise
@@ -3220,7 +3397,9 @@ class Supervisor:
                 job_id,
                 exc.sqlstate or "N/A",
             )
-            if not _quarantine_job(conn, job_id, f"immediate finalization error: {exc}"):
+            if not _quarantine_job(
+                conn, job_id, f"immediate finalization error: {exc}", server=self.settings.server
+            ):
                 # Both the finalization and the quarantine terminalization writes
                 # failed: keep the claimed job locally owned for retry so it stays
                 # represented.  Its lease is intentionally NOT refreshed, so it is
@@ -3347,7 +3526,7 @@ class Supervisor:
             verify_protocol_schema(conn)
         except SchemaInvariantError:
             LOGGER.exception(
-                "refusing to run against a table that is not a migrated protocol v3 schema"
+                "refusing to run against a table that is not a migrated protocol v4 schema"
             )
             with suppress(Exception):
                 conn.close()
@@ -3519,6 +3698,7 @@ class Supervisor:
                     job,
                     list(OUTPUT_STREAMS),
                     time.monotonic(),
+                    server=self.settings.server,
                     force=True,
                 )
             except psycopg.Error as exc:
@@ -3529,7 +3709,12 @@ class Supervisor:
                     job.id,
                     exc.sqlstate or "N/A",
                 )
-                _quarantine_job(self.conn, job.id, f"shutdown publication error: {exc}")
+                _quarantine_job(
+                    self.conn,
+                    job.id,
+                    f"shutdown publication error: {exc}",
+                    server=self.settings.server,
+                )
                 continue
             if not retained:
                 self._untrack_lost_job(job)
