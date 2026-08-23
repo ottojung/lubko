@@ -29,7 +29,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -44,14 +44,13 @@ from lubko.state import cli_root_dir, rollback_state_path
 from lubko.supervisor import Settings, SupervisorDaemon
 from lubko.supervisor import main as supervisor_main
 from lubko.worker import group_has_members
+from tests import _pg
 from tests import _process_guard as guard
 from tests.test_cli import make_repo
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from uuid import UUID
-
-    from tests import _pg
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
@@ -300,7 +299,7 @@ def running_supervisor(env: dict[str, str]) -> Iterator[subprocess.Popen[bytes]]
     """Run a supervisor daemon and guarantee deterministic teardown.
 
     Args:
-        env: Environment for the daemon.
+        env: Environment for the daemon (and its worker child).
 
     Yields:
         The daemon process.
@@ -310,6 +309,35 @@ def running_supervisor(env: dict[str, str]) -> Iterator[subprocess.Popen[bytes]]
         yield proc
     finally:
         stop_supervisor(proc)
+
+
+@contextmanager
+def _owned_supervisors(
+    startups: Sequence[Callable[[], subprocess.Popen[bytes]]],
+) -> Iterator[list[subprocess.Popen[bytes]]]:
+    """Start supervisors and unconditionally reap every created stack.
+
+    Orchestration invariant under review: a failure during a later startup,
+    during the test body, or during an earlier teardown must never leak an
+    already-running stack.  Every successful startup immediately registers
+    its teardown on an :class:`contextlib.ExitStack`, so all registered
+    callbacks run even when something else raises, and Python exception
+    chaining preserves each earlier failure as context.
+
+    Args:
+        startups: One zero-argument callable per stack, invoked in order.
+            A callable that raises aborts the remaining startups.
+
+    Yields:
+        The processes of every successfully started stack, in creation order.
+    """
+    with ExitStack() as stack:
+        started: list[subprocess.Popen[bytes]] = []
+        for start in startups:
+            proc = start()
+            started.append(proc)
+            stack.callback(stop_supervisor, proc)
+        yield started
 
 
 def request_and_wait(commit: str, repo: Path) -> int:
@@ -768,10 +796,12 @@ def test_wait_for_replacement_rejects_transient_none_and_returns_observed_pid(
 
 
 def test_repeated_crashes_never_accumulate_workers(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """Repeated crashes back off and never accumulate processes or zombies."""
+    del jobs_db
     repo, first, _second = maintained_env
     with running_supervisor(supervisor_env):
         request_and_wait(first, repo)
@@ -821,6 +851,365 @@ def test_database_outage_restart_backs_off_until_readiness(
         wait_until(status_ready, timeout=60.0)
         probe_id = insert_pending_job(jobs_db, str(tmp_path), "echo recovered")
         wait_until(lambda: read_status_of(jobs_db, probe_id) == "succeeded", timeout=60.0)
+
+
+@pytest.fixture
+def second_pg_cluster(tmp_path: Path) -> Iterator[_pg.PgCluster]:
+    """Start a second independent pytest-owned PostgreSQL cluster.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Yields:
+        The running second cluster.
+    """
+    binaries = _pg.postgres_binaries()
+    if binaries is None:
+        pytest.skip("PostgreSQL server binaries not available on this host")
+    root = tmp_path / "pg-second"
+    data_dir = root / "data"
+    socket_dir = root / "sock"
+    socket_dir.mkdir(parents=True)
+    port = _pg.free_port()
+    env = dict(os.environ)
+    lib = _pg.postgres_lib_dir(Path(binaries["postgres"]).parent)
+    if lib is not None:
+        env["LD_LIBRARY_PATH"] = lib
+    subprocess.run(
+        [binaries["initdb"], "-D", str(data_dir), "-U", "postgres", "--auth=trust"],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    cluster = _pg.PgCluster(binaries, data_dir, socket_dir, port, env)
+    cluster.start()
+    try:
+        yield cluster
+    finally:
+        cluster.stop()
+
+
+def _apply_jobs_baseline(conninfo: str) -> None:
+    """Apply the canonical baseline on a fresh ``lubko.jobs`` table.
+
+    Args:
+        conninfo: Connection string of the target cluster.
+    """
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+
+
+def _stack_b_environment(
+    tmp_path: Path,
+    supervisor_env: dict[str, str],
+    cluster: _pg.PgCluster,
+    xdg_b: Path,
+) -> dict[str, str]:
+    """Build the full environment for the independent second stack.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        supervisor_env: The stack-A environment to derive from.
+        cluster: The second PostgreSQL cluster.
+        xdg_b: The pytest-owned XDG root for stack B.
+
+    Returns:
+        The environment for stack B's supervisor and its worker.
+    """
+    conf_b = tmp_path / "stack-b" / "database.conf"
+    conf_b.parent.mkdir(parents=True, exist_ok=True)
+    conf_b.write_text(
+        f"host={cluster.socket_dir}\n"
+        f"port={cluster.port}\n"
+        "dbname=postgres\n"
+        "user=postgres\n"
+        "password=local-trust\n",
+        encoding="utf-8",
+    )
+    conf_b.chmod(0o600)
+    env_b = dict(supervisor_env)
+    env_b["LUBKO_DATABASE_CONFIG"] = str(conf_b)
+    for env_key in (
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_BIN_HOME",
+    ):
+        env_b[env_key] = str(xdg_b / env_key.removeprefix("XDG_").lower())
+    return env_b
+
+
+def _with_stack_b_env(
+    monkeypatch: pytest.MonkeyPatch,
+    env_b: dict[str, str],
+    action: Callable[[], object],
+) -> None:
+    """Run ``action`` with stack B's XDG root authoritative.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        env_b: The stack-B environment.
+        action: The callable to run.
+    """
+    with monkeypatch.context() as m:
+        for env_key, value in env_b.items():
+            if env_key.startswith("XDG_"):
+                m.setenv(env_key, value)
+        action()
+
+
+@pytest.fixture
+def stack_a(
+    jobs_db: str,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> tuple[Path, str, dict[str, str], str]:
+    """Bundle the stack-A repo, commit, environment, and queue connection.
+
+    Args:
+        jobs_db: Baseline queue connection for stack A's readiness probe.
+        maintained_env: The two-commit repository.
+        supervisor_env: The stack-A environment.
+
+    Returns:
+        The ``(repo, first_commit, env, conninfo)`` quadruple.
+    """
+    repo, first, _second = maintained_env
+    return repo, first, supervisor_env, jobs_db
+
+
+def _prepare_stack_b(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supervisor_env: dict[str, str],
+    cluster: _pg.PgCluster,
+) -> tuple[Path, str, dict[str, str]]:
+    """Build repo, CLI root, and environment for the independent stack B.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+        supervisor_env: The stack-A environment to derive from.
+        cluster: The second PostgreSQL cluster.
+
+    Returns:
+        The ``(repo, first_commit, env)`` triple for stack B.
+    """
+    _apply_jobs_baseline(cluster.conninfo())
+    env_b = _stack_b_environment(tmp_path, supervisor_env, cluster, tmp_path / "stack-b" / "xdg")
+    repo_b, first_b, _second_b = make_repo(tmp_path / "repo-b")
+    with monkeypatch.context() as m:
+        for env_key, value in env_b.items():
+            if env_key.startswith("XDG_"):
+                m.setenv(env_key, value)
+        cli.build_cli_root(repo_b, first_b, "uv", 60.0)
+    return repo_b, first_b, env_b
+
+
+def test_two_simultaneous_owned_stacks_never_cross_talk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stack_a: tuple[Path, str, dict[str, str], str],
+    second_pg_cluster: _pg.PgCluster,
+) -> None:
+    """Two simultaneous cluster+supervisor+worker stacks stay fully isolated.
+
+    Each stack lives in its own pytest-owned XDG root and its own PostgreSQL
+    cluster.  Both supervisors run concurrently with exactly one worker each;
+    status surfaces, workers, and queues never cross; and teardown retires
+    every process by exact identity with nothing left alive or reparented to
+    PID 1.
+    """
+    repo_a, first_a, supervisor_env, conninfo_a = stack_a
+
+    # Independent baselines: stack A's queue is refreshed by its fixture.
+    repo_b, first_b, env_b = _prepare_stack_b(
+        tmp_path, monkeypatch, supervisor_env, second_pg_cluster
+    )
+
+    pid_a: int | None = None
+    pid_b: int | None = None
+
+    def read_b() -> supervise.SupervisorStatus | None:
+        status: supervise.SupervisorStatus | None = None
+
+        def read() -> None:
+            nonlocal status
+            status = supervise.read_status()
+
+        _with_stack_b_env(monkeypatch, env_b, read)
+        return status
+
+    with _owned_supervisors([
+        lambda: start_supervisor(supervisor_env),
+        lambda: start_supervisor(env_b),
+    ]) as _stack_procs:
+        request_and_wait(first_a, repo_a)
+        _with_stack_b_env(
+            monkeypatch,
+            env_b,
+            lambda: request_and_wait(first_b, repo_b),
+        )
+
+        pid_a = worker_pid()
+        assert pid_a is not None
+        status_a = supervise.read_status()
+        assert status_a is not None
+        assert status_a.ready is True
+        assert status_a.commit == first_a
+        assert len(direct_children(status_a.supervisor_pid)) == 1
+
+        status_b = read_b()
+        assert status_b is not None
+        assert status_b.child is not None
+        pid_b = status_b.child.pid
+        assert pid_a != pid_b
+        assert status_b.ready is True
+        assert status_b.commit == first_b
+        assert len(direct_children(status_b.supervisor_pid)) == 1
+
+        # Queue isolation: each worker consumes only its own cluster's queue.
+        probe_a = insert_pending_job(conninfo_a, str(tmp_path), "echo stack-a")
+        wait_until(
+            lambda: read_status_of(conninfo_a, probe_a) == "succeeded",
+            timeout=60.0,
+        )
+        probe_b = insert_pending_job(second_pg_cluster.conninfo(), str(tmp_path), "echo stack-b")
+        wait_until(
+            lambda: read_status_of(second_pg_cluster.conninfo(), probe_b) == "succeeded",
+            timeout=60.0,
+        )
+
+    # Exact cleanup: no test-owned process survives, so none can reparent.
+    # Both pids were captured inside the converged body, so they are bound.
+    assert pid_a is not None
+    assert pid_b is not None
+    assert not process_alive(pid_a)
+    assert not process_alive(pid_b)
+
+
+class _FakeSupervisor:
+    """Duck-typed supervisor handle recording teardown signals for regressions."""
+
+    def __init__(self) -> None:
+        self.terminated = False
+
+    @staticmethod
+    def poll() -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminated = True
+
+    @staticmethod
+    def wait(timeout: float | None = None) -> int:
+        del timeout
+        return 0
+
+
+def test_second_stack_startup_failure_still_stops_first_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed second startup must not leak the first, converged stack."""
+    first = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [cast("subprocess.Popen[bytes]", first)]
+    startup_attempts: list[int] = []
+    stopped: list[subprocess.Popen[bytes]] = []
+
+    def failing_second_start() -> subprocess.Popen[bytes]:
+        startup_attempts.append(1)
+        if len(startup_attempts) == 1:
+            return handles[0]
+        msg = "second stack startup exploded"
+        raise RuntimeError(msg)
+
+    def fake_stop(proc: subprocess.Popen[bytes]) -> None:
+        stopped.append(proc)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", fake_stop)
+
+    with (
+        pytest.raises(RuntimeError, match="second stack startup exploded"),
+        _owned_supervisors([failing_second_start, failing_second_start]),
+    ):
+        pass
+
+    assert len(startup_attempts) == 2
+    assert stopped == [handles[0]]
+
+
+def test_first_teardown_failure_still_converges_rest_and_surfaces_chained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing teardown never skips later stacks nor hides the failure."""
+    first = _FakeSupervisor()
+    second = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [
+        cast("subprocess.Popen[bytes]", first),
+        cast("subprocess.Popen[bytes]", second),
+    ]
+    stop_order: list[subprocess.Popen[bytes]] = []
+
+    def fake_stop(proc: subprocess.Popen[bytes]) -> None:
+        stop_order.append(proc)
+        if proc is handles[0]:
+            msg = "teardown wedged"
+            raise OSError(msg)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", fake_stop)
+    handles_iter = iter(handles)
+    startups: list[Callable[[], subprocess.Popen[bytes]]] = [
+        handles_iter.__next__,
+        handles_iter.__next__,
+    ]
+
+    body_ran = False
+    with (
+        pytest.raises(OSError, match="teardown wedged"),
+        _owned_supervisors(startups),
+    ):
+        body_ran = True
+
+    assert body_ran is True
+    # ExitStack unwinds LIFO, but every registered stack is still converged.
+    assert stop_order == [handles[1], handles[0]]
+
+
+def test_body_failure_with_failing_teardown_chains_both_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup that cannot converge chains loudly instead of masking the body."""
+    first = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [cast("subprocess.Popen[bytes]", first)]
+    stopped: list[subprocess.Popen[bytes]] = []
+
+    def always_wedged_stop(_proc: subprocess.Popen[bytes]) -> None:
+        stopped.append(handles[0])
+        msg = "teardown wedged"
+        raise OSError(msg)
+
+    def failing_body() -> None:
+        msg = "body assertion blew up"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", always_wedged_stop)
+
+    excinfo: pytest.ExceptionInfo[OSError]
+    with (
+        pytest.raises(OSError, match="teardown wedged") as excinfo,
+        _owned_supervisors([lambda: handles[0]]),
+    ):
+        failing_body()
+
+    assert stopped == handles
+    assert isinstance(excinfo.value.__context__, ValueError)
+    assert str(excinfo.value.__context__) == "body assertion blew up"
 
 
 def test_live_worker_db_outage_is_not_duplicated(
@@ -887,10 +1276,12 @@ def test_supervisor_restart_reconstructs_a_single_worker(
 
 
 def test_supervisor_takeover_stops_orphan_worker_by_exact_identity(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """A hard-killed supervisor's orphaned worker is taken over, never duplicated."""
+    del jobs_db
     repo, first, _second = maintained_env
     first_proc = start_supervisor(supervisor_env)
     try:
@@ -2549,10 +2940,12 @@ def test_read_status_returns_none_when_process_zombie(
 
 
 def test_read_status_returns_valid_for_live_supervisor(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """A status snapshot from the live supervisor is accepted."""
+    del jobs_db
     repo, first, _second = maintained_env
     with running_supervisor(supervisor_env):
         request_and_wait(first, repo)
