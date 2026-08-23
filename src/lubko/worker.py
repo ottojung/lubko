@@ -877,14 +877,20 @@ def _finish_capture_stream(stream: OutputStream) -> str:
 
     Returns:
         ``"eof"`` when the stream is fully drained, or ``"error"`` when a
-        residual pending-buffer write failed.
+        residual pending-buffer write failed or a positive partial write
+        landed only a prefix of the final pending bytes.
     """
     fd = stream.fd
     if fd is not None:
         with suppress(OSError):
             os.close(fd)
     stream.fd = None
-    if stream.pending and not _flush_pending(stream):
+    # A final flush must land every retained byte: a hard failure retains
+    # the buffer intact, and a positive partial write consumes only its
+    # landed prefix. Either way a residual suffix means the already-read
+    # bytes cannot all be represented on disk, so the stream is failed
+    # closed instead of silently marking EOF over unlanded output.
+    if stream.pending and (not _flush_pending(stream) or stream.pending):
         return "error"
     stream.eof = True
     return "eof"

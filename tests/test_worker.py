@@ -1776,6 +1776,86 @@ def test_spool_append_write_error_does_not_discard_read_bytes(
     os.close(r2)
 
 
+def test_finish_eof_partial_final_write_never_marks_eof_over_residual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EOF finalization with a positive partial write fails closed.
+
+    When the producer's write end closes while ``pending`` still holds bytes,
+    the final flush must land every retained byte before EOF is marked. A
+    short write that lands only a prefix leaves a residual suffix, so
+    ``_finish_capture_stream`` must report ``"error"`` (the exact capture/job
+    fails closed) with every already-read byte still represented — never
+    silently mark EOF over unlanded output.
+    """
+    real_write = os.write
+
+    class _PrefixThenFail:
+        """Land a 2-byte prefix once, then fail so the suffix stays retained."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def __call__(self, fd: int, data: bytes) -> int:
+            self.calls += 1
+            if self.calls == 1:
+                return real_write(fd, data[:2])
+            msg = "injected spool write failure"
+            raise OSError(msg)
+
+    job = make_active_job(tmp_path)
+    read_end, write_end = os.pipe()
+    os.close(write_end)
+    job.stdout = OutputStream(path=tmp_path / "so.cap", fd=read_end)
+    job.stdout.path.write_bytes(b"PRE-")
+    # Bytes already taken ownership of from the pipe, as a prior partial
+    # flush would have left them after landing its own prefix.
+    job.stdout.pending += b"hello world"
+
+    monkeypatch.setattr(os, "write", _PrefixThenFail())
+    assert worker._finish_capture_stream(job.stdout) == "error"
+    # The stream is NOT marked EOF over its unlanded bytes...
+    eof_after_error = job.stdout.eof
+    assert not eof_after_error
+    assert bytes(job.stdout.pending) == b"llo world"
+    # ...and exactly the landed prefix is on disk: no gap, no duplication.
+    assert job.stdout.path.read_bytes() == b"PRE-he"
+    monkeypatch.undo()
+
+    # A retried final flush that lands every byte completes the stream:
+    # EOF is marked normally and the payload is complete exactly once.
+    assert worker._finish_capture_stream(job.stdout) == "eof"
+    assert job.stdout.eof
+    remaining = bytes(job.stdout.pending)
+    assert not remaining
+    assert job.stdout.path.read_bytes() == b"PRE-hello world"
+    with suppress(OSError):
+        os.close(read_end)
+
+
+def test_finish_eof_complete_final_flush_marks_eof_normally(
+    tmp_path: Path,
+) -> None:
+    """A final flush landing every pending byte marks EOF cleanly."""
+    job = make_active_job(tmp_path)
+    read_end, write_end = os.pipe()
+    os.write(write_end, b"hello world")
+    os.close(write_end)
+    job.stdout = OutputStream(path=tmp_path / "so.cap", fd=read_end)
+    job.stdout.path.write_bytes(b"PRE-")
+
+    # Drain to natural EOF: the payload is read and flushed completely on the
+    # first drain, then the second observes the closed write end and finishes
+    # the stream without error.
+    assert drain_capture_stream(job.stdout, 10_000_000) == "ok"
+    assert drain_capture_stream(job.stdout, 10_000_000) == "eof"
+    assert job.stdout.eof
+    assert not job.stdout.pending
+    assert job.stdout.path.read_bytes() == b"PRE-hello world"
+    with suppress(OSError):
+        os.close(read_end)
+
+
 def test_bad_capture_fd_is_isolated_from_healthy_sibling(tmp_path: Path) -> None:
     """A bad capture fd fails only its own job; the sibling keeps draining.
 
