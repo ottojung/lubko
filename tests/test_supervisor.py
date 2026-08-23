@@ -1088,7 +1088,9 @@ def test_original_bug_processless_job_not_heartbeated_after_outage(
     real_spawn_job = worker_module.spawn_job
     refusal = "simulated pre-spawn refusal"
 
-    def _refuse_marked_spawn(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
+    def _refuse_marked_spawn(
+        job: Job,
+    ) -> tuple[subprocess.Popen[bytes], Path, Path, int, int, int, int]:
         if job.process and job.process[0] == "/nonexistent/lubko-no-such-bin":
             raise OSError(refusal)
         return real_spawn_job(job)
@@ -1214,7 +1216,9 @@ def test_retry_terminations_handles_double_terminalization_failure(
     real_spawn_job = worker_module.spawn_job
     refusal = "simulated pre-spawn refusal"
 
-    def _refuse_marked_spawn(job: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
+    def _refuse_marked_spawn(
+        job: Job,
+    ) -> tuple[subprocess.Popen[bytes], Path, Path, int, int, int, int]:
         if job.process and job.process[0] == "/nonexistent/lubko-no-such-bin":
             raise OSError(refusal)
         return real_spawn_job(job)
@@ -1423,6 +1427,11 @@ def _publish_job_for(job_id: UUID, cwd: str) -> ActiveJob:
     )
     job.stdout = OutputStream(path=Path(cwd) / "stdout.cap")
     job.stderr = OutputStream(path=Path(cwd) / "stderr.cap")
+    # Production pre-creates both spool files at spawn time; an active job
+    # with a missing spool is a fail-closed capture error, so the fixture must
+    # model the real invariant and create both.
+    job.stdout.path.touch()
+    job.stderr.path.touch()
     return job
 
 
@@ -1892,7 +1901,7 @@ def _run_delayed_batch_lease_scenario(
     captured: dict[str, object] = {}
     spawned = (threading.Event(), threading.Event())
 
-    def delayed_spawn(spec: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int]:
+    def delayed_spawn(spec: Job) -> tuple[subprocess.Popen[bytes], Path, Path, int, int, int, int]:
         if spec.id == later_id:
             time.sleep(delay)
             captured["later_spawn_mono"] = time.monotonic()

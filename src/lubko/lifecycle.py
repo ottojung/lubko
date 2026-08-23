@@ -1104,7 +1104,37 @@ def _current_queue_job() -> tuple[object | None, bool]:
         raise DeployAbortedError from None
 
 
-def _close_inherited_descriptors(keep: set[int]) -> None:
+def detach_standard_streams(keep: set[int]) -> None:
+    """Sever inherited stdio of a detached child and close every other stray fd.
+
+    A detached deployment child (queue handoff helper or rollback watchdog)
+    outlives the job process that forked it while the owning worker may be
+    finalizing that exact job: under worker-owned pipe capture the inherited
+    standard streams ARE the capture-pipe write ends, so keeping them open
+    pins output the worker no longer owns, and writing after the worker closes
+    its read ends kills the helper with ``EPIPE`` before it can settle durable
+    state. This redirects fd 0/1/2 to ``/dev/null`` (so the child always has a
+    valid, harmless stdin/stdout/stderr), closes every other inherited
+    descriptor except the explicitly kept ones (the response writer), and
+    leaves the child owning exactly: /dev/null stdio plus ``keep``.
+
+    Args:
+        keep: Descriptor numbers that must remain open besides 0/1/2.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(OSError, ValueError):
+            stream.flush()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    try:
+        for stream_fd in (0, 1, 2):
+            os.dup2(devnull, stream_fd)
+    finally:
+        with suppress(OSError):
+            os.close(devnull)
+    close_inherited_descriptors({0, 1, 2, *keep})
+
+
+def close_inherited_descriptors(keep: set[int]) -> None:
     """Close every inherited file descriptor except the explicitly kept ones.
 
     The detached handoff helpers are forked from the queue job's controller, so
@@ -1250,7 +1280,7 @@ def _run_deploy_helper(options: DeployOptions, job_id: object, writer: int) -> N
         with suppress(OSError):
             os.close(writer)
         os._exit(0)
-    _close_inherited_descriptors({0, 1, 2, writer})
+    detach_standard_streams(keep={writer})
     try:
         try:
             with deploy_lock(options.lock_timeout_seconds):
@@ -2868,7 +2898,7 @@ def _run_restart_helper(job_id: object, writer: int) -> None:
         with suppress(OSError):
             os.close(writer)
         os._exit(0)
-    _close_inherited_descriptors({0, 1, 2, writer})
+    detach_standard_streams(keep={writer})
     try:
         try:
             _restart_helper_locked(job_id, writer)

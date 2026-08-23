@@ -1328,7 +1328,7 @@ def test_close_inherited_descriptors_closes_unintended_fds(tmp_path: Path) -> No
         pid = os.fork()
         if pid == 0:
             os.close(reader)
-            lifecycle._close_inherited_descriptors({0, 1, 2, kept, writer})
+            lifecycle.close_inherited_descriptors({0, 1, 2, kept, writer})
             try:
                 os.fstat(stray)
                 result = b"open"
@@ -1347,6 +1347,81 @@ def test_close_inherited_descriptors_closes_unintended_fds(tmp_path: Path) -> No
             os.close(stray)
         with suppress(OSError):
             os.close(kept)
+
+
+def _child_daemonize_probe(writer: int, stray: int) -> None:
+    """In-child probe: daemonize, then report fd invariants over ``writer``."""
+    ok = True
+    try:
+        os.fstat(stray)
+        ok = False  # stray inherited descriptor must be closed
+    except OSError:
+        pass
+    for stream_fd in (0, 1, 2):
+        try:
+            os.fstat(stream_fd)
+        except OSError:
+            ok = False  # stdin/stdout/stderr must stay open
+    # Writing to the severed stdout goes to /dev/null, never to the old pipe.
+    os.write(1, b"this must not reach the capture pipe")
+    os.write(writer, b"ok" if ok else b"bad")
+    os.close(writer)
+    os._exit(0)
+
+
+def test_detach_standard_streams_severs_capture_pipe_inheritance(
+    tmp_path: Path,
+) -> None:
+    """A detached helper never retains the parent's stdio pipe writers.
+
+    Under worker-owned capture the inherited stdout/stderr are the job's
+    capture-pipe write ends. A detached child that outlives the job must not
+    keep them open (pinning output the worker no longer owns) and must survive
+    writes after the worker closes its read ends. After daemonization fd 0/1/2
+    resolve to /dev/null, the response writer stays usable, a stray inherited
+    descriptor is closed, and the original capture pipe reaches EOF for the
+    reader once every holder is gone.
+    """
+    capture_reader, capture_writer = os.pipe()  # stands in for the job's captured stdout
+    reader, writer = os.pipe()  # the helper's explicit control/response pipe
+    stray = os.open(tmp_path / "stray", os.O_CREAT | os.O_RDWR)
+    os.write(capture_writer, b"inherited")
+    try:
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - child path never returns
+            os.close(capture_reader)
+            # Make the capture write end BE the child's stdout, like fork from
+            # a captured job process does.
+            os.dup2(capture_writer, 1)
+            os.close(capture_writer)
+            lifecycle.detach_standard_streams(keep={writer})
+            _child_daemonize_probe(writer, stray)
+        os.close(capture_writer)
+        os.close(writer)
+        raw = os.read(reader, 8)
+        os.close(reader)
+        # Drain until EOF: EOF proves the detached child holds no copy of the
+        # capture-pipe write end anymore.
+        drained = bytearray()
+        while True:
+            chunk = os.read(capture_reader, 64)
+            if not chunk:
+                break
+            drained.extend(chunk)
+        os.waitpid(pid, 0)
+        assert raw == b"ok"
+        assert bytes(drained) == b"inherited"
+    finally:
+        with suppress(OSError):
+            os.close(capture_reader)
+        with suppress(OSError):
+            os.close(capture_writer)
+        with suppress(OSError):
+            os.close(reader)
+        with suppress(OSError):
+            os.close(writer)
+        with suppress(OSError):
+            os.close(stray)
 
 
 def test_run_deploy_helper_fails_closed_when_setsid_fails(
