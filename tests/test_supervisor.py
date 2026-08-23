@@ -3300,6 +3300,248 @@ def test_nonconverging_abort_blocks_on_connectivity_error(
     )
 
 
+def _no_process_mentions(fragment: str) -> bool:
+    """Return whether no live process command line mentions ``fragment``.
+
+    Args:
+        fragment: Text expected in no live process's ``/proc/<pid>/cmdline``.
+
+    Returns:
+        ``True`` when no process survives whose command line contains the
+        fragment.
+    """
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if fragment.encode() in cmdline:
+            return False
+    return True
+
+
+def _reassign_row(jobs_db: str, job_id: UUID, mismatch: str) -> None:
+    """Make a job row unmatchable for the guarded persistence update.
+
+    Args:
+        jobs_db: PostgreSQL connection string.
+        job_id: Job row to mutate in place.
+        mismatch: ``"server"`` moves the row to a foreign server;
+            ``"ownership"`` re-owns it by a foreign worker incarnation;
+            ``"worker"`` re-records it under a foreign worker identifier.
+    """
+    if mismatch == "server":
+        json_path, key = "{server}", "ghost-server"
+    elif mismatch == "worker":
+        json_path, key = "{state,worker_id}", "ghost-worker"
+    else:
+        json_path, key = "{state,worker_incarnation}", "ghost-incarnation"
+    with psycopg.connect(jobs_db) as mutate_conn:
+        mutate_conn.execute(
+            "UPDATE lubko.jobs\n"
+            "SET payload = jsonb_set(payload::jsonb, %s, to_jsonb(%s::text))::text\n"
+            "WHERE id = %s",
+            (json_path, key, job_id),
+        )
+
+
+def _delete_row_snapshot(jobs_db: str, job_id: UUID) -> str:
+    """Delete a job row and return its payload text for later restoration.
+
+    Args:
+        jobs_db: PostgreSQL connection string.
+        job_id: Job row to snapshot and delete.
+
+    Returns:
+        The exact payload text the row carried before deletion.
+    """
+    with psycopg.connect(jobs_db) as snapshot_conn:
+        row = snapshot_conn.execute(
+            "SELECT payload FROM lubko.jobs WHERE id = %s",
+            (job_id,),
+        ).fetchone()
+    assert row is not None
+    payload_text = str(row[0])
+    with psycopg.connect(jobs_db) as delete_conn:
+        delete_conn.execute("DELETE FROM lubko.jobs WHERE id = %s", (job_id,))
+    return payload_text
+
+
+def _restore_row(jobs_db: str, job_id: UUID, payload_text: str) -> None:
+    """Re-insert a previously snapshotted job row.
+
+    Args:
+        jobs_db: PostgreSQL connection string.
+        job_id: Identifier to re-insert the row under.
+        payload_text: Exact payload text captured before deletion.
+    """
+    with psycopg.connect(jobs_db) as restore_conn:
+        restore_conn.execute(
+            "INSERT INTO lubko.jobs (id, payload) VALUES (%s, %s)",
+            (job_id, payload_text),
+        )
+
+
+def _run_cas_miss_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    """Prove a guarded-persistence miss never releases the start gate.
+
+    The injected ``_persist_process`` wrapper first makes the owned running row
+    unmatchable — deleting it entirely (zero-row disappearance), re-owning it
+    by a foreign incarnation, or moving it to a foreign server — and then runs
+    the real compare-and-swap update against that mutated row. The gate must
+    stay closed: the user command never executes, the gated group is converged
+    (no surviving process), and the job is finalized failed.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        jobs_db: PostgreSQL connection string.
+        pg_cluster: The isolated PostgreSQL cluster.
+        tmp_path: Per-test scratch directory.
+        mismatch: Which mutation to inject: ``"disappeared"``,
+            ``"ownership"``, ``"worker"``, or ``"server"``.
+    """
+    sentinel = tmp_path / "ran"
+    job_id = insert_process_job(
+        jobs_db,
+        str(tmp_path),
+        [
+            sys.executable,
+            "-c",
+            "import sys; open(sys.argv[1], 'w').close()",
+            str(sentinel),
+        ],
+    )
+    settings = supervisor_settings(f"cas-miss-{uuid4().hex[:8]}")
+    real_persist = worker_module._persist_process  # ruff: ignore[private-member-access] -- monkeypatching the exact guarded update under test is materially clearer than adding production observability hooks
+    real_release = worker_module.release_gate
+    release_calls: list[int] = []
+
+    def mutating_persist(
+        conn: JobsConnection,
+        mutated_id: UUID,
+        gated: worker_module.GatedSpawn,
+        start_ticks: int,
+        settings: Settings,
+    ) -> bool:
+        """Make the row unmatchable, run the real guard, then restore.
+
+        Args:
+            conn: Open PostgreSQL connection used by the real guard.
+            mutated_id: Identifier of the job row under test.
+            gated: Handles and exact identity of the gated start.
+            start_ticks: Valid positive start-time ticks.
+            settings: Worker runtime settings passed through.
+
+        Returns:
+            What the real guard reported on the mutated row.
+        """
+        if mismatch == "disappeared":
+            payload_text = _delete_row_snapshot(jobs_db, mutated_id)
+            try:
+                return real_persist(conn, mutated_id, gated, start_ticks, settings)
+            finally:
+                _restore_row(jobs_db, mutated_id, payload_text)
+        _reassign_row(jobs_db, mutated_id, mismatch)
+        return real_persist(conn, mutated_id, gated, start_ticks, settings)
+
+    def recording_release(gate_fd_: int) -> bool:
+        release_calls.append(gate_fd_)
+        return real_release(gate_fd_)
+
+    monkeypatch.setattr(worker_module, "_persist_process", mutating_persist)
+    monkeypatch.setattr(worker_module, "release_gate", recording_release)
+
+    def status_when_present() -> str | None:
+        """Read the row's status, tolerating its injected disappearance.
+
+        Returns:
+            The row's status, or ``None`` while the row does not exist.
+        """
+        try:
+            return read_status(jobs_db, job_id)
+        except AssertionError:
+            return None
+
+    with supervisor_running(settings, make_database_config(pg_cluster), jobs_db):
+        if mismatch == "server":
+            # A row moved to a foreign server is untouchable: this daemon can
+            # neither release the gate nor finalize another server's row, so
+            # the row stays exactly as the mutation left it.
+            wait_until(lambda: status_when_present() not in {None, "pending"})
+            for _ in range(10):
+                payload_now = read_root(jobs_db, job_id)
+                assert payload_now["state"]["status"] == "running"
+                assert "result" not in payload_now
+                time.sleep(0.02)
+        else:
+            wait_until(lambda: status_when_present() == "failed")
+
+    payload = read_root(jobs_db, job_id)
+    # Fail closed: the guarded persistence proved nothing was released.
+    if mismatch == "server":
+        assert payload["state"]["status"] == "running"
+        assert payload["server"] == "ghost-server"
+    else:
+        assert payload["state"]["status"] == "failed"
+        assert "unable to record process identity" in str(
+            payload.get("result", {}).get("stderr", "")
+        )
+    # The user program NEVER ran and the gate was never released.
+    assert not sentinel.exists()
+    assert release_calls == []
+    # No identity was ever durably recorded and no process survived.
+    assert "process_pgid" not in (payload["state"] or {})
+    assert _no_process_mentions(str(sentinel))
+
+
+def test_gate_stays_closed_when_row_disappears_before_persistence(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """Zero-row disappearance: the CAS matches nothing and the gate stays shut."""
+    _run_cas_miss_scenario(monkeypatch, jobs_db, pg_cluster, tmp_path, "disappeared")
+
+
+def test_gate_stays_closed_on_foreign_owner_or_server(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """Ownership/server mismatch: the CAS matches nothing, the gate stays shut."""
+    _run_cas_miss_scenario(monkeypatch, jobs_db, pg_cluster, tmp_path, "ownership")
+
+
+def test_gate_stays_closed_on_foreign_worker_id(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """A worker-id mismatch matches nothing and never releases the gate."""
+    _run_cas_miss_scenario(monkeypatch, jobs_db, pg_cluster, tmp_path, "worker")
+
+
+def test_gate_stays_closed_on_foreign_server_row(
+    monkeypatch: pytest.MonkeyPatch,
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+) -> None:
+    """A row moved to a foreign server is never mutated and never released."""
+    _run_cas_miss_scenario(monkeypatch, jobs_db, pg_cluster, tmp_path, "server")
+
+
 def test_two_servers_claim_only_their_own_jobs(
     jobs_db: str, pg_cluster: _pg.PgCluster, tmp_path: Path
 ) -> None:
