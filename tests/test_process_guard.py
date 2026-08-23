@@ -7,7 +7,6 @@ signals the pytest/shared process group, and fails loudly when a test leaks.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import shutil
 import signal
@@ -178,7 +177,11 @@ def test_teardown_never_signals_reused_pid_identity() -> None:
         assert pid_live(innocent.pid)
     finally:
         if innocent.poll() is None:
-            innocent.kill()
+            assert guard.signal_identity_checked(
+                innocent.pid,
+                innocent_spawn_ticks,
+                signal.SIGKILL,
+            )
             innocent.wait(timeout=10)
     assert innocent.pid not in guard.TRACKED
 
@@ -274,12 +277,7 @@ def test_teardown_never_kills_identity_reused_after_term(
         monkeypatch.undo()
         if proc.poll() is None:
             # Non-leader: exact-PID cleanup only, never the shared group.
-            assert guard.proc_start_ticks(proc.pid) == subject_spawn_ticks, (
-                "subject identity stale/reused at cleanup; KILL refused"
-            )
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=10)
+            verified_kill(proc, subject_spawn_ticks)
         if proc.stdout is not None:
             proc.stdout.close()
     assert proc.pid not in guard.TRACKED
@@ -329,6 +327,8 @@ time.sleep(300)
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    proc_spawn_ticks = guard.proc_start_ticks(proc.pid)
+    assert proc_spawn_ticks is not None
     child_pid_path = tmp_path / "child-pid"
     try:
         deadline = time.monotonic() + 30.0
@@ -347,7 +347,11 @@ time.sleep(300)
         wait_until(lambda: not pid_live(child_pid), timeout=10.0)
     finally:
         if proc.poll() is None:
-            os.killpg(proc.pid, signal.SIGKILL)
+            assert guard.signal_identity_checked(
+                proc.pid,
+                proc_spawn_ticks,
+                signal.SIGKILL,
+            )
             proc.wait(timeout=10)
 
 
@@ -371,6 +375,10 @@ def test_signal_identity_checked_never_signals_shared_group() -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    target_ticks = guard.proc_start_ticks(target.pid)
+    sibling_ticks = guard.proc_start_ticks(sibling.pid)
+    assert target_ticks is not None
+    assert sibling_ticks is not None
     try:
         assert os.getpgid(target.pid) == os.getpgrp()
         assert os.getpgid(sibling.pid) == os.getpgrp()
@@ -386,10 +394,10 @@ def test_signal_identity_checked_never_signals_shared_group() -> None:
         assert guard.signal_identity_checked(sibling.pid, (ticks or 0) + 1, signal.SIGKILL) is False
         assert pid_live(sibling.pid)
     finally:
-        for proc in (target, sibling):
+        for proc, spawn_ticks in ((target, target_ticks), (sibling, sibling_ticks)):
             if proc.poll() is None:
-                proc.kill()
-            proc.wait(timeout=10)
+                assert guard.signal_identity_checked(proc.pid, spawn_ticks, signal.SIGKILL)
+                proc.wait(timeout=10)
 
 
 def test_register_ignores_already_terminal_process() -> None:
@@ -413,6 +421,8 @@ def test_teardown_never_signals_entries_without_valid_ticks() -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    innocent_spawn_ticks = guard.proc_start_ticks(innocent.pid)
+    assert innocent_spawn_ticks is not None
     try:
         guard.register_unverifiable(innocent)
         with pytest.raises(AssertionError, match="never signalled"):
@@ -420,7 +430,11 @@ def test_teardown_never_signals_entries_without_valid_ticks() -> None:
         assert pid_live(innocent.pid)
     finally:
         if innocent.poll() is None:
-            innocent.kill()
+            assert guard.signal_identity_checked(
+                innocent.pid,
+                innocent_spawn_ticks,
+                signal.SIGKILL,
+            )
             innocent.wait(timeout=10)
     assert innocent.pid not in guard.TRACKED
 

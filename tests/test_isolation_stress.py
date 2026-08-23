@@ -77,7 +77,8 @@ def test_subject() -> None:
     guard.register(proc)
     try:
         if mode == "success":
-            os.killpg(proc.pid, signal.SIGTERM)
+            success_ticks = guard.proc_start_ticks(proc.pid)
+            assert guard.signal_identity_checked(proc.pid, success_ticks, signal.SIGTERM)
             assert proc.wait(timeout=10) == -signal.SIGTERM
             guard.unregister(proc)
             return
