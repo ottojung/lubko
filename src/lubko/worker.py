@@ -1597,11 +1597,11 @@ def _spool_shrank(job: ActiveJob, used_before: int | None) -> bool:
 def _persist_process(
     conn: JobsConnection,
     job_id: UUID,
-    pid: int,
-    pgid: int,
+    gated: GatedSpawn,
     start_ticks: int,
-) -> None:
-    """Persist the exact process identity of a running job.
+    settings: Settings,
+) -> bool:
+    """Persist the exact process identity behind a compare-and-swap guard.
 
     The identity is written into ``payload.state.process_pid``,
     ``payload.state.process_pgid`` and ``payload.state.process_start_time_ticks``,
@@ -1610,13 +1610,27 @@ def _persist_process(
     recycled by an unrelated process no longer matches the recorded command and
     is never signalled.
 
+    The write is guarded: it only applies to exactly the row this worker still
+    owns — same configured server, matching ``state.worker_id`` and
+    ``state.worker_incarnation`` (consistent with lease refresh and
+    finalization guards), and status ``running`` — so a row that vanished, was
+    re-owned by another worker or server, or already left the running state is
+    never mutated. The gate may be released only when the update positively
+    reports exactly one affected row.
+
     Args:
         conn: Open PostgreSQL connection.
         job_id: Identifier of the running job.
-        pid: Exact process ID of the spawned process.
-        pgid: Exact process group ID of the spawned process.
+        gated: Handles and exact identity of the gated start.
         start_ticks: Valid positive start-time ticks of the exact process,
             obtained before the start gate was released.
+        settings: Worker runtime settings whose ``server``, ``worker_id`` and
+            ``worker_incarnation`` must all match the row for the update to
+            apply.
+
+    Returns:
+        ``True`` when exactly one owned running row was updated; ``False``
+        when zero rows matched (the caller must fail closed).
     """
     set_chain = _jsonb_set_chain(
         "payload::jsonb",
@@ -1632,9 +1646,24 @@ def _persist_process(
     )
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
-            "UPDATE lubko.jobs\nSET payload = " + set_chain + "::text\nWHERE id = %s\n",
-            (pid, pgid, start_ticks, job_id),
+            "UPDATE lubko.jobs\n"
+            "SET payload = " + set_chain + "::text\n"
+            "WHERE id = %s\n"
+            "    AND " + SERVER_MATCH_SQL + "%s\n"
+            "    AND (payload::jsonb)->'state'->>'worker_id' = %s\n"
+            "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %s\n"
+            "    AND (payload::jsonb)->'state'->>'status' = 'running'\n",
+            (
+                gated.proc.pid,
+                gated.pgid,
+                start_ticks,
+                job_id,
+                settings.server,
+                settings.worker_id,
+                settings.worker_incarnation,
+            ),
         )
+        return cursor.rowcount == 1
 
 
 def _process_pgrp(pid: int) -> int | None:
@@ -4652,7 +4681,8 @@ class Supervisor:
         Returns:
             The final stderr message when the start failed after convergence
             (the caller must finalize failed), or ``None`` when persistence
-            succeeded.
+            positively proved the guarded update of exactly one owned running
+            row.
 
         Raises:
             psycopg.Error: When persisting the identity fails with a
@@ -4661,7 +4691,7 @@ class Supervisor:
         start_ticks = proc_start_ticks(gated.proc.pid)
         if start_ticks is not None and start_ticks > 0:
             try:
-                _persist_process(conn, job_id, gated.proc.pid, gated.pgid, start_ticks)
+                persisted = _persist_process(conn, job_id, gated, start_ticks, self.settings)
             except psycopg.Error as exc:
                 connectivity = self._is_connectivity_error(exc)
                 self._abort_and_converge(gated, job_id)
@@ -4671,6 +4701,17 @@ class Supervisor:
                     "unable to persist process identity for job %s (SQLSTATE %s)",
                     job_id,
                     exc.sqlstate or "N/A",
+                )
+                return "unable to record process identity; job not started"
+            if not persisted:
+                # Fail closed: zero rows matched, so this worker can no longer
+                # positively prove it still owns a same-server running row for
+                # this incarnation. The gate must never be released.
+                self._abort_and_converge(gated, job_id)
+                LOGGER.error(
+                    "process-identity persistence matched no owned running row "
+                    "for job %s; gated start aborted without executing user code",
+                    job_id,
                 )
                 return "unable to record process identity; job not started"
             return None
