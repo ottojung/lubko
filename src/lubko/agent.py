@@ -255,6 +255,7 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "exit_code": None,
         "exit_signal": None,
         "intent": None,
+        "delete_pending": False,
         "stop_reason": None,
         "active_runner": False,
         "runner_gen": 0,
@@ -1088,6 +1089,11 @@ def runner(aid: str, mode: str) -> None:
     claimed = {}
 
     def claim(m: Meta) -> None:
+        if m.get("delete_pending"):
+            # A concurrent delete owns the lifecycle: a runner must never
+            # claim (and later recreate state) once deletion was decided.
+            claimed["ok"] = False
+            return
         res = m.get("runner_reservation")
         if not isinstance(res, dict):
             # No reservation: a production runner must never execute without an
@@ -1116,6 +1122,9 @@ def runner(aid: str, mode: str) -> None:
     update_meta(aid, claim)
     if not claimed.get("ok"):
         return
+    # Deterministic test boundary after the exact claim committed but before
+    # any state recreation, so tests can force the delete/runner race.
+    _test_sync("runner_prestart")
     directory = agent_dir(aid)
     directory.mkdir(parents=True, exist_ok=True)
     log_path = directory / "output.log"
@@ -1143,7 +1152,8 @@ def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
     """
     while True:
         meta = read_meta(ctx.aid)
-        if meta is None:
+        if meta is None or meta.get("delete_pending"):
+            # Deleted (or being deleted): never start another invocation.
             return
         prompt = meta.get("pending_prompt")
         if not prompt:
@@ -3151,8 +3161,123 @@ def cmd_kill(args: argparse.Namespace) -> int:
     return EXIT_ERROR
 
 
+def _begin_delete(aid: str, *, force: bool) -> Meta | None:
+    """Durably record deletion intent under the metadata lock.
+
+    The tombstone is written in the same locked transaction that snapshots
+    every exact process identity, so it is serialized against the runner's
+    claim/startup: any runner claiming after this point observes the tombstone
+    and bails instead of recreating state.  The snapshot is what deletion then
+    converges on.
+
+    Args:
+        aid: Lubko agent ID.
+        force: Whether forced kill semantics were requested (records the
+            ``kill`` intent exactly like ``cmd_kill`` does).
+
+    Returns:
+        The exact identity snapshot taken under the lock, or ``None`` when the
+        agent state vanished before the tombstone could be written.
+    """
+    snapshot: dict[str, Meta] = {}
+
+    def fn(m: Meta) -> None:
+        m["delete_pending"] = True
+        if force:
+            m["intent"] = "kill"
+        m["last_activity_at"] = time.time()
+        res = m.get("runner_reservation")
+        snapshot["meta"] = {
+            "id": aid,
+            "pid": m.get("pid"),
+            "pgid": m.get("pgid"),
+            "start_time": m.get("start_time"),
+            "runner_pid": m.get("runner_pid"),
+            "runner_start_time": m.get("runner_start_time"),
+            "active_runner": bool(m.get("active_runner")),
+            "runner_reservation": dict(res) if isinstance(res, dict) else None,
+            "delete_pending": True,
+        }
+
+    update_meta(aid, fn)
+    return snapshot.get("meta")
+
+
+def _delete_converged(cur: Meta | None) -> bool:
+    """Return whether no runner or invocation of the agent can still execute.
+
+    Args:
+        cur: Freshly read metadata, or ``None`` when the state is gone.
+
+    Returns:
+        ``True`` only when the exact runner, the invocation group, and any
+        reserved-but-unclaimed runner are all provably gone.
+    """
+    if cur is None:
+        return True
+    return not runner_alive(cur) and not group_alive(cur) and not reservation_in_flight(cur)
+
+
+def _abort_delete(aid: str) -> None:
+    """Clear the deletion tombstone so a failed delete can be retried."""
+    update_meta(aid, lambda m: m.update(delete_pending=False))
+
+
+def _remove_deleted_state(aid: str) -> bool:
+    """Remove the agent directory and verify it stays gone.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` only when the directory is provably absent afterwards.
+    """
+    shutil.rmtree(agent_dir(aid), ignore_errors=True)
+    return not agent_dir(aid).exists()
+
+
+def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
+    """Converge the exact runner and invocation before state removal.
+
+    Args:
+        aid: Lubko agent ID.
+        force: Whether live processes may be signalled.
+        deadline: Absolute time by which convergence must be proven.
+
+    Returns:
+        ``True`` only when no runner or invocation can still execute.
+    """
+    while True:
+        cur = read_meta(aid)
+        if cur is not None and cur.get("delete_pending"):
+            if force:
+                # Converge the exact recorded runner identity first...
+                if runner_alive(cur):
+                    with contextlib.suppress(OSError):
+                        os.kill(int(cur["runner_pid"]), signal.SIGKILL)
+                # ...then the exact invocation process group.
+                if group_alive(cur):
+                    send_signal_group(cur, signal.SIGKILL)
+            elif not _delete_converged(cur):
+                # Something became live between the decision and the
+                # tombstone; non-forced deletion must not kill it.
+                return False
+        if _delete_converged(cur):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     """Delete an agent's local state and logs.
+
+    Deletion establishes lifecycle ownership with a durable tombstone written
+    under the metadata lock (so a reserved runner can never claim afterwards),
+    then converges both the exact managed runner identity and the exact
+    invocation process group before removing any state.  If convergence cannot
+    be proven the deletion fails closed, keeps the agent state intact for a
+    retry, and never reports success.
 
     Args:
         args: Parsed command arguments.
@@ -3165,16 +3290,25 @@ def cmd_delete(args: argparse.Namespace) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    if is_alive(meta) or group_alive(meta):
-        if not args.force:
-            _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
-            return EXIT_ERROR
-        update_meta(aid, lambda m: m.update(intent="kill", last_activity_at=time.time()))
-        send_signal_group(meta, signal.SIGKILL)
-        wait_group_dead(meta, KILL_WAIT_SECONDS)
-    shutil.rmtree(agent_dir(aid), ignore_errors=True)
-    _out(f"deleted agent {aid}")
-    return EXIT_OK
+    live = is_alive(meta) or group_alive(meta) or runner_alive(meta) or reservation_in_flight(meta)
+    if live and not args.force:
+        _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
+        return EXIT_ERROR
+    _begin_delete(aid, force=args.force)
+    if not _converge_for_delete(aid, force=args.force, deadline=time.time() + KILL_WAIT_SECONDS):
+        # Fail closed: convergence was not proven, so keep the retryable state.
+        _abort_delete(aid)
+        if args.force:
+            _err(f"{PROG}: agent {aid} could not be deleted; runner or invocation did not converge")
+        else:
+            _err(f"{PROG}: agent {aid} started running during delete; use --force")
+        return EXIT_ERROR
+    if _remove_deleted_state(aid):
+        _out(f"deleted agent {aid}")
+        return EXIT_OK
+    _abort_delete(aid)
+    _err(f"{PROG}: agent {aid} directory could not be removed")
+    return EXIT_ERROR
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
