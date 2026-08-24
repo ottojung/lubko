@@ -118,6 +118,11 @@ convention = "google"
 "tests/test_lifecycle.py" = [
     "private-member-access",
 ]
+"tests/test_supervisor_daemon.py" = [
+    "private-member-access",
+    "too-many-arguments",
+    "too-many-positional-arguments",
+]
 "tests/test_worker.py" = [
     "private-member-access",
 ]

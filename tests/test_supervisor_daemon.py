@@ -1718,12 +1718,12 @@ def test_status_keeps_live_supervised_pending_mission(
         assert status is not None
         assert status.commit == second
 
-        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
+        result = dc._handle_status(_status_options(repo))
 
         assert result["phase"] == "await-confirmation"
         assert result["proposed_commit"] == second
         assert result["previous_commit"] == first
-        after = dc._read_state()  # ruff: ignore[private-member-access]
+        after = dc._read_state()
         assert after is not None
         assert after.status == dc.STATUS_PENDING
         assert worker_pid() == candidate_pid
@@ -1760,11 +1760,11 @@ def test_status_rolls_back_supervised_mission_with_lapsed_deadline(
         candidate_pid = worker_pid()
         assert candidate_pid is not None
 
-        result = dc._handle_status(_status_options(repo))  # ruff: ignore[private-member-access]
+        result = dc._handle_status(_status_options(repo))
 
         assert result["phase"] == "idle"
         assert result["last_outcome"] == dc.STATUS_ROLLED_BACK
-        final = dc._read_state()  # ruff: ignore[private-member-access]
+        final = dc._read_state()
         assert final is not None
         assert final.status == dc.STATUS_ROLLED_BACK
         wait_until(status_commit_is(first), timeout=30.0)
@@ -1952,7 +1952,7 @@ def test_derive_action_fails_closed_on_corrupt_rollback(tmp_path: Path) -> None:
         )
     )
     daemon = SupervisorDaemon(Settings())
-    action, commit = daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
+    action, commit = daemon._derive_action(supervise.read_state())
     assert action == "hold"
     assert commit is None
 
@@ -1964,7 +1964,7 @@ def _derive_action() -> tuple[str, str | None]:
         The ``(action, commit)`` pair.
     """
     daemon = SupervisorDaemon(Settings())
-    return daemon._derive_action(supervise.read_state())  # ruff: ignore[private-member-access]
+    return daemon._derive_action(supervise.read_state())
 
 
 def test_derive_action_pending_newer_than_desired_selects_candidate(
@@ -2137,7 +2137,7 @@ def test_wait_for_identity_rejects_non_leader_on_timeout() -> None:
     guard.register(proc)
     try:
         daemon = SupervisorDaemon(Settings(identity_timeout_seconds=0.3))
-        assert daemon._wait_for_identity(proc.pid) is None  # ruff: ignore[private-member-access]
+        assert daemon._wait_for_identity(proc.pid) is None
     finally:
         guard.teardown_tracked(fail_on_leak=False)
 
@@ -3698,3 +3698,215 @@ def test_reconcile_takeover_fails_closed_on_wrong_identity(
     assert second_state.child.token == child.token
     assert spawn_calls == [], "no worker must be spawned across repeated ticks"
     assert len(stop_calls) == 2, "stop_worker must be called on each retry"
+
+
+# ---------------------------------------------------------------------------
+# Issue #184: cold migration converges deployment authority and CLIs
+# ---------------------------------------------------------------------------
+
+
+def _write_confirmed_mission_for(generation: int, commit: str, repo: Path) -> None:
+    """Persist a terminal ``confirmed`` mission for one older commit."""
+    write_rollback(
+        replace(
+            mission_state(generation, dc.STATUS_CONFIRMED, commit, "0" * 40),
+            repo=str(repo),
+            supervisor_owned=True,
+        )
+    )
+
+
+def test_migrate_supersedes_stale_terminal_mission_and_records_migration(
+    maintained_env: tuple[Path, str, str],
+) -> None:
+    """A newer cold-migration generation supersedes terminal confirmed authority."""
+    repo, first, second = maintained_env
+    _write_confirmed_mission_for(5, first, repo)
+    args = argparse.Namespace(commit=second, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.commit == second
+    assert desired.generation > 5
+    assert desired.migration is True
+    mission = dc.read_rollback_state()
+    assert mission is not None
+    assert mission.status == dc.STATUS_ROLLED_BACK
+    assert mission.commit == first
+
+
+def test_migration_intent_is_atomic_with_target_publication(
+    maintained_env: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publishing the migrated commit and recording it is one durable write.
+
+    Regression guard for the review blocker: an intermediate durable state of
+    "target commit published without the migration completion obligation"
+    must be unrepresentable. ``write_json_durable`` replaces atomically, so
+    the only observable contents of ``desired.json`` are the previous intent
+    or the complete new one; this test proves the complete new one always
+    carries the migration flag together with the target commit in a single
+    write.
+    """
+    repo, first, second = maintained_env
+    _write_confirmed_mission_for(5, first, repo)
+    written: list[dict[str, object]] = []
+    original = supervise.write_desired
+
+    def spy(desired: supervise.SupervisorDesired) -> None:
+        written.append(desired.to_dict())
+        original(desired)
+
+    monkeypatch.setattr(supervise, "write_desired", spy)
+    args = argparse.Namespace(commit=second, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+    assert len(written) == 1, "publication and migration intent must be one write"
+    assert written[0]["commit"] == second
+    assert written[0]["migration"] is True
+    assert int(str(written[0]["generation"])) > 5
+
+
+def test_corrupt_migration_desired_fails_closed_to_old_authority(
+    maintained_env: tuple[Path, str, str],
+) -> None:
+    """An untrustworthy migration intent never activates either side."""
+    repo, first, second = maintained_env
+    cli.set_current(first)
+    _write_confirmed_mission_for(5, first, repo)
+    args = argparse.Namespace(commit=second, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+    supervise.desired_path().write_text("{corrupt\n", encoding="utf-8")
+    assert supervise.read_desired() is None
+    daemon = SupervisorDaemon(Settings())
+    daemon._complete_cold_migration()
+    assert cli.current_commit() == first
+    # Reconciliation may only ever target pre-migration authority, never the
+    # unproven migrated commit.
+    assert dc._cli_target_commit(dc.read_rollback_state()) != second
+
+
+def test_cold_migration_holds_cli_until_ready_then_converges_idempotently(
+    maintained_env: tuple[Path, str, str],
+) -> None:
+    """The CLI pointer stays fail-closed before readiness and converges after."""
+    repo, first, second = maintained_env
+    cli.set_current(first)
+    _write_confirmed_mission_for(5, first, repo)
+    args = argparse.Namespace(commit=second, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+
+    # Before the migrated worker is proven ready every reconciliation surface
+    # must hold: no path may activate the unproven target.
+    assert cli.current_commit() == first
+    assert dc._cli_target_commit(dc.read_rollback_state()) is None
+
+    state = supervise.fresh_state()
+    supervise.write_state(replace(state, mode="run", applied_generation=6, commit=second))
+    daemon = SupervisorDaemon(Settings())
+    daemon._complete_cold_migration()
+    assert cli.current_commit() == first, "unready target must never be activated"
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.migration is True
+
+    # Readiness proven for the exact migration generation/commit: converge
+    # crash-safely and idempotently onto that exact commit.
+    supervise.write_state(
+        replace(state, mode="run", applied_generation=6, commit=second, ready=True)
+    )
+    daemon._complete_cold_migration()
+    assert cli.current_commit() == second
+    assert dc.read_rollback_state() is None, "superseded terminal authority must be removed"
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.migration is False
+    daemon._complete_cold_migration()
+    assert cli.current_commit() == second, "completion must be idempotent"
+
+
+def test_cold_migration_e2e_converges_authority_and_survives_restart(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    tmp_path: Path,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Production-reproduced scenario: confirmed A migrates cold to B."""
+    del pg_cluster, tmp_path
+    repo, first, second = maintained_env
+    _write_confirmed_mission_for(5, first, repo)
+    cli.set_current(first)
+
+    args = argparse.Namespace(commit=second, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+    assert cli.current_commit() == first, "migration must stay fail-closed"
+
+    with running_supervisor(supervisor_env):
+        wait_until(status_commit_is(second), timeout=30.0)
+        wait_until(status_ready, timeout=30.0)
+        probe_id = insert_pending_job(jobs_db, str(repo), "echo through-b")
+        wait_until(lambda: read_status_of(jobs_db, probe_id) == "succeeded", timeout=60.0)
+        wait_until(lambda: cli.current_commit() == second, timeout=30.0)
+
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == second
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.git_commit == second
+        assert dc.read_rollback_state() is None
+        converged = supervise.read_desired()
+        assert converged is not None
+        assert converged.migration is False
+
+        options = dc.Options(
+            repo=repo,
+            uv_path="uv",
+            confirm_window_seconds=120,
+            stop_grace_seconds=1.0,
+            postgres_timeout_seconds=5,
+            lock_timeout_seconds=5,
+            validation_timeout_seconds=5,
+            git_timeout_seconds=5,
+            cli_timeout_seconds=60,
+        )
+        ctl_status = dc._handle_status(options)
+        assert ctl_status["phase"] == "idle"
+        assert ctl_status["known_commit"] == second
+        assert dc._cli_target_commit(None) == second
+
+        capsys.readouterr()
+        assert lifecycle.status_cmd() == 0
+        captured = capsys.readouterr()
+        assert "maintained CLIs resolve to" not in captured.err
+
+    # Container/supervisor restart: B stays the single authoritative commit.
+    with running_supervisor(supervisor_env):
+        wait_until(status_commit_is(second), timeout=30.0)
+        wait_until(status_ready, timeout=30.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == second
+        assert len(direct_children(status.supervisor_pid)) == 1
+        assert cli.current_commit() == second
+        restart_probe = insert_pending_job(jobs_db, str(repo), "echo after-restart")
+        wait_until(lambda: read_status_of(jobs_db, restart_probe) == "succeeded", timeout=60.0)
+
+
+def test_cold_migration_failure_never_advances_cli_authority(
+    maintained_env: tuple[Path, str, str],
+) -> None:
+    """If the migrated target never becomes ready, old authority is kept."""
+    repo, first, second = maintained_env
+    cli.set_current(first)
+    args = argparse.Namespace(commit=second, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+    # No supervisor ever proves `second` ready; the CLI pointer and deployctl
+    # reconciliation must remain held on the old authority.
+    assert cli.current_commit() == first
+    assert dc._cli_target_commit(dc.read_rollback_state()) is None
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.migration is True

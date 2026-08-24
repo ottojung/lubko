@@ -3279,6 +3279,12 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
         mission = None
     with supervise.generation_lock():
         generation = supervise.next_generation()
+        # The migration flag travels inside this one atomically written
+        # desired intent: publishing the migrated target commit and recording
+        # the convergence obligation is a single durable transition, so no
+        # crash can leave the supervisor running the migrated commit without
+        # its completion obligation (nor an orphaned migration intent without
+        # a published commit).
         supervise.write_desired(
             supervise.SupervisorDesired(
                 schema_version=supervise.SCHEMA_VERSION,
@@ -3289,6 +3295,7 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
                 worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
                 restart=False,
                 requested_at=time.time(),
+                migration=True,
             )
         )
     if mission is None:
@@ -3298,6 +3305,20 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
         deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)
         append_deploy_log(
             f"migration archived stale pending mission generation {mission.generation}"
+        )
+    elif (
+        mission.status in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}
+        and mission.generation < generation
+    ):
+        # A strictly newer cold-migration intent supersedes older terminal
+        # mission authority: leaving a terminal ``confirmed`` record for an
+        # older commit intact would keep deployctl (and through its
+        # reconciliation the maintained CLI pointer) permanently pinned to the
+        # obsolete commit even after the migrated target is proven ready.
+        deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)
+        append_deploy_log(
+            f"migration superseded terminal {mission.status} mission generation "
+            f"{mission.generation} (commit {mission.commit})"
         )
     append_deploy_log(f"migrated lifecycle state to verified exact commit {commit}")
     _out(f"lifecycle state migrated to verified exact commit {commit}")

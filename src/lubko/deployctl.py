@@ -1701,12 +1701,24 @@ def _cli_target_commit(state: RollbackState | None) -> str | None:
     provisional the pointer must stay on the previous confirmed commit, so a
     repair never activates candidate code before confirmation.
 
+    An in-flight cold migration is also a hold: while the durable desired
+    intent still carries its ``migration`` flag, the supervisor has not yet
+    proven the migrated target queue-ready and converged authority, so the
+    only safe target is the previous confirmed authority. Reconciliation must
+    neither activate the unproven target nor keep restoring the superseded
+    terminal record. A strictly newer deployment mission supersedes the
+    migration and resumes normal reconciliation.
+
     Args:
         state: Current supervised-deployment state, or ``None``.
 
     Returns:
         The exact commit the CLI pointer should select, or ``None``.
     """
+    desired = supervise.read_desired()
+    if desired is not None and desired.migration:
+        if state is None or state.generation <= desired.generation:
+            return None
     if state is None:
         meta = read_meta()
         return None if meta is None else meta.git_commit
