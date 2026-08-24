@@ -46,7 +46,7 @@ The queue-invoked controller forks a detached handoff helper (its own session an
 The initiating checkout row is therefore durably terminal `succeeded` before the destructive previous-worker retirement begins, with no transient `cancelled` row along the way.
 
 The same detached-handoff protection covers a queue-invoked plain
-`lubko-deploy deploy` (a protocol-v3 root job that runs the deploy command
+`lubko-deploy deploy` (a protocol-v4 root job that runs the deploy command
 itself) and a queue-invoked `lubko-deploy restart`. The command recognizes its
 own queue row from the exact injected `LUBKO_JOB_ID`, forks a detached handoff
 helper, and reports the validated outcome so the initiating row reaches durable
