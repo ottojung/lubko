@@ -4102,7 +4102,13 @@ class Supervisor:
                     # be assumed zero (which would risk finalizing a half-
                     # captured job).
                     raise SpoolCaptureError(job.id, name, other.path) from exc
-            size_before = stream.path.stat().st_size
+            try:
+                size_before = stream.path.stat().st_size
+            except OSError as exc:
+                # A spool stat failure must fail the exact job closed, never
+                # be assumed zero (which would risk finalizing a half-
+                # captured job).
+                raise SpoolCaptureError(job.id, name, stream.path) from exc
             was_eof = stream.eof
             status = drain_capture_stream(stream, bound, aggregate_used=total)
             if status == "error":
@@ -4275,6 +4281,27 @@ class Supervisor:
         self._fail_capture_closed(job)
         return False
 
+    def _drain_or_fail_closed(self, job: ActiveJob, bound: int) -> tuple[bool, bool]:
+        """Drain a completed job's streams, converting spool stat failures.
+
+        Args:
+            job: The completed active job whose streams to drain.
+            bound: Maximum physical spool size in bytes (always enforced).
+
+        Returns:
+            A ``(progressed, failed_closed)`` pair: whether any stream made
+            real progress, and whether a spool stat failure was converted into
+            a capture failure for this exact job (the caller must stop
+            finalizing it via its ``"capture"`` outcome path).
+        """
+        try:
+            return self._drain_completed_streams(job, bound), False
+        except SpoolCaptureError:
+            # A spool stat failure during completed-job drain must enter the
+            # same exact-job fail-closed path as any other unreadable spool,
+            # never escape bounded finalization as a raw filesystem error.
+            return False, True
+
     def _bounded_cycle_turn(
         self,
         job: ActiveJob,
@@ -4299,9 +4326,12 @@ class Supervisor:
             was failed closed or handed to its quarantine/loss path; ``"wait"``
             when the cycle should keep draining.
         """
-        progressed = self._drain_completed_streams(job, bound)
-        used_before = _spool_used_bytes(job)
-        outcome = self._publish_bounded(conn, job, now)
+        progressed, failed_closed = self._drain_or_fail_closed(job, bound)
+        # A drain-time spool stat failure already failed the exact job closed;
+        # classify that as a ``"capture"`` outcome so this turn stops without
+        # publishing or re-reading the bad spool.
+        used_before = None if failed_closed else _spool_used_bytes(job)
+        outcome = "capture" if failed_closed else self._publish_bounded(conn, job, now)
         if outcome == "capture":
             self._fail_capture_closed(job)
             return "stop"
