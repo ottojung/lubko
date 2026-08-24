@@ -95,6 +95,7 @@ from lubko.supervise import (
     SCHEMA_VERSION,
     LastExit,
     SupervisorStatus,
+    UnresolvedChild,
     WorkerChild,
     acquire_supervisor_lock,
     proc_start_ticks,
@@ -237,6 +238,22 @@ class Settings:
                 )
             ),
         )
+
+
+def _identity_is_private_session(identity: ProcessIdentity) -> bool:
+    """Return whether an identity proves the process leads a private session.
+
+    This is the exact invariant ``_wait_for_identity`` requires: the process
+    must be both its own session leader and its own process group leader, so
+    signalling that group can never reach any unrelated process.
+
+    Args:
+        identity: Observed live identity of a process.
+
+    Returns:
+        ``True`` when group authority over the identity is safe to grant.
+    """
+    return identity.pgid == identity.pid and identity.sid == identity.pid
 
 
 def _process_ppid(pid: int) -> int | None:
@@ -752,6 +769,8 @@ class SupervisorDaemon:
         Args:
             commit: Exact commit the worker must run.
         """
+        if not self._resolve_unresolved_child():
+            return
         state = read_state()
         if state.child is not None and self._child_alive(state) and state.commit == commit:
             return
@@ -1217,11 +1236,7 @@ class SupervisorDaemon:
         self.proc = proc
         identity = self._wait_for_identity(proc.pid)
         if identity is None:
-            LOGGER.error("worker for commit %s exited before establishing its identity", commit)
-            with suppress(Exception):
-                proc.wait(timeout=self.settings.stop_grace_seconds)
-            self.proc = None
-            return None
+            return self._settle_unproven_spawn(commit, proc, token, worker_id)
         return WorkerChild(
             pid=identity.pid,
             pgid=identity.pgid,
@@ -1231,6 +1246,363 @@ class SupervisorDaemon:
             worker_id=worker_id,
             spawned_at=time.time(),
         )
+
+    def _settle_unproven_spawn(
+        self,
+        commit: str,
+        proc: subprocess.Popen[bytes],
+        token: str,
+        worker_id: str,
+    ) -> WorkerChild | None:
+        """Settle a spawn whose exact identity was never established.
+
+        ``_wait_for_identity`` returns ``None`` for two distinct conditions:
+        an already-exited child (an ordinary retryable spawn failure) and a
+        child that is still alive when the identity deadline expires. A live
+        child is never forgotten: while it is still this supervisor's direct
+        ``Popen`` child it is converged with exact single-PID signals and its
+        exit is positively proven by reaping. If convergence cannot be proven,
+        ownership is durably retained so no later reconciliation (including
+        after a supervisor restart) can start a second maintained worker
+        alongside the unresolved first child. Group authority is only ever
+        granted when the observed identity satisfies the same private
+        session/group invariant ``_wait_for_identity`` requires; otherwise a
+        distinct unresolved-child hold is recorded, which carries **no**
+        group/session authority and can only ever be converged by exact
+        single-PID signals guarded by start-time ticks.
+
+        Args:
+            commit: Exact commit whose worker spawn failed.
+            proc: The direct ``Popen`` handle of the spawned child.
+            token: Lifecycle token handed to the spawned child.
+            worker_id: Worker identity handed to the spawned child.
+
+        Returns:
+            Always ``None``: a failed spawn never yields a usable child.
+        """
+        if proc.poll() is not None:
+            LOGGER.error("worker for commit %s exited before establishing its identity", commit)
+            self.proc = None
+            return None
+        LOGGER.error(
+            "worker pid %d for commit %s is live without an acceptable identity; converging it",
+            proc.pid,
+            commit,
+        )
+        hold_persisted = False
+        while True:
+            if self._converge_direct_child(proc):
+                # Converged while a crash-safe hold was already on disk:
+                # clear it so an ordinary retryable failure can proceed.
+                if hold_persisted:
+                    write_state(replace(read_state(), unresolved_child=None))
+                self.proc = None
+                return None
+            observed = self._await_observable_identity(proc)
+            if observed is None and proc.poll() is not None:
+                # The child exited during the hold: an ordinary retryable failure.
+                if hold_persisted:
+                    write_state(replace(read_state(), unresolved_child=None))
+                self.proc = None
+                return None
+            if observed is not None and _identity_is_private_session(observed):
+                self._record_proven_private_child(observed, token, worker_id)
+                break
+            if observed is None:
+                hold_persisted = self._persist_unobservable_hold(
+                    proc, token, already_persisted=hold_persisted
+                )
+                time.sleep(IDENTITY_POLL_SECONDS)
+                continue
+            self._record_shared_group_hold(proc, observed, token)
+            break
+        state = read_state()
+        if state.unresolved_child is not None:
+            self._message = (
+                f"worker pid {proc.pid} for commit {commit} could not be converged after its "
+                "identity timed out; holding without group-signallable authority or a "
+                "replacement worker"
+            )
+            LOGGER.error("%s", self._message)
+        else:
+            LOGGER.info(
+                "worker pid %d for commit %s proved a private session before any replacement; "
+                "recorded as the maintained child",
+                proc.pid,
+                commit,
+            )
+        return None
+
+    @staticmethod
+    def _record_proven_private_child(
+        observed: ProcessIdentity,
+        token: str,
+        worker_id: str,
+    ) -> None:
+        """Record a child whose observed identity proved the private invariant.
+
+        The identity satisfies the exact private session/group invariant, so
+        recording it as the maintained child grants safe group authority for
+        later retirement. Any earlier authority-free hold for this same child
+        is upgraded away: it must never outlive the proven-safe record.
+
+        Args:
+            observed: Observed exact identity of the live direct child.
+            token: Lifecycle token handed to the spawned child.
+            worker_id: Worker identity handed to the spawned child.
+        """
+        write_state(
+            replace(
+                read_state(),
+                child=WorkerChild(
+                    pid=observed.pid,
+                    pgid=observed.pgid,
+                    sid=observed.sid,
+                    start_time_ticks=observed.start_time_ticks,
+                    token=token,
+                    worker_id=worker_id,
+                    spawned_at=time.time(),
+                ),
+                unresolved_child=None,
+            )
+        )
+
+    @staticmethod
+    def _persist_unobservable_hold(
+        proc: subprocess.Popen[bytes],
+        token: str,
+        *,
+        already_persisted: bool,
+    ) -> bool:
+        """Persist an authority-free hold for a live but unobservable child.
+
+        The hold is written immediately, before any further waiting, so a
+        supervisor crash/restart during convergence can never forget the live
+        spawned child. ``start_time_ticks`` is deliberately ``None``: nothing
+        was observable to prove, so no signalling may ever be authorized from
+        this record; it only blocks replacement until the PID is positively
+        gone (or a safe identity appears).
+
+        Args:
+            proc: The direct ``Popen`` handle of the spawned child.
+            token: Lifecycle token handed to the spawned child.
+            already_persisted: Whether the hold is already on disk.
+
+        Returns:
+            ``True`` once the hold is durably recorded.
+        """
+        if already_persisted:
+            return True
+        write_state(
+            replace(
+                read_state(),
+                unresolved_child=UnresolvedChild(
+                    pid=proc.pid,
+                    start_time_ticks=None,
+                    token=token,
+                    spawned_at=time.time(),
+                ),
+            )
+        )
+        LOGGER.error(
+            "identity of live worker pid %d remains unobservable; "
+            "persisting an authority-free hold before further convergence",
+            proc.pid,
+        )
+        return True
+
+    @staticmethod
+    def _record_shared_group_hold(
+        proc: subprocess.Popen[bytes],
+        observed: ProcessIdentity,
+        token: str,
+    ) -> None:
+        """Record an authority-free hold for a live child with a shared group.
+
+        The observed identity does NOT satisfy the private session/group
+        invariant. Persisting it as an ordinary child would let lifecycle code
+        signal a possibly shared group, so fail closed with an authority-free
+        hold instead (ticks recorded so the exact instance — never a recycled
+        PID — can later be signalled by exact PID).
+
+        Args:
+            proc: The direct ``Popen`` handle of the spawned child.
+            observed: Observed (unsafe) exact identity of the live child.
+            token: Lifecycle token handed to the spawned child.
+        """
+        write_state(
+            replace(
+                read_state(),
+                unresolved_child=UnresolvedChild(
+                    pid=proc.pid,
+                    start_time_ticks=observed.start_time_ticks,
+                    token=token,
+                    spawned_at=time.time(),
+                ),
+            )
+        )
+
+    @staticmethod
+    def _unresolved_alive(hold: UnresolvedChild) -> bool:
+        """Return whether the exact unresolved child instance is still alive.
+
+        Args:
+            hold: The recorded authority-free hold.
+
+        Returns:
+            ``True`` only when a live process matches the recorded PID *and*
+            start time ticks (when ticks were observed), so a recycled PID can
+            never extend the hold.
+        """
+        if hold.start_time_ticks is None:
+            return proc_start_ticks(hold.pid) is not None
+        return proc_start_ticks(hold.pid) == hold.start_time_ticks
+
+    def _await_unresolved_exit(self, hold: UnresolvedChild) -> bool:
+        """Wait until the exact unresolved child instance provably exits.
+
+        Args:
+            hold: The recorded authority-free hold.
+
+        Returns:
+            ``True`` when the exact instance is gone within the stop grace.
+        """
+        deadline = time.monotonic() + self.settings.stop_grace_seconds
+        while self._unresolved_alive(hold):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(IDENTITY_POLL_SECONDS)
+        return True
+
+    def _converge_unresolved(self, hold: UnresolvedChild) -> bool:
+        """Converge an unresolved direct child without any group signalling.
+
+        Only exact single-PID signals are used, each authorized by a matching
+        start-time-ticks observation (or withheld entirely when ticks were
+        never observable). A recycled PID therefore ends the hold instead of
+        being signalled.
+
+        Args:
+            hold: The recorded authority-free hold.
+
+        Returns:
+            ``True`` when the exact instance is positively gone afterwards.
+        """
+        if not self._unresolved_alive(hold):
+            return True
+        if hold.start_time_ticks is not None:
+            with suppress(OSError):
+                os.kill(hold.pid, signal.SIGTERM)
+            if self._await_unresolved_exit(hold):
+                return True
+            with suppress(OSError):
+                os.kill(hold.pid, signal.SIGKILL)
+            return self._await_unresolved_exit(hold)
+        # Ticks were never observable: no signal can be authorized. The hold
+        # resolves only when the PID itself is provably gone; a live PID keeps
+        # the hold (and blocks any replacement) no matter how long it takes.
+        return self._await_unresolved_exit(hold)
+
+    def _resolve_unresolved_child(self) -> bool:
+        """Resolve any durable unresolved-child hold before further decisions.
+
+        Returns:
+            ``True`` when no blocking hold remains.
+        """
+        state = read_state()
+        if state.unresolved_hold_malformed:
+            # A present-but-malformed durable hold was found on disk. The
+            # blocking obligation survives its own shape corruption: a possibly
+            # live unresolved spawned child may still exist, so no replacement
+            # worker can ever be authorized until the state is repaired by an
+            # operator. This is deliberately not self-healing.
+            now = time.monotonic()
+            write_state(
+                replace(read_state(), next_attempt_at=now + self.settings.poll_interval_seconds)
+            )
+            self._message = (
+                "the durable unresolved-worker hold is malformed; failing closed without "
+                "starting any worker until the supervisor state is repaired"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        hold = state.unresolved_child
+        if hold is None:
+            return True
+        if not self._converge_unresolved(hold):
+            now = time.monotonic()
+            write_state(
+                replace(read_state(), next_attempt_at=now + self.settings.poll_interval_seconds)
+            )
+            self._message = (
+                f"unresolved worker pid {hold.pid} cannot be converged by exact identity; "
+                "holding without starting a worker"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        write_state(replace(read_state(), unresolved_child=None))
+        LOGGER.info("resolved prior unresolved worker pid=%d", hold.pid)
+        return True
+
+    def _converge_direct_child(self, proc: subprocess.Popen[bytes]) -> bool:
+        """Terminate and reap our own direct ``Popen`` child exactly.
+
+        Signals go only to the exact PID of the process this supervisor just
+        spawned — never to a process group — so no other process can ever be
+        signalled. The child is positively reaped before success is reported.
+
+        Args:
+            proc: The direct ``Popen`` handle of the spawned child.
+
+        Returns:
+            ``True`` when the child provably exited and was reaped.
+        """
+        with suppress(OSError):
+            proc.terminate()
+        reaped = False
+        try:
+            proc.wait(timeout=self.settings.stop_grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            reaped = True
+        if reaped:
+            return True
+        with suppress(OSError):
+            proc.kill()
+        force_reaped = True
+        try:
+            proc.wait(timeout=self.settings.stop_grace_seconds)
+        except subprocess.TimeoutExpired:
+            force_reaped = False
+        if not force_reaped:
+            LOGGER.error(
+                "could not prove exit of live worker pid %d; failing closed",
+                proc.pid,
+            )
+            return False
+        return True
+
+    def _await_observable_identity(self, proc: subprocess.Popen[bytes]) -> ProcessIdentity | None:
+        """Observe the identity of a live direct child for a fail-closed hold.
+
+        Args:
+            proc: The direct ``Popen`` handle of the spawned child.
+
+        Returns:
+            The observed exact identity of the still-live child, or ``None``
+            when the child exited (or could not be observed) meanwhile.
+        """
+        deadline = time.monotonic() + self.settings.stop_grace_seconds
+        while True:
+            identity = lifecycle.process_identity(proc.pid)
+            if identity is not None:
+                return identity
+            if proc.poll() is not None:
+                return None
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(IDENTITY_POLL_SECONDS)
 
     def _wait_for_identity(self, pid: int) -> ProcessIdentity | None:
         """Wait until a spawned worker establishes its own session and group.
@@ -1328,6 +1700,14 @@ class SupervisorDaemon:
         LOGGER.info("supervisor shutting down")
         if read_state().child is not None:
             self._retire_child()
+        if not self._resolve_unresolved_child():
+            # The hold survives shutdown on purpose: an unresolved spawned
+            # child must never be abandoned to make room for a replacement.
+            hold = read_state().unresolved_child
+            LOGGER.error(
+                "shutting down with an unresolved worker pid=%s still held",
+                hold.pid if hold is not None else None,
+            )
         remove_durable(supervise.supervisor_pid_path())
         self._write_status("stopped")
         LOGGER.info("supervisor stopped")
