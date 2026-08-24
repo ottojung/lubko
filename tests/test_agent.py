@@ -3598,3 +3598,132 @@ def test_terminal_or_unknown_reconciles_before_decision(
     finally:
         with contextlib.suppress(Exception):
             kill_proc(proc)
+
+
+# ---------------------------------------------------------------------------
+# Delete/runner lifecycle convergence (issue #163)
+# ---------------------------------------------------------------------------
+
+
+def _wait_file_absent_after(path: Path, seconds: float = 0.5) -> None:
+    """Assert a path stays absent for a grace period (no resurrection)."""
+    time.sleep(seconds)
+    assert not path.exists()
+
+
+def test_delete_never_succeeds_while_claimed_runner_can_recreate_state(
+    state_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A live managed runner racing delete cannot resurrect the agent directory.
+
+    Forces the exact interleaving: a managed runner claims its reservation and
+    pauses immediately before the state-recreation boundary while
+    ``delete --force`` runs concurrently. Deletion must converge the exact
+    claimed runner before removing state, and after success no released runner
+    may recreate the directory or start the invocation.
+    """
+    aid = "163aaaa"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    sync = tmp_path / "sync"
+    prompt = _run_cli(
+        ["prompt", "--id", aid, "--detach", "racy"],
+        sync_dir=sync,
+        FAKE_OPENCODE_CMD="sleep 300",
+    )
+    try:
+        _wait_sync_reached(sync, "sc_observe", 1)
+        _release_sync(sync, "sc_observe")
+        _wait_sync_reached(sync, "sc_decide", 1)
+        _release_sync(sync, "sc_decide")
+        prompt.wait(timeout=30)
+        _wait_sync_reached(sync, "runner_preclaim", 1)
+        _release_sync(sync, "runner_preclaim")
+        # The runner has now claimed (exact identity recorded in meta) but is
+        # paused before it could recreate state or start the invocation.
+        wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        assert meta.get("runner_reservation", {}).get("state") == "claimed"
+        runner_pid = int(meta["runner_pid"])
+        assert agent.pid_alive(runner_pid)
+        _assert_exact_runner(runner_pid, aid, 1)
+
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 5.0)
+        assert agent.main(["delete", aid, "--force"]) == agent.EXIT_OK
+        out = capsys.readouterr()
+        assert "deleted" in out.out
+
+        # The exact claimed runner was converged by delete itself.
+        wait_until(functools.partial(_runner_dead, runner_pid))
+
+        # Release the paused runner: even if it had survived, the tombstone
+        # must prevent any claim/state recreation. Prove the directory stays
+        # absent after the runner would have resumed.
+        _release_sync(sync, "runner_prestart")
+        _release_sync(sync, "runner_preclaim")
+        _wait_file_absent_after(agent.agents_dir() / aid)
+        assert agent.read_meta(aid) is None
+    finally:
+        with contextlib.suppress(Exception):
+            prompt.wait(timeout=5)
+        _teardown_runners(aid, sync)
+
+
+def test_delete_fails_closed_when_group_convergence_times_out(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A timed-out invocation group convergence never reports successful deletion."""
+    aid = "163bbbb"
+    proc = spawn_marked_term_ignoring(aid)
+    try:
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 0.2)
+        # Deterministic unkillable-group simulation: the exact group probe
+        # keeps reporting live members no matter what deletion signals.
+        monkeypatch.setattr(agent, "group_alive", lambda _meta: True)
+        agent.write_meta(aid, meta_for_process(aid, proc, str(state_dir)))
+        code = agent.main(["delete", aid, "--force"])
+        assert code == agent.EXIT_ERROR
+        captured = capsys.readouterr()
+        assert "deleted" not in captured.out
+        assert "did not converge" in captured.err
+        # Fail closed: state kept intact and retryable (no lingering tombstone).
+        assert (agent.agents_dir() / aid).exists()
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        assert not meta.get("delete_pending")
+    finally:
+        kill_proc(proc)
+
+
+def test_delete_refuses_live_runner_without_force(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Deleting an agent with a proven-live managed runner requires --force."""
+    aid = "163cccc"
+    proc = spawn_stale_marked_process(aid, gen=3)
+    try:
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["active_runner"] = True
+        meta["runner_pid"] = proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
+        meta["runner_reservation"] = {
+            "state": "claimed",
+            "gen": 3,
+            "owner_pid": os.getpid(),
+            "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
+        }
+        agent.write_meta(aid, meta)
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 0.2)
+        assert agent.main(["delete", aid]) == agent.EXIT_ERROR
+        captured = capsys.readouterr()
+        assert "deleted" not in captured.out
+        assert (agent.agents_dir() / aid).exists()
+    finally:
+        kill_proc(proc)
