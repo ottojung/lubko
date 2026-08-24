@@ -2282,6 +2282,50 @@ def test_confirm_rejection_keeps_zero_exit_code(
     assert code == dc.EXIT_OK
 
 
+def test_checkout_with_unusable_explicit_uv_exits_failed(tmp_path: Path) -> None:
+    """A failed ``checkout`` with an unusable explicit ``--uv`` exits non-zero."""
+    code = dc.main([
+        json.dumps({"type": "checkout", "commit": "2" * 40}),
+        "--repo",
+        str(tmp_path),
+        "--uv",
+        str(tmp_path / "missing-uv"),
+    ])
+
+    assert code == dc.EXIT_ERROR
+
+
+def test_checkout_with_nonpositive_confirm_window_exits_failed(tmp_path: Path) -> None:
+    """A failed ``checkout`` with a non-positive confirm window exits non-zero."""
+    code = dc.main([
+        *_controller_main_args(json.dumps({"type": "checkout", "commit": "2" * 40}), tmp_path),
+        "--confirm-window-seconds",
+        "0",
+    ])
+
+    assert code == dc.EXIT_ERROR
+
+
+def test_malformed_request_keeps_zero_exit_code(tmp_path: Path) -> None:
+    """A malformed request still returns zero so its structured error is delivered."""
+    code = dc.main(_controller_main_args("not json", tmp_path))
+
+    assert code == dc.EXIT_OK
+
+
+def test_noncheckout_with_unusable_explicit_uv_keeps_zero_exit_code(tmp_path: Path) -> None:
+    """A non-checkout protocol rejection keeps returning zero despite a bad ``--uv``."""
+    code = dc.main([
+        json.dumps({"type": "status"}),
+        "--repo",
+        str(tmp_path),
+        "--uv",
+        str(tmp_path / "missing-uv"),
+    ])
+
+    assert code == dc.EXIT_OK
+
+
 def test_helper_uses_fresh_durable_success_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

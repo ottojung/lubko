@@ -2030,6 +2030,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     request_type = ""
     try:
+        request = _parse_request(args.request)
+        request_type = _request_type(request)
         uv_path = resolve_uv(args.uv)
         options = Options(
             repo=args.repo.resolve(),
@@ -2044,8 +2046,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         if options.confirm_window_seconds <= 0:
             raise DeployCtlError("confirmation window must be positive")
-        request = _parse_request(args.request)
-        request_type = _request_type(request)
         response = _dispatch(options, request)
     except (DeployCtlError, UvResolutionError) as exc:
         response = {"ok": False, "error": str(exc)}
