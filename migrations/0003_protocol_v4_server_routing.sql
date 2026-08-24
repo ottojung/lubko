@@ -18,7 +18,8 @@
 --      and its output_chunk history is discarded.
 --   4. Apply this migration (preflight check, then drop + recreate + validate
 --      the constraint, then rebuild the queue index).
---   5. Start the v4 daemon(s) with their configured LUBKO_SERVER identity and
+--   5. Start the v4 daemon(s) with their configured non-empty server identity
+--      (the 'server' setting of each restricted worker configuration file) and
 --      prove a fresh round trip.
 --
 -- The ENTIRE migration runs inside one explicit transaction whose FIRST

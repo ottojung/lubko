@@ -92,7 +92,7 @@ import psycopg
 from psycopg.rows import tuple_row
 
 from lubko._start_gate import GATE_RELEASE_BYTE
-from lubko.config import load_database_config
+from lubko.config import load_database_config, load_worker_server
 from lubko.health import (
     WorkerHealth,
     configure_worker_logging,
@@ -464,7 +464,9 @@ class Settings:
     #: Configured execution-server identity of this daemon. Every claim,
     #: mutation, publication, recovery, and GC pass is scoped to exactly this
     #: server; a daemon refuses to start without a valid non-empty identity.
-    server: str = field(default_factory=lambda: os.environ.get("LUBKO_SERVER", ""))
+    #: The identity is never environmental: it is read from the restricted
+    #: worker configuration file (see :func:`lubko.config.load_worker_server`).
+    server: str
     worker_incarnation: str = field(
         default_factory=lambda: os.environ.get("LUBKO_LIFECYCLE_TOKEN", uuid4().hex)
     )
@@ -490,8 +492,9 @@ class Settings:
         """
         if not self.server:
             msg = (
-                "LUBKO_SERVER must be a non-empty server identity; every daemon "
-                "owns exactly one configured server and refuses to start without it"
+                "a non-empty 'server' setting in the worker configuration file is "
+                "required; every daemon owns exactly one configured server and "
+                "refuses to start without it"
             )
             raise ValueError(msg)
         self._validate_lease_timing()
@@ -568,13 +571,22 @@ class Settings:
             raise ValueError(msg)
 
     @classmethod
-    def from_environment(cls) -> Settings:
+    def from_environment(cls, *, server: str) -> Settings:
         """Load worker settings from environment variables.
 
+        The execution-server identity is never environmental: it must be
+        supplied explicitly, loaded from the restricted worker configuration
+        file by the entry point.
+
+        Args:
+            server: Non-empty execution-server identity from the config file.
+
         Returns:
-            Settings derived from the process environment.
+            Settings derived from the process environment plus the configured
+            server identity.
         """
         return cls(
+            server=server,
             worker_id=os.getenv("LUBKO_WORKER_ID", socket.gethostname()),
             poll_interval_seconds=float(
                 os.getenv(
@@ -5370,12 +5382,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        server = load_worker_server()
+    except (OSError, ValueError):
+        LOGGER.exception("unable to load the worker server configuration")
+        raise SystemExit(1) from None
+    try:
         database = load_database_config()
     except (OSError, ValueError):
         LOGGER.exception("unable to load database configuration")
         raise SystemExit(1) from None
     try:
-        settings = Settings.from_environment()
+        settings = Settings.from_environment(server=server)
     except ValueError:
         LOGGER.exception("invalid worker runtime settings")
         raise SystemExit(1) from None

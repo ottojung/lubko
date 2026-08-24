@@ -239,7 +239,6 @@ def test_sigkilled_worker_group_is_recovered_before_replacement(
     """
     db_conf = _db_conf_from_conninfo(jobs_db, tmp_path)
     monkeypatch.setenv("LUBKO_DATABASE_CONFIG", str(db_conf))
-    monkeypatch.setenv("LUBKO_SERVER", "alpha-server")
     token = crash_token
     worker = _spawn_real_worker(db_conf, token=token)
     command = (

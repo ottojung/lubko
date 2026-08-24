@@ -1,4 +1,4 @@
-"""Tests for loading the Lubko database configuration file."""
+"""Tests for loading the Lubko database and worker configuration files."""
 
 from pathlib import Path
 from typing import Final
@@ -6,11 +6,15 @@ from typing import Final
 import psycopg
 import pytest
 
+from lubko import config
 from lubko.config import (
+    WORKER_CONFIG_ENV,
     DatabaseConfig,
     database_config_path,
     load_database_config,
+    load_worker_server,
     parse_database_config,
+    worker_config_path,
 )
 
 TEST_HOST: Final = "db.example.com"
@@ -172,3 +176,119 @@ def test_database_config_path_falls_back_to_home(monkeypatch: pytest.MonkeyPatch
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
 
     assert database_config_path() == Path("~/.config/lubko/database.conf").expanduser()
+
+
+def worker_private_file(tmp_path: Path, text: str = "server = alpha-server\n") -> Path:
+    """Write a private (mode 0600) worker configuration file for tests.
+
+    Args:
+        tmp_path: Temporary directory to write into.
+        text: Configuration file text.
+
+    Returns:
+        The written file path.
+    """
+    path = tmp_path / "worker.conf"
+    path.write_text(text)
+    path.chmod(0o600)
+    return path
+
+
+def test_worker_config_path_uses_config_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """XDG_CONFIG_HOME determines the default worker configuration path."""
+    monkeypatch.delenv("LUBKO_WORKER_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    assert worker_config_path() == tmp_path / "lubko" / "worker.conf"
+
+
+def test_worker_config_path_falls_back_to_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without XDG_CONFIG_HOME the path falls back to the home directory."""
+    monkeypatch.delenv("LUBKO_WORKER_CONFIG", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+    assert worker_config_path() == Path("~/.config/lubko/worker.conf").expanduser()
+
+
+def test_worker_config_path_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """LUBKO_WORKER_CONFIG overrides the default path, path selection only."""
+    target = tmp_path / "private.conf"
+    monkeypatch.setenv("LUBKO_WORKER_CONFIG", str(target))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "other"))
+
+    assert worker_config_path() == target
+
+
+def test_load_worker_server_reads_explicit_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The default load resolves LUBKO_WORKER_CONFIG when it is set."""
+    target = worker_private_file(tmp_path, "server = override-server\n")
+    monkeypatch.setenv("LUBKO_WORKER_CONFIG", str(target))
+
+    assert load_worker_server() == "override-server"
+
+
+def test_worker_config_env_never_carries_the_server_identity() -> None:
+    """The override constant is a path selector, distinct from any value env."""
+    assert WORKER_CONFIG_ENV == "LUBKO_WORKER_CONFIG"
+    identity_envs = [name for name in vars(config) if name.endswith("_ENV")]
+    for name in identity_envs:
+        assert "SERVER" not in getattr(config, name)
+
+
+def test_load_worker_server_roundtrip(tmp_path: Path) -> None:
+    """A private file with a non-empty server setting loads that identity."""
+    assert load_worker_server(worker_private_file(tmp_path)) == "alpha-server"
+
+
+def test_load_worker_server_rejects_empty_setting(tmp_path: Path) -> None:
+    """An empty or whitespace-only server setting fails closed."""
+    for text in ("server =\n", "server =   \n"):
+        with pytest.raises(ValueError, match="non-empty 'server' setting"):
+            load_worker_server(worker_private_file(tmp_path, text))
+
+
+def test_load_worker_server_requires_server_setting(tmp_path: Path) -> None:
+    """A file without a server setting fails closed."""
+    with pytest.raises(ValueError, match="non-empty 'server' setting"):
+        load_worker_server(worker_private_file(tmp_path, "host = db.example.com\n"))
+
+
+def test_load_worker_server_rejects_malformed_file(tmp_path: Path) -> None:
+    """A malformed line anywhere in the file fails closed."""
+    with pytest.raises(ValueError, match="invalid database configuration line"):
+        load_worker_server(worker_private_file(tmp_path, "server = alpha\nnot a setting\n"))
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o666])
+def test_load_worker_server_rejects_group_or_world_accessible_file(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    """A group- or world-accessible file is refused."""
+    path = worker_private_file(tmp_path)
+    path.chmod(mode)
+
+    with pytest.raises(PermissionError, match="must not be readable by group or others"):
+        load_worker_server(path)
+
+
+def test_load_worker_server_missing_file(tmp_path: Path) -> None:
+    """A missing configuration file fails closed."""
+    missing = tmp_path / "absent" / "worker.conf"
+
+    with pytest.raises(FileNotFoundError):
+        load_worker_server(missing)
+
+
+def test_load_worker_server_reads_isolated_default() -> None:
+    """The default path resolves the isolated per-test worker configuration."""
+    assert load_worker_server() == "alpha-server"

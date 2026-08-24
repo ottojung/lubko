@@ -71,10 +71,19 @@ group or by other users.
 
 Optional runtime settings:
 
-- `LUBKO_SERVER` — execution-server identity of this daemon (required, no
-  default). Every daemon claims, heartbeats, and terminalizes only jobs whose
-  payload `server` field exactly equals this identity; the worker refuses to
-  start without it.
+The execution-server identity is not an environment variable: it is the
+required non-empty `server` setting of a second private file,
+`$XDG_CONFIG_HOME/lubko/worker.conf` with a fallback of
+`~/.config/lubko/worker.conf`; the file path can be selected explicitly with
+`LUBKO_WORKER_CONFIG` (path only — the identity value itself is never
+environmental). Every daemon claims, heartbeats, and
+terminalizes only jobs whose payload `server` field exactly equals this
+identity; the worker and `lubko-deploy` readiness probes refuse to start
+without it, and the file must be readable and writable only by the owning
+user (mode `0600`), never accessible by the group or by other users.
+
+Other runtime settings:
+
 - `LUBKO_WORKER_ID` — worker identifier, default is the host name.
 - `LUBKO_POLL_INTERVAL_SECONDS` — idle polling interval, default `1`.
 - `LUBKO_PROCESS_POLL_INTERVAL_SECONDS` — interval for polling a running job's
@@ -147,7 +156,8 @@ values ('{"v":4,"type":"command","server":"alpha-server","request":{"cwd":"/work
 returning id;
 ```
 
-The job runs only on the daemon whose configured `LUBKO_SERVER` identity is
+The job runs only on the daemon whose configured server identity (the
+non-empty `server` setting of its private worker configuration file) is
 `alpha-server`; jobs addressed to other servers stay pending untouched.
 
 Poll it with:
@@ -288,7 +298,8 @@ migration, and no compatibility path. Operationally, the cutover quiesces the
 live queue: stop new submissions, let any in-flight work become durably
 terminal, `truncate lubko.jobs`, apply
 `migrations/0003_protocol_v4_server_routing.sql`, start the daemon with its
-configured `LUBKO_SERVER` identity, and prove a fresh v4 round trip.
+configured server identity (the non-empty `server` setting of its private
+worker configuration file), and prove a fresh v4 round trip.
 Truncating before applying is required; applying against a table that still
 holds nonconforming rows fails fast with an explicit diagnostic. Either way the
 end state is an empty `lubko.jobs` with no v3 row or history preserved.

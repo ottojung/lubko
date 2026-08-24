@@ -1365,17 +1365,15 @@ def _proc_state(pid: int) -> bytes | None:
 
 def test_settings_rejects_nonpositive_spool_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     """A non-positive spool bound is rejected as invalid configuration."""
-    monkeypatch.setenv("LUBKO_SERVER", "bound-server")
     monkeypatch.setenv("LUBKO_OUTPUT_SPOOL_MAX_BYTES", "0")
     with pytest.raises(ValueError, match="LUBKO_OUTPUT_SPOOL_MAX_BYTES"):
-        Settings.from_environment()
+        Settings.from_environment(server="bound-server")
 
 
 def test_settings_reads_lease_and_output_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Lease, publication, server, and fairness settings come from the environment."""
-    monkeypatch.setenv("LUBKO_SERVER", "env-server")
     monkeypatch.setenv("LUBKO_LEASE_DURATION_SECONDS", "12.5")
     monkeypatch.setenv("LUBKO_LEASE_REFRESH_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS", "4.5")
@@ -1385,7 +1383,7 @@ def test_settings_reads_lease_and_output_environment(
     monkeypatch.setenv("LUBKO_DB_OPERATION_TIMEOUT_SECONDS", "8.5")
     monkeypatch.setenv("LUBKO_OUTPUT_SPOOL_MAX_BYTES", "524288")
 
-    settings = Settings.from_environment()
+    settings = Settings.from_environment(server="env-server")
 
     assert settings.lease_duration_seconds == pytest.approx(12.5)
     assert settings.lease_refresh_interval_seconds == pytest.approx(2.5)
@@ -1398,11 +1396,10 @@ def test_settings_reads_lease_and_output_environment(
     assert settings.server == "env-server"
 
 
-def test_settings_defaults_and_incarnation(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settings_defaults_and_incarnation() -> None:
     """Settings default to the documented values and have a non-empty incarnation."""
-    monkeypatch.setenv("LUBKO_SERVER", "default-server")
-    first = Settings.from_environment()
-    second = Settings.from_environment()
+    first = Settings.from_environment(server="default-server")
+    second = Settings.from_environment(server="default-server")
 
     assert first.lease_duration_seconds == DEFAULT_LEASE_DURATION_SECONDS
     assert first.lease_refresh_interval_seconds == DEFAULT_LEASE_REFRESH_INTERVAL_SECONDS
@@ -1418,7 +1415,7 @@ def test_settings_defaults_and_incarnation(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_settings_rejects_empty_server() -> None:
     """A daemon refuses to start without a configured server identity."""
-    with pytest.raises(ValueError, match="LUBKO_SERVER"):
+    with pytest.raises(ValueError, match="non-empty 'server' setting"):
         Settings(
             server="",
             worker_id="w",

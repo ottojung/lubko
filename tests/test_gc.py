@@ -410,11 +410,10 @@ def test_settings_gc_defaults() -> None:
 
 def test_settings_reads_gc_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """GC settings come from the environment."""
-    monkeypatch.setenv("LUBKO_SERVER", "env-server")
     monkeypatch.setenv("LUBKO_GC_RETENTION_SECONDS", "600")
     monkeypatch.setenv("LUBKO_GC_INTERVAL_SECONDS", "30")
     monkeypatch.setenv("LUBKO_GC_BATCH_LIMIT", "50")
-    settings = Settings.from_environment()
+    settings = Settings.from_environment(server="env-server")
     assert settings.gc_retention_seconds == pytest.approx(600.0)
     assert settings.gc_interval_seconds == pytest.approx(30.0)
     assert settings.gc_batch_limit == 50

@@ -2464,7 +2464,6 @@ def worker_env_with(token: str) -> dict[str, str]:
     """
     env = lifecycle.worker_env(token)
     env["LUBKO_WORKER_ID"] = "e2e-worker"
-    env["LUBKO_SERVER"] = "alpha-server"
     env.update(WORKER_TIMINGS)
     return env
 
