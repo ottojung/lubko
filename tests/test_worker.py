@@ -386,6 +386,85 @@ def test_truncate_output_keeps_tail() -> None:
     assert len(result.encode()) == limit
 
 
+def test_truncate_output_hard_bound_at_marker_length() -> None:
+    """A limit equal to the marker length is a hard bound."""
+    result = truncate_output(b"x" * 1000, len(TRUNCATION_MARKER))
+    assert result.encode() == TRUNCATION_MARKER
+    assert len(result.encode()) <= len(TRUNCATION_MARKER)
+
+
+def test_truncate_output_hard_bound_at_adjacent_limits() -> None:
+    """Limits one byte below/above the marker length behave deterministically."""
+    with pytest.raises(ValueError, match="truncation marker"):
+        truncate_output(b"xyz", len(TRUNCATION_MARKER) - 1)
+
+    data = b"y" * 1000
+    for delta in (0, 1, 2, 3):
+        limit = len(TRUNCATION_MARKER) + delta
+        result = truncate_output(data, limit)
+        assert len(result.encode()) <= limit
+
+
+def test_truncate_output_hard_bound_despite_replacement_expansion() -> None:
+    """NUL bytes expand to 3-byte U+FFFD; the limit still holds."""
+    limit = 64
+    data = b"\x00" * 100 + b"the-end"
+
+    result = truncate_output(data, limit)
+
+    assert len(result.encode()) <= limit
+    assert result.encode().startswith(TRUNCATION_MARKER)
+    assert result.endswith("the-end")
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"\x00" * 500,
+        bytes(range(128, 256)) * 4,
+        b"ab\x80\x80\x80\x80cd",
+        b"ok" * 300,
+        ("héllo".encode() * 50) + b"end",
+    ],
+)
+def test_truncate_output_invariant_across_limits(data: bytes) -> None:
+    """Encoded output never exceeds the limit regardless of decoding expansion."""
+    limits = [len(TRUNCATION_MARKER), 30, 33, 64, 100, 257, 1024]
+    for limit in limits:
+        result = truncate_output(data, limit)
+        encoded = result.encode()
+        assert len(encoded) <= limit
+        if len(data) > limit:
+            assert encoded.startswith(TRUNCATION_MARKER)
+
+
+def test_truncate_output_multibyte_boundary_keeps_valid_text() -> None:
+    """Truncation across multibyte boundaries returns bounded, valid text."""
+    data = "€".encode() * 100
+    limits = [len(TRUNCATION_MARKER), len(TRUNCATION_MARKER) + 13, 64, 100]
+
+    for limit in limits:
+        result = truncate_output(data, limit)
+        encoded = result.encode()
+        assert len(encoded) <= limit
+        if len(data) > limit:
+            assert encoded.startswith(TRUNCATION_MARKER)
+        result.encode("utf-8")  # valid UTF-8 text round-trips cleanly
+
+
+def test_truncate_output_expansion_heavy_payload_stays_linear() -> None:
+    """A large replacement-heavy payload is bounded without quadratic rework."""
+    limit = 512
+    data = b"\x00" * 50_000 + b"tail"
+
+    result = truncate_output(data, limit)
+
+    encoded = result.encode()
+    assert len(encoded) <= limit
+    assert encoded.startswith(TRUNCATION_MARKER)
+    assert result.endswith("tail")
+
+
 def test_read_output_returns_captured_bytes(tmp_path: Path) -> None:
     """read_output returns everything captured into an output file."""
     target = tmp_path / "out"

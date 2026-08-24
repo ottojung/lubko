@@ -686,11 +686,23 @@ def truncate_output(data: bytes, limit: int) -> str:
         msg = "output limit must be at least as large as the truncation marker"
         raise ValueError(msg)
 
-    if len(data) > limit:
-        payload = TRUNCATION_MARKER + data[-(limit - len(TRUNCATION_MARKER)) :]
-    else:
-        payload = data
-    return pg_safe_decode(payload)
+    truncated = len(data) > limit
+    payload = TRUNCATION_MARKER + data[-(limit - len(TRUNCATION_MARKER)) :] if truncated else data
+    result = pg_safe_decode(payload)
+
+    # Decoding can expand the byte length (NUL and invalid sequences become
+    # the 3-byte U+FFFD), so drop the oldest decoded payload characters,
+    # keeping any truncation marker, until the configured limit holds as a
+    # hard bound on the encoded output.
+    body_offset = len(TRUNCATION_MARKER.decode()) if truncated else 0
+    encoded_len = len(result.encode())
+    if encoded_len > limit:
+        index = body_offset
+        while encoded_len > limit:
+            encoded_len -= len(result[index].encode())
+            index += 1
+        result = result[:body_offset] + result[index:]
+    return result
 
 
 def read_output(path: Path) -> bytes:
