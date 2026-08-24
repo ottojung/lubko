@@ -2346,6 +2346,65 @@ def test_cmd_delete_force_kills_live_group(
         kill_proc(proc)
 
 
+@pytest.mark.parametrize("mode", ["stop", "kill"])
+def test_cmd_stop_kill_identity_race_never_terminalizes_newer_invocation(
+    mode: str,
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A newer invocation recorded mid-stop/kill is never marked terminal.
+
+    Forces the A -> B race deterministically: while the command waits for
+    invocation A's group to die, the runner records live invocation B. The
+    command must not terminalize or untrack B and must report failure.
+    """
+    proc_a = spawn_marked_process("aaaaaaaa")
+    proc_b = spawn_marked_process("aaaaaaaa")
+    try:
+        monkeypatch.setattr(agent, "STOP_WAIT_SECONDS", 2.0)
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 2.0)
+        a_meta = meta_for_process("aaaaaaaa", proc_a, str(state_dir))
+        agent.write_meta("aaaaaaaa", a_meta)
+
+        original_wait = agent.wait_group_dead
+
+        def record_newer_then_wait(meta: agent.Meta, timeout: float) -> bool:
+            # Simulate the runner recording invocation B while the command
+            # waits for invocation A's exact group to die.
+            b_meta = meta_for_process("aaaaaaaa", proc_b, str(state_dir))
+            b_meta["runner_pid"] = proc_b.pid
+            b_meta["runner_start_time"] = agent.proc_start_ticks(proc_b.pid)
+            b_meta["active_runner"] = True
+            agent.write_meta("aaaaaaaa", b_meta)
+            return original_wait(meta, timeout)
+
+        monkeypatch.setattr(agent, "wait_group_dead", record_newer_then_wait)
+
+        code = agent.main([mode, "aaaaaaaa"])
+        assert code == agent.EXIT_ERROR
+        assert "restarted" in capsys.readouterr().err
+
+        wait_until(lambda: proc_a.poll() is not None)
+        assert proc_b.poll() is None, "newer invocation must stay alive"
+
+        meta = agent.read_meta("aaaaaaaa")
+        assert meta is not None
+        assert meta["pid"] == proc_b.pid
+        assert meta["runner_pid"] == proc_b.pid
+        assert meta["state"] == "running", "newer invocation must stay live"
+        assert meta["active_runner"] is True, "B's active runner must be preserved"
+        assert agent.active_runner_justified(meta)
+        assert agent.runner_alive(meta)
+        assert meta["stop_reason"] is None
+        assert meta["exit_signal"] is None
+        assert meta["finished_at"] is None
+        assert agent.is_alive(meta)
+    finally:
+        kill_proc(proc_a)
+        kill_proc(proc_b)
+
+
 def test_runner_alive_matches_exact_identity(state_dir: Path) -> None:
     """A live runner with matching start time and marker is reported alive."""
     proc = spawn_marked_process("aaaaaaaa")
