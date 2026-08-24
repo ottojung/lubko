@@ -3537,8 +3537,15 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
     return applied
 
 
-def _runner_identity_alive(pid: int, ticks: object, aid: str) -> bool:
-    """Return whether the exact observed runner identity is still alive.
+def _runner_identity_state(pid: int, ticks: object, aid: str) -> str:
+    """Classify the exact observed runner identity's liveness evidence.
+
+    Transient ``/proc`` read failures must never be mistaken for death, so
+    this distinguishes three states instead of a boolean: positively alive,
+    positively gone (process exited, or provably replaced by a different
+    start-time identity such as after PID reuse), and unprovable (the process
+    is alive but its start ticks or environment marker cannot be read).
+    Unprovable keeps convergence fail-closed: only positive evidence counts.
 
     Args:
         pid: The observed runner process ID.
@@ -3546,14 +3553,25 @@ def _runner_identity_alive(pid: int, ticks: object, aid: str) -> bool:
         aid: Exact agent ID whose environment marker must match.
 
     Returns:
-        ``True`` only when the live process matches every recorded identity
-        field, so a recycled PID is never mistaken for the runner.
+        ``"alive"``, ``"gone"``, or ``"unprovable"``.
     """
     if not pid_alive(pid):
-        return False
-    if proc_start_ticks(pid) != ticks:
-        return False
-    return env_has_marker(pid, aid)
+        return "gone"
+    if _is_zombie(pid):
+        # A defunct process has no execution authority left.
+        return "gone"
+    current = proc_start_ticks(pid)
+    if current is None:
+        return "unprovable"
+    if current != ticks:
+        # Provably a different start identity occupies the PID now.
+        return "gone"
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return "unprovable"
+    marker = f"LUBKO_AGENT_ID={aid}".encode()
+    return "alive" if marker in environ.split(b"\0") else "unprovable"
 
 
 def _converge_observed_runner(observed: Meta, mode: str) -> bool:
@@ -3563,8 +3581,12 @@ def _converge_observed_runner(observed: Meta, mode: str) -> bool:
     (start ticks plus per-agent marker, like deletion's convergence), never by
     a broad match.  A runner recorded later in metadata (a post-cancellation
     re-reservation by an explicit new prompt) is never signalled; once the
-    observed identity is gone, the pre-existing execution authority it carried
-    is provably converged regardless of what metadata names now.
+    observed identity is *positively* proven gone (exited, or provably
+    replaced by a different start identity), the pre-existing execution
+    authority it carried is converged regardless of what metadata names now.
+    Identity that is merely unprovable (unreadable ``/proc`` data) is never
+    counted as death: convergence keeps retrying within its bounded window
+    and fails closed instead.
 
     Args:
         observed: The metadata snapshot taken when the cancellation was
@@ -3585,12 +3607,16 @@ def _converge_observed_runner(observed: Meta, mode: str) -> bool:
     marker_aid = str(observed.get("id", ""))
     grace_signal = signal.SIGTERM if mode == "stop" else signal.SIGKILL
     signal_identity_checked(pid, ticks, grace_signal, marker_aid=marker_aid)
+
+    def positively_gone() -> bool:
+        return _runner_identity_state(pid, ticks, marker_aid) == "gone"
+
     deadline = time.time() + (STOP_WAIT_SECONDS if mode == "stop" else KILL_WAIT_SECONDS)
     while time.time() < deadline:
-        if not _runner_identity_alive(pid, ticks, marker_aid):
+        if positively_gone():
             return True
         time.sleep(0.05)
-    if not _runner_identity_alive(pid, ticks, marker_aid):
+    if positively_gone():
         return True
     if mode == "stop":
         # Grace period expired: escalate exactly like the invocation-group
@@ -3598,7 +3624,7 @@ def _converge_observed_runner(observed: Meta, mode: str) -> bool:
         signal_identity_checked(pid, ticks, signal.SIGKILL, marker_aid=marker_aid)
         deadline = time.time() + KILL_WAIT_SECONDS
         while time.time() < deadline:
-            if not _runner_identity_alive(pid, ticks, marker_aid):
+            if positively_gone():
                 return True
             time.sleep(0.05)
     return False
