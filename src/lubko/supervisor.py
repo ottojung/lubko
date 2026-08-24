@@ -1132,13 +1132,22 @@ class SupervisorDaemon:
         return next_attempt is not None and now < next_attempt
 
     def _maybe_reset_backoff(self, state: supervise.SupervisorState, now: float) -> None:
-        """Reset the restart counter once a worker has been stable.
+        """Reset crash backoff only after the exact worker stayed healthy.
+
+        Elapsed time since ``last_spawn_at`` is stability evidence only while
+        the same recorded child is still our live direct child. A dead child
+        must never earn crash forgiveness merely by remaining absent until the
+        stability window elapses; otherwise an active exponential-backoff
+        deadline can be shortened and a persistent crash loop never reaches
+        its configured cap.
 
         Args:
             state: Current daemon state.
             now: Monotonic time.
         """
         if state.restart_count == 0 and state.next_attempt_at is None:
+            return
+        if state.child is None or not self._child_alive(state):
             return
         last_spawn = state.last_spawn_at
         if last_spawn is None or now - last_spawn < self.settings.stable_window_seconds:
