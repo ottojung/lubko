@@ -38,6 +38,7 @@ from lubko.worker import (
     STOP_REASON_SPOOL,
     TRUNCATION_MARKER,
     ActiveJob,
+    GatedSpawn,
     Job,
     JobResult,
     JobsConnection,
@@ -121,7 +122,14 @@ SLEEP_300: Final = (sys.executable, "-c", "import time; time.sleep(300)")
 LEFTOVER_GROUP_PROBE: Final = (
     sys.executable,
     "-c",
-    "import os, time\nif os.fork() == 0:\n    time.sleep(30)\nelse:\n    os._exit(0)\n",
+    (
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(30)\n"
+        "else:\n"
+        "    time.sleep(0.5)\n"
+        "    os._exit(0)\n"
+    ),
 )
 
 #: A short-lived child that emits a little output on both streams and exits
@@ -1583,8 +1591,6 @@ def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
     )
     guard.register(proc)
     try:
-        proc.wait(timeout=10)
-        assert group_has_members(pgid)
         job = ActiveJob(
             id=uuid4(),
             cwd=str(tmp_path),
@@ -1596,6 +1602,16 @@ def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
             started_mono=time.monotonic(),
             claimed_at=time.time(),
         )
+        # Supervision observes the job while its leader is alive: the
+        # positive-proof pass records every member's exact identity.
+
+        def _observed() -> bool:
+            worker._owned_group_view(job)
+            return any(pid != job.pgid for pid in job.owned_members)
+
+        wait_until(_observed)
+        assert group_has_members(pgid)
+        proc.wait(timeout=10)
         job.completed = True
         job.returncode = 0
         request_group_reap(job)
@@ -3326,9 +3342,11 @@ def test_surviving_owned_descendants_converge_before_finalization(
     """Genuine descendants of an exited owned leader are signalled individually.
 
     The original leader exited but a descendant forked before it died still
-    lives in the exact group. The ownership proof must keep succeeding for the
-    descendant: it receives SIGTERM by exact pid, finalization stays withheld
-    while it lives, and observation proves the group gone once it exits.
+    lives in the exact group. Its identity was recorded under positive
+    ownership proof (leader slot held the recorded command), and that exact
+    (pid, start-ticks) ledger entry keeps proving it ours after the leader
+    exit: it receives SIGTERM by exact pid, finalization stays withheld while
+    it lives, and observation proves the group gone once it exits.
     """
     job = make_active_job(tmp_path)
     job.completed = True
@@ -3336,6 +3354,8 @@ def test_surviving_owned_descendants_converge_before_finalization(
     job.start_ticks = 1000
     descendant = job.pgid + 7
     members = [descendant]
+    # Recorded under a prior positive-proof pass while the leader was alive.
+    job.owned_members[descendant] = job.start_ticks + 1
     monkeypatch.setattr(
         worker, "group_has_members", lambda g: bool(members) if g == job.pgid else False
     )
@@ -3345,6 +3365,7 @@ def test_surviving_owned_descendants_converge_before_finalization(
         lambda pid: None if pid == job.pgid else (job.start_ticks + 1 if pid in members else None),
     )
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    monkeypatch.setattr(worker, "_process_ppid", lambda _pid: None)
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
     monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
@@ -3409,3 +3430,150 @@ def test_recovery_escalation_never_kills_a_recycled_occupant(
 
     assert worker._terminate_one_group(pgid, recorded_ticks, cancel_grace_seconds=0.0) is True
     assert events == [(pgid, signal.SIGTERM)]
+
+
+def test_recovery_reports_nonconvergence_while_leader_stays_ours(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery never claims convergence while the exact leader is still ours.
+
+    An ineffective escalation (members survive TERM and KILL) must report the
+    owned group as NOT converged, even though every signal was correctly
+    authorized by the matching leader identity.
+    """
+    pgid = 6021
+    recorded_ticks = 31337
+    members = [pgid]
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == pgid else False
+    )
+    monkeypatch.setattr(
+        worker, "proc_start_ticks", lambda pid: recorded_ticks if pid == pgid else None
+    )
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    monkeypatch.setattr(worker, "_process_ppid", lambda _pid: None)
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+
+    assert worker._terminate_one_group(pgid, recorded_ticks, cancel_grace_seconds=0.05) is False
+    # Escalation happened against the exact proven group only.
+    assert events == [(pgid, signal.SIGTERM), (pgid, signal.SIGKILL)]
+
+    members.clear()
+    assert worker._terminate_one_group(pgid, recorded_ticks, cancel_grace_seconds=0.0) is True
+
+
+def test_recycled_group_stranger_descendants_are_never_signalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Descendants of an exited recycled leader are never signalled.
+
+    After the original group emptied, its numeric PGID was recycled by an
+    unrelated leader which itself exited leaving descendants. Only members
+    carrying an exact ledger identity recorded under positive ownership proof
+    may be signalled; stranger descendants fail closed even though the leader
+    slot is vacant again.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.returncode = 0
+    job.start_ticks = 500
+    owned_descendant = job.pgid + 11
+    stranger_descendant = job.pgid + 22
+    members = [owned_descendant, stranger_descendant]
+    job.owned_members[owned_descendant] = 501
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == job.pgid else False
+    )
+    monkeypatch.setattr(
+        worker,
+        "proc_start_ticks",
+        lambda pid: (
+            None
+            if pid == job.pgid
+            else (job.owned_members.get(pid) if pid in job.owned_members else 424_242)
+        ),
+    )
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    monkeypatch.setattr(worker, "_process_ppid", lambda _pid: None)
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+
+    request_group_reap(job)
+    assert events == [(owned_descendant, signal.SIGTERM)]
+
+    supervisor = _spy_supervisor()
+    assert supervisor._observe_and_escalate(job, time.monotonic()) is False
+
+    members.remove(owned_descendant)
+    assert supervisor._observe_and_escalate(job, time.monotonic()) is True
+    assert stranger_descendant not in {target for target, _sig in events}
+
+
+def test_gated_identity_is_carried_not_reread_after_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ActiveJob identity is the persisted value, not a post-release re-read.
+
+    The start-time ticks obtained and durably persisted before gate release
+    are carried onto the active job unchanged. If the command exits before the
+    active job is built — so a /proc re-read would find nothing — the in-memory
+    identity still equals the persisted value.
+    """
+    proc = subprocess.Popen(
+        ["/bin/true"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    guard.register(proc)
+    try:
+        proc.wait(timeout=10)
+        gated = GatedSpawn(
+            proc=proc,
+            pgid=proc.pid,
+            stdout_path=tmp_path / "stdout.cap",
+            stderr_path=tmp_path / "stderr.cap",
+            gate_fd=-1,
+        )
+        persisted_ticks = 987_654
+
+        supervisor = _spy_supervisor()
+        reads = {"n": 0}
+
+        def fake_ticks(_pid: int) -> int | None:
+            # The command exits right after persistence: only the very first
+            # identity read (before persist) succeeds.
+            reads["n"] += 1
+            return persisted_ticks if reads["n"] == 1 else None
+
+        captured: dict[str, int] = {}
+
+        def fake_persist(
+            _conn: object,
+            _job_id: object,
+            _gated: object,
+            ticks: int,
+            _settings: object,
+        ) -> bool:
+            captured["ticks"] = ticks
+            return True
+
+        monkeypatch.setattr(worker, "_persist_process", fake_persist)
+        monkeypatch.setattr(worker, "proc_start_ticks", fake_ticks)
+        monkeypatch.setattr(worker, "release_gate", lambda _fd: True)
+
+        job_spec = Job(id=uuid4(), cwd=str(tmp_path), process=("/bin/true",))
+        job = supervisor._activate_gated_job(
+            cast("JobsConnection", None), uuid4(), job_spec, gated, claim_mono=time.monotonic()
+        )
+
+        assert captured == {"ticks": persisted_ticks}
+        assert job is not None
+        assert job.start_ticks == persisted_ticks
+        assert job.owned_members == {proc.pid: persisted_ticks}
+    finally:
+        guard.unregister(proc)

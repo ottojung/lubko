@@ -70,6 +70,7 @@ worker) rather than letting one job poison supervision.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import json
 import logging
@@ -422,10 +423,18 @@ class ActiveJob:
     # process can never outlive its database lease.
     last_heartbeat_at: float = 0.0
     # Exact start-time clock ticks of the command process (== group leader),
-    # durably persisted before gate release. This is the non-reusable identity
-    # proof that keeps every live supervision/drain/shutdown group decision
-    # from ever mistaking a numerically recycled PGID for this job's group.
+    # durably persisted before gate release and carried in memory unchanged.
+    # This is the non-reusable identity proof that keeps every live
+    # supervision/drain/shutdown group decision from ever mistaking a
+    # numerically recycled PGID for this job's group.
     start_ticks: int = 0
+    # Per-invocation member ledger (pid -> start-time ticks) recorded under
+    # positive ownership proof: seeded with the exact persisted leader identity
+    # at activation and extended with every member observed while the leader
+    # slot provably holds the recorded command. A member counts as ours later
+    # (leader exited, PGID possibly recycled) ONLY by exact (pid, ticks) match
+    # against this ledger; anything else fails closed and is never signalled.
+    owned_members: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -1964,28 +1973,154 @@ def _group_member_pids(pgid: int) -> list[int]:
     return [pgid]
 
 
-def _owned_group_view(pgid: int, start_ticks: int | None) -> _OwnedGroupView:
-    """Classify a numeric group against a job's persisted exact identity.
+_PR_SET_CHILD_SUBREAPER = 36
 
-    A numeric PGID is reusable once its group empties, so bare membership can
-    never authorize signalling. Membership counts as *ours* only under a
-    non-reusable proof:
+_subreaper_state: Final = {"attempted": False, "enabled": False}
 
-    * the live process at the leader slot (pid == pgid) has start-time ticks
-      exactly equal to the persisted identity (leader and all members are
-      then descendants of our own command), or
-    * there is no live process at the leader slot — reuse requires an empty
-      group, so every current member must be an original descendant — or
-    * a member's own start ticks predate the ticks of an unrelated recycled
-      leader occupying the slot (it forked from our group before the group
-      ever emptied).
 
-    Anything else is treated as not ours and is never signalled.
+def enable_child_subreaping() -> bool:
+    """Mark this process as a child subreaper so orphaned members return to us.
+
+    When a job's intermediate ancestor (for example a shell that spawned
+    ``sleep 30 &``) exits, its still-running descendants are reparented to the
+    nearest ancestor marked as a subreaper instead of init. With this enabled,
+    a live group member whose parent is this worker provably descends from one
+    of this worker's own children — a non-reusable lineage proof that survives
+    leader exit and numeric PGID recycling, because an unrelated stranger can
+    never become this process's child.
+
+    Returns:
+        ``True`` when the kernel accepted the subreaper marking.
+    """
+    if _subreaper_state["enabled"]:
+        return True
+    if not _subreaper_state["attempted"]:
+        _subreaper_state["attempted"] = True
+        result = -1
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            result = libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+        except (OSError, AttributeError):
+            result = -1
+        if result == 0:
+            _subreaper_state["enabled"] = True
+    return _subreaper_state["enabled"]
+
+
+def _process_ppid(pid: int) -> int | None:
+    """Return the parent pid of a live process, or ``None`` when unavailable.
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        The parent process id, or ``None`` for dead/unreadable processes.
+    """
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+    except OSError:
+        return None
+    close_paren = stat.rfind(b")")
+    if close_paren == -1:
+        return None
+    fields = stat[close_paren + 2 :].split()
+    if len(fields) < STAT_MIN_FIELDS:
+        return None
+    if fields[0] in {b"Z", b"X"}:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+def _signal_owned_pids(pids: tuple[int, ...], sig: int) -> bool:
+    """Signal provably-owned members individually by exact pid.
+
+    Args:
+        pids: Proven member pids to signal.
+        sig: Signal number to deliver.
+
+    Returns:
+        ``True`` when there was anything to signal, ``False`` when empty.
+    """
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            LOGGER.debug("process %d already gone", pid)
+    return True
+
+
+def _ledger_owned_members(pgid: int, ledger: dict[int, int]) -> tuple[int, ...]:
+    """Return group members proven ours by exact ledger identity match.
+
+    A member counts as ours when its live start-time ticks exactly equal the
+    ticks recorded for that pid under a prior positive ownership proof, or —
+    for members that escaped every snapshot because their parent exited first
+    — when child subreaping proves the lineage: with this worker marked as a
+    child subreaper, an orphaned process whose parent is this worker provably
+    descends from one of this worker's own children (a non-reusable proof,
+    since an unrelated stranger can never become this process's child), so a
+    member of the exact recorded group reparented to us is ours.
+
+    Pids that were never recorded (for example unrelated descendants forked by
+    an exited recycled leader) or whose identity no longer matches fail closed:
+    they are never signalled.
 
     Args:
         pgid: The recorded process group id.
-        start_ticks: The persisted command start-time ticks (``None`` or
-            non-positive when no valid identity was recorded).
+        ledger: Recorded per-member identities from positive-proof passes.
+
+    Returns:
+        The provably-owned member pids (the leader slot itself is excluded).
+    """
+    owned: list[int] = []
+    worker_pid = os.getpid()
+    for pid in _group_member_pids(pgid):
+        if pid == pgid:
+            continue
+        member_ticks = proc_start_ticks(pid)
+        if member_ticks is None:
+            continue
+        if ledger.get(pid) == member_ticks:
+            owned.append(pid)
+            continue
+        if enable_child_subreaping() and _process_ppid(pid) == worker_pid:
+            # Orphaned descendant of our own command, reparented to this
+            # worker: exact non-reusable lineage proof.
+            ledger[pid] = member_ticks
+            owned.append(pid)
+    return tuple(owned)
+
+
+def _classify_group(
+    pgid: int,
+    start_ticks: int | None,
+    ledger: dict[int, int],
+) -> _OwnedGroupView:
+    """Classify a numeric group against a persisted exact identity and ledger.
+
+    Membership is *ours* only under non-reusable proof:
+
+    * the live process at the leader slot (pid == pgid) has start-time ticks
+      exactly equal to the persisted identity — the whole numeric group is
+      then ours by construction, and every member's exact identity is recorded
+      into the ledger for later convergence; or
+    * the member matches the positive-proof ledger exactly (pid AND live
+      start-time ticks).
+
+    Anything else — a recycled occupant of the leader slot, its descendants,
+    or members whose provenance cannot be established — fails closed and is
+    never signalled.
+
+    Args:
+        pgid: The recorded process group id.
+        start_ticks: The persisted command start-time ticks (invalid/zero when
+            none was ever obtained).
+        ledger: Per-member identities recorded under positive proof.
 
     Returns:
         The :class:`_OwnedGroupView` proving which parts of the numeric group,
@@ -1994,26 +2129,28 @@ def _owned_group_view(pgid: int, start_ticks: int | None) -> _OwnedGroupView:
     if not group_has_members(pgid):
         return _OwnedGroupView(leader_ours=False, pids=())
     leader_ticks = proc_start_ticks(pgid)
-    identity_valid = isinstance(start_ticks, int) and start_ticks > 0
-    if leader_ticks is not None:
-        if identity_valid and leader_ticks == start_ticks:
-            return _OwnedGroupView(leader_ours=True, pids=())
-        # The leader slot holds a different process than the recorded command:
-        # either a recycled numeric PGID or an unreadable identity. Only
-        # members proven to predate the occupant remain ours; the occupant
-        # itself (pid == pgid) is never signalled.
-        pids = tuple(
-            pid
-            for pid in _group_member_pids(pgid)
-            if pid != pgid
-            and (member_ticks := proc_start_ticks(pid)) is not None
-            and leader_ticks > member_ticks
-        )
-        return _OwnedGroupView(leader_ours=False, pids=pids)
-    # No live process at the leader slot: the numeric id cannot have been
-    # re-created while the group still has members, so every member is an
-    # original descendant of the recorded command.
-    return _OwnedGroupView(leader_ours=False, pids=tuple(_group_member_pids(pgid)))
+    if isinstance(start_ticks, int) and start_ticks > 0 and leader_ticks == start_ticks:
+        # The recorded command itself provably occupies the leader slot, so
+        # every current member is its descendant. Snapshot their identities
+        # while this positive proof holds.
+        for pid in _group_member_pids(pgid):
+            member_ticks = proc_start_ticks(pid)
+            if member_ticks is not None:
+                ledger[pid] = member_ticks
+        return _OwnedGroupView(leader_ours=True, pids=())
+    return _OwnedGroupView(leader_ours=False, pids=_ledger_owned_members(pgid, ledger))
+
+
+def _owned_group_view(job: ActiveJob) -> _OwnedGroupView:
+    """Classify one active job's numeric group against its carried identity.
+
+    Args:
+        job: The active job whose recorded group to inspect.
+
+    Returns:
+        The :class:`_OwnedGroupView` for the job's exact group.
+    """
+    return _classify_group(job.pgid, job.start_ticks, job.owned_members)
 
 
 def _signal_owned_group(job: ActiveJob, sig: int) -> None:
@@ -2021,30 +2158,27 @@ def _signal_owned_group(job: ActiveJob, sig: int) -> None:
 
     Identity is re-proven immediately before every emission so a proof never
     goes stale between SIGTERM and SIGKILL escalation: if the numeric PGID has
-    been recycled in the meantime, the new occupant is never signalled and the
-    old owned group is treated as gone.
+    been recycled in the meantime, neither the new occupant nor its descendants
+    are signalled, and only ledger-proven members receive the signal.
 
     Args:
         job: The active job whose exact group should receive ``sig``.
         sig: Signal number to deliver.
     """
-    view = _owned_group_view(job.pgid, job.start_ticks)
+    view = _owned_group_view(job)
     if view.leader_ours:
         _signal_group(job.pgid, sig)
         return
     for pid in view.pids:
-        # Just-in-time per-pid guard: re-read both identities at emission time.
+        # Just-in-time per-pid guard: re-read the identity at emission time.
         member_ticks = proc_start_ticks(pid)
-        if member_ticks is None:
+        if member_ticks is None or job.owned_members.get(pid) != member_ticks:
             continue
-        leader_ticks = proc_start_ticks(job.pgid)
-        if leader_ticks == job.start_ticks:
-            # The original leader is back in provable possession (never left):
-            # the whole exact group is ours again.
+        if proc_start_ticks(job.pgid) == job.start_ticks:
+            # The original leader is back in provable possession: the whole
+            # exact group is ours again.
             _signal_group(job.pgid, sig)
             return
-        if leader_ticks is not None and member_ticks >= leader_ticks:
-            continue
         try:
             os.kill(pid, sig)
         except ProcessLookupError:
@@ -2065,7 +2199,7 @@ def _owned_group_alive(job: ActiveJob) -> bool:
     Returns:
         ``True`` only when at least one provably-owned member is still alive.
     """
-    view = _owned_group_view(job.pgid, job.start_ticks)
+    view = _owned_group_view(job)
     return view.leader_ours or bool(view.pids)
 
 
@@ -2098,9 +2232,14 @@ def _terminate_one_group(pgid: int, start_ticks: int, cancel_grace_seconds: floa
 
     The exact identity (persisted start-time ticks) is re-verified at every
     stage — including immediately before the SIGKILL escalation — so a proof
-    that was valid at SIGTERM time cannot go stale: if the group empties and
-    its numeric id is recycled before escalation, the new occupant is never
-    signalled and the old owned group counts as converged.
+    that was valid at SIGTERM time cannot go stale: if the numeric id is
+    recycled before escalation, the new occupant and its descendants are never
+    signalled. Member identities are recorded into a local ledger while the
+    leader slot provably holds the recorded command, and only ledger-matching
+    members are signalled individually afterwards. Convergence is reported
+    only when the leader is no longer provably ours AND every provably-owned
+    member is gone; an unproven live occupant never counts as convergence of
+    the old owned group.
 
     Args:
         pgid: Exact process group id to terminate.
@@ -2109,31 +2248,38 @@ def _terminate_one_group(pgid: int, start_ticks: int, cancel_grace_seconds: floa
 
     Returns:
         ``True`` only when the old owned group is proven gone — no surviving
-        member of ours, and any current numeric occupant is a recycled
+        provably-owned member, and any current numeric occupant is a recycled
         stranger that must not be touched.
     """
+    ledger: dict[int, int] = {}
 
-    def _still_ours() -> bool:
-        live = proc_start_ticks(pgid)
-        return live is not None and live == start_ticks
+    def view() -> _OwnedGroupView:
+        return _classify_group(pgid, start_ticks, ledger)
 
-    if not _still_ours():
-        # Identity lost between decision and signal: never touch the number.
+    first = view()
+    if first.leader_ours:
+        _signal_group(pgid, signal.SIGTERM)
+    # Identity lost between decision and signal: only ledger-proven
+    # members may be signalled, never the numeric group.
+    elif not _signal_owned_pids(first.pids, signal.SIGTERM):
         return True
-    _signal_group(pgid, signal.SIGTERM)
     term_deadline = time.monotonic() + cancel_grace_seconds
     while time.monotonic() < term_deadline and group_has_members(pgid):
         time.sleep(0.05)
-    if _still_ours() and group_has_members(pgid):
+    escalated = view()
+    if escalated.leader_ours:
         _signal_group(pgid, signal.SIGKILL)
+    else:
+        _signal_owned_pids(escalated.pids, signal.SIGKILL)
     reap_deadline = time.monotonic() + cancel_grace_seconds
-    while time.monotonic() < reap_deadline and group_has_members(pgid):
-        if not _still_ours():
-            # Reuse happened mid-wait: our group is gone; the occupant is a
-            # stranger and must be left alone.
+    while time.monotonic() < reap_deadline:
+        current = view()
+        if not (current.leader_ours or current.pids):
             return True
         time.sleep(0.05)
-    return not _owned_group_view(pgid, start_ticks).pids
+    final = view()
+    # Terminal proof must cover the leader AND every provably-owned member.
+    return not (final.leader_ours or final.pids)
 
 
 def recover_owned_job_groups(
@@ -3553,6 +3699,14 @@ class Supervisor:
         self._next_reconnect_at = 0.0
         self._next_gc_at = 0.0
         self._started_at = time.time()
+        # Mark this worker as a child subreaper so orphaned descendants of the
+        # jobs it owns reparent to it, giving live group members a non-reusable
+        # lineage proof (see :func:`enable_child_subreaping`).
+        if not enable_child_subreaping():
+            LOGGER.warning(
+                "could not enable child subreaping; orphaned job group members "
+                "are converged only via the positive-proof member ledger"
+            )
         self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
         self._db_connected_at: float | None = None
         self._db_error_at: float | None = None
@@ -4900,7 +5054,7 @@ class Supervisor:
         conn: JobsConnection,
         job_id: UUID,
         gated: GatedSpawn,
-    ) -> str | None:
+    ) -> tuple[str | None, int]:
         """Obtain and durably persist the exact identity before any release.
 
         Fail-closed ordering: valid positive start-time ticks must be obtained
@@ -4916,10 +5070,14 @@ class Supervisor:
             gated: Handles and exact identity of the gated start.
 
         Returns:
-            The final stderr message when the start failed after convergence
-            (the caller must finalize failed), or ``None`` when persistence
-            positively proved the guarded update of exactly one owned running
-            row.
+            A pair of the final stderr message when the start failed after
+            convergence (the caller must finalize failed) — or ``None`` when
+            persistence positively proved the guarded update of exactly one
+            owned running row — together with the exact start-time ticks that
+            were obtained and persisted (``0`` on any failure). The returned
+            ticks are the authoritative in-memory identity of the command and
+            must be carried onto the active job unchanged, never re-read from
+            ``/proc`` after gate release.
 
         Raises:
             psycopg.Error: When persisting the identity fails with a
@@ -4939,7 +5097,7 @@ class Supervisor:
                     job_id,
                     exc.sqlstate or "N/A",
                 )
-                return "unable to record process identity; job not started"
+                return "unable to record process identity; job not started", 0
             if not persisted:
                 # Fail closed: zero rows matched, so this worker can no longer
                 # positively prove it still owns a same-server running row for
@@ -4950,8 +5108,8 @@ class Supervisor:
                     "for job %s; gated start aborted without executing user code",
                     job_id,
                 )
-                return "unable to record process identity; job not started"
-            return None
+                return "unable to record process identity; job not started", 0
+            return None, start_ticks
         # No durable exact identity exists, so this worker itself must own the
         # childless gated child to convergence before anything else.
         self._abort_and_converge(gated, job_id)
@@ -4961,7 +5119,7 @@ class Supervisor:
             job_id,
             gated.proc.pid,
         )
-        return "unable to record exact process identity; job not started"
+        return "unable to record exact process identity; job not started", 0
 
     def _activate_gated_job(
         self,
@@ -4993,13 +5151,17 @@ class Supervisor:
             converges the exact gated wrapper (terminal and reaped), so no
             untracked live group ever outlives this call.
         """
-        failure = self._pre_release_failure(conn, job_id, gated)
+        failure, start_ticks = self._pre_release_failure(conn, job_id, gated)
         if failure is None:
             # The exact identity is durably recorded. Release the gate so the
             # wrapper execs the user argv on the exact same PID, after which
             # normal supervision applies. A failed release is a start failure:
             # converge the live child first, then finalize failed.
             if release_gate(gated.gate_fd):
+                # Carry the exact ticks that were obtained and persisted before
+                # the gate release: exec keeps the identity, and /proc is never
+                # re-read after release. The member ledger is seeded with the
+                # persisted leader identity itself.
                 return ActiveJob(
                     id=job_id,
                     cwd=job_spec.cwd,
@@ -5009,9 +5171,8 @@ class Supervisor:
                     pgid=gated.pgid,
                     started_mono=time.monotonic(),
                     claimed_at=claim_mono,
-                    # Same process that durably persisted its identity before
-                    # release: exec does not change start-time ticks.
-                    start_ticks=proc_start_ticks(gated.proc.pid) or 0,
+                    start_ticks=start_ticks,
+                    owned_members={gated.proc.pid: start_ticks},
                 )
             self._abort_and_converge(gated, job_id)
             LOGGER.error(
