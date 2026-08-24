@@ -39,7 +39,7 @@ Supabase / PostgreSQL
 ChatGPT
 ```
 
-A basic protocol-v4 command submission, addressed to the execution server that must run it (`LUBKO_SERVER` of the target daemon; remember the returned UUID):
+A basic protocol-v4 command submission, addressed to the execution server that must run it (the non-empty `server` setting of the target daemon's private worker configuration file; remember the returned UUID):
 
 ```sql
 insert into lubko.jobs (payload)
@@ -153,7 +153,7 @@ Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` i
 
 Immutable historical output lives in separate `output_chunk` rows in the same two-column table, explicitly owned by a root job via `payload.thread`. Root live output tails are bounded rolling windows of the newest up to 4000 raw bytes per stream (decoded to at most 4000 characters), never shortened by archival rotation. Chunk insertion and the root `previous` pointer update are transactional, and the publication transaction first retains the root `command` row with a row-level lock so a root deleted concurrently leaves no new chunk rows.
 
-The worker atomically claims pending `command` rows whose `payload.server` exactly equals the daemon's configured `LUBKO_SERVER` identity, using PostgreSQL row locking and a JSON compare-and-swap, including `FOR UPDATE SKIP LOCKED`; jobs addressed to other servers stay pending untouched. Running jobs carry a lease (`payload.state.lease_expires_at`) refreshed by the owning worker's heartbeat; on crash/restart an expired lease is recovered by marking the abandoned job `failed` with a `payload.result.recovery_note` rather than re-executing it. A live job is never stolen, and recovery never lets two workers execute the same job concurrently. Timing is configurable (`LUBKO_LEASE_DURATION_SECONDS`, `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`, `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS`); see the README.
+The worker atomically claims pending `command` rows whose `payload.server` exactly equals the daemon's configured server identity (the non-empty `server` setting of its restricted worker configuration file), using PostgreSQL row locking and a JSON compare-and-swap, including `FOR UPDATE SKIP LOCKED`; jobs addressed to other servers stay pending untouched. Running jobs carry a lease (`payload.state.lease_expires_at`) refreshed by the owning worker's heartbeat; on crash/restart an expired lease is recovered by marking the abandoned job `failed` with a `payload.result.recovery_note` rather than re-executing it. A live job is never stolen, and recovery never lets two workers execute the same job concurrently. Timing is configurable (`LUBKO_LEASE_DURATION_SECONDS`, `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`, `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS`); see the README.
 
 One worker is a single nonblocking supervisor and runs arbitrarily many jobs concurrently; there is no application-level concurrency limit, so submitting several independent jobs lets them genuinely run at the same time.
 
@@ -167,7 +167,7 @@ live queue by stopping new submissions, let any in-flight work become durably
 terminal, `truncate lubko.jobs` while quiescent (truncating before applying is
 required; applying against nonconforming rows fails fast with an explicit
 diagnostic), apply `migrations/0003_protocol_v4_server_routing.sql`, start each
-daemon with its configured `LUBKO_SERVER` identity, and prove a fresh v4
+daemon with its configured server identity, and prove a fresh v4
 round trip. The end state is an empty `lubko.jobs` with no v3 or historical
 content left behind.
 

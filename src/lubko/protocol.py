@@ -43,7 +43,6 @@ from uuid import UUID
 
 PROTOCOL_VERSION: Final = 4
 
-SERVER_ENV: Final = "LUBKO_SERVER"
 
 JOB_TYPE_COMMAND: Final = "command"
 JOB_TYPE_OUTPUT_CHUNK: Final = "output_chunk"

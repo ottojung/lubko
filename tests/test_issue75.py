@@ -386,7 +386,6 @@ def _spawn_real_worker(
     """
     env = dict(os.environ)
     env["LUBKO_DATABASE_CONFIG"] = str(db_conf)
-    env["LUBKO_SERVER"] = "alpha-server"
     env["LUBKO_WORKER_ID"] = worker_id
     if token is not None:
         env["LUBKO_LIFECYCLE_TOKEN"] = token
@@ -600,16 +599,6 @@ def test_planned_replacement_drains_sigterm_ignoring_command(
         if worker.poll() is None:
             lifecycle.stop_worker(_meta_for_live(worker, tmp_path, worker_token), 5.0)
         _recover_incarnation(jobs_db, incarnation)
-
-
-@pytest.fixture(autouse=True)
-def _issue75_server_identity(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give every in-process probe an explicit protocol v4 server identity.
-
-    Protocol v4 has no implicit or default server: queue probes inserted by
-    ``verify_worker_consumes_queue`` must be addressed to a configured server.
-    """
-    monkeypatch.setenv("LUBKO_SERVER", "alpha-server")
 
 
 @pytest.fixture(autouse=True)

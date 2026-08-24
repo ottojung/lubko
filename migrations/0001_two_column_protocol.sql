@@ -43,7 +43,8 @@
 -- compatibility path; the physical schema is identical for v3 and v4. The
 -- cutover runs against the live queue: quiesce new submissions, let any
 -- in-flight v3 work become durably terminal, bring up and prove the v4
--- supervisor/worker with its configured LUBKO_SERVER identity, then
+-- supervisor/worker with its configured non-empty 'server' identity
+-- (from each restricted worker configuration file), then
 -- `truncate lubko.jobs` while quiescent (dropping every old root command row
 -- and every output_chunk row), and prove a fresh v4 round trip. Truncating
 -- before the first v4 start is equally valid; only the end state matters, and

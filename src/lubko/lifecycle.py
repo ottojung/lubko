@@ -41,7 +41,7 @@ import psycopg
 from psycopg.rows import tuple_row
 
 from lubko import cli, protocol, supervise, toolchain
-from lubko.config import load_database_config
+from lubko.config import load_database_config, load_worker_server
 from lubko.durable import remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
@@ -2053,23 +2053,24 @@ def _probe_server() -> str:
     """Return the configured server identity a probe job must be addressed to.
 
     The probe targets the local daemon, whose single configured server
-    identity comes from ``LUBKO_SERVER``; there is no implicit or default
-    server.
+    identity comes from the restricted worker configuration file; there is
+    no implicit or default server.
 
     Returns:
         The non-empty configured server identity.
 
     Raises:
-        RuntimeError: If ``LUBKO_SERVER`` is unset or empty.
+        RuntimeError: If the configured server identity cannot be loaded.
     """
-    server = os.environ.get("LUBKO_SERVER", "")
-    if not server:
+    try:
+        return load_worker_server()
+    except (OSError, ValueError) as exc:
         msg = (
-            "LUBKO_SERVER must name the target execution server for the probe "
-            "job; there is no implicit or default server"
+            "the worker configuration file must provide a non-empty 'server' "
+            "identity addressed by the probe job; there is no implicit or "
+            f"default server ({exc})"
         )
-        raise RuntimeError(msg)
-    return server
+        raise RuntimeError(msg) from exc
 
 
 def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:

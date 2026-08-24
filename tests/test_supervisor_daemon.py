@@ -237,7 +237,6 @@ def supervisor_env(
     """
     env = dict(os.environ)
     env["LUBKO_DATABASE_CONFIG"] = str(_database_config_file(pg_cluster, tmp_path))
-    env["LUBKO_SERVER"] = "alpha-server"
     env["LUBKO_SUPERVISOR_POLL_SECONDS"] = "0.1"
     env["LUBKO_SUPERVISOR_BACKOFF_BASE_SECONDS"] = "0.2"
     env["LUBKO_SUPERVISOR_BACKOFF_MAX_SECONDS"] = "2.0"

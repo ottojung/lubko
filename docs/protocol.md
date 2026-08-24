@@ -144,8 +144,9 @@ access contract.
 ## Server routing
 
 Protocol v4 introduces explicit execution-server routing. Every daemon runs
-with exactly one configured non-empty server identity (`LUBKO_SERVER`; it
-refuses to start without one), and every valid payload carries that identity:
+with exactly one configured non-empty server identity (the `server` setting
+of its restricted worker configuration file; it refuses to start without
+one), and every valid payload carries that identity:
 
 - **Claims** select only `pending` `command` rows whose `server` exactly equals
   the daemon's identity. Jobs addressed to other servers stay pending,
@@ -518,11 +519,16 @@ active process group (escalating to `SIGKILL` after the bounded grace period),
 finalizes the affected jobs when PostgreSQL is available, and removes temporary
 capture files.
 
-The worker behavior is configurable through environment variables:
+The worker behavior is configurable through environment variables, plus the
+execution-server identity which is never environmental: it is the required
+non-empty `server` setting of the restricted worker configuration file
+(`$XDG_CONFIG_HOME/lubko/worker.conf`, fallback `~/.config/lubko/worker.conf`,
+path selectable via `LUBKO_WORKER_CONFIG`, mode `0600`); a missing, malformed,
+empty, or group/world-accessible file
+makes the daemon (and every deploy-side readiness probe) fail closed.
 
 | Variable                                | Default | Meaning                                          |
 | --------------------------------------- | ------- | ------------------------------------------------ |
-| `LUBKO_SERVER`                          | — (required) | execution-server identity; claims only jobs addressed to it |
 | `LUBKO_LEASE_DURATION_SECONDS`          | `30`    | how far in the future a claim or heartbeat pushes the lease deadline |
 | `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`  | `5`     | how often the worker heartbeats its running jobs  |
 | `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS` | `10`    | how often a worker runs the stale-job recovery pass |
@@ -557,7 +563,8 @@ insert into lubko.jobs (payload)
 values ('{"v":4,"type":"command","server":"alpha-server","request":{"cwd":"...","process":["git","status"]},"state":{"status":"pending"}}');
 ```
 
-The job runs only on the daemon whose configured `LUBKO_SERVER` identity is
+The job runs only on the daemon whose configured server identity (the
+non-empty `server` setting of its restricted worker configuration file) is
 `alpha-server`; jobs addressed to other servers stay pending untouched.
 
 Upgrading an existing transport from v3 is a destructive cutover that replaces
@@ -569,7 +576,7 @@ become durably terminal, `truncate lubko.jobs` while quiescent (discarding
 every old root `command` row and `output_chunk` history — truncating before
 applying is **required**; applying against nonconforming rows fails fast with
 an explicit diagnostic), apply the migration, start each daemon with its
-configured `LUBKO_SERVER` identity, and prove a fresh v4 round trip.
+configured server identity, and prove a fresh v4 round trip.
 Old v3 contents are discarded; there is no protocol-data drain/migration path,
 and no v3 row is transformed or preserved. Only the payload protocol version
 and the shape constraint change; the physical schema stays the canonical

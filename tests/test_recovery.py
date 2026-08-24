@@ -366,7 +366,6 @@ def test_worker_crash_is_recovered_by_replacement_worker(
     conf.chmod(0o600)
     env = dict(os.environ)
     env["LUBKO_DATABASE_CONFIG"] = str(conf)
-    env["LUBKO_SERVER"] = "alpha-server"
     env["LUBKO_POLL_INTERVAL_SECONDS"] = "0.05"
     env["LUBKO_PROCESS_POLL_INTERVAL_SECONDS"] = "0.01"
     env["LUBKO_LEASE_DURATION_SECONDS"] = "1.0"

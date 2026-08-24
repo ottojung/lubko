@@ -34,17 +34,19 @@ from lubko.state import rollback_state_path
 from lubko.worker import JOB_ID_ENV, delete_job_and_chunks, request_cancel
 from tests import _pg
 from tests import _process_guard as guard
+from tests.conftest import write_worker_server_config
 from tests.test_cli import fake_uv_sync, make_repo
 
 
 @pytest.fixture(autouse=True)
-def _probe_server_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+def _probe_server_identity() -> None:
     """Give every lifecycle test and spawned daemon an explicit server identity.
 
     Protocol v4 has no implicit or default server: probes are addressed to the
-    configured ``LUBKO_SERVER`` identity, and worker subprocesses inherit it.
+    server identity configured in the isolated worker configuration file, and
+    worker subprocesses read the same file.
     """
-    monkeypatch.setenv("LUBKO_SERVER", "probe-server")
+    write_worker_server_config("probe-server")
 
 
 MARKER: Final = "test-marker"

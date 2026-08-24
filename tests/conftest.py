@@ -445,3 +445,53 @@ def jobs_db(pg_cluster: _pg.PgCluster) -> str:
         conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
         conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
     return pg_cluster.conninfo()
+
+
+@pytest.fixture(autouse=True)
+def _worker_server_config(
+    _isolated_lubko_state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Provide a valid private worker configuration for the current test.
+
+    The worker and every deploy-side probe read the execution-server identity
+    from the restricted worker configuration file. Each test gets a fresh
+    ``worker.conf`` with a non-empty server; tests that need another identity
+    (or a deliberately missing/corrupt config) rewrite or remove this file.
+    ``LUBKO_WORKER_CONFIG`` pins the path so tests that switch
+    ``XDG_CONFIG_HOME`` (e.g. dual-stack isolation tests) still resolve the
+    per-test private configuration.
+
+    Args:
+        _isolated_lubko_state: The pytest-owned XDG root for this test.
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        The worker configuration file path.
+    """
+    config_dir = Path(os.environ["XDG_CONFIG_HOME"]) / "lubko"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_file = config_dir / "worker.conf"
+    config_file.write_text("server = alpha-server\n", encoding="utf-8")
+    config_file.chmod(0o600)
+    monkeypatch.setenv("LUBKO_WORKER_CONFIG", str(config_file))
+    return config_file
+
+
+def write_worker_server_config(server: str) -> Path:
+    """Rewrite the isolated worker configuration with one server identity.
+
+    Args:
+        server: Non-empty execution-server identity to configure.
+
+    Returns:
+        The worker configuration file path.
+    """
+    config_file = Path(
+        os.environ.get("LUBKO_WORKER_CONFIG")
+        or Path(os.environ["XDG_CONFIG_HOME"]) / "lubko" / "worker.conf"
+    )
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(f"server = {server}\n", encoding="utf-8")
+    config_file.chmod(0o600)
+    return config_file
