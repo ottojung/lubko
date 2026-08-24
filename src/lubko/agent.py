@@ -1259,8 +1259,13 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     update_meta(aid, lambda m: _clear_pending(m, prompt))
     try:
         log = ctx.log_path.open("ab")
-    except OSError:
-        return None  # agent directory no longer exists
+    except OSError as exc:
+        # Fail closed on real spool/log failures (e.g. EACCES, EIO, EDQUOT);
+        # only an intentionally deleted agent directory exits benignly.
+        if isinstance(exc, FileNotFoundError) and not agent_dir(aid).is_dir():
+            return None  # agent directory intentionally deleted; metadata is gone
+        _fail_invocation_closed(aid, f"failed to open agent log: {exc}")
+        return None
     with log:
         try:
             proc = subprocess.Popen(
@@ -1276,8 +1281,7 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
         except OSError as exc:
             error = str(exc)
             log.write(f"LUBKO RUNNER: failed to start agent: {error}\n".encode("utf-8", "replace"))
-            update_meta(aid, lambda m: _finalize_terminal(m, 127, None, "failed", error))
-            update_meta(aid, lambda m: _set_active_runner(m, value=False))
+            _fail_invocation_closed(aid, error, exit_code=127)
             return None
 
         start = proc_start_ticks(proc.pid)
@@ -1297,6 +1301,26 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
         update_meta(aid, _finalize_after(rc))
 
     return _drain_next(aid)
+
+
+def _fail_invocation_closed(aid: str, error: str, *, exit_code: int | None = None) -> None:
+    """Atomically finalize a failed invocation and deactivate the runner.
+
+    Terminal failure and runner deactivation (including reservation cleanup)
+    land in one metadata mutation under the lock, so a crash between the two
+    can never leave terminal state with ``active_runner`` stuck true.
+
+    Args:
+        aid: Lubko agent ID.
+        error: Failure note recorded with the terminal state.
+        exit_code: Optional synthetic exit code for the terminal record.
+    """
+
+    def fail(m: Meta) -> None:
+        _finalize_terminal(m, exit_code, None, "failed", error)
+        _set_active_runner(m, value=False)
+
+    update_meta(aid, fail)
 
 
 def _wait_for_invocation_exit(
