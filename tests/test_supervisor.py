@@ -32,6 +32,7 @@ import pytest
 from lubko import health
 from lubko import worker as worker_module
 from lubko.config import DatabaseConfig
+from lubko.health import proc_start_ticks
 from lubko.protocol import (
     OUTPUT_CHUNK_MAX_BYTES,
     ProtocolError,
@@ -1422,6 +1423,7 @@ def _publish_job_for(job_id: UUID, cwd: str) -> ActiveJob:
         proc=proc,
         pid=proc.pid,
         pgid=proc.pid,
+        start_ticks=proc_start_ticks(proc.pid) or 0,
         started_mono=time.monotonic(),
         claimed_at=time.time(),
     )
@@ -3033,10 +3035,11 @@ def test_shutdown_withholds_drain_sentinel_when_group_proof_fails(
     """No clean-drain sentinel is emitted while an exact group is unproven.
 
     Fault injection: ``group_has_members`` reports the running job's exact
-    group as permanently member-occupied, so the final post-SIGKILL proof
-    fails. Shutdown must NOT write the drain sentinel and must retain the job
-    (never terminalize/untrack it), keeping its running row exactly
-    recoverable by emergency recovery.
+    group as permanently member-occupied AND its leader identity keeps
+    matching the persisted start-time ticks, so the final post-SIGKILL proof
+    fails for a provably-owned surviving group. Shutdown must NOT write the
+    drain sentinel and must retain the job (never terminalize/untrack it),
+    keeping its running row exactly recoverable by emergency recovery.
     """
     job_id = insert_job(jobs_db, str(tmp_path), "sleep 300")
     settings = supervisor_settings(f"sentinel-{uuid4().hex[:8]}")
@@ -3044,14 +3047,22 @@ def test_shutdown_withholds_drain_sentinel_when_group_proof_fails(
         wait_until(lambda: read_status(jobs_db, job_id) == "running")
         payload = read_root(jobs_db, job_id)
         pgid = int(payload["state"]["process_pgid"])
+        start_ticks = int(payload["state"]["process_start_time_ticks"])
         real_has_members = group_has_members
+        real_ticks = proc_start_ticks
 
         def _survives(pgid_arg: int) -> bool:
             if pgid_arg == pgid:
                 return True
             return real_has_members(pgid_arg)
 
+        def _immortal_leader(pid: int) -> int | None:
+            if pid == pgid:
+                return start_ticks
+            return real_ticks(pid)
+
         monkeypatch.setattr(worker_module, "group_has_members", _survives)
+        monkeypatch.setattr(worker_module, "proc_start_ticks", _immortal_leader)
         supervisor.request_shutdown()
 
     # No clean-drain sentinel may exist while the exact group remains.

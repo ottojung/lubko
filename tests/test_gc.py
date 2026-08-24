@@ -21,6 +21,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from lubko.health import proc_start_ticks
 from lubko.worker import (
     OUTPUT_STREAMS,
     ActiveJob,
@@ -1157,6 +1158,7 @@ def test_gc_mark_prevents_publication_no_orphan_chunks(db: str, tmp_path: Path) 
             proc=proc,
             pid=proc.pid,
             pgid=proc.pid,
+            start_ticks=proc_start_ticks(proc.pid) or 0,
             started_mono=0.0,
             claimed_at=0.0,
         )

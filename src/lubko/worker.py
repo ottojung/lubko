@@ -421,6 +421,11 @@ class ActiveJob:
     # at commit time and never at spawn. Drives lease-safety eviction so a
     # process can never outlive its database lease.
     last_heartbeat_at: float = 0.0
+    # Exact start-time clock ticks of the command process (== group leader),
+    # durably persisted before gate release. This is the non-reusable identity
+    # proof that keeps every live supervision/drain/shutdown group decision
+    # from ever mistaking a numerically recycled PGID for this job's group.
+    start_ticks: int = 0
 
 
 @dataclass(slots=True)
@@ -1917,6 +1922,154 @@ def _group_reclaim_decision(pgid: int, start_ticks: int | None) -> GroupReclaimD
 
 
 @dataclass(frozen=True)
+class _OwnedGroupView:
+    """Exact-identity view of one recorded command group at observation time.
+
+    Attributes:
+        leader_ours: ``True`` when the process currently occupying the leader
+            slot (pid == pgid) provably is the recorded command (its live
+            start-time ticks match the persisted identity). The whole numeric
+            group is then ours by construction and may be signalled as such.
+        pids: Live member pids that are provably original members of the
+            recorded group even though the leader slot does not prove it (the
+            leader exited, or the numeric PGID was recycled by an unrelated
+            later leader). Only these pids — never the whole numeric group —
+            may be signalled individually.
+    """
+
+    leader_ours: bool
+    pids: tuple[int, ...]
+
+
+def _group_member_pids(pgid: int) -> list[int]:
+    """Return live pids whose exact process group equals ``pgid``.
+
+    Args:
+        pgid: Process group identifier to inspect.
+
+    Returns:
+        Every live pid in the exact group (empty when none).
+    """
+    proc_dir = Path("/proc")
+    if proc_dir.is_dir():
+        return [
+            int(entry.name)
+            for entry in proc_dir.iterdir()
+            if entry.name.isdigit() and _process_pgrp(int(entry.name)) == pgid
+        ]
+    try:
+        os.getpgid(pgid)
+    except ProcessLookupError:
+        return []
+    return [pgid]
+
+
+def _owned_group_view(pgid: int, start_ticks: int | None) -> _OwnedGroupView:
+    """Classify a numeric group against a job's persisted exact identity.
+
+    A numeric PGID is reusable once its group empties, so bare membership can
+    never authorize signalling. Membership counts as *ours* only under a
+    non-reusable proof:
+
+    * the live process at the leader slot (pid == pgid) has start-time ticks
+      exactly equal to the persisted identity (leader and all members are
+      then descendants of our own command), or
+    * there is no live process at the leader slot — reuse requires an empty
+      group, so every current member must be an original descendant — or
+    * a member's own start ticks predate the ticks of an unrelated recycled
+      leader occupying the slot (it forked from our group before the group
+      ever emptied).
+
+    Anything else is treated as not ours and is never signalled.
+
+    Args:
+        pgid: The recorded process group id.
+        start_ticks: The persisted command start-time ticks (``None`` or
+            non-positive when no valid identity was recorded).
+
+    Returns:
+        The :class:`_OwnedGroupView` proving which parts of the numeric group,
+        if any, still belong to the recorded job.
+    """
+    if not group_has_members(pgid):
+        return _OwnedGroupView(leader_ours=False, pids=())
+    leader_ticks = proc_start_ticks(pgid)
+    identity_valid = isinstance(start_ticks, int) and start_ticks > 0
+    if leader_ticks is not None:
+        if identity_valid and leader_ticks == start_ticks:
+            return _OwnedGroupView(leader_ours=True, pids=())
+        # The leader slot holds a different process than the recorded command:
+        # either a recycled numeric PGID or an unreadable identity. Only
+        # members proven to predate the occupant remain ours; the occupant
+        # itself (pid == pgid) is never signalled.
+        pids = tuple(
+            pid
+            for pid in _group_member_pids(pgid)
+            if pid != pgid
+            and (member_ticks := proc_start_ticks(pid)) is not None
+            and leader_ticks > member_ticks
+        )
+        return _OwnedGroupView(leader_ours=False, pids=pids)
+    # No live process at the leader slot: the numeric id cannot have been
+    # re-created while the group still has members, so every member is an
+    # original descendant of the recorded command.
+    return _OwnedGroupView(leader_ours=False, pids=tuple(_group_member_pids(pgid)))
+
+
+def _signal_owned_group(job: ActiveJob, sig: int) -> None:
+    """Signal only the provably-owned portion of a job's recorded group.
+
+    Identity is re-proven immediately before every emission so a proof never
+    goes stale between SIGTERM and SIGKILL escalation: if the numeric PGID has
+    been recycled in the meantime, the new occupant is never signalled and the
+    old owned group is treated as gone.
+
+    Args:
+        job: The active job whose exact group should receive ``sig``.
+        sig: Signal number to deliver.
+    """
+    view = _owned_group_view(job.pgid, job.start_ticks)
+    if view.leader_ours:
+        _signal_group(job.pgid, sig)
+        return
+    for pid in view.pids:
+        # Just-in-time per-pid guard: re-read both identities at emission time.
+        member_ticks = proc_start_ticks(pid)
+        if member_ticks is None:
+            continue
+        leader_ticks = proc_start_ticks(job.pgid)
+        if leader_ticks == job.start_ticks:
+            # The original leader is back in provable possession (never left):
+            # the whole exact group is ours again.
+            _signal_group(job.pgid, sig)
+            return
+        if leader_ticks is not None and member_ticks >= leader_ticks:
+            continue
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            LOGGER.debug("process %d already gone", pid)
+
+
+def _owned_group_alive(job: ActiveJob) -> bool:
+    """Return whether any member provably belonging to the job's group lives.
+
+    A numerically recycled PGID occupied by an unrelated process does NOT keep
+    the old owned group alive: on identity mismatch the old group is treated
+    as gone so terminalization, drain, and shutdown can never be blocked (nor
+    authorized to signal) by a stranger.
+
+    Args:
+        job: The active job whose recorded group to inspect.
+
+    Returns:
+        ``True`` only when at least one provably-owned member is still alive.
+    """
+    view = _owned_group_view(job.pgid, job.start_ticks)
+    return view.leader_ours or bool(view.pids)
+
+
+@dataclass(frozen=True)
 class ReclaimedGroups:
     """Exact-owned command groups after an emergency recovery pass.
 
@@ -1940,28 +2093,47 @@ class ReclaimedGroups:
     unresolved: list[int]
 
 
-def _terminate_one_group(pgid: int, cancel_grace_seconds: float) -> bool:
-    """Ask one exact process group to terminate, then SIGKILL and reap it.
+def _terminate_one_group(pgid: int, start_ticks: int, cancel_grace_seconds: float) -> bool:
+    """Ask one exact owned process group to terminate, then SIGKILL and reap it.
+
+    The exact identity (persisted start-time ticks) is re-verified at every
+    stage — including immediately before the SIGKILL escalation — so a proof
+    that was valid at SIGTERM time cannot go stale: if the group empties and
+    its numeric id is recycled before escalation, the new occupant is never
+    signalled and the old owned group counts as converged.
 
     Args:
         pgid: Exact process group id to terminate.
+        start_ticks: Persisted start-time ticks proving ownership of pgid.
         cancel_grace_seconds: Grace before escalating to SIGKILL.
 
     Returns:
-        ``True`` only when the group is proven to have no surviving members
-        after the SIGKILL + reap wait, so the caller knows it is safe to treat
-        the recovery as complete.
+        ``True`` only when the old owned group is proven gone — no surviving
+        member of ours, and any current numeric occupant is a recycled
+        stranger that must not be touched.
     """
+
+    def _still_ours() -> bool:
+        live = proc_start_ticks(pgid)
+        return live is not None and live == start_ticks
+
+    if not _still_ours():
+        # Identity lost between decision and signal: never touch the number.
+        return True
     _signal_group(pgid, signal.SIGTERM)
     term_deadline = time.monotonic() + cancel_grace_seconds
     while time.monotonic() < term_deadline and group_has_members(pgid):
         time.sleep(0.05)
-    if group_has_members(pgid):
+    if _still_ours() and group_has_members(pgid):
         _signal_group(pgid, signal.SIGKILL)
     reap_deadline = time.monotonic() + cancel_grace_seconds
     while time.monotonic() < reap_deadline and group_has_members(pgid):
+        if not _still_ours():
+            # Reuse happened mid-wait: our group is gone; the occupant is a
+            # stranger and must be left alone.
+            return True
         time.sleep(0.05)
-    return not group_has_members(pgid)
+    return not _owned_group_view(pgid, start_ticks).pids
 
 
 def recover_owned_job_groups(
@@ -2009,7 +2181,7 @@ def recover_owned_job_groups(
         if decision is GroupReclaimDecision.GONE:
             continue
         if decision is GroupReclaimDecision.RECLAIM:
-            if _terminate_one_group(pgid, cancel_grace_seconds):
+            if _terminate_one_group(pgid, start_ticks or 0, cancel_grace_seconds):
                 reaped.append(pgid)
             else:
                 surviving.append(pgid)
@@ -3954,7 +4126,7 @@ class Supervisor:
         conn = self.conn
         now = time.monotonic()
         for job in list(self.active.values()):
-            if job.quarantined and job.completed and not group_has_members(job.pgid):
+            if job.quarantined and job.completed and not _owned_group_alive(job):
                 cleanup_job(job)
                 job.finalized = True
                 self.active.pop(job.id, None)
@@ -3962,7 +4134,7 @@ class Supervisor:
             if (
                 job.quarantine_pending
                 and job.completed
-                and not group_has_members(job.pgid)
+                and not _owned_group_alive(job)
                 and conn is not None
             ):
                 if now < job.quarantine_next_retry_at:
@@ -4039,7 +4211,7 @@ class Supervisor:
         """
         job.spool_evicted = True
         request_stop(job, STOP_REASON_SPOOL)
-        if not (job.completed and not group_has_members(job.pgid)):
+        if not (job.completed and not _owned_group_alive(job)):
             # Still running (or leftover group members alive): keep ownership
             # until the stop escalation proves the exact group is gone.
             return
@@ -4473,7 +4645,7 @@ class Supervisor:
                 continue
             if job.quarantined or job.quarantine_pending:
                 continue
-            if group_has_members(job.pgid):
+            if _owned_group_alive(job):
                 continue
             self._try_finalize_one_completed(job)
 
@@ -4837,6 +5009,9 @@ class Supervisor:
                     pgid=gated.pgid,
                     started_mono=time.monotonic(),
                     claimed_at=claim_mono,
+                    # Same process that durably persisted its identity before
+                    # release: exec does not change start-time ticks.
+                    start_ticks=proc_start_ticks(gated.proc.pid) or 0,
                 )
             self._abort_and_converge(gated, job_id)
             LOGGER.error(
@@ -5069,7 +5244,7 @@ class Supervisor:
             # terminalize/untrack those jobs (their running rows keep the exact
             # persisted identity recoverable by emergency recovery), and fail
             # loudly in the log so the outer authority holds instead of reaping.
-            surviving = [job.pgid for job in self.active.values() if group_has_members(job.pgid)]
+            surviving = [job.pgid for job in self.active.values() if _owned_group_alive(job)]
             LOGGER.error(
                 "shutdown cannot prove groups %s member-free; withholding the "
                 "drain sentinel and retaining their jobs for exact-identity "
@@ -5124,7 +5299,7 @@ class Supervisor:
             with suppress(Exception):
                 job.proc.wait(timeout=self.settings.cancel_grace_seconds)
         self._drain_captures()
-        return all(not group_has_members(job.pgid) for job in self.active.values())
+        return all(not _owned_group_alive(job) for job in self.active.values())
 
     def _observe_and_escalate(self, job: ActiveJob, now: float) -> bool:
         """Poll one child, escalate its in-flight stop, and report whether it is gone.
@@ -5148,7 +5323,7 @@ class Supervisor:
             if returncode is not None:
                 job.completed = True
                 job.returncode = returncode
-        if job.completed and not job.term_sent and group_has_members(job.pgid):
+        if job.completed and not job.term_sent and _owned_group_alive(job):
             LOGGER.info(
                 "reaping leftover process group %d of completed job %s",
                 job.pgid,
@@ -5158,9 +5333,9 @@ class Supervisor:
         if job.term_sent and not job.kill_sent and job.stop_started is not None:
             grace_elapsed = now - job.stop_started >= self.settings.cancel_grace_seconds
             leader_alive = job.proc.poll() is None
-            if grace_elapsed and (leader_alive or group_has_members(job.pgid)):
+            if grace_elapsed and (leader_alive or _owned_group_alive(job)):
                 signal_kill(job)
-        return job.completed and not group_has_members(job.pgid)
+        return job.completed and not _owned_group_alive(job)
 
     def _finalize_all_for_shutdown(self, *, retain_groups: list[int] | None = None) -> None:
         """Finalize every tracked job when PostgreSQL is available.
@@ -5265,7 +5440,7 @@ def request_stop(job: ActiveJob, reason: str) -> None:
     job.stop_started = time.monotonic()
     job.stop_reason = reason
     job.cancellation_note = _stop_note(reason)
-    _signal_group(job.pgid, signal.SIGTERM)
+    _signal_owned_group(job, signal.SIGTERM)
 
 
 def request_group_reap(job: ActiveJob) -> None:
@@ -5284,7 +5459,7 @@ def request_group_reap(job: ActiveJob) -> None:
         return
     job.term_sent = True
     job.stop_started = time.monotonic()
-    _signal_group(job.pgid, signal.SIGTERM)
+    _signal_owned_group(job, signal.SIGTERM)
 
 
 def signal_kill(job: ActiveJob) -> None:
@@ -5294,7 +5469,7 @@ def signal_kill(job: ActiveJob) -> None:
         job: The active job whose group still has members.
     """
     job.kill_sent = True
-    _signal_group(job.pgid, signal.SIGKILL)
+    _signal_owned_group(job, signal.SIGKILL)
     if job.cancellation_note is not None:
         job.cancellation_note = f"{job.cancellation_note}; grace period expired, sent SIGKILL"
 

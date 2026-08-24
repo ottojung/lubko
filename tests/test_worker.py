@@ -21,6 +21,7 @@ import pytest
 
 from lubko import worker
 from lubko.config import DatabaseConfig
+from lubko.health import proc_start_ticks
 from lubko.protocol import (
     OUTPUT_CHUNK_MAX_BYTES,
     OUTPUT_TAIL_MAX_BYTES,
@@ -346,6 +347,7 @@ def make_active_job(tmp_path: Path, *, process: tuple[str, ...] = SLEEP_30) -> A
         proc=proc,
         pid=proc.pid,
         pgid=proc.pid,
+        start_ticks=proc_start_ticks(proc.pid) or 0,
         started_mono=time.monotonic(),
         claimed_at=time.time(),
     )
@@ -1318,6 +1320,7 @@ def test_publish_output_trim_does_not_signal_process_group(
             proc=proc,
             pid=proc.pid,
             pgid=pgid,
+            start_ticks=proc_start_ticks(proc.pid) or 0,
             started_mono=time.monotonic(),
             claimed_at=time.time(),
         )
@@ -1483,6 +1486,7 @@ def test_request_stop_sends_sigterm_to_exact_group(tmp_path: Path) -> None:
             proc=proc,
             pid=proc.pid,
             pgid=pgid,
+            start_ticks=proc_start_ticks(proc.pid) or 0,
             started_mono=time.monotonic(),
             claimed_at=time.time(),
         )
@@ -1588,6 +1592,7 @@ def test_request_group_reap_preserves_natural_status(tmp_path: Path) -> None:
             proc=proc,
             pid=proc.pid,
             pgid=pgid,
+            start_ticks=proc_start_ticks(proc.pid) or 0,
             started_mono=time.monotonic(),
             claimed_at=time.time(),
         )
@@ -1623,6 +1628,7 @@ def test_signal_kill_does_not_note_natural_reap(tmp_path: Path) -> None:
             proc=proc,
             pid=proc.pid,
             pgid=proc.pid,
+            start_ticks=proc_start_ticks(proc.pid) or 0,
             started_mono=time.monotonic(),
             claimed_at=time.time(),
         )
@@ -1658,6 +1664,7 @@ def test_signal_kill_appends_diagnostic(tmp_path: Path) -> None:
             proc=proc,
             pid=proc.pid,
             pgid=proc.pid,
+            start_ticks=proc_start_ticks(proc.pid) or 0,
             started_mono=time.monotonic(),
             claimed_at=time.time(),
         )
@@ -1715,6 +1722,7 @@ def test_bounded_spool_backpressures_fast_sigterm_ignoring_producer(
         proc=proc,
         pid=proc.pid,
         pgid=pgid,
+        start_ticks=proc_start_ticks(proc.pid) or 0,
         started_mono=time.monotonic(),
         claimed_at=time.time(),
     )
@@ -1975,6 +1983,7 @@ def test_bad_capture_fd_is_isolated_from_healthy_sibling(tmp_path: Path) -> None
         proc=proc,
         pid=proc.pid,
         pgid=pgid,
+        start_ticks=proc_start_ticks(proc.pid) or 0,
         started_mono=time.monotonic(),
         claimed_at=time.time(),
     )
@@ -2073,6 +2082,7 @@ def test_exit_drains_more_than_one_chunk_to_eof(tmp_path: Path) -> None:
         proc=proc,
         pid=proc.pid,
         pgid=pgid,
+        start_ticks=proc_start_ticks(proc.pid) or 0,
         started_mono=time.monotonic(),
         claimed_at=time.time(),
     )
@@ -2296,6 +2306,7 @@ def test_aggregate_spool_backpressures_both_streams_simultaneously(tmp_path: Pat
         proc=proc,
         pid=proc.pid,
         pgid=pgid,
+        start_ticks=proc_start_ticks(proc.pid) or 0,
         started_mono=time.monotonic(),
         claimed_at=time.time(),
     )
@@ -2994,6 +3005,7 @@ def test_running_capture_failure_retains_ownership_until_group_gone(
         proc=proc,
         pid=proc.pid,
         pgid=os.getpgid(proc.pid),
+        start_ticks=proc_start_ticks(proc.pid) or 0,
         started_mono=time.monotonic(),
         claimed_at=time.time(),
     )
@@ -3219,3 +3231,181 @@ def test_post_popen_failure_owns_exact_child_until_reaped(
     assert polls["n"] > hold_polls, "spawn must poll past the hold before raising"
     # The convergence closed every descriptor and removed the spool files.
     assert len(list(Path("/proc/self/fd").iterdir())) == fd_baseline
+
+
+# ---------------------------------------------------------------------------
+# Exact group identity under numeric PGID reuse (injected identity seams)
+# ---------------------------------------------------------------------------
+
+
+def _identity_seams(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pgid: int,
+    recorded_ticks: int,
+    leader_ticks: int | None,
+    members: list[int],
+) -> list[tuple[int, int]]:
+    """Install injected PGID-identity seams and return the signal spy log.
+
+    Models a ``/proc`` identity layer deterministically: the leader slot at
+    ``pgid`` reports ``leader_ticks`` (``None`` when no live leader exists),
+    every pid in ``members`` belongs to the exact group, and any other member
+    pid reports ticks strictly greater than ``recorded_ticks``. Group and
+    per-pid signals are both recorded instead of delivered.
+
+    Returns:
+        The recorded signal events as (target, signal-number) pairs.
+    """
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == pgid else group_has_members(g)
+    )
+    monkeypatch.setattr(
+        worker,
+        "proc_start_ticks",
+        lambda pid: (
+            leader_ticks if pid == pgid else (recorded_ticks + 1 if pid in members else None)
+        ),
+    )
+    monkeypatch.setattr(worker, "_group_member_pids", lambda g: list(members) if g == pgid else [])
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    return events
+
+
+def _spy_supervisor() -> Supervisor:
+    """Build a supervisor that never touches a real database.
+
+    Returns:
+        A supervisor wired to unreachable database settings.
+    """
+    db = DatabaseConfig(host="h", port=1, dbname="d", user="u", password=str(uuid4()))
+    return Supervisor(make_settings(), db)
+
+
+def test_recycled_pgid_is_never_signalled_and_never_blocks_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recycled numeric PGID is never signalled and never blocks finalization.
+
+    A completed job's recorded group id is occupied by an unrelated later
+    process (different start-time ticks). No TERM or KILL may reach the number,
+    and the old owned group counts as gone so supervision, drain, and shutdown
+    all converge.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.returncode = 0
+    job.start_ticks = 424242
+    events = _identity_seams(
+        monkeypatch,
+        pgid=job.pgid,
+        recorded_ticks=job.start_ticks,
+        leader_ticks=999_999,
+        members=[job.pgid],
+    )
+
+    request_stop(job, "cancel")
+    request_group_reap(job)
+    signal_kill(job)
+    assert not events
+
+    supervisor = _spy_supervisor()
+    assert supervisor._observe_and_escalate(job, time.monotonic()) is True
+    supervisor.active[job.id] = job
+    assert supervisor._drain_active_groups() is True
+    assert supervisor._shutdown is not None
+    surviving = [j.pgid for j in supervisor.active.values() if worker._owned_group_alive(j)]
+    assert not surviving
+
+
+def test_surviving_owned_descendants_converge_before_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Genuine descendants of an exited owned leader are signalled individually.
+
+    The original leader exited but a descendant forked before it died still
+    lives in the exact group. The ownership proof must keep succeeding for the
+    descendant: it receives SIGTERM by exact pid, finalization stays withheld
+    while it lives, and observation proves the group gone once it exits.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.returncode = 0
+    job.start_ticks = 1000
+    descendant = job.pgid + 7
+    members = [descendant]
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == job.pgid else False
+    )
+    monkeypatch.setattr(
+        worker,
+        "proc_start_ticks",
+        lambda pid: None if pid == job.pgid else (job.start_ticks + 1 if pid in members else None),
+    )
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+
+    request_group_reap(job)
+    assert events == [(descendant, signal.SIGTERM)]
+
+    supervisor = _spy_supervisor()
+    assert supervisor._observe_and_escalate(job, time.monotonic()) is False
+
+    members.clear()
+    assert supervisor._observe_and_escalate(job, time.monotonic()) is True
+
+
+def test_kill_escalation_reproves_identity_after_term(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A TERM-to-KILL escalation re-proves ownership at emission time.
+
+    SIGTERM went out while the group was provably ours; by escalation time the
+    group emptied and its numeric id was recycled. The KILL must never reach
+    the new occupant, and the old owned group is treated as gone.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.term_sent = True
+    job.stop_started = time.monotonic() - 3600.0
+    job.start_ticks = 424242
+    events = _identity_seams(
+        monkeypatch,
+        pgid=job.pgid,
+        recorded_ticks=job.start_ticks,
+        leader_ticks=999_999,
+        members=[job.pgid],
+    )
+
+    supervisor = _spy_supervisor()
+    assert supervisor._observe_and_escalate(job, time.monotonic()) is True
+    assert not events
+
+
+def test_recovery_escalation_never_kills_a_recycled_occupant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Emergency recovery re-verifies identity between SIGTERM and SIGKILL.
+
+    Recovery proves ownership once and sends SIGTERM; before the SIGKILL
+    escalation the numeric id is recycled. Only the verified SIGTERM may have
+    been emitted and the old owned group converges without blocking.
+    """
+    pgid = 5150
+    recorded_ticks = 777
+
+    def fake_members(g: int) -> bool:
+        return g == pgid
+
+    monkeypatch.setattr(worker, "group_has_members", fake_members)
+    ticks = iter([recorded_ticks] + [999_999] * 32)
+    monkeypatch.setattr(worker, "proc_start_ticks", lambda _pid: next(ticks))
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+
+    assert worker._terminate_one_group(pgid, recorded_ticks, cancel_grace_seconds=0.0) is True
+    assert events == [(pgid, signal.SIGTERM)]
