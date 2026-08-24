@@ -1,13 +1,16 @@
-"""Regression tests for legacy rollback live-child convergence (#182)."""
+"""Rollback spawns must be converged before any retry can start another."""
 
 from __future__ import annotations
 
 import subprocess
+import time
 
 import pytest
 
 from lubko import deployctl as dc
-from tests.test_deployctl import pending_state
+from lubko import lifecycle
+
+COMMIT = "a" * 40
 
 
 class FakePopen:
@@ -62,13 +65,61 @@ class FakePopen:
         return self.returncode
 
 
-@pytest.fixture
-def identity_timeout_state() -> dc.RollbackState:
-    """Return a pending rollback mission whose previous worker is retiring.
+def pending_state(*, previous_retiring: bool = False) -> dc.RollbackState:
+    """Return a live pending deployment state.
+
+    Args:
+        previous_retiring: Whether the previous worker's retirement has begun.
 
     Returns:
-        A rollback mission in the ``previous_retiring`` phase, so
-        ``_restart_previous`` takes the fresh-spawn path.
+        A pending rollback state with distinct old/new commits.
+    """
+
+    def worker_meta(commit: str, *, pid: int) -> lifecycle.WorkerMeta:
+        return lifecycle.WorkerMeta(
+            schema_version=lifecycle.SCHEMA_VERSION,
+            state=lifecycle.STATE_RUNNING,
+            pid=pid,
+            pgid=pid,
+            sid=pid,
+            start_time_ticks=pid * 10,
+            token=f"token-{pid}",
+            repo="/workspace/Lubko",
+            git_commit=commit,
+            worker_id="test-worker",
+            log_path="/workspace/worker.log",
+            started_at=1.0,
+            stopped_at=None,
+        )
+
+    old = "1" * 40
+    new = "2" * 40
+    return dc.RollbackState(
+        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=1,
+        status=dc.STATUS_PENDING,
+        commit=new,
+        previous_commit=old,
+        challenge_hash=None,
+        deadline=time.time() + 60,
+        repo="/workspace/Lubko",
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=5.0,
+        previous_retiring=previous_retiring,
+        previous_meta=worker_meta(old, pid=100),
+        new_meta=worker_meta(new, pid=200),
+        supervisor_owned=False,
+    )
+
+
+@pytest.fixture
+def retiring_state() -> dc.RollbackState:
+    """Return a rollback mission whose previous worker is retiring.
+
+    Returns:
+        A rollback mission in the ``previous_retiring`` phase, so the
+        fresh-spawn replacement path is exercised.
     """
     return pending_state(previous_retiring=True)
 
@@ -98,16 +149,16 @@ def _install_failing_identity(
     monkeypatch.setattr(dc, "spawn_worker", fake_spawn)
 
 
-def test_identity_timeout_converges_live_child_and_stays_retryable(
+def test_unproven_live_child_is_converged_and_retry_stays_possible(
     monkeypatch: pytest.MonkeyPatch,
-    identity_timeout_state: dc.RollbackState,
+    retiring_state: dc.RollbackState,
 ) -> None:
     """A live child whose identity timed out is converged before returning."""
     fake = FakePopen(41001, mode="converges")
     spawned: list[FakePopen] = []
     _install_failing_identity(monkeypatch, fake, spawned)
 
-    restored = dc._restart_previous(identity_timeout_state)  # ruff: ignore[private-member-access]
+    restored = dc.restart_previous(retiring_state)
 
     assert restored is None
     assert spawned == [fake]
@@ -115,44 +166,43 @@ def test_identity_timeout_converges_live_child_and_stays_retryable(
     assert fake.poll() == -15
 
 
-def test_identity_timeout_already_exited_child_is_retryable(
+def test_already_exited_child_needs_no_convergence(
     monkeypatch: pytest.MonkeyPatch,
-    identity_timeout_state: dc.RollbackState,
+    retiring_state: dc.RollbackState,
 ) -> None:
     """An already-exited child remains an ordinary retryable failure."""
     fake = FakePopen(41002, mode="exited")
     spawned: list[FakePopen] = []
     _install_failing_identity(monkeypatch, fake, spawned)
 
-    restored = dc._restart_previous(identity_timeout_state)  # ruff: ignore[private-member-access]
+    restored = dc.restart_previous(retiring_state)
 
     assert restored is None
     assert fake.signals == []
 
 
-def test_identity_timeout_child_ignoring_sigterm_is_killed_and_reaped(
+def test_child_ignoring_sigterm_is_killed_and_reaped(
     monkeypatch: pytest.MonkeyPatch,
-    identity_timeout_state: dc.RollbackState,
+    retiring_state: dc.RollbackState,
 ) -> None:
     """A child that ignores SIGTERM is exact-PID SIGKILLed and reaped."""
     fake = FakePopen(41003, mode="needs_kill")
     spawned: list[FakePopen] = []
     _install_failing_identity(monkeypatch, fake, spawned)
 
-    restored = dc._restart_previous(identity_timeout_state)  # ruff: ignore[private-member-access]
+    restored = dc.restart_previous(retiring_state)
 
     assert restored is None
     assert fake.signals == ["SIGTERM", "SIGKILL"]
     assert fake.poll() == -9
 
 
-def test_repeated_rollback_retries_never_leave_a_live_worker_behind(
+def test_repeated_retries_never_leave_a_live_worker_behind(
     monkeypatch: pytest.MonkeyPatch,
-    identity_timeout_state: dc.RollbackState,
+    retiring_state: dc.RollbackState,
 ) -> None:
     """Repeated watchdog retries converge every spawn before the next one."""
     spawned: list[FakePopen] = []
-    attempts = iter(range(3))
 
     def counting_spawn(
         *_args: object,
@@ -166,13 +216,31 @@ def test_repeated_rollback_retries_never_leave_a_live_worker_behind(
     monkeypatch.setattr(dc, "_wait_for_identity", lambda _proc: None)
     monkeypatch.setattr(dc, "spawn_worker", counting_spawn)
 
-    results = [
-        dc._restart_previous(identity_timeout_state)  # ruff: ignore[private-member-access]
-        for _ in attempts
-    ]
+    results = [dc.restart_previous(retiring_state) for _ in range(3)]
 
     assert results == [None, None, None]
     # Every abandoned spawn was positively converged: no live worker from any
     # earlier retry can coexist with a later replacement.
     assert all(fake.poll() is not None for fake in spawned)
     assert [fake.signals for fake in spawned] == [["SIGTERM"]] * 3
+
+
+def test_controller_requests_must_be_json_objects() -> None:
+    """Controller requests must be JSON objects; the type defaults to empty."""
+    request = dc.parse_request('{"type": "status", "x": 1}')
+    assert dc.request_type(request) == "status"
+    assert not dc.request_type({})
+    assert not dc.request_type({"type": 3})
+    with pytest.raises(dc.DeployCtlError, match="not valid JSON"):
+        dc.parse_request("{oops")
+    with pytest.raises(dc.DeployCtlError, match="JSON object"):
+        dc.parse_request("[1]")
+
+
+def test_only_failed_checkout_reports_failure_via_exit_code() -> None:
+    """Only a failed checkout reports failure via the exit code."""
+    failed: dict[str, object] = {"ok": False}
+    succeeded: dict[str, object] = {"ok": True}
+    assert dc.checkout_failure_exit_code("checkout", failed) != 0
+    assert dc.checkout_failure_exit_code("checkout", succeeded) == 0
+    assert dc.checkout_failure_exit_code("confirm", failed) == 0
