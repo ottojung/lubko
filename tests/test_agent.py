@@ -20,11 +20,37 @@ import pytest
 
 from lubko import agent
 from lubko.durable import write_text_durable
+from lubko.worker import group_has_members
 from tests import _process_guard as guard
 
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
+SH_BIN: Final = shutil.which("sh") or "/bin/sh"
+TRUE_BIN: Final = shutil.which("true") or "/bin/true"
 MARKER_AID: Final = "a1b2c3d4"
 FAILURE_EXIT_CODE: Final = 7
+FORKED_GROUP_SIZE: Final = 2
+
+
+def _group_size(pgid: int) -> int:
+    """Return how many live processes currently belong to ``pgid``.
+
+    Args:
+        pgid: Process group ID to inspect.
+
+    Returns:
+        The number of live members.
+    """
+    size = 0
+    with contextlib.suppress(OSError):
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                if os.getpgid(int(entry.name)) == pgid:
+                    size += 1
+    return size
+
+
 STEER_PROMPT_TOTAL: Final = 2
 REQUIRED_COMMANDS: Final = frozenset({
     "new",
@@ -180,7 +206,7 @@ def fake_agent_command(_meta: agent.Meta, _prompt: str, *, is_continue: bool) ->
         A shell command echoing ``$LUBKO_PROMPT``.
     """
     del is_continue
-    return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
+    return [SH_BIN, "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
 
 
 @pytest.fixture(autouse=True)
@@ -292,6 +318,206 @@ def test_is_alive_rejects_wrong_start_time() -> None:
         assert not agent.is_alive(meta)
     finally:
         kill_proc(proc)
+
+
+def test_send_signal_group_rejects_recycled_pid() -> None:
+    """Signalling never hits an unrelated process that reused the PID.
+
+    Deterministic model of the check-then-signal race: the recorded agent
+    exited, the OS recycled its PID into an unrelated session leader, and a
+    stop/kill then delivers its signal. The signal point must revalidate the
+    exact recorded start time, so the unrelated group survives.
+    """
+    victim = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    try:
+        meta = agent.idle_meta(MARKER_AID, "/workspace", None)
+        meta["pid"] = victim.pid
+        meta["pgid"] = victim.pid
+        # The recycled process's start time can never match the recorded one.
+        meta["start_time"] = (agent.proc_start_ticks(victim.pid) or 0) + 1
+        agent.send_signal_group(meta, signal.SIGKILL)
+        time.sleep(0.3)
+        assert victim.poll() is None
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            victim.kill()
+        victim.wait(timeout=5)
+
+
+def test_send_signal_group_signals_exact_identity() -> None:
+    """A matching identity is still signalled at the group."""
+    proc = spawn_marked_process(MARKER_AID)
+    try:
+        meta = meta_for_process(MARKER_AID, proc, "/workspace")
+        agent.send_signal_group(meta, signal.SIGTERM)
+        wait_until(lambda: proc.poll() is not None)
+    finally:
+        kill_proc(proc)
+
+
+def test_cmd_delete_force_never_kills_recycled_runner_pid(
+    state_dir: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Force-delete never SIGKILLs an unrelated process reusing the runner PID."""
+    victim = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    try:
+        meta = agent.idle_meta("aaaaaaaa", str(state_dir), None)
+        meta["runner_pid"] = victim.pid
+        meta["runner_start_time"] = (agent.proc_start_ticks(victim.pid) or 0) + 1
+        agent.write_meta("aaaaaaaa", meta)
+        code = agent.main(["delete", "aaaaaaaa", "--force"])
+        assert code == agent.EXIT_OK
+        assert "deleted" in capsys.readouterr().out
+        time.sleep(0.3)
+        assert victim.poll() is None
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            victim.kill()
+        victim.wait(timeout=5)
+
+
+def test_signal_identity_checked_single_process_rejects_recycled_pid() -> None:
+    """The single-process variant also refuses a mismatched reused PID."""
+    victim = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    try:
+        agent.signal_identity_checked(
+            victim.pid,
+            (agent.proc_start_ticks(victim.pid) or 0) + 1,
+            signal.SIGKILL,
+        )
+        time.sleep(0.3)
+        assert victim.poll() is None
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            victim.kill()
+        victim.wait(timeout=5)
+
+
+def test_signal_identity_checked_signals_matching_runner() -> None:
+    """A matching runner identity is still signalled exactly."""
+    proc = spawn_marked_process(MARKER_AID)
+    try:
+        meta = meta_for_process(MARKER_AID, proc, "/workspace")
+        agent.signal_identity_checked(
+            proc.pid,
+            meta["start_time"],
+            signal.SIGKILL,
+            marker_aid=MARKER_AID,
+        )
+        wait_until(lambda: proc.poll() is not None)
+    finally:
+        kill_proc(proc)
+
+
+def test_signal_identity_checked_missing_pid_is_noop() -> None:
+    """A vanished PID is silently skipped."""
+    gone = subprocess.Popen(
+        [TRUE_BIN],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    gone.wait(timeout=5)
+    stale_start = agent.proc_start_ticks(gone.pid)
+    agent.signal_identity_checked(gone.pid, stale_start, signal.SIGKILL)
+    agent.signal_identity_checked(gone.pid + 10_000, None, signal.SIGKILL)
+
+
+def test_send_signal_group_converges_orphaned_group_members() -> None:
+    """When the leader is dead, surviving marked members are still converged.
+
+    Deterministic leader-dead interleaving: a session leader spawns a
+    TERM-ignoring child and exits; the recorded invocation identity (captured
+    while the leader lived) then receives stop/kill. The orphaned member of
+    the exact recorded group must still be signalled.
+    """
+    env = dict(os.environ)
+    env["LUBKO_AGENT_ID"] = MARKER_AID
+    leader = subprocess.Popen(
+        [SH_BIN, "-c", f"{SLEEP_BIN} 300 &\nexit 0"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    try:
+        pgid = leader.pid
+        start_time = agent.proc_start_ticks(pgid)
+        # Wait until the child exists, then let the leader die.
+        wait_until(lambda: group_has_members(pgid) and _group_size(pgid) >= FORKED_GROUP_SIZE)
+        leader.wait(timeout=5)
+        assert start_time is not None
+        meta = agent.idle_meta(MARKER_AID, "/workspace", None)
+        meta["pid"] = pgid
+        meta["pgid"] = pgid
+        meta["start_time"] = start_time
+        assert not agent.is_alive(meta)  # leader gone...
+        assert agent.group_alive(meta)  # ...but its member survives.
+        agent.send_signal_group(meta, signal.SIGKILL)
+        wait_until(lambda: not agent.group_alive(meta))
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(leader.pid, signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            leader.wait(timeout=5)
+
+
+def test_send_signal_group_spares_recycled_session_with_children() -> None:
+    """A recycled session leader and its children are never collateral damage.
+
+    The recorded PID was reused by an unrelated session leader that has its
+    own children: neither the recycled group nor any other process may be
+    signalled even though the pgid numerically matches the record.
+    """
+    env = dict(os.environ)
+    env["LUBKO_AGENT_ID"] = "not-this-agent"
+    victim = subprocess.Popen(
+        [SH_BIN, "-c", f"{SLEEP_BIN} 300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    try:
+        wait_until(lambda: _group_size(victim.pid) >= FORKED_GROUP_SIZE)
+        meta = agent.idle_meta(MARKER_AID, "/workspace", None)
+        meta["pid"] = victim.pid
+        meta["pgid"] = victim.pid
+        meta["start_time"] = (agent.proc_start_ticks(victim.pid) or 0) + 1
+        agent.send_signal_group(meta, signal.SIGKILL)
+        time.sleep(0.3)
+        assert victim.poll() is None
+        assert group_has_members(victim.pid)
+    finally:
+        with contextlib.suppress(OSError):
+            os.killpg(victim.pid, signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            victim.wait(timeout=5)
 
 
 def test_fmt_time_handles_unknown() -> None:
@@ -966,7 +1192,7 @@ def test_cmd_prompt_attached_normalizes_colored_output(
         is_continue: bool,
     ) -> list[str]:
         del is_continue
-        return ["sh", "-c", "printf '\\x1b[36m%s\\x1b[0m\\n' \"$LUBKO_PROMPT\""]
+        return [SH_BIN, "-c", "printf '\\x1b[36m%s\\x1b[0m\\n' \"$LUBKO_PROMPT\""]
 
     monkeypatch.setattr(agent, "build_agent_command", colored_command)
     runner_threads: list[threading.Thread] = []
@@ -1609,7 +1835,7 @@ def test_runner_records_failure(state_dir: Path, monkeypatch: pytest.MonkeyPatch
 
     def failing_command(_meta: agent.Meta, _prompt: str, *, is_continue: bool) -> list[str]:
         del is_continue
-        return ["sh", "-c", "exit 7"]
+        return [SH_BIN, "-c", "exit 7"]
 
     monkeypatch.setattr(agent, "build_agent_command", failing_command)
     reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
@@ -1830,7 +2056,7 @@ def test_runner_does_not_drop_concurrently_queued_prompt(
     def racing_command(_meta: agent.Meta, _prompt: str, *, is_continue: bool) -> list[str]:
         del is_continue
         agent.update_meta("aaaaaaaa", lambda m: m.update(pending_prompt="second"))
-        return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
+        return [SH_BIN, "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
 
     monkeypatch.setattr(agent, "build_agent_command", racing_command)
     reserve_runner_generation("aaaaaaaa", gen=1, mode="continue", monkeypatch=monkeypatch)
@@ -1856,7 +2082,7 @@ def test_runner_runs_prompt_queued_during_invocation(
         if not queued["done"]:
             queued["done"] = True
             agent.update_meta("aaaaaaaa", lambda m: m.update(pending_prompt="second"))
-        return ["sh", "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
+        return [SH_BIN, "-c", "printf '%s\\n' \"$LUBKO_PROMPT\""]
 
     monkeypatch.setattr(agent, "build_agent_command", queuing_command)
     reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
