@@ -1,4 +1,4 @@
-"""Regression tests for legacy rollback live-child convergence (#182)."""
+"""Rollback spawns must be converged before any retry can start another."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import subprocess
 import pytest
 
 from lubko import deployctl as dc
-from tests.test_deployctl import pending_state
 
 
 class FakePopen:
@@ -62,13 +61,31 @@ class FakePopen:
         return self.returncode
 
 
-@pytest.fixture
-def identity_timeout_state() -> dc.RollbackState:
-    """Return a pending rollback mission whose previous worker is retiring.
+def pending_state(*, previous_retiring: bool = False) -> dc.RollbackState:
+    """Return a live pending deployment state.
+
+    Args:
+        previous_retiring: Whether the previous worker's retirement has begun.
 
     Returns:
-        A rollback mission in the ``previous_retiring`` phase, so
-        ``_restart_previous`` takes the fresh-spawn path.
+        A pending rollback state with distinct old/new commits.
+    """
+    return dc.RollbackState(
+        repo="/workspace/Lubko",
+        old="1" * 40,
+        new="2" * 40,
+        previous_retiring=previous_retiring,
+        generation=1,
+    )
+
+
+@pytest.fixture
+def retiring_state() -> dc.RollbackState:
+    """Return a rollback mission whose previous worker is retiring.
+
+    Returns:
+        A rollback mission in the ``previous_retiring`` phase, so the
+        fresh-spawn replacement path is exercised.
     """
     return pending_state(previous_retiring=True)
 
@@ -98,16 +115,16 @@ def _install_failing_identity(
     monkeypatch.setattr(dc, "spawn_worker", fake_spawn)
 
 
-def test_identity_timeout_converges_live_child_and_stays_retryable(
+def test_unproven_live_child_is_converged_and_retry_stays_possible(
     monkeypatch: pytest.MonkeyPatch,
-    identity_timeout_state: dc.RollbackState,
+    retiring_state: dc.RollbackState,
 ) -> None:
     """A live child whose identity timed out is converged before returning."""
     fake = FakePopen(41001, mode="converges")
     spawned: list[FakePopen] = []
     _install_failing_identity(monkeypatch, fake, spawned)
 
-    restored = dc._restart_previous(identity_timeout_state)  # ruff: ignore[private-member-access]
+    restored = dc.restart_previous(retiring_state)
 
     assert restored is None
     assert spawned == [fake]
@@ -115,44 +132,43 @@ def test_identity_timeout_converges_live_child_and_stays_retryable(
     assert fake.poll() == -15
 
 
-def test_identity_timeout_already_exited_child_is_retryable(
+def test_already_exited_child_needs_no_convergence(
     monkeypatch: pytest.MonkeyPatch,
-    identity_timeout_state: dc.RollbackState,
+    retiring_state: dc.RollbackState,
 ) -> None:
     """An already-exited child remains an ordinary retryable failure."""
     fake = FakePopen(41002, mode="exited")
     spawned: list[FakePopen] = []
     _install_failing_identity(monkeypatch, fake, spawned)
 
-    restored = dc._restart_previous(identity_timeout_state)  # ruff: ignore[private-member-access]
+    restored = dc.restart_previous(retiring_state)
 
     assert restored is None
     assert fake.signals == []
 
 
-def test_identity_timeout_child_ignoring_sigterm_is_killed_and_reaped(
+def test_child_ignoring_sigterm_is_killed_and_reaped(
     monkeypatch: pytest.MonkeyPatch,
-    identity_timeout_state: dc.RollbackState,
+    retiring_state: dc.RollbackState,
 ) -> None:
     """A child that ignores SIGTERM is exact-PID SIGKILLed and reaped."""
     fake = FakePopen(41003, mode="needs_kill")
     spawned: list[FakePopen] = []
     _install_failing_identity(monkeypatch, fake, spawned)
 
-    restored = dc._restart_previous(identity_timeout_state)  # ruff: ignore[private-member-access]
+    restored = dc.restart_previous(retiring_state)
 
     assert restored is None
     assert fake.signals == ["SIGTERM", "SIGKILL"]
     assert fake.poll() == -9
 
 
-def test_repeated_rollback_retries_never_leave_a_live_worker_behind(
+def test_repeated_retries_never_leave_a_live_worker_behind(
     monkeypatch: pytest.MonkeyPatch,
-    identity_timeout_state: dc.RollbackState,
+    retiring_state: dc.RollbackState,
 ) -> None:
     """Repeated watchdog retries converge every spawn before the next one."""
     spawned: list[FakePopen] = []
-    attempts = iter(range(3))
 
     def counting_spawn(
         *_args: object,
@@ -166,10 +182,7 @@ def test_repeated_rollback_retries_never_leave_a_live_worker_behind(
     monkeypatch.setattr(dc, "_wait_for_identity", lambda _proc: None)
     monkeypatch.setattr(dc, "spawn_worker", counting_spawn)
 
-    results = [
-        dc._restart_previous(identity_timeout_state)  # ruff: ignore[private-member-access]
-        for _ in attempts
-    ]
+    results = [dc.restart_previous(retiring_state) for _ in range(3)]
 
     assert results == [None, None, None]
     # Every abandoned spawn was positively converged: no live worker from any

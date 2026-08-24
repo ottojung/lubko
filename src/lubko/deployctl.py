@@ -2069,6 +2069,10 @@ parse_request = _parse_request
 request_type = _request_type
 checkout_failure_exit_code = _checkout_failure_exit_code
 
+# Public rollback-spawn convergence helper: previous-worker replacement is a
+# stable rollback contract exercised directly by the tests.
+restart_previous = _restart_previous
+
 
 def main(argv: list[str] | None = None) -> int:
     """Run one stable-wrapper protocol request.
