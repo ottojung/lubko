@@ -1529,6 +1529,61 @@ def _mark_terminal(
     _set_active_runner(meta, value=False)
 
 
+def _invocation_identity(meta: Meta) -> tuple[object, ...]:
+    """Return the exact invocation identity recorded in metadata.
+
+    The identity spans every field the runner rewrites when a new invocation
+    is recorded: the process triple (``pid``, ``pgid``, ``start_time``) plus
+    the stronger runner anchor (``runner_pid``, ``runner_start_time``), so a
+    newer live invocation can never be mistaken for the targeted one.
+
+    Args:
+        meta: Agent metadata.
+
+    Returns:
+        A comparable identity tuple.
+    """
+    return (
+        meta.get("pid"),
+        meta.get("pgid"),
+        meta.get("start_time"),
+        meta.get("runner_pid"),
+        meta.get("runner_start_time"),
+    )
+
+
+def _update_meta_if_same_invocation(
+    aid: str,
+    identity: tuple[object, ...],
+    mutate: Callable[[Meta], None],
+) -> bool:
+    """Apply ``mutate`` under the metadata lock only if identity still matches.
+
+    A background runner may record a newer invocation while a stop-like
+    command waits for the old one to die. This guard ensures the mutation is
+    skipped instead of clobbering the newer live invocation's record.
+
+    Args:
+        aid: Lubko agent ID.
+        identity: The exact invocation identity targeted.
+        mutate: Mutation to apply under the lock when identity matches.
+
+    Returns:
+        ``True`` only when the mutation was applied.
+    """
+    applied = False
+
+    def fn(m: Meta) -> None:
+        nonlocal applied
+        if _invocation_identity(m) != identity:
+            return
+        mutate(m)
+        applied = True
+
+    update_meta(aid, fn)
+    return applied
+
+
 # ---------------------------------------------------------------------------
 # Exit status mapping
 # ---------------------------------------------------------------------------
@@ -2969,13 +3024,50 @@ def cmd_wait(args: argparse.Namespace) -> int:
     return exit_code_for(meta)
 
 
+def _finish_stop_like(
+    aid: str,
+    identity: tuple[object, ...],
+    terminal: tuple[int, int, str, str],
+    success_msg: str,
+) -> int:
+    """Terminalize a targeted invocation, guarding against an A -> B race.
+
+    The metadata is marked terminal under the lock only when the currently
+    recorded invocation still matches the exact targeted identity; a newer
+    live invocation recorded meanwhile is never overwritten or untracked.
+
+    Args:
+        aid: Lubko agent ID.
+        identity: Exact invocation identity targeted.
+        terminal: Exit code, exit signal, terminal state, and stop reason.
+        success_msg: Message printed on success.
+
+    Returns:
+        ``EXIT_OK`` on success, ``EXIT_ERROR`` when identity changed.
+    """
+    exit_code, exit_signal, state, stop_reason = terminal
+    if not _update_meta_if_same_invocation(
+        aid, identity, lambda m: _mark_terminal(m, exit_code, exit_signal, state, stop_reason)
+    ):
+        _err(
+            f"{PROG}: agent {aid} was restarted during the operation; "
+            "newer invocation left running untouched"
+        )
+        return EXIT_ERROR
+    _out(success_msg)
+    return EXIT_OK
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     """Gracefully stop a running agent.
 
     Sends ``SIGTERM`` to the exact recorded process group, then — while any
     member of that exact group remains — ``SIGKILL`` after the grace period,
     mirroring the worker's cancellation contract so an agent run can never
-    leave abandoned OpenCode children behind.
+    leave abandoned OpenCode children behind. Terminalization is guarded by
+    the exact recorded invocation identity: if the runner records a newer
+    invocation while the old one is being stopped, the newer record is never
+    overwritten and the command reports failure instead of false success.
 
     Args:
         args: Parsed command arguments.
@@ -2991,27 +3083,30 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if not is_alive(meta) and not group_alive(meta):
         _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
         return EXIT_OK
-    update_meta(aid, lambda m: _begin_stop_like(m, "stop"))
+    identity = _invocation_identity(meta)
+    if not _update_meta_if_same_invocation(aid, identity, lambda m: _begin_stop_like(m, "stop")):
+        _err(f"{PROG}: agent {aid} changed during stop; newer invocation left running untouched")
+        return EXIT_ERROR
     send_signal_group(meta, signal.SIGTERM)
     if wait_group_dead(meta, STOP_WAIT_SECONDS):
-        update_meta(
+        return _finish_stop_like(
             aid,
-            lambda m: _mark_terminal(m, -signal.SIGTERM, signal.SIGTERM, "stopped", "stop"),
+            identity,
+            (-signal.SIGTERM, signal.SIGTERM, "stopped", "stop"),
+            f"stopped agent {aid}",
         )
-        _out(f"stopped agent {aid}")
-        return EXIT_OK
     # The exact group still has live members; escalate so no child is
     # abandoned, exactly like the worker's cancel grace period.
     if group_alive(meta):
         send_signal_group(meta, signal.SIGKILL)
     if wait_group_dead(meta, KILL_WAIT_SECONDS):
-        update_meta(
+        return _finish_stop_like(
             aid,
-            lambda m: _mark_terminal(m, -signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
+            identity,
+            (-signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
+            f"stopped agent {aid} (force-killed group members)",
         )
-        _out(f"stopped agent {aid} (force-killed group members)")
-        return EXIT_OK
-    update_meta(aid, lambda m: m.update(intent=None))
+    _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
     _err(f"{PROG}: agent {aid} did not stop within {STOP_WAIT_SECONDS:.0f}s; use 'kill'")
     return EXIT_ERROR
 
@@ -3021,6 +3116,9 @@ def cmd_kill(args: argparse.Namespace) -> int:
 
     The exact recorded process group is signalled and confirmed gone, so
     ``SIGKILL`` to the leader alone can never leave group members behind.
+    Terminalization is guarded by the exact recorded invocation identity: a
+    newer invocation recorded mid-kill is never overwritten or falsely
+    reported as killed.
 
     Args:
         args: Parsed command arguments.
@@ -3036,16 +3134,19 @@ def cmd_kill(args: argparse.Namespace) -> int:
     if not is_alive(meta) and not group_alive(meta):
         _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
         return EXIT_OK
-    update_meta(aid, lambda m: _begin_stop_like(m, "kill"))
+    identity = _invocation_identity(meta)
+    if not _update_meta_if_same_invocation(aid, identity, lambda m: _begin_stop_like(m, "kill")):
+        _err(f"{PROG}: agent {aid} changed during kill; newer invocation left running untouched")
+        return EXIT_ERROR
     send_signal_group(meta, signal.SIGKILL)
     if wait_group_dead(meta, KILL_WAIT_SECONDS):
-        update_meta(
+        return _finish_stop_like(
             aid,
-            lambda m: _mark_terminal(m, -signal.SIGKILL, signal.SIGKILL, "killed", "kill"),
+            identity,
+            (-signal.SIGKILL, signal.SIGKILL, "killed", "kill"),
+            f"killed agent {aid}",
         )
-        _out(f"killed agent {aid}")
-        return EXIT_OK
-    update_meta(aid, lambda m: m.update(intent=None))
+    _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
     _err(f"{PROG}: agent {aid} could not be killed")
     return EXIT_ERROR
 
