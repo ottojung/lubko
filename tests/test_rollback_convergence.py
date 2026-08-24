@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import subprocess
+import time
 
 import pytest
 
 from lubko import deployctl as dc
+from lubko import lifecycle
 
 
 class FakePopen:
@@ -70,12 +72,42 @@ def pending_state(*, previous_retiring: bool = False) -> dc.RollbackState:
     Returns:
         A pending rollback state with distinct old/new commits.
     """
+
+    def worker_meta(commit: str, *, pid: int) -> lifecycle.WorkerMeta:
+        return lifecycle.WorkerMeta(
+            schema_version=lifecycle.SCHEMA_VERSION,
+            state=lifecycle.STATE_RUNNING,
+            pid=pid,
+            pgid=pid,
+            sid=pid,
+            start_time_ticks=pid * 10,
+            token=f"token-{pid}",
+            repo="/workspace/Lubko",
+            git_commit=commit,
+            worker_id="test-worker",
+            log_path="/workspace/worker.log",
+            started_at=1.0,
+            stopped_at=None,
+        )
+
+    old = "1" * 40
+    new = "2" * 40
     return dc.RollbackState(
-        repo="/workspace/Lubko",
-        old="1" * 40,
-        new="2" * 40,
-        previous_retiring=previous_retiring,
+        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
         generation=1,
+        status=dc.STATUS_PENDING,
+        commit=new,
+        previous_commit=old,
+        challenge_hash=None,
+        deadline=time.time() + 60,
+        repo="/workspace/Lubko",
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=5.0,
+        previous_retiring=previous_retiring,
+        previous_meta=worker_meta(old, pid=100),
+        new_meta=worker_meta(new, pid=200),
+        supervisor_owned=False,
     )
 
 
