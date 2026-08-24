@@ -9,7 +9,7 @@ from lubko import worker
 from lubko.lifecycle import SCHEMA_VERSION, ProcessIdentity, WorkerMeta, identity_matches
 
 LIVE = ProcessIdentity(pid=42, pgid=42, sid=7, start_time_ticks=1234)
-PIN_AND_SIGNAL = worker._pin_and_signal  # ruff: ignore[private-member-access]
+PIN_AND_SIGNAL = worker._pin_and_signal
 
 
 def meta(**overrides: object) -> WorkerMeta:

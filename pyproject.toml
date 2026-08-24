@@ -52,8 +52,13 @@ convention = "google"
 # literals plus the fixed, Final-declared SERVER_MATCH_SQL routing fragment;
 # all values are bound parameters, so the string construction carries no
 # external data.
+# TC004: DeadlineConnection is statically imported under TYPE_CHECKING for its
+# type while a PEP 562 module __getattr__ supplies the runtime value lazily,
+# keeping psycopg's compiled layer unloaded until an actual database turn
+# needs it.
 "src/lubko/worker.py" = [
     "hardcoded-sql-expression",
+    "runtime-import-in-type-checking-block",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
@@ -104,8 +109,11 @@ convention = "google"
     "suspicious-subprocess-import",
 ]
 "tests/**/*.py" = [
+    # Tests assert invariants of the worker's internal state machine (outage
+    # convergence, deadline derivation), which are deliberately not public API.
     "assert",
     "magic-value-comparison",
+    "private-member-access",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
