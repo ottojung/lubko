@@ -3365,7 +3365,6 @@ def test_surviving_owned_descendants_converge_before_finalization(
         lambda pid: None if pid == job.pgid else (job.start_ticks + 1 if pid in members else None),
     )
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
-    monkeypatch.setattr(worker, "_process_ppid", lambda _pid: None)
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
     monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
@@ -3451,7 +3450,6 @@ def test_recovery_reports_nonconvergence_while_leader_stays_ours(
         worker, "proc_start_ticks", lambda pid: recorded_ticks if pid == pgid else None
     )
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
-    monkeypatch.setattr(worker, "_process_ppid", lambda _pid: None)
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
     monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
@@ -3496,7 +3494,6 @@ def test_recycled_group_stranger_descendants_are_never_signalled(
         ),
     )
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
-    monkeypatch.setattr(worker, "_process_ppid", lambda _pid: None)
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
     monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
@@ -3577,3 +3574,189 @@ def test_gated_identity_is_carried_not_reread_after_release(
         assert job.owned_members == {proc.pid: persisted_ticks}
     finally:
         guard.unregister(proc)
+
+
+def test_newer_same_worker_job_reusing_pgid_is_never_attributed_to_old(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-worker ancestry is never ownership proof across invocations.
+
+    Job A's group emptied and its numeric PGID was reused by a newer job B of
+    the SAME worker; B's leader then exited leaving descendants reparented to
+    this worker. Those descendants carry no identity recorded under job A's
+    positive proof, so A must neither consider them owned nor signal them —
+    even though they belong to this very worker. Only A's own ledger-proven
+    members converge.
+    """
+    old = make_active_job(tmp_path)
+    old.completed = True
+    old.returncode = 0
+    old.start_ticks = 500
+
+    newer_descendant = old.pgid + 33
+    own_leftover = old.pgid + 44
+    members = [newer_descendant, own_leftover]
+    # Job A's ledger: only identities snapshotted under its own positive proof.
+    old.owned_members[own_leftover] = 501
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == old.pgid else False
+    )
+    monkeypatch.setattr(
+        worker,
+        "proc_start_ticks",
+        lambda pid: (
+            None
+            if pid == old.pgid
+            else (old.owned_members.get(pid) if pid in old.owned_members else 900_000)
+        ),
+    )
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+
+    supervisor = _spy_supervisor()
+    # The reparented descendant of the NEWER invocation is invisible to A.
+    assert not worker._owned_group_view(old).leader_ours
+    request_group_reap(old)
+    signal_kill(old)
+    assert events == [(own_leftover, signal.SIGTERM), (own_leftover, signal.SIGKILL)]
+
+    # A converges once its own proven leftover exits; the stranger remains.
+    members.remove(own_leftover)
+    assert supervisor._observe_and_escalate(old, time.monotonic()) is True
+    assert newer_descendant not in {target for target, _sig in events}
+
+
+def test_exact_job_marker_proves_unledgered_background_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unledgered member carrying this invocation's marker is provably ours.
+
+    The root exited before any positive-proof pass recorded a background
+    descendant, but the descendant still carries the exact ``LUBKO_JOB_ID``
+    injected at spawn. That exact per-invocation marker proves ownership, so
+    the member is signalled individually and blocks convergence until gone.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.returncode = 0
+    job.start_ticks = 1000
+    leftover = job.pgid + 7
+    members = [leftover]
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == job.pgid else False
+    )
+    monkeypatch.setattr(worker, "proc_start_ticks", lambda pid: None if pid == job.pgid else 1001)
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    monkeypatch.setattr(worker, "_process_job_id", lambda _pid: str(job.id))
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+
+    supervisor = _spy_supervisor()
+    assert worker._owned_group_alive(job) is True
+    request_group_reap(job)
+    assert events == [(leftover, signal.SIGTERM)]
+    assert supervisor._observe_and_escalate(job, time.monotonic()) is False
+
+    members.clear()
+    assert worker._owned_group_alive(job) is False
+
+
+def test_different_same_worker_job_marker_never_proves_old_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newer same-worker job's marker never satisfies an older invocation.
+
+    A recycled PGID group carries ``LUBKO_JOB_ID`` of a NEWER job (a different
+    UUID from the same worker). The old invocation must treat those members as
+    strangers: no signal ever reaches them and the old group counts as gone.
+    """
+    old = make_active_job(tmp_path)
+    old.completed = True
+    old.returncode = 0
+    old.start_ticks = 1000
+    stranger = old.pgid + 9
+    members = [stranger]
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == old.pgid else False
+    )
+    monkeypatch.setattr(worker, "proc_start_ticks", lambda pid: None if pid == old.pgid else 2000)
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    monkeypatch.setattr(worker, "_process_job_id", lambda _pid: str(uuid4()))
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+
+    request_stop(old, "cancel")
+    request_group_reap(old)
+    signal_kill(old)
+    assert not events
+    assert worker._owned_group_alive(old) is False
+
+
+def test_missing_or_unreadable_job_marker_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A member with a missing or unreadable marker is never signalled.
+
+    Neither ledger nor marker proof holds (the environ read fails), so the
+    member fails closed on every path: classification, TERM, KILL.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.returncode = 0
+    job.start_ticks = 1000
+    opaque = job.pgid + 11
+    members = [opaque]
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == job.pgid else False
+    )
+    monkeypatch.setattr(worker, "proc_start_ticks", lambda pid: None if pid == job.pgid else 3000)
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    monkeypatch.setattr(worker, "_process_job_id", lambda _pid: None)
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+
+    request_stop(job, "cancel")
+    request_group_reap(job)
+    signal_kill(job)
+    assert not events
+
+
+def test_signal_revalidates_identity_and_marker_before_every_emission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PID reuse between classification and signal cannot redirect a signal.
+
+    A member was classified as owned moments ago, but by emission time the
+    slot has been reused: different start-time ticks and no matching ledger
+    identity or marker. The just-in-time per-emission guard re-proves identity
+    and fails closed, so neither TERM nor KILL reaches the reused pid.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.stop_started = time.monotonic()
+    job.start_ticks = 1000
+    reused = job.pgid + 13
+    members = [reused]
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == job.pgid else False
+    )
+    monkeypatch.setattr(
+        worker, "proc_start_ticks", lambda pid: None if pid == job.pgid else 999_999
+    )
+    # The reused process carries a DIFFERENT invocation's marker.
+    monkeypatch.setattr(worker, "_process_job_id", lambda _pid: str(uuid4()))
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    events: list[tuple[int, int]] = []
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    stale_view = worker._OwnedGroupView(leader_ours=False, pids=(reused,))
+    monkeypatch.setattr(worker, "_owned_group_view", lambda _job: stale_view)
+
+    worker._signal_owned_group(job, signal.SIGTERM)
+    worker._signal_owned_group(job, signal.SIGKILL)
+    assert not events
