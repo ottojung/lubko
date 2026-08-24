@@ -2482,6 +2482,139 @@ def test_cmd_stop_kill_identity_race_never_terminalizes_newer_invocation(
         kill_proc(proc_b)
 
 
+@pytest.mark.parametrize("mode", ["stop", "kill"])
+def test_steer_cannot_overwrite_in_flight_stop_like_intent(
+    mode: str,
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A racing steer never overwrites an accepted stop/kill intent (issue #168).
+
+    Deterministic interleaving via metadata state: invocation A is live with a
+    durably recorded stop-like intent (exactly what ``_begin_stop_like`` leaves
+    behind while the signaled process is still dying). A concurrent
+    ``prompt --steer`` must be rejected busy, must not queue work, and after A
+    dies the terminal classification and drain must reflect the stop/kill, not
+    resurrect the agent.
+    """
+    proc_a = spawn_marked_process("aaaaaaaa")
+    try:
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode_, **_k: spawned.append(mode_))
+        meta = meta_for_process("aaaaaaaa", proc_a, str(state_dir))
+        meta["runner_pid"] = proc_a.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc_a.pid)
+        agent.write_meta("aaaaaaaa", meta)
+
+        # Step 2: begin stop/kill — the stop-like intent is durably recorded
+        # while A is still alive (signal delivery is asynchronous).
+        agent.update_meta("aaaaaaaa", lambda m: agent._begin_stop_like(m, mode))
+        assert agent.read_meta("aaaaaaaa") is not None
+        recorded = agent.read_meta("aaaaaaaa")
+        assert recorded is not None
+        assert recorded["intent"] == mode
+        assert agent.is_alive(recorded)
+
+        # Step 3: before A exits, a concurrent steer races in.
+        code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "X"])
+        assert code == agent.EXIT_ERROR
+        assert "still running" in capsys.readouterr().err
+
+        # The steer was rejected: no queued work, intent untouched, no spawn.
+        mid = agent.read_meta("aaaaaaaa")
+        assert mid is not None
+        assert mid["intent"] == mode
+        assert mid["steer_queue"] == []
+        assert mid["pending_prompt"] is None
+        assert mid["stop_reason"] is None
+        assert spawned == []
+
+        # Steps 4-5: A dies from the requested signal; finalization must
+        # classify it as stopped/killed and drain nothing.
+        sig = signal.SIGTERM if mode == "stop" else signal.SIGKILL
+        agent.send_signal_group(mid, sig)
+        wait_until(lambda: proc_a.poll() is not None)
+        agent.update_meta("aaaaaaaa", agent._finalize_after(-sig))
+        final = agent.read_meta("aaaaaaaa")
+        assert final is not None
+        expected_state = "stopped" if mode == "stop" else "killed"
+        assert final["state"] == expected_state
+        assert final["stop_reason"] == mode
+        assert final["exit_signal"] == sig
+        assert final["intent"] is None
+
+        # No replacement invocation may start from the racing steer.
+        assert agent._drain_next("aaaaaaaa") is None
+        drained = agent.read_meta("aaaaaaaa")
+        assert drained is not None
+        assert drained["active_runner"] is False
+        assert not agent.runner_alive(drained)
+        assert spawned == []
+    finally:
+        kill_proc(proc_a)
+
+
+@pytest.mark.parametrize("mode", ["stop", "kill"])
+def test_ordinary_prompt_also_rejected_while_stop_like_intent_active(
+    mode: str,
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An ordinary prompt is also rejected while a stop/kill intent is active."""
+    proc_a = spawn_marked_process("aaaaaaaa")
+    try:
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode_, **_k: spawned.append(mode_))
+        meta = meta_for_process("aaaaaaaa", proc_a, str(state_dir))
+        agent.write_meta("aaaaaaaa", meta)
+        agent.update_meta("aaaaaaaa", lambda m: agent._begin_stop_like(m, mode))
+
+        code = agent.main(["prompt", "--id", "aaaaaaaa", "Y"])
+        assert code == agent.EXIT_ERROR
+        assert "still running" in capsys.readouterr().err
+
+        mid = agent.read_meta("aaaaaaaa")
+        assert mid is not None
+        assert mid["intent"] == mode
+        assert mid["pending_prompt"] is None
+        assert spawned == []
+    finally:
+        kill_proc(proc_a)
+
+
+def test_ordinary_steer_on_live_agent_unaffected_by_guard(
+    state_dir: Path,
+) -> None:
+    """Without a stop-like intent, ordinary steer queuing behavior is unchanged."""
+    proc_a = spawn_marked_process("aaaaaaaa")
+    try:
+        meta = meta_for_process("aaaaaaaa", proc_a, str(state_dir))
+        agent.write_meta("aaaaaaaa", meta)
+
+        decision: dict[str, object] = {}
+        agent.update_meta(
+            "aaaaaaaa",
+            lambda m: agent._apply_locked_transition(
+                m,
+                decision,
+                prompt="S",
+                steer=True,
+                mode="continue",
+            ),
+        )
+        assert decision["action"] == "reuse"
+        assert decision["interrupt"] is True
+        mid = agent.read_meta("aaaaaaaa")
+        assert mid is not None
+        assert mid["intent"] == "steer"
+        assert mid["steer_queue"]
+        assert mid["steer_queue"][0]["prompt"] == "S"
+    finally:
+        kill_proc(proc_a)
+
+
 def test_runner_alive_matches_exact_identity(state_dir: Path) -> None:
     """A live runner with matching start time and marker is reported alive."""
     proc = spawn_marked_process("aaaaaaaa")

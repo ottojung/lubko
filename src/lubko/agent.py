@@ -1976,6 +1976,14 @@ def _decide_invocation(
         prompt: Instruction to run or steer.
         steer: Whether this is a steer rather than an ordinary prompt.
     """
+    if m.get("intent") in STOP_REASONS:
+        # A durably accepted stop/kill obligation for this invocation must
+        # never be overwritten by a later prompt/steer: otherwise the dying
+        # invocation is finalized as a steer and _drain_next resurrects the
+        # agent with replacement work. Reject as busy until finalization
+        # clears the stop-like intent.
+        decision["action"] = "busy"
+        return
     mode = _resolve_session_mode(m)
     if mode is None:
         decision["action"] = "error_session_gone"
