@@ -824,7 +824,13 @@ def test_database_outage_restart_backs_off_until_readiness(
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
-    """A restart during a PostgreSQL outage backs off until readiness is possible."""
+    """A restart during a PostgreSQL outage backs off until readiness is possible.
+
+    Under #161 the crash path fails closed while exact owned-group recovery
+    cannot be proven: during the outage the dead child identity stays recorded,
+    no replacement is spawned, and only after the database (and therefore the
+    recovery proof) returns does the replacement appear and reach readiness.
+    """
     repo, first, _second = maintained_env
     with running_supervisor(supervisor_env):
         request_and_wait(first, repo)
@@ -834,20 +840,42 @@ def test_database_outage_restart_backs_off_until_readiness(
         pg_cluster.stop()
         os.killpg(original_pid, signal.SIGKILL)
 
-        wait_until(lambda: worker_pid() is not None and worker_pid() != original_pid, timeout=30.0)
-        replacement_pid = worker_pid()
-        assert replacement_pid is not None
-        status = supervise.read_status()
-        assert status is not None
-        assert status.ready is False
-        time.sleep(1.0)
-        assert worker_pid() == replacement_pid
-        current = supervise.read_status()
-        assert current is not None
-        assert current.ready is False
-        assert len(direct_children(status.supervisor_pid)) == 1
+        # Fail closed: the dead child identity is retained as the blocking
+        # recovery obligation and no replacement may be spawned.
+        wait_until(
+            lambda: (
+                (status := supervise.read_status()) is not None
+                and status.child is not None
+                and status.child.pid == original_pid
+                and status.ready is False
+            ),
+            timeout=30.0,
+        )
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            status = supervise.read_status()
+            assert status is not None
+            assert status.child is not None, "the obligation must stay durable"
+            assert status.child.pid == original_pid
+            assert len(direct_children(status.supervisor_pid)) == 0, (
+                "no replacement may be spawned while recovery is unprovable"
+            )
+            assert status.ready is False
+            time.sleep(0.2)
 
         pg_cluster.start()
+        # Recovery now completes and the ordinary restart path takes over.
+        wait_until(lambda: worker_pid() is not None and worker_pid() != original_pid, timeout=60.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.child is not None
+        assert status.child.pid != original_pid
+        time.sleep(1.0)
+        assert worker_pid() != original_pid
+        current = supervise.read_status()
+        assert current is not None
+        assert len(direct_children(current.supervisor_pid)) == 1
+
         wait_until(status_ready, timeout=60.0)
         probe_id = insert_pending_job(jobs_db, str(tmp_path), "echo recovered")
         wait_until(lambda: read_status_of(jobs_db, probe_id) == "succeeded", timeout=60.0)
@@ -2371,7 +2399,16 @@ def test_reboot_with_stale_child_records_crash_then_recovers(
     monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
     monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
     monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    # This test covers cross-boot state normalization, not database-backed
+    # group recovery: stub the exact recovery machinery as a successful no-op.
+    recovered_tokens: list[str] = []
+
+    def _no_op_recovery(incarnation: str) -> None:
+        recovered_tokens.append(incarnation)
+
+    monkeypatch.setattr(supervisor_module, "recover_owned_groups", _no_op_recovery)
     daemon.reconcile(100.0)
+    assert recovered_tokens == ["stale-token"]
     state = supervise.read_state()
     assert state.child is None
     assert state.restart_count == 2
