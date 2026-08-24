@@ -156,6 +156,7 @@ class SupervisorDesired:
 
         Raises:
             ValueError: If required fields are missing or malformed.
+            TypeError: If a present ``migration`` value is not a JSON boolean.
         """
         schema_version = _optional_int(data.get("schema_version"))
         generation = _optional_int(data.get("generation"))
@@ -163,6 +164,13 @@ class SupervisorDesired:
         if schema_version is None or generation is None or commit is None:
             msg = "supervisor desired state is malformed"
             raise ValueError(msg)
+        migration = data.get("migration", False)
+        # Absence is backward-compatible false, but a present value must be a
+        # real JSON boolean: anything else means the authoritative intent file
+        # is not trustworthy and parsing must fail closed.
+        if not isinstance(migration, bool):
+            msg = "supervisor desired state is malformed"
+            raise TypeError(msg)
         try:
             return cls(
                 schema_version=schema_version,
@@ -173,7 +181,7 @@ class SupervisorDesired:
                 worker_id=_optional_string(data.get("worker_id")),
                 restart=data.get("restart", False) is True,
                 requested_at=_optional_float(data.get("requested_at")) or 0.0,
-                migration=data.get("migration", False) is True,
+                migration=migration,
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervisor desired state is malformed"
@@ -718,7 +726,7 @@ def read_desired() -> SupervisorDesired | None:
         return None
     try:
         desired = SupervisorDesired.from_dict(data)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     if desired.schema_version != SCHEMA_VERSION:
         return None

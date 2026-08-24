@@ -3910,3 +3910,100 @@ def test_cold_migration_failure_never_advances_cli_authority(
     desired = supervise.read_desired()
     assert desired is not None
     assert desired.migration is True
+
+
+def test_cold_migration_completion_holds_deployment_lock(
+    maintained_env: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Authority mutations are serialized under the deployctl deployment lock."""
+    repo, _first, second = maintained_env
+    args = argparse.Namespace(commit=second, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+    supervise.write_state(
+        replace(
+            supervise.fresh_state(),
+            mode="run",
+            applied_generation=6,
+            commit=second,
+            ready=True,
+        )
+    )
+    lock_held_during_mutation = False
+
+    def prove_exclusion(_repo: Path, _commit: str, _uv_path: str, _timeout_seconds: float) -> Path:
+        nonlocal lock_held_during_mutation
+        try:
+            with lifecycle.deploy_lock(0.0):
+                pass
+        except lifecycle.LockTimeoutError:
+            lock_held_during_mutation = True
+        return cli.cli_commit_dir(_commit)
+
+    monkeypatch.setattr(cli, "build_cli_root", prove_exclusion)
+    daemon = SupervisorDaemon(Settings())
+    daemon._complete_cold_migration()
+    assert lock_held_during_mutation, (
+        "completion must hold the deployment lock across its authority mutations"
+    )
+
+
+def test_newer_mission_survives_and_owns_authority_over_stale_migration(
+    maintained_env: tuple[Path, str, str],
+) -> None:
+    """A newer published mission outranks the stale migration completion."""
+    repo, first, second = maintained_env
+    cli.set_current(first)
+    _write_confirmed_mission_for(5, first, repo)
+    args = argparse.Namespace(commit=second, repo=repo, uv="uv", lock_timeout=5.0)
+    assert lifecycle.migrate_cmd(args) == 0
+    write_rollback(
+        replace(
+            mission_state(7, dc.STATUS_PENDING, "c" * 40, second),
+            repo=str(repo),
+            supervisor_owned=True,
+        )
+    )
+    supervise.write_state(
+        replace(
+            supervise.fresh_state(),
+            mode="run",
+            applied_generation=6,
+            commit=second,
+            ready=True,
+        )
+    )
+    daemon = SupervisorDaemon(Settings())
+    daemon._complete_cold_migration()
+    assert cli.current_commit() == first, "stale migration must not move the pointer"
+    mission = dc.read_rollback_state()
+    assert mission is not None
+    assert mission.generation == 7, "the newer mission must survive untouched"
+    desired = supervise.read_desired()
+    assert desired is not None
+    assert desired.migration is False
+
+
+@pytest.mark.parametrize("malformed", [1, "true", None, {}, []])
+def test_present_non_boolean_migration_flag_fails_closed(
+    malformed: object,
+) -> None:
+    """A present ``migration`` value must be a real JSON boolean or fail closed."""
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "generation": 1,
+        "commit": "a" * 40,
+        "migration": malformed,
+    }
+    with pytest.raises((TypeError, ValueError), match="malformed"):
+        supervise.SupervisorDesired.from_dict(payload)
+
+
+def test_absent_migration_flag_remains_backward_compatible_false() -> None:
+    """Legacy intents without a ``migration`` key parse as migration=False."""
+    desired = supervise.SupervisorDesired.from_dict({
+        "schema_version": 1,
+        "generation": 1,
+        "commit": "a" * 40,
+    })
+    assert desired.migration is False

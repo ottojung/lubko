@@ -571,16 +571,47 @@ class SupervisorDaemon:
           authority follows the actually maintained worker, and finally the
           flag itself is cleared under the generation lock.
 
+        The whole decision-and-mutation sequence runs under the same
+        deployment lock every deployctl writer holds, so a concurrent newer
+        checkout/confirm can never publish a mission between the re-read and
+        the CLI/rollback mutations: it either completed before this critical
+        section (and strictly outranks the migration) or afterwards (and its
+        authority survives untouched). Lock order stays deployment lock
+        before generation lock. On lock contention the completion is simply
+        retried on a later tick.
+
         Every step is idempotent and ordered so a crash between steps leaves
         either the old coherent authority or retries the same convergence on
         the next tick; the flag is cleared last, so an interrupted run is
         always resumed rather than skipped.
-
-        A strictly newer supervised-deployment mission supersedes the
-        migration entirely and clears the stale flag.
         """
         desired = read_desired()
         if desired is None or not desired.migration:
+            return
+        try:
+            with lifecycle.deploy_lock(DEFAULT_LOCK_TIMEOUT_SECONDS):
+                self._complete_cold_migration_locked(desired)
+        except lifecycle.LockTimeoutError:
+            LOGGER.warning("cold-migration completion deferred: deployment lock is held")
+            self._message = "cold-migration completion deferred; deployment in progress"
+
+    def _complete_cold_migration_locked(self, desired: supervise.SupervisorDesired) -> None:
+        """Perform cold-migration convergence while holding the deployment lock.
+
+        All authority inputs are re-read inside the critical section so the
+        decision is serialized against deployctl writers.
+
+        Args:
+            desired: The migration intent observed before locking; re-read
+                and revalidated while locked.
+        """
+        current_desired = read_desired()
+        if (
+            current_desired is None
+            or not current_desired.migration
+            or current_desired.generation != desired.generation
+            or current_desired.commit != desired.commit
+        ):
             return
         try:
             mission = deployctl.read_rollback_state()
@@ -588,7 +619,8 @@ class SupervisorDaemon:
             mission = None
         if mission is not None and mission.generation > desired.generation:
             # A strictly newer supervised-deployment mission supersedes the
-            # migration; its own confirmation path owns authority now.
+            # migration; its own confirmation path owns authority now and its
+            # record must survive untouched.
             supervise.clear_migration_flag(desired.generation)
             lifecycle.append_deploy_log(
                 f"cold migration to {desired.commit} superseded by newer mission "
