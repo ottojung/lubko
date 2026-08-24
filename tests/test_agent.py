@@ -1544,6 +1544,7 @@ def test_runner_fails_closed_when_log_open_raises_non_enoent_oserror(
     assert "failed to open agent log" in result["error"]
     assert "Is a directory" in result["error"]
     assert result["active_runner"] is False
+    assert result["runner_reservation"] is None
     assert result["finished_at"] is not None
 
 
@@ -1554,6 +1555,14 @@ def test_runner_fails_closed_when_log_open_enoent_but_agent_dir_exists(
     """An ENOENT log open without deletion also fails the invocation closed."""
     meta = make_agent(state_dir, "aaaaaaaa", state_value="running")
     meta["active_runner"] = True
+    meta["runner_reservation"] = {
+        "gen": 1,
+        "owner_pid": os.getpid(),
+        "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
+        "state": "claimed",
+        "reserved_at": time.time(),
+        "mode": "new",
+    }
     agent.write_meta("aaaaaaaa", meta)
     monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
     ctx = agent._RunnerContext(
@@ -1568,6 +1577,8 @@ def test_runner_fails_closed_when_log_open_enoent_but_agent_dir_exists(
     assert result["state"] == "failed"
     assert "failed to open agent log" in result["error"]
     assert result["active_runner"] is False
+    assert result["runner_reservation"] is None
+    assert result["finished_at"] is not None
 
 
 def test_runner_log_open_enoent_with_deleted_agent_dir_remains_benign(
