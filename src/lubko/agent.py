@@ -1259,8 +1259,15 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     update_meta(aid, lambda m: _clear_pending(m, prompt))
     try:
         log = ctx.log_path.open("ab")
-    except OSError:
-        return None  # agent directory no longer exists
+    except OSError as exc:
+        # Fail closed on real spool/log failures (e.g. EACCES, EIO, EDQUOT);
+        # only an intentionally deleted agent directory exits benignly.
+        if isinstance(exc, FileNotFoundError) and not agent_dir(aid).is_dir():
+            return None  # agent directory intentionally deleted; metadata is gone
+        error = f"failed to open agent log: {exc}"
+        update_meta(aid, lambda m: _finalize_terminal(m, None, None, "failed", error))
+        update_meta(aid, lambda m: _set_active_runner(m, value=False))
+        return None
     with log:
         try:
             proc = subprocess.Popen(

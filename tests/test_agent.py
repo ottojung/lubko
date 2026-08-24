@@ -1526,6 +1526,72 @@ def test_runner_drains_queued_steers(state_dir: Path, monkeypatch: pytest.Monkey
     assert "second" in log
 
 
+def test_runner_fails_closed_when_log_open_raises_non_enoent_oserror(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-benign log-open OSError fails the invocation closed immediately."""
+    make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.mkdir()
+    agent.runner("aaaaaaaa", "new")
+    result = agent.read_meta("aaaaaaaa")
+    assert result is not None
+    assert result["state"] == "failed"
+    assert result["exit_code"] is None
+    assert "failed to open agent log" in result["error"]
+    assert "Is a directory" in result["error"]
+    assert result["active_runner"] is False
+    assert result["finished_at"] is not None
+
+
+def test_runner_fails_closed_when_log_open_enoent_but_agent_dir_exists(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ENOENT log open without deletion also fails the invocation closed."""
+    meta = make_agent(state_dir, "aaaaaaaa", state_value="running")
+    meta["active_runner"] = True
+    agent.write_meta("aaaaaaaa", meta)
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    ctx = agent._RunnerContext(
+        aid="aaaaaaaa",
+        log_path=agent.agents_dir() / "aaaaaaaa" / "missing-dir" / "output.log",
+        cwd=str(state_dir),
+        env=dict(os.environ),
+    )
+    assert agent._run_invocation(ctx, "the prompt", is_continue=False) is None
+    result = agent.read_meta("aaaaaaaa")
+    assert result is not None
+    assert result["state"] == "failed"
+    assert "failed to open agent log" in result["error"]
+    assert result["active_runner"] is False
+
+
+def test_runner_log_open_enoent_with_deleted_agent_dir_remains_benign(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An intentionally deleted agent directory still exits the runner benignly."""
+    meta = make_agent(state_dir, "aaaaaaaa", state_value="running")
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    ctx = agent._RunnerContext(
+        aid="aaaaaaaa",
+        log_path=agent.agents_dir() / "aaaaaaaa" / "output.log",
+        cwd=str(state_dir),
+        env=dict(os.environ),
+    )
+    shutil.rmtree(agent.agents_dir() / "aaaaaaaa")
+    # The runner raced with an intentional delete: metadata was read just
+    # before the directory disappeared, so the log open hits ENOENT.
+    real_read_meta = agent.read_meta
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: dict(meta))
+    assert agent._run_invocation(ctx, "the prompt", is_continue=False) is None
+    assert real_read_meta("aaaaaaaa") is None
+
+
 def test_runner_records_failure(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The runner records a non-zero invocation result."""
     make_agent(state_dir, "aaaaaaaa", state_value="running")
