@@ -2375,6 +2375,7 @@ def test_cmd_stop_kill_identity_race_never_terminalizes_newer_invocation(
             b_meta = meta_for_process("aaaaaaaa", proc_b, str(state_dir))
             b_meta["runner_pid"] = proc_b.pid
             b_meta["runner_start_time"] = agent.proc_start_ticks(proc_b.pid)
+            b_meta["active_runner"] = True
             agent.write_meta("aaaaaaaa", b_meta)
             return original_wait(meta, timeout)
 
@@ -2392,6 +2393,9 @@ def test_cmd_stop_kill_identity_race_never_terminalizes_newer_invocation(
         assert meta["pid"] == proc_b.pid
         assert meta["runner_pid"] == proc_b.pid
         assert meta["state"] == "running", "newer invocation must stay live"
+        assert meta["active_runner"] is True, "B's active runner must be preserved"
+        assert agent.active_runner_justified(meta)
+        assert agent.runner_alive(meta)
         assert meta["stop_reason"] is None
         assert meta["exit_signal"] is None
         assert meta["finished_at"] is None
