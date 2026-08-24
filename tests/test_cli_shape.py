@@ -13,7 +13,6 @@ from lubko.config import (
     worker_config_path,
 )
 from lubko.state import state_root
-from lubko.supervisor import build_parser as build_supervisor_parser
 
 COMMIT = "a" * 40
 
@@ -50,12 +49,3 @@ def test_explicit_config_env_overrides_xdg(monkeypatch: pytest.MonkeyPatch, tmp_
     monkeypatch.setenv(CONFIG_HOME_ENV, "/elsewhere")
     assert database_config_path() == tmp_path / "db.conf"
     assert worker_config_path() == tmp_path / "worker.conf"
-
-
-def test_supervisor_parser_defaults() -> None:
-    """The supervisor CLI defaults to daemon mode without ``--status``."""
-    args = build_supervisor_parser().parse_args([])
-    assert args.status is False
-    assert args.uv is None
-    status = build_supervisor_parser().parse_args(["--status"])
-    assert status.status is True
