@@ -1041,6 +1041,15 @@ class SupervisorDaemon:
     def _handle_crash(self, state: supervise.SupervisorState, now: float) -> None:
         """Record an unexpected worker exit and schedule a bounded retry.
 
+        Before the dead child identity is cleared, any command process group
+        still owned by the exact crashed worker incarnation is recovered with
+        the same blocking machinery used for planned retirement. If recovery
+        cannot be completed (missing database configuration, unreachable
+        database, query failure, or a surviving/unresolved group) the crash is
+        failed closed: the durable child identity is preserved as the
+        blocking recovery obligation, no replacement is spawned, and a later
+        reconciliation tick retries the same exact incarnation.
+
         Args:
             state: Daemon state holding the dead child.
             now: Monotonic time of the crash.
@@ -1051,6 +1060,33 @@ class SupervisorDaemon:
             state.child.pid if state.child is not None else None,
             returncode,
         )
+        child = state.child
+        if child is not None and not (
+            child.token and worker_mod.drain_sentinel_matches(child.token)
+        ):
+            try:
+                recover_owned_groups(child.token)
+            except OwnedGroupRecoveryError:
+                LOGGER.exception(
+                    "owned-group recovery for crashed incarnation %s is incomplete; "
+                    "preserving the dead child identity and withholding any replacement",
+                    child.token,
+                )
+                self._message = (
+                    f"owned-group recovery for crashed incarnation {child.token} "
+                    "is incomplete; holding without a replacement worker"
+                )
+                write_state(
+                    replace(
+                        state,
+                        last_exit=LastExit(returncode=returncode, at=time.time()),
+                        intent=INTENT_RUN,
+                        next_attempt_at=now + self._backoff_seconds(state.restart_count + 1),
+                        ready=False,
+                        next_readiness_at=None,
+                    )
+                )
+                return
         restart_count = state.restart_count + 1
         backoff = self._backoff_seconds(restart_count)
         next_state = replace(
