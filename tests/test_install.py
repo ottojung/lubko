@@ -2,11 +2,14 @@
 
 import os
 import subprocess
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
-from lubko import cli, install, toolchain
+from lubko import cli, install, lifecycle, supervise, toolchain
 from tests.test_cli import fake_uv_sync, git, make_repo
 
 REQUIRED_ENTRY_POINTS: frozenset[str] = frozenset(cli.ENTRY_POINTS)
@@ -329,3 +332,221 @@ def test_main_activation_failure_preserves_prior_cli(
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == f"lubko-agent@{old_commit}"
+
+
+# ---------------------------------------------------------------------------
+# Supervisor-authoritative runtime preservation (issue #183)
+# ---------------------------------------------------------------------------
+
+
+def make_repo_with_pyproject(
+    tmp_path: Path,
+) -> tuple[Path, str, str]:
+    """Return a two-commit repo plus a third HEAD commit adding pyproject.toml.
+
+    Returns:
+        The repository path, the first two commit hashes, with HEAD at the
+        ``lubko``-shaped checkout commit.
+    """
+    repo, first, second = make_repo(tmp_path / "repo")
+    (repo / "pyproject.toml").write_text('[project]\nname = "lubko"\n', encoding="utf-8")
+    git("add", "pyproject.toml", cwd=repo)
+    git("commit", "-q", "-m", "add pyproject", cwd=repo)
+    return repo, first, second
+
+
+def write_desired_commit(commit: str, repo: Path) -> None:
+    """Persist a minimal desired intent naming one commit."""
+    supervise.write_desired(
+        supervise.SupervisorDesired(
+            schema_version=supervise.SCHEMA_VERSION,
+            generation=1,
+            commit=commit,
+            repo=str(repo),
+            uv_path="uv",
+            worker_id=None,
+        )
+    )
+
+
+def installable_bin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> Path:
+    """Prepare bin/PATH/uv so ``install.main`` can run to completion.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        tmp_path: Temporary directory for bin and uv helpers.
+
+    Returns:
+        The prepared bin directory.
+    """
+    uv_dir = tmp_path / "uv-dir"
+    uv_dir.mkdir()
+    write_uv_executable(uv_dir)
+    bin_dir = tmp_path / "bin"
+    make_installed_bin(bin_dir)
+    monkeypatch.setenv("XDG_BIN_HOME", str(bin_dir))
+    patch_path(monkeypatch, uv_dir, bin_dir)
+    return bin_dir
+
+
+def test_main_refuses_version_changing_install_over_desired_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Installing a different commit than the desired worker fails closed."""
+    repo, first, _second = make_repo_with_pyproject(tmp_path)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    write_desired_commit(first, repo)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "refusing to install commit" in err
+    assert "lubko-deploy" in err
+    assert cli.current_commit() is None
+
+
+def test_refused_install_keeps_worker_runtime_startable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """After refusal the supervisor can still recover its maintained runtime."""
+    repo, _first, second = make_repo_with_pyproject(tmp_path)
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    cli.set_current(second)
+    write_desired_commit(second, repo)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert f"refusing to install commit {head}" in err
+    assert cli.runtime_is_usable(second)
+    assert cli.current_commit() == second
+    assert cli.reconcile_pointer(second) is True
+
+
+def test_main_allows_same_commit_install_with_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A same-commit fresh install succeeds and GC keeps only authority roots."""
+    repo, first, _second = make_repo_with_pyproject(tmp_path)
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.build_cli_root(repo, head, "uv", 60.0)
+    cli.set_current(head)
+    write_desired_commit(head, repo)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_OK
+    assert cli.current_commit() == head
+    assert cli.cli_commit_dir(head).is_dir()
+    assert not cli.cli_commit_dir(first).exists()
+    meta = toolchain.read_toolchain()
+    assert meta is not None
+
+
+def test_main_refuses_version_changing_install_over_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A bootstrap override naming another commit blocks version-changing installs."""
+    repo, first, second = make_repo_with_pyproject(tmp_path)
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.set_current(first)
+    supervise.write_supervisor_runtime_override(second)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    err = capsys.readouterr().err
+    assert f"refusing to install commit {head}" in err
+    assert second in err
+    assert cli.current_commit() == first
+    assert cli.runtime_is_usable(first)
+
+
+def test_main_rechecks_authority_under_deploy_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Authority appearing between the pre-check and the lock still aborts.
+
+    A concurrent deploy may write its desired intent right after the
+    installer's unlocked pre-check; the guard re-evaluated inside the
+    deployment-lock critical section must catch it (TOCTOU regression).
+    """
+    repo, first, _second = make_repo_with_pyproject(tmp_path)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    real_lock = lifecycle.deploy_lock
+
+    @contextmanager
+    def racing_lock(timeout_seconds: float) -> Iterator[None]:
+        with real_lock(timeout_seconds):
+            write_desired_commit(first, repo)
+            yield
+
+    monkeypatch.setattr(lifecycle, "deploy_lock", racing_lock)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "refusing to install commit" in capsys.readouterr().err
+    assert cli.current_commit() is None
+
+
+def test_main_fails_closed_when_deploy_lock_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A held deployment lock makes the installer refuse without mutating CLIs."""
+    repo, _first, _second = make_repo_with_pyproject(tmp_path)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    bin_dir = installable_bin(monkeypatch, tmp_path)
+    monkeypatch.setattr(lifecycle, "DEFAULT_LOCK_TIMEOUT_SECONDS", 0.2)
+
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with lifecycle.deploy_lock(10.0):
+            release.wait(timeout=30)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        while True:
+            try:
+                with lifecycle.deploy_lock(0.05):
+                    continue
+            except lifecycle.LockTimeoutError:
+                break
+        code = install.main(["--repo", str(repo)])
+    finally:
+        release.set()
+        holder.join()
+
+    assert code == install.EXIT_ERROR
+    assert "deployment lock" in capsys.readouterr().err
+    assert cli.current_commit() is None
+    assert (bin_dir / "lubko-agent").is_file()

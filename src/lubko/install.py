@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Final
 
 from lubko import cli
+from lubko import lifecycle as _lifecycle
 from lubko.toolchain import UvResolutionError, resolve_uv, write_toolchain
 
 DEFAULT_GIT_TIMEOUT_SECONDS: Final = 10.0
@@ -159,6 +160,101 @@ def main(argv: list[str] | None = None) -> int:
     return _install_repo(repo, args.uv)
 
 
+def _version_change_refusal(commit: str) -> str | None:
+    """Return why a version-changing install must be refused, if so.
+
+    The supervisor daemon and its maintained worker are authoritative for the
+    runtime they run: the durable desired intent, the applied state, and the
+    supervisor-runtime override each name a commit that must stay startable
+    and coherent with the global CLIs. Installing a different commit would
+    switch ``cli/current`` away from the worker's commit and garbage-collect
+    or strand the worker's runtime, silently diverging the worker from the
+    CLIs and setting up a later outage (for example after a restart).
+
+    Same-commit installs are always allowed: they repair or freshly rebuild
+    the exact runtime the supervisor already maintains, which is idempotent
+    and never diverges anything.
+
+    The guard is evaluated under the deployment lock so a concurrent deploy
+    cannot change the supervisor authority between this check and the CLI
+    mutation (fail closed against the check-to-mutation TOCTOU window).
+
+    Args:
+        commit: Exact commit the installer wants to activate.
+
+    Returns:
+        A user-facing refusal message, or ``None`` when the install may
+        proceed.
+    """
+    conflicting = cli.supervisor_authoritative_commits() - {commit}
+    if not conflicting:
+        return None
+    listed = ", ".join(sorted(conflicting))
+    return (
+        f"refusing to install commit {commit}: the supervisor maintains a different "
+        f"runtime ({listed}); switch the maintained worker with "
+        "'lubko-deploy --repo <checkout>' instead, then re-run lubko-install"
+    )
+
+
+def _activate_under_deploy_lock(repo: Path, commit: str, uv_path: str) -> int:
+    """Build, activate, and garbage-collect under the deployment lock.
+
+    The supervisor-authoritative divergence guard is re-evaluated inside the
+    lock so a concurrent deploy cannot change desired/applied/override
+    authority between the check and the CLI mutation (fail closed against
+    the check-to-mutation TOCTOU window).
+
+    Args:
+        repo: Repository checkout to install from.
+        commit: Exact commit to activate.
+        uv_path: Resolved ``uv`` executable path.
+
+    Returns:
+        ``EXIT_OK`` on success, ``EXIT_ERROR`` otherwise.
+    """
+    try:
+        with _lifecycle.deploy_lock(_lifecycle.DEFAULT_LOCK_TIMEOUT_SECONDS):
+            return _activate_mutation_locked(repo, commit, uv_path)
+    except _lifecycle.LockTimeoutError:
+        _err(
+            "timed out waiting for the deployment lock; a lifecycle mutation "
+            "(lubko-deploy/restart/recover) may be in flight, refusing to mutate the "
+            "maintained CLI runtimes concurrently"
+        )
+        return EXIT_ERROR
+
+
+def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
+    """Perform the guarded runtime and CLI mutation while holding the lock.
+
+    Args:
+        repo: Repository checkout to install from.
+        commit: Exact commit to activate.
+        uv_path: Resolved ``uv`` executable path.
+
+    Returns:
+        ``EXIT_OK`` on success, ``EXIT_ERROR`` otherwise.
+    """
+    refusal = _version_change_refusal(commit)
+    if refusal is not None:
+        _err(refusal)
+        return EXIT_ERROR
+    try:
+        cli.build_cli_root(repo, commit, uv_path, cli.DEFAULT_BUILD_TIMEOUT_SECONDS)
+    except cli.CliError as exc:
+        _err("could not prepare the maintained CLI environment: " + str(exc))
+        return EXIT_ERROR
+    cli.install_launchers(bin_home())
+    try:
+        cli.set_current(commit)
+    except cli.CliError as exc:
+        _err("could not activate the maintained CLI environment: " + str(exc))
+        return EXIT_ERROR
+    cli.gc_cli_roots((commit,))
+    return EXIT_OK
+
+
 def _install_repo(repo: Path, uv: str | None) -> int:
     """Install stable launchers and activate one repo commit.
 
@@ -180,19 +276,13 @@ def _install_repo(repo: Path, uv: str | None) -> int:
         _err(f"could not read the git commit of {repo}")
         return EXIT_ERROR
 
-    try:
-        cli.build_cli_root(repo, commit, uv_path, cli.DEFAULT_BUILD_TIMEOUT_SECONDS)
-    except cli.CliError as exc:
-        _err("could not prepare the maintained CLI environment: " + str(exc))
+    refusal = _version_change_refusal(commit)
+    if refusal is not None:
+        _err(refusal)
         return EXIT_ERROR
 
-    cli.install_launchers(bin_home())
-    try:
-        cli.set_current(commit)
-    except cli.CliError as exc:
-        _err("could not activate the maintained CLI environment: " + str(exc))
+    if _activate_under_deploy_lock(repo, commit, uv_path) != EXIT_OK:
         return EXIT_ERROR
-    cli.gc_cli_roots((commit,))
     write_toolchain(uv_path)
 
     if _verify_installed() != EXIT_OK:

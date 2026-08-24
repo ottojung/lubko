@@ -270,6 +270,105 @@ def test_gc_cli_roots_preserves_current_root(
     assert cli.current_commit() == first
 
 
+def write_desired_commit(commit: str) -> None:
+    """Persist a minimal desired intent naming one commit."""
+    supervise.write_desired(
+        supervise.SupervisorDesired(
+            schema_version=supervise.SCHEMA_VERSION,
+            generation=1,
+            commit=commit,
+            repo="/repo",
+            uv_path="uv",
+            worker_id=None,
+        )
+    )
+
+
+def write_applied_state(commit: str | None) -> None:
+    """Persist a minimal durable daemon state applying one commit."""
+    supervise.write_state(
+        supervise.SupervisorState(
+            schema_version=supervise.SCHEMA_VERSION,
+            applied_generation=1,
+            mode=supervise.MODE_RUN,
+            commit=commit,
+            child=None,
+            unresolved_child=None,
+            unresolved_hold_malformed=False,
+            intent="run",
+            restart_count=0,
+            next_attempt_at=None,
+            last_exit=None,
+            last_spawn_at=None,
+            ready=True,
+            next_readiness_at=None,
+            boot_id=None,
+        )
+    )
+
+
+def test_supervisor_authoritative_commits_unions_desired_applied_override(
+    two_commit_repo: tuple[Path, str, str],
+) -> None:
+    """Desired, applied, and override commits are all reported authoritative."""
+    _repo, first, second = two_commit_repo
+    assert cli.supervisor_authoritative_commits() == set()
+    write_desired_commit(first)
+    write_applied_state(second)
+    override = _make_override_commit()
+    supervise.write_supervisor_runtime_override(override)
+    assert cli.supervisor_authoritative_commits() == {first, second, override}
+
+
+def _make_override_commit() -> str:
+    """Return a synthetic-but-valid 40-hex commit for pointer-only tests."""
+    return "b" * 40
+
+
+def test_gc_cli_roots_preserves_desired_and_applied_runtimes(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GC never deletes runtimes named by desired/applied/override authority."""
+    repo, first, second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    third = add_commit(repo, "third")
+    for commit in (first, second, third):
+        cli.build_cli_root(repo, commit, "uv", 60.0)
+    cli.set_current(first)
+    write_desired_commit(second)
+    write_applied_state(third)
+    supervise.write_supervisor_runtime_override("c" * 40)
+    (cli.cli_commit_dir("c" * 40)).mkdir(parents=True)
+
+    cli.gc_cli_roots((first,))
+
+    for commit in (first, second, third):
+        assert cli.cli_commit_dir(commit).is_dir()
+    assert cli.cli_commit_dir("c" * 40).is_dir()
+
+
+def test_remove_cli_root_preserves_supervisor_authoritative_commits(
+    two_commit_repo: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit removal refuses desired/applied/override runtimes fail closed."""
+    repo, first, second = two_commit_repo
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.build_cli_root(repo, second, "uv", 60.0)
+    cli.set_current(first)
+    write_desired_commit(second)
+    write_applied_state(first)
+    supervise.write_supervisor_runtime_override(second)
+
+    cli.remove_cli_root(second)
+    cli.remove_cli_root(first)
+
+    assert cli.cli_commit_dir(second).is_dir()
+    assert cli.cli_commit_dir(first).is_dir()
+
+
 def test_remove_cli_root_skips_the_active_commit(
     two_commit_repo: tuple[Path, str, str],
     monkeypatch: pytest.MonkeyPatch,
