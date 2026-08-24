@@ -3487,15 +3487,19 @@ def _finish_stop_like(
 
 
 def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
-    """Cancel reserved/queued runner work under the metadata lock (issue #185).
+    """Durably record the stop-like cancellation of runner-owned work.
 
     When no invocation process group is live but a runner reservation, a
     proven-live runner, or an accepted ``pending_prompt`` can still start
-    work, this durably records the stop-like decision in the same locked
+    work, this establishes the stop-like decision in the same locked
     transaction that observed that ownership: the pending prompt and steer
-    queue are dropped, the terminal state is written, and the runner is
-    deactivated (dropping any unclaimed reservation so a later claim fails
-    closed).  The mutation is guarded by the exact observed ownership snapshot
+    queue are dropped, the durable stop reason deactivates the runner, and any
+    unclaimed reservation is dropped so a later claim fails closed.  The
+    terminal record is written only after the exact observed runner identity
+    is converged (see ``_converge_observed_runner``), so success is never
+    reported while the pre-existing execution authority is still alive.
+
+    The mutation is guarded by the exact observed ownership snapshot
     (invocation identity, pending prompt, and reservation generation), so a
     concurrently accepted newer invocation is never cancelled by a stale
     observation.
@@ -3512,7 +3516,6 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
     expected_pending = meta.get("pending_prompt")
     res = meta.get("runner_reservation")
     expected_gen = res.get("gen") if isinstance(res, dict) else None
-    state = "stopped" if intent == "stop" else "killed"
     applied = False
 
     def cancel(m: Meta) -> None:
@@ -3526,11 +3529,79 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
         ):
             return
         _begin_stop_like(m, intent)
-        _mark_terminal(m, None, None, state, intent)
+        m["stop_reason"] = intent
+        _set_active_runner(m, value=False)
         applied = True
 
     update_meta(aid, cancel)
     return applied
+
+
+def _runner_identity_alive(pid: int, ticks: object, aid: str) -> bool:
+    """Return whether the exact observed runner identity is still alive.
+
+    Args:
+        pid: The observed runner process ID.
+        ticks: The observed runner start time in clock ticks.
+        aid: Exact agent ID whose environment marker must match.
+
+    Returns:
+        ``True`` only when the live process matches every recorded identity
+        field, so a recycled PID is never mistaken for the runner.
+    """
+    if not pid_alive(pid):
+        return False
+    if proc_start_ticks(pid) != ticks:
+        return False
+    return env_has_marker(pid, aid)
+
+
+def _converge_observed_runner(observed: Meta, mode: str) -> bool:
+    """Converge the exact observed runner identity before terminalizing.
+
+    The runner recorded in ``observed`` is signalled by its exact identity
+    (start ticks plus per-agent marker, like deletion's convergence), never by
+    a broad match.  A runner recorded later in metadata (a post-cancellation
+    re-reservation by an explicit new prompt) is never signalled; once the
+    observed identity is gone, the pre-existing execution authority it carried
+    is provably converged regardless of what metadata names now.
+
+    Args:
+        observed: The metadata snapshot taken when the cancellation was
+            decided.
+        mode: ``stop`` for graceful-then-forced termination of the runner,
+            ``kill`` for an immediate forced kill.
+
+    Returns:
+        ``True`` only when the observed runner identity is provably gone.
+    """
+    pid = observed.get("runner_pid")
+    if not pid:
+        # No runner was ever recorded (reserved pre-spawn window); nothing to
+        # converge beyond dropping the reservation.
+        return True
+    pid = int(pid)
+    ticks = observed.get("runner_start_time")
+    marker_aid = str(observed.get("id", ""))
+    grace_signal = signal.SIGTERM if mode == "stop" else signal.SIGKILL
+    signal_identity_checked(pid, ticks, grace_signal, marker_aid=marker_aid)
+    deadline = time.time() + (STOP_WAIT_SECONDS if mode == "stop" else KILL_WAIT_SECONDS)
+    while time.time() < deadline:
+        if not _runner_identity_alive(pid, ticks, marker_aid):
+            return True
+        time.sleep(0.05)
+    if not _runner_identity_alive(pid, ticks, marker_aid):
+        return True
+    if mode == "stop":
+        # Grace period expired: escalate exactly like the invocation-group
+        # path so no managed runner survives a successful stop.
+        signal_identity_checked(pid, ticks, signal.SIGKILL, marker_aid=marker_aid)
+        deadline = time.time() + KILL_WAIT_SECONDS
+        while time.time() < deadline:
+            if not _runner_identity_alive(pid, ticks, marker_aid):
+                return True
+            time.sleep(0.05)
+    return False
 
 
 def _no_invocation_owned(meta: Meta) -> bool:
@@ -3585,8 +3656,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
             _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
             return EXIT_OK
         if _cancel_runner_work(aid, "stop", meta):
-            _out(f"stopped agent {aid} (cancelled reserved runner work)")
-            return EXIT_OK
+            return _finish_cancelled_runner_work(aid, meta, "stop")
         # Ownership changed concurrently (a newer invocation was recorded);
         # re-read and retry against the fresh state.
         newer = read_meta(aid)
@@ -3627,13 +3697,49 @@ def cmd_kill(args: argparse.Namespace) -> int:
             _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
             return EXIT_OK
         if _cancel_runner_work(aid, "kill", meta):
-            _out(f"killed agent {aid} (cancelled reserved runner work)")
-            return EXIT_OK
+            return _finish_cancelled_runner_work(aid, meta, "kill")
         newer = read_meta(aid)
         if newer is None:
             _out(f"{PROG}: agent {aid} is already dead")
             return EXIT_OK
         meta = newer
+
+
+def _finish_cancelled_runner_work(aid: str, observed: Meta, mode: str) -> int:
+    """Converge the observed runner and terminalize the cancelled work.
+
+    The stop-like decision is already durably recorded (no new work can
+    claim); success additionally requires the exact observed runner identity
+    to be provably gone.  Only then is the terminal record written under the
+    lock.  If convergence fails, the command fails closed with a coherent,
+    retryable record (intent and reason kept) instead of reporting false
+    success.
+
+    Args:
+        aid: Lubko agent ID.
+        observed: The metadata snapshot taken when cancellation was decided.
+        mode: ``stop`` or ``kill``.
+
+    Returns:
+        A process exit code.
+    """
+    if not _converge_observed_runner(observed, mode):
+        _err(f"{PROG}: agent {aid} did not converge; its recorded runner is still alive")
+        return EXIT_ERROR
+    state = "stopped" if mode == "stop" else "killed"
+    if not _update_meta_if_same_invocation(
+        aid,
+        _invocation_identity(observed),
+        lambda m: _mark_terminal(m, None, None, state, mode),
+    ):
+        # A newer invocation was recorded during convergence (a later explicit
+        # prompt re-reserved the agent); it must not be terminalized here.
+        verb = "stop" if mode == "stop" else "kill"
+        _err(f"{PROG}: agent {aid} changed during {verb}; newer invocation left running untouched")
+        return EXIT_ERROR
+    verb = "stopped" if mode == "stop" else "killed"
+    _out(f"{verb} agent {aid} (cancelled reserved runner work)")
+    return EXIT_OK
 
 
 def _signal_live_invocation(aid: str, meta: Meta, mode: str) -> int:
