@@ -223,3 +223,35 @@ def test_missing_invocation_id_fails_closed(tmp_path: Path) -> None:
         assert not _wait_gone(pids, timeout=2.0), "unverifiable record signalled anyway"
     finally:
         _terminate(pids)
+
+
+def test_rejected_candidates_do_not_leak_pidfds(tmp_path: Path) -> None:
+    """Repeated scans close the pin of every rejected candidate.
+
+    Each scanned candidate is pinned before verification; candidates that do
+    not match the exact invocation group must have their descriptor closed by
+    the scan itself, so repeated convergence passes never leak descriptors.
+    """
+    aid = "issue179-agent"
+    other_iid = "other" * 16
+    _, pids = _spawn_invocation_tree(aid, other_iid, tmp_path)
+    try:
+        # The recorded invocation marker matches nothing live: every pinned
+        # candidate (the whole process table) must be rejected and closed.
+
+        def open_fds() -> set[str]:
+            return {entry.name for entry in Path("/proc/self/fd").iterdir()}
+
+        baseline = open_fds()
+        stale_meta: agent.Meta = {
+            "id": aid,
+            "pid": pids[0],
+            "pgid": pids[0],
+            "start_time": 1,
+            "invocation_id": "nomatch" * 4,
+        }
+        for _ in range(5):
+            assert not agent.group_alive(stale_meta)
+        assert open_fds() <= baseline, "rejected candidates leaked pidfds"
+    finally:
+        _terminate(pids)

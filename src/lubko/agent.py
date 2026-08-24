@@ -579,11 +579,14 @@ def _pinned_invocation_members(pgid: int, aid: str, iid: str) -> list[tuple[int,
             if fd is None:
                 continue
             try:
-                if not _matches_invocation_group(member, pgid, aid, iid):
-                    continue
+                matched = _matches_invocation_group(member, pgid, aid, iid)
             except BaseException:
                 os.close(fd)
                 raise
+            if not matched:
+                # Ownership: a rejected candidate must never keep its pin.
+                os.close(fd)
+                continue
             members.append((member, fd))
     return members
 
