@@ -18,9 +18,11 @@ import argparse
 import codecs
 import contextlib
 import copy
+import ctypes
 import fcntl
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -29,6 +31,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import uuid
 from dataclasses import dataclass
 from itertools import starmap
 from pathlib import Path
@@ -51,6 +54,32 @@ TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
 STOP_REASONS: Final = frozenset({"stop", "kill"})
 PROG: Final = "lubko-agent"
 HEX_DIGITS: Final = frozenset("0123456789abcdef")
+
+# Environment variable carrying the durable, invocation-specific identity of a
+# spawned agent invocation. Unlike the agent-wide ``LUBKO_AGENT_ID`` (shared by
+# every invocation of the same agent across time), this token is freshly
+# generated for each spawned invocation and inherited by its whole process
+# tree, so signalling can never cross an invocation boundary even when the OS
+# recycles a process-group ID into a newer invocation of the same agent.
+INVOCATION_ID_VAR: Final = "LUBKO_INVOCATION_ID"
+
+# ``SYS_pidfd_open`` uses the unified syscall number 434 on every architecture
+# with a shared generic syscall table (x86_64, aarch64, riscv64, arm32, ppc64,
+# s390x, loongarch). Architectures with private numbering (alpha, mips,
+# parisc, sparc) are absent: there pinning is unsupported and signalling
+# fails closed.
+_PIDFD_OPEN_SYSCALL_NR: Final[dict[str, int]] = {
+    "x86_64": 434,
+    "aarch64": 434,
+    "armv7l": 434,
+    "armv8l": 434,
+    "riscv64": 434,
+    "ppc64": 434,
+    "ppc64le": 434,
+    "s390x": 434,
+    "loongarch64": 434,
+}
+_LIBC_CACHE: Final[dict[str, ctypes.CDLL]] = {}
 
 # Exit codes.
 EXIT_OK: Final = 0
@@ -248,6 +277,7 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "pid": None,
         "pgid": None,
         "start_time": None,
+        "invocation_id": None,
         "runner_pid": None,
         "runner_start_time": None,
         "started_at": None,
@@ -338,12 +368,244 @@ def env_has_marker(pid: int, aid: str) -> bool:
     Returns:
         ``True`` only when an exact ``LUBKO_AGENT_ID=<aid>`` entry is present.
     """
-    marker = f"LUBKO_AGENT_ID={aid}".encode()
+    return _env_has_entry(pid, f"LUBKO_AGENT_ID={aid}".encode())
+
+
+def env_has_invocation(pid: int, iid: str) -> bool:
+    """Return whether a process environment carries the exact invocation marker.
+
+    Args:
+        pid: Process whose environment to inspect.
+        iid: Exact invocation ID the marker must match.
+
+    Returns:
+        ``True`` only when an exact ``LUBKO_INVOCATION_ID=<iid>`` entry is
+        present.
+    """
+    return _env_has_entry(pid, f"{INVOCATION_ID_VAR}={iid}".encode())
+
+
+def _env_has_entry(pid: int, entry: bytes) -> bool:
+    """Return whether a process environment contains the exact NUL-delimited entry.
+
+    Args:
+        pid: Process whose environment to inspect.
+        entry: Whole ``KEY=VALUE`` environment entry required.
+
+    Returns:
+        ``True`` only when the exact entry is present.
+    """
     try:
         environ = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
         return False
-    return marker in environ.split(b"\0")
+    return entry in environ.split(b"\0")
+
+
+def open_pidfd(pid: int) -> int | None:
+    """Return a file descriptor pinning ``pid``, or ``None`` when unavailable.
+
+    A pidfd holds a reference to the kernel's PID structure, so the operating
+    system can never recycle that PID while the descriptor is open — even if
+    the process exits and is reaped. This is what makes check-then-signal
+    sequences race-free: identity verified through the pin refers to exactly
+    the process that is later signalled.
+
+    Prefers ``os.pidfd_open``; falls back to a narrowly encapsulated raw
+    ``SYS_pidfd_open`` syscall via ``ctypes`` on architectures with the
+    unified syscall number. Returns ``None`` when the process is gone
+    (``ESRCH``) or when the platform cannot pin PIDs at all, in which case
+    callers must fail closed rather than signal an unpinned target.
+
+    Args:
+        pid: Process ID to pin.
+
+    Returns:
+        A pidfd file descriptor, or ``None``.
+    """
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if pidfd_open is not None:
+        try:
+            return int(pidfd_open(int(pid)))
+        except OSError:
+            return None
+    nr = _PIDFD_OPEN_SYSCALL_NR.get(platform.machine())
+    libc = _load_libc()
+    if nr is None or libc is None:
+        return None
+    result = libc.syscall(ctypes.c_long(nr), ctypes.c_int(pid), ctypes.c_uint(0))
+    return int(result) if result >= 0 else None
+
+
+def _load_libc() -> ctypes.CDLL | None:
+    """Return a cached handle to the C library, or ``None``.
+
+    Returns:
+        The ``ctypes`` C library handle, or ``None`` when unavailable.
+    """
+    if "libc" not in _LIBC_CACHE:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.syscall.restype = ctypes.c_long
+        except OSError:
+            return None
+        _LIBC_CACHE["libc"] = libc
+    return _LIBC_CACHE["libc"]
+
+
+def signal_identity_checked(
+    pid: int,
+    start_time: object,
+    sig: int,
+    marker_aid: str | None = None,
+) -> None:
+    """Deliver ``sig`` to exactly the pinned-and-verified single process.
+
+    The PID is pinned with a pidfd before verification, so it cannot be
+    recycled between verification and delivery: a recorded runner PID that was
+    already reused by an unrelated process never matches and is never
+    signalled. When the platform cannot pin PIDs the signal is withheld (fail
+    closed).
+
+    Args:
+        pid: Recorded runner PID to signal.
+        start_time: Recorded start time in clock ticks that must match.
+        sig: Signal to deliver.
+        marker_aid: Exact agent ID whose environment marker must be present.
+    """
+    fd = open_pidfd(int(pid))
+    if fd is None:
+        return
+    try:
+        if proc_start_ticks(int(pid)) != start_time:
+            return
+        if marker_aid is not None and not env_has_marker(int(pid), marker_aid):
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(pid), sig)
+    finally:
+        os.close(fd)
+
+
+def send_signal_group(meta: Meta, sig: int) -> None:
+    """Deliver a signal to the agent's exact recorded invocation group.
+
+    Race-free by construction: every signalled process is first pinned with a
+    pidfd (which prevents PID recycling) and then verified against the
+    recorded invocation identity at the signal point itself. Two paths:
+
+    - Live leader: the leader is pinned, its start time and markers are
+      verified under the pin, then the whole group is signalled via
+      ``killpg`` — safe because the pinned PID cannot be recycled, so the
+      group is either the exact recorded one or already gone.
+    - Dead leader: any surviving members of the recorded group are converged
+      one member at a time, each individually pinned and required to carry
+      the recorded PGID, the exact agent marker, *and* the exact durable
+      per-invocation marker. A newer invocation of the same agent (with a
+      different invocation ID) is therefore never signalled, no matter how
+      the OS recycled PIDs or the group ID. When no invocation ID was
+      recorded, nothing is signalled: fail closed instead of guessing.
+
+    When no process can be pinned (platform without pidfd support), nothing
+    is signalled: fail closed instead of guessing.
+
+    Args:
+        meta: Agent metadata.
+        sig: Signal to deliver.
+    """
+    leader = meta.get("pid")
+    aid = str(meta.get("id", ""))
+    iid = meta.get("invocation_id")
+    if leader:
+        fd = open_pidfd(int(leader))
+        if fd is not None:
+            try:
+                verified = proc_start_ticks(int(leader)) == meta.get(
+                    "start_time"
+                ) and env_has_marker(int(leader), aid)
+                if verified and iid is not None:
+                    verified = env_has_invocation(int(leader), str(iid))
+                if verified:
+                    with contextlib.suppress(ProcessLookupError):
+                        # the agent was launched as its own session leader
+                        os.killpg(int(leader), sig)
+                    return
+            finally:
+                os.close(fd)
+    # The leader could not be pinned as the exact recorded invocation (it is
+    # dead, or its PID was recycled). Converge surviving members of the
+    # recorded group through the exact per-member pinned path — but only with
+    # a durable invocation-specific identity to authorize them.
+    pgid = meta.get("pgid") or leader
+    if not pgid or iid is None:
+        return
+    for member, fd in _pinned_invocation_members(int(pgid), aid, str(iid)):
+        try:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(member, sig)
+        finally:
+            os.close(fd)
+
+
+def _pinned_invocation_members(pgid: int, aid: str, iid: str) -> list[tuple[int, int]]:
+    """Return ``(pid, pidfd)`` pairs for surviving members of one invocation group.
+
+    Each candidate process is pinned with a pidfd before any check, so the
+    pgid/marker verification refers to exactly the returned, unrecyclable
+    process. Only processes inside the recorded group carrying both the exact
+    agent marker and the exact invocation marker qualify. Candidates whose own
+    PID equals the recorded PGID are always skipped: after the recorded leader
+    died, that slot may have been recycled into a newer session (or a newer
+    invocation's leader), and the invocation marker alone decides membership.
+
+    Args:
+        pgid: The recorded process group ID.
+        aid: Exact agent ID whose environment marker members must carry.
+        iid: Exact invocation ID whose environment marker members must carry.
+
+    Returns:
+        Pinned member PIDs with their still-open pidfds (caller closes).
+    """
+    members: list[tuple[int, int]] = []
+    with contextlib.suppress(OSError):
+        for entry in Path("/proc").iterdir():
+            name = entry.name
+            if not name.isdigit():
+                continue
+            member = int(name)
+            if member == pgid:
+                continue
+            fd = open_pidfd(member)
+            if fd is None:
+                continue
+            try:
+                if not _matches_invocation_group(member, pgid, aid, iid):
+                    continue
+            except BaseException:
+                os.close(fd)
+                raise
+            members.append((member, fd))
+    return members
+
+
+def _matches_invocation_group(member: int, pgid: int, aid: str, iid: str) -> bool:
+    """Return whether a process belongs to one exact recorded invocation group.
+
+    Args:
+        member: Candidate process ID.
+        pgid: The recorded process group ID.
+        aid: Exact agent ID whose environment marker must be present.
+        iid: Exact invocation ID whose environment marker must be present.
+
+    Returns:
+        ``True`` only when group and both markers match exactly.
+    """
+    try:
+        if os.getpgid(member) != pgid:
+            return False
+    except ProcessLookupError:
+        return False
+    return env_has_marker(member, aid) and env_has_invocation(member, iid)
 
 
 def is_alive(meta: Meta) -> bool:
@@ -373,31 +635,34 @@ def is_alive(meta: Meta) -> bool:
     return True
 
 
-def send_signal_group(meta: Meta, sig: int) -> None:
-    """Deliver a signal to the agent's process group (session leader).
-
-    Args:
-        meta: Agent metadata.
-        sig: Signal to deliver.
-    """
-    pid = meta.get("pid")
-    if not pid:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pid, sig)  # the agent was launched as its own session leader
-
-
 def group_alive(meta: Meta) -> bool:
-    """Return whether any live process remains in the agent's process group.
+    """Return whether any live process remains in the agent's exact invocation group.
+
+    When a durable invocation ID was recorded, group membership is decided by
+    the invocation-exact pinned scan: a recycled PGID hosting a newer
+    invocation of the same agent never counts as this invocation's survivors.
+    Without a recorded invocation ID the plain process-group membership is
+    used (legacy metadata).
 
     Args:
         meta: Agent metadata.
 
     Returns:
-        ``True`` when the recorded process group still has live members.
+        ``True`` when the recorded invocation still has live group members.
     """
     pgid = meta.get("pgid")
-    return bool(pgid and group_has_members(int(pgid)))
+    if not pgid:
+        return False
+    iid = meta.get("invocation_id")
+    if iid is None:
+        return bool(group_has_members(int(pgid)))
+    if is_alive(meta):
+        # The verified live leader implies its whole session group.
+        return True
+    fds = _pinned_invocation_members(int(pgid), str(meta.get("id", "")), str(iid))
+    for _, fd in fds:
+        os.close(fd)
+    return bool(fds)
 
 
 def wait_group_dead(meta: Meta, timeout: float) -> bool:
@@ -1241,6 +1506,12 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     meta = read_meta(aid)
     if meta is None:
         return None
+    # A fresh, durable identity for exactly this invocation. It is stamped
+    # into the spawned process environment (inherited by the whole process
+    # tree) and recorded in metadata, so later signalling can prove
+    # invocation-exact membership even across PGID/PID recycling.
+    iid = uuid.uuid4().hex
+    ctx.env[INVOCATION_ID_VAR] = iid
     ctx.env["LUBKO_PROMPT"] = prompt
     cmd = build_agent_command(meta, prompt, is_continue=is_continue)
     if cmd is None:
@@ -1285,7 +1556,7 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
             return None
 
         start = proc_start_ticks(proc.pid)
-        update_meta(aid, _record_running(proc, start))
+        update_meta(aid, _record_running(proc, start, iid))
 
         try:
             rc = _wait_for_invocation_exit(proc, aid, is_continue=is_continue)
@@ -1350,12 +1621,15 @@ def _wait_for_invocation_exit(
     return proc.wait()
 
 
-def _record_running(proc: subprocess.Popen[bytes], start: int | None) -> Callable[[Meta], None]:
+def _record_running(
+    proc: subprocess.Popen[bytes], start: int | None, iid: str
+) -> Callable[[Meta], None]:
     """Return a metadata mutation that records a running agent process.
 
     Args:
         proc: The spawned agent process.
         start: The process start time in clock ticks.
+        iid: The durable invocation ID stamped into the spawned environment.
 
     Returns:
         The metadata mutation.
@@ -1365,6 +1639,7 @@ def _record_running(proc: subprocess.Popen[bytes], start: int | None) -> Callabl
         m["pid"] = proc.pid
         m["pgid"] = proc.pid
         m["start_time"] = start
+        m["invocation_id"] = iid
         m["runner_pid"] = os.getpid()
         m["runner_start_time"] = proc_start_ticks(os.getpid())
         m["started_at"] = time.time()
@@ -3224,6 +3499,7 @@ def _begin_delete(aid: str, *, force: bool) -> Meta | None:
             "pid": m.get("pid"),
             "pgid": m.get("pgid"),
             "start_time": m.get("start_time"),
+            "invocation_id": m.get("invocation_id"),
             "runner_pid": m.get("runner_pid"),
             "runner_start_time": m.get("runner_start_time"),
             "active_runner": bool(m.get("active_runner")),
@@ -3283,10 +3559,16 @@ def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
         cur = read_meta(aid)
         if cur is not None and cur.get("delete_pending"):
             if force:
-                # Converge the exact recorded runner identity first...
-                if runner_alive(cur):
-                    with contextlib.suppress(OSError):
-                        os.kill(int(cur["runner_pid"]), signal.SIGKILL)
+                # Converge the exact recorded runner identity first: pinned,
+                # start-time and marker verified at the signal point, so a
+                # recycled runner PID can never be signalled.
+                if cur.get("runner_pid"):
+                    signal_identity_checked(
+                        int(cur["runner_pid"]),
+                        cur.get("runner_start_time"),
+                        signal.SIGKILL,
+                        marker_aid=str(cur.get("id", "")),
+                    )
                 # ...then the exact invocation process group.
                 if group_alive(cur):
                     send_signal_group(cur, signal.SIGKILL)
