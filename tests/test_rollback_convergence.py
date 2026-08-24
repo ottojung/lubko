@@ -10,6 +10,8 @@ import pytest
 from lubko import deployctl as dc
 from lubko import lifecycle
 
+COMMIT = "a" * 40
+
 
 class FakePopen:
     """Deterministic stand-in for the spawned previous-worker ``Popen``."""
@@ -221,3 +223,24 @@ def test_repeated_retries_never_leave_a_live_worker_behind(
     # earlier retry can coexist with a later replacement.
     assert all(fake.poll() is not None for fake in spawned)
     assert [fake.signals for fake in spawned] == [["SIGTERM"]] * 3
+
+
+def test_controller_requests_must_be_json_objects() -> None:
+    """Controller requests must be JSON objects; the type defaults to empty."""
+    request = dc.parse_request('{"type": "status", "x": 1}')
+    assert dc.request_type(request) == "status"
+    assert not dc.request_type({})
+    assert not dc.request_type({"type": 3})
+    with pytest.raises(dc.DeployCtlError, match="not valid JSON"):
+        dc.parse_request("{oops")
+    with pytest.raises(dc.DeployCtlError, match="JSON object"):
+        dc.parse_request("[1]")
+
+
+def test_only_failed_checkout_reports_failure_via_exit_code() -> None:
+    """Only a failed checkout reports failure via the exit code."""
+    failed: dict[str, object] = {"ok": False}
+    succeeded: dict[str, object] = {"ok": True}
+    assert dc.checkout_failure_exit_code("checkout", failed) != 0
+    assert dc.checkout_failure_exit_code("checkout", succeeded) == 0
+    assert dc.checkout_failure_exit_code("confirm", failed) == 0
