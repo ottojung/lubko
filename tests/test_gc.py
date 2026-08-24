@@ -41,10 +41,12 @@ if TYPE_CHECKING:
 
 def _make_settings(
     *,
+    server: str = "alpha-server",
     gc_retention_seconds: float = 0.0,
     gc_batch_limit: int = 100,
 ) -> Settings:
     return Settings(
+        server=server,
         worker_id="test-worker",
         poll_interval_seconds=0.05,
         process_poll_interval_seconds=0.01,
@@ -75,12 +77,14 @@ def _insert_terminal_job(
     conninfo: str,
     *,
     status: str = "succeeded",
+    server: str = "alpha-server",
     finished_at: str = "2020-01-01T00:00:00.000000Z",
     worker_id: str = "old-worker",
 ) -> UUID:
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": server,
         "request": {"cwd": "/workspace", "process": ["echo", "hi"]},
         "state": {"status": status, "finished_at": finished_at, "worker_id": worker_id},
     })
@@ -94,8 +98,9 @@ def _insert_terminal_job(
 
 def _insert_pending_job(conninfo: str) -> UUID:
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": "/workspace", "process": ["sleep", "30"]},
         "state": {"status": "pending"},
     })
@@ -109,8 +114,9 @@ def _insert_pending_job(conninfo: str) -> UUID:
 
 def _insert_running_job(conninfo: str) -> UUID:
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": "/workspace", "process": ["sleep", "30"]},
         "state": {
             "status": "running",
@@ -128,10 +134,13 @@ def _insert_running_job(conninfo: str) -> UUID:
     return cast("UUID", row[0])
 
 
-def _insert_output_chunk(conninfo: str, root_id: UUID, *, sequence: int = 0) -> UUID:
+def _insert_output_chunk(
+    conninfo: str, root_id: UUID, *, sequence: int = 0, server: str = "alpha-server"
+) -> UUID:
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "output_chunk",
+        "server": server,
         "thread": str(root_id),
         "stream": "stdout",
         "sequence": sequence,
@@ -150,8 +159,9 @@ def _insert_output_chunk(conninfo: str, root_id: UUID, *, sequence: int = 0) -> 
 
 def _insert_orphan_chunk(conninfo: str, dangling_root_id: UUID) -> UUID:
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "output_chunk",
+        "server": "alpha-server",
         "thread": str(dangling_root_id),
         "stream": "stdout",
         "sequence": 0,
@@ -349,6 +359,7 @@ def test_settings_rejects_zero_gc_retention() -> None:
     """A negative GC retention is refused."""
     with pytest.raises(ValueError, match="GC_RETENTION_SECONDS"):
         Settings(
+            server="alpha-server",
             worker_id="w",
             poll_interval_seconds=1.0,
             process_poll_interval_seconds=0.1,
@@ -361,6 +372,7 @@ def test_settings_rejects_zero_gc_interval() -> None:
     """A zero GC interval is refused."""
     with pytest.raises(ValueError, match="GC_INTERVAL_SECONDS"):
         Settings(
+            server="alpha-server",
             worker_id="w",
             poll_interval_seconds=1.0,
             process_poll_interval_seconds=0.1,
@@ -373,6 +385,7 @@ def test_settings_rejects_zero_gc_batch_limit() -> None:
     """A zero GC batch limit is refused."""
     with pytest.raises(ValueError, match="GC_BATCH_LIMIT"):
         Settings(
+            server="alpha-server",
             worker_id="w",
             poll_interval_seconds=1.0,
             process_poll_interval_seconds=0.1,
@@ -384,6 +397,7 @@ def test_settings_rejects_zero_gc_batch_limit() -> None:
 def test_settings_gc_defaults() -> None:
     """GC settings default to documented values."""
     settings = Settings(
+        server="alpha-server",
         worker_id="w",
         poll_interval_seconds=1.0,
         process_poll_interval_seconds=0.1,
@@ -399,7 +413,7 @@ def test_settings_reads_gc_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LUBKO_GC_RETENTION_SECONDS", "600")
     monkeypatch.setenv("LUBKO_GC_INTERVAL_SECONDS", "30")
     monkeypatch.setenv("LUBKO_GC_BATCH_LIMIT", "50")
-    settings = Settings.from_environment()
+    settings = Settings.from_environment(server="env-server")
     assert settings.gc_retention_seconds == pytest.approx(600.0)
     assert settings.gc_interval_seconds == pytest.approx(30.0)
     assert settings.gc_batch_limit == 50
@@ -848,7 +862,7 @@ def test_gc_collects_after_lease_recovery_makes_terminal(db: str) -> None:
 
     # Lease recovery marks it failed.
     with psycopg.connect(db) as conn:
-        recovered = recover_stale_jobs(conn)
+        recovered = recover_stale_jobs(conn, _make_settings().server)
     assert len(recovered) == 1
     assert recovered[0][0] == root_id
     assert _read_status(db, root_id) == "failed"
@@ -916,8 +930,9 @@ def test_gc_does_not_mark_unknown_status(db: str) -> None:
     Any unknown or future status value is retained, not collected.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": "/workspace", "process": ["echo", "hi"]},
         "state": {
             "status": "mystery",
@@ -981,8 +996,9 @@ def test_gc_orphan_pass_cleans_malformed_thread(db: str) -> None:
     chunk_ids: list[UUID] = []
     for thread_val, _label in cases:
         payload = json.dumps({
-            "v": 3,
+            "v": 4,
             "type": "output_chunk",
+            "server": "alpha-server",
             "thread": thread_val,
             "stream": "stdout",
             "sequence": 0,
@@ -1149,7 +1165,9 @@ def test_gc_mark_prevents_publication_no_orphan_chunks(db: str, tmp_path: Path) 
 
         # publish_output refuses the gc-marked root.
         with psycopg.connect(db) as conn:
-            published = publish_output(conn, job, list(OUTPUT_STREAMS), 0.0, force=True)
+            published = publish_output(
+                conn, job, list(OUTPUT_STREAMS), 0.0, server="alpha-server", force=True
+            )
         assert published is False
         # No new chunk created by the refused publication.
         assert _count_chunks_for_root(db, root_id) == 2
@@ -1184,8 +1202,9 @@ def test_gc_orphan_retains_uppercase_thread_with_existing_root(db: str) -> None:
     """
     root_id = _insert_terminal_job(db, finished_at="2099-01-01T00:00:00.000000Z")
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "output_chunk",
+        "server": "alpha-server",
         "thread": str(root_id).upper(),
         "stream": "stdout",
         "sequence": 0,
@@ -1219,8 +1238,9 @@ def test_gc_drains_uppercase_thread_chunks_from_marked_root(db: str) -> None:
     # Insert chunks with uppercase thread.
     for i in range(5):
         payload = json.dumps({
-            "v": 3,
+            "v": 4,
             "type": "output_chunk",
+            "server": "alpha-server",
             "thread": str(root_id).upper(),
             "stream": "stdout",
             "sequence": i,
@@ -1254,8 +1274,9 @@ def test_gc_orphan_deletes_malformed_with_no_owner(db: str) -> None:
 
     # A malformed chunk — must be deleted.
     bad_payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "output_chunk",
+        "server": "alpha-server",
         "thread": "not-a-uuid",
         "stream": "stdout",
         "sequence": 0,
@@ -1278,3 +1299,74 @@ def test_gc_orphan_deletes_malformed_with_no_owner(db: str) -> None:
     assert orphans == 1
     assert not _row_exists(db, bad_id)
     assert _row_exists(db, valid_chunk)
+
+
+def test_gc_is_isolated_per_server(db: str) -> None:
+    """A GC pass collects only terminal roots and chunks of its own server.
+
+    A beta-addressed terminal root with owned chunks is invisible to an alpha
+    daemon's collection pass (mark, drain, and orphan phases all skip it); the
+    same pass run for the beta identity drains exactly that transport.
+    """
+    beta_id = _insert_terminal_job(db, server="beta-server")
+    _insert_output_chunk(db, beta_id, sequence=0, server="beta-server")
+    _insert_output_chunk(db, beta_id, sequence=1, server="beta-server")
+
+    with psycopg.connect(db) as conn:
+        assert collect_transport(conn, _make_settings()) == ([], 0, 0)
+    assert _row_exists(db, beta_id)
+    assert _count_chunks_for_root(db, beta_id) == 2
+
+    with psycopg.connect(db) as conn:
+        roots, chunks, orphans = collect_transport(conn, _make_settings(server="beta-server"))
+    assert roots == [beta_id]
+    assert chunks == 2
+    assert orphans == 0
+    assert not _row_exists(db, beta_id)
+    assert _count_chunks_for_root(db, beta_id) == 0
+
+
+def test_gc_orphan_pass_is_isolated_per_server(db: str) -> None:
+    """Orphan chunks of another server are never collected by this daemon."""
+    dangling_beta = uuid4()
+    _insert_orphan_chunk_for_server(db, dangling_beta, "beta-server")
+
+    with psycopg.connect(db) as conn:
+        _roots, _chunks, orphans = collect_transport(conn, _make_settings())
+    assert orphans == 0
+    assert _row_exists(db, _chunk_id(db, dangling_beta))
+
+    with psycopg.connect(db) as conn:
+        _roots, _chunks, orphans = collect_transport(conn, _make_settings(server="beta-server"))
+    assert orphans == 1
+
+
+def _insert_orphan_chunk_for_server(conninfo: str, dangling_root_id: UUID, server: str) -> UUID:
+    payload = json.dumps({
+        "v": 4,
+        "type": "output_chunk",
+        "server": server,
+        "thread": str(dangling_root_id),
+        "stream": "stdout",
+        "sequence": 0,
+        "start": 0,
+        "end": 10,
+        "value": "orphan",
+        "previous": None,
+    })
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id", (payload,)
+        ).fetchone()
+    assert row is not None
+    return cast("UUID", row[0])
+
+
+def _chunk_id(conninfo: str, thread: UUID) -> UUID:
+    with psycopg.connect(conninfo) as conn:
+        row = conn.execute(
+            "SELECT id FROM lubko.jobs WHERE (payload::jsonb)->>'thread' = %s",
+            (str(thread),),
+        ).fetchone()
+    assert row is not None
+    return cast("UUID", row[0])

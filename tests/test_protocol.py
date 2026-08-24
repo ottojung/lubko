@@ -1,7 +1,7 @@
 """Tests for the versioned Lubko transport JSON binding."""
 
 import json
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -27,6 +27,8 @@ from lubko.protocol import (
     parse_payload,
 )
 
+SERVER_A = "alpha-server"
+
 
 def test_invariant_matches_issue_contract() -> None:
     """The invariant names exactly two columns and the JSON payload."""
@@ -35,9 +37,9 @@ def test_invariant_matches_issue_contract() -> None:
     assert "payload" in TWO_COLUMN_INVARIANT
 
 
-def test_protocol_version_is_three() -> None:
-    """Protocol v3 is the current binding."""
-    assert PROTOCOL_VERSION == 3
+def test_protocol_version_is_four() -> None:
+    """Protocol v4 is the current binding."""
+    assert PROTOCOL_VERSION == 4
     assert JOB_TYPE_COMMAND in KNOWN_JOB_TYPES
     assert JOB_TYPE_OUTPUT_CHUNK in KNOWN_JOB_TYPES
     assert STATUS_PENDING in KNOWN_STATUSES
@@ -46,7 +48,9 @@ def test_protocol_version_is_three() -> None:
 
 def test_build_payload_process() -> None:
     """build_payload emits a claimable protocol v3 command payload."""
-    payload = build_payload(cwd="/workspace/project", process=["git", "status", "--short"])
+    payload = build_payload(
+        server=SERVER_A, cwd="/workspace/project", process=["git", "status", "--short"]
+    )
 
     assert payload["v"] == PROTOCOL_VERSION
     assert payload["type"] == JOB_TYPE_COMMAND
@@ -60,21 +64,23 @@ def test_build_payload_process() -> None:
 def test_build_payload_process_element_is_empty() -> None:
     """An empty string inside the argv array is a binding violation."""
     with pytest.raises(ProtocolError, match="non-empty"):
-        build_payload(cwd="/x", process=["git", ""])
+        build_payload(server=SERVER_A, cwd="/x", process=["git", ""])
 
 
 def test_build_payload_rejects_non_string_process() -> None:
     """build_payload runtime-validates process is a list of strings, not truthy items."""
+    bad_process = cast("Any", [1, 2])
+    bad_process_tuple = cast("Any", (1, "git"))
     with pytest.raises(ProtocolError, match=r"request\.process"):
-        build_payload(cwd="/x", process=[1, 2])  # type: ignore[list-item]
+        build_payload(server=SERVER_A, cwd="/x", process=bad_process)
     with pytest.raises(ProtocolError, match=r"request\.process"):
-        build_payload(cwd="/x", process=(1, "git"))  # type: ignore[arg-type]
+        build_payload(server=SERVER_A, cwd="/x", process=bad_process_tuple)
 
 
 def test_build_payload_rejects_empty_process() -> None:
     """A missing or empty request.process is a binding violation."""
     with pytest.raises(ProtocolError, match=r"request\.process"):
-        build_payload(cwd="/x", process=[])
+        build_payload(server=SERVER_A, cwd="/x", process=[])
 
 
 def test_build_output_window_payload() -> None:
@@ -120,6 +126,7 @@ def test_build_output_chunk_payload() -> None:
     thread = uuid4()
     previous = uuid4()
     chunk = build_output_chunk_payload(
+        server=SERVER_A,
         thread=thread,
         stream="stdout",
         sequence=17,
@@ -144,6 +151,7 @@ def test_build_output_chunk_payload_rejects_unknown_stream() -> None:
     """Only stdout and stderr are valid chunk streams."""
     with pytest.raises(ProtocolError, match="output stream"):
         build_output_chunk_payload(
+            server=SERVER_A,
             thread=uuid4(),
             stream="logs",
             sequence=0,
@@ -158,6 +166,7 @@ def test_build_output_chunk_payload_rejects_oversized_value() -> None:
     """A chunk larger than the strict bound is rejected."""
     with pytest.raises(ProtocolError, match="at most"):
         build_output_chunk_payload(
+            server=SERVER_A,
             thread=uuid4(),
             stream="stderr",
             sequence=0,
@@ -172,6 +181,7 @@ def test_build_output_chunk_payload_rejects_bad_offsets() -> None:
     """A chunk with an end before its start is rejected."""
     with pytest.raises(ProtocolError, match="precedes"):
         build_output_chunk_payload(
+            server=SERVER_A,
             thread=uuid4(),
             stream="stdout",
             sequence=0,
@@ -187,6 +197,7 @@ def test_parse_payload_accepts_json_text() -> None:
     text = json.dumps({
         "v": PROTOCOL_VERSION,
         "type": JOB_TYPE_COMMAND,
+        "server": SERVER_A,
         "request": {"cwd": "/workspace/project", "process": ["echo", "hi"]},
         "state": {"status": STATUS_PENDING},
     })
@@ -206,6 +217,7 @@ def test_parse_payload_accepts_decoded_mapping() -> None:
     data: dict[str, Any] = {
         "v": PROTOCOL_VERSION,
         "type": JOB_TYPE_COMMAND,
+        "server": SERVER_A,
         "request": {"cwd": "/x", "process": ["true"]},
         "state": {"status": "running"},
     }
@@ -222,6 +234,7 @@ def test_parse_payload_accepts_bounded_output_and_result() -> None:
     data: dict[str, Any] = {
         "v": PROTOCOL_VERSION,
         "type": JOB_TYPE_COMMAND,
+        "server": SERVER_A,
         "request": {"cwd": "/x", "process": ["true"]},
         "state": {"status": "succeeded"},
         "output": {
@@ -254,6 +267,7 @@ def test_parse_payload_rejects_oversized_tail() -> None:
         parse_payload({
             "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
             "request": {"cwd": "/x", "process": ["ls"]},
             "state": {"status": "running"},
             "output": {
@@ -274,12 +288,13 @@ def test_parse_payload_rejects_non_json_text() -> None:
 
 
 def test_parse_payload_rejects_unsupported_version() -> None:
-    """Legacy and unknown protocol versions (v1, v2, and beyond) are rejected."""
-    for version in (1, 2, 4):
+    """Legacy and unknown protocol versions (v1, v2, v3, and beyond) are rejected."""
+    for version in (1, 2, 3, 5):
         with pytest.raises(ProtocolError, match="unsupported protocol version"):
             parse_payload({
                 "v": version,
                 "type": JOB_TYPE_COMMAND,
+                "server": SERVER_A,
                 "request": {"cwd": "/x", "process": ["ls"]},
                 "state": {"status": STATUS_PENDING},
             })
@@ -291,6 +306,7 @@ def test_parse_payload_rejects_legacy_v2_command_form() -> None:
         parse_payload({
             "v": 2,
             "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
             "request": {"cwd": "/x", "command": "ls"},
             "state": {"status": STATUS_PENDING},
         })
@@ -299,7 +315,13 @@ def test_parse_payload_rejects_legacy_v2_command_form() -> None:
 def test_parse_payload_rejects_unknown_type() -> None:
     """Unknown job kinds are rejected."""
     with pytest.raises(ProtocolError, match="unknown job type"):
-        parse_payload({"v": 3, "type": "runaway", "request": {}, "state": {}})
+        parse_payload({
+            "v": PROTOCOL_VERSION,
+            "server": SERVER_A,
+            "type": "runaway",
+            "request": {},
+            "state": {},
+        })
 
 
 def test_parse_payload_rejects_chunk_rows() -> None:
@@ -307,6 +329,7 @@ def test_parse_payload_rejects_chunk_rows() -> None:
     with pytest.raises(ProtocolError, match="not a command job"):
         parse_payload(
             build_output_chunk_payload(
+                server=SERVER_A,
                 thread=uuid4(),
                 stream="stdout",
                 sequence=0,
@@ -321,27 +344,43 @@ def test_parse_payload_rejects_chunk_rows() -> None:
 def test_parse_payload_rejects_missing_request() -> None:
     """A payload without a request object is a binding violation."""
     with pytest.raises(ProtocolError, match="request object"):
-        parse_payload({"v": 3, "type": JOB_TYPE_COMMAND, "state": {}})
+        parse_payload({
+            "v": PROTOCOL_VERSION,
+            "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
+            "state": {},
+        })
 
 
 def test_parse_payload_rejects_missing_cwd() -> None:
     """A request without a cwd is a binding violation."""
     with pytest.raises(ProtocolError, match=r"request\.cwd"):
-        parse_payload({"v": 3, "type": JOB_TYPE_COMMAND, "request": {"process": ["ls"]}})
+        parse_payload({
+            "v": PROTOCOL_VERSION,
+            "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
+            "request": {"process": ["ls"]},
+        })
 
 
 def test_parse_payload_rejects_missing_process() -> None:
     """A request without request.process is a binding violation."""
     with pytest.raises(ProtocolError, match=r"request\.process"):
-        parse_payload({"v": 3, "type": JOB_TYPE_COMMAND, "request": {"cwd": "/x"}})
+        parse_payload({
+            "v": PROTOCOL_VERSION,
+            "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
+            "request": {"cwd": "/x"},
+        })
 
 
 def test_parse_payload_rejects_legacy_command_key() -> None:
     """The legacy request.command key is rejected even alongside a valid process."""
     with pytest.raises(ProtocolError, match="legacy protocol v2 fields"):
         parse_payload({
-            "v": 3,
+            "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
             "request": {"cwd": "/x", "process": ["ls"], "command": "ls"},
         })
 
@@ -350,8 +389,9 @@ def test_parse_payload_rejects_legacy_args_key() -> None:
     """The legacy request.args key is rejected even alongside a valid process."""
     with pytest.raises(ProtocolError, match="legacy protocol v2 fields"):
         parse_payload({
-            "v": 3,
+            "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
             "request": {"cwd": "/x", "process": ["ls"], "args": ["ls"]},
         })
 
@@ -360,8 +400,9 @@ def test_parse_payload_rejects_missing_state() -> None:
     """A payload without a state object is a binding violation."""
     with pytest.raises(ProtocolError, match="state object"):
         parse_payload({
-            "v": 3,
+            "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
             "request": {"cwd": "/x", "process": ["ls"]},
         })
 
@@ -370,8 +411,9 @@ def test_parse_payload_rejects_unknown_status() -> None:
     """An unknown job status is a binding violation."""
     with pytest.raises(ProtocolError, match="unknown job status"):
         parse_payload({
-            "v": 3,
+            "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
             "request": {"cwd": "/x", "process": ["ls"]},
             "state": {"status": "exploded"},
         })
@@ -381,8 +423,9 @@ def test_parse_payload_rejects_absent_status() -> None:
     """A state without a status is a binding violation."""
     with pytest.raises(ProtocolError, match="unknown job status"):
         parse_payload({
-            "v": 3,
+            "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_COMMAND,
+            "server": SERVER_A,
             "request": {"cwd": "/x", "process": ["ls"]},
             "state": {},
         })
@@ -393,6 +436,7 @@ def test_parse_chunk_payload_roundtrip() -> None:
     thread = uuid4()
     previous = uuid4()
     payload = build_output_chunk_payload(
+        server=SERVER_A,
         thread=thread,
         stream="stderr",
         sequence=3,
@@ -416,6 +460,7 @@ def test_parse_chunk_payload_roundtrip() -> None:
 def test_parse_chunk_payload_accepts_json_text() -> None:
     """A stored chunk payload decodes and validates from JSON text."""
     payload = build_output_chunk_payload(
+        server=SERVER_A,
         thread=uuid4(),
         stream="stdout",
         sequence=0,
@@ -434,6 +479,7 @@ def test_parse_chunk_payload_rejects_missing_thread() -> None:
         parse_chunk_payload({
             "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_OUTPUT_CHUNK,
+            "server": SERVER_A,
             "stream": "stdout",
             "sequence": 0,
             "start": 0,
@@ -448,6 +494,7 @@ def test_parse_chunk_payload_rejects_bad_previous_uuid() -> None:
         parse_chunk_payload({
             "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_OUTPUT_CHUNK,
+            "server": SERVER_A,
             "thread": str(uuid4()),
             "stream": "stdout",
             "sequence": 0,
@@ -461,7 +508,7 @@ def test_parse_chunk_payload_rejects_bad_previous_uuid() -> None:
 def test_parse_chunk_payload_rejects_command_rows() -> None:
     """A command payload is rejected by the chunk parser."""
     with pytest.raises(ProtocolError, match="not an output_chunk"):
-        parse_chunk_payload(build_payload(cwd="/x", process=["ls"]))
+        parse_chunk_payload(build_payload(server=SERVER_A, cwd="/x", process=["ls"]))
 
 
 def test_parse_chunk_payload_rejects_oversized_value() -> None:
@@ -470,6 +517,7 @@ def test_parse_chunk_payload_rejects_oversized_value() -> None:
         parse_chunk_payload({
             "v": PROTOCOL_VERSION,
             "type": JOB_TYPE_OUTPUT_CHUNK,
+            "server": SERVER_A,
             "thread": str(uuid4()),
             "stream": "stdout",
             "sequence": 0,
@@ -485,6 +533,7 @@ def test_output_offsets_use_uuid_previous() -> None:
     parsed = parse_payload({
         "v": PROTOCOL_VERSION,
         "type": JOB_TYPE_COMMAND,
+        "server": SERVER_A,
         "request": {"cwd": "/x", "process": ["ls"]},
         "state": {"status": "running"},
         "output": {"stdout": {"tail": "hi", "start": 0, "end": 2, "previous": str(previous)}},
@@ -492,3 +541,104 @@ def test_output_offsets_use_uuid_previous() -> None:
     assert parsed.output is not None
     assert parsed.output.stdout is not None
     assert parsed.output.stdout.previous == UUID(str(previous))
+
+
+def test_build_payload_requires_server() -> None:
+    """build_payload requires a non-empty server and stamps it top-level."""
+    payload = build_payload(server="phoebe-dev", cwd="/x", process=["ls"])
+    assert payload["server"] == "phoebe-dev"
+
+
+def test_build_payload_rejects_missing_or_empty_server() -> None:
+    """A missing, empty, or non-string server is a binding violation."""
+    missing_server = cast("Any", None)
+    numeric_server = cast("Any", 7)
+    with pytest.raises(ProtocolError, match="non-empty string"):
+        build_payload(server="", cwd="/x", process=["ls"])
+    with pytest.raises(ProtocolError, match="non-empty string"):
+        build_payload(server=missing_server, cwd="/x", process=["ls"])
+    with pytest.raises(ProtocolError, match="non-empty string"):
+        build_payload(server=numeric_server, cwd="/x", process=["ls"])
+
+
+def test_build_output_chunk_payload_requires_server() -> None:
+    """The chunk builder stamps and validates the required server field."""
+    chunk = build_output_chunk_payload(
+        server="beta-server",
+        thread=uuid4(),
+        stream="stdout",
+        sequence=0,
+        start=0,
+        end=1,
+        value="x",
+        previous=None,
+    )
+    assert chunk["server"] == "beta-server"
+    with pytest.raises(ProtocolError, match="non-empty string"):
+        build_output_chunk_payload(
+            server="",
+            thread=uuid4(),
+            stream="stdout",
+            sequence=0,
+            start=0,
+            end=1,
+            value="x",
+            previous=None,
+        )
+
+
+def test_parse_payload_rejects_v3_payload_without_server() -> None:
+    """A stored v3 row has no routing identity and is rejected outright."""
+    v3 = {
+        "v": 3,
+        "type": JOB_TYPE_COMMAND,
+        "request": {"cwd": "/x", "process": ["ls"]},
+        "state": {"status": STATUS_PENDING},
+    }
+    with pytest.raises(ProtocolError, match="unsupported protocol version"):
+        parse_payload(v3)
+
+
+def test_parse_payload_rejects_missing_empty_and_nonstring_server() -> None:
+    """Missing server is invalid; there is no implicit or default server."""
+
+    def without_server() -> dict[str, Any]:
+        return {
+            "v": PROTOCOL_VERSION,
+            "type": JOB_TYPE_COMMAND,
+            "request": {"cwd": "/x", "process": ["ls"]},
+            "state": {"status": STATUS_PENDING},
+        }
+
+    data = without_server()
+    with pytest.raises(ProtocolError, match="payload server must be a non-empty string"):
+        parse_payload(data)
+    data = without_server()
+    data["server"] = ""
+    with pytest.raises(ProtocolError, match="payload server must be a non-empty string"):
+        parse_payload(data)
+    data = without_server()
+    data["server"] = None
+    with pytest.raises(ProtocolError, match="payload server must be a non-empty string"):
+        parse_payload(data)
+
+
+def test_parse_chunk_payload_rejects_missing_server() -> None:
+    """A chunk without a server identity is rejected."""
+    with pytest.raises(ProtocolError, match="payload server must be a non-empty string"):
+        parse_chunk_payload({
+            "v": PROTOCOL_VERSION,
+            "type": JOB_TYPE_OUTPUT_CHUNK,
+            "thread": str(uuid4()),
+            "stream": "stdout",
+            "sequence": 0,
+            "start": 0,
+            "end": 1,
+            "value": "x",
+        })
+
+
+def test_parse_payload_exposes_server_identity() -> None:
+    """Parsed command payloads expose their routing server."""
+    parsed = parse_payload(build_payload(server="gamma-server", cwd="/x", process=["ls"]))
+    assert parsed.server == "gamma-server"

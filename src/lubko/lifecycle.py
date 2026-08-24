@@ -40,8 +40,8 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, supervise, toolchain
-from lubko.config import load_database_config
+from lubko import cli, protocol, supervise, toolchain
+from lubko.config import load_database_config, load_worker_server
 from lubko.durable import remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
@@ -1104,7 +1104,37 @@ def _current_queue_job() -> tuple[object | None, bool]:
         raise DeployAbortedError from None
 
 
-def _close_inherited_descriptors(keep: set[int]) -> None:
+def detach_standard_streams(keep: set[int]) -> None:
+    """Sever inherited stdio of a detached child and close every other stray fd.
+
+    A detached deployment child (queue handoff helper or rollback watchdog)
+    outlives the job process that forked it while the owning worker may be
+    finalizing that exact job: under worker-owned pipe capture the inherited
+    standard streams ARE the capture-pipe write ends, so keeping them open
+    pins output the worker no longer owns, and writing after the worker closes
+    its read ends kills the helper with ``EPIPE`` before it can settle durable
+    state. This redirects fd 0/1/2 to ``/dev/null`` (so the child always has a
+    valid, harmless stdin/stdout/stderr), closes every other inherited
+    descriptor except the explicitly kept ones (the response writer), and
+    leaves the child owning exactly: /dev/null stdio plus ``keep``.
+
+    Args:
+        keep: Descriptor numbers that must remain open besides 0/1/2.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(OSError, ValueError):
+            stream.flush()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    try:
+        for stream_fd in (0, 1, 2):
+            os.dup2(devnull, stream_fd)
+    finally:
+        with suppress(OSError):
+            os.close(devnull)
+    close_inherited_descriptors({0, 1, 2, *keep})
+
+
+def close_inherited_descriptors(keep: set[int]) -> None:
     """Close every inherited file descriptor except the explicitly kept ones.
 
     The detached handoff helpers are forked from the queue job's controller, so
@@ -1250,7 +1280,7 @@ def _run_deploy_helper(options: DeployOptions, job_id: object, writer: int) -> N
         with suppress(OSError):
             os.close(writer)
         os._exit(0)
-    _close_inherited_descriptors({0, 1, 2, writer})
+    detach_standard_streams(keep={writer})
     try:
         try:
             with deploy_lock(options.lock_timeout_seconds):
@@ -1293,28 +1323,39 @@ def _deploy_helper_locked(options: DeployOptions, job_id: object, writer: int) -
 
     previous = read_meta()
     state = worker_state(previous)
+    error: str | None
     if options.bootstrap:
-        deployctl.send_helper_error(
-            writer,
+        error = (
             "queue-invoked bootstrap is refused: the worker executing this job is a live queue "
             "consumer, and the bootstrap path requires the legacy worker to be stopped manually "
-            "first so the replacement never starts alongside a live consumer",
+            "first so the replacement never starts alongside a live consumer"
         )
-        return
-    if state == STATE_UNMANAGED:
-        deployctl.send_helper_error(writer, UNMANAGED_WORKER_MESSAGE)
-        return
-    if not supervise.supervisor_running():
-        deployctl.send_helper_error(
-            writer,
-            "no external supervisor is running; refusing to deploy the maintained worker without "
-            "automatic restart protection",
+    elif state == STATE_UNMANAGED:
+        error = UNMANAGED_WORKER_MESSAGE
+    else:
+        error = _supervised_mutation_blocker() or (
+            None
+            if supervise.supervisor_running()
+            else (
+                "no external supervisor is running; refusing to deploy the maintained worker "
+                "without automatic restart protection"
+            )
         )
+    if error is not None:
+        deployctl.send_helper_error(writer, error)
         return
     try:
         commit = _validate_and_prepare(options)
     except DeployAbortedError as exc:
         deployctl.send_helper_error(writer, str(exc) or "deployment validation failed")
+        return
+    if _refuse_version_changing_deploy(previous, commit) and previous is not None:
+        cli.remove_cli_root(commit)
+        deployctl.send_helper_error(
+            writer,
+            f"maintained worker metadata records commit {previous.git_commit}; ordinary deploys "
+            "cannot change versions; use 'lubko-deploy-ctl checkout'",
+        )
         return
     deployctl.send_helper_response(writer, _queue_prepared_response(commit))
     durable_deadline = time.time() + deployctl.handoff_durable_wait_seconds
@@ -1706,12 +1747,80 @@ def _deploy_direct(
     return new_meta
 
 
+def _supervised_mutation_blocker() -> str | None:
+    """Return why ordinary lifecycle mutation is currently blocked, if it is.
+
+    ``lubko-deploy-ctl`` is the only authority for version-changing worker
+    mutations, and the external supervisor owns the mission state that decides
+    whether a handoff is in flight. Ordinary ``lubko-deploy`` mutations must
+    therefore fail closed while a supervised deployment is pending or while the
+    durable rollback state is unreadable/corrupt: mutating during an unknown
+    handoff could disrupt a rollback or resurrect a superseded commit. Callers
+    must invoke this under the deployment lock so no guard-to-mutation TOCTOU
+    window remains.
+
+    Returns:
+        ``None`` when mutation may proceed, otherwise a human-readable refusal
+        reason.
+
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    try:
+        mission = deployctl.read_rollback_state()
+    except deployctl.DeployCtlError as exc:
+        return (
+            f"supervised deployment state is unreadable or corrupt ({exc}); refusing to mutate "
+            "lifecycle state; inspect with 'lubko-deploy-ctl status'"
+        )
+    if mission is None:
+        return None
+    if mission.status == deployctl.STATUS_PENDING:
+        return (
+            f"a supervised checkout of commit {mission.commit} (generation {mission.generation}) "
+            "is still pending confirmation; lifecycle mutation is blocked until it is resolved "
+            "with 'lubko-deploy-ctl confirm' or 'lubko-deploy-ctl rollback'"
+        )
+    if mission.status not in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}:
+        return (
+            f"supervised deployment state has unknown status {mission.status!r}; refusing to "
+            "mutate lifecycle state"
+        )
+    return None
+
+
+def _refuse_version_changing_deploy(previous: WorkerMeta | None, commit: str) -> bool:
+    """Decide whether an ordinary deploy would change the recorded version.
+
+    Maintained-worker metadata is lifecycle/deploy authority: once any
+    maintained worker is recorded — running, stopped, or otherwise non-live —
+    an ordinary ``lubko-deploy deploy`` must never change its commit. Only a
+    clean first installation (no metadata) and a same-commit invocation are
+    allowed.
+
+    Args:
+        previous: Previously recorded worker metadata, or ``None``.
+        commit: Exact validated target commit.
+
+    Returns:
+        ``True`` when the deploy must be refused.
+    """
+    return previous is not None and previous.git_commit != commit
+
+
 def _deploy_locked(options: DeployOptions) -> int:
     """Perform a deployment while holding the deployment lock.
 
     The external supervisor is the single authority that owns the maintained
     worker; a normal deployment hands the exact commit to the daemon and never
-    silently falls back to direct spawning when the daemon is absent.
+    silently falls back to direct spawning when the daemon is absent. Ordinary
+    deploys serve only the clean first maintained-worker installation and the
+    same-commit restart; version-changing mutations must go through
+    ``lubko-deploy-ctl``, and mutation is refused while supervised rollback
+    state is pending or corrupt. The guard and the mutation share this held
+    deployment lock, so no guard-to-mutation TOCTOU window exists.
 
     Args:
         options: Deployment inputs.
@@ -1726,6 +1835,11 @@ def _deploy_locked(options: DeployOptions) -> int:
     previous = read_meta()
     state = worker_state(previous)
 
+    blocker = _supervised_mutation_blocker()
+    if blocker is not None:
+        _err(blocker)
+        raise DeployAbortedError
+
     if state == STATE_UNMANAGED:
         if not options.bootstrap:
             _err(UNMANAGED_WORKER_MESSAGE)
@@ -1734,6 +1848,13 @@ def _deploy_locked(options: DeployOptions) -> int:
         _out("bootstrap: no maintained worker metadata; assuming the legacy worker was stopped")
 
     commit = _validate_and_prepare(options)
+    if _refuse_version_changing_deploy(previous, commit) and previous is not None:
+        _err(
+            f"maintained worker metadata records commit {previous.git_commit}; ordinary "
+            "'lubko-deploy deploy' cannot change versions"
+        )
+        _err("use 'lubko-deploy-ctl checkout' for the rollback-safe version change")
+        raise DeployAbortedError
     return _complete_deploy_handoff(options, commit, previous, state)
 
 
@@ -1928,6 +2049,30 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
     remove_durable(path)
 
 
+def _probe_server() -> str:
+    """Return the configured server identity a probe job must be addressed to.
+
+    The probe targets the local daemon, whose single configured server
+    identity comes from the restricted worker configuration file; there is
+    no implicit or default server.
+
+    Returns:
+        The non-empty configured server identity.
+
+    Raises:
+        RuntimeError: If the configured server identity cannot be loaded.
+    """
+    try:
+        return load_worker_server()
+    except (OSError, ValueError) as exc:
+        msg = (
+            "the worker configuration file must provide a non-empty 'server' "
+            "identity addressed by the probe job; there is no implicit or "
+            f"default server ({exc})"
+        )
+        raise RuntimeError(msg) from exc
+
+
 def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     """Insert one pending queue probe job.
 
@@ -1938,12 +2083,13 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     Returns:
         The probe job identifier, or ``None`` if the insert failed.
     """
-    probe_payload = json.dumps({
-        "v": 3,
-        "type": "command",
-        "request": {"cwd": cwd, "process": ["/usr/bin/sleep", "60"]},
-        "state": {"status": "pending"},
-    })
+    probe_payload = json.dumps(
+        protocol.build_payload(
+            server=_probe_server(),
+            cwd=cwd,
+            process=["/usr/bin/sleep", "60"],
+        )
+    )
     with conn.cursor() as cursor:
         cursor.execute(
             "INSERT INTO lubko.jobs (payload) VALUES (%s) RETURNING id",
@@ -2169,10 +2315,10 @@ def _verify_queue_roundtrip(
             )
         finally:
             with suppress(psycopg.Error):
-                request_cancel(conn, probe_id)
+                request_cancel(conn, probe_id, server=_probe_server())
             _wait_for_probe_terminal(conn, probe_id, timeout_seconds)
             with suppress(psycopg.Error):
-                delete_job_and_chunks(conn, probe_id)
+                delete_job_and_chunks(conn, probe_id, server=_probe_server())
         return outcome
     finally:
         conn.close()
@@ -2322,6 +2468,14 @@ def _repair_locked(options: DeployOptions, recovery_worker_pid: int) -> int:
     cli.gc_cli_roots((commit,))
     _cleanup_ready_markers(recovery_worker_pid)
     _reconcile_toolchain(options.uv_path)
+    if not _verify_queue_roundtrip(
+        worker_id, str(options.repo), recovery_worker_pid, options.probe_timeout_seconds
+    ):
+        _err(
+            "post-repair verification failed: the adopted worker no longer exclusively "
+            "consumes the queue; refusing to report success"
+        )
+        return EXIT_ERROR
     append_deploy_log(f"repaired: adopted recovery worker pid={new_meta.pid} commit={commit}")
     _out(f"adopted recovery worker pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     _out(f"worker id: {worker_id}")
@@ -2424,10 +2578,10 @@ def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool:
             return _wait_for_any_claim(conn, probe_id, timeout_seconds)
         finally:
             with suppress(psycopg.Error):
-                request_cancel(conn, probe_id)
+                request_cancel(conn, probe_id, server=_probe_server())
             _wait_for_probe_terminal(conn, probe_id, timeout_seconds)
             with suppress(psycopg.Error):
-                delete_job_and_chunks(conn, probe_id)
+                delete_job_and_chunks(conn, probe_id, server=_probe_server())
     finally:
         conn.close()
 
@@ -2673,33 +2827,39 @@ def restart_cmd(_args: argparse.Namespace) -> int:
     return _restart_manual()
 
 
-def _restart_manual() -> int:
-    """Restart the confirmed commit synchronously outside a queue job.
+def _restart_intent_locked() -> tuple[int | None, int | None, str | None]:
+    """Run the supervised-state guard and request a restart under the locks.
 
-    Args:
-        None.
+    Must be called while the deployment lock is held so the pending/corrupt
+    rollback-state guard and the restart intent write are serialized against
+    concurrent lifecycle mutation. Nesting ``supervise.request_restart``'s
+    generation lock is safe: lock ordering is deployment-lock before
+    generation-lock everywhere.
 
     Returns:
-        A process exit code.
+        ``(generation, previous_pid, error)``. On success ``generation`` is the
+        written intent generation and ``error`` is ``None``; otherwise
+        ``generation`` is ``None`` and ``error`` describes the refusal.
     """
+    blocker = _supervised_mutation_blocker()
+    if blocker is not None:
+        return None, None, blocker
     if not supervise.supervisor_running():
-        _err(
+        msg = (
             "no external supervisor is running; a supervised restart is not possible "
             "(the only supported way to stop Lubko is to stop its environment)"
         )
-        return EXIT_ERROR
+        return None, None, msg
     state = supervise.read_state()
     commit = state.commit
-    if commit is None or not cli.runtime_is_usable(commit):
-        _err(
-            "no usable sealed runtime to restart"
-            if commit is None
-            else (
-                f"the exact sealed runtime for commit {commit} is missing, corrupt, "
-                "incomplete, or not sealed; refusing to restart"
-            )
+    if commit is None:
+        return None, None, "no usable sealed runtime to restart"
+    if not cli.runtime_is_usable(commit):
+        msg = (
+            f"the exact sealed runtime for commit {commit} is missing, corrupt, "
+            "incomplete, or not sealed; refusing to restart"
         )
-        return EXIT_ERROR
+        return None, None, msg
     previous = supervise.read_status()
     previous_pid = (
         previous.child.pid if previous is not None and previous.child is not None else None
@@ -2716,6 +2876,31 @@ def _restart_manual() -> int:
             else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
         ),
     )
+    return generation, previous_pid, None
+
+
+def _restart_manual() -> int:
+    """Restart the confirmed commit synchronously outside a queue job.
+
+    The pending/corrupt supervised-state guard and the restart intent request
+    are serialized under the same deployment lock; readiness waits run after
+    the lock is released.
+
+    Args:
+        None.
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        with deploy_lock(DEFAULT_LOCK_TIMEOUT_SECONDS):
+            generation, previous_pid, error = _restart_intent_locked()
+    except LockTimeoutError as exc:
+        _err(f"timed out waiting for the deployment lock: {exc}")
+        return EXIT_ERROR
+    if error is not None or generation is None:
+        _err(error or "restart could not be requested")
+        return EXIT_ERROR
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         _err("the external supervisor did not apply the restart")
         return EXIT_ERROR
@@ -2844,7 +3029,7 @@ def _run_restart_helper(job_id: object, writer: int) -> None:
         with suppress(OSError):
             os.close(writer)
         os._exit(0)
-    _close_inherited_descriptors({0, 1, 2, writer})
+    detach_standard_streams(keep={writer})
     try:
         try:
             _restart_helper_locked(job_id, writer)
@@ -2856,6 +3041,51 @@ def _run_restart_helper(job_id: object, writer: int) -> None:
         with suppress(OSError):
             os.close(writer)
     os._exit(0)
+
+
+def _prepare_restart_locked(writer: int) -> bool:
+    """Validate a queue restart and report the prepared response under the lock.
+
+    Must be called while the deployment lock is held so the pending/corrupt
+    supervised-state guard is serialized with the restart handoff decision.
+    On refusal a helper error is delivered and ``False`` is returned; on
+    success the prepared response is delivered and ``True`` is returned.
+
+    Args:
+        writer: Write end of the response pipe to the parent.
+
+    Returns:
+        ``True`` when the restart validated and may proceed after the lock.
+    """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+        deployctl,
+    )
+
+    blocker = _supervised_mutation_blocker()
+    if blocker is not None:
+        deployctl.send_helper_error(writer, blocker)
+        return False
+    if not supervise.supervisor_running():
+        deployctl.send_helper_error(
+            writer,
+            "no external supervisor is running; a supervised restart is not possible",
+        )
+        return False
+    state = supervise.read_state()
+    commit = state.commit
+    if commit is None or not cli.runtime_is_usable(commit):
+        deployctl.send_helper_error(
+            writer,
+            "no usable sealed runtime to restart"
+            if commit is None
+            else (
+                f"the exact sealed runtime for commit {commit} is missing, corrupt, "
+                "incomplete, or not sealed; refusing to restart"
+            ),
+        )
+        return False
+    deployctl.send_helper_response(writer, _restart_prepared_response(commit))
+    return True
 
 
 def _restart_helper_locked(job_id: object, writer: int) -> None:
@@ -2877,26 +3107,13 @@ def _restart_helper_locked(job_id: object, writer: int) -> None:
         deployctl,
     )
 
-    if not supervise.supervisor_running():
-        deployctl.send_helper_error(
-            writer,
-            "no external supervisor is running; a supervised restart is not possible",
-        )
+    try:
+        with deploy_lock(DEFAULT_LOCK_TIMEOUT_SECONDS):
+            if not _prepare_restart_locked(writer):
+                return
+    except LockTimeoutError as exc:
+        deployctl.send_helper_error(writer, f"timed out waiting for the deployment lock: {exc}")
         return
-    state = supervise.read_state()
-    commit = state.commit
-    if commit is None or not cli.runtime_is_usable(commit):
-        deployctl.send_helper_error(
-            writer,
-            "no usable sealed runtime to restart"
-            if commit is None
-            else (
-                f"the exact sealed runtime for commit {commit} is missing, corrupt, "
-                "incomplete, or not sealed; refusing to restart"
-            ),
-        )
-        return
-    deployctl.send_helper_response(writer, _restart_prepared_response(commit))
     durable_deadline = time.time() + deployctl.handoff_durable_wait_seconds
     try:
         deployctl.wait_for_durable_success(job_id, durable_deadline)
@@ -2911,22 +3128,33 @@ def _restart_helper_locked(job_id: object, writer: int) -> None:
     append_deploy_log("queue restart converged after durable success")
 
 
-def _complete_restart_handoff() -> None:
-    """Request and await the supervised same-commit process replacement.
+def _request_restart_intent_locked() -> tuple[int, int | None]:
+    """Recheck the supervised guard and write the restart intent under the lock.
 
-    The supervisor is the single process-lifecycle authority: deployctl/lifecycle
-    only record the restart intent at a strictly newer generation and wait until
-    the daemon proves a fresh worker consumes the queue. A worker process that
-    was not actually replaced is reported as a failure.
+    Must be called while the deployment lock is held so a mission that appears
+    after the prepared/durable-success boundary cannot be outranked or
+    disrupted by this handoff.
+
+    Returns:
+        ``(generation, previous_pid)`` for the written restart intent.
 
     Raises:
-        DeployAbortedError: If the supervisor did not apply or prove the
-            replacement, or the worker process was not replaced.
+        DeployAbortedError: If the supervised-state guard refuses, no confirmed
+            commit exists, or its sealed runtime is unusable.
     """
+    blocker = _supervised_mutation_blocker()
+    if blocker is not None:
+        raise DeployAbortedError(blocker)
     state = supervise.read_state()
     commit = state.commit
     if commit is None:
         msg = "no confirmed commit to restart"
+        raise DeployAbortedError(msg)
+    if not cli.runtime_is_usable(commit):
+        msg = (
+            f"the exact sealed runtime for commit {commit} is missing, corrupt, "
+            "incomplete, or not sealed; refusing to restart"
+        )
         raise DeployAbortedError(msg)
     previous = supervise.read_status()
     previous_pid = (
@@ -2943,6 +3171,37 @@ def _complete_restart_handoff() -> None:
             else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
         ),
     )
+    return generation, previous_pid
+
+
+def _complete_restart_handoff() -> None:
+    """Request and await the supervised same-commit process replacement.
+
+    The supervisor is the single process-lifecycle authority: deployctl/lifecycle
+    only record the restart intent at a strictly newer generation and wait until
+    the daemon proves a fresh worker consumes the queue. A worker process that
+    was not actually replaced is reported as a failure.
+
+    The pending/corrupt supervised-state guard, the runtime recheck, and the
+    restart intent request are serialized under a freshly acquired deployment
+    lock: a supervised checkout mission that appears after the prepared/
+    durable-success boundary must abort the handoff instead of being outranked
+    or disrupted. Lock ordering stays deployment-lock before generation-lock,
+    so nesting with ``supervise.request_restart``'s generation lock cannot
+    deadlock; generation/readiness waits run after the lock is released.
+
+    Raises:
+        DeployAbortedError: If the guarded intent request fails (including a
+            supervised state that turned pending/corrupt after durable
+            success), if the supervisor did not apply or prove the replacement,
+            or the worker process was not replaced.
+    """
+    try:
+        with deploy_lock(DEFAULT_LOCK_TIMEOUT_SECONDS):
+            generation, previous_pid = _request_restart_intent_locked()
+    except LockTimeoutError as exc:
+        msg = f"timed out waiting for the deployment lock: {exc}"
+        raise DeployAbortedError(msg) from None
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         msg = "the external supervisor did not apply the restart"
         raise DeployAbortedError(msg)

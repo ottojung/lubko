@@ -11,14 +11,20 @@ third column; protocol evolution happens by adding fields within the current
 version or by bumping ``v``. See ``docs/protocol.md`` for the authoritative
 human-readable specification.
 
-Protocol v3 distinguishes two payload kinds:
+Protocol v4 distinguishes two payload kinds:
 
 - ``command`` — a runnable root job with ``request``, ``state``, optional
   terminal ``result``, and optional bounded live output tails (``output``);
 - ``output_chunk`` — an immutable, explicitly owned historical output chunk
   belonging to exactly one root ``command`` job (via ``thread``).
 
-A v3 ``command`` request carries exactly one executable field: ``process``, a
+Every valid payload of either kind carries a required top-level non-empty
+``server`` string naming the execution server that owns and may execute the
+job. There is no implicit or default server: clients name the target server
+explicitly, and each daemon claims, mutates, publishes, and collects only
+rows whose ``server`` exactly equals its configured identity.
+
+A v4 ``command`` request carries exactly one executable field: ``process``, a
 non-empty array of non-empty strings that the worker executes directly as argv,
 never through a shell.
 
@@ -35,7 +41,8 @@ from dataclasses import dataclass
 from typing import Any, Final
 from uuid import UUID
 
-PROTOCOL_VERSION: Final = 3
+PROTOCOL_VERSION: Final = 4
+
 
 JOB_TYPE_COMMAND: Final = "command"
 JOB_TYPE_OUTPUT_CHUNK: Final = "output_chunk"
@@ -118,10 +125,11 @@ class ResultView:
 
 @dataclass(frozen=True, slots=True)
 class JobPayload:
-    """A parsed and validated protocol v3 ``command`` job payload."""
+    """A parsed and validated protocol v4 ``command`` job payload."""
 
     version: int
     type: str
+    server: str
     request: JobRequest
     status: str
     output: OutputSection | None
@@ -130,8 +138,9 @@ class JobPayload:
 
 @dataclass(frozen=True, slots=True)
 class OutputChunk:
-    """A parsed and validated protocol v3 ``output_chunk`` payload."""
+    """A parsed and validated protocol v4 ``output_chunk`` payload."""
 
+    server: str
     thread: UUID
     stream: str
     sequence: int
@@ -165,13 +174,34 @@ def _parse_uuid(value: object) -> UUID | None:
         raise ProtocolError(msg) from None
 
 
-def build_payload(*, cwd: str, process: list[str]) -> dict[str, Any]:
-    """Build a protocol v3 ``command`` job payload ready for submission.
-
-    ``process`` is the sole executable field: a required list of non-empty
-    strings executed directly as argv, never through a shell.
+def parse_server(value: object) -> str:
+    """Validate a raw ``server`` value as a non-empty string.
 
     Args:
+        value: The raw JSON value of the top-level ``server`` field.
+
+    Returns:
+        The validated server identity.
+
+    Raises:
+        ProtocolError: If the value is missing, not a string, or empty.
+    """
+    if not isinstance(value, str) or not value:
+        msg = "payload server must be a non-empty string"
+        raise ProtocolError(msg)
+    return value
+
+
+def build_payload(*, server: str, cwd: str, process: list[str]) -> dict[str, Any]:
+    """Build a protocol v4 ``command`` job payload ready for submission.
+
+    ``server`` is required and names the execution server that must claim and
+    run the job; there is no implicit or default server. ``process`` is the
+    sole executable field: a required list of non-empty strings executed
+    directly as argv, never through a shell.
+
+    Args:
+        server: Non-empty identity of the target execution server.
         cwd: Absolute working directory for the job.
         process: Non-empty list of non-empty argv strings to execute directly.
 
@@ -181,6 +211,7 @@ def build_payload(*, cwd: str, process: list[str]) -> dict[str, Any]:
     Raises:
         ProtocolError: If the request violates the binding.
     """
+    validated_server = parse_server(server)
     request: dict[str, object] = {"cwd": cwd}
     request["process"] = list(_parse_process(process))
     if not cwd:
@@ -189,6 +220,7 @@ def build_payload(*, cwd: str, process: list[str]) -> dict[str, Any]:
     return {
         "v": PROTOCOL_VERSION,
         "type": JOB_TYPE_COMMAND,
+        "server": validated_server,
         "request": request,
         "state": {"status": STATUS_PENDING},
     }
@@ -228,8 +260,9 @@ def build_output_window_payload(
     return window
 
 
-def build_output_chunk_payload(  # ruff: ignore[too-many-arguments]
+def build_output_chunk_payload(  # ruff: ignore[too-many-arguments] -- every field is required by the immutable chunk binding
     *,
+    server: str,
     thread: UUID,
     stream: str,
     sequence: int,
@@ -241,6 +274,7 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments]
     """Build an immutable ``output_chunk`` payload mapping.
 
     Args:
+        server: Non-empty server identity of the owning root job's daemon.
         thread: UUID of the owning root ``command`` job.
         stream: Which stream the chunk belongs to (``stdout`` or ``stderr``).
         sequence: Monotonic chunk sequence number for the stream.
@@ -256,6 +290,7 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments]
         ProtocolError: If the chunk violates the binding or size bound.
     """
     _validate_stream(stream)
+    validated_server = parse_server(server)
     if sequence < 0:
         msg = "output_chunk.sequence must be a non-negative integer"
         raise ProtocolError(msg)
@@ -266,6 +301,7 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments]
     chunk: dict[str, Any] = {
         "v": PROTOCOL_VERSION,
         "type": JOB_TYPE_OUTPUT_CHUNK,
+        "server": validated_server,
         "thread": str(thread),
         "stream": stream,
         "sequence": sequence,
@@ -330,7 +366,7 @@ def _parse_request(raw_request: object) -> JobRequest:
     if "command" in raw_request or "args" in raw_request:
         msg = (
             "request.command and request.args are legacy protocol v2 fields and "
-            "are not accepted in v3"
+            "are not accepted in v4"
         )
         raise ProtocolError(msg)
     cwd = raw_request.get("cwd")
@@ -558,6 +594,7 @@ def parse_payload(data: object) -> JobPayload:
     return JobPayload(
         version=version,
         type=job_type,
+        server=parse_server(decoded.get("server")),
         request=_parse_request(decoded.get("request")),
         status=_parse_status(decoded.get("state")),
         output=_parse_output_section(decoded.get("output")),
@@ -608,6 +645,7 @@ def parse_chunk_payload(data: object) -> OutputChunk:
         raise ProtocolError(msg)
     previous = _parse_uuid(decoded.get("previous"))
     return OutputChunk(
+        server=parse_server(decoded.get("server")),
         thread=thread,
         stream=stream,
         sequence=int(sequence),

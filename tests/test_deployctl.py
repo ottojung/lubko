@@ -1615,8 +1615,9 @@ def insert_running_job(conninfo: str, cwd: str, command: str) -> object:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "running"},
     })
@@ -2281,6 +2282,50 @@ def test_confirm_rejection_keeps_zero_exit_code(
     assert code == dc.EXIT_OK
 
 
+def test_checkout_with_unusable_explicit_uv_exits_failed(tmp_path: Path) -> None:
+    """A failed ``checkout`` with an unusable explicit ``--uv`` exits non-zero."""
+    code = dc.main([
+        json.dumps({"type": "checkout", "commit": "2" * 40}),
+        "--repo",
+        str(tmp_path),
+        "--uv",
+        str(tmp_path / "missing-uv"),
+    ])
+
+    assert code == dc.EXIT_ERROR
+
+
+def test_checkout_with_nonpositive_confirm_window_exits_failed(tmp_path: Path) -> None:
+    """A failed ``checkout`` with a non-positive confirm window exits non-zero."""
+    code = dc.main([
+        *_controller_main_args(json.dumps({"type": "checkout", "commit": "2" * 40}), tmp_path),
+        "--confirm-window-seconds",
+        "0",
+    ])
+
+    assert code == dc.EXIT_ERROR
+
+
+def test_malformed_request_keeps_zero_exit_code(tmp_path: Path) -> None:
+    """A malformed request still returns zero so its structured error is delivered."""
+    code = dc.main(_controller_main_args("not json", tmp_path))
+
+    assert code == dc.EXIT_OK
+
+
+def test_noncheckout_with_unusable_explicit_uv_keeps_zero_exit_code(tmp_path: Path) -> None:
+    """A non-checkout protocol rejection keeps returning zero despite a bad ``--uv``."""
+    code = dc.main([
+        json.dumps({"type": "status"}),
+        "--repo",
+        str(tmp_path),
+        "--uv",
+        str(tmp_path / "missing-uv"),
+    ])
+
+    assert code == dc.EXIT_OK
+
+
 def test_helper_uses_fresh_durable_success_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2466,9 +2511,7 @@ def worker_without_persist_command(tmp_path: Path) -> list[str]:
     """
     wrapper = tmp_path / "worker_no_persist.py"
     wrapper.write_text(
-        "from lubko import worker\n"
-        "worker._persist_process = lambda _conn, _job_id, _pid, _pgid, _ticks: None\n"
-        "worker.main()\n",
+        "from lubko import worker\nworker._persist_process = lambda *_args: True\nworker.main()\n",
         encoding="utf-8",
     )
     return [sys.executable, str(wrapper)]
@@ -2486,8 +2529,9 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "pending"},
     })
@@ -2512,8 +2556,9 @@ def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> o
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })
@@ -3334,3 +3379,99 @@ def test_supervisor_restart_gap_preserves_supervised_mission(
 
     assert calls == [], "supervisor-owned mission must not trigger rollback during gap"
     assert write_calls == [], "no state mutation should occur during supervisor gap"
+
+
+# ---------------------------------------------------------------------------
+# Rollback-state schema evolution (issue #104)
+# ---------------------------------------------------------------------------
+
+
+def legacy_v2_state_dict(state: dc.RollbackState) -> dict[str, object]:
+    """Downgrade a state mapping to the supported schema-2 shape.
+
+    Schema 2 predates supervisor ownership, so the ``supervisor_owned`` key is
+    absent entirely; parsing must treat its authority as unknown.
+
+    Args:
+        state: A current-schema mission.
+
+    Returns:
+        The same mission as a schema-2 JSON mapping.
+    """
+    data = state.to_dict()
+    del data["supervisor_owned"]
+    data["schema_version"] = 2
+    return data
+
+
+def test_read_rollback_state_parses_supported_legacy_schema() -> None:
+    """A supported older rollback file parses explicitly instead of corrupt."""
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(
+        json.dumps(legacy_v2_state_dict(pending_state()), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    state = dc.read_rollback_state()
+
+    assert state is not None
+    assert state.schema_version == dc.ROLLBACK_SCHEMA_VERSION
+    assert state.status == dc.STATUS_PENDING
+    # Missing ownership fields stay unknown: fail closed, never legacy-authorized.
+    assert state.supervisor_owned is None
+
+
+def test_read_rollback_state_rejects_unsupported_future_version() -> None:
+    """An unknown future schema version remains fail-closed corruption."""
+    future = pending_state().to_dict()
+    future["schema_version"] = dc.ROLLBACK_SCHEMA_VERSION + 1
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(json.dumps(future, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(dc.DeployCtlError, match="unsupported supervised deployment state version"):
+        dc.read_rollback_state()
+
+
+def test_archive_of_parsed_legacy_mission_writes_current_schema() -> None:
+    """Rewrites of a parsed legacy mission use the current schema version."""
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(
+        json.dumps(legacy_v2_state_dict(pending_state()), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    state = dc.read_rollback_state()
+    assert state is not None
+
+    dc.archive_mission(state, dc.STATUS_ROLLED_BACK)
+
+    on_disk = json.loads(rollback_state_path().read_text(encoding="utf-8"))
+    assert on_disk["schema_version"] == dc.ROLLBACK_SCHEMA_VERSION
+
+
+def test_unknown_authority_mission_never_triggers_legacy_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mission without an ownership field is never implicitly authorized.
+
+    An old pending mission whose ownership is unknown must fail closed in the
+    watchdog exactly like a supervisor-owned one: no legacy direct rollback may
+    run while the supervisor is absent.
+    """
+    state = replace(pending_state(), supervisor_owned=None, deadline=time.time() - 1)
+    rolled_back = replace(state, status=dc.STATUS_ROLLED_BACK)
+    states = iter((state, rolled_back))
+    calls: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_read_state", lambda: next(states))
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+
+    def rollback(value: dc.RollbackState) -> bool:
+        calls.append(value)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    dc._watchdog_main(lock_timeout_seconds=1.0)
+
+    assert calls == [], "unknown-authority mission must not trigger legacy rollback"

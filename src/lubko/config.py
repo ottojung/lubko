@@ -11,6 +11,8 @@ DATABASE_CONFIG_ENV: Final = "LUBKO_DATABASE_CONFIG"
 CONFIG_HOME_ENV: Final = "XDG_CONFIG_HOME"
 CONFIG_HOME_FALLBACK: Final = ".config"
 CONFIG_RELATIVE_PATH: Final = Path("lubko/database.conf")
+WORKER_CONFIG_ENV: Final = "LUBKO_WORKER_CONFIG"
+WORKER_CONFIG_RELATIVE_PATH: Final = Path("lubko/worker.conf")
 REQUIRED_KEYS: Final = ("host", "port", "dbname", "user", "password")
 PRIVATE_MODE_MASK: Final = 0o077
 
@@ -141,3 +143,63 @@ def load_database_config(path: Path | None = None) -> DatabaseConfig:
         user=values["user"],
         password=values["password"],
     )
+
+
+def worker_config_path() -> Path:
+    """Return the path of the worker configuration file.
+
+    The path is ``$LUBKO_WORKER_CONFIG`` when set, otherwise
+    ``$XDG_CONFIG_HOME/lubko/worker.conf`` with a fallback of
+    ``~/.config/lubko/worker.conf``, following the same per-user convention
+    as the database configuration file. The override selects the file path
+    only; the execution-server identity itself always lives inside the file.
+
+    Returns:
+        The worker configuration file path.
+    """
+    explicit = os.environ.get(WORKER_CONFIG_ENV)
+    if explicit:
+        return Path(explicit)
+    base = os.environ.get(CONFIG_HOME_ENV) or str(Path.home() / CONFIG_HOME_FALLBACK)
+    return Path(base) / WORKER_CONFIG_RELATIVE_PATH
+
+
+def load_worker_server(path: Path | None = None) -> str:
+    """Load the execution-server identity from the restricted worker config.
+
+    The file follows the same permission rules as the database configuration:
+    it must not be accessible by the group or by other users. The ``server``
+    setting is required and must be a non-empty string; every protocol-v4
+    claim, mutation, publication, recovery, and GC pass of the worker is
+    scoped to exactly this identity, so an absent or invalid value fails
+    closed and the daemon refuses to start.
+
+    Args:
+        path: Configuration path, or ``None`` to use :func:`worker_config_path`.
+
+    Returns:
+        The non-empty configured server identity.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        PermissionError: If the file is accessible by group or others.
+        ValueError: If the ``server`` setting is missing or empty.
+    """
+    config_path = path if path is not None else worker_config_path()
+    try:
+        file_stat = config_path.stat()
+    except FileNotFoundError as exc:
+        msg = f"worker configuration file not found: {config_path}"
+        raise FileNotFoundError(msg) from exc
+    if file_stat.st_mode & PRIVATE_MODE_MASK:
+        msg = f"worker configuration file must not be readable by group or others: {config_path}"
+        raise PermissionError(msg)
+    values = parse_database_config(config_path.read_text(encoding="utf-8"))
+    server = values.get("server", "")
+    if not server:
+        msg = (
+            "worker configuration file is missing a non-empty 'server' setting; "
+            "every daemon owns exactly one execution-server identity"
+        )
+        raise ValueError(msg)
+    return server

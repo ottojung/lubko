@@ -55,6 +55,8 @@ if TYPE_CHECKING:
 
 SCHEMA_VERSION: Final = 1
 
+BOOT_ID_PATH: Final = Path("/proc/sys/kernel/random/boot_id")
+
 SUPERVISOR_RUNTIME_COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}\n\Z")
 
 STAT_MIN_FIELDS: Final = 20
@@ -165,6 +167,63 @@ class SupervisorDesired:
 
 
 @dataclass(frozen=True, slots=True)
+class UnresolvedChild:
+    """A spawned direct child whose exact session/group identity was never proven.
+
+    This is a fail-closed hold: it records ownership of a live spawned child
+    that could not be converged after its identity establishment timed out.
+    It deliberately carries **no** process group or session authority: the
+    recorded identity never satisfies (and is never trusted for) private
+    session/group semantics, so nothing downstream may ever signal a group on
+    its behalf. Convergence uses exact single-PID signals guarded by start
+    time ticks only.
+    """
+
+    pid: int
+    start_time_ticks: int | None
+    token: str
+    spawned_at: float
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the unresolved child for storage.
+
+        Returns:
+            A JSON-serializable mapping.
+        """
+        return {
+            "pid": self.pid,
+            "start_time_ticks": self.start_time_ticks,
+            "token": self.token,
+            "spawned_at": self.spawned_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> UnresolvedChild:
+        """Parse one unresolved child strictly.
+
+        Args:
+            data: Mapping produced by :meth:`to_dict`.
+
+        Returns:
+            The parsed hold.
+
+        Raises:
+            ValueError: If a required field is missing or malformed.
+        """
+        pid = _optional_int(data.get("pid"))
+        token = _optional_string(data.get("token"))
+        if pid is None or token is None:
+            msg = "unresolved child hold is malformed"
+            raise ValueError(msg)
+        return cls(
+            pid=pid,
+            start_time_ticks=_optional_int(data.get("start_time_ticks")),
+            token=token,
+            spawned_at=_optional_float(data.get("spawned_at")) or 0.0,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class LastExit:
     """Durable record of the most recent worker child exit."""
 
@@ -181,6 +240,14 @@ class SupervisorState:
     mode: str
     commit: str | None
     child: WorkerChild | None
+    unresolved_child: UnresolvedChild | None
+    #: A present-but-malformed ``unresolved_child`` record was found on disk.
+    #: The durable fail-closed hold cannot be forgotten just because its shape
+    # is corrupt: this flag keeps the blocking obligation alive so no
+    # replacement worker can ever be authorized beside a possibly-live
+    # unresolved spawned child. It only ever clears through explicit operator
+    # repair of the state file.
+    unresolved_hold_malformed: bool
     intent: str
     restart_count: int
     next_attempt_at: float | None
@@ -188,6 +255,7 @@ class SupervisorState:
     last_spawn_at: float | None
     ready: bool
     next_readiness_at: float | None
+    boot_id: str | None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the daemon state for storage.
@@ -201,6 +269,10 @@ class SupervisorState:
             "mode": self.mode,
             "commit": self.commit,
             "child": None if self.child is None else _child_to_dict(self.child),
+            "unresolved_child": (
+                None if self.unresolved_child is None else self.unresolved_child.to_dict()
+            ),
+            "unresolved_hold_malformed": self.unresolved_hold_malformed,
             "intent": self.intent,
             "restart_count": self.restart_count,
             "next_attempt_at": self.next_attempt_at,
@@ -213,6 +285,7 @@ class SupervisorState:
             "last_spawn_at": self.last_spawn_at,
             "ready": self.ready,
             "next_readiness_at": self.next_readiness_at,
+            "boot_id": self.boot_id,
         }
 
     @classmethod
@@ -232,6 +305,19 @@ class SupervisorState:
                 child = _child_from_dict(child_data)
             except (TypeError, ValueError, KeyError):
                 child = None
+        unresolved_data = data.get("unresolved_child")
+        unresolved: UnresolvedChild | None = None
+        unresolved_hold_malformed = False
+        if isinstance(unresolved_data, dict):
+            try:
+                unresolved = UnresolvedChild.from_dict(unresolved_data)
+            except (TypeError, ValueError):
+                # A present-but-malformed hold must never degrade to absence:
+                # the durable blocking obligation survives as a flag that the
+                # daemon treats exactly like an unresolvable hold.
+                unresolved_hold_malformed = True
+        elif unresolved_data is not None:
+            unresolved_hold_malformed = True
         exit_data = data.get("last_exit")
         last_exit: LastExit | None = None
         if isinstance(exit_data, dict):
@@ -248,6 +334,9 @@ class SupervisorState:
             mode=_optional_string(data.get("mode")) or MODE_IDLE,
             commit=_optional_string(data.get("commit")),
             child=child,
+            unresolved_child=unresolved,
+            unresolved_hold_malformed=unresolved_hold_malformed
+            or data.get("unresolved_hold_malformed") is True,
             intent=_optional_string(data.get("intent")) or INTENT_RUN,
             restart_count=_optional_int(data.get("restart_count")) or 0,
             next_attempt_at=_optional_float(data.get("next_attempt_at")),
@@ -255,6 +344,7 @@ class SupervisorState:
             last_spawn_at=_optional_float(data.get("last_spawn_at")),
             ready=data.get("ready", False) is True,
             next_readiness_at=_optional_float(data.get("next_readiness_at")),
+            boot_id=_optional_string(data.get("boot_id")),
         )
 
 
@@ -506,6 +596,29 @@ def acquire_supervisor_lock() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Boot identity
+# ---------------------------------------------------------------------------
+
+
+def current_boot_id() -> str | None:
+    """Return an identifier for the current boot, or ``None`` when unknown.
+
+    The kernel exposes a stable per-boot UUID in
+    ``/proc/sys/kernel/random/boot_id``; it changes across host/container
+    reboot and stays constant across daemon restarts within one boot. When the
+    identifier cannot be read the caller must assume the clock domain is
+    unverifiable and treat durable monotonic values as stale.
+
+    Returns:
+        The boot identifier string, or ``None``.
+    """
+    try:
+        return BOOT_ID_PATH.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Atomic storage
 # ---------------------------------------------------------------------------
 
@@ -623,6 +736,8 @@ def fresh_state() -> SupervisorState:
         mode=MODE_IDLE,
         commit=None,
         child=None,
+        unresolved_child=None,
+        unresolved_hold_malformed=False,
         intent=INTENT_RUN,
         restart_count=0,
         next_attempt_at=None,
@@ -630,6 +745,7 @@ def fresh_state() -> SupervisorState:
         last_spawn_at=None,
         ready=False,
         next_readiness_at=None,
+        boot_id=None,
     )
 
 

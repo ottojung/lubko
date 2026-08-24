@@ -29,7 +29,7 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -44,14 +44,13 @@ from lubko.state import cli_root_dir, rollback_state_path
 from lubko.supervisor import Settings, SupervisorDaemon
 from lubko.supervisor import main as supervisor_main
 from lubko.worker import group_has_members
+from tests import _pg
 from tests import _process_guard as guard
 from tests.test_cli import make_repo
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from uuid import UUID
-
-    from tests import _pg
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 BASELINE_MIGRATION: Final = REPO_ROOT / "migrations" / "0001_two_column_protocol.sql"
@@ -299,7 +298,7 @@ def running_supervisor(env: dict[str, str]) -> Iterator[subprocess.Popen[bytes]]
     """Run a supervisor daemon and guarantee deterministic teardown.
 
     Args:
-        env: Environment for the daemon.
+        env: Environment for the daemon (and its worker child).
 
     Yields:
         The daemon process.
@@ -309,6 +308,35 @@ def running_supervisor(env: dict[str, str]) -> Iterator[subprocess.Popen[bytes]]
         yield proc
     finally:
         stop_supervisor(proc)
+
+
+@contextmanager
+def _owned_supervisors(
+    startups: Sequence[Callable[[], subprocess.Popen[bytes]]],
+) -> Iterator[list[subprocess.Popen[bytes]]]:
+    """Start supervisors and unconditionally reap every created stack.
+
+    Orchestration invariant under review: a failure during a later startup,
+    during the test body, or during an earlier teardown must never leak an
+    already-running stack.  Every successful startup immediately registers
+    its teardown on an :class:`contextlib.ExitStack`, so all registered
+    callbacks run even when something else raises, and Python exception
+    chaining preserves each earlier failure as context.
+
+    Args:
+        startups: One zero-argument callable per stack, invoked in order.
+            A callable that raises aborts the remaining startups.
+
+    Yields:
+        The processes of every successfully started stack, in creation order.
+    """
+    with ExitStack() as stack:
+        started: list[subprocess.Popen[bytes]] = []
+        for start in startups:
+            proc = start()
+            started.append(proc)
+            stack.callback(stop_supervisor, proc)
+        yield started
 
 
 def request_and_wait(commit: str, repo: Path) -> int:
@@ -392,7 +420,7 @@ def shell_command_argv(command: str) -> list[str]:
 
 
 def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
-    """Insert a protocol v3 pending command job running a shell snippet.
+    """Insert a protocol v4 pending command job running a shell snippet.
 
     Args:
         conninfo: PostgreSQL connection string.
@@ -403,8 +431,9 @@ def insert_pending_job(conninfo: str, cwd: str, command: str) -> UUID:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": shell_command_argv(command)},
         "state": {"status": "pending"},
     })
@@ -766,10 +795,12 @@ def test_wait_for_replacement_rejects_transient_none_and_returns_observed_pid(
 
 
 def test_repeated_crashes_never_accumulate_workers(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """Repeated crashes back off and never accumulate processes or zombies."""
+    del jobs_db
     repo, first, _second = maintained_env
     with running_supervisor(supervisor_env):
         request_and_wait(first, repo)
@@ -792,7 +823,13 @@ def test_database_outage_restart_backs_off_until_readiness(
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
-    """A restart during a PostgreSQL outage backs off until readiness is possible."""
+    """A restart during a PostgreSQL outage backs off until readiness is possible.
+
+    Under #161 the crash path fails closed while exact owned-group recovery
+    cannot be proven: during the outage the dead child identity stays recorded,
+    no replacement is spawned, and only after the database (and therefore the
+    recovery proof) returns does the replacement appear and reach readiness.
+    """
     repo, first, _second = maintained_env
     with running_supervisor(supervisor_env):
         request_and_wait(first, repo)
@@ -802,23 +839,404 @@ def test_database_outage_restart_backs_off_until_readiness(
         pg_cluster.stop()
         os.killpg(original_pid, signal.SIGKILL)
 
-        wait_until(lambda: worker_pid() is not None and worker_pid() != original_pid, timeout=30.0)
-        replacement_pid = worker_pid()
-        assert replacement_pid is not None
-        status = supervise.read_status()
-        assert status is not None
-        assert status.ready is False
-        time.sleep(1.0)
-        assert worker_pid() == replacement_pid
-        current = supervise.read_status()
-        assert current is not None
-        assert current.ready is False
-        assert len(direct_children(status.supervisor_pid)) == 1
+        # Fail closed: the dead child identity is retained as the blocking
+        # recovery obligation and no replacement may be spawned.
+        wait_until(
+            lambda: (
+                (status := supervise.read_status()) is not None
+                and status.child is not None
+                and status.child.pid == original_pid
+                and status.ready is False
+            ),
+            timeout=30.0,
+        )
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            status = supervise.read_status()
+            assert status is not None
+            assert status.child is not None, "the obligation must stay durable"
+            assert status.child.pid == original_pid
+            assert len(direct_children(status.supervisor_pid)) == 0, (
+                "no replacement may be spawned while recovery is unprovable"
+            )
+            assert status.ready is False
+            time.sleep(0.2)
 
         pg_cluster.start()
+        # Recovery now completes and the ordinary restart path takes over.
+        wait_until(lambda: worker_pid() is not None and worker_pid() != original_pid, timeout=60.0)
+        status = supervise.read_status()
+        assert status is not None
+        assert status.child is not None
+        assert status.child.pid != original_pid
+        time.sleep(1.0)
+        assert worker_pid() != original_pid
+        current = supervise.read_status()
+        assert current is not None
+        assert len(direct_children(current.supervisor_pid)) == 1
+
         wait_until(status_ready, timeout=60.0)
         probe_id = insert_pending_job(jobs_db, str(tmp_path), "echo recovered")
         wait_until(lambda: read_status_of(jobs_db, probe_id) == "succeeded", timeout=60.0)
+
+
+@pytest.fixture
+def second_pg_cluster(tmp_path: Path) -> Iterator[_pg.PgCluster]:
+    """Start a second independent pytest-owned PostgreSQL cluster.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Yields:
+        The running second cluster.
+    """
+    binaries = _pg.postgres_binaries()
+    if binaries is None:
+        pytest.skip("PostgreSQL server binaries not available on this host")
+    root = tmp_path / "pg-second"
+    data_dir = root / "data"
+    socket_dir = root / "sock"
+    socket_dir.mkdir(parents=True)
+    port = _pg.free_port()
+    env = dict(os.environ)
+    lib = _pg.postgres_lib_dir(Path(binaries["postgres"]).parent)
+    if lib is not None:
+        env["LD_LIBRARY_PATH"] = lib
+    subprocess.run(
+        [binaries["initdb"], "-D", str(data_dir), "-U", "postgres", "--auth=trust"],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+    cluster = _pg.PgCluster(binaries, data_dir, socket_dir, port, env)
+    cluster.start()
+    try:
+        yield cluster
+    finally:
+        cluster.stop()
+
+
+def _apply_jobs_baseline(conninfo: str) -> None:
+    """Apply the canonical baseline on a fresh ``lubko.jobs`` table.
+
+    Args:
+        conninfo: Connection string of the target cluster.
+    """
+    with psycopg.connect(conninfo) as conn:
+        conn.execute("CREATE SCHEMA IF NOT EXISTS lubko")
+        conn.execute("DROP TABLE IF EXISTS lubko.jobs CASCADE")
+        conn.execute(BASELINE_MIGRATION.read_text(encoding="utf-8"))
+
+
+def _stack_b_environment(
+    tmp_path: Path,
+    supervisor_env: dict[str, str],
+    cluster: _pg.PgCluster,
+    xdg_b: Path,
+) -> dict[str, str]:
+    """Build the full environment for the independent second stack.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        supervisor_env: The stack-A environment to derive from.
+        cluster: The second PostgreSQL cluster.
+        xdg_b: The pytest-owned XDG root for stack B.
+
+    Returns:
+        The environment for stack B's supervisor and its worker.
+    """
+    conf_b = tmp_path / "stack-b" / "database.conf"
+    conf_b.parent.mkdir(parents=True, exist_ok=True)
+    conf_b.write_text(
+        f"host={cluster.socket_dir}\n"
+        f"port={cluster.port}\n"
+        "dbname=postgres\n"
+        "user=postgres\n"
+        "password=local-trust\n",
+        encoding="utf-8",
+    )
+    conf_b.chmod(0o600)
+    env_b = dict(supervisor_env)
+    env_b["LUBKO_DATABASE_CONFIG"] = str(conf_b)
+    for env_key in (
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_BIN_HOME",
+    ):
+        env_b[env_key] = str(xdg_b / env_key.removeprefix("XDG_").lower())
+    return env_b
+
+
+def _with_stack_b_env(
+    monkeypatch: pytest.MonkeyPatch,
+    env_b: dict[str, str],
+    action: Callable[[], object],
+) -> None:
+    """Run ``action`` with stack B's XDG root authoritative.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        env_b: The stack-B environment.
+        action: The callable to run.
+    """
+    with monkeypatch.context() as m:
+        for env_key, value in env_b.items():
+            if env_key.startswith("XDG_"):
+                m.setenv(env_key, value)
+        action()
+
+
+@pytest.fixture
+def stack_a(
+    jobs_db: str,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+) -> tuple[Path, str, dict[str, str], str]:
+    """Bundle the stack-A repo, commit, environment, and queue connection.
+
+    Args:
+        jobs_db: Baseline queue connection for stack A's readiness probe.
+        maintained_env: The two-commit repository.
+        supervisor_env: The stack-A environment.
+
+    Returns:
+        The ``(repo, first_commit, env, conninfo)`` quadruple.
+    """
+    repo, first, _second = maintained_env
+    return repo, first, supervisor_env, jobs_db
+
+
+def _prepare_stack_b(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supervisor_env: dict[str, str],
+    cluster: _pg.PgCluster,
+) -> tuple[Path, str, dict[str, str]]:
+    """Build repo, CLI root, and environment for the independent stack B.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+        supervisor_env: The stack-A environment to derive from.
+        cluster: The second PostgreSQL cluster.
+
+    Returns:
+        The ``(repo, first_commit, env)`` triple for stack B.
+    """
+    _apply_jobs_baseline(cluster.conninfo())
+    env_b = _stack_b_environment(tmp_path, supervisor_env, cluster, tmp_path / "stack-b" / "xdg")
+    repo_b, first_b, _second_b = make_repo(tmp_path / "repo-b")
+    with monkeypatch.context() as m:
+        for env_key, value in env_b.items():
+            if env_key.startswith("XDG_"):
+                m.setenv(env_key, value)
+        cli.build_cli_root(repo_b, first_b, "uv", 60.0)
+    return repo_b, first_b, env_b
+
+
+def test_two_simultaneous_owned_stacks_never_cross_talk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stack_a: tuple[Path, str, dict[str, str], str],
+    second_pg_cluster: _pg.PgCluster,
+) -> None:
+    """Two simultaneous cluster+supervisor+worker stacks stay fully isolated.
+
+    Each stack lives in its own pytest-owned XDG root and its own PostgreSQL
+    cluster.  Both supervisors run concurrently with exactly one worker each;
+    status surfaces, workers, and queues never cross; and teardown retires
+    every process by exact identity with nothing left alive or reparented to
+    PID 1.
+    """
+    repo_a, first_a, supervisor_env, conninfo_a = stack_a
+
+    # Independent baselines: stack A's queue is refreshed by its fixture.
+    repo_b, first_b, env_b = _prepare_stack_b(
+        tmp_path, monkeypatch, supervisor_env, second_pg_cluster
+    )
+
+    pid_a: int | None = None
+    pid_b: int | None = None
+
+    def read_b() -> supervise.SupervisorStatus | None:
+        status: supervise.SupervisorStatus | None = None
+
+        def read() -> None:
+            nonlocal status
+            status = supervise.read_status()
+
+        _with_stack_b_env(monkeypatch, env_b, read)
+        return status
+
+    with _owned_supervisors([
+        lambda: start_supervisor(supervisor_env),
+        lambda: start_supervisor(env_b),
+    ]) as _stack_procs:
+        request_and_wait(first_a, repo_a)
+        _with_stack_b_env(
+            monkeypatch,
+            env_b,
+            lambda: request_and_wait(first_b, repo_b),
+        )
+
+        pid_a = worker_pid()
+        assert pid_a is not None
+        status_a = supervise.read_status()
+        assert status_a is not None
+        assert status_a.ready is True
+        assert status_a.commit == first_a
+        assert len(direct_children(status_a.supervisor_pid)) == 1
+
+        status_b = read_b()
+        assert status_b is not None
+        assert status_b.child is not None
+        pid_b = status_b.child.pid
+        assert pid_a != pid_b
+        assert status_b.ready is True
+        assert status_b.commit == first_b
+        assert len(direct_children(status_b.supervisor_pid)) == 1
+
+        # Queue isolation: each worker consumes only its own cluster's queue.
+        probe_a = insert_pending_job(conninfo_a, str(tmp_path), "echo stack-a")
+        wait_until(
+            lambda: read_status_of(conninfo_a, probe_a) == "succeeded",
+            timeout=60.0,
+        )
+        probe_b = insert_pending_job(second_pg_cluster.conninfo(), str(tmp_path), "echo stack-b")
+        wait_until(
+            lambda: read_status_of(second_pg_cluster.conninfo(), probe_b) == "succeeded",
+            timeout=60.0,
+        )
+
+    # Exact cleanup: no test-owned process survives, so none can reparent.
+    # Both pids were captured inside the converged body, so they are bound.
+    assert pid_a is not None
+    assert pid_b is not None
+    assert not process_alive(pid_a)
+    assert not process_alive(pid_b)
+
+
+class _FakeSupervisor:
+    """Duck-typed supervisor handle recording teardown signals for regressions."""
+
+    def __init__(self) -> None:
+        self.terminated = False
+
+    @staticmethod
+    def poll() -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminated = True
+
+    @staticmethod
+    def wait(timeout: float | None = None) -> int:
+        del timeout
+        return 0
+
+
+def test_second_stack_startup_failure_still_stops_first_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed second startup must not leak the first, converged stack."""
+    first = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [cast("subprocess.Popen[bytes]", first)]
+    startup_attempts: list[int] = []
+    stopped: list[subprocess.Popen[bytes]] = []
+
+    def failing_second_start() -> subprocess.Popen[bytes]:
+        startup_attempts.append(1)
+        if len(startup_attempts) == 1:
+            return handles[0]
+        msg = "second stack startup exploded"
+        raise RuntimeError(msg)
+
+    def fake_stop(proc: subprocess.Popen[bytes]) -> None:
+        stopped.append(proc)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", fake_stop)
+
+    with (
+        pytest.raises(RuntimeError, match="second stack startup exploded"),
+        _owned_supervisors([failing_second_start, failing_second_start]),
+    ):
+        pass
+
+    assert len(startup_attempts) == 2
+    assert stopped == [handles[0]]
+
+
+def test_first_teardown_failure_still_converges_rest_and_surfaces_chained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing teardown never skips later stacks nor hides the failure."""
+    first = _FakeSupervisor()
+    second = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [
+        cast("subprocess.Popen[bytes]", first),
+        cast("subprocess.Popen[bytes]", second),
+    ]
+    stop_order: list[subprocess.Popen[bytes]] = []
+
+    def fake_stop(proc: subprocess.Popen[bytes]) -> None:
+        stop_order.append(proc)
+        if proc is handles[0]:
+            msg = "teardown wedged"
+            raise OSError(msg)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", fake_stop)
+    handles_iter = iter(handles)
+    startups: list[Callable[[], subprocess.Popen[bytes]]] = [
+        handles_iter.__next__,
+        handles_iter.__next__,
+    ]
+
+    body_ran = False
+    with (
+        pytest.raises(OSError, match="teardown wedged"),
+        _owned_supervisors(startups),
+    ):
+        body_ran = True
+
+    assert body_ran is True
+    # ExitStack unwinds LIFO, but every registered stack is still converged.
+    assert stop_order == [handles[1], handles[0]]
+
+
+def test_body_failure_with_failing_teardown_chains_both_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup that cannot converge chains loudly instead of masking the body."""
+    first = _FakeSupervisor()
+    handles: list[subprocess.Popen[bytes]] = [cast("subprocess.Popen[bytes]", first)]
+    stopped: list[subprocess.Popen[bytes]] = []
+
+    def always_wedged_stop(_proc: subprocess.Popen[bytes]) -> None:
+        stopped.append(handles[0])
+        msg = "teardown wedged"
+        raise OSError(msg)
+
+    def failing_body() -> None:
+        msg = "body assertion blew up"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(sys.modules[__name__], "stop_supervisor", always_wedged_stop)
+
+    excinfo: pytest.ExceptionInfo[OSError]
+    with (
+        pytest.raises(OSError, match="teardown wedged") as excinfo,
+        _owned_supervisors([lambda: handles[0]]),
+    ):
+        failing_body()
+
+    assert stopped == handles
+    assert isinstance(excinfo.value.__context__, ValueError)
+    assert str(excinfo.value.__context__) == "body assertion blew up"
 
 
 def test_live_worker_db_outage_is_not_duplicated(
@@ -885,10 +1303,12 @@ def test_supervisor_restart_reconstructs_a_single_worker(
 
 
 def test_supervisor_takeover_stops_orphan_worker_by_exact_identity(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """A hard-killed supervisor's orphaned worker is taken over, never duplicated."""
+    del jobs_db
     repo, first, _second = maintained_env
     first_proc = start_supervisor(supervisor_env)
     try:
@@ -1656,6 +2076,45 @@ def test_derive_action_no_desired_selects_newer_pending_candidate(
     assert commit == "2" * 40
 
 
+def test_derive_action_legacy_v2_mission_without_ownership_is_parsed(tmp_path: Path) -> None:
+    """A supported schema-2 mission parses; unknown ownership never authorizes.
+
+    The old file must not look corrupt to the supervisor, and its missing
+    ``supervisor_owned`` field must stay unknown (fail-closed) instead of being
+    implicitly legacy-authorized.
+    """
+    del tmp_path
+    supervise.request_run("2" * 40, repo="", uv_path="uv", worker_id="w")
+    legacy = mission_state(1, dc.STATUS_PENDING, "2" * 40, "1" * 40).to_dict()
+    del legacy["supervisor_owned"]
+    legacy["schema_version"] = 2
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(json.dumps(legacy, sort_keys=True) + "\n", encoding="utf-8")
+
+    parsed = dc.read_rollback_state()
+
+    assert parsed is not None
+    assert parsed.schema_version == dc.ROLLBACK_SCHEMA_VERSION
+    assert parsed.supervisor_owned is None
+    # The old pending mission is older than the freshly written desired intent,
+    # so it is stale history: the supervisor runs the desired commit.
+    action, commit = _derive_action()
+    assert action == "run"
+    assert commit == "2" * 40
+
+
+def test_derive_action_fails_closed_on_unsupported_future_version(tmp_path: Path) -> None:
+    """A valid-looking future-schema mission holds without a worker."""
+    del tmp_path
+    future = mission_state(3, dc.STATUS_PENDING, "2" * 40, "1" * 40).to_dict()
+    future["schema_version"] = dc.ROLLBACK_SCHEMA_VERSION + 1
+    rollback_state_path().parent.mkdir(parents=True, exist_ok=True)
+    rollback_state_path().write_text(json.dumps(future, sort_keys=True) + "\n", encoding="utf-8")
+    action, commit = _derive_action()
+    assert action == "hold"
+    assert commit is None
+
+
 def test_next_generation_surpasses_open_mission(tmp_path: Path) -> None:
     """Generation allocation always outranks an open mission."""
     del tmp_path
@@ -1793,6 +2252,237 @@ def test_tick_derives_before_applying_stale_desired(
 
 
 # ---------------------------------------------------------------------------
+# Reboot-safe restart/backoff state (#151)
+# ---------------------------------------------------------------------------
+
+
+def _write_backing_off_state(
+    boot_id: str,
+    commit: str,
+    *,
+    child: supervise.WorkerChild | None = None,
+    restart_count: int = 3,
+    generation: int | None = None,
+) -> None:
+    """Persist durable supervisor state backing off in a huge pre-reboot domain.
+
+    Args:
+        boot_id: Boot identifier recorded for the state.
+        commit: Exact confirmed commit the state claims to run.
+        child: Optional stale recorded worker child.
+        restart_count: Consecutive-crash counter to persist.
+        generation: Applied generation; defaults to the current desired one.
+    """
+    desired = supervise.read_desired()
+    assert desired is not None
+    supervise.write_state(
+        replace(
+            supervise.fresh_state(),
+            applied_generation=desired.generation if generation is None else generation,
+            mode=supervise.MODE_RUN,
+            commit=commit,
+            child=child,
+            intent=supervise.INTENT_RUN,
+            restart_count=restart_count,
+            # Deliberately much larger than any plausible current-boot
+            # monotonic value: the pre-reboot clock domain.
+            next_attempt_at=10_000_000.0,
+            last_spawn_at=10_000_000.0 - 5.0,
+            ready=False,
+            next_readiness_at=None,
+            boot_id=boot_id,
+        )
+    )
+
+
+def _live_child() -> supervise.WorkerChild:
+    """Spawn a real live sleep process and return its exact child identity.
+
+    Returns:
+        A worker child identity bound to a genuinely live direct child of the
+        test process.
+    """
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "30"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "LUBKO_LIFECYCLE_TOKEN": "reboot-test-token"},
+    )
+    guard.register(proc)
+    identity = lifecycle.process_identity(proc.pid)
+    assert identity is not None
+    return supervise.WorkerChild(
+        pid=identity.pid,
+        pgid=identity.pgid,
+        sid=identity.sid,
+        start_time_ticks=identity.start_time_ticks,
+        token="reboot-test-token",  # ruff: ignore[hardcoded-password-func-arg]
+        worker_id=TEST_WORKER_ID,
+        spawned_at=time.time(),
+    )
+
+
+def test_reboot_with_no_child_converges_promptly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-reboot backoff deadline never wedges a fresh-boot supervisor."""
+    commit = "a" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    _write_backing_off_state("pre-reboot-boot", commit, child=None)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "post-reboot-boot")
+    daemon = SupervisorDaemon(Settings())
+    supervisor_module.normalize_cross_boot_state()
+    state = supervise.read_state()
+    assert state.boot_id == "post-reboot-boot"
+    assert state.next_attempt_at is None
+    assert state.last_spawn_at is None
+    assert state.restart_count == 3
+    ensured: list[str] = []
+    monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    daemon.reconcile(100.0)
+    assert ensured == [commit]
+
+
+def test_same_boot_restart_preserves_bounded_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-boot daemon restart keeps the still-valid backoff deadline."""
+    commit = "b" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    _write_backing_off_state("same-boot", commit, child=None, restart_count=2)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "same-boot")
+    daemon = SupervisorDaemon(Settings())
+    supervisor_module.normalize_cross_boot_state()
+    state = supervise.read_state()
+    assert state.boot_id == "same-boot"
+    assert state.next_attempt_at == pytest.approx(10_000_000.0)
+    assert state.last_spawn_at == pytest.approx(10_000_000.0 - 5.0)
+    assert state.restart_count == 2
+    ensured: list[str] = []
+    monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    daemon.reconcile(1_000.0)
+    assert ensured == []
+    daemon.reconcile(10_000_000.5)
+    assert ensured == [commit]
+
+
+def test_reboot_with_stale_child_records_crash_then_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-reboot recorded child is crash-handled once, then replaced."""
+    commit = "c" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    stale_child = supervise.WorkerChild(
+        pid=999_999,
+        pgid=999_999,
+        sid=999_999,
+        start_time_ticks=42,
+        token="stale-token",  # ruff: ignore[hardcoded-password-func-arg]
+        worker_id=TEST_WORKER_ID,
+        spawned_at=10_000_000.0,
+    )
+    _write_backing_off_state("pre-reboot-boot", commit, child=stale_child, restart_count=1)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "post-reboot-boot")
+    daemon = SupervisorDaemon(Settings())
+    supervisor_module.normalize_cross_boot_state()
+    state = supervise.read_state()
+    assert state.child is not None
+    assert state.child.pid == stale_child.pid
+    assert state.next_attempt_at is None
+    ensured: list[str] = []
+    monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    # This test covers cross-boot state normalization, not database-backed
+    # group recovery: stub the exact recovery machinery as a successful no-op.
+    recovered_tokens: list[str] = []
+
+    def _no_op_recovery(incarnation: str) -> None:
+        recovered_tokens.append(incarnation)
+
+    monkeypatch.setattr(supervisor_module, "recover_owned_groups", _no_op_recovery)
+    daemon.reconcile(100.0)
+    assert recovered_tokens == ["stale-token"]
+    state = supervise.read_state()
+    assert state.child is None
+    assert state.restart_count == 2
+    assert state.next_attempt_at is not None
+    assert state.next_attempt_at <= 100.0 + Settings().backoff_max_seconds
+    assert ensured == []
+    daemon.reconcile(state.next_attempt_at + 1.0 if state.next_attempt_at else 1e9)
+    assert ensured == [commit]
+
+
+def test_reboot_never_spawns_a_duplicate_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-reboot reconciliation spawns exactly one worker child."""
+    commit = "d" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    _write_backing_off_state("pre-reboot-boot", commit, child=None)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "post-reboot-boot")
+    daemon = SupervisorDaemon(Settings(backoff_base_seconds=0.05))
+    supervisor_module.normalize_cross_boot_state()
+    try:
+        spawned: list[supervise.WorkerChild] = []
+        live = _live_child()
+
+        def _fake_spawn(_commit: str) -> supervise.WorkerChild:
+            spawned.append(live)
+            return live
+
+        monkeypatch.setattr(daemon, "_spawn_worker", _fake_spawn)
+        monkeypatch.setattr(daemon, "_check_readiness", lambda _child, _cwd: (False, "deferred"))
+        now = 100.0
+        for _ in range(6):
+            daemon.reconcile(now)
+            time.sleep(0.06)
+            now += 1.0
+        assert len(spawned) == 1
+        state = supervise.read_state()
+        assert state.child is not None
+        assert state.child.pid == live.pid
+    finally:
+        guard.teardown_tracked(fail_on_leak=False)
+
+
+def test_reboot_restores_confirmed_commit_and_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-reboot convergence runs the intended confirmed commit, ready."""
+    commit = "e" * 40
+    supervise.request_run(commit, repo="", uv_path="uv", worker_id=TEST_WORKER_ID)
+    _write_backing_off_state("pre-reboot-boot", commit, child=None)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: "post-reboot-boot")
+    daemon = SupervisorDaemon(Settings(backoff_base_seconds=0.05))
+    supervisor_module.normalize_cross_boot_state()
+    live = _live_child()
+    monkeypatch.setattr(daemon, "_spawn_worker", lambda _commit: live)
+    monkeypatch.setattr(supervisor_module, "publish_current_surfaces", lambda _token: None)
+    monkeypatch.setattr(daemon, "_check_readiness", lambda _child, _cwd: (True, "ok"))
+    try:
+        now = time.monotonic()
+        daemon.reconcile(now)
+        state = supervise.read_state()
+        assert state.commit == commit
+        assert state.ready is False
+        assert state.child is not None
+        assert state.child.pid == live.pid
+        daemon.reconcile(now + Settings().readiness_interval_seconds + 1.0)
+        state = supervise.read_state()
+        assert state.commit == commit
+        assert state.ready is True
+        assert state.next_readiness_at is None
+    finally:
+        guard.teardown_tracked(fail_on_leak=False)
+
+
+# ---------------------------------------------------------------------------
 # Queue-invoked plain ``lubko-deploy deploy`` (#68)
 # ---------------------------------------------------------------------------
 
@@ -1818,6 +2508,41 @@ def write_fake_uv(tmp_path: Path, *, fail_validation: bool = False) -> Path:
     script.write_text("#!/bin/sh\nexit 9\n" if fail_validation else "#!/bin/sh\nexit 0\n")
     script.chmod(0o755)
     return script
+
+
+def checkout_args(repo: Path, fake_uv: Path, commit: str) -> list[str]:
+    """Build the argv of one queue-invoked ``lubko-deploy-ctl checkout`` job.
+
+    Args:
+        repo: Deployment checkout pinned to the candidate commit.
+        fake_uv: Stub ``uv`` executable.
+        commit: Exact candidate commit to check out.
+
+    Returns:
+        The checkout argv running the real stable-wrapper CLI.
+    """
+    return [
+        sys.executable,
+        "-m",
+        "lubko.deployctl",
+        json.dumps({"type": "checkout", "commit": commit}),
+        "--repo",
+        str(repo),
+        "--uv",
+        str(fake_uv),
+        "--grace-seconds",
+        "0.5",
+        "--db-timeout",
+        "5",
+        "--lock-timeout",
+        "15",
+        "--validation-timeout",
+        "30",
+        "--git-timeout",
+        "10",
+        "--cli-timeout",
+        "60",
+    ]
 
 
 def deploy_deploy_args(repo: Path, fake_uv: Path) -> list[str]:
@@ -1855,7 +2580,7 @@ def deploy_deploy_args(repo: Path, fake_uv: Path) -> list[str]:
 
 
 def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> UUID:
-    """Insert a protocol v3 pending command job executing argv directly.
+    """Insert a protocol v4 pending command job executing argv directly.
 
     Args:
         conninfo: PostgreSQL connection string.
@@ -1866,8 +2591,9 @@ def insert_pending_process_job(conninfo: str, cwd: str, process: list[str]) -> U
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": process},
         "state": {"status": "pending"},
     })
@@ -1927,6 +2653,56 @@ def payload_state(payload: dict[str, object]) -> dict[str, Any]:
     return state
 
 
+def ctl_request(request: dict[str, object], repo: Path, fake_uv: Path) -> dict[str, object]:
+    """Run one synchronous ``lubko-deploy-ctl`` protocol request.
+
+    Args:
+        request: Protocol request object.
+        repo: Maintained checkout passed as ``--repo``.
+        fake_uv: Stub ``uv`` executable.
+
+    Returns:
+        The decoded protocol response.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "lubko.deployctl",
+            json.dumps(request),
+            "--repo",
+            str(repo),
+            "--uv",
+            str(fake_uv),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return cast("dict[str, object]", json.loads(proc.stdout))
+
+
+def confirm_checkout(repo: Path, fake_uv: Path, commit: str) -> None:
+    """Drive the supported two-phase confirmation for a pending checkout.
+
+    Args:
+        repo: Maintained checkout.
+        fake_uv: Stub ``uv`` executable.
+        commit: Exact proposed candidate commit.
+    """
+    first = ctl_request({"type": "confirm", "commit": commit}, repo, fake_uv)
+    challenge = first["challenge"]
+    assert isinstance(challenge, str)
+    second = ctl_request(
+        {"type": "confirm", "commit": commit, "challenge": challenge[::-1]},
+        repo,
+        fake_uv,
+    )
+    assert second.get("confirmed") is True
+
+
 def _deploy_converged(applied: int, commit: str, old_pid: int) -> Callable[[], bool]:
     """Return a predicate asserting the exact supervisor convergence.
 
@@ -1962,25 +2738,26 @@ def _deploy_converged(applied: int, commit: str, old_pid: int) -> Callable[[], b
     return check
 
 
-def test_queue_deploy_survives_old_worker_shutdown_and_converges(
+def test_queue_checkout_survives_old_worker_shutdown_and_converges(
     jobs_db: str,
     pg_cluster: _pg.PgCluster,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    """A queue-invoked ``lubko-deploy deploy`` survives its own old worker.
+    """A queue-invoked ``lubko-deploy-ctl checkout`` survives its own old worker.
 
-    The production defect: a root job executes ``lubko-deploy deploy`` from a
-    worker-owned process group, the external supervisor retires that very
-    worker during the handoff, and the old worker's shutdown cancels the
-    initiating row even though the deployment converges. Here the deploy forks a
-    detached handoff helper, the root row reaches durable ``succeeded`` (never
-    ``cancelled``) before the old worker dies, the helper then drives the
-    supervisor handoff and activates the maintained CLIs so the CLI pointer,
-    the supervisor desired+applied state, and the new worker commit converge
-    without any later status reconciliation, and an unrelated active job is
-    still terminated by the old worker's shutdown rather than orphaned.
+    The production defect: a root job executes a version-changing deployment
+    from a worker-owned process group, the external supervisor retires that
+    very worker during the handoff, and the old worker's shutdown cancels the
+    initiating row even though the deployment converges. Under #29 the
+    supported version-changing path is ``lubko-deploy-ctl checkout``; here its
+    detached helper drives the supervisor handoff while the root row reaches
+    durable ``succeeded`` (never ``cancelled``) before the old worker dies, so
+    the CLI pointer, the supervisor desired+applied state, and the new worker
+    commit converge without any later status reconciliation, and an unrelated
+    active job is still terminated by the old worker's shutdown rather than
+    orphaned.
     """
     del pg_cluster
     repo, first, second = maintained_env
@@ -1994,19 +2771,19 @@ def test_queue_deploy_survives_old_worker_shutdown_and_converges(
         unrelated = insert_pending_job(jobs_db, str(repo), "sleep 30")
         wait_until(lambda: read_status_of(jobs_db, unrelated) == "running", timeout=30.0)
 
-        deploy_id = insert_pending_process_job(
-            jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+        checkout_id = insert_pending_process_job(
+            jobs_db, str(repo), checkout_args(repo, fake_uv, second)
         )
-        _wait_for_queue_success_and_old_death(jobs_db, deploy_id, old_meta)
+        _wait_for_queue_success_and_old_death(jobs_db, checkout_id, old_meta)
 
-        deploy_payload = read_payload(jobs_db, deploy_id)
-        deploy_state = payload_state(deploy_payload)
-        assert deploy_state["status"] == "succeeded"
-        result = deploy_payload["result"]
+        checkout_payload = read_payload(jobs_db, checkout_id)
+        checkout_state = payload_state(checkout_payload)
+        assert checkout_state["status"] == "succeeded"
+        result = checkout_payload["result"]
         assert isinstance(result, dict)
         assert result["exit_code"] == 0
+        assert '"ok": true' in str(result["stdout"])
         assert second in str(result["stdout"])
-        assert "converges detached" in str(result["stdout"])
 
         wait_until(
             lambda: read_status_of(jobs_db, unrelated) in {"cancelled", "failed"},
@@ -2017,6 +2794,11 @@ def test_queue_deploy_survives_old_worker_shutdown_and_converges(
         pgid = unrelated_state.get("process_pgid")
         assert pgid is not None
         assert not group_has_members(int(str(pgid)))
+
+        # A checkout is provisional by design (#103): the supported two-phase
+        # confirmation settles the supervisor on the candidate and activates
+        # the maintained CLIs.
+        confirm_checkout(repo, fake_uv, second)
 
         wait_until(_deploy_converged(applied, second, old_meta.pid), timeout=60.0)
         status = supervise.read_status()
@@ -2033,6 +2815,63 @@ def test_queue_deploy_survives_old_worker_shutdown_and_converges(
         assert meta.git_commit == second
         assert lifecycle.worker_alive(meta)
         assert cli.current_commit() == second
+
+
+def test_queue_version_changing_deploy_is_refused_durably_without_retiring_old_worker(
+    jobs_db: str,
+    pg_cluster: _pg.PgCluster,
+    maintained_env: tuple[Path, str, str],
+    supervisor_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A queue-owned ordinary version-changing ``deploy`` is refused durably.
+
+    Issue #29: once maintained-worker metadata exists, an ordinary
+    ``lubko-deploy deploy`` must never change versions — even when invoked as a
+    queue job from the live maintained worker itself. The owning worker records
+    the root row as durably ``failed`` with the refusal guidance, the old
+    worker is never retired (so an unrelated active job keeps running), and the
+    supervisor state stays pinned to the previously confirmed commit.
+    """
+    del pg_cluster
+    repo, first, _second = maintained_env
+    fake_uv = write_fake_uv(tmp_path)
+    with running_supervisor(supervisor_env):
+        applied = request_and_wait(first, repo)
+        old_meta = lifecycle.read_meta()
+        assert old_meta is not None
+        assert old_meta.pid is not None
+
+        unrelated = insert_pending_job(jobs_db, str(repo), "sleep 30")
+        wait_until(lambda: read_status_of(jobs_db, unrelated) == "running", timeout=30.0)
+
+        deploy_id = insert_pending_process_job(
+            jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+        )
+        wait_until(lambda: read_status_of(jobs_db, deploy_id) == "failed", timeout=60.0)
+
+        deploy_payload = read_payload(jobs_db, deploy_id)
+        deploy_state = payload_state(deploy_payload)
+        assert deploy_state["status"] == "failed"
+        result = deploy_payload["result"]
+        assert isinstance(result, dict)
+        assert result["exit_code"] != 0
+        assert "cannot change versions" in str(result["stderr"])
+        assert "lubko-deploy-ctl checkout" in str(result["stderr"])
+
+        assert lifecycle.worker_alive(old_meta)
+        assert worker_pid() == old_meta.pid
+        status = supervise.read_status()
+        assert status is not None
+        assert status.commit == first
+        assert status.applied_generation == applied
+        meta = lifecycle.read_meta()
+        assert meta is not None
+        assert meta.git_commit == first
+
+        assert read_status_of(jobs_db, unrelated) == "running"
+        unrelated_state = payload_state(read_payload(jobs_db, unrelated))
+        assert unrelated_state.get("process_pgid") is not None
 
 
 def test_queue_deploy_validation_failure_leaves_failed_row_and_old_worker(
@@ -2169,52 +3008,22 @@ def test_queue_restart_survives_old_worker_shutdown_and_replaces_worker(
         assert lifecycle.worker_alive(meta)
 
 
-def _deploy_rollback_converged(applied: int, commit: str) -> Callable[[], bool]:
-    """Return a predicate asserting the exact post-rollback coherence.
-
-    After a queue deploy whose CLI activation failed, the helper settles the
-    supervisor back to the previous confirmed commit and the maintained CLIs
-    keep selecting it, so the live worker, the supervisor desired/applied
-    commit, and ``cli/current`` all match.
-
-    Args:
-        applied: The generation applied before the deploy.
-        commit: The exact previous confirmed commit to restore.
-
-    Returns:
-        A predicate usable with :func:`wait_until`.
-    """
-
-    def check() -> bool:
-        status = supervise.read_status()
-        return bool(
-            status is not None
-            and status.applied_generation > applied
-            and status.commit == commit
-            and status.child is not None
-            and status.ready
-            and cli.current_commit() == commit
-        )
-
-    return check
-
-
-def test_queue_deploy_cli_activation_failure_rolls_back_and_converges(
+def test_queue_checkout_cli_activation_failure_keeps_confirmed_worker_reconcilable(
     jobs_db: str,
     pg_cluster: _pg.PgCluster,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    """A queue deploy whose CLI activation fails rolls back to full coherence.
+    """A confirmed queue checkout whose CLI activation failed stays reconcilable.
 
-    The candidate becomes live and ready through the real supervisor handoff,
-    but every maintained-CLI activation retry fails (the atomic pointer switch
-    is blocked). The detached helper must not leave the candidate worker on the
-    new commit with a stale ``cli/current``: it settles the supervisor back to
-    the previous confirmed commit so the live worker, the supervisor
-    desired/applied commit, and ``cli/current`` all match — with no manual
-    ``lubko-deploy-ctl status`` reconciliation.
+    The candidate becomes live and ready through the real supervisor handoff
+    and the two-phase confirmation settles it durably, but every maintained-CLI
+    activation attempt fails (the atomic pointer switch is blocked). The
+    checkout must never roll back a *confirmed* deployment: the worker, the
+    supervisor desired/applied commit, and the metadata stay pinned to the
+    candidate while ``cli/current`` stays stale, and one unblocked controller
+    invocation repairs the pointer through the idempotent reconciliation.
     """
     del pg_cluster
     repo, first, second = maintained_env
@@ -2225,9 +3034,7 @@ def test_queue_deploy_cli_activation_failure_rolls_back_and_converges(
     # the ``current`` pointer.  Both runtimes are already built by
     # ``maintained_env``, so this blocks only the final pointer switch and not
     # any new commit-runtime construction.  The previously established
-    # ``current`` pointer stays readable as ``first``; any ``set_current``
-    # attempt (candidate or rollback) fails closed, leaving the pointer on
-    # ``first`` until the supervisor rolls back to the previous commit.
+    # ``current`` pointer stays readable as ``first``.
     cli_root = cli_root_dir()
     original_mode = cli_root.stat().st_mode & 0o777
     cli_root.chmod(original_mode & ~0o222)
@@ -2239,34 +3046,43 @@ def test_queue_deploy_cli_activation_failure_rolls_back_and_converges(
             assert old_meta is not None
             assert old_meta.pid is not None
 
-            deploy_id = insert_pending_process_job(
-                jobs_db, str(repo), deploy_deploy_args(repo, fake_uv)
+            checkout_id = insert_pending_process_job(
+                jobs_db, str(repo), checkout_args(repo, fake_uv, second)
             )
-            wait_until(lambda: read_status_of(jobs_db, deploy_id) == "succeeded", timeout=90.0)
-            wait_until(_deploy_rollback_converged(applied, first), timeout=90.0)
+            wait_until(lambda: read_status_of(jobs_db, checkout_id) == "succeeded", timeout=90.0)
+            payload = read_payload(jobs_db, checkout_id)
+            result = payload["result"]
+            assert isinstance(result, dict)
+            assert result["exit_code"] == 0
+
+            confirm_checkout(repo, fake_uv, second)
 
             status = supervise.read_status()
             assert status is not None
-            assert status.commit == first
+            assert status.commit == second
             assert status.applied_generation > applied
             assert status.child is not None
             assert status.child.pid != old_meta.pid
             assert len(direct_children(status.supervisor_pid)) == 1
-            assert cli.current_commit() == first
-
             meta = lifecycle.read_meta()
             assert meta is not None
-            assert meta.git_commit == first
+            assert meta.git_commit == second
             assert lifecycle.worker_alive(meta)
 
-            payload = read_payload(jobs_db, deploy_id)
-            assert payload_state(payload)["status"] == "succeeded"
-            result = payload["result"]
-            assert isinstance(result, dict)
-            assert result["exit_code"] == 0
-            assert second in str(result["stdout"])
+            # Confirmation succeeded while the pointer switch was blocked: the
+            # deployment is confirmed-but-stale, never rolled back.
+            assert cli.current_commit() == first
     finally:
         cli_root.chmod(original_mode)
+
+    # One unblocked controller invocation repairs the stale pointer to the
+    # exactly confirmed commit without touching worker or mission state.
+    ctl_request({"type": "status"}, repo, fake_uv)
+    wait_until(lambda: cli.current_commit() == second, timeout=30.0)
+    final_meta = lifecycle.read_meta()
+    assert final_meta is not None
+    assert final_meta.git_commit == second
+    assert cli.current_commit() == second
 
 
 # ---------------------------------------------------------------------------
@@ -2382,10 +3198,12 @@ def test_read_status_returns_none_when_process_zombie(
 
 
 def test_read_status_returns_valid_for_live_supervisor(
+    jobs_db: str,
     maintained_env: tuple[Path, str, str],
     supervisor_env: dict[str, str],
 ) -> None:
     """A status snapshot from the live supervisor is accepted."""
+    del jobs_db
     repo, first, _second = maintained_env
     with running_supervisor(supervisor_env):
         request_and_wait(first, repo)

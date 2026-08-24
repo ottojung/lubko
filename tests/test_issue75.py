@@ -430,7 +430,7 @@ def _db_conf_from_conninfo(conninfo: str, tmp_path: Path) -> Path:
 
 
 def _insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
-    """Insert a protocol v3 pending command job running a shell snippet.
+    """Insert a protocol v4 pending command job running a shell snippet.
 
     Args:
         conninfo: PostgreSQL connection string.
@@ -441,8 +441,9 @@ def _insert_pending_job(conninfo: str, cwd: str, command: str) -> object:
         The job identifier.
     """
     payload = json.dumps({
-        "v": 3,
+        "v": 4,
         "type": "command",
+        "server": "alpha-server",
         "request": {"cwd": cwd, "process": ["/bin/sh", "-c", command]},
         "state": {"status": "pending"},
     })
@@ -778,7 +779,7 @@ def test_start_gate_release_runs_user_code(tmp_path: Path) -> None:
     exact same PID execs the user program.
     """
     sentinel = tmp_path / "ran"
-    proc, stdout_path, stderr_path, pgid, gate_fd = worker_mod.spawn_job(
+    proc, stdout_path, stderr_path, pgid, gate_fd, _so_r, _se_r = worker_mod.spawn_job(
         worker_mod.Job(
             id=uuid4(),
             cwd=str(tmp_path),
@@ -824,7 +825,7 @@ def test_start_gate_persist_failure_aborts_cleanly(tmp_path: Path) -> None:
     and no unowned process may survive.
     """
     sentinel = tmp_path / "ran"
-    proc, stdout_path, stderr_path, pgid, gate_fd = worker_mod.spawn_job(
+    proc, stdout_path, stderr_path, pgid, gate_fd, _so_r, _se_r = worker_mod.spawn_job(
         worker_mod.Job(
             id=uuid4(),
             cwd=str(tmp_path),
@@ -870,7 +871,7 @@ def test_start_gate_worker_death_before_release_leaves_no_orphan(
     replacement authority can claim the same job without overlap.
     """
     sentinel = tmp_path / "ran"
-    proc, stdout_path, stderr_path, pgid, gate_fd = worker_mod.spawn_job(
+    proc, stdout_path, stderr_path, pgid, gate_fd, _so_r, _se_r = worker_mod.spawn_job(
         worker_mod.Job(
             id=uuid4(),
             cwd=str(tmp_path),

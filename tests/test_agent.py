@@ -1526,6 +1526,83 @@ def test_runner_drains_queued_steers(state_dir: Path, monkeypatch: pytest.Monkey
     assert "second" in log
 
 
+def test_runner_fails_closed_when_log_open_raises_non_enoent_oserror(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-benign log-open OSError fails the invocation closed immediately."""
+    make_agent(state_dir, "aaaaaaaa", state_value="running", prompt_count=1)
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    reserve_runner_generation("aaaaaaaa", gen=1, mode="new", monkeypatch=monkeypatch)
+    log_path = agent.agents_dir() / "aaaaaaaa" / "output.log"
+    log_path.mkdir()
+    agent.runner("aaaaaaaa", "new")
+    result = agent.read_meta("aaaaaaaa")
+    assert result is not None
+    assert result["state"] == "failed"
+    assert result["exit_code"] is None
+    assert "failed to open agent log" in result["error"]
+    assert "Is a directory" in result["error"]
+    assert result["active_runner"] is False
+    assert result["runner_reservation"] is None
+    assert result["finished_at"] is not None
+
+
+def test_runner_fails_closed_when_log_open_enoent_but_agent_dir_exists(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ENOENT log open without deletion also fails the invocation closed."""
+    meta = make_agent(state_dir, "aaaaaaaa", state_value="running")
+    meta["active_runner"] = True
+    meta["runner_reservation"] = {
+        "gen": 1,
+        "owner_pid": os.getpid(),
+        "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
+        "state": "claimed",
+        "reserved_at": time.time(),
+        "mode": "new",
+    }
+    agent.write_meta("aaaaaaaa", meta)
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    ctx = agent._RunnerContext(
+        aid="aaaaaaaa",
+        log_path=agent.agents_dir() / "aaaaaaaa" / "missing-dir" / "output.log",
+        cwd=str(state_dir),
+        env=dict(os.environ),
+    )
+    assert agent._run_invocation(ctx, "the prompt", is_continue=False) is None
+    result = agent.read_meta("aaaaaaaa")
+    assert result is not None
+    assert result["state"] == "failed"
+    assert "failed to open agent log" in result["error"]
+    assert result["active_runner"] is False
+    assert result["runner_reservation"] is None
+    assert result["finished_at"] is not None
+
+
+def test_runner_log_open_enoent_with_deleted_agent_dir_remains_benign(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An intentionally deleted agent directory still exits the runner benignly."""
+    meta = make_agent(state_dir, "aaaaaaaa", state_value="running")
+    monkeypatch.setattr(agent, "build_agent_command", fake_agent_command)
+    ctx = agent._RunnerContext(
+        aid="aaaaaaaa",
+        log_path=agent.agents_dir() / "aaaaaaaa" / "output.log",
+        cwd=str(state_dir),
+        env=dict(os.environ),
+    )
+    shutil.rmtree(agent.agents_dir() / "aaaaaaaa")
+    # The runner raced with an intentional delete: metadata was read just
+    # before the directory disappeared, so the log open hits ENOENT.
+    real_read_meta = agent.read_meta
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: dict(meta))
+    assert agent._run_invocation(ctx, "the prompt", is_continue=False) is None
+    assert real_read_meta("aaaaaaaa") is None
+
+
 def test_runner_records_failure(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The runner records a non-zero invocation result."""
     make_agent(state_dir, "aaaaaaaa", state_value="running")
@@ -2346,6 +2423,198 @@ def test_cmd_delete_force_kills_live_group(
         kill_proc(proc)
 
 
+@pytest.mark.parametrize("mode", ["stop", "kill"])
+def test_cmd_stop_kill_identity_race_never_terminalizes_newer_invocation(
+    mode: str,
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A newer invocation recorded mid-stop/kill is never marked terminal.
+
+    Forces the A -> B race deterministically: while the command waits for
+    invocation A's group to die, the runner records live invocation B. The
+    command must not terminalize or untrack B and must report failure.
+    """
+    proc_a = spawn_marked_process("aaaaaaaa")
+    proc_b = spawn_marked_process("aaaaaaaa")
+    try:
+        monkeypatch.setattr(agent, "STOP_WAIT_SECONDS", 2.0)
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 2.0)
+        a_meta = meta_for_process("aaaaaaaa", proc_a, str(state_dir))
+        agent.write_meta("aaaaaaaa", a_meta)
+
+        original_wait = agent.wait_group_dead
+
+        def record_newer_then_wait(meta: agent.Meta, timeout: float) -> bool:
+            # Simulate the runner recording invocation B while the command
+            # waits for invocation A's exact group to die.
+            b_meta = meta_for_process("aaaaaaaa", proc_b, str(state_dir))
+            b_meta["runner_pid"] = proc_b.pid
+            b_meta["runner_start_time"] = agent.proc_start_ticks(proc_b.pid)
+            b_meta["active_runner"] = True
+            agent.write_meta("aaaaaaaa", b_meta)
+            return original_wait(meta, timeout)
+
+        monkeypatch.setattr(agent, "wait_group_dead", record_newer_then_wait)
+
+        code = agent.main([mode, "aaaaaaaa"])
+        assert code == agent.EXIT_ERROR
+        assert "restarted" in capsys.readouterr().err
+
+        wait_until(lambda: proc_a.poll() is not None)
+        assert proc_b.poll() is None, "newer invocation must stay alive"
+
+        meta = agent.read_meta("aaaaaaaa")
+        assert meta is not None
+        assert meta["pid"] == proc_b.pid
+        assert meta["runner_pid"] == proc_b.pid
+        assert meta["state"] == "running", "newer invocation must stay live"
+        assert meta["active_runner"] is True, "B's active runner must be preserved"
+        assert agent.active_runner_justified(meta)
+        assert agent.runner_alive(meta)
+        assert meta["stop_reason"] is None
+        assert meta["exit_signal"] is None
+        assert meta["finished_at"] is None
+        assert agent.is_alive(meta)
+    finally:
+        kill_proc(proc_a)
+        kill_proc(proc_b)
+
+
+@pytest.mark.parametrize("mode", ["stop", "kill"])
+def test_steer_cannot_overwrite_in_flight_stop_like_intent(
+    mode: str,
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A racing steer never overwrites an accepted stop/kill intent (issue #168).
+
+    Deterministic interleaving via metadata state: invocation A is live with a
+    durably recorded stop-like intent (exactly what ``_begin_stop_like`` leaves
+    behind while the signaled process is still dying). A concurrent
+    ``prompt --steer`` must be rejected busy, must not queue work, and after A
+    dies the terminal classification and drain must reflect the stop/kill, not
+    resurrect the agent.
+    """
+    proc_a = spawn_marked_process("aaaaaaaa")
+    try:
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode_, **_k: spawned.append(mode_))
+        meta = meta_for_process("aaaaaaaa", proc_a, str(state_dir))
+        meta["runner_pid"] = proc_a.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc_a.pid)
+        agent.write_meta("aaaaaaaa", meta)
+
+        # Step 2: begin stop/kill — the stop-like intent is durably recorded
+        # while A is still alive (signal delivery is asynchronous).
+        agent.update_meta("aaaaaaaa", lambda m: agent._begin_stop_like(m, mode))
+        assert agent.read_meta("aaaaaaaa") is not None
+        recorded = agent.read_meta("aaaaaaaa")
+        assert recorded is not None
+        assert recorded["intent"] == mode
+        assert agent.is_alive(recorded)
+
+        # Step 3: before A exits, a concurrent steer races in.
+        code = agent.main(["prompt", "--id", "aaaaaaaa", "--steer", "X"])
+        assert code == agent.EXIT_ERROR
+        assert "still running" in capsys.readouterr().err
+
+        # The steer was rejected: no queued work, intent untouched, no spawn.
+        mid = agent.read_meta("aaaaaaaa")
+        assert mid is not None
+        assert mid["intent"] == mode
+        assert mid["steer_queue"] == []
+        assert mid["pending_prompt"] is None
+        assert mid["stop_reason"] is None
+        assert spawned == []
+
+        # Steps 4-5: A dies from the requested signal; finalization must
+        # classify it as stopped/killed and drain nothing.
+        sig = signal.SIGTERM if mode == "stop" else signal.SIGKILL
+        agent.send_signal_group(mid, sig)
+        wait_until(lambda: proc_a.poll() is not None)
+        agent.update_meta("aaaaaaaa", agent._finalize_after(-sig))
+        final = agent.read_meta("aaaaaaaa")
+        assert final is not None
+        expected_state = "stopped" if mode == "stop" else "killed"
+        assert final["state"] == expected_state
+        assert final["stop_reason"] == mode
+        assert final["exit_signal"] == sig
+        assert final["intent"] is None
+
+        # No replacement invocation may start from the racing steer.
+        assert agent._drain_next("aaaaaaaa") is None
+        drained = agent.read_meta("aaaaaaaa")
+        assert drained is not None
+        assert drained["active_runner"] is False
+        assert not agent.runner_alive(drained)
+        assert spawned == []
+    finally:
+        kill_proc(proc_a)
+
+
+@pytest.mark.parametrize("mode", ["stop", "kill"])
+def test_ordinary_prompt_also_rejected_while_stop_like_intent_active(
+    mode: str,
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An ordinary prompt is also rejected while a stop/kill intent is active."""
+    proc_a = spawn_marked_process("aaaaaaaa")
+    try:
+        spawned: list[str] = []
+        monkeypatch.setattr(agent, "spawn_runner", lambda _aid, mode_, **_k: spawned.append(mode_))
+        meta = meta_for_process("aaaaaaaa", proc_a, str(state_dir))
+        agent.write_meta("aaaaaaaa", meta)
+        agent.update_meta("aaaaaaaa", lambda m: agent._begin_stop_like(m, mode))
+
+        code = agent.main(["prompt", "--id", "aaaaaaaa", "Y"])
+        assert code == agent.EXIT_ERROR
+        assert "still running" in capsys.readouterr().err
+
+        mid = agent.read_meta("aaaaaaaa")
+        assert mid is not None
+        assert mid["intent"] == mode
+        assert mid["pending_prompt"] is None
+        assert spawned == []
+    finally:
+        kill_proc(proc_a)
+
+
+def test_ordinary_steer_on_live_agent_unaffected_by_guard(
+    state_dir: Path,
+) -> None:
+    """Without a stop-like intent, ordinary steer queuing behavior is unchanged."""
+    proc_a = spawn_marked_process("aaaaaaaa")
+    try:
+        meta = meta_for_process("aaaaaaaa", proc_a, str(state_dir))
+        agent.write_meta("aaaaaaaa", meta)
+
+        decision: dict[str, object] = {}
+        agent.update_meta(
+            "aaaaaaaa",
+            lambda m: agent._apply_locked_transition(
+                m,
+                decision,
+                prompt="S",
+                steer=True,
+                mode="continue",
+            ),
+        )
+        assert decision["action"] == "reuse"
+        assert decision["interrupt"] is True
+        mid = agent.read_meta("aaaaaaaa")
+        assert mid is not None
+        assert mid["intent"] == "steer"
+        assert mid["steer_queue"]
+        assert mid["steer_queue"][0]["prompt"] == "S"
+    finally:
+        kill_proc(proc_a)
+
+
 def test_runner_alive_matches_exact_identity(state_dir: Path) -> None:
     """A live runner with matching start time and marker is reported alive."""
     proc = spawn_marked_process("aaaaaaaa")
@@ -2435,7 +2704,7 @@ def _cli_env(sync_dir: Path | None, **extra: str) -> dict[str, str]:
         # harness command.  Production code never sees FAKE_OPENCODE_CMD and
         # still builds the fixed `opencode run --model opencode-go/ox-alpha-free`
         # argv; only this fake reads it.
-        script = (
+        payload = (
             "#!" + sys.executable + "\n"
             "import os\n"
             "import sqlite3\n"
@@ -2466,8 +2735,24 @@ def _cli_env(sync_dir: Path | None, **extra: str) -> dict[str, str]:
             '_cmd = os.environ.get("FAKE_OPENCODE_CMD", "sleep 1")\n'
             'sys.exit(subprocess.call(["/bin/sh", "-c", _cmd]))\n'
         )
-        opencode.write_text(script)
-        opencode.chmod(0o755)
+        # The fake executable may be executing inside a live runner while
+        # another CLI invocation prepares its environment. Rewriting the file
+        # in place races that execution (OSError ETXTBSY) and could truncate a
+        # concurrently running script. The payload is invariant, so reuse an
+        # identical existing file; otherwise write to a fresh temporary file
+        # and atomically replace, which is safe against live executors.
+        if not opencode.exists() or opencode.read_text(encoding="utf-8") != payload:
+            fd, staged = tempfile.mkstemp(dir=fake_bin, prefix=".opencode-")
+            staged_path = Path(staged)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                staged_path.chmod(0o700)
+                staged_path.replace(opencode)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    staged_path.unlink()
+                raise
         env["FAKE_OPENCODE_CMD"] = fake_cmd
         env["XDG_DATA_HOME"] = str(fake_data)
         env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
@@ -2716,6 +3001,44 @@ def spawn_stale_marked_process(aid: str, gen: int) -> subprocess.Popen[bytes]:
     )
     guard.register(proc)
     return proc
+
+
+def test_cli_env_reprepare_while_fake_executable_is_live(tmp_path: Path) -> None:
+    """Preparing another CLI env cannot fail or corrupt a live fake executable.
+
+    Regression coverage for the ETXTBSY race: while a runner is executing the
+    fake ``opencode`` binary, ``_cli_env`` must be able to prepare further CLI
+    invocations without raising ``OSError`` (ETXTBSY) or truncating/corrupting
+    the executable the live process is running.
+    """
+    sync = tmp_path / "sync"
+    started = tmp_path / "started"
+    env = _cli_env(sync, FAKE_OPENCODE_CMD=f'touch "{started}"; sleep 300')
+    fake_bin = sync / "fake-opencode-bin"
+    opencode = fake_bin / "opencode"
+    original = opencode.read_bytes()
+    proc = subprocess.Popen(
+        [str(opencode), "run"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    guard.register(proc)
+    try:
+        wait_until(started.exists, timeout=10)
+        # The fake executable is now genuinely executing. Repeatedly prepare
+        # further CLI environments exactly as concurrent prompt callers would.
+        for _ in range(16):
+            _cli_env(sync, FAKE_OPENCODE_CMD=f'touch "{started}"; sleep 300')
+            _cli_env(None, FAKE_OPENCODE_CMD="sleep 1")
+        assert opencode.read_bytes() == original
+        assert opencode.stat().st_mode & 0o111
+    finally:
+        _kill_runner(proc.pid)
+        proc.wait(timeout=10)
 
 
 def test_linearizable_two_concurrent_prompts_exactly_one_runner(
@@ -3485,3 +3808,132 @@ def test_terminal_or_unknown_reconciles_before_decision(
     finally:
         with contextlib.suppress(Exception):
             kill_proc(proc)
+
+
+# ---------------------------------------------------------------------------
+# Delete/runner lifecycle convergence (issue #163)
+# ---------------------------------------------------------------------------
+
+
+def _wait_file_absent_after(path: Path, seconds: float = 0.5) -> None:
+    """Assert a path stays absent for a grace period (no resurrection)."""
+    time.sleep(seconds)
+    assert not path.exists()
+
+
+def test_delete_never_succeeds_while_claimed_runner_can_recreate_state(
+    state_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A live managed runner racing delete cannot resurrect the agent directory.
+
+    Forces the exact interleaving: a managed runner claims its reservation and
+    pauses immediately before the state-recreation boundary while
+    ``delete --force`` runs concurrently. Deletion must converge the exact
+    claimed runner before removing state, and after success no released runner
+    may recreate the directory or start the invocation.
+    """
+    aid = "163aaaa"
+    agent.write_meta(aid, agent.idle_meta(aid, str(state_dir), None))
+    sync = tmp_path / "sync"
+    prompt = _run_cli(
+        ["prompt", "--id", aid, "--detach", "racy"],
+        sync_dir=sync,
+        FAKE_OPENCODE_CMD="sleep 300",
+    )
+    try:
+        _wait_sync_reached(sync, "sc_observe", 1)
+        _release_sync(sync, "sc_observe")
+        _wait_sync_reached(sync, "sc_decide", 1)
+        _release_sync(sync, "sc_decide")
+        prompt.wait(timeout=30)
+        _wait_sync_reached(sync, "runner_preclaim", 1)
+        _release_sync(sync, "runner_preclaim")
+        # The runner has now claimed (exact identity recorded in meta) but is
+        # paused before it could recreate state or start the invocation.
+        wait_until(functools.partial(_runner_claimed, aid), timeout=10)
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        assert meta.get("runner_reservation", {}).get("state") == "claimed"
+        runner_pid = int(meta["runner_pid"])
+        assert agent.pid_alive(runner_pid)
+        _assert_exact_runner(runner_pid, aid, 1)
+
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 5.0)
+        assert agent.main(["delete", aid, "--force"]) == agent.EXIT_OK
+        out = capsys.readouterr()
+        assert "deleted" in out.out
+
+        # The exact claimed runner was converged by delete itself.
+        wait_until(functools.partial(_runner_dead, runner_pid))
+
+        # Release the paused runner: even if it had survived, the tombstone
+        # must prevent any claim/state recreation. Prove the directory stays
+        # absent after the runner would have resumed.
+        _release_sync(sync, "runner_prestart")
+        _release_sync(sync, "runner_preclaim")
+        _wait_file_absent_after(agent.agents_dir() / aid)
+        assert agent.read_meta(aid) is None
+    finally:
+        with contextlib.suppress(Exception):
+            prompt.wait(timeout=5)
+        _teardown_runners(aid, sync)
+
+
+def test_delete_fails_closed_when_group_convergence_times_out(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A timed-out invocation group convergence never reports successful deletion."""
+    aid = "163bbbb"
+    proc = spawn_marked_term_ignoring(aid)
+    try:
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 0.2)
+        # Deterministic unkillable-group simulation: the exact group probe
+        # keeps reporting live members no matter what deletion signals.
+        monkeypatch.setattr(agent, "group_alive", lambda _meta: True)
+        agent.write_meta(aid, meta_for_process(aid, proc, str(state_dir)))
+        code = agent.main(["delete", aid, "--force"])
+        assert code == agent.EXIT_ERROR
+        captured = capsys.readouterr()
+        assert "deleted" not in captured.out
+        assert "did not converge" in captured.err
+        # Fail closed: state kept intact and retryable (no lingering tombstone).
+        assert (agent.agents_dir() / aid).exists()
+        meta = agent.read_meta(aid)
+        assert meta is not None
+        assert not meta.get("delete_pending")
+    finally:
+        kill_proc(proc)
+
+
+def test_delete_refuses_live_runner_without_force(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Deleting an agent with a proven-live managed runner requires --force."""
+    aid = "163cccc"
+    proc = spawn_stale_marked_process(aid, gen=3)
+    try:
+        meta = agent.idle_meta(aid, str(state_dir), None)
+        meta["active_runner"] = True
+        meta["runner_pid"] = proc.pid
+        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
+        meta["runner_reservation"] = {
+            "state": "claimed",
+            "gen": 3,
+            "owner_pid": os.getpid(),
+            "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
+        }
+        agent.write_meta(aid, meta)
+        monkeypatch.setattr(agent, "KILL_WAIT_SECONDS", 0.2)
+        assert agent.main(["delete", aid]) == agent.EXIT_ERROR
+        captured = capsys.readouterr()
+        assert "deleted" not in captured.out
+        assert (agent.agents_dir() / aid).exists()
+    finally:
+        kill_proc(proc)

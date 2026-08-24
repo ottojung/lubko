@@ -71,6 +71,19 @@ group or by other users.
 
 Optional runtime settings:
 
+The execution-server identity is not an environment variable: it is the
+required non-empty `server` setting of a second private file,
+`$XDG_CONFIG_HOME/lubko/worker.conf` with a fallback of
+`~/.config/lubko/worker.conf`; the file path can be selected explicitly with
+`LUBKO_WORKER_CONFIG` (path only — the identity value itself is never
+environmental). Every daemon claims, heartbeats, and
+terminalizes only jobs whose payload `server` field exactly equals this
+identity; the worker and `lubko-deploy` readiness probes refuse to start
+without it, and the file must be readable and writable only by the owning
+user (mode `0600`), never accessible by the group or by other users.
+
+Other runtime settings:
+
 - `LUBKO_WORKER_ID` — worker identifier, default is the host name.
 - `LUBKO_POLL_INTERVAL_SECONDS` — idle polling interval, default `1`.
 - `LUBKO_PROCESS_POLL_INTERVAL_SECONDS` — interval for polling a running job's
@@ -127,19 +140,25 @@ payload text not null
 `payload` is one string containing a JSON object; all evolving job/request/
 result/state/cancellation/process-identity/output data lives inside it.
 **Never add a third column.** See `docs/protocol.md` for the versioned binding:
-the payload carries a protocol version `v` (currently `3`) with `command` rows
+the payload carries a protocol version `v` (currently `4`) with a required
+non-empty top-level `server` field naming the execution server that owns the
+row, plus `command` rows
 (`request.process` argv, `state`, optional terminal `result`, and bounded live
 `output` tails) and immutable `output_chunk` rows. SQL casts `payload::jsonb`
 only transiently for predicates and atomic updates and stores `::text` back. The
 worker refuses to start against a table that violates this invariant.
 
-Submit a job in protocol v3 form:
+Submit a job in protocol v4 form:
 
 ```sql
 insert into lubko.jobs (payload)
-values ('{"v":3,"type":"command","request":{"cwd":"/workspace/project","process":["git","status","--short"]},"state":{"status":"pending"}}')
+values ('{"v":4,"type":"command","server":"alpha-server","request":{"cwd":"/workspace/project","process":["git","status","--short"]},"state":{"status":"pending"}}')
 returning id;
 ```
+
+The job runs only on the daemon whose configured server identity (the
+non-empty `server` setting of its private worker configuration file) is
+`alpha-server`; jobs addressed to other servers stay pending untouched.
 
 Poll it with:
 
@@ -261,27 +280,29 @@ canonical two-column `lubko.jobs` table with its type-aware checks, the
 command queue index, the output-chunk ownership/ordering indexes, the
 invariant comment, and the worker role grant. There is no older schema and no
 rollback path: the two-column table is the only supported binding, and the
-worker verifies the protocol v3 output-chunk shape at startup, refusing to
+worker verifies the protocol v4 output-chunk shape at startup, refusing to
 run against any other table. See `docs/protocol.md` for the authoritative
 binding.
 
-The baseline grants the `lubko_worker` role everything protocol v3 needs:
+The baseline grants the `lubko_worker` role everything protocol v4 needs:
 `USAGE` on the `lubko` schema and `SELECT`, `INSERT`, `UPDATE` on
 `lubko.jobs` (INSERT is required to publish immutable `output_chunk` rows).
 The grant is guarded by `to_regrole`, so applying the baseline before the role
 is provisioned does not fail.
 
-**Protocol upgrades are destructive.** The v2 → v3 cutover discards old
+**Protocol upgrades are destructive.** The v3 → v4 cutover discards old
 transport contents rather than migrating them: the physical two-column table
-is identical in v2 and v3, and v3 rejects every v2 payload (including any still
-carrying `request.command` or `request.args`). There is no protocol-data drain or migration,
-and no compatibility path. Operationally, the cutover quiesces the live queue: stop
-new submissions, let any in-flight v2 work become durably terminal, bring up
-and prove the v3 supervisor/worker, then `truncate lubko.jobs` while quiescent
-to purge every old root `command` row and `output_chunk` history, and prove a
-fresh v3 round trip. Truncating before the first v3 start is equally valid;
-either way the end state is an empty `lubko.jobs` with no v2 row or history
-preserved.
+is identical in v3 and v4, and v4 rejects every v3 payload (which lacks the
+required non-empty top-level `server` field). There is no protocol-data drain or
+migration, and no compatibility path. Operationally, the cutover quiesces the
+live queue: stop new submissions, let any in-flight work become durably
+terminal, `truncate lubko.jobs`, apply
+`migrations/0003_protocol_v4_server_routing.sql`, start the daemon with its
+configured server identity (the non-empty `server` setting of its private
+worker configuration file), and prove a fresh v4 round trip.
+Truncating before applying is required; applying against a table that still
+holds nonconforming rows fails fast with an explicit diagnostic. Either way the
+end state is an empty `lubko.jobs` with no v3 row or history preserved.
 
 Run the worker with:
 

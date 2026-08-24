@@ -48,6 +48,7 @@ from lubko.lifecycle import (
     append_deploy_log,
     check_postgres,
     deploy_lock,
+    detach_standard_streams,
     process_identity,
     read_meta,
     run_validation,
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
 ROLLBACK_SCHEMA_VERSION: Final = 3
+SUPPORTED_ROLLBACK_SCHEMA_VERSIONS: Final = frozenset({2})
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
@@ -267,6 +269,34 @@ def _write_state(state: RollbackState) -> None:
     write_json_durable(rollback_state_path(), state.to_dict())
 
 
+def _normalize_parsed_state(state: RollbackState) -> RollbackState:
+    """Normalize a parsed state onto the current rollback schema.
+
+    Supported older schema versions are parsed explicitly and upgraded in
+    memory to the current version so every later rewrite (including mission
+    archival) uses the current schema. Missing ownership fields on older
+    missions stay ``supervisor_owned=None`` (unknown authority), which every
+    consumer must treat fail-closed; they are never implicitly
+    legacy-authorized.
+
+    Args:
+        state: Parsed state with its on-disk schema version.
+
+    Returns:
+        The state pinned to :data:`ROLLBACK_SCHEMA_VERSION` when supported.
+
+    Raises:
+        DeployCtlError: If the on-disk version is not supported (including
+            unknown future versions).
+    """
+    if state.schema_version == ROLLBACK_SCHEMA_VERSION:
+        return state
+    if state.schema_version in SUPPORTED_ROLLBACK_SCHEMA_VERSIONS:
+        return replace(state, schema_version=ROLLBACK_SCHEMA_VERSION)
+    msg = f"unsupported supervised deployment state version {state.schema_version}"
+    raise DeployCtlError(msg)
+
+
 def _read_state() -> RollbackState | None:
     """Read rollback state, failing closed on corruption.
 
@@ -293,10 +323,7 @@ def _read_state() -> RollbackState | None:
         msg = "supervised deployment state must be an object"
         raise DeployCtlError(msg)
     state = RollbackState.from_dict(decoded)
-    if state.schema_version != ROLLBACK_SCHEMA_VERSION:
-        msg = f"unsupported supervised deployment state version {state.schema_version}"
-        raise DeployCtlError(msg)
-    return state
+    return _normalize_parsed_state(state)
 
 
 def next_mission_generation() -> int:
@@ -1229,6 +1256,10 @@ def _fork_watchdog(lock_timeout_seconds: float) -> None:
     os.closerange(3, int(os.sysconf("SC_OPEN_MAX")))
     with suppress(OSError):
         os.setsid()
+    # The watchdog outlives the job process that forked it: sever the
+    # inherited standard streams (capture-pipe write ends under worker-owned
+    # capture) exactly like every other detached deployment child.
+    detach_standard_streams(keep=set())
     try:
         _watchdog_main(lock_timeout_seconds)
     finally:
@@ -1293,10 +1324,7 @@ def read_rollback_state() -> RollbackState | None:
     except (KeyError, TypeError, ValueError) as exc:
         msg = "supervised deployment state is malformed"
         raise DeployCtlError(msg) from exc
-    if state.schema_version != ROLLBACK_SCHEMA_VERSION:
-        msg = f"unsupported supervised deployment state version {state.schema_version}"
-        raise DeployCtlError(msg)
-    return state
+    return _normalize_parsed_state(state)
 
 
 def _cleanup_pending_locked() -> None:
@@ -1503,6 +1531,7 @@ def _run_helper(options: Options, commit: str, job_id: object, writer: int) -> N
     """
     with suppress(OSError):
         os.setsid()
+    detach_standard_streams(keep={writer})
     try:
         try:
             with deploy_lock(options.lock_timeout_seconds):
@@ -2001,6 +2030,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     request_type = ""
     try:
+        request = _parse_request(args.request)
+        request_type = _request_type(request)
         uv_path = resolve_uv(args.uv)
         options = Options(
             repo=args.repo.resolve(),
@@ -2015,8 +2046,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         if options.confirm_window_seconds <= 0:
             raise DeployCtlError("confirmation window must be positive")
-        request = _parse_request(args.request)
-        request_type = _request_type(request)
         response = _dispatch(options, request)
     except (DeployCtlError, UvResolutionError) as exc:
         response = {"ok": False, "error": str(exc)}

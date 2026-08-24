@@ -18,9 +18,11 @@ import argparse
 import codecs
 import contextlib
 import copy
+import ctypes
 import fcntl
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -29,6 +31,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import uuid
 from dataclasses import dataclass
 from itertools import starmap
 from pathlib import Path
@@ -51,6 +54,32 @@ TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
 STOP_REASONS: Final = frozenset({"stop", "kill"})
 PROG: Final = "lubko-agent"
 HEX_DIGITS: Final = frozenset("0123456789abcdef")
+
+# Environment variable carrying the durable, invocation-specific identity of a
+# spawned agent invocation. Unlike the agent-wide ``LUBKO_AGENT_ID`` (shared by
+# every invocation of the same agent across time), this token is freshly
+# generated for each spawned invocation and inherited by its whole process
+# tree, so signalling can never cross an invocation boundary even when the OS
+# recycles a process-group ID into a newer invocation of the same agent.
+INVOCATION_ID_VAR: Final = "LUBKO_INVOCATION_ID"
+
+# ``SYS_pidfd_open`` uses the unified syscall number 434 on every architecture
+# with a shared generic syscall table (x86_64, aarch64, riscv64, arm32, ppc64,
+# s390x, loongarch). Architectures with private numbering (alpha, mips,
+# parisc, sparc) are absent: there pinning is unsupported and signalling
+# fails closed.
+_PIDFD_OPEN_SYSCALL_NR: Final[dict[str, int]] = {
+    "x86_64": 434,
+    "aarch64": 434,
+    "armv7l": 434,
+    "armv8l": 434,
+    "riscv64": 434,
+    "ppc64": 434,
+    "ppc64le": 434,
+    "s390x": 434,
+    "loongarch64": 434,
+}
+_LIBC_CACHE: Final[dict[str, ctypes.CDLL]] = {}
 
 # Exit codes.
 EXIT_OK: Final = 0
@@ -248,6 +277,7 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "pid": None,
         "pgid": None,
         "start_time": None,
+        "invocation_id": None,
         "runner_pid": None,
         "runner_start_time": None,
         "started_at": None,
@@ -255,6 +285,7 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "exit_code": None,
         "exit_signal": None,
         "intent": None,
+        "delete_pending": False,
         "stop_reason": None,
         "active_runner": False,
         "runner_gen": 0,
@@ -337,12 +368,247 @@ def env_has_marker(pid: int, aid: str) -> bool:
     Returns:
         ``True`` only when an exact ``LUBKO_AGENT_ID=<aid>`` entry is present.
     """
-    marker = f"LUBKO_AGENT_ID={aid}".encode()
+    return _env_has_entry(pid, f"LUBKO_AGENT_ID={aid}".encode())
+
+
+def env_has_invocation(pid: int, iid: str) -> bool:
+    """Return whether a process environment carries the exact invocation marker.
+
+    Args:
+        pid: Process whose environment to inspect.
+        iid: Exact invocation ID the marker must match.
+
+    Returns:
+        ``True`` only when an exact ``LUBKO_INVOCATION_ID=<iid>`` entry is
+        present.
+    """
+    return _env_has_entry(pid, f"{INVOCATION_ID_VAR}={iid}".encode())
+
+
+def _env_has_entry(pid: int, entry: bytes) -> bool:
+    """Return whether a process environment contains the exact NUL-delimited entry.
+
+    Args:
+        pid: Process whose environment to inspect.
+        entry: Whole ``KEY=VALUE`` environment entry required.
+
+    Returns:
+        ``True`` only when the exact entry is present.
+    """
     try:
         environ = Path(f"/proc/{pid}/environ").read_bytes()
     except OSError:
         return False
-    return marker in environ.split(b"\0")
+    return entry in environ.split(b"\0")
+
+
+def open_pidfd(pid: int) -> int | None:
+    """Return a file descriptor pinning ``pid``, or ``None`` when unavailable.
+
+    A pidfd holds a reference to the kernel's PID structure, so the operating
+    system can never recycle that PID while the descriptor is open — even if
+    the process exits and is reaped. This is what makes check-then-signal
+    sequences race-free: identity verified through the pin refers to exactly
+    the process that is later signalled.
+
+    Prefers ``os.pidfd_open``; falls back to a narrowly encapsulated raw
+    ``SYS_pidfd_open`` syscall via ``ctypes`` on architectures with the
+    unified syscall number. Returns ``None`` when the process is gone
+    (``ESRCH``) or when the platform cannot pin PIDs at all, in which case
+    callers must fail closed rather than signal an unpinned target.
+
+    Args:
+        pid: Process ID to pin.
+
+    Returns:
+        A pidfd file descriptor, or ``None``.
+    """
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if pidfd_open is not None:
+        try:
+            return int(pidfd_open(int(pid)))
+        except OSError:
+            return None
+    nr = _PIDFD_OPEN_SYSCALL_NR.get(platform.machine())
+    libc = _load_libc()
+    if nr is None or libc is None:
+        return None
+    result = libc.syscall(ctypes.c_long(nr), ctypes.c_int(pid), ctypes.c_uint(0))
+    return int(result) if result >= 0 else None
+
+
+def _load_libc() -> ctypes.CDLL | None:
+    """Return a cached handle to the C library, or ``None``.
+
+    Returns:
+        The ``ctypes`` C library handle, or ``None`` when unavailable.
+    """
+    if "libc" not in _LIBC_CACHE:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.syscall.restype = ctypes.c_long
+        except OSError:
+            return None
+        _LIBC_CACHE["libc"] = libc
+    return _LIBC_CACHE["libc"]
+
+
+def signal_identity_checked(
+    pid: int,
+    start_time: object,
+    sig: int,
+    marker_aid: str | None = None,
+) -> None:
+    """Deliver ``sig`` to exactly the pinned-and-verified single process.
+
+    The PID is pinned with a pidfd before verification, so it cannot be
+    recycled between verification and delivery: a recorded runner PID that was
+    already reused by an unrelated process never matches and is never
+    signalled. When the platform cannot pin PIDs the signal is withheld (fail
+    closed).
+
+    Args:
+        pid: Recorded runner PID to signal.
+        start_time: Recorded start time in clock ticks that must match.
+        sig: Signal to deliver.
+        marker_aid: Exact agent ID whose environment marker must be present.
+    """
+    fd = open_pidfd(int(pid))
+    if fd is None:
+        return
+    try:
+        if proc_start_ticks(int(pid)) != start_time:
+            return
+        if marker_aid is not None and not env_has_marker(int(pid), marker_aid):
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(pid), sig)
+    finally:
+        os.close(fd)
+
+
+def send_signal_group(meta: Meta, sig: int) -> None:
+    """Deliver a signal to the agent's exact recorded invocation group.
+
+    Race-free by construction: every signalled process is first pinned with a
+    pidfd (which prevents PID recycling) and then verified against the
+    recorded invocation identity at the signal point itself. Two paths:
+
+    - Live leader: the leader is pinned, its start time and markers are
+      verified under the pin, then the whole group is signalled via
+      ``killpg`` — safe because the pinned PID cannot be recycled, so the
+      group is either the exact recorded one or already gone.
+    - Dead leader: any surviving members of the recorded group are converged
+      one member at a time, each individually pinned and required to carry
+      the recorded PGID, the exact agent marker, *and* the exact durable
+      per-invocation marker. A newer invocation of the same agent (with a
+      different invocation ID) is therefore never signalled, no matter how
+      the OS recycled PIDs or the group ID. When no invocation ID was
+      recorded, nothing is signalled: fail closed instead of guessing.
+
+    When no process can be pinned (platform without pidfd support), nothing
+    is signalled: fail closed instead of guessing.
+
+    Args:
+        meta: Agent metadata.
+        sig: Signal to deliver.
+    """
+    leader = meta.get("pid")
+    aid = str(meta.get("id", ""))
+    iid = meta.get("invocation_id")
+    if leader:
+        fd = open_pidfd(int(leader))
+        if fd is not None:
+            try:
+                verified = proc_start_ticks(int(leader)) == meta.get(
+                    "start_time"
+                ) and env_has_marker(int(leader), aid)
+                if verified and iid is not None:
+                    verified = env_has_invocation(int(leader), str(iid))
+                if verified:
+                    with contextlib.suppress(ProcessLookupError):
+                        # the agent was launched as its own session leader
+                        os.killpg(int(leader), sig)
+                    return
+            finally:
+                os.close(fd)
+    # The leader could not be pinned as the exact recorded invocation (it is
+    # dead, or its PID was recycled). Converge surviving members of the
+    # recorded group through the exact per-member pinned path — but only with
+    # a durable invocation-specific identity to authorize them.
+    pgid = meta.get("pgid") or leader
+    if not pgid or iid is None:
+        return
+    for member, fd in _pinned_invocation_members(int(pgid), aid, str(iid)):
+        try:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(member, sig)
+        finally:
+            os.close(fd)
+
+
+def _pinned_invocation_members(pgid: int, aid: str, iid: str) -> list[tuple[int, int]]:
+    """Return ``(pid, pidfd)`` pairs for surviving members of one invocation group.
+
+    Each candidate process is pinned with a pidfd before any check, so the
+    pgid/marker verification refers to exactly the returned, unrecyclable
+    process. Only processes inside the recorded group carrying both the exact
+    agent marker and the exact invocation marker qualify. Candidates whose own
+    PID equals the recorded PGID are always skipped: after the recorded leader
+    died, that slot may have been recycled into a newer session (or a newer
+    invocation's leader), and the invocation marker alone decides membership.
+
+    Args:
+        pgid: The recorded process group ID.
+        aid: Exact agent ID whose environment marker members must carry.
+        iid: Exact invocation ID whose environment marker members must carry.
+
+    Returns:
+        Pinned member PIDs with their still-open pidfds (caller closes).
+    """
+    members: list[tuple[int, int]] = []
+    with contextlib.suppress(OSError):
+        for entry in Path("/proc").iterdir():
+            name = entry.name
+            if not name.isdigit():
+                continue
+            member = int(name)
+            if member == pgid:
+                continue
+            fd = open_pidfd(member)
+            if fd is None:
+                continue
+            try:
+                matched = _matches_invocation_group(member, pgid, aid, iid)
+            except BaseException:
+                os.close(fd)
+                raise
+            if not matched:
+                # Ownership: a rejected candidate must never keep its pin.
+                os.close(fd)
+                continue
+            members.append((member, fd))
+    return members
+
+
+def _matches_invocation_group(member: int, pgid: int, aid: str, iid: str) -> bool:
+    """Return whether a process belongs to one exact recorded invocation group.
+
+    Args:
+        member: Candidate process ID.
+        pgid: The recorded process group ID.
+        aid: Exact agent ID whose environment marker must be present.
+        iid: Exact invocation ID whose environment marker must be present.
+
+    Returns:
+        ``True`` only when group and both markers match exactly.
+    """
+    try:
+        if os.getpgid(member) != pgid:
+            return False
+    except ProcessLookupError:
+        return False
+    return env_has_marker(member, aid) and env_has_invocation(member, iid)
 
 
 def is_alive(meta: Meta) -> bool:
@@ -372,31 +638,34 @@ def is_alive(meta: Meta) -> bool:
     return True
 
 
-def send_signal_group(meta: Meta, sig: int) -> None:
-    """Deliver a signal to the agent's process group (session leader).
-
-    Args:
-        meta: Agent metadata.
-        sig: Signal to deliver.
-    """
-    pid = meta.get("pid")
-    if not pid:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pid, sig)  # the agent was launched as its own session leader
-
-
 def group_alive(meta: Meta) -> bool:
-    """Return whether any live process remains in the agent's process group.
+    """Return whether any live process remains in the agent's exact invocation group.
+
+    When a durable invocation ID was recorded, group membership is decided by
+    the invocation-exact pinned scan: a recycled PGID hosting a newer
+    invocation of the same agent never counts as this invocation's survivors.
+    Without a recorded invocation ID the plain process-group membership is
+    used (legacy metadata).
 
     Args:
         meta: Agent metadata.
 
     Returns:
-        ``True`` when the recorded process group still has live members.
+        ``True`` when the recorded invocation still has live group members.
     """
     pgid = meta.get("pgid")
-    return bool(pgid and group_has_members(int(pgid)))
+    if not pgid:
+        return False
+    iid = meta.get("invocation_id")
+    if iid is None:
+        return bool(group_has_members(int(pgid)))
+    if is_alive(meta):
+        # The verified live leader implies its whole session group.
+        return True
+    fds = _pinned_invocation_members(int(pgid), str(meta.get("id", "")), str(iid))
+    for _, fd in fds:
+        os.close(fd)
+    return bool(fds)
 
 
 def wait_group_dead(meta: Meta, timeout: float) -> bool:
@@ -1088,6 +1357,11 @@ def runner(aid: str, mode: str) -> None:
     claimed = {}
 
     def claim(m: Meta) -> None:
+        if m.get("delete_pending"):
+            # A concurrent delete owns the lifecycle: a runner must never
+            # claim (and later recreate state) once deletion was decided.
+            claimed["ok"] = False
+            return
         res = m.get("runner_reservation")
         if not isinstance(res, dict):
             # No reservation: a production runner must never execute without an
@@ -1116,6 +1390,9 @@ def runner(aid: str, mode: str) -> None:
     update_meta(aid, claim)
     if not claimed.get("ok"):
         return
+    # Deterministic test boundary after the exact claim committed but before
+    # any state recreation, so tests can force the delete/runner race.
+    _test_sync("runner_prestart")
     directory = agent_dir(aid)
     directory.mkdir(parents=True, exist_ok=True)
     log_path = directory / "output.log"
@@ -1143,7 +1420,8 @@ def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
     """
     while True:
         meta = read_meta(ctx.aid)
-        if meta is None:
+        if meta is None or meta.get("delete_pending"):
+            # Deleted (or being deleted): never start another invocation.
             return
         prompt = meta.get("pending_prompt")
         if not prompt:
@@ -1231,6 +1509,12 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     meta = read_meta(aid)
     if meta is None:
         return None
+    # A fresh, durable identity for exactly this invocation. It is stamped
+    # into the spawned process environment (inherited by the whole process
+    # tree) and recorded in metadata, so later signalling can prove
+    # invocation-exact membership even across PGID/PID recycling.
+    iid = uuid.uuid4().hex
+    ctx.env[INVOCATION_ID_VAR] = iid
     ctx.env["LUBKO_PROMPT"] = prompt
     cmd = build_agent_command(meta, prompt, is_continue=is_continue)
     if cmd is None:
@@ -1249,8 +1533,13 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     update_meta(aid, lambda m: _clear_pending(m, prompt))
     try:
         log = ctx.log_path.open("ab")
-    except OSError:
-        return None  # agent directory no longer exists
+    except OSError as exc:
+        # Fail closed on real spool/log failures (e.g. EACCES, EIO, EDQUOT);
+        # only an intentionally deleted agent directory exits benignly.
+        if isinstance(exc, FileNotFoundError) and not agent_dir(aid).is_dir():
+            return None  # agent directory intentionally deleted; metadata is gone
+        _fail_invocation_closed(aid, f"failed to open agent log: {exc}")
+        return None
     with log:
         try:
             proc = subprocess.Popen(
@@ -1266,12 +1555,11 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
         except OSError as exc:
             error = str(exc)
             log.write(f"LUBKO RUNNER: failed to start agent: {error}\n".encode("utf-8", "replace"))
-            update_meta(aid, lambda m: _finalize_terminal(m, 127, None, "failed", error))
-            update_meta(aid, lambda m: _set_active_runner(m, value=False))
+            _fail_invocation_closed(aid, error, exit_code=127)
             return None
 
         start = proc_start_ticks(proc.pid)
-        update_meta(aid, _record_running(proc, start))
+        update_meta(aid, _record_running(proc, start, iid))
 
         try:
             rc = _wait_for_invocation_exit(proc, aid, is_continue=is_continue)
@@ -1287,6 +1575,26 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
         update_meta(aid, _finalize_after(rc))
 
     return _drain_next(aid)
+
+
+def _fail_invocation_closed(aid: str, error: str, *, exit_code: int | None = None) -> None:
+    """Atomically finalize a failed invocation and deactivate the runner.
+
+    Terminal failure and runner deactivation (including reservation cleanup)
+    land in one metadata mutation under the lock, so a crash between the two
+    can never leave terminal state with ``active_runner`` stuck true.
+
+    Args:
+        aid: Lubko agent ID.
+        error: Failure note recorded with the terminal state.
+        exit_code: Optional synthetic exit code for the terminal record.
+    """
+
+    def fail(m: Meta) -> None:
+        _finalize_terminal(m, exit_code, None, "failed", error)
+        _set_active_runner(m, value=False)
+
+    update_meta(aid, fail)
 
 
 def _wait_for_invocation_exit(
@@ -1316,12 +1624,15 @@ def _wait_for_invocation_exit(
     return proc.wait()
 
 
-def _record_running(proc: subprocess.Popen[bytes], start: int | None) -> Callable[[Meta], None]:
+def _record_running(
+    proc: subprocess.Popen[bytes], start: int | None, iid: str
+) -> Callable[[Meta], None]:
     """Return a metadata mutation that records a running agent process.
 
     Args:
         proc: The spawned agent process.
         start: The process start time in clock ticks.
+        iid: The durable invocation ID stamped into the spawned environment.
 
     Returns:
         The metadata mutation.
@@ -1331,6 +1642,7 @@ def _record_running(proc: subprocess.Popen[bytes], start: int | None) -> Callabl
         m["pid"] = proc.pid
         m["pgid"] = proc.pid
         m["start_time"] = start
+        m["invocation_id"] = iid
         m["runner_pid"] = os.getpid()
         m["runner_start_time"] = proc_start_ticks(os.getpid())
         m["started_at"] = time.time()
@@ -1527,6 +1839,61 @@ def _mark_terminal(
     _finalize_terminal(meta, exit_code, exit_signal, state, None)
     meta["stop_reason"] = stop_reason
     _set_active_runner(meta, value=False)
+
+
+def _invocation_identity(meta: Meta) -> tuple[object, ...]:
+    """Return the exact invocation identity recorded in metadata.
+
+    The identity spans every field the runner rewrites when a new invocation
+    is recorded: the process triple (``pid``, ``pgid``, ``start_time``) plus
+    the stronger runner anchor (``runner_pid``, ``runner_start_time``), so a
+    newer live invocation can never be mistaken for the targeted one.
+
+    Args:
+        meta: Agent metadata.
+
+    Returns:
+        A comparable identity tuple.
+    """
+    return (
+        meta.get("pid"),
+        meta.get("pgid"),
+        meta.get("start_time"),
+        meta.get("runner_pid"),
+        meta.get("runner_start_time"),
+    )
+
+
+def _update_meta_if_same_invocation(
+    aid: str,
+    identity: tuple[object, ...],
+    mutate: Callable[[Meta], None],
+) -> bool:
+    """Apply ``mutate`` under the metadata lock only if identity still matches.
+
+    A background runner may record a newer invocation while a stop-like
+    command waits for the old one to die. This guard ensures the mutation is
+    skipped instead of clobbering the newer live invocation's record.
+
+    Args:
+        aid: Lubko agent ID.
+        identity: The exact invocation identity targeted.
+        mutate: Mutation to apply under the lock when identity matches.
+
+    Returns:
+        ``True`` only when the mutation was applied.
+    """
+    applied = False
+
+    def fn(m: Meta) -> None:
+        nonlocal applied
+        if _invocation_identity(m) != identity:
+            return
+        mutate(m)
+        applied = True
+
+    update_meta(aid, fn)
+    return applied
 
 
 # ---------------------------------------------------------------------------
@@ -1887,6 +2254,14 @@ def _decide_invocation(
         prompt: Instruction to run or steer.
         steer: Whether this is a steer rather than an ordinary prompt.
     """
+    if m.get("intent") in STOP_REASONS:
+        # A durably accepted stop/kill obligation for this invocation must
+        # never be overwritten by a later prompt/steer: otherwise the dying
+        # invocation is finalized as a steer and _drain_next resurrects the
+        # agent with replacement work. Reject as busy until finalization
+        # clears the stop-like intent.
+        decision["action"] = "busy"
+        return
     mode = _resolve_session_mode(m)
     if mode is None:
         decision["action"] = "error_session_gone"
@@ -2969,13 +3344,50 @@ def cmd_wait(args: argparse.Namespace) -> int:
     return exit_code_for(meta)
 
 
+def _finish_stop_like(
+    aid: str,
+    identity: tuple[object, ...],
+    terminal: tuple[int, int, str, str],
+    success_msg: str,
+) -> int:
+    """Terminalize a targeted invocation, guarding against an A -> B race.
+
+    The metadata is marked terminal under the lock only when the currently
+    recorded invocation still matches the exact targeted identity; a newer
+    live invocation recorded meanwhile is never overwritten or untracked.
+
+    Args:
+        aid: Lubko agent ID.
+        identity: Exact invocation identity targeted.
+        terminal: Exit code, exit signal, terminal state, and stop reason.
+        success_msg: Message printed on success.
+
+    Returns:
+        ``EXIT_OK`` on success, ``EXIT_ERROR`` when identity changed.
+    """
+    exit_code, exit_signal, state, stop_reason = terminal
+    if not _update_meta_if_same_invocation(
+        aid, identity, lambda m: _mark_terminal(m, exit_code, exit_signal, state, stop_reason)
+    ):
+        _err(
+            f"{PROG}: agent {aid} was restarted during the operation; "
+            "newer invocation left running untouched"
+        )
+        return EXIT_ERROR
+    _out(success_msg)
+    return EXIT_OK
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     """Gracefully stop a running agent.
 
     Sends ``SIGTERM`` to the exact recorded process group, then — while any
     member of that exact group remains — ``SIGKILL`` after the grace period,
     mirroring the worker's cancellation contract so an agent run can never
-    leave abandoned OpenCode children behind.
+    leave abandoned OpenCode children behind. Terminalization is guarded by
+    the exact recorded invocation identity: if the runner records a newer
+    invocation while the old one is being stopped, the newer record is never
+    overwritten and the command reports failure instead of false success.
 
     Args:
         args: Parsed command arguments.
@@ -2991,27 +3403,30 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if not is_alive(meta) and not group_alive(meta):
         _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
         return EXIT_OK
-    update_meta(aid, lambda m: _begin_stop_like(m, "stop"))
+    identity = _invocation_identity(meta)
+    if not _update_meta_if_same_invocation(aid, identity, lambda m: _begin_stop_like(m, "stop")):
+        _err(f"{PROG}: agent {aid} changed during stop; newer invocation left running untouched")
+        return EXIT_ERROR
     send_signal_group(meta, signal.SIGTERM)
     if wait_group_dead(meta, STOP_WAIT_SECONDS):
-        update_meta(
+        return _finish_stop_like(
             aid,
-            lambda m: _mark_terminal(m, -signal.SIGTERM, signal.SIGTERM, "stopped", "stop"),
+            identity,
+            (-signal.SIGTERM, signal.SIGTERM, "stopped", "stop"),
+            f"stopped agent {aid}",
         )
-        _out(f"stopped agent {aid}")
-        return EXIT_OK
     # The exact group still has live members; escalate so no child is
     # abandoned, exactly like the worker's cancel grace period.
     if group_alive(meta):
         send_signal_group(meta, signal.SIGKILL)
     if wait_group_dead(meta, KILL_WAIT_SECONDS):
-        update_meta(
+        return _finish_stop_like(
             aid,
-            lambda m: _mark_terminal(m, -signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
+            identity,
+            (-signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
+            f"stopped agent {aid} (force-killed group members)",
         )
-        _out(f"stopped agent {aid} (force-killed group members)")
-        return EXIT_OK
-    update_meta(aid, lambda m: m.update(intent=None))
+    _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
     _err(f"{PROG}: agent {aid} did not stop within {STOP_WAIT_SECONDS:.0f}s; use 'kill'")
     return EXIT_ERROR
 
@@ -3021,6 +3436,9 @@ def cmd_kill(args: argparse.Namespace) -> int:
 
     The exact recorded process group is signalled and confirmed gone, so
     ``SIGKILL`` to the leader alone can never leave group members behind.
+    Terminalization is guarded by the exact recorded invocation identity: a
+    newer invocation recorded mid-kill is never overwritten or falsely
+    reported as killed.
 
     Args:
         args: Parsed command arguments.
@@ -3036,22 +3454,147 @@ def cmd_kill(args: argparse.Namespace) -> int:
     if not is_alive(meta) and not group_alive(meta):
         _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
         return EXIT_OK
-    update_meta(aid, lambda m: _begin_stop_like(m, "kill"))
+    identity = _invocation_identity(meta)
+    if not _update_meta_if_same_invocation(aid, identity, lambda m: _begin_stop_like(m, "kill")):
+        _err(f"{PROG}: agent {aid} changed during kill; newer invocation left running untouched")
+        return EXIT_ERROR
     send_signal_group(meta, signal.SIGKILL)
     if wait_group_dead(meta, KILL_WAIT_SECONDS):
-        update_meta(
+        return _finish_stop_like(
             aid,
-            lambda m: _mark_terminal(m, -signal.SIGKILL, signal.SIGKILL, "killed", "kill"),
+            identity,
+            (-signal.SIGKILL, signal.SIGKILL, "killed", "kill"),
+            f"killed agent {aid}",
         )
-        _out(f"killed agent {aid}")
-        return EXIT_OK
-    update_meta(aid, lambda m: m.update(intent=None))
+    _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
     _err(f"{PROG}: agent {aid} could not be killed")
     return EXIT_ERROR
 
 
+def _begin_delete(aid: str, *, force: bool) -> Meta | None:
+    """Durably record deletion intent under the metadata lock.
+
+    The tombstone is written in the same locked transaction that snapshots
+    every exact process identity, so it is serialized against the runner's
+    claim/startup: any runner claiming after this point observes the tombstone
+    and bails instead of recreating state.  The snapshot is what deletion then
+    converges on.
+
+    Args:
+        aid: Lubko agent ID.
+        force: Whether forced kill semantics were requested (records the
+            ``kill`` intent exactly like ``cmd_kill`` does).
+
+    Returns:
+        The exact identity snapshot taken under the lock, or ``None`` when the
+        agent state vanished before the tombstone could be written.
+    """
+    snapshot: dict[str, Meta] = {}
+
+    def fn(m: Meta) -> None:
+        m["delete_pending"] = True
+        if force:
+            m["intent"] = "kill"
+        m["last_activity_at"] = time.time()
+        res = m.get("runner_reservation")
+        snapshot["meta"] = {
+            "id": aid,
+            "pid": m.get("pid"),
+            "pgid": m.get("pgid"),
+            "start_time": m.get("start_time"),
+            "invocation_id": m.get("invocation_id"),
+            "runner_pid": m.get("runner_pid"),
+            "runner_start_time": m.get("runner_start_time"),
+            "active_runner": bool(m.get("active_runner")),
+            "runner_reservation": dict(res) if isinstance(res, dict) else None,
+            "delete_pending": True,
+        }
+
+    update_meta(aid, fn)
+    return snapshot.get("meta")
+
+
+def _delete_converged(cur: Meta | None) -> bool:
+    """Return whether no runner or invocation of the agent can still execute.
+
+    Args:
+        cur: Freshly read metadata, or ``None`` when the state is gone.
+
+    Returns:
+        ``True`` only when the exact runner, the invocation group, and any
+        reserved-but-unclaimed runner are all provably gone.
+    """
+    if cur is None:
+        return True
+    return not runner_alive(cur) and not group_alive(cur) and not reservation_in_flight(cur)
+
+
+def _abort_delete(aid: str) -> None:
+    """Clear the deletion tombstone so a failed delete can be retried."""
+    update_meta(aid, lambda m: m.update(delete_pending=False))
+
+
+def _remove_deleted_state(aid: str) -> bool:
+    """Remove the agent directory and verify it stays gone.
+
+    Args:
+        aid: Lubko agent ID.
+
+    Returns:
+        ``True`` only when the directory is provably absent afterwards.
+    """
+    shutil.rmtree(agent_dir(aid), ignore_errors=True)
+    return not agent_dir(aid).exists()
+
+
+def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
+    """Converge the exact runner and invocation before state removal.
+
+    Args:
+        aid: Lubko agent ID.
+        force: Whether live processes may be signalled.
+        deadline: Absolute time by which convergence must be proven.
+
+    Returns:
+        ``True`` only when no runner or invocation can still execute.
+    """
+    while True:
+        cur = read_meta(aid)
+        if cur is not None and cur.get("delete_pending"):
+            if force:
+                # Converge the exact recorded runner identity first: pinned,
+                # start-time and marker verified at the signal point, so a
+                # recycled runner PID can never be signalled.
+                if cur.get("runner_pid"):
+                    signal_identity_checked(
+                        int(cur["runner_pid"]),
+                        cur.get("runner_start_time"),
+                        signal.SIGKILL,
+                        marker_aid=str(cur.get("id", "")),
+                    )
+                # ...then the exact invocation process group.
+                if group_alive(cur):
+                    send_signal_group(cur, signal.SIGKILL)
+            elif not _delete_converged(cur):
+                # Something became live between the decision and the
+                # tombstone; non-forced deletion must not kill it.
+                return False
+        if _delete_converged(cur):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 def cmd_delete(args: argparse.Namespace) -> int:
     """Delete an agent's local state and logs.
+
+    Deletion establishes lifecycle ownership with a durable tombstone written
+    under the metadata lock (so a reserved runner can never claim afterwards),
+    then converges both the exact managed runner identity and the exact
+    invocation process group before removing any state.  If convergence cannot
+    be proven the deletion fails closed, keeps the agent state intact for a
+    retry, and never reports success.
 
     Args:
         args: Parsed command arguments.
@@ -3064,16 +3607,25 @@ def cmd_delete(args: argparse.Namespace) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    if is_alive(meta) or group_alive(meta):
-        if not args.force:
-            _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
-            return EXIT_ERROR
-        update_meta(aid, lambda m: m.update(intent="kill", last_activity_at=time.time()))
-        send_signal_group(meta, signal.SIGKILL)
-        wait_group_dead(meta, KILL_WAIT_SECONDS)
-    shutil.rmtree(agent_dir(aid), ignore_errors=True)
-    _out(f"deleted agent {aid}")
-    return EXIT_OK
+    live = is_alive(meta) or group_alive(meta) or runner_alive(meta) or reservation_in_flight(meta)
+    if live and not args.force:
+        _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
+        return EXIT_ERROR
+    _begin_delete(aid, force=args.force)
+    if not _converge_for_delete(aid, force=args.force, deadline=time.time() + KILL_WAIT_SECONDS):
+        # Fail closed: convergence was not proven, so keep the retryable state.
+        _abort_delete(aid)
+        if args.force:
+            _err(f"{PROG}: agent {aid} could not be deleted; runner or invocation did not converge")
+        else:
+            _err(f"{PROG}: agent {aid} started running during delete; use --force")
+        return EXIT_ERROR
+    if _remove_deleted_state(aid):
+        _out(f"deleted agent {aid}")
+        return EXIT_OK
+    _abort_delete(aid)
+    _err(f"{PROG}: agent {aid} directory could not be removed")
+    return EXIT_ERROR
 
 
 def cmd_clean(args: argparse.Namespace) -> int:
