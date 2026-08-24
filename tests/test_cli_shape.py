@@ -13,6 +13,7 @@ from lubko.config import (
     worker_config_path,
 )
 from lubko.deployctl import (
+    DeployCtlError,
     checkout_failure_exit_code,
     parse_request,
     request_type,
@@ -76,9 +77,9 @@ def test_failed_checkout_exits_nonzero_other_rejections_do_not() -> None:
 
 def test_deployctl_rejects_non_object_and_bad_json() -> None:
     """Non-JSON text and non-object JSON are rejected as requests."""
-    with pytest.raises(Exception, match="not valid JSON"):
+    with pytest.raises(DeployCtlError, match="not valid JSON"):
         parse_request("{oops")
-    with pytest.raises(Exception, match="JSON object"):
+    with pytest.raises(DeployCtlError, match="JSON object"):
         parse_request("[1]")
 
 

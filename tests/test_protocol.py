@@ -1,6 +1,7 @@
 """Protocol v4 payload construction and parsing invariants."""
 
 import json
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -66,8 +67,10 @@ def test_rejects_bad_server() -> None:
 )
 def test_rejects_invalid_process(process: object) -> None:
     """The process field must be a non-empty array of non-empty strings."""
+    raw = command_payload()
+    raw["request"] = {"cwd": "/srv/jobs", "process": process}
     with pytest.raises(ProtocolError):
-        build_payload(server=SERVER, cwd="/srv/jobs", process=process)  # type: ignore[arg-type]
+        parse_payload(raw)
 
 
 def test_rejects_legacy_command_fields() -> None:
@@ -150,10 +153,28 @@ def test_result_section_parsing() -> None:
         parse_payload(json.dumps(raw))
 
 
-def chunk_kwargs() -> dict[str, object]:
-    """Return valid keyword arguments for one minimal output chunk."""
+def test_chunk_round_trip() -> None:
+    """Output chunks serialize and parse losslessly."""
+    payload = build_output_chunk_payload(
+        server=SERVER,
+        thread=uuid4(),
+        stream="stdout",
+        sequence=0,
+        start=0,
+        end=2,
+        value="ok",
+        previous=None,
+    )
+    chunk = parse_chunk_payload(payload)
+    assert chunk.value == "ok"
+    assert chunk.stream == "stdout"
+    assert chunk.previous is None
+
+
+def test_chunk_validation_errors() -> None:
+    """Chunk streams, sequences, sizes, and offsets are strictly validated."""
     thread = uuid4()
-    return {
+    base: dict[str, Any] = {
         "server": SERVER,
         "thread": thread,
         "stream": "stdout",
@@ -163,36 +184,28 @@ def chunk_kwargs() -> dict[str, object]:
         "value": "ok",
         "previous": None,
     }
-
-
-def test_chunk_round_trip() -> None:
-    """Output chunks serialize and parse losslessly."""
-    kwargs = chunk_kwargs()
-    chunk = parse_chunk_payload(build_output_chunk_payload(**kwargs))  # type: ignore[arg-type]
-    assert chunk.value == "ok"
-    assert chunk.stream == "stdout"
-    assert chunk.previous is None
-
-
-def test_chunk_validation_errors() -> None:
-    """Chunk streams, sequences, sizes, and offsets are strictly validated."""
-    bad_stream = dict(chunk_kwargs(), stream="stdin")
     with pytest.raises(ProtocolError, match="stream"):
-        build_output_chunk_payload(**bad_stream)  # type: ignore[arg-type]
-    negative = dict(chunk_kwargs(), sequence=-1)
+        build_output_chunk_payload(**base | {"stream": "stdin"})
     with pytest.raises(ProtocolError, match="sequence"):
-        build_output_chunk_payload(**negative)  # type: ignore[arg-type]
-    oversized = dict(chunk_kwargs(), value="x" * (OUTPUT_CHUNK_MAX_BYTES + 1))
+        build_output_chunk_payload(**base | {"sequence": -1})
     with pytest.raises(ProtocolError, match="value"):
-        build_output_chunk_payload(**oversized)  # type: ignore[arg-type]
-    reversed_offsets = dict(chunk_kwargs(), start=9, end=1)
+        build_output_chunk_payload(**base | {"value": "x" * (OUTPUT_CHUNK_MAX_BYTES + 1)})
     with pytest.raises(ProtocolError, match="precedes"):
-        build_output_chunk_payload(**reversed_offsets)  # type: ignore[arg-type]
+        build_output_chunk_payload(**base | {"start": 9, "end": 1})
 
 
 def test_chunk_requires_thread_and_kind_separation() -> None:
     """Chunks need an owning thread and never parse as commands."""
-    raw = build_output_chunk_payload(**chunk_kwargs())  # type: ignore[arg-type]
+    raw = build_output_chunk_payload(
+        server=SERVER,
+        thread=uuid4(),
+        stream="stdout",
+        sequence=0,
+        start=0,
+        end=2,
+        value="ok",
+        previous=None,
+    )
     del raw["thread"]
     with pytest.raises(ProtocolError, match="thread"):
         parse_chunk_payload(raw)
