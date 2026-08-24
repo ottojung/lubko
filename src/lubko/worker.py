@@ -687,7 +687,12 @@ def truncate_output(data: bytes, limit: int) -> str:
         raise ValueError(msg)
 
     truncated = len(data) > limit
-    payload = TRUNCATION_MARKER + data[-(limit - len(TRUNCATION_MARKER)) :] if truncated else data
+    if truncated:
+        budget = limit - len(TRUNCATION_MARKER)
+        tail = data[-budget:] if budget > 0 else b""
+        payload = TRUNCATION_MARKER + tail
+    else:
+        payload = data
     result = pg_safe_decode(payload)
 
     # Decoding can expand the byte length (NUL and invalid sequences become

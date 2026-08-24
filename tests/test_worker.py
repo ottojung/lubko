@@ -465,6 +465,26 @@ def test_truncate_output_expansion_heavy_payload_stays_linear() -> None:
     assert result.endswith("tail")
 
 
+def test_truncate_output_zero_budget_does_not_decode_full_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At limit == marker length the decoder never receives the huge payload."""
+    decoded: list[bytes] = []
+    original = worker.pg_safe_decode
+
+    def spy(data: bytes) -> str:
+        decoded.append(data)
+        return original(data)
+
+    monkeypatch.setattr(worker, "pg_safe_decode", spy)
+
+    data = b"x" * 1_000_000
+    result = truncate_output(data, len(TRUNCATION_MARKER))
+
+    assert result.encode() == TRUNCATION_MARKER
+    assert decoded == [TRUNCATION_MARKER]
+
+
 def test_read_output_returns_captured_bytes(tmp_path: Path) -> None:
     """read_output returns everything captured into an output file."""
     target = tmp_path / "out"
