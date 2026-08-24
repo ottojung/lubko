@@ -10,6 +10,7 @@ from lubko import supervise
 from lubko.supervisor import Settings, SupervisorDaemon
 
 COMMIT = "f" * 40
+TEST_TOKEN = "test-incarnation"  # ruff: ignore[hardcoded-password-string] - test token
 
 
 def _backing_off_without_child(
@@ -18,7 +19,11 @@ def _backing_off_without_child(
     restart_count: int,
     delay: float,
 ) -> supervise.SupervisorState:
-    """Persist a crash-loop state whose retry deadline is still in the future."""
+    """Persist a crash-loop state whose retry deadline is still in the future.
+
+    Returns:
+        The persisted supervisor state.
+    """
     state = replace(
         supervise.fresh_state(),
         mode=supervise.MODE_RUN,
@@ -68,7 +73,7 @@ def test_live_child_earns_stability_reset(monkeypatch: pytest.MonkeyPatch) -> No
         pgid=101,
         sid=101,
         start_time_ticks=12345,
-        token="test-incarnation",
+        token=TEST_TOKEN,
         worker_id="test-worker",
         spawned_at=1.0,
     )
