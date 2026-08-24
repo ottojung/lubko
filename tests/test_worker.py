@@ -2670,6 +2670,74 @@ def _abandon_cleanup(writer_pid: int, stderr_write: int) -> None:
         os.close(stderr_write)
 
 
+def test_bounded_finalize_per_stream_stat_failure_fails_exact_job_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-stream ``size_before`` stat failure fails only the exact job closed.
+
+    During completed-job bounded finalization, the aggregate planning stats in
+    ``_drain_completed_streams`` succeed but the later per-stream
+    ``size_before`` lookup can still fail (for example a spool file removed
+    between the two lookups). That filesystem error must be converted into the
+    exact-job fail-closed path — never escape bounded finalization as a raw
+    ``OSError`` and never disturb a sibling job.
+    """
+    settings = make_settings(output_spool_max_bytes=8192)
+    db = DatabaseConfig(host="h", port=1, dbname="d", user="u", password=str(uuid4()))
+    supervisor = Supervisor(settings, db)
+    conn = _RecordingConnection()
+    supervisor.conn = as_db(conn)
+
+    job = make_active_job(tmp_path)
+    conn.retained_root = (str(job.id),)
+    conn.status_result = ("running",)
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    for fd in (stdout_read, stderr_read):
+        os.set_blocking(fd, False)
+    job.stdout = OutputStream(path=job.stdout.path, fd=stdout_read)
+    job.stderr = OutputStream(path=job.stderr.path, fd=stderr_read)
+    job.stdout.path.write_bytes(b"out")
+    job.stderr.path.write_bytes(b"err")
+    job.completed = True
+    supervisor.active[job.id] = job
+
+    sibling = make_active_job(tmp_path)
+    sibling.completed = False
+    supervisor.active[sibling.id] = sibling
+
+    # Fail exactly the per-stream ``size_before`` lookup of the affected job's
+    # stdout spool: within one drain turn, the first stdout spool stat is the
+    # aggregate planning lookup (must succeed) and the second is the
+    # ``size_before`` lookup. Every other stat is untouched.
+    target = job.stdout.path
+    real_stat = Path.stat
+    target_stats = {"count": 0}
+
+    def failing_size_before_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == target:
+            target_stats["count"] += 1
+            if target_stats["count"] >= 2:
+                msg = f"simulated spool disappearance during size_before: {path}"
+                raise FileNotFoundError(msg)
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", failing_size_before_stat)
+    try:
+        supervisor.finalize_completed_job_bounded(job)
+
+        assert job.spool_evicted is True, "the exact job must be marked spool-evicted"
+        assert job.stop_reason == STOP_REASON_SPOOL
+        assert job.finalized is True, "the exact job must be finalized fail-closed"
+        assert job.id not in supervisor.active, "the failed job must be removed from active state"
+        assert sibling.id in supervisor.active, "a sibling job must be unaffected"
+        assert sibling.finalized is False
+    finally:
+        for fd in (stdout_read, stdout_write, stderr_read, stderr_write):
+            with suppress(OSError):
+                os.close(fd)
+
+
 def test_abandon_at_exact_bound_fails_closed_without_appending(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
