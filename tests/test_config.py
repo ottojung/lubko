@@ -28,7 +28,7 @@ def write_config(path: Path, text: str, mode: int) -> Path:
 
 
 def test_parse_settings() -> None:
-    """Check that parse settings holds."""
+    """Settings split at the first ``=``; comments, blanks, and junk lines handled."""
     text = "\n# comment\nhost=db\nport = 5432\nempty=\nbad line\n"
     with pytest.raises(ValueError, match="invalid database configuration"):
         parse_database_config(text)
@@ -37,7 +37,7 @@ def test_parse_settings() -> None:
 
 
 def test_load_database_config(tmp_path: Path) -> None:
-    """Check that load database config holds."""
+    """Private config files load into validated connection settings."""
     path = write_config(
         tmp_path / "db.conf",
         "host=h\nport=5433\ndbname=d\nuser=u\npassword=p\n",
@@ -49,7 +49,7 @@ def test_load_database_config(tmp_path: Path) -> None:
 
 
 def test_missing_required_key_and_bad_port(tmp_path: Path) -> None:
-    """Check that missing required key and bad port holds."""
+    """Missing settings and non-integer ports fail with clear errors."""
     path = write_config(
         tmp_path / "db.conf", "host=h\nport=x\ndbname=d\nuser=u\npassword=p\n", PRIVATE
     )
@@ -62,7 +62,7 @@ def test_missing_required_key_and_bad_port(tmp_path: Path) -> None:
 
 
 def test_group_readable_file_is_rejected(tmp_path: Path) -> None:
-    """Check that group readable file is rejected holds."""
+    """Config files readable by group or others are refused."""
     path = write_config(
         tmp_path / "db.conf",
         "host=h\nport=1\ndbname=d\nuser=u\npassword=p\n",
@@ -73,13 +73,13 @@ def test_group_readable_file_is_rejected(tmp_path: Path) -> None:
 
 
 def test_missing_file(tmp_path: Path) -> None:
-    """Check that missing file holds."""
+    """Absent configuration files raise ``FileNotFoundError`` naming the path."""
     with pytest.raises(FileNotFoundError):
         load_database_config(tmp_path / "absent.conf")
 
 
 def test_conninfo_quoting() -> None:
-    """Check that conninfo quoting holds."""
+    """Conninfo values quote backslashes and single quotes safely."""
     value = "it's a \\ test"
     config = DatabaseConfig(host="h", port=1, dbname="d", user="u", password=value)
     assert config.conninfo() == (
@@ -88,7 +88,7 @@ def test_conninfo_quoting() -> None:
 
 
 def test_worker_server_requires_non_empty_value(tmp_path: Path) -> None:
-    """Check that worker server requires non empty value holds."""
+    """The worker server identity must be non-empty."""
     path = write_config(tmp_path / "worker.conf", "server=alpha\n", PRIVATE)
     assert load_worker_server(path) == "alpha"
     write_config(tmp_path / "empty.conf", "server=\n", PRIVATE)
@@ -97,7 +97,7 @@ def test_worker_server_requires_non_empty_value(tmp_path: Path) -> None:
 
 
 def test_worker_server_enforces_private_mode(tmp_path: Path) -> None:
-    """Check that worker server enforces private mode holds."""
+    """Worker config files enforce the same private-mode rule."""
     path = write_config(tmp_path / "worker.conf", "server=alpha\n", PUBLIC)
     assert stat.S_IMODE(path.stat().st_mode) & 0o077
     with pytest.raises(PermissionError):

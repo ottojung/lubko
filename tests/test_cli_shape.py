@@ -24,7 +24,7 @@ COMMIT = "a" * 40
 
 
 def test_commit_name_is_exactly_40_hex() -> None:
-    """Check that commit name is exactly 40 hex holds."""
+    """Only full 40-hex commit names are valid runtime identifiers."""
     assert is_valid_commit_name(COMMIT)
     assert is_valid_commit_name("a1F0" * 10)
     for bad in ("", "a" * 39, "a" * 41, "g" * 40, COMMIT + "/../etc", "../" + COMMIT):
@@ -34,13 +34,13 @@ def test_commit_name_is_exactly_40_hex() -> None:
 
 
 def test_commit_directory_shape(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Check that commit directory shape holds."""
+    """A commit maps to ``$XDG_STATE_HOME/lubko/cli/<commit>``."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     assert cli_commit_dir(COMMIT) == tmp_path / "lubko" / "cli" / COMMIT
 
 
 def test_state_root_follows_xdg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Check that state root follows xdg holds."""
+    """The state root honors ``XDG_STATE_HOME`` with the XDG fallback."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     assert state_root() == tmp_path / "lubko"
     monkeypatch.delenv("XDG_STATE_HOME")
@@ -49,7 +49,7 @@ def test_state_root_follows_xdg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 
 
 def test_explicit_config_env_overrides_xdg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Check that explicit config env overrides xdg holds."""
+    """Explicit config env vars override the XDG config home."""
     monkeypatch.setenv(DATABASE_CONFIG_ENV, str(tmp_path / "db.conf"))
     monkeypatch.setenv(WORKER_CONFIG_ENV, str(tmp_path / "worker.conf"))
     monkeypatch.setenv(CONFIG_HOME_ENV, "/elsewhere")
@@ -58,7 +58,7 @@ def test_explicit_config_env_overrides_xdg(monkeypatch: pytest.MonkeyPatch, tmp_
 
 
 def test_deployctl_request_parsing() -> None:
-    """Check that deployctl request parsing holds."""
+    """Controller requests must be JSON objects; the type defaults to empty."""
     request = parse_request('{"type": "status", "x": 1}')
     assert request_type(request) == "status"
     assert not request_type({})
@@ -66,7 +66,7 @@ def test_deployctl_request_parsing() -> None:
 
 
 def test_failed_checkout_exits_nonzero_other_rejections_do_not() -> None:
-    """Check that failed checkout exits nonzero other rejections do not holds."""
+    """Only a failed checkout reports failure via the exit code."""
     failed: dict[str, object] = {"ok": False}
     succeeded: dict[str, object] = {"ok": True}
     assert checkout_failure_exit_code("checkout", failed) != 0
@@ -75,7 +75,7 @@ def test_failed_checkout_exits_nonzero_other_rejections_do_not() -> None:
 
 
 def test_deployctl_rejects_non_object_and_bad_json() -> None:
-    """Check that deployctl rejects non object and bad json holds."""
+    """Non-JSON text and non-object JSON are rejected as requests."""
     with pytest.raises(Exception, match="not valid JSON"):
         parse_request("{oops")
     with pytest.raises(Exception, match="JSON object"):
@@ -83,7 +83,7 @@ def test_deployctl_rejects_non_object_and_bad_json() -> None:
 
 
 def test_supervisor_parser_defaults() -> None:
-    """Check that supervisor parser defaults holds."""
+    """The supervisor CLI defaults to daemon mode without ``--status``."""
     args = build_supervisor_parser().parse_args([])
     assert args.status is False
     assert args.uv is None

@@ -26,13 +26,13 @@ def meta(**overrides: object) -> WorkerMeta:
 
 
 def test_metadata_round_trip() -> None:
-    """Check that metadata round trip holds."""
+    """Worker metadata survives a serialization round trip unchanged."""
     original = meta()
     assert WorkerMeta.from_dict(original.to_dict()) == original
 
 
 def test_identity_match_requires_every_recorded_field() -> None:
-    """Check that identity match requires every recorded field holds."""
+    """Live identity must match every recorded field, defeating PID reuse."""
     assert identity_matches(meta(), LIVE)
     assert not identity_matches(meta(pid=None), LIVE)
     assert not identity_matches(meta(pid=43), LIVE)

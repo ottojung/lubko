@@ -9,12 +9,12 @@ from lubko.worker import archive_target, output_window_text, pg_safe_decode, tru
 
 
 def test_pg_safe_decode_replaces_nul_and_invalid_bytes() -> None:
-    """Check that pg safe decode replaces nul and invalid bytes holds."""
+    """NUL and invalid UTF-8 become U+FFFD for PostgreSQL safety."""
     assert pg_safe_decode(b"ab\x00c\xff") == "ab\ufffdc\ufffd"
 
 
 def test_truncate_output_bounds_and_marker() -> None:
-    """Check that truncate output bounds and marker holds."""
+    """Truncated output keeps the newest bytes under a hard bound."""
     marker = worker.TRUNCATION_MARKER
     data = b"x" * 100
     assert truncate_output(data, 200) == "x" * 100
@@ -28,7 +28,7 @@ def test_truncate_output_bounds_and_marker() -> None:
 
 
 def test_truncate_output_survives_multibyte_expansion() -> None:
-    """Check that truncate output survives multibyte expansion holds."""
+    """Decoding expansion cannot push encoded output past the limit."""
     marker = len(worker.TRUNCATION_MARKER)
     # Each invalid byte becomes a 3-byte U+FFFD (100 raw bytes -> ~300
     # characters), so naive byte truncation would exceed the limit; the hard
@@ -38,7 +38,7 @@ def test_truncate_output_survives_multibyte_expansion() -> None:
 
 
 def test_archive_target_never_shortens_the_live_tail() -> None:
-    """Check that archive target never shortens the live tail holds."""
+    """Archiving stays below or within the live tail window."""
     assert archive_target(0) == 0
     assert archive_target(500) == 0
     target = archive_target(10**9)
@@ -46,7 +46,7 @@ def test_archive_target_never_shortens_the_live_tail() -> None:
 
 
 def test_output_window_text_returns_logical_offsets(tmp_path: Path) -> None:
-    """Check that output window text returns logical offsets holds."""
+    """Live windows return the newest bytes with logical offsets."""
     path = tmp_path / "stdout"
     path.write_bytes(b"abcdefgh")
     text, start, end = output_window_text(path, 4)
@@ -59,7 +59,7 @@ def test_output_window_text_returns_logical_offsets(tmp_path: Path) -> None:
 
 
 def test_output_window_offsets_are_byte_based(tmp_path: Path) -> None:
-    """Check that output window offsets are byte based holds."""
+    """Window limits count bytes even inside multi-byte runes."""
     path = tmp_path / "s"
     path.write_bytes("é".encode())  # two bytes
     _text, start, end = output_window_text(path, 1)

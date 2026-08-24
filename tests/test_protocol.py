@@ -27,7 +27,7 @@ def command_payload() -> dict[str, object]:
 
 
 def test_build_payload_shape() -> None:
-    """Check that build payload shape holds."""
+    """Built command payloads carry the versioned binding fields exactly."""
     payload = command_payload()
     assert payload["v"] == PROTOCOL_VERSION
     assert payload["type"] == "command"
@@ -37,7 +37,7 @@ def test_build_payload_shape() -> None:
 
 
 def test_round_trip_command() -> None:
-    """Check that round trip command holds."""
+    """Built payloads parse back into equivalent validated views."""
     parsed = parse_payload(json.dumps(command_payload()))
     assert parsed.server == SERVER
     assert parsed.request.cwd == "/srv/jobs"
@@ -48,7 +48,7 @@ def test_round_trip_command() -> None:
 
 
 def test_rejects_bad_server() -> None:
-    """Check that rejects bad server holds."""
+    """Server identities must be present non-empty strings everywhere."""
     with pytest.raises(ProtocolError):
         build_payload(server="", cwd="/srv/jobs", process=["ls"])
     raw = command_payload()
@@ -65,13 +65,13 @@ def test_rejects_bad_server() -> None:
     [[], ["echo", ""], "echo", [1, 2], None],
 )
 def test_rejects_invalid_process(process: object) -> None:
-    """Check that rejects invalid process holds."""
+    """The process field must be a non-empty array of non-empty strings."""
     with pytest.raises(ProtocolError):
         build_payload(server=SERVER, cwd="/srv/jobs", process=process)  # type: ignore[arg-type]
 
 
 def test_rejects_legacy_command_fields() -> None:
-    """Check that rejects legacy command fields holds."""
+    """Legacy v2 ``command``/``args`` request fields are rejected."""
     raw = command_payload()
     raw["request"] = {"cwd": "/srv/jobs", "command": "echo", "args": [], "process": ["x"]}
     with pytest.raises(ProtocolError, match="legacy"):
@@ -79,7 +79,7 @@ def test_rejects_legacy_command_fields() -> None:
 
 
 def test_rejects_unknown_version_type_and_status() -> None:
-    """Check that rejects unknown version type and status holds."""
+    """Unknown versions, job types, and statuses fail validation."""
     raw = command_payload()
     raw["v"] = PROTOCOL_VERSION + 1
     with pytest.raises(ProtocolError, match="version"):
@@ -95,7 +95,7 @@ def test_rejects_unknown_version_type_and_status() -> None:
 
 
 def test_rejects_non_object_and_bad_json() -> None:
-    """Check that rejects non object and bad json holds."""
+    """Payloads must decode to JSON objects from raw text or mappings."""
     with pytest.raises(ProtocolError):
         parse_payload("[]")
     with pytest.raises(ProtocolError):
@@ -103,7 +103,7 @@ def test_rejects_non_object_and_bad_json() -> None:
 
 
 def test_output_window_round_trip_and_bounds() -> None:
-    """Check that output window round trip and bounds holds."""
+    """Output windows carry offsets and honor the tail size bound."""
     window = build_output_window_payload(tail="abc", start=0, end=3, previous=None)
     assert window == {"tail": "abc", "start": 0, "end": 3, "previous": None}
     previous = uuid4()
@@ -118,7 +118,7 @@ def test_output_window_round_trip_and_bounds() -> None:
 
 
 def test_output_window_parsed_from_payload() -> None:
-    """Check that output window parsed from payload holds."""
+    """Embedded output sections parse into per-stream windows."""
     raw = command_payload()
     raw["output"] = {
         "stdout": {"tail": "out", "start": 0, "end": 3, "previous": None},
@@ -131,7 +131,7 @@ def test_output_window_parsed_from_payload() -> None:
 
 
 def test_result_section_parsing() -> None:
-    """Check that result section parsing holds."""
+    """Terminal results validate their bounded fields and integer exit codes."""
     raw = command_payload()
     raw["result"] = {
         "stdout": "",
@@ -166,7 +166,7 @@ def chunk_kwargs() -> dict[str, object]:
 
 
 def test_chunk_round_trip() -> None:
-    """Check that chunk round trip holds."""
+    """Output chunks serialize and parse losslessly."""
     kwargs = chunk_kwargs()
     chunk = parse_chunk_payload(build_output_chunk_payload(**kwargs))  # type: ignore[arg-type]
     assert chunk.value == "ok"
@@ -175,7 +175,7 @@ def test_chunk_round_trip() -> None:
 
 
 def test_chunk_validation_errors() -> None:
-    """Check that chunk validation errors holds."""
+    """Chunk streams, sequences, sizes, and offsets are strictly validated."""
     bad_stream = dict(chunk_kwargs(), stream="stdin")
     with pytest.raises(ProtocolError, match="stream"):
         build_output_chunk_payload(**bad_stream)  # type: ignore[arg-type]
@@ -191,7 +191,7 @@ def test_chunk_validation_errors() -> None:
 
 
 def test_chunk_requires_thread_and_kind_separation() -> None:
-    """Check that chunk requires thread and kind separation holds."""
+    """Chunks need an owning thread and never parse as commands."""
     raw = build_output_chunk_payload(**chunk_kwargs())  # type: ignore[arg-type]
     del raw["thread"]
     with pytest.raises(ProtocolError, match="thread"):

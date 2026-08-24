@@ -33,7 +33,7 @@ def _clean_injectors() -> Iterator[None]:
 
 
 def test_write_and_overwrite(tmp_path: Path) -> None:
-    """Check that write and overwrite holds."""
+    """Durable writes create, replace, and round-trip file contents."""
     path = tmp_path / "state" / "nested" / "file.json"
     write_bytes_durable(path, b"first")
     assert path.read_bytes() == b"first"
@@ -44,7 +44,7 @@ def test_write_and_overwrite(tmp_path: Path) -> None:
 
 
 def test_no_temporary_leftovers(tmp_path: Path) -> None:
-    """Check that no temporary leftovers holds."""
+    """Confirmed durable writes leave no temporary files behind."""
     directory = tmp_path / "d"
     for index in range(5):
         write_bytes_durable(directory / "f", str(index).encode())
@@ -55,7 +55,7 @@ def test_no_temporary_leftovers(tmp_path: Path) -> None:
 
 
 def test_short_write_still_writes_everything(tmp_path: Path) -> None:
-    """Check that short write still writes everything holds."""
+    """Short ``os.write`` results are retried until complete."""
     set_short_write_injector(0.1)
     path = tmp_path / "f"
     payload = bytes(range(256)) * 64
@@ -64,7 +64,7 @@ def test_short_write_still_writes_everything(tmp_path: Path) -> None:
 
 
 def test_failure_before_rename_keeps_previous_value(tmp_path: Path) -> None:
-    """Check that failure before rename keeps previous value holds."""
+    """A pre-rename confirmation failure leaves the prior value intact."""
     path = tmp_path / "f"
     write_bytes_durable(path, b"old")
     set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_FILE)
@@ -75,7 +75,7 @@ def test_failure_before_rename_keeps_previous_value(tmp_path: Path) -> None:
 
 
 def test_failed_dir_fsync_raises_and_restores_previous(tmp_path: Path) -> None:
-    """Check that failed dir fsync raises and restores previous holds."""
+    """An unconfirmed rename fails closed and restores the prior authority."""
     path = tmp_path / "f"
     write_bytes_durable(path, b"old")
 
@@ -93,7 +93,7 @@ def test_failed_dir_fsync_raises_and_restores_previous(tmp_path: Path) -> None:
 
 
 def test_first_write_neutralized_on_unconfirmed_dir_fsync(tmp_path: Path) -> None:
-    """Check that first write neutralized on unconfirmed dir fsync holds."""
+    """A first write whose directory fsync fails leaves no destination."""
     path = tmp_path / "f"
     set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR, path=path.parent)
     with pytest.raises(DurabilityError):
@@ -102,7 +102,7 @@ def test_first_write_neutralized_on_unconfirmed_dir_fsync(tmp_path: Path) -> Non
 
 
 def test_symlink_switch_round_trip_and_restore(tmp_path: Path) -> None:
-    """Check that symlink switch round trip and restore holds."""
+    """Symlink switches are atomic and restore the prior pointer on failure."""
     link = tmp_path / "current"
     write_bytes_durable(tmp_path / "a", b"a")
     write_bytes_durable(tmp_path / "b", b"b")
@@ -116,7 +116,7 @@ def test_symlink_switch_round_trip_and_restore(tmp_path: Path) -> None:
 
 
 def test_remove_durable(tmp_path: Path) -> None:
-    """Check that remove durable holds."""
+    """Durable removal deletes the entry and is idempotent."""
     path = tmp_path / "gone"
     write_bytes_durable(path, b"x")
     remove_durable(path)
@@ -125,7 +125,7 @@ def test_remove_durable(tmp_path: Path) -> None:
 
 
 def test_make_directory_durable_is_idempotent(tmp_path: Path) -> None:
-    """Check that make directory durable is idempotent holds."""
+    """Missing directories are created durably and re-created harmlessly."""
     target = tmp_path / "a" / "b" / "c"
     make_directory_durable(target)
     assert target.is_dir()
@@ -133,7 +133,7 @@ def test_make_directory_durable_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_temporary_names_are_unique(tmp_path: Path) -> None:
-    """Check that temporary names are unique holds."""
+    """Every temporary write path gets a unique name next to its target."""
     destination = tmp_path / "f"
     names = {temporary_path(destination).name for _ in range(20)}
     assert len(names) == 20
