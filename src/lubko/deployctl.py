@@ -34,10 +34,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
-import psycopg
-from psycopg.rows import tuple_row
-
 from lubko import cli, supervise
+from lubko._pg import psycopg, tuple_row
 from lubko.config import load_database_config
 from lubko.durable import write_json_durable
 from lubko.lifecycle import (
@@ -2064,6 +2062,12 @@ send_helper_response = _send_helper_response
 send_helper_error = _send_helper_error
 wait_for_durable_success = _wait_for_durable_success
 handoff_durable_wait_seconds = HANDOFF_DURABLE_WAIT_SECONDS
+
+# Public protocol-parsing helpers: the JSON request/response contract of the
+# controller protocol is a stable interface exercised directly by the tests.
+parse_request = _parse_request
+request_type = _request_type
+checkout_failure_exit_code = _checkout_failure_exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
