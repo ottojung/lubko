@@ -77,6 +77,8 @@ from typing import TYPE_CHECKING, Final
 
 from lubko import cli, deployctl, lifecycle, supervise
 from lubko import worker as worker_mod
+from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
+from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
 from lubko._pg import psycopg
 from lubko.config import load_database_config
 from lubko.durable import remove_durable
@@ -1599,10 +1601,17 @@ class SupervisorDaemon:
     def _converge_unresolved(self, hold: UnresolvedChild) -> bool:
         """Converge an unresolved direct child without any group signalling.
 
-        Only exact single-PID signals are used, each authorized by a matching
-        start-time-ticks observation (or withheld entirely when ticks were
-        never observable). A recycled PID therefore ends the hold instead of
-        being signalled.
+        The recorded PID is first pinned with a pidfd, which kernel-pins the
+        exact process instance even if the numeric PID is recycled afterwards.
+        Only when the pinned process still provably matches the recorded
+        start-time ticks are signals delivered — through ``pidfd_send_signal``
+        on that same pinned descriptor for both TERM and KILL escalation, so a
+        recycled numeric identity can never be signalled at any point.
+
+        When pinning or exact proof is unavailable, nothing is signalled and
+        the hold is preserved (fail closed). When start-time ticks were never
+        observable, no signal can be authorized and the previous no-signal
+        behavior applies.
 
         Args:
             hold: The recorded authority-free hold.
@@ -1612,18 +1621,35 @@ class SupervisorDaemon:
         """
         if not self._unresolved_alive(hold):
             return True
-        if hold.start_time_ticks is not None:
-            with suppress(OSError):
-                os.kill(hold.pid, signal.SIGTERM)
+        ticks = hold.start_time_ticks
+        if ticks is None:
+            # Ticks were never observable: no signal can be authorized. The
+            # hold resolves only when the PID itself is provably gone; a live
+            # PID keeps the hold (and blocks any replacement) no matter how
+            # long it takes.
+            return self._await_unresolved_exit(hold)
+        try:
+            pidfd = _open_unresolved_pidfd(hold.pid)
+        except (OSError, AttributeError):
+            LOGGER.debug("unresolved worker pid %d could not be pinned", hold.pid)
+            return False
+        try:
+            if proc_start_ticks(hold.pid) != ticks:
+                LOGGER.debug(
+                    "pinned process %d no longer matches its recorded start ticks",
+                    hold.pid,
+                )
+                return False
+            with suppress(OSError, AttributeError):
+                _signal_pinned_unresolved(pidfd, signal.SIGTERM)
             if self._await_unresolved_exit(hold):
                 return True
-            with suppress(OSError):
-                os.kill(hold.pid, signal.SIGKILL)
+            with suppress(OSError, AttributeError):
+                _signal_pinned_unresolved(pidfd, signal.SIGKILL)
             return self._await_unresolved_exit(hold)
-        # Ticks were never observable: no signal can be authorized. The hold
-        # resolves only when the PID itself is provably gone; a live PID keeps
-        # the hold (and blocks any replacement) no matter how long it takes.
-        return self._await_unresolved_exit(hold)
+        finally:
+            with suppress(OSError):
+                os.close(pidfd)
 
     def _resolve_unresolved_child(self) -> bool:
         """Resolve any durable unresolved-child hold before further decisions.
