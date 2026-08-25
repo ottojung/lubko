@@ -727,15 +727,77 @@ def is_alive(meta: Meta) -> bool:
     return True
 
 
+def _recorded_leader_state(meta: Meta) -> str:
+    """Tri-state survival evidence for a metadata record's leader.
+
+    Args:
+        meta: Agent metadata carrying ``pid``, ``pgid``, ``start_time``,
+            ``id``, and ``invocation_id``.
+
+    Returns:
+        ``"live"`` when the pinned identity positively matches including its
+        environment markers, ``"gone"`` when the PID is provably dead or
+        recycled by an unrelated occupant, ``"ambiguous"`` when evidence
+        cannot be inspected (unreadable procfs) — never collapsing ambiguity
+        into death.
+    """
+    pid = meta.get("pid")
+    if not pid:
+        return "gone"
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return "gone"
+    except OSError:
+        return "ambiguous"  # exists but uninspectable
+    ticks = proc_start_ticks(int(pid))
+    if ticks is None or ticks != meta.get("start_time"):
+        # Unreadable ticks are ambiguity; readable different ticks prove the
+        # slot was recycled by an unrelated occupant.
+        return "ambiguous" if ticks is None else "gone"
+    state = _leader_marker_state(meta, int(pid))
+    return state if state is not None else "ambiguous"
+
+
+def _leader_marker_state(meta: Meta, pid: int) -> str | None:
+    """Marker-based verdict for a start-time-matching recorded leader.
+
+    Args:
+        meta: Agent metadata.
+        pid: The live leader PID whose markers decide exact identity.
+
+    Returns:
+        ``"live"``/``"gone"`` when markers positively decide, ``None`` when
+        marker inspection is ambiguous and the caller must stay conservative.
+    """
+    aid = str(meta.get("id", ""))
+    iid = meta.get("invocation_id")
+    if iid is None:
+        return "live" if env_has_marker(pid, aid) else "gone"
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except FileNotFoundError:
+        return "gone"  # vanished mid-check: benign race
+    except OSError:
+        return None  # marker evidence uninspectable: stay conservative
+    entries = environ.split(b"\0")
+    exact = (
+        f"LUBKO_AGENT_ID={aid}".encode() in entries
+        and f"{INVOCATION_ID_VAR}={iid}".encode() in entries
+    )
+    return "live" if exact else "gone"
+
+
 def group_alive(meta: Meta) -> bool:
     """Return whether any live process remains in the agent's exact invocation group.
 
     When a durable invocation ID was recorded, group membership is decided by
     the invocation-exact pinned scan: a recycled PGID hosting a newer
     invocation of the same agent never counts as this invocation's survivors,
-    and an *incomplete* scan (procfs enumeration failure, unpinnable or
+    an *incomplete* scan (procfs enumeration failure, unpinnable or
     uninspectable candidate) conservatively counts as alive so convergence
-    can never fail open. Without a recorded invocation ID the plain
+    can never fail open, and an ambiguous recorded-leader identity likewise
+    counts as alive. Without a recorded invocation ID the plain
     process-group membership is used (legacy metadata).
 
     Args:
@@ -753,6 +815,12 @@ def group_alive(meta: Meta) -> bool:
         return bool(group_has_members(int(pgid)))
     if is_alive(meta):
         # The verified live leader implies its whole session group.
+        return True
+    leader_state = _recorded_leader_state(meta)
+    if leader_state != "gone":
+        # A live leader implies its session group; ambiguous leader evidence
+        # (e.g. unreadable environ with matching start ticks) must never be
+        # collapsed into a proven-dead group.
         return True
     fds, complete = _proven_invocation_members(int(pgid), str(meta.get("id", "")), str(iid))
     for _, fd in fds:

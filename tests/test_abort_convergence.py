@@ -1086,3 +1086,53 @@ def test_proven_scan_incomplete_after_member_keeps_and_closes_fds(
                 pytest.fail("double-close would mean a leaked or reused fd")
     finally:
         os.close(pin_fd)
+
+
+def test_group_alive_stays_true_when_live_leader_environ_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Matching start ticks with unreadable leader markers is never 'gone'.
+
+    A live recorded leader whose environ cannot be inspected must count as
+    alive so wait_group_dead cannot falsely prove convergence; a recycled
+    leader slot still falls through to the exact descendant scan.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-lead"
+    owner = _MarkedProcess(aid, iid)
+    try:
+        meta = agent.idle_meta(aid, str(tmp_path), None)
+        meta["pgid"] = owner.pid
+        meta["invocation_id"] = iid
+        meta["pid"] = owner.pid
+        meta["start_time"] = agent.proc_start_ticks(owner.pid)
+        agent.write_meta(aid, meta)
+
+        def unreadable_environ(_self: Path) -> bytes:
+            failure = OSError(errno.EACCES, "environ uninspectable")
+            raise failure
+
+        # is_alive collapses the marker-read failure to False; group_alive
+        # must still refuse to declare the group dead.
+        monkeypatch.setattr(pathlib.Path, "read_bytes", unreadable_environ)
+        cur = agent.read_meta(aid)
+        assert cur is not None
+        assert agent.is_alive(cur) is False  # the collapse being guarded against
+        assert agent.group_alive(cur) is True
+        with monkeypatch.context() as guard:
+            guard.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+            assert agent.wait_group_dead(cur, 0.05) is False
+
+        # A positively recycled leader slot (different ticks) still falls
+        # through to the exact member scan, which proves the group empty.
+        def readable_foreign(_self: Path) -> bytes:
+            return b"LUBKO_AGENT_ID=other\0"
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", readable_foreign)
+        stale = dict(meta)
+        stale["pid"] = os.getpid()  # live process with mismatching ticks
+        stale["start_time"] = 1
+        assert agent.group_alive(stale) is False
+    finally:
+        owner.kill_and_reap()
