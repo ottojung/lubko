@@ -272,11 +272,39 @@ def test_send_signal_group_member_path_survives_numeric_reuse_after_proof(
             "pidfd_send_signal",
             lambda fd, sig: delivered.append((fd, sig)),
         )
-        monkeypatch.setattr(os, "close", lambda _fd: None)
+        # Record every close while still performing it for real, so the
+        # production path genuinely closes the pidfd it owns.
+        closed: list[int] = []
+        real_close = os.close
+
+        def recording_close(fd: int) -> None:
+            real_close(fd)
+            closed.append(fd)
+
+        monkeypatch.setattr(os, "close", recording_close)
         agent.send_signal_group(meta, signal.SIGKILL)
         assert delivered == [(member_fd, signal.SIGKILL)]
+        assert closed == [member_fd]
+        assert not _fd_open(member_fd), "owned pin must be truly closed"
     finally:
-        os.close(member_fd)
+        with contextlib.suppress(OSError):
+            os.close(member_fd)
+
+
+def _fd_open(fd: int) -> bool:
+    """Return whether ``fd`` still refers to an open file description.
+
+    Args:
+        fd: Descriptor number to probe.
+
+    Returns:
+        ``True`` when the descriptor is still open.
+    """
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
 
 
 def test_send_signal_group_fails_closed_without_invocation_identity(
