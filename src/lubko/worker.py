@@ -70,6 +70,7 @@ worker) rather than letting one job poison supervision.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import json
 import logging
@@ -115,7 +116,7 @@ from lubko.protocol import (
 from lubko.state import state_root
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Collection, Iterable
     from uuid import UUID
 
     from lubko.config import DatabaseConfig
@@ -1977,39 +1978,145 @@ def _group_member_pids(pgid: int) -> list[int]:
     return [pgid]
 
 
-def _signal_owned_pids(
-    pids: tuple[int, ...],
-    sig: int,
-    ledger: dict[int, int] | None = None,
-    marker: str | None = None,
-) -> bool:
-    """Signal provably-owned members individually by exact pid.
+if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
 
-    When a ledger/marker pair is supplied, every individual emission is
-    re-validated just-in-time (live start-time ticks plus exact ledger
-    identity or exact job marker) so PID reuse between classification and
-    signal can never redirect the signal to an unrelated process.
+    def _pidfd_open(pid: int) -> int:
+        """Open a pidfd pinning ``pid`` against kernel pid reuse.
+
+        Args:
+            pid: Process id to pin.
+
+        Returns:
+            The new pid file descriptor; ``OSError`` on failure.
+        """
+        return int(os.pidfd_open(pid))
+
+    def _pidfd_send_signal(pidfd: int, sig: int) -> None:
+        """Deliver ``sig`` to exactly the process pinned by ``pidfd``.
+
+        Args:
+            pidfd: Pinned process file descriptor.
+            sig: Signal number to deliver.
+
+        OSError is raised by the platform binding on failure.
+        """
+        signal.pidfd_send_signal(pidfd, sig)
+
+else:  # pragma: no cover - platform-dependent resolution
+    _LIBC: Final = ctypes.CDLL(None, use_errno=True)
+
+    def _pidfd_open(pid: int) -> int:
+        """Open a pidfd pinning ``pid`` against kernel pid reuse.
+
+        Args:
+            pid: Process id to pin.
+
+        Returns:
+            The new pid file descriptor.
+
+        Raises:
+            OSError: If the pid cannot be pinned.
+        """
+        _LIBC.pidfd_open.argtypes = (ctypes.c_int, ctypes.c_uint)
+        _LIBC.pidfd_open.restype = ctypes.c_int
+        fd = _LIBC.pidfd_open(pid, 0)
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "pidfd_open failed")
+        return int(fd)
+
+    def _pidfd_send_signal(pidfd: int, sig: int) -> None:
+        """Deliver ``sig`` to exactly the process pinned by ``pidfd``.
+
+        Args:
+            pidfd: Pinned process file descriptor.
+            sig: Signal number to deliver.
+
+        Raises:
+            OSError: If delivery fails.
+        """
+        _LIBC.pidfd_send_signal.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        )
+        _LIBC.pidfd_send_signal.restype = ctypes.c_int
+        if _LIBC.pidfd_send_signal(pidfd, sig, None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "pidfd_send_signal failed")
+
+
+def _pin_and_signal(pid: int, sig: int, expected_ticks: int) -> bool:
+    """Deliver ``sig`` to exactly the process proven as ``pid`` — or nothing.
+
+    The pidfd is opened FIRST, which kernel-pins the numeric pid: the kernel
+    cannot recycle that pid for any other process while this descriptor exists,
+    even if the process exits. Only after pinning is the identity re-checked
+    against ``expected_ticks``; if it matches, the signal goes through
+    ``pidfd_send_signal`` and can therefore hit ONLY the pinned, verified
+    process. A reuse that happens at any point — before or after proof —
+    either fails the ticks re-check or fails the pin itself, so a recycled
+    numeric identity is never signalled.
 
     Args:
-        pids: Proven member pids to signal.
+        pid: Proven member pid to signal.
         sig: Signal number to deliver.
-        ledger: Optional recorded per-member identities for JIT re-proof.
-        marker: Optional invocation ``LUBKO_JOB_ID`` value for JIT re-proof.
+        expected_ticks: Start-time ticks the pinned process must still show.
 
     Returns:
-        ``True`` when at least one signal was authorized and attempted,
-        ``False`` when nothing was proven/attempted.
+        ``True`` only when the signal was delivered to the verified process.
     """
-    sent = False
+    try:
+        pidfd = _pidfd_open(pid)
+    except OSError:
+        LOGGER.debug("process %d could not be pinned", pid)
+        return False
+    try:
+        if proc_start_ticks(pid) != expected_ticks:
+            LOGGER.debug("process %d no longer matches its proven identity", pid)
+            return False
+        _pidfd_send_signal(pidfd, sig)
+    except OSError:
+        LOGGER.debug("process %d already gone", pid)
+        return False
+    else:
+        return True
+    finally:
+        with suppress(OSError):
+            os.close(pidfd)
+
+
+def _signal_owned_pids(
+    pids: Iterable[int],
+    sig: int,
+    ledger: dict[int, int],
+    marker: str | None = None,
+) -> bool:
+    """Signal provably-owned members individually by pinned exact identity.
+
+    Every individual emission is re-validated just-in-time (live start-time
+    ticks plus exact ledger identity or exact job marker) and then delivered
+    through a pidfd pinned to that exact identity, so PID or PGID recycling
+    between classification, re-proof, and the signal syscall itself can never
+    redirect the signal to an unrelated process.
+
+    Args:
+        pids: Candidate member pids to signal.
+        sig: Signal number to deliver.
+        ledger: Recorded per-member identities for JIT re-proof.
+        marker: Invocation ``LUBKO_JOB_ID`` value for JIT re-proof.
+
+    Returns:
+        ``True`` when at least one member was proven (delivery attempted),
+        ``False`` when nothing was proven.
+    """
+    attempted = False
     for pid in pids:
-        if ledger is not None and not _member_is_proven(pid, ledger, marker):
+        ticks = _proven_member_ticks(pid, ledger, marker)
+        if ticks is None:
             continue
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            LOGGER.debug("process %d already gone", pid)
-        sent = True
-    return sent
+        _pin_and_signal(pid, sig, ticks)
+        attempted = True
+    return attempted
 
 
 def _process_job_id(pid: int) -> str | None:
@@ -2033,12 +2140,12 @@ def _process_job_id(pid: int) -> str | None:
     return None
 
 
-def _member_is_proven(
+def _proven_member_ticks(
     pid: int,
     ledger: dict[int, int],
     marker: str | None,
-) -> bool:
-    """Return whether a live group member provably belongs to this invocation.
+) -> int | None:
+    """Return the proven start-time ticks of a live group member, if any.
 
     Ledger proof is strongest: the member's live start-time ticks exactly equal
     the ticks recorded for that pid under a prior positive ownership proof.
@@ -2055,14 +2162,17 @@ def _member_is_proven(
             when no marker proof is available (ledger-only mode).
 
     Returns:
-        ``True`` only when the member is provably ours right now.
+        The proven start-time ticks of the member, or ``None`` when it cannot
+        be proven ours right now.
     """
     member_ticks = proc_start_ticks(pid)
     if member_ticks is None:
-        return False
+        return None
     if ledger.get(pid) == member_ticks:
-        return True
-    return marker is not None and _process_job_id(pid) == marker
+        return member_ticks
+    if marker is not None and _process_job_id(pid) == marker:
+        return member_ticks
+    return None
 
 
 def _ledger_owned_members(
@@ -2076,7 +2186,7 @@ def _ledger_owned_members(
     its live start-time ticks exactly equal the ticks recorded for that pid
     under a prior positive ownership proof (the leader slot provably held the
     recorded command), or its environment carries exactly this invocation's
-    ``LUBKO_JOB_ID`` marker (see :func:`_member_is_proven`). Per-worker
+    ``LUBKO_JOB_ID`` marker (see :func:`_proven_member_ticks`). Per-worker
     ancestry is deliberately NOT used, because it is not invocation-specific —
     a newer job of the same worker can recycle the numeric PGID and its
     reparented descendants would then be indistinguishable from the old
@@ -2094,7 +2204,7 @@ def _ledger_owned_members(
     return tuple(
         pid
         for pid in _group_member_pids(pgid)
-        if pid != pgid and _member_is_proven(pid, ledger, marker)
+        if pid != pgid and _proven_member_ticks(pid, ledger, marker) is not None
     )
 
 
@@ -2164,14 +2274,16 @@ def _owned_group_view(job: ActiveJob) -> _OwnedGroupView:
 
 
 def _signal_owned_group(job: ActiveJob, sig: int) -> None:
-    """Signal only the provably-owned portion of a job's recorded group.
+    """Signal only the provably-owned members of a job's recorded group.
 
-    Identity is re-proven immediately before every emission so a proof never
-    goes stale between SIGTERM and SIGKILL escalation: if the numeric PGID has
-    been recycled in the meantime, neither the new occupant nor its descendants
-    are signalled, and only proven members receive the signal. Each individual
-    emission re-validates the live pid's start-time ticks together with either
-    its exact ledger identity or its exact invocation job marker.
+    Bare group signalling is deliberately avoided: a ``killpg`` between proof
+    and syscall could hit a recycled numeric PGID. Instead every live member —
+    including the leader slot when it provably holds the recorded command —
+    is signalled individually. Identity is re-proven immediately before every
+    emission and delivered through a pidfd pinned to that exact identity (see
+    :func:`_pin_and_signal`), so PID or PGID reuse at any point between
+    classification, re-proof, and the kernel call can never redirect the
+    signal to an unrelated process.
 
     Args:
         job: The active job whose exact group should receive ``sig``.
@@ -2179,24 +2291,13 @@ def _signal_owned_group(job: ActiveJob, sig: int) -> None:
     """
     view = _owned_group_view(job)
     marker = str(job.id)
-    if view.leader_ours:
-        _signal_group(job.pgid, sig)
-        return
-    for pid in view.pids:
+    candidates = _group_member_pids(job.pgid) if view.leader_ours else list(view.pids)
+    for pid in candidates:
         # Just-in-time per-pid guard: re-read the identity AND the marker at
-        # emission time so a reuse between classification and signal can
-        # never redirect this signal to an unrelated process.
-        if not _member_is_proven(pid, job.owned_members, marker):
-            continue
-        if proc_start_ticks(job.pgid) == job.start_ticks:
-            # The original leader is back in provable possession: the whole
-            # exact group is ours again.
-            _signal_group(job.pgid, sig)
-            return
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
-            LOGGER.debug("process %d already gone", pid)
+        # emission time; delivery is then bound to that proven identity.
+        ticks = _proven_member_ticks(pid, job.owned_members, marker)
+        if ticks is not None:
+            _pin_and_signal(pid, sig, ticks)
 
 
 def _owned_group_alive(job: ActiveJob) -> bool:
@@ -2251,15 +2352,16 @@ def _terminate_one_group(
 
     The exact identity (persisted start-time ticks) is re-verified at every
     stage — including immediately before the SIGKILL escalation — so a proof
-    that was valid at SIGTERM time cannot go stale: if the numeric id is
-    recycled before escalation, the new occupant and its descendants are never
-    signalled. Member identities are recorded into a local ledger while the
-    leader slot provably holds the recorded command, and only members proven
-    at emission time (exact ledger identity or exact invocation job marker)
-    are signalled individually afterwards. Convergence is reported only when
-    the leader is no longer provably ours AND every provably-owned member is
-    gone; an unproven live occupant never counts as convergence of the old
-    owned group.
+    that was valid at SIGTERM time cannot go stale. Bare group signalling is
+    avoided: member identities are recorded into a local ledger while the
+    leader slot provably holds the recorded command, then every live member is
+    signalled individually, re-proven at emission time (exact ledger identity
+    or exact invocation job marker) and delivered through a pidfd pinned to
+    that proven identity, so PID or PGID reuse between classification,
+    re-proof, and the kernel call can never redirect a signal. Convergence is
+    reported only when the leader is no longer provably ours AND every
+    provably-owned member is gone; an unproven live occupant never counts as
+    convergence of the old owned group.
 
     Args:
         pgid: Exact process group id to terminate.
@@ -2278,21 +2380,21 @@ def _terminate_one_group(
     def view() -> _OwnedGroupView:
         return _classify_group(pgid, start_ticks, ledger, marker)
 
+    def emit(view_now: _OwnedGroupView, sig: int) -> bool:
+        # Every emission goes member-by-member through pinned identity; the
+        # numeric group is never signalled wholesale.
+        candidates = _group_member_pids(pgid) if view_now.leader_ours else list(view_now.pids)
+        return _signal_owned_pids(candidates, sig, ledger, marker)
+
     first = view()
-    if first.leader_ours:
-        _signal_group(pgid, signal.SIGTERM)
     # Identity lost between decision and signal: only members re-proven at
     # emission time may be signalled, never the numeric group.
-    elif not _signal_owned_pids(first.pids, signal.SIGTERM, ledger, marker):
+    if not emit(first, signal.SIGTERM):
         return True
     term_deadline = time.monotonic() + cancel_grace_seconds
     while time.monotonic() < term_deadline and group_has_members(pgid):
         time.sleep(0.05)
-    escalated = view()
-    if escalated.leader_ours:
-        _signal_group(pgid, signal.SIGKILL)
-    else:
-        _signal_owned_pids(escalated.pids, signal.SIGKILL, ledger, marker)
+    emit(view(), signal.SIGKILL)
     reap_deadline = time.monotonic() + cancel_grace_seconds
     while time.monotonic() < reap_deadline:
         current = view()

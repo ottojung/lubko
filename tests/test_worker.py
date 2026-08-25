@@ -3286,8 +3286,28 @@ def _identity_seams(
     )
     monkeypatch.setattr(worker, "_group_member_pids", lambda g: list(members) if g == pgid else [])
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+
+    def record(pid: int, sig: int, _ticks: int) -> bool:
+        events.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(worker, "_pin_and_signal", record)
     monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
     return events
+
+
+def _record_pinned_signals(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[tuple[int, int]],
+) -> None:
+    """Record pinned individual emissions instead of delivering them."""
+    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+
+    def record(pid: int, sig: int, _ticks: int) -> bool:
+        events.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(worker, "_pin_and_signal", record)
 
 
 def _spy_supervisor() -> Supervisor:
@@ -3367,7 +3387,7 @@ def test_surviving_owned_descendants_converge_before_finalization(
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
-    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    _record_pinned_signals(monkeypatch, events)
 
     request_group_reap(job)
     assert events == [(descendant, signal.SIGTERM)]
@@ -3424,8 +3444,9 @@ def test_recovery_escalation_never_kills_a_recycled_occupant(
     monkeypatch.setattr(worker, "group_has_members", fake_members)
     ticks = iter([recorded_ticks] + [999_999] * 32)
     monkeypatch.setattr(worker, "proc_start_ticks", lambda _pid: next(ticks))
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: [pgid])
     events: list[tuple[int, int]] = []
-    monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
+    _record_pinned_signals(monkeypatch, events)
 
     assert worker._terminate_one_group(pgid, recorded_ticks, cancel_grace_seconds=0.0) is True
     assert events == [(pgid, signal.SIGTERM)]
@@ -3452,7 +3473,7 @@ def test_recovery_reports_nonconvergence_while_leader_stays_ours(
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
-    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    _record_pinned_signals(monkeypatch, events)
 
     assert worker._terminate_one_group(pgid, recorded_ticks, cancel_grace_seconds=0.05) is False
     # Escalation happened against the exact proven group only.
@@ -3496,7 +3517,7 @@ def test_recycled_group_stranger_descendants_are_never_signalled(
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
-    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    _record_pinned_signals(monkeypatch, events)
 
     request_group_reap(job)
     assert events == [(owned_descendant, signal.SIGTERM)]
@@ -3613,7 +3634,7 @@ def test_newer_same_worker_job_reusing_pgid_is_never_attributed_to_old(
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
-    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    _record_pinned_signals(monkeypatch, events)
 
     supervisor = _spy_supervisor()
     # The reparented descendant of the NEWER invocation is invisible to A.
@@ -3652,7 +3673,7 @@ def test_exact_job_marker_proves_unledgered_background_descendant(
     monkeypatch.setattr(worker, "_process_job_id", lambda _pid: str(job.id))
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
-    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    _record_pinned_signals(monkeypatch, events)
 
     supervisor = _spy_supervisor()
     assert worker._owned_group_alive(job) is True
@@ -3687,7 +3708,7 @@ def test_different_same_worker_job_marker_never_proves_old_invocation(
     monkeypatch.setattr(worker, "_process_job_id", lambda _pid: str(uuid4()))
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
-    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    _record_pinned_signals(monkeypatch, events)
 
     request_stop(old, "cancel")
     request_group_reap(old)
@@ -3718,7 +3739,7 @@ def test_missing_or_unreadable_job_marker_fails_closed(
     monkeypatch.setattr(worker, "_process_job_id", lambda _pid: None)
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
-    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    _record_pinned_signals(monkeypatch, events)
 
     request_stop(job, "cancel")
     request_group_reap(job)
@@ -3753,10 +3774,77 @@ def test_signal_revalidates_identity_and_marker_before_every_emission(
     monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
     events: list[tuple[int, int]] = []
     monkeypatch.setattr(worker, "_signal_group", lambda g, sig: events.append((g, sig)))
-    monkeypatch.setattr(os, "kill", lambda pid, sig: events.append((pid, sig)))
+    _record_pinned_signals(monkeypatch, events)
     stale_view = worker._OwnedGroupView(leader_ours=False, pids=(reused,))
     monkeypatch.setattr(worker, "_owned_group_view", lambda _job: stale_view)
 
     worker._signal_owned_group(job, signal.SIGTERM)
     worker._signal_owned_group(job, signal.SIGKILL)
     assert not events
+
+
+def test_pin_and_signal_delivers_only_to_the_exact_proven_identity() -> None:
+    """Pidfd pinning binds delivery to the verified identity or nothing.
+
+    A live process is signalled (signal 0 poll) only when its pinned identity
+    still matches the proven start-time ticks; a wrong-ticks proof, and a
+    vanished pid, both deliver nothing.
+    """
+    proc = subprocess.Popen(("/usr/bin/sleep", "30"))
+    try:
+        ticks = proc_start_ticks(proc.pid)
+        assert ticks is not None
+        guard.register(proc, start_ticks=ticks)
+
+        assert worker._pin_and_signal(proc.pid, signal.SIGCONT, ticks) is True
+        # Wrong proven identity: the live process must NOT be signalled.
+        assert worker._pin_and_signal(proc.pid, signal.SIGKILL, ticks + 1) is False
+        assert proc.poll() is None
+    finally:
+        with suppress(ProcessLookupError):
+            proc.kill()
+        proc.wait()
+
+    assert worker._pin_and_signal(proc.pid, signal.SIGKILL, 1) is False
+
+
+def test_reuse_after_reproof_but_before_syscall_is_never_signalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recycle landing between re-proof and the signal syscall is contained.
+
+    The member passes classification and the just-in-time re-proof with its
+    original identity; the pid is then recycled before the kernel call. The
+    pinned emission re-checks identity AFTER pinning, sees the recycled
+    ticks, and delivers nothing — even though every earlier proof passed.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.returncode = 0
+    job.start_ticks = 1000
+    member = job.pgid + 17
+    members = [member]
+    job.owned_members[member] = 1001
+    monkeypatch.setattr(
+        worker, "group_has_members", lambda g: bool(members) if g == job.pgid else False
+    )
+    monkeypatch.setattr(worker, "_group_member_pids", lambda _g: list(members))
+    reads = {"n": 0}
+
+    def flaky_ticks(pid: int) -> int | None:
+        if pid == job.pgid:
+            return None
+        reads["n"] += 1
+        return 1001 if reads["n"] <= 2 else 999_999
+
+    monkeypatch.setattr(worker, "proc_start_ticks", flaky_ticks)
+    monkeypatch.setattr(worker, "_pidfd_open", lambda _pid: 42)
+    delivered: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        worker,
+        "_pidfd_send_signal",
+        lambda fd, s: delivered.append((fd - 42, s)),
+    )
+
+    request_group_reap(job)
+    assert delivered == []
