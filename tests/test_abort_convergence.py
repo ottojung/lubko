@@ -11,7 +11,9 @@ converged.
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
+import pathlib
 import shutil
 import signal
 import subprocess
@@ -919,3 +921,79 @@ def test_unresolved_group_reuse_by_foreign_invocation_is_gone() -> None:
                 owned.kill_and_reap()
     finally:
         owner.kill_and_reap()
+
+
+def _unresolved_marker_for(pgid: int) -> tuple[agent.Meta, dict[str, object]]:
+    """Metadata with a dead-leader unresolved marker pinned to ``pgid``.
+
+    Args:
+        pgid: The recorded process group of the old invocation.
+
+    Returns:
+        The metadata mapping and the marker placed inside it.
+    """
+    marker: dict[str, object] = {
+        "pid": 424242,  # long-dead leader slot
+        "pgid": pgid,
+        "start_time": 1,
+        "invocation_id": "inv-old",
+    }
+    meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped"}
+    meta["unresolved_invocation"] = marker
+    return meta, marker
+
+
+def test_unresolved_scan_proc_enumeration_failure_stays_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/proc enumeration failure keeps the obligation ambiguous and blocking."""
+    owner = _MarkedProcess("aaaaaaaa", "inv-foreign")
+    try:
+        meta, _ = _unresolved_marker_for(owner.pid)
+
+        def broken_iterdir(_self: Path) -> object:
+            failure = OSError(errno.EIO, "procfs unavailable")
+            raise failure
+
+        monkeypatch.setattr(pathlib.Path, "iterdir", broken_iterdir)
+        assert agent._unresolved_child_state(meta) == "ambiguous"
+        assert agent._delete_converged(meta) is False
+    finally:
+        owner.kill_and_reap()
+
+
+def test_unresolved_scan_uninspectable_marker_keeps_block_and_no_numeric_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-group candidate with unreadable markers stays ambiguously blocked.
+
+    The scan cannot prove membership or absence, so deletion stays blocked
+    and forced convergence never falls back to numeric PID/PGID signalling.
+    """
+    meta, _ = _unresolved_marker_for(525252)
+    pin_fd = os.open(os.devnull, os.O_RDONLY)
+
+    # Deterministic enumeration: exactly one synthetic candidate (a member
+    # distinct from the recorded PGID so it is not skipped as the leader slot).
+    class _FakeEntry:
+        name = "525253"
+
+        @staticmethod
+        def is_dir() -> bool:
+            return True
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", lambda _self: iter([_FakeEntry()]))
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: os.dup(pin_fd))
+    monkeypatch.setattr(os, "getpgid", lambda _pid: 525252)
+
+    def unreadable_environ(_self: Path) -> bytes:
+        failure = OSError(errno.EACCES, "environ uninspectable")
+        raise failure
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", unreadable_environ)
+    monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+    try:
+        assert agent._unresolved_child_state(meta) == "ambiguous"
+        assert agent._delete_converged(meta) is False
+    finally:
+        os.close(pin_fd)

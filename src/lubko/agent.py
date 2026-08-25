@@ -405,6 +405,90 @@ def _env_has_entry(pid: int, entry: bytes) -> bool:
     return entry in environ.split(b"\0")
 
 
+def _proven_invocation_members(pgid: int, aid: str, iid: str) -> tuple[list[tuple[int, int]], bool]:
+    """Pinned exact-member scan with proven-complete evidence.
+
+    Like ``_pinned_invocation_members`` for signalling, but the caller also
+    learns whether the scan *completed*: ``/proc`` enumeration failure, an
+    alive-but-unpinnable candidate, or uninspectable marker data all yield
+    ``complete=False`` so ownership decisions can fail closed. A candidate
+    that positively vanishes mid-scan is a benign race and stays complete.
+
+    Args:
+        pgid: The recorded process group ID.
+        aid: Exact agent ID whose environment marker members must carry.
+        iid: Exact invocation ID whose environment marker members must carry.
+
+    Returns:
+        ``(members, complete)`` — pinned member PIDs with open pidfds (caller
+        closes) and whether absence of further members was positively proven.
+    """
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return [], False  # enumeration failure: membership unknown
+    members: list[tuple[int, int]] = []
+    for entry in entries:
+        name = entry.name
+        if not name.isdigit():
+            continue
+        member = int(name)
+        if member == pgid:
+            continue
+        fd = open_pidfd(member)
+        if fd is None:
+            # Distinguish a benign mid-scan disappearance from an unprovable
+            # pin (platform without pidfd support, or another pin failure).
+            try:
+                os.kill(member, 0)
+            except ProcessLookupError:
+                continue  # positively vanished: benign race
+            return [], False  # alive but unpinnable: ambiguity
+        matched = _matches_invocation_group_proven(member, pgid, aid, iid)
+        if matched is None:
+            os.close(fd)
+            return [], False  # marker inspection uninspectable: ambiguity
+        if not matched:
+            os.close(fd)
+            continue
+        members.append((member, fd))
+    return members, True
+
+
+def _matches_invocation_group_proven(member: int, pgid: int, aid: str, iid: str) -> bool | None:
+    """Tri-state exact invocation-group membership check.
+
+    Args:
+        member: Candidate process ID.
+        pgid: The recorded process group ID.
+        aid: Exact agent ID whose environment marker must be present.
+        iid: Exact invocation ID whose environment marker must be present.
+
+    Returns:
+        ``True`` when group and both markers match exactly, ``False`` on a
+        positive mismatch or benign disappearance, ``None`` when inspection
+        is ambiguous (unreadable procfs).
+    """
+    try:
+        if os.getpgid(member) != pgid:
+            return False
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+    environ: bytes | None
+    try:
+        environ = Path(f"/proc/{member}/environ").read_bytes()
+    except FileNotFoundError:
+        return False  # vanished mid-scan: benign race
+    except OSError:
+        return None  # exists but uninspectable: ambiguity
+    entries = environ.split(b"\0")
+    has_aid = f"LUBKO_AGENT_ID={aid}".encode() in entries
+    has_iid = f"{INVOCATION_ID_VAR}={iid}".encode() in entries
+    return has_aid and has_iid
+
+
 def open_pidfd(pid: int) -> int | None:
     """Return a file descriptor pinning ``pid``, or ``None`` when unavailable.
 
@@ -1890,6 +1974,32 @@ def _hold_unrecorded(aid: str, pid: int, start: object, iid: str) -> None:
     update_meta(aid, hold)
 
 
+def _unresolved_leader_state(rec: Meta) -> str | None:
+    """Classify the recorded leader's survival evidence for an unresolved record.
+
+    Args:
+        rec: The persisted unresolved-invocation marker.
+
+    Returns:
+        ``"live"`` or ``"ambiguous"`` when the leader decides the outcome,
+        ``None`` when the leader is positively dead/recycled and the group
+        scan must decide instead.
+    """
+    pid = rec["pid"]
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return None  # leader positively dead: the group scan decides
+    except OSError:
+        return "ambiguous"  # exists but uninspectable (e.g. EPERM)
+    ticks = proc_start_ticks(int(pid))
+    if ticks is None:
+        return "ambiguous"  # unreadable procfs cannot prove anything
+    if ticks == rec["start_time"]:
+        return "live"  # the recorded leader itself still lives
+    return None  # leader positively recycled by an unrelated occupant
+
+
 def _unresolved_child_state(m: Meta) -> str:
     """Classify the exact recorded unresolved invocation's survival evidence.
 
@@ -1897,12 +2007,12 @@ def _unresolved_child_state(m: Meta) -> str:
     the whole recorded invocation *group*, not just its leader: leader death
     or PID recycling alone never proves it gone, because genuine descendants
     can survive in the old process group. The record is gone only when the
-    leader is positively dead/recycled *and* the pinned per-invocation scan
-    finds no surviving member carrying both the agent marker and the exact
-    invocation marker (a recycled PGID hosting a foreign invocation never
-    counts). Anything uninspectable — unreadable procfs, permission failures,
-    malformed persisted state — stays ambiguous so the block never fails
-    open.
+    leader is positively dead/recycled *and* a complete pinned per-invocation
+    scan finds no surviving member carrying both the agent marker and the
+    exact invocation marker (a recycled PGID hosting a foreign invocation
+    never counts). Anything uninspectable — unreadable procfs, permission
+    failures, malformed persisted state — stays ambiguous so the block never
+    fails open.
 
     Args:
         m: Agent metadata.
@@ -1925,7 +2035,7 @@ def _unresolved_child_state(m: Meta) -> str:
         """
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
-    if not (
+    well_formed = (
         isinstance(rec, dict)
         and valid_identity(rec.get("pid"))
         and isinstance(rec.get("start_time"), int)
@@ -1933,27 +2043,19 @@ def _unresolved_child_state(m: Meta) -> str:
         and valid_identity(rec.get("pgid"))
         and isinstance(rec.get("invocation_id"), str)
         and bool(rec["invocation_id"])
-    ):
+    )
+    if not well_formed:
         return "ambiguous"  # malformed persisted state fails closed
-    pid: int = rec["pid"]
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        pass  # leader positively dead: the group scan decides below
-    except OSError:
-        return "ambiguous"  # exists but uninspectable (e.g. EPERM)
-    else:
-        ticks = proc_start_ticks(pid)
-        if ticks is None:
-            return "ambiguous"  # unreadable procfs cannot prove anything
-        if ticks == rec["start_time"]:
-            return "live"  # the recorded leader itself still lives
-        # leader positively recycled by an unrelated occupant: scan below
+    leader_state = _unresolved_leader_state(rec)
+    if leader_state is not None:
+        return leader_state
     pgid: int = rec["pgid"]
     iid: str = rec["invocation_id"]
-    members = _pinned_invocation_members(pgid, str(m.get("id", "")), iid)
+    members, complete = _proven_invocation_members(pgid, str(m.get("id", "")), iid)
     for _, fd in members:
         os.close(fd)
+    if not complete:
+        return "ambiguous"  # uncertain membership never proves the group gone
     return "live" if members else "gone"
 
 
