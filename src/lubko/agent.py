@@ -559,7 +559,8 @@ def signal_identity_checked(
     could still retarget onto an unrelated occupant of the recycled PID even
     after a successful proof, because the kernel frees a numeric PID for reuse
     before the pinned reference is released. When the platform cannot pin PIDs
-    the signal is withheld (fail closed).
+    — or can pin them but has no ``pidfd_send_signal`` binding — the signal is
+    withheld (fail closed).
 
     Args:
         pid: Recorded runner PID to signal.
@@ -575,7 +576,10 @@ def signal_identity_checked(
             return
         if marker_aid is not None and not env_has_marker(int(pid), marker_aid):
             return
-        with contextlib.suppress(ProcessLookupError):
+        # Fail closed when the platform can pin PIDs but cannot deliver
+        # pidfd signals: withhold the signal rather than crash or fall back
+        # to a numeric kill.
+        with contextlib.suppress(OSError, AttributeError):
             pidfd_send_signal(fd, sig)
     finally:
         os.close(fd)
@@ -602,9 +606,10 @@ def send_signal_group(meta: Meta, sig: int) -> None:
       agent (with a different invocation ID) is therefore never signalled,
       no matter how the OS recycled PIDs or the group ID.
 
-    When no process can be pinned (platform without pidfd support), nothing
-    is signalled: fail closed instead of guessing. The same holds when no
-    durable invocation identity is recorded.
+    When no process can be pinned (platform without pidfd support), or when
+    the platform cannot deliver pidfd signals, nothing is signalled: fail
+    closed instead of guessing. The same holds when no durable invocation
+    identity is recorded.
 
     Args:
         meta: Agent metadata.
@@ -628,7 +633,7 @@ def send_signal_group(meta: Meta, sig: int) -> None:
                 if verified:
                     # Deliver through the pin itself: a numeric killpg on the
                     # recorded group could retarget after PGID reuse.
-                    with contextlib.suppress(ProcessLookupError):
+                    with contextlib.suppress(OSError, AttributeError):
                         pidfd_send_signal(fd, sig)
             finally:
                 os.close(fd)
@@ -637,7 +642,7 @@ def send_signal_group(meta: Meta, sig: int) -> None:
     # identity to authorize them.
     for _member, member_fd in _pinned_invocation_members(int(pgid), aid, str(iid)):
         try:
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(OSError, AttributeError):
                 pidfd_send_signal(member_fd, sig)
         finally:
             os.close(member_fd)
