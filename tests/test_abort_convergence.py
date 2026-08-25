@@ -1304,3 +1304,85 @@ def test_group_alive_stays_true_when_live_leader_environ_unreadable(
         assert agent.group_alive(stale) is False
     finally:
         owner.kill_and_reap()
+
+
+def test_signal_identity_checked_delivers_through_the_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proven identity is signalled through its pinned descriptor only.
+
+    The numeric PID may be recycled between the proof and delivery: numeric
+    ``kill`` could retarget onto an unrelated occupant even after a successful
+    proof. Delivery must go exclusively through ``pidfd_send_signal`` on the
+    descriptor that pinned the verified process.
+    """
+    closed: list[int] = []
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 55)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
+    monkeypatch.setattr(os, "close", closed.append)
+    delivered: list[tuple[int, int]] = []
+    monkeypatch.setattr(agent, "pidfd_send_signal", lambda fd, sig: delivered.append((fd, sig)))
+
+    agent.signal_identity_checked(424242, 111, signal.SIGKILL)
+
+    assert delivered == [(55, signal.SIGKILL)]
+    assert closed == [55]
+
+
+def test_signal_identity_checked_ignores_pid_reused_after_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded PID whose start ticks no longer match is never signalled."""
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 56)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 999)
+    monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
+    monkeypatch.setattr(
+        agent,
+        "pidfd_send_signal",
+        lambda *_a: pytest.fail("signalled a recycled PID"),
+    )
+    closed: list[int] = []
+    monkeypatch.setattr(os, "close", closed.append)
+
+    agent.signal_identity_checked(424242, 111, signal.SIGKILL)
+
+    assert closed == [56]
+
+
+def test_signal_identity_checked_fails_closed_without_a_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without pidfd support nothing is signalled and no numeric path runs."""
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: None)
+    monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
+    monkeypatch.setattr(
+        agent,
+        "pidfd_send_signal",
+        lambda *_a: pytest.fail("signalled without a pin"),
+    )
+
+    agent.signal_identity_checked(424242, 111, signal.SIGKILL)
+
+
+def test_signal_identity_checked_live_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuinely live matching process is signalled through its real pin."""
+    owner = subprocess.Popen([SLEEP_BIN, "30"])
+    try:
+        ticks = agent.proc_start_ticks(owner.pid)
+        sent: list[tuple[int, int]] = []
+
+        def fake_send(pidfd: int, sig: int) -> None:
+            os.kill(owner.pid, sig)
+            sent.append((pidfd, sig))
+
+        monkeypatch.setattr(agent, "pidfd_send_signal", fake_send)
+        agent.signal_identity_checked(owner.pid, ticks, signal.SIGTERM)
+        assert len(sent) == 1
+        assert sent[0][1] == signal.SIGTERM
+        assert sent[0][0] > 2  # delivery used a real descriptor
+        assert owner.wait(timeout=5) == -signal.SIGTERM
+    finally:
+        with contextlib.suppress(OSError):
+            owner.kill()
+            owner.wait(timeout=5)
