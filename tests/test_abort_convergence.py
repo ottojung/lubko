@@ -407,3 +407,59 @@ def test_spawn_and_run_exceptional_cleanup_never_touches_newer_invocation(
     assert final["invocation_id"] == "inv-new", "newer record must stay untouched"
     assert final["state"] == "running"
     assert final["intent"] is None
+
+
+def test_spawn_and_run_unprovable_live_child_records_hold_without_wedging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live child with unprovable ownership cannot wedge the cleanup.
+
+    When the exact-identity signal fails closed and the spawned child stays
+    live, the bounded reap gives up, and a durable nonterminal safety hold is
+    recorded instead of blocking forever or terminalizing.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-live"
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "running"
+    seed["invocation_id"] = iid
+    seed["runner_pid"] = os.getpid()
+    seed["runner_start_time"] = agent.proc_start_ticks(os.getpid())
+    agent.write_meta(aid, seed)
+
+    # Exact signalling fails closed: no signal reaches the child.
+    monkeypatch.setattr(agent, "_kill_spawned_invocation", lambda *_a: None)
+    monkeypatch.setattr(agent, "ABORT_REAP_SECONDS", 0.05)
+    monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+
+    def boom(_proc: subprocess.Popen[bytes], _aid: str, *, is_continue: bool) -> int:
+        del is_continue
+        failure = RuntimeError("injected runner failure")
+        raise failure
+
+    monkeypatch.setattr(agent, "_wait_for_invocation_exit", boom)
+
+    ctx = agent._RunnerContext(
+        aid=aid,
+        log_path=tmp_path / "output.log",
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+    )
+    with pytest.raises(RuntimeError):
+        agent._spawn_and_run(ctx, aid, [SLEEP_BIN, "300"], iid, is_continue=False)
+
+    child_pid = agent.read_meta(aid)
+    assert child_pid is not None
+    victim = int(child_pid["pid"])
+    try:
+        assert agent.pid_alive(victim), "child must still be live (fail-closed, no signal)"
+        final = child_pid
+        assert final["state"] == "running", "no terminal record while child survives"
+        assert final["intent"] == "kill"
+        assert final["active_runner"] is True
+        assert final["invocation_id"] == iid
+        assert agent._claim_pending_prompt(aid, "replacement prompt") is False
+    finally:
+        os.kill(victim, signal.SIGKILL)
+        os.waitpid(victim, 0)

@@ -99,6 +99,7 @@ SESSION_DISCOVER_POLL_SECONDS: Final = 1
 STOP_WAIT_SECONDS: Final = 10.0
 KILL_WAIT_SECONDS: Final = 5.0
 ABORT_WAIT_SECONDS: Final = 5.0
+ABORT_REAP_SECONDS: Final = 5.0
 IDLE_BREAK_SECONDS: Final = 5
 STABLE_TERMINAL_SECONDS: Final = 0.5
 STATUS_TAIL_LINES: Final = 50
@@ -1630,8 +1631,17 @@ def _spawn_and_run(
             # SIGKILL to an unrelated group. Terminalization still requires
             # positively proven group death.
             _kill_spawned_invocation(aid, proc.pid, start, iid)
-            with contextlib.suppress(OSError):
-                proc.wait()
+            # Bounded reap: when exact ownership was unprovable the signal
+            # failed closed and the child may still be live, so an unbounded
+            # wait here could wedge the runner before any durable safety hold
+            # is recorded.
+            reaped = True
+            try:
+                proc.wait(timeout=ABORT_REAP_SECONDS)
+            except subprocess.TimeoutExpired:
+                reaped = False
+            except OSError:
+                reaped = False
             observed = {
                 "id": aid,
                 "pid": proc.pid,
@@ -1649,7 +1659,7 @@ def _spawn_and_run(
                 os.getpid(),
                 proc_start_ticks(os.getpid()),
             )
-            converged = wait_group_dead(observed, ABORT_WAIT_SECONDS)
+            converged = reaped and wait_group_dead(observed, ABORT_WAIT_SECONDS)
             _update_meta_if_same_invocation(
                 aid,
                 identity,
