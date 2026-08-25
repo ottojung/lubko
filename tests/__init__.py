@@ -1,1 +1,1 @@
-"""Lubko test package."""
+"""Invariant test suite for Lubko."""

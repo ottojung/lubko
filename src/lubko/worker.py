@@ -70,11 +70,14 @@ worker) rather than letting one job poison supervision.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
+import importlib
 import json
 import logging
 import os
 import select
+import selectors
 import signal
 import socket
 import subprocess
@@ -85,12 +88,10 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, override
+from typing import TYPE_CHECKING, Any, Final, cast, override
 from uuid import uuid4
 
-import psycopg
-from psycopg.rows import tuple_row
-
+from lubko._pg import psycopg, tuple_row
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config, load_worker_server
 from lubko.health import (
@@ -115,12 +116,130 @@ from lubko.protocol import (
 from lubko.state import state_root
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Collection, Iterable
     from uuid import UUID
 
+    from psycopg.abc import RV, PQGen
+
+    from lubko._pg_deadline import DeadlineConnection
     from lubko.config import DatabaseConfig
 
-JobsConnection = psycopg.Connection[tuple[Any, ...]]
+    JobsConnection = psycopg.Connection[tuple[Any, ...]]
+else:
+    # Annotation-only alias; resolved lazily so importing this module never
+    # executes the compiled driver.
+    JobsConnection = Any
+
+#: Explicit re-export of the lazily-loaded driver-bound connection class;
+#: listed because strict type checking disables implicit re-export.
+__all__ = ["DeadlineConnection"]
+
+_DEADLINE_EXPORTS: Final[frozenset[str]] = frozenset({"DeadlineConnection"})
+
+
+def _ensure_deadline_bindings() -> None:
+    """Bind the driver-bound deadline names into this module's globals.
+
+    A module-level ``__getattr__`` only serves *external* attribute access;
+    plain global lookups inside this module's own functions would raise
+    ``NameError``. Every runtime use site therefore calls this first, which
+    loads the compiled psycopg driver once, on the first actual database turn.
+    """
+    if "DeadlineConnection" in globals():
+        return
+    module = importlib.import_module("lubko._pg_deadline")
+    for name in _DEADLINE_EXPORTS:
+        globals()[name] = getattr(module, name)
+
+
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> object:
+        # External re-export hook: resolve driver-bound deadline names lazily
+        # so importing :mod:`lubko.worker` never pays the driver load cost.
+        if name in _DEADLINE_EXPORTS:
+            return getattr(importlib.import_module("lubko._pg_deadline"), name)
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg)
+
+
+class DbOperationDeadlineError(TimeoutError):
+    """An established database operation exceeded its hard client-side deadline.
+
+    Raised by :func:`wait_with_deadline` when a libpq operation on an
+    already-established connection did not complete by the operation's
+    absolute monotonic deadline (for example because the socket silently
+    black-holes packets). The connection is failed closed before the error is
+    raised, so the supervisor classifies it as a connectivity failure and
+    converges through the outage-safety path. It deliberately needs no
+    psycopg base class: the supervisor catches it directly and treats it as a
+    connectivity-classified outage trigger.
+    """
+
+
+def wait_with_deadline(gen: PQGen[RV], fileno: int, deadline: float) -> RV:
+    """Drive a nonblocking libpq generator under an absolute monotonic deadline.
+
+    This is the application-owned hard client bound on established database
+    operations: unlike ``connect_timeout`` (which bounds only connection
+    establishment) and server-side ``statement_timeout`` (which cannot
+    guarantee the client ever notices a network black hole), this seam bounds
+    the client's own waiting on every readiness cycle of the operation. When
+    the deadline passes, the generator is abandoned and
+    :class:`DbOperationDeadlineError` is raised; the caller must fail the
+    connection closed and enter outage handling.
+
+    Args:
+        gen: A psycopg nonblocking generator performing a database operation.
+        fileno: The established connection socket descriptor to wait on.
+        deadline: Absolute monotonic time by which the operation must finish.
+
+    Returns:
+        Whatever ``gen`` returns on completion.
+    """
+    try:
+        state = next(gen)
+        with selectors.DefaultSelector() as sel:
+            sel.register(fileno, state)
+            return _drive_under_deadline(gen, sel, fileno, deadline)
+    except StopIteration as ex:
+        result: RV = ex.value
+        return result
+
+
+def _drive_under_deadline(
+    gen: PQGen[RV], sel: selectors.BaseSelector, fileno: int, deadline: float
+) -> RV:
+    """Run the readiness loop of :func:`wait_with_deadline` under ``deadline``.
+
+    Args:
+        gen: The nonblocking libpq generator being driven.
+        sel: Selector with ``fileno`` already registered.
+        fileno: The established connection socket descriptor.
+        deadline: Absolute monotonic time by which the operation must finish.
+
+    Raises:
+        DbOperationDeadlineError: If the deadline passed before completion.
+    """
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            msg = (
+                "database operation exceeded its hard client deadline on an established connection"
+            )
+            raise DbOperationDeadlineError(msg)
+        events = sel.select(timeout=remaining)
+        if not events:
+            # Mirror psycopg's own selector loop: a timeout with no readiness
+            # still probes whether the socket disappeared, then lets the
+            # generator decide how to proceed. The event mask ``0`` matches
+            # what psycopg itself sends for this probe (selectors deliver
+            # plain integer masks).
+            os.fstat(fileno)
+            gen.send(0)
+            continue
+        state = gen.send(events[0][1])
+        sel.modify(fileno, state)
 
 
 def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None) -> bool:
@@ -157,6 +276,71 @@ def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None
         and conn is not None
         and (conn.broken or conn.closed)
     )
+
+
+def operation_deadline_at(
+    now_mono: float,
+    heartbeat_origins: Collection[float],
+    settings: Settings,
+) -> float:
+    """Return the absolute monotonic deadline for this turn's database work.
+
+    The deadline is capped by the configured ``db_operation_timeout_seconds``
+    and, when any live owned group is heartbeated, additionally bounded by the
+    earliest job's local lease-safety instant
+    ``last_heartbeat_at + lease_duration - margin``. Because settings
+    validation guarantees ``db_operation_timeout_seconds < lease_duration -
+    margin - refresh_interval``, a hung established operation is always
+    detected strictly before any owned process's lease can become unsafe, no
+    matter how late in a lease cycle the operation starts.
+
+    Args:
+        now_mono: Current monotonic time.
+        heartbeat_origins: Conservative monotonic origins of the last committed
+            heartbeats of locally-owned jobs with live process groups.
+        settings: Worker runtime settings.
+
+    Returns:
+        The absolute monotonic operation deadline for this turn.
+    """
+    limit = now_mono + settings.db_operation_timeout_seconds
+    safety_instants = (
+        origin + settings.lease_duration_seconds - settings.lease_safety_margin_seconds
+        for origin in heartbeat_origins
+    )
+    earliest = min(safety_instants, default=None)
+    if earliest is not None and earliest < limit:
+        return earliest
+    return limit
+
+
+def install_operation_deadline(conn: JobsConnection | None, deadline: float) -> None:
+    """Install the hard client deadline on the supervisor's live connection.
+
+    The deadline capability is expressed as a ``operation_deadline`` class
+    attribute on the connection type: production connections are established
+    as :class:`DeadlineConnection`, which defines it, while a plain
+    production-established connection does not and therefore fails closed —
+    silently operating without the established-operation bound is never
+    acceptable. Test doubles may opt in by declaring the same class
+    attribute.
+
+    Args:
+        conn: The supervisor's current database connection (or ``None``).
+        deadline: The absolute monotonic operation deadline to install.
+
+    Raises:
+        TypeError: If the connection type lacks the deadline capability.
+    """
+    if conn is None:
+        return
+    if getattr(type(conn), "operation_deadline", None) is None:
+        msg = (
+            "database connection lacks the hard client operation-deadline "
+            "capability; refusing to operate without the lease-safety bound"
+        )
+        raise TypeError(msg)
+    cast("Any", conn).operation_deadline = deadline
 
 
 LOGGER: Final = logging.getLogger(__name__)
@@ -421,6 +605,19 @@ class ActiveJob:
     # at commit time and never at spawn. Drives lease-safety eviction so a
     # process can never outlive its database lease.
     last_heartbeat_at: float = 0.0
+    # Exact start-time clock ticks of the command process (== group leader),
+    # durably persisted before gate release and carried in memory unchanged.
+    # This is the non-reusable identity proof that keeps every live
+    # supervision/drain/shutdown group decision from ever mistaking a
+    # numerically recycled PGID for this job's group.
+    start_ticks: int = 0
+    # Per-invocation member ledger (pid -> start-time ticks) recorded under
+    # positive ownership proof: seeded with the exact persisted leader identity
+    # at activation and extended with every member observed while the leader
+    # slot provably holds the recorded command. A member counts as ours later
+    # (leader exited, PGID possibly recycled) ONLY by exact (pid, ticks) match
+    # against this ledger; anything else fails closed and is never signalled.
+    owned_members: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -529,6 +726,28 @@ class Settings:
             msg = (
                 "LUBKO_LEASE_SAFETY_MARGIN_SECONDS must be non-negative and smaller "
                 "than LUBKO_LEASE_DURATION_SECONDS"
+            )
+            raise ValueError(msg)
+        # Fail-closed ordering invariant: the configured hard client deadline
+        # for an established database operation must fit inside the lease-safety
+        # budget that remains at the latest possible heartbeat attempt. A
+        # refresh starts no later than ``last_heartbeat_at + refresh_interval``
+        # and its group must be terminable before ``last_heartbeat_at +
+        # lease_duration - margin``, so the operation deadline must be strictly
+        # smaller than ``duration - margin - refresh_interval``. Otherwise a
+        # single hung database operation could outlive the safety margin and a
+        # worker would refuse to start rather than run unsafely.
+        if self.db_operation_timeout_seconds >= (
+            self.lease_duration_seconds
+            - self.lease_safety_margin_seconds
+            - self.lease_refresh_interval_seconds
+        ):
+            msg = (
+                "LUBKO_DB_OPERATION_TIMEOUT_SECONDS must be smaller than "
+                "LUBKO_LEASE_DURATION_SECONDS - LUBKO_LEASE_SAFETY_MARGIN_SECONDS "
+                "- LUBKO_LEASE_REFRESH_INTERVAL_SECONDS so a hung established "
+                "database operation can never block past the local lease-safety "
+                "deadline"
             )
             raise ValueError(msg)
 
@@ -1813,19 +2032,23 @@ def drain_sentinel_matches(incarnation: str) -> bool:
         return False
 
 
-def _owned_running_groups(conn: JobsConnection, incarnation: str) -> list[tuple[int, int | None]]:
-    """Return the exact (process group id, start-time ticks) of owned commands.
+def _owned_running_groups(
+    conn: JobsConnection,
+    incarnation: str,
+) -> list[tuple[int, int | None, str]]:
+    """Return the exact identity of owned commands for one incarnation.
 
     Args:
         conn: Open PostgreSQL connection.
         incarnation: The worker incarnation (lifecycle token) to match.
 
     Returns:
-        Pairs of the exact process group id and the persisted command start-time
-        ticks (``None`` when the legacy row never recorded ticks) for every
+        Triples of the exact process group id, the persisted command start-time
+        ticks (``None`` when the legacy row never recorded ticks), and the job
+        row id (as text, usable as the ``LUBKO_JOB_ID`` marker) for every
         running command owned by the incarnation.
     """
-    groups: list[tuple[int, int | None]] = []
+    groups: list[tuple[int, int | None, str]] = []
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT id, (payload::jsonb)->'state'->>'process_pgid',\n"
@@ -1838,6 +2061,7 @@ def _owned_running_groups(conn: JobsConnection, incarnation: str) -> list[tuple[
             {"inc": incarnation},
         )
         for row in cursor.fetchall():
+            row_id = row[0]
             pgid = row[1]
             start_ticks = row[2]
             if pgid is None:
@@ -1852,7 +2076,7 @@ def _owned_running_groups(conn: JobsConnection, incarnation: str) -> list[tuple[
                     start_i = int(str(start_ticks))
                 except ValueError:
                     start_i = None
-            groups.append((pgid_i, start_i))
+            groups.append((pgid_i, start_i, str(row_id)))
     return groups
 
 
@@ -1917,6 +2141,391 @@ def _group_reclaim_decision(pgid: int, start_ticks: int | None) -> GroupReclaimD
 
 
 @dataclass(frozen=True)
+class _OwnedGroupView:
+    """Exact-identity view of one recorded command group at observation time.
+
+    Attributes:
+        leader_ours: ``True`` when the process currently occupying the leader
+            slot (pid == pgid) provably is the recorded command (its live
+            start-time ticks match the persisted identity). The whole numeric
+            group is then ours by construction and may be signalled as such.
+        pids: Live member pids that are provably original members of the
+            recorded group even though the leader slot does not prove it (the
+            leader exited, or the numeric PGID was recycled by an unrelated
+            later leader). Only these pids — never the whole numeric group —
+            may be signalled individually.
+    """
+
+    leader_ours: bool
+    pids: tuple[int, ...]
+
+
+def _group_member_pids(pgid: int) -> list[int]:
+    """Return live pids whose exact process group equals ``pgid``.
+
+    Args:
+        pgid: Process group identifier to inspect.
+
+    Returns:
+        Every live pid in the exact group (empty when none).
+    """
+    proc_dir = Path("/proc")
+    if proc_dir.is_dir():
+        return [
+            int(entry.name)
+            for entry in proc_dir.iterdir()
+            if entry.name.isdigit() and _process_pgrp(int(entry.name)) == pgid
+        ]
+    try:
+        os.getpgid(pgid)
+    except ProcessLookupError:
+        return []
+    return [pgid]
+
+
+if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+
+    def _pidfd_open(pid: int) -> int:
+        """Open a pidfd pinning ``pid`` against kernel pid reuse.
+
+        Args:
+            pid: Process id to pin.
+
+        Returns:
+            The new pid file descriptor; ``OSError`` on failure.
+        """
+        return int(os.pidfd_open(pid))
+
+    def _pidfd_send_signal(pidfd: int, sig: int) -> None:
+        """Deliver ``sig`` to exactly the process pinned by ``pidfd``.
+
+        Args:
+            pidfd: Pinned process file descriptor.
+            sig: Signal number to deliver.
+
+        OSError is raised by the platform binding on failure.
+        """
+        signal.pidfd_send_signal(pidfd, sig)
+
+else:  # pragma: no cover - platform-dependent resolution
+    _LIBC: Final = ctypes.CDLL(None, use_errno=True)
+
+    def _pidfd_open(pid: int) -> int:
+        """Open a pidfd pinning ``pid`` against kernel pid reuse.
+
+        Args:
+            pid: Process id to pin.
+
+        Returns:
+            The new pid file descriptor.
+
+        Raises:
+            OSError: If the pid cannot be pinned.
+        """
+        _LIBC.pidfd_open.argtypes = (ctypes.c_int, ctypes.c_uint)
+        _LIBC.pidfd_open.restype = ctypes.c_int
+        fd = _LIBC.pidfd_open(pid, 0)
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "pidfd_open failed")
+        return int(fd)
+
+    def _pidfd_send_signal(pidfd: int, sig: int) -> None:
+        """Deliver ``sig`` to exactly the process pinned by ``pidfd``.
+
+        Args:
+            pidfd: Pinned process file descriptor.
+            sig: Signal number to deliver.
+
+        Raises:
+            OSError: If delivery fails.
+        """
+        _LIBC.pidfd_send_signal.argtypes = (
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        )
+        _LIBC.pidfd_send_signal.restype = ctypes.c_int
+        if _LIBC.pidfd_send_signal(pidfd, sig, None, 0) != 0:
+            raise OSError(ctypes.get_errno(), "pidfd_send_signal failed")
+
+
+def _pin_and_signal(pid: int, sig: int, expected_ticks: int) -> bool:
+    """Deliver ``sig`` to exactly the process proven as ``pid`` — or nothing.
+
+    The pidfd is opened FIRST, which kernel-pins the numeric pid: the kernel
+    cannot recycle that pid for any other process while this descriptor exists,
+    even if the process exits. Only after pinning is the identity re-checked
+    against ``expected_ticks``; if it matches, the signal goes through
+    ``pidfd_send_signal`` and can therefore hit ONLY the pinned, verified
+    process. A reuse that happens at any point — before or after proof —
+    either fails the ticks re-check or fails the pin itself, so a recycled
+    numeric identity is never signalled.
+
+    Args:
+        pid: Proven member pid to signal.
+        sig: Signal number to deliver.
+        expected_ticks: Start-time ticks the pinned process must still show.
+
+    Returns:
+        ``True`` only when the signal was delivered to the verified process.
+    """
+    try:
+        pidfd = _pidfd_open(pid)
+    except (OSError, AttributeError):
+        # AttributeError: the platform resolves no pidfd binding at all —
+        # fail closed with a controlled refusal, never a crash.
+        LOGGER.debug("process %d could not be pinned", pid)
+        return False
+    try:
+        if proc_start_ticks(pid) != expected_ticks:
+            LOGGER.debug("process %d no longer matches its proven identity", pid)
+            return False
+        _pidfd_send_signal(pidfd, sig)
+    except (OSError, AttributeError):
+        LOGGER.debug("process %d already gone", pid)
+        return False
+    else:
+        return True
+    finally:
+        with suppress(OSError):
+            os.close(pidfd)
+
+
+def _signal_owned_pids(
+    pids: Iterable[int],
+    sig: int,
+    ledger: dict[int, int],
+    marker: str | None = None,
+) -> bool:
+    """Signal provably-owned members individually by pinned exact identity.
+
+    Every individual emission is re-validated just-in-time (live start-time
+    ticks plus exact ledger identity or exact job marker) and then delivered
+    through a pidfd pinned to that exact identity, so PID or PGID recycling
+    between classification, re-proof, and the signal syscall itself can never
+    redirect the signal to an unrelated process.
+
+    Args:
+        pids: Candidate member pids to signal.
+        sig: Signal number to deliver.
+        ledger: Recorded per-member identities for JIT re-proof.
+        marker: Invocation ``LUBKO_JOB_ID`` value for JIT re-proof.
+
+    Returns:
+        ``True`` when at least one member was proven (delivery attempted),
+        ``False`` when nothing was proven.
+    """
+    attempted = False
+    for pid in pids:
+        ticks = _proven_member_ticks(pid, ledger, marker)
+        if ticks is None:
+            continue
+        _pin_and_signal(pid, sig, ticks)
+        attempted = True
+    return attempted
+
+
+def _process_job_id(pid: int) -> str | None:
+    """Return the invocation-specific job marker of a live process.
+
+    Args:
+        pid: Process id whose environment to inspect.
+
+    Returns:
+        The exact ``LUBKO_JOB_ID`` value carried by the process, or ``None``
+        when its environment is unreadable, empty, or lacks the marker.
+    """
+    try:
+        data = (Path("/proc") / str(pid) / "environ").read_bytes()
+    except OSError:
+        return None
+    prefix = f"{JOB_ID_ENV}=".encode()
+    for entry in data.split(b"\0"):
+        if entry.startswith(prefix):
+            return entry[len(prefix) :].decode("utf-8", errors="replace")
+    return None
+
+
+def _proven_member_ticks(
+    pid: int,
+    ledger: dict[int, int],
+    marker: str | None,
+) -> int | None:
+    """Return the proven start-time ticks of a live group member, if any.
+
+    Ledger proof is strongest: the member's live start-time ticks exactly equal
+    the ticks recorded for that pid under a prior positive ownership proof.
+    Failing that, an unproven member is accepted ONLY when its own environment
+    carries exactly ``LUBKO_JOB_ID=<this invocation's id>``: the marker is
+    injected per spawn, so a newer same-worker job (a different UUID) can never
+    satisfy an older invocation's marker. Missing/unreadable/different markers
+    fail closed.
+
+    Args:
+        pid: Candidate member pid.
+        ledger: Recorded per-member identities from positive-proof passes.
+        marker: This invocation's exact ``LUBKO_JOB_ID`` value, or ``None``
+            when no marker proof is available (ledger-only mode).
+
+    Returns:
+        The proven start-time ticks of the member, or ``None`` when it cannot
+        be proven ours right now.
+    """
+    member_ticks = proc_start_ticks(pid)
+    if member_ticks is None:
+        return None
+    if ledger.get(pid) == member_ticks:
+        return member_ticks
+    if marker is not None and _process_job_id(pid) == marker:
+        return member_ticks
+    return None
+
+
+def _ledger_owned_members(
+    pgid: int,
+    ledger: dict[int, int],
+    marker: str | None = None,
+) -> tuple[int, ...]:
+    """Return group members proven ours by exact identity or exact job marker.
+
+    A member counts as ours when either non-reusable proof holds right now:
+    its live start-time ticks exactly equal the ticks recorded for that pid
+    under a prior positive ownership proof (the leader slot provably held the
+    recorded command), or its environment carries exactly this invocation's
+    ``LUBKO_JOB_ID`` marker (see :func:`_proven_member_ticks`). Per-worker
+    ancestry is deliberately NOT used, because it is not invocation-specific —
+    a newer job of the same worker can recycle the numeric PGID and its
+    reparented descendants would then be indistinguishable from the old
+    invocation's. Anything never recorded and carrying no exact marker fails
+    closed: it is never signalled.
+
+    Args:
+        pgid: The recorded process group id.
+        ledger: Recorded per-member identities from positive-proof passes.
+        marker: This invocation's exact ``LUBKO_JOB_ID`` value, or ``None``.
+
+    Returns:
+        The provably-owned member pids (the leader slot itself is excluded).
+    """
+    return tuple(
+        pid
+        for pid in _group_member_pids(pgid)
+        if pid != pgid and _proven_member_ticks(pid, ledger, marker) is not None
+    )
+
+
+def _classify_group(
+    pgid: int,
+    start_ticks: int | None,
+    ledger: dict[int, int],
+    marker: str | None = None,
+) -> _OwnedGroupView:
+    """Classify a numeric group against a persisted exact identity and ledger.
+
+    Membership is *ours* only under non-reusable proof:
+
+    * the live process at the leader slot (pid == pgid) has start-time ticks
+      exactly equal to the persisted identity — the whole numeric group is
+      then ours by construction, and every member's exact identity is recorded
+      into the ledger for later convergence; or
+    * the member matches the positive-proof ledger exactly (pid AND live
+      start-time ticks); or
+    * the member's own environment carries exactly this invocation's
+      ``LUBKO_JOB_ID`` marker (a per-spawn UUID, never satisfiable by a newer
+      same-worker job).
+
+    Anything else — a recycled occupant of the leader slot, its descendants,
+    or members whose provenance cannot be established — fails closed and is
+    never signalled.
+
+    Args:
+        pgid: The recorded process group id.
+        start_ticks: The persisted command start-time ticks (invalid/zero when
+            none was ever obtained).
+        ledger: Per-member identities recorded under positive proof.
+        marker: This invocation's exact ``LUBKO_JOB_ID`` value, or ``None``.
+
+    Returns:
+        The :class:`_OwnedGroupView` proving which parts of the numeric group,
+        if any, still belong to the recorded job.
+    """
+    if not group_has_members(pgid):
+        return _OwnedGroupView(leader_ours=False, pids=())
+    leader_ticks = proc_start_ticks(pgid)
+    if isinstance(start_ticks, int) and start_ticks > 0 and leader_ticks == start_ticks:
+        # The recorded command itself provably occupies the leader slot, so
+        # every current member is its descendant. Snapshot their identities
+        # while this positive proof holds.
+        for pid in _group_member_pids(pgid):
+            member_ticks = proc_start_ticks(pid)
+            if member_ticks is not None:
+                ledger[pid] = member_ticks
+        return _OwnedGroupView(leader_ours=True, pids=())
+    return _OwnedGroupView(
+        leader_ours=False,
+        pids=_ledger_owned_members(pgid, ledger, marker),
+    )
+
+
+def _owned_group_view(job: ActiveJob) -> _OwnedGroupView:
+    """Classify one active job's numeric group against its carried identity.
+
+    Args:
+        job: The active job whose recorded group to inspect.
+
+    Returns:
+        The :class:`_OwnedGroupView` for the job's exact group.
+    """
+    return _classify_group(job.pgid, job.start_ticks, job.owned_members, str(job.id))
+
+
+def _signal_owned_group(job: ActiveJob, sig: int) -> None:
+    """Signal only the provably-owned members of a job's recorded group.
+
+    Bare group signalling is deliberately avoided: a ``killpg`` between proof
+    and syscall could hit a recycled numeric PGID. Instead every live member —
+    including the leader slot when it provably holds the recorded command —
+    is signalled individually. Identity is re-proven immediately before every
+    emission and delivered through a pidfd pinned to that exact identity (see
+    :func:`_pin_and_signal`), so PID or PGID reuse at any point between
+    classification, re-proof, and the kernel call can never redirect the
+    signal to an unrelated process.
+
+    Args:
+        job: The active job whose exact group should receive ``sig``.
+        sig: Signal number to deliver.
+    """
+    view = _owned_group_view(job)
+    marker = str(job.id)
+    candidates = _group_member_pids(job.pgid) if view.leader_ours else list(view.pids)
+    for pid in candidates:
+        # Just-in-time per-pid guard: re-read the identity AND the marker at
+        # emission time; delivery is then bound to that proven identity.
+        ticks = _proven_member_ticks(pid, job.owned_members, marker)
+        if ticks is not None:
+            _pin_and_signal(pid, sig, ticks)
+
+
+def _owned_group_alive(job: ActiveJob) -> bool:
+    """Return whether any member provably belonging to the job's group lives.
+
+    A numerically recycled PGID occupied by an unrelated process does NOT keep
+    the old owned group alive: on identity mismatch the old group is treated
+    as gone so terminalization, drain, and shutdown can never be blocked (nor
+    authorized to signal) by a stranger.
+
+    Args:
+        job: The active job whose recorded group to inspect.
+
+    Returns:
+        ``True`` only when at least one provably-owned member is still alive.
+    """
+    view = _owned_group_view(job)
+    return view.leader_ours or bool(view.pids)
+
+
+@dataclass(frozen=True)
 class ReclaimedGroups:
     """Exact-owned command groups after an emergency recovery pass.
 
@@ -1940,28 +2549,68 @@ class ReclaimedGroups:
     unresolved: list[int]
 
 
-def _terminate_one_group(pgid: int, cancel_grace_seconds: float) -> bool:
-    """Ask one exact process group to terminate, then SIGKILL and reap it.
+def _terminate_one_group(
+    pgid: int,
+    start_ticks: int,
+    cancel_grace_seconds: float,
+    marker: str | None = None,
+) -> bool:
+    """Ask one exact owned process group to terminate, then SIGKILL and reap it.
+
+    The exact identity (persisted start-time ticks) is re-verified at every
+    stage — including immediately before the SIGKILL escalation — so a proof
+    that was valid at SIGTERM time cannot go stale. Bare group signalling is
+    avoided: member identities are recorded into a local ledger while the
+    leader slot provably holds the recorded command, then every live member is
+    signalled individually, re-proven at emission time (exact ledger identity
+    or exact invocation job marker) and delivered through a pidfd pinned to
+    that proven identity, so PID or PGID reuse between classification,
+    re-proof, and the kernel call can never redirect a signal. Convergence is
+    reported only when the leader is no longer provably ours AND every
+    provably-owned member is gone; an unproven live occupant never counts as
+    convergence of the old owned group.
 
     Args:
         pgid: Exact process group id to terminate.
+        start_ticks: Persisted start-time ticks proving ownership of pgid.
         cancel_grace_seconds: Grace before escalating to SIGKILL.
+        marker: Invocation ``LUBKO_JOB_ID`` value enabling marker-based
+            member proof, or ``None`` for ledger-only classification.
 
     Returns:
-        ``True`` only when the group is proven to have no surviving members
-        after the SIGKILL + reap wait, so the caller knows it is safe to treat
-        the recovery as complete.
+        ``True`` only when the old owned group is proven gone — no surviving
+        provably-owned member, and any current numeric occupant is a recycled
+        stranger that must not be touched.
     """
-    _signal_group(pgid, signal.SIGTERM)
+    ledger: dict[int, int] = {}
+
+    def view() -> _OwnedGroupView:
+        return _classify_group(pgid, start_ticks, ledger, marker)
+
+    def emit(view_now: _OwnedGroupView, sig: int) -> bool:
+        # Every emission goes member-by-member through pinned identity; the
+        # numeric group is never signalled wholesale.
+        candidates = _group_member_pids(pgid) if view_now.leader_ours else list(view_now.pids)
+        return _signal_owned_pids(candidates, sig, ledger, marker)
+
+    first = view()
+    # Identity lost between decision and signal: only members re-proven at
+    # emission time may be signalled, never the numeric group.
+    if not emit(first, signal.SIGTERM):
+        return True
     term_deadline = time.monotonic() + cancel_grace_seconds
     while time.monotonic() < term_deadline and group_has_members(pgid):
         time.sleep(0.05)
-    if group_has_members(pgid):
-        _signal_group(pgid, signal.SIGKILL)
+    emit(view(), signal.SIGKILL)
     reap_deadline = time.monotonic() + cancel_grace_seconds
-    while time.monotonic() < reap_deadline and group_has_members(pgid):
+    while time.monotonic() < reap_deadline:
+        current = view()
+        if not (current.leader_ours or current.pids):
+            return True
         time.sleep(0.05)
-    return not group_has_members(pgid)
+    final = view()
+    # Terminal proof must cover the leader AND every provably-owned member.
+    return not (final.leader_ours or final.pids)
 
 
 def recover_owned_job_groups(
@@ -2004,12 +2653,12 @@ def recover_owned_job_groups(
     reaped: list[int] = []
     surviving: list[int] = []
     unresolved: list[int] = []
-    for pgid, start_ticks in groups:
+    for pgid, start_ticks, marker in groups:
         decision = _group_reclaim_decision(pgid, start_ticks)
         if decision is GroupReclaimDecision.GONE:
             continue
         if decision is GroupReclaimDecision.RECLAIM:
-            if _terminate_one_group(pgid, cancel_grace_seconds):
+            if _terminate_one_group(pgid, start_ticks or 0, cancel_grace_seconds, marker):
                 reaped.append(pgid)
             else:
                 surviving.append(pgid)
@@ -3424,9 +4073,17 @@ class Supervisor:
         while not self._stopping:
             try:
                 self._tick(time.monotonic())
+            except DbOperationDeadlineError:
+                # A hung established operation breached its hard client
+                # deadline mid-turn. Enter outage handling and enforce lease
+                # safety immediately rather than sleeping a turn so an owned
+                # group can never outlive its database lease.
+                self._enter_outage()
+                self._enforce_lease_safety()
             except psycopg.Error as exc:
                 if self._is_connectivity_error(exc):
                     self._enter_outage()
+                    self._enforce_lease_safety()
                 else:
                     LOGGER.critical(
                         "unexpected non-connectivity database error "
@@ -3453,7 +4110,28 @@ class Supervisor:
         if self.conn is None:
             self._outage_phase()
             return
+        install_operation_deadline(self.conn, self._operation_deadline(now))
         self._db_phase(now)
+
+    def _operation_deadline(self, now_mono: float) -> float:
+        """Return the hard client deadline for this turn's database operations.
+
+        Derived from the earliest live owned job's lease-safety instant (see
+        :func:`operation_deadline_at`), so no single hung database operation
+        can ever block the supervisor past a local lease-safety deadline.
+
+        Args:
+            now_mono: Current monotonic time.
+
+        Returns:
+            The absolute monotonic operation deadline.
+        """
+        origins = [
+            job.last_heartbeat_at
+            for job in self.active.values()
+            if not job.completed and not job.term_sent and job.last_heartbeat_at > 0.0
+        ]
+        return operation_deadline_at(now_mono, origins, self.settings)
 
     def _service_processes(self) -> None:
         """Observe child exits and escalate in-flight cancellations.
@@ -3954,7 +4632,7 @@ class Supervisor:
         conn = self.conn
         now = time.monotonic()
         for job in list(self.active.values()):
-            if job.quarantined and job.completed and not group_has_members(job.pgid):
+            if job.quarantined and job.completed and not _owned_group_alive(job):
                 cleanup_job(job)
                 job.finalized = True
                 self.active.pop(job.id, None)
@@ -3962,7 +4640,7 @@ class Supervisor:
             if (
                 job.quarantine_pending
                 and job.completed
-                and not group_has_members(job.pgid)
+                and not _owned_group_alive(job)
                 and conn is not None
             ):
                 if now < job.quarantine_next_retry_at:
@@ -4039,7 +4717,7 @@ class Supervisor:
         """
         job.spool_evicted = True
         request_stop(job, STOP_REASON_SPOOL)
-        if not (job.completed and not group_has_members(job.pgid)):
+        if not (job.completed and not _owned_group_alive(job)):
             # Still running (or leftover group members alive): keep ownership
             # until the stop escalation proves the exact group is gone.
             return
@@ -4473,7 +5151,7 @@ class Supervisor:
                 continue
             if job.quarantined or job.quarantine_pending:
                 continue
-            if group_has_members(job.pgid):
+            if _owned_group_alive(job):
                 continue
             self._try_finalize_one_completed(job)
 
@@ -4728,7 +5406,7 @@ class Supervisor:
         conn: JobsConnection,
         job_id: UUID,
         gated: GatedSpawn,
-    ) -> str | None:
+    ) -> tuple[str | None, int]:
         """Obtain and durably persist the exact identity before any release.
 
         Fail-closed ordering: valid positive start-time ticks must be obtained
@@ -4744,10 +5422,14 @@ class Supervisor:
             gated: Handles and exact identity of the gated start.
 
         Returns:
-            The final stderr message when the start failed after convergence
-            (the caller must finalize failed), or ``None`` when persistence
-            positively proved the guarded update of exactly one owned running
-            row.
+            A pair of the final stderr message when the start failed after
+            convergence (the caller must finalize failed) — or ``None`` when
+            persistence positively proved the guarded update of exactly one
+            owned running row — together with the exact start-time ticks that
+            were obtained and persisted (``0`` on any failure). The returned
+            ticks are the authoritative in-memory identity of the command and
+            must be carried onto the active job unchanged, never re-read from
+            ``/proc`` after gate release.
 
         Raises:
             psycopg.Error: When persisting the identity fails with a
@@ -4767,7 +5449,7 @@ class Supervisor:
                     job_id,
                     exc.sqlstate or "N/A",
                 )
-                return "unable to record process identity; job not started"
+                return "unable to record process identity; job not started", 0
             if not persisted:
                 # Fail closed: zero rows matched, so this worker can no longer
                 # positively prove it still owns a same-server running row for
@@ -4778,8 +5460,8 @@ class Supervisor:
                     "for job %s; gated start aborted without executing user code",
                     job_id,
                 )
-                return "unable to record process identity; job not started"
-            return None
+                return "unable to record process identity; job not started", 0
+            return None, start_ticks
         # No durable exact identity exists, so this worker itself must own the
         # childless gated child to convergence before anything else.
         self._abort_and_converge(gated, job_id)
@@ -4789,7 +5471,7 @@ class Supervisor:
             job_id,
             gated.proc.pid,
         )
-        return "unable to record exact process identity; job not started"
+        return "unable to record exact process identity; job not started", 0
 
     def _activate_gated_job(
         self,
@@ -4821,13 +5503,17 @@ class Supervisor:
             converges the exact gated wrapper (terminal and reaped), so no
             untracked live group ever outlives this call.
         """
-        failure = self._pre_release_failure(conn, job_id, gated)
+        failure, start_ticks = self._pre_release_failure(conn, job_id, gated)
         if failure is None:
             # The exact identity is durably recorded. Release the gate so the
             # wrapper execs the user argv on the exact same PID, after which
             # normal supervision applies. A failed release is a start failure:
             # converge the live child first, then finalize failed.
             if release_gate(gated.gate_fd):
+                # Carry the exact ticks that were obtained and persisted before
+                # the gate release: exec keeps the identity, and /proc is never
+                # re-read after release. The member ledger is seeded with the
+                # persisted leader identity itself.
                 return ActiveJob(
                     id=job_id,
                     cwd=job_spec.cwd,
@@ -4837,6 +5523,8 @@ class Supervisor:
                     pgid=gated.pgid,
                     started_mono=time.monotonic(),
                     claimed_at=claim_mono,
+                    start_ticks=start_ticks,
+                    owned_members={gated.proc.pid: start_ticks},
                 )
             self._abort_and_converge(gated, job_id)
             LOGGER.error(
@@ -4996,7 +5684,8 @@ class Supervisor:
                 invariant.
         """
         try:
-            conn = psycopg.connect(
+            _ensure_deadline_bindings()
+            conn = DeadlineConnection.connect(
                 self.database.conninfo(),
                 connect_timeout=max(1, min(5, int(self.settings.db_operation_timeout_seconds))),
                 row_factory=tuple_row,
@@ -5004,6 +5693,9 @@ class Supervisor:
                     f"-c statement_timeout={int(self.settings.db_operation_timeout_seconds * 1000)}"
                 ),
             )
+            # The invariant-verification queries below are established
+            # operations too: bound them by the same hard client deadline.
+            conn.operation_deadline = time.monotonic() + self.settings.db_operation_timeout_seconds
         except psycopg.Error:
             LOGGER.exception("database connection failed")
             self.conn = None
@@ -5060,6 +5752,9 @@ class Supervisor:
         removes the temporary capture files.
         """
         LOGGER.info("shutting down: terminating %d active job(s)", len(self.active))
+        install_operation_deadline(
+            self.conn, time.monotonic() + self.settings.db_operation_timeout_seconds
+        )
         for job in list(self.active.values()):
             if not job.completed and not job.term_sent:
                 request_stop(job, STOP_REASON_SHUTDOWN)
@@ -5069,7 +5764,7 @@ class Supervisor:
             # terminalize/untrack those jobs (their running rows keep the exact
             # persisted identity recoverable by emergency recovery), and fail
             # loudly in the log so the outer authority holds instead of reaping.
-            surviving = [job.pgid for job in self.active.values() if group_has_members(job.pgid)]
+            surviving = [job.pgid for job in self.active.values() if _owned_group_alive(job)]
             LOGGER.error(
                 "shutdown cannot prove groups %s member-free; withholding the "
                 "drain sentinel and retaining their jobs for exact-identity "
@@ -5124,7 +5819,7 @@ class Supervisor:
             with suppress(Exception):
                 job.proc.wait(timeout=self.settings.cancel_grace_seconds)
         self._drain_captures()
-        return all(not group_has_members(job.pgid) for job in self.active.values())
+        return all(not _owned_group_alive(job) for job in self.active.values())
 
     def _observe_and_escalate(self, job: ActiveJob, now: float) -> bool:
         """Poll one child, escalate its in-flight stop, and report whether it is gone.
@@ -5148,7 +5843,7 @@ class Supervisor:
             if returncode is not None:
                 job.completed = True
                 job.returncode = returncode
-        if job.completed and not job.term_sent and group_has_members(job.pgid):
+        if job.completed and not job.term_sent and _owned_group_alive(job):
             LOGGER.info(
                 "reaping leftover process group %d of completed job %s",
                 job.pgid,
@@ -5158,9 +5853,9 @@ class Supervisor:
         if job.term_sent and not job.kill_sent and job.stop_started is not None:
             grace_elapsed = now - job.stop_started >= self.settings.cancel_grace_seconds
             leader_alive = job.proc.poll() is None
-            if grace_elapsed and (leader_alive or group_has_members(job.pgid)):
+            if grace_elapsed and (leader_alive or _owned_group_alive(job)):
                 signal_kill(job)
-        return job.completed and not group_has_members(job.pgid)
+        return job.completed and not _owned_group_alive(job)
 
     def _finalize_all_for_shutdown(self, *, retain_groups: list[int] | None = None) -> None:
         """Finalize every tracked job when PostgreSQL is available.
@@ -5265,7 +5960,7 @@ def request_stop(job: ActiveJob, reason: str) -> None:
     job.stop_started = time.monotonic()
     job.stop_reason = reason
     job.cancellation_note = _stop_note(reason)
-    _signal_group(job.pgid, signal.SIGTERM)
+    _signal_owned_group(job, signal.SIGTERM)
 
 
 def request_group_reap(job: ActiveJob) -> None:
@@ -5284,7 +5979,7 @@ def request_group_reap(job: ActiveJob) -> None:
         return
     job.term_sent = True
     job.stop_started = time.monotonic()
-    _signal_group(job.pgid, signal.SIGTERM)
+    _signal_owned_group(job, signal.SIGTERM)
 
 
 def signal_kill(job: ActiveJob) -> None:
@@ -5294,7 +5989,7 @@ def signal_kill(job: ActiveJob) -> None:
         job: The active job whose group still has members.
     """
     job.kill_sent = True
-    _signal_group(job.pgid, signal.SIGKILL)
+    _signal_owned_group(job, signal.SIGKILL)
     if job.cancellation_note is not None:
         job.cancellation_note = f"{job.cancellation_note}; grace period expired, sent SIGKILL"
 

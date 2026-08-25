@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -33,10 +34,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
-import psycopg
-from psycopg.rows import tuple_row
-
 from lubko import cli, supervise
+from lubko._pg import psycopg, tuple_row
 from lubko.config import load_database_config
 from lubko.durable import write_json_durable
 from lubko.lifecycle import (
@@ -65,6 +64,8 @@ from lubko.worker import JOB_ID_ENV
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+LOGGER: Final = logging.getLogger(__name__)
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
@@ -1021,6 +1022,54 @@ def _complete_handoff(
         raise
 
 
+def _converge_unproven_spawn(proc: subprocess.Popen[bytes], grace_seconds: float) -> None:
+    """Terminate and reap a spawned worker whose identity was never proven.
+
+    ``_wait_for_identity`` returns ``None`` for two distinct conditions: an
+    already-exited child (an ordinary retryable rollback failure) and a child
+    that is still alive when the identity deadline expires. A live child is
+    never forgotten (#182, mirroring the supervisor #177 design): while it is
+    still this controller's direct ``Popen`` child it is converged with exact
+    single-PID signals — never group signals — and its exit is positively
+    proven by reaping. If even ``SIGKILL`` cannot prove exit, this function
+    fails closed by blocking on the reap, so no caller can ever proceed to a
+    retry that would spawn a second previous-commit worker alongside the
+    unresolved first child.
+
+    Args:
+        proc: The direct ``Popen`` handle of the spawned child.
+        grace_seconds: Grace period before the emergency single-PID force-kill.
+    """
+    if proc.poll() is not None:
+        # Already exited before its identity was established: an ordinary
+        # retryable failure with nothing left to converge.
+        return
+    LOGGER.error(
+        "worker pid %d is live without an acceptable identity; converging it",
+        proc.pid,
+    )
+    grace = max(grace_seconds, 0.0)
+    with suppress(OSError):
+        proc.terminate()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        return
+    with suppress(OSError):
+        proc.kill()
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        LOGGER.exception(
+            "worker pid %d cannot be converged by exact identity after SIGKILL; "
+            "failing closed until it provably exits",
+            proc.pid,
+        )
+        proc.wait()
+
+
 def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     """Restore the previous known-good worker process.
 
@@ -1059,6 +1108,7 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
         return None
     identity = _wait_for_identity(proc)
     if identity is None:
+        _converge_unproven_spawn(proc, state.stop_grace_seconds)
         return None
     meta = WorkerMeta(
         schema_version=SCHEMA_VERSION,
@@ -2012,6 +2062,16 @@ send_helper_response = _send_helper_response
 send_helper_error = _send_helper_error
 wait_for_durable_success = _wait_for_durable_success
 handoff_durable_wait_seconds = HANDOFF_DURABLE_WAIT_SECONDS
+
+# Public protocol-parsing helpers: the JSON request/response contract of the
+# controller protocol is a stable interface exercised directly by the tests.
+parse_request = _parse_request
+request_type = _request_type
+checkout_failure_exit_code = _checkout_failure_exit_code
+
+# Public rollback-spawn convergence helper: previous-worker replacement is a
+# stable rollback contract exercised directly by the tests.
+restart_previous = _restart_previous
 
 
 def main(argv: list[str] | None = None) -> int:
