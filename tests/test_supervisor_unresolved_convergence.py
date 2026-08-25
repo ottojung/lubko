@@ -11,6 +11,10 @@ from __future__ import annotations
 import errno
 import os
 import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,8 +22,8 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-from lubko import supervisor
-from lubko.supervise import UnresolvedChild
+from lubko import supervise, supervisor
+from lubko.supervise import UnresolvedChild, proc_start_ticks, read_state
 
 type TicksMap = dict[int, int | None]
 
@@ -244,3 +248,179 @@ def test_unpinnable_process_preserves_the_hold(converge: FakePinning) -> None:
 
     assert converged is False
     assert fake.delivered == []
+
+
+# ---------------------------------------------------------------------------
+# Owned direct-child zombie reaping
+# ---------------------------------------------------------------------------
+
+
+def _spawn_blocking_child() -> subprocess.Popen[bytes]:
+    """Spawn a real child that stays alive until killed.
+
+    Returns:
+        The live ``Popen`` child of this test process.
+    """
+    return subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _wait_zombie(pid: int) -> None:
+    """Busy-wait without sleeping until ``pid`` is an unreaped zombie.
+
+    Args:
+        pid: The PID to observe.
+
+    Raises:
+        AssertionError: When ``pid`` never reaches zombie state.
+    """
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+        except OSError:
+            continue
+        close_paren = stat.rfind(b")")
+        if close_paren != -1 and stat[close_paren + 2 :].split()[0] == b"Z":
+            return
+    msg = "child never became a zombie"
+    raise AssertionError(msg)
+
+
+def _owned_daemon(proc: subprocess.Popen[bytes]) -> supervisor.SupervisorDaemon:
+    """Build a daemon owning ``proc`` as its direct child.
+
+    Args:
+        proc: The direct ``Popen`` child to assign to the daemon.
+
+    Returns:
+        A daemon whose ``self.proc`` is exactly ``proc``.
+    """
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings(stop_grace_seconds=5.0))
+    daemon.proc = proc
+    return daemon
+
+
+def test_owned_zombie_child_is_reaped_and_the_hold_clears() -> None:
+    """An exited-but-unreaped owned direct child converges instead of blocking.
+
+    After the pinned TERM/KILL kills our own direct Popen child, the child
+    remains visible in /proc with its original start ticks until it is
+    reaped. Liveness for such an owned hold must be decided by reaping, so
+    convergence succeeds immediately rather than treating the zombie as live
+    forever.
+    """
+    proc = _spawn_blocking_child()
+    try:
+        ticks = proc_start_ticks(proc.pid)
+        assert ticks is not None
+        os.kill(proc.pid, signal.SIGKILL)
+        _wait_zombie(proc.pid)
+        # The unreaped zombie still reports its exact recorded start ticks.
+        assert proc_start_ticks(proc.pid) == ticks
+
+        converged = _owned_daemon(proc)._converge_unresolved(_hold(pid=proc.pid, ticks=ticks))
+
+        assert converged is True
+        assert proc.poll() is not None, "the zombie was positively reaped"
+    finally:
+        proc.poll()
+
+
+def test_owned_live_child_converges_through_pinned_term(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live owned child receives pinned TERM and its exit is positively reaped."""
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    proc = _spawn_blocking_child()
+    try:
+        ticks = proc_start_ticks(proc.pid)
+        assert ticks is not None
+
+        converged = _owned_daemon(proc)._converge_unresolved(_hold(pid=proc.pid, ticks=ticks))
+
+        assert converged is True
+        assert proc.poll() is not None, "the exited child was reaped"
+    finally:
+        proc.poll()
+
+
+def test_foreign_zombie_is_never_treated_as_owned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zombie that is not our still-owned direct child never clears a hold."""
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    proc = _spawn_blocking_child()
+    try:
+        ticks = proc_start_ticks(proc.pid)
+        assert ticks is not None
+        os.kill(proc.pid, signal.SIGKILL)
+        _wait_zombie(proc.pid)
+
+        daemon = supervisor.SupervisorDaemon(supervisor.Settings(stop_grace_seconds=0.05))
+        daemon.proc = None
+        converged = daemon._converge_unresolved(_hold(pid=proc.pid, ticks=ticks))
+
+        assert converged is False
+    finally:
+        proc.poll()
+
+
+def _state_with_hold(hold: UnresolvedChild) -> supervise.SupervisorState:
+    """Build a minimal durable state carrying only ``hold``.
+
+    Args:
+        hold: The unresolved-child hold to persist.
+
+    Returns:
+        A valid durable supervisor state.
+    """
+    return supervise.SupervisorState(
+        schema_version=supervise.SCHEMA_VERSION,
+        applied_generation=0,
+        mode=supervise.MODE_RUN,
+        commit=None,
+        child=None,
+        unresolved_child=hold,
+        ownership_hold_malformed=False,
+        unresolved_hold_malformed=False,
+        intent=supervise.INTENT_RUN,
+        restart_count=0,
+        next_attempt_at=None,
+        last_exit=None,
+        last_spawn_at=None,
+        ready=False,
+        next_readiness_at=None,
+        boot_id=None,
+    )
+
+
+def test_resolve_unresolved_child_clears_the_durable_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Converging an owned zombie clears the persisted hold, not just in memory.
+
+    The zombie is a real unreaped direct child of the test process, so the
+    full resolution path — convergence by kernel-proven ownership followed by
+    a durable state write — runs without any sleeping.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    proc = _spawn_blocking_child()
+    try:
+        ticks = proc_start_ticks(proc.pid)
+        assert ticks is not None
+        os.kill(proc.pid, signal.SIGKILL)
+        _wait_zombie(proc.pid)
+        hold = _hold(pid=proc.pid, ticks=ticks)
+        supervise.write_state(_state_with_hold(hold))
+
+        daemon = supervisor.SupervisorDaemon(supervisor.Settings(stop_grace_seconds=5.0))
+        daemon.proc = proc
+
+        assert daemon._resolve_unresolved_child() is True
+        assert read_state().unresolved_child is None, "the durable hold was cleared"
+        assert proc.poll() is not None, "the zombie was positively reaped"
+    finally:
+        proc.poll()

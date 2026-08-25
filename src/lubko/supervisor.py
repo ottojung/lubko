@@ -1566,8 +1566,53 @@ class SupervisorDaemon:
             )
         )
 
-    @staticmethod
-    def _unresolved_alive(hold: UnresolvedChild) -> bool:
+    def _owned_hold_child(self, hold: UnresolvedChild) -> subprocess.Popen[bytes] | None:
+        """Return our direct ``Popen`` child when the kernel proves the hold is its exit.
+
+        Ownership is proven by kernel parentage rather than bookkeeping alone:
+        only a live or unreaped direct child of this very process can be
+        waited for, so a successful ``waitpid(WNOHANG)`` proves the recorded
+        PID is exactly our own still-unreaped child — and simultaneously reaps
+        it when it has already exited — while ``ECHILD`` proves the PID does
+        not belong to any unreaped child of ours. A foreign or arbitrary
+        zombie is therefore never claimed, and because the kernel cannot
+        recycle the numeric PID of an unreaped child, no recycled identity can
+        slip through either. When start-time ticks were recorded they must
+        additionally still match the live instance.
+
+        Relying on ``self.proc`` as the wait target rests on a structural
+        daemon invariant: while an unresolved hold survives on disk, no
+        replacement worker can be spawned, because the only writer of a fresh
+        ``self.proc`` (``_spawn_worker``) is reachable solely through
+        ``_ensure_worker``, which first runs ``_resolve_unresolved_child()``
+        and refuses to proceed until the durable hold has been cleared; after
+        a supervisor restart ``self.proc`` is ``None``. The ``waitpid`` parentage
+        proof above remains sound independently of that invariant.
+
+        Args:
+            hold: The recorded authority-free hold.
+
+        Returns:
+            The owned direct child handle, or ``None`` when the hold does not
+            correspond to a still-owned, kernel-proven direct child.
+        """
+        proc = self.proc
+        if proc is None or proc.pid != hold.pid:
+            return None
+        try:
+            os.waitpid(proc.pid, os.WNOHANG)
+        except ChildProcessError:
+            # The kernel itself proves this PID is not an unreaped direct
+            # child of this process: nothing owned can be converged here.
+            return None
+        if (
+            hold.start_time_ticks is not None
+            and proc_start_ticks(hold.pid) != hold.start_time_ticks
+        ):
+            return None
+        return proc
+
+    def _unresolved_alive(self, hold: UnresolvedChild) -> bool:
         """Return whether the exact unresolved child instance is still alive.
 
         Args:
@@ -1576,8 +1621,15 @@ class SupervisorDaemon:
         Returns:
             ``True`` only when a live process matches the recorded PID *and*
             start time ticks (when ticks were observed), so a recycled PID can
-            never extend the hold.
+            never extend the hold. When the hold corresponds to our own
+            kernel-proven direct child, an exited child — including its
+            unreaped zombie state — has already been positively reaped by the
+            ownership proof itself and is gone instead of looking alive
+            forever.
         """
+        child = self._owned_hold_child(hold)
+        if child is not None:
+            return child.poll() is None
         if hold.start_time_ticks is None:
             return proc_start_ticks(hold.pid) is not None
         return proc_start_ticks(hold.pid) == hold.start_time_ticks
