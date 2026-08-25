@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import logging
 import os
 import secrets
 import signal
@@ -58,6 +59,8 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from lubko.worker import JobsConnection
+
+LOGGER = logging.getLogger(__name__)
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
@@ -846,20 +849,140 @@ def worker_env(token: str) -> dict[str, str]:
 def _wait_for_identity(pid: int) -> ProcessIdentity | None:
     """Wait until a spawned process establishes its session and group.
 
+    On timeout the *last observed* identity is returned even when it does not
+    yet satisfy ``pgid == pid == sid``: that observation is the only exact
+    pre-transition ownership anchor (PID plus start-time ticks) available for
+    converging a child whose PGID/SID transitions after the deadline, and it
+    is lost if the timeout collapses into ``None``. ``None`` therefore means
+    only that the process was never observable (already dead). Callers must
+    explicitly reject a returned identity that is not a private session and
+    hand the observed identity to :func:`_converge_unproven_spawn`.
+
     Args:
         pid: Process ID of the spawned worker.
 
     Returns:
-        The exact identity, or ``None`` if the process died first.
+        The exact private-session identity once observed, otherwise the last
+        observed identity at the timeout, or ``None`` if the process died
+        before any identity could be read.
     """
     deadline = time.monotonic() + SESSION_ESTABLISH_TIMEOUT_SECONDS
+    last_observed: ProcessIdentity | None = None
     while True:
         identity = process_identity(pid)
         if identity is not None and identity.pgid == pid and identity.sid == pid:
             return identity
+        if identity is not None:
+            # Keep the newest non-private observation: the final poll before
+            # the deadline can transiently return None (for example when the
+            # /proc entry is momentarily unreadable) without discarding the
+            # exact startup anchor.
+            last_observed = identity
         if time.monotonic() >= deadline:
-            return identity
+            return last_observed
         time.sleep(SESSION_WAIT_INTERVAL_SECONDS)
+
+
+def _signal_pinned_anchor(pin: int, pid: int, anchor: ProcessIdentity, sig: int) -> None:
+    """Deliver ``sig`` to the pinned process only while its anchor still holds.
+
+    The pinned descriptor addresses the exact kernel process instance, so
+    delivery itself can never hit a recycled PID. The preceding re-proof is a
+    safety gate in the direction of refusing to signal: the occupant observed
+    through ``/proc`` must still be the exact anchored instance (same PID and
+    same start-time ticks; PGID/SID may legitimately have transitioned), so a
+    recycled numeric occupant is never signalled.
+
+    Args:
+        pin: pidfd pinning the exact process instance.
+        pid: Numeric PID, used only for the ``/proc`` identity re-proof.
+        anchor: The exact identity observed for this child earlier.
+        sig: Signal to deliver.
+    """
+    observed = process_identity(pid)
+    if observed is None or observed.pid != anchor.pid:
+        LOGGER.error("pinned process %d is no longer observable; not signalling", pid)
+        return
+    if observed.start_time_ticks != anchor.start_time_ticks:
+        LOGGER.error(
+            "pinned process %d no longer matches its anchored start-time ticks; "
+            "it is a different process instance and is never signalled",
+            pid,
+        )
+        return
+    with suppress(OSError):
+        pidfd_send_signal(pin, sig)
+
+
+def _converge_unproven_spawn(
+    proc: subprocess.Popen[bytes],
+    grace_seconds: float,
+    anchor: ProcessIdentity | None,
+) -> None:
+    """Terminate and reap a spawned worker whose identity was never proven.
+
+    ``_wait_for_identity`` returns a non-private identity (or ``None``) for a
+    child that is still alive when the identity deadline expires. Such a child
+    is never forgotten: while it is still this deployer's direct ``Popen``
+    child — which is itself the lifecycle authority over it — it is converged
+    exactly. When the caller observed a pre-timeout identity, that observation
+    is the ownership anchor: the numeric PID is pinned with a pidfd, the
+    occupant is re-proved under the pin against the anchor's PID and
+    start-time ticks (PGID/SID transitions are tolerated), and TERM/KILL
+    escalation is delivered only through ``pidfd_send_signal`` on that pin, so
+    neither a broad group nor a recycled numeric PID can ever absorb a signal
+    — including when the original child exits between the anchor observation
+    and the pin and its PID is reused. Without an anchor, or when the anchor
+    cannot be re-proved under the pin, nothing is signalled at all and this
+    function fails closed by positively reaping the original direct child
+    before returning, so no unresolved child can coexist with another worker.
+
+    Args:
+        proc: The direct ``Popen`` handle of the spawned child.
+        grace_seconds: Grace period before the emergency force-kill.
+        anchor: The exact identity observed for the child, or ``None``.
+    """
+    if proc.poll() is not None:
+        # Already exited before its identity was established: an ordinary
+        # retryable failure with nothing left to converge.
+        return
+    LOGGER.error(
+        "worker pid %d is live without an acceptable identity; converging it",
+        proc.pid,
+    )
+    grace = max(grace_seconds, 0.0)
+    if anchor is not None:
+        try:
+            pin = _open_exact_pidfd(anchor.pid)
+        except (OSError, AttributeError):
+            LOGGER.exception(
+                "worker pid %d could not be pinned; no signal can be authorized", anchor.pid
+            )
+            pin = None
+        if pin is not None:
+            try:
+                with suppress(OSError):
+                    _signal_pinned_anchor(pin, anchor.pid, anchor, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    return
+                with suppress(OSError):
+                    _signal_pinned_anchor(pin, anchor.pid, anchor, signal.SIGKILL)
+            finally:
+                with suppress(OSError):
+                    os.close(pin)
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        LOGGER.exception(
+            "worker pid %d cannot be converged by exact identity; "
+            "failing closed until it provably exits",
+            proc.pid,
+        )
+        proc.wait()
 
 
 def _live_group_member_pids(pgid: int) -> list[int]:
@@ -1837,7 +1960,20 @@ def _deploy_direct(
 
     identity = _wait_for_identity(proc.pid)
     if identity is None:
-        _err("replacement worker exited before establishing its identity")
+        if proc.poll() is None:
+            # Never observable yet still live: no exact anchor exists, so
+            # convergence may only fail closed and reap the direct child.
+            _err("replacement worker stayed live without an observable identity; converging it")
+        else:
+            _err("replacement worker exited before establishing its identity")
+        _converge_unproven_spawn(proc, options.stop_grace_seconds, None)
+        raise DeployAbortedError
+    if identity.pgid != proc.pid or identity.sid != proc.pid:
+        _err(
+            "replacement worker timed out before establishing its private session; "
+            "converging it before aborting"
+        )
+        _converge_unproven_spawn(proc, options.stop_grace_seconds, identity)
         raise DeployAbortedError
 
     new_meta = WorkerMeta(
