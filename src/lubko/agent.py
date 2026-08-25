@@ -1494,6 +1494,119 @@ class _RunnerContext:
     env: dict[str, str]
 
 
+def _claim_pending_prompt(aid: str, prompt: str) -> bool:
+    """Claim the accepted pending prompt for this runner invocation.
+
+    Linearizes the spawn against stop/kill (issue #185): the claim under the
+    metadata lock refuses when a durably recorded stop-like intent or reason
+    exists, so a prompt accepted before a concurrent stop can never be started
+    by a stale runner read — whichever side wins the lock decides.
+
+    Args:
+        aid: Lubko agent ID.
+        prompt: The exact prompt this invocation is about to run.
+
+    Returns:
+        ``True`` when the prompt was claimed and may be spawned.
+    """
+    claimed: dict[str, bool] = {}
+
+    def claim(m: Meta) -> None:
+        if (
+            m.get("delete_pending")
+            or m.get("intent") in STOP_REASONS
+            or m.get("stop_reason") in STOP_REASONS
+        ):
+            return
+        _clear_pending(m, prompt)
+        claimed["ok"] = True
+
+    update_meta(aid, claim)
+    if not claimed.get("ok"):
+        update_meta(aid, lambda m: _set_active_runner(m, value=False))
+        return False
+    return True
+
+
+def _spawn_and_run(
+    ctx: _RunnerContext,
+    aid: str,
+    cmd: list[str],
+    iid: str,
+    *,
+    is_continue: bool,
+) -> int | None:
+    """Spawn one invocation process, wait for it, and record its result.
+
+    The spawn is linearized against stop/kill (issue #185): if a concurrent
+    stop/kill durably records its intent between the prompt claim and the
+    running-record lock, the freshly spawned process is never tracked as
+    running and is killed immediately instead.
+
+    Args:
+        ctx: Shared runner context.
+        aid: Lubko agent ID.
+        cmd: The exact agent command argv to execute.
+        iid: The durable invocation ID stamped into the spawned environment.
+        is_continue: Whether this invocation continues an existing session.
+
+    Returns:
+        The invocation's return code, or ``None`` when the runner must stop
+        without draining further queued work.
+    """
+    try:
+        log = ctx.log_path.open("ab")
+    except OSError as exc:
+        # Fail closed on real spool/log failures (e.g. EACCES, EIO, EDQUOT);
+        # only an intentionally deleted agent directory exits benignly.
+        if isinstance(exc, FileNotFoundError) and not agent_dir(aid).is_dir():
+            return None  # agent directory intentionally deleted; metadata is gone
+        _fail_invocation_closed(aid, f"failed to open agent log: {exc}")
+        return None
+    with log:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                cwd=ctx.cwd,
+                start_new_session=True,
+                close_fds=True,
+                env=ctx.env,
+            )
+        except OSError as exc:
+            error = str(exc)
+            log.write(f"LUBKO RUNNER: failed to start agent: {error}\n".encode("utf-8", "replace"))
+            _fail_invocation_closed(aid, error, exit_code=127)
+            return None
+
+        start = proc_start_ticks(proc.pid)
+        # The record is conditional (issue #185): see ``_spawn_and_run``.
+        blocked: dict[str, bool] = {}
+        update_meta(aid, _record_running(proc, start, iid, blocked))
+        if blocked.get("stopped"):
+            # The freshly spawned invocation lost the race against stop/kill;
+            # converge it instead of leaving it running untracked.
+            _kill_unrecorded_invocation(proc)
+            return None
+
+        try:
+            rc = _wait_for_invocation_exit(proc, aid, is_continue=is_continue)
+        except BaseException:
+            # Abnormal runner exit: never leave the invocation process group
+            # running untracked, and never leave the agent stuck "running".
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(OSError):
+                proc.wait()
+            update_meta(aid, _finalize_abort())
+            raise
+        update_meta(aid, _finalize_after(rc))
+
+    return rc
+
+
 def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> str | None:
     """Run one agent invocation and decide whether a queued steer follows.
 
@@ -1530,49 +1643,14 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
         )
         update_meta(aid, lambda m: _set_active_runner(m, value=False))
         return None
-    update_meta(aid, lambda m: _clear_pending(m, prompt))
-    try:
-        log = ctx.log_path.open("ab")
-    except OSError as exc:
-        # Fail closed on real spool/log failures (e.g. EACCES, EIO, EDQUOT);
-        # only an intentionally deleted agent directory exits benignly.
-        if isinstance(exc, FileNotFoundError) and not agent_dir(aid).is_dir():
-            return None  # agent directory intentionally deleted; metadata is gone
-        _fail_invocation_closed(aid, f"failed to open agent log: {exc}")
+    # Linearize the spawn against stop/kill (issue #185): see
+    # ``_claim_pending_prompt``.
+    if not _claim_pending_prompt(aid, prompt):
         return None
-    with log:
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=log,
-                cwd=ctx.cwd,
-                start_new_session=True,
-                close_fds=True,
-                env=ctx.env,
-            )
-        except OSError as exc:
-            error = str(exc)
-            log.write(f"LUBKO RUNNER: failed to start agent: {error}\n".encode("utf-8", "replace"))
-            _fail_invocation_closed(aid, error, exit_code=127)
-            return None
 
-        start = proc_start_ticks(proc.pid)
-        update_meta(aid, _record_running(proc, start, iid))
-
-        try:
-            rc = _wait_for_invocation_exit(proc, aid, is_continue=is_continue)
-        except BaseException:
-            # Abnormal runner exit: never leave the invocation process group
-            # running untracked, and never leave the agent stuck "running".
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            with contextlib.suppress(OSError):
-                proc.wait()
-            update_meta(aid, _finalize_abort())
-            raise
-        update_meta(aid, _finalize_after(rc))
+    rc = _spawn_and_run(ctx, aid, cmd, iid, is_continue=is_continue)
+    if rc is None:
+        return None
 
     return _drain_next(aid)
 
@@ -1624,8 +1702,27 @@ def _wait_for_invocation_exit(
     return proc.wait()
 
 
+def _kill_unrecorded_invocation(proc: subprocess.Popen[bytes]) -> None:
+    """Kill a freshly spawned invocation that lost the stop/kill race.
+
+    The spawn gate (``_record_running``) refused to track the process because a
+    concurrent stop/kill durably recorded its intent first, so the invocation
+    is converged immediately instead of running untracked.
+
+    Args:
+        proc: The just-spawned agent process.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        proc.wait()
+
+
 def _record_running(
-    proc: subprocess.Popen[bytes], start: int | None, iid: str
+    proc: subprocess.Popen[bytes],
+    start: int | None,
+    iid: str,
+    blocked: dict[str, bool],
 ) -> Callable[[Meta], None]:
     """Return a metadata mutation that records a running agent process.
 
@@ -1633,12 +1730,23 @@ def _record_running(
         proc: The spawned agent process.
         start: The process start time in clock ticks.
         iid: The durable invocation ID stamped into the spawned environment.
+        blocked: Caller-owned mapping set to ``{"stopped": True}`` when a
+            concurrently recorded stop/kill intent (or deletion tombstone)
+            won the linearization race and the invocation must not be
+            tracked as running.
 
     Returns:
         The metadata mutation.
     """
 
     def record(m: Meta) -> None:
+        if (
+            m.get("delete_pending")
+            or m.get("intent") in STOP_REASONS
+            or m.get("stop_reason") in STOP_REASONS
+        ):
+            blocked["stopped"] = True
+            return
         m["pid"] = proc.pid
         m["pgid"] = proc.pid
         m["start_time"] = start
@@ -3378,6 +3486,167 @@ def _finish_stop_like(
     return EXIT_OK
 
 
+def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
+    """Durably record the stop-like cancellation of runner-owned work.
+
+    When no invocation process group is live but a runner reservation, a
+    proven-live runner, or an accepted ``pending_prompt`` can still start
+    work, this establishes the stop-like decision in the same locked
+    transaction that observed that ownership: the pending prompt and steer
+    queue are dropped, the durable stop reason deactivates the runner, and any
+    unclaimed reservation is dropped so a later claim fails closed.  The
+    terminal record is written only after the exact observed runner identity
+    is converged (see ``_converge_observed_runner``), so success is never
+    reported while the pre-existing execution authority is still alive.
+
+    The mutation is guarded by the exact observed ownership snapshot
+    (invocation identity, pending prompt, and reservation generation), so a
+    concurrently accepted newer invocation is never cancelled by a stale
+    observation.
+
+    Args:
+        aid: Lubko agent ID.
+        intent: The stop-like intent (``stop`` or ``kill``).
+        meta: The pre-lock metadata snapshot that justified the cancellation.
+
+    Returns:
+        ``True`` only when the cancellation was applied under the lock.
+    """
+    identity = _invocation_identity(meta)
+    expected_pending = meta.get("pending_prompt")
+    res = meta.get("runner_reservation")
+    expected_gen = res.get("gen") if isinstance(res, dict) else None
+    applied = False
+
+    def cancel(m: Meta) -> None:
+        nonlocal applied
+        cur_res = m.get("runner_reservation")
+        cur_gen = cur_res.get("gen") if isinstance(cur_res, dict) else None
+        if (
+            _invocation_identity(m) != identity
+            or m.get("pending_prompt") != expected_pending
+            or cur_gen != expected_gen
+        ):
+            return
+        _begin_stop_like(m, intent)
+        m["stop_reason"] = intent
+        _set_active_runner(m, value=False)
+        applied = True
+
+    update_meta(aid, cancel)
+    return applied
+
+
+def _runner_identity_state(pid: int, ticks: object, aid: str) -> str:
+    """Classify the exact observed runner identity's liveness evidence.
+
+    Transient ``/proc`` read failures must never be mistaken for death, so
+    this distinguishes three states instead of a boolean: positively alive,
+    positively gone (process exited, or provably replaced by a different
+    start-time identity such as after PID reuse), and unprovable (the process
+    is alive but its start ticks or environment marker cannot be read).
+    Unprovable keeps convergence fail-closed: only positive evidence counts.
+
+    Args:
+        pid: The observed runner process ID.
+        ticks: The observed runner start time in clock ticks.
+        aid: Exact agent ID whose environment marker must match.
+
+    Returns:
+        ``"alive"``, ``"gone"``, or ``"unprovable"``.
+    """
+    if not pid_alive(pid):
+        return "gone"
+    if _is_zombie(pid):
+        # A defunct process has no execution authority left.
+        return "gone"
+    current = proc_start_ticks(pid)
+    if current is None:
+        return "unprovable"
+    if current != ticks:
+        # Provably a different start identity occupies the PID now.
+        return "gone"
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return "unprovable"
+    marker = f"LUBKO_AGENT_ID={aid}".encode()
+    return "alive" if marker in environ.split(b"\0") else "unprovable"
+
+
+def _converge_observed_runner(observed: Meta, mode: str) -> bool:
+    """Converge the exact observed runner identity before terminalizing.
+
+    The runner recorded in ``observed`` is signalled by its exact identity
+    (start ticks plus per-agent marker, like deletion's convergence), never by
+    a broad match.  A runner recorded later in metadata (a post-cancellation
+    re-reservation by an explicit new prompt) is never signalled; once the
+    observed identity is *positively* proven gone (exited, or provably
+    replaced by a different start identity), the pre-existing execution
+    authority it carried is converged regardless of what metadata names now.
+    Identity that is merely unprovable (unreadable ``/proc`` data) is never
+    counted as death: convergence keeps retrying within its bounded window
+    and fails closed instead.
+
+    Args:
+        observed: The metadata snapshot taken when the cancellation was
+            decided.
+        mode: ``stop`` for graceful-then-forced termination of the runner,
+            ``kill`` for an immediate forced kill.
+
+    Returns:
+        ``True`` only when the observed runner identity is provably gone.
+    """
+    pid = observed.get("runner_pid")
+    if not pid:
+        # No runner was ever recorded (reserved pre-spawn window); nothing to
+        # converge beyond dropping the reservation.
+        return True
+    pid = int(pid)
+    ticks = observed.get("runner_start_time")
+    marker_aid = str(observed.get("id", ""))
+    grace_signal = signal.SIGTERM if mode == "stop" else signal.SIGKILL
+    signal_identity_checked(pid, ticks, grace_signal, marker_aid=marker_aid)
+
+    def positively_gone() -> bool:
+        return _runner_identity_state(pid, ticks, marker_aid) == "gone"
+
+    deadline = time.time() + (STOP_WAIT_SECONDS if mode == "stop" else KILL_WAIT_SECONDS)
+    while time.time() < deadline:
+        if positively_gone():
+            return True
+        time.sleep(0.05)
+    if positively_gone():
+        return True
+    if mode == "stop":
+        # Grace period expired: escalate exactly like the invocation-group
+        # path so no managed runner survives a successful stop.
+        signal_identity_checked(pid, ticks, signal.SIGKILL, marker_aid=marker_aid)
+        deadline = time.time() + KILL_WAIT_SECONDS
+        while time.time() < deadline:
+            if positively_gone():
+                return True
+            time.sleep(0.05)
+    return False
+
+
+def _no_invocation_owned(meta: Meta) -> bool:
+    """Return whether nothing beyond a live invocation could still start work.
+
+    Args:
+        meta: Agent metadata.
+
+    Returns:
+        ``True`` when no proven-live runner, in-flight reservation, or
+        accepted pending prompt remains.
+    """
+    return (
+        not runner_alive(meta)
+        and not reservation_in_flight(meta)
+        and not meta.get("pending_prompt")
+    )
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     """Gracefully stop a running agent.
 
@@ -3389,6 +3658,12 @@ def cmd_stop(args: argparse.Namespace) -> int:
     invocation while the old one is being stopped, the newer record is never
     overwritten and the command reports failure instead of false success.
 
+    Even with no live invocation process group, a reserved-but-unclaimed
+    runner, a proven-live runner between invocations, or an accepted pending
+    prompt could still start work; stop cancels exactly that owned work under
+    the per-agent metadata lock instead of reporting false quiescence
+    (issue #185).
+
     Args:
         args: Parsed command arguments.
 
@@ -3400,35 +3675,21 @@ def cmd_stop(args: argparse.Namespace) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    if not is_alive(meta) and not group_alive(meta):
-        _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
-        return EXIT_OK
-    identity = _invocation_identity(meta)
-    if not _update_meta_if_same_invocation(aid, identity, lambda m: _begin_stop_like(m, "stop")):
-        _err(f"{PROG}: agent {aid} changed during stop; newer invocation left running untouched")
-        return EXIT_ERROR
-    send_signal_group(meta, signal.SIGTERM)
-    if wait_group_dead(meta, STOP_WAIT_SECONDS):
-        return _finish_stop_like(
-            aid,
-            identity,
-            (-signal.SIGTERM, signal.SIGTERM, "stopped", "stop"),
-            f"stopped agent {aid}",
-        )
-    # The exact group still has live members; escalate so no child is
-    # abandoned, exactly like the worker's cancel grace period.
-    if group_alive(meta):
-        send_signal_group(meta, signal.SIGKILL)
-    if wait_group_dead(meta, KILL_WAIT_SECONDS):
-        return _finish_stop_like(
-            aid,
-            identity,
-            (-signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
-            f"stopped agent {aid} (force-killed group members)",
-        )
-    _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
-    _err(f"{PROG}: agent {aid} did not stop within {STOP_WAIT_SECONDS:.0f}s; use 'kill'")
-    return EXIT_ERROR
+    while True:
+        if is_alive(meta) or group_alive(meta):
+            return _signal_live_invocation(aid, meta, "stop")
+        if _no_invocation_owned(meta):
+            _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
+            return EXIT_OK
+        if _cancel_runner_work(aid, "stop", meta):
+            return _finish_cancelled_runner_work(aid, meta, "stop")
+        # Ownership changed concurrently (a newer invocation was recorded);
+        # re-read and retry against the fresh state.
+        newer = read_meta(aid)
+        if newer is None:
+            _out(f"{PROG}: agent {aid} is already stopped")
+            return EXIT_OK
+        meta = newer
 
 
 def cmd_kill(args: argparse.Namespace) -> int:
@@ -3440,6 +3701,10 @@ def cmd_kill(args: argparse.Namespace) -> int:
     newer invocation recorded mid-kill is never overwritten or falsely
     reported as killed.
 
+    Like stop, kill also converges reserved or queued runner work when no
+    invocation process group is live, instead of falsely reporting the agent
+    as dead (issue #185).
+
     Args:
         args: Parsed command arguments.
 
@@ -3451,21 +3716,100 @@ def cmd_kill(args: argparse.Namespace) -> int:
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
         return EXIT_NOT_FOUND
-    if not is_alive(meta) and not group_alive(meta):
-        _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
-        return EXIT_OK
-    identity = _invocation_identity(meta)
-    if not _update_meta_if_same_invocation(aid, identity, lambda m: _begin_stop_like(m, "kill")):
-        _err(f"{PROG}: agent {aid} changed during kill; newer invocation left running untouched")
+    while True:
+        if is_alive(meta) or group_alive(meta):
+            return _signal_live_invocation(aid, meta, "kill")
+        if _no_invocation_owned(meta):
+            _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
+            return EXIT_OK
+        if _cancel_runner_work(aid, "kill", meta):
+            return _finish_cancelled_runner_work(aid, meta, "kill")
+        newer = read_meta(aid)
+        if newer is None:
+            _out(f"{PROG}: agent {aid} is already dead")
+            return EXIT_OK
+        meta = newer
+
+
+def _finish_cancelled_runner_work(aid: str, observed: Meta, mode: str) -> int:
+    """Converge the observed runner and terminalize the cancelled work.
+
+    The stop-like decision is already durably recorded (no new work can
+    claim); success additionally requires the exact observed runner identity
+    to be provably gone.  Only then is the terminal record written under the
+    lock.  If convergence fails, the command fails closed with a coherent,
+    retryable record (intent and reason kept) instead of reporting false
+    success.
+
+    Args:
+        aid: Lubko agent ID.
+        observed: The metadata snapshot taken when cancellation was decided.
+        mode: ``stop`` or ``kill``.
+
+    Returns:
+        A process exit code.
+    """
+    if not _converge_observed_runner(observed, mode):
+        _err(f"{PROG}: agent {aid} did not converge; its recorded runner is still alive")
         return EXIT_ERROR
-    send_signal_group(meta, signal.SIGKILL)
-    if wait_group_dead(meta, KILL_WAIT_SECONDS):
+    state = "stopped" if mode == "stop" else "killed"
+    if not _update_meta_if_same_invocation(
+        aid,
+        _invocation_identity(observed),
+        lambda m: _mark_terminal(m, None, None, state, mode),
+    ):
+        # A newer invocation was recorded during convergence (a later explicit
+        # prompt re-reserved the agent); it must not be terminalized here.
+        verb = "stop" if mode == "stop" else "kill"
+        _err(f"{PROG}: agent {aid} changed during {verb}; newer invocation left running untouched")
+        return EXIT_ERROR
+    verb = "stopped" if mode == "stop" else "killed"
+    _out(f"{verb} agent {aid} (cancelled reserved runner work)")
+    return EXIT_OK
+
+
+def _signal_live_invocation(aid: str, meta: Meta, mode: str) -> int:
+    """Signal, converge, and terminalize one live recorded invocation.
+
+    Args:
+        aid: Lubko agent ID.
+        meta: Metadata whose recorded invocation identity is targeted.
+        mode: ``stop`` for graceful-then-forced termination, ``kill`` for an
+            immediate forced kill.
+
+    Returns:
+        A process exit code.
+    """
+    identity = _invocation_identity(meta)
+    if not _update_meta_if_same_invocation(aid, identity, lambda m: _begin_stop_like(m, mode)):
+        verb = "stop" if mode == "stop" else "kill"
+        _err(f"{PROG}: agent {aid} changed during {verb}; newer invocation left running untouched")
+        return EXIT_ERROR
+    grace_signal = signal.SIGKILL if mode == "kill" else signal.SIGTERM
+    send_signal_group(meta, grace_signal)
+    wait_seconds = KILL_WAIT_SECONDS if mode == "kill" else STOP_WAIT_SECONDS
+    if wait_group_dead(meta, wait_seconds):
         return _finish_stop_like(
             aid,
             identity,
-            (-signal.SIGKILL, signal.SIGKILL, "killed", "kill"),
-            f"killed agent {aid}",
+            (-grace_signal, grace_signal, "killed" if mode == "kill" else "stopped", mode),
+            f"{'killed' if mode == 'kill' else 'stopped'} agent {aid}",
         )
+    if mode == "stop":
+        # The exact group still has live members; escalate so no child is
+        # abandoned, exactly like the worker's cancel grace period.
+        if group_alive(meta):
+            send_signal_group(meta, signal.SIGKILL)
+        if wait_group_dead(meta, KILL_WAIT_SECONDS):
+            return _finish_stop_like(
+                aid,
+                identity,
+                (-signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
+                f"stopped agent {aid} (force-killed group members)",
+            )
+        _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
+        _err(f"{PROG}: agent {aid} did not stop within {STOP_WAIT_SECONDS:.0f}s; use 'kill'")
+        return EXIT_ERROR
     _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
     _err(f"{PROG}: agent {aid} could not be killed")
     return EXIT_ERROR
