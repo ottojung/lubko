@@ -158,7 +158,8 @@ class SupervisorDesired:
 
         Raises:
             ValueError: If required fields are missing or malformed.
-            TypeError: If a present ``migration`` value is not a JSON boolean.
+            TypeError: If a present ``restart`` or ``migration`` value is not
+                a JSON boolean.
         """
         schema_version = _optional_int(data.get("schema_version"))
         generation = _optional_int(data.get("generation"))
@@ -173,6 +174,13 @@ class SupervisorDesired:
         if not isinstance(migration, bool):
             msg = "supervisor desired state is malformed"
             raise TypeError(msg)
+        restart = data.get("restart", False)
+        # Same fail-closed contract as ``migration``: absence means false, but
+        # a present value that is not a real JSON boolean means the durable
+        # intent is untrustworthy and must enter malformed-desired handling.
+        if not isinstance(restart, bool):
+            msg = "supervisor desired state is malformed"
+            raise TypeError(msg)
         try:
             return cls(
                 schema_version=schema_version,
@@ -181,7 +189,7 @@ class SupervisorDesired:
                 repo=str(data.get("repo") or ""),
                 uv_path=str(data.get("uv_path") or ""),
                 worker_id=_optional_string(data.get("worker_id")),
-                restart=data.get("restart", False) is True,
+                restart=restart,
                 requested_at=_optional_float(data.get("requested_at")) or 0.0,
                 migration=migration,
             )
