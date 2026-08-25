@@ -1838,8 +1838,10 @@ def _hold_unrecorded(aid: str, pid: int, start: object, iid: str) -> None:
     """
 
     def hold(m: Meta) -> None:
-        if m.get("delete_pending"):
-            return  # deletion owns the lifecycle: no resurrection markers
+        # The marker survives even delete-pending metadata: deletion
+        # convergence only knows recorded runner/group/reservation
+        # identities, so an unrecorded loser must carry its own authority
+        # through the tombstone until positively proven gone.
         m["unresolved_invocation"] = {
             "pid": pid,
             "start_time": start,
@@ -4054,6 +4056,7 @@ def _begin_delete(aid: str, *, force: bool) -> Meta | None:
             m["intent"] = "kill"
         m["last_activity_at"] = time.time()
         res = m.get("runner_reservation")
+        marker = m.get("unresolved_invocation")
         snapshot["meta"] = {
             "id": aid,
             "pid": m.get("pid"),
@@ -4064,6 +4067,7 @@ def _begin_delete(aid: str, *, force: bool) -> Meta | None:
             "runner_start_time": m.get("runner_start_time"),
             "active_runner": bool(m.get("active_runner")),
             "runner_reservation": dict(res) if isinstance(res, dict) else None,
+            "unresolved_invocation": dict(marker) if isinstance(marker, dict) else None,
             "delete_pending": True,
         }
 
@@ -4083,7 +4087,42 @@ def _delete_converged(cur: Meta | None) -> bool:
     """
     if cur is None:
         return True
+    if _unresolved_child_state(cur) != "gone":
+        # An exact unrecorded invocation was never positively proven gone
+        # (still live, or evidence ambiguous): deletion must not remove
+        # state while it may still execute.
+        return False
     return not runner_alive(cur) and not group_alive(cur) and not reservation_in_flight(cur)
+
+
+def _signal_unresolved_child(meta: Meta) -> None:
+    """Signal an unresolved child through exact-identity-safe pinned logic.
+
+    Signals only when the persisted marker is well-formed; malformed or
+    ambiguous state is left untouched so convergence keeps failing closed.
+    Never falls back to a numeric PID/PGID signal.
+
+    Args:
+        meta: Metadata carrying the ``unresolved_invocation`` marker.
+    """
+    rec = meta.get("unresolved_invocation")
+    if (
+        not isinstance(rec, dict)
+        or not isinstance(rec.get("pid"), int)
+        or isinstance(rec.get("pid"), bool)
+        or rec["pid"] <= 0
+    ):
+        return
+    send_signal_group(
+        {
+            "id": str(meta.get("id", "")),
+            "pid": rec["pid"],
+            "pgid": rec["pid"],
+            "start_time": rec.get("start_time"),
+            "invocation_id": rec.get("invocation_id"),
+        },
+        signal.SIGKILL,
+    )
 
 
 def _abort_delete(aid: str) -> None:
@@ -4132,6 +4171,10 @@ def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
                 # ...then the exact invocation process group.
                 if group_alive(cur):
                     send_signal_group(cur, signal.SIGKILL)
+                # ...and the exact unrecorded child, if any survived the
+                # spawn gate: signalled only through the same pinned,
+                # identity-exact path — never a numeric PID/PGID fallback.
+                _signal_unresolved_child(cur)
             elif not _delete_converged(cur):
                 # Something became live between the decision and the
                 # tombstone; non-forced deletion must not kill it.

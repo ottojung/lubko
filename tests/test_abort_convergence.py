@@ -15,6 +15,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -611,3 +612,79 @@ def test_unresolved_child_proven_recycled_clears_block() -> None:
         assert meta["unresolved_invocation"] is None
     finally:
         patcher.undo()
+
+
+def test_delete_honors_unresolved_child_until_exactly_proven_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deletion cannot remove state while an unrecorded loser stays alive.
+
+    A tombstoned agent whose leaked spawn-gate loser could not be exactly
+    signalled must fail closed for both forced and non-forced deletion,
+    keep its metadata and marker, accept only exact-identity-safe
+    signalling, and converge once the child's death is positively proven.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-del"
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "killed"
+    seed["stop_reason"] = "kill"
+    seed["intent"] = None
+    seed["delete_pending"] = True
+    agent.write_meta(aid, seed)
+
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    try:
+        marker = {
+            "pid": proc.pid,
+            "start_time": agent.proc_start_ticks(proc.pid),
+            "invocation_id": iid,
+        }
+        seed["unresolved_invocation"] = marker
+        agent.write_meta(aid, seed)
+
+        monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+
+        # Non-forced deletion must not signal at all and must fail closed.
+        def refuse_signal(_m: agent.Meta, _sig: int) -> None:
+            pytest.fail("non-forced delete must never signal")
+
+        monkeypatch.setattr(agent, "send_signal_group", refuse_signal)
+        assert agent._converge_for_delete(aid, force=False, deadline=time.time() + 0.05) is False
+        kept = agent.read_meta(aid)
+        assert kept is not None
+        assert kept["delete_pending"] is True
+        assert kept["unresolved_invocation"] == marker
+
+        # Forced deletion signals only through the exact-identity helper and
+        # still fails closed while the child survives.
+        signalled: list[tuple[int, object, str]] = []
+
+        def record_signal(m: agent.Meta, sig: int) -> None:
+            del sig
+            signalled.append((int(m["pid"]), m.get("start_time"), str(m["invocation_id"])))
+
+        monkeypatch.setattr(agent, "send_signal_group", record_signal)
+        assert agent._converge_for_delete(aid, force=True, deadline=time.time() + 0.05) is False
+        assert any(pid == proc.pid for pid, _, _ in signalled)
+        kept = agent.read_meta(aid)
+        assert kept is not None
+        assert kept["state"] == "killed"
+        assert kept["unresolved_invocation"] == marker
+
+        # Positive proof of the child's death lets forced deletion converge.
+        proc.kill()
+        proc.wait(timeout=5)
+        assert agent._converge_for_delete(aid, force=True, deadline=time.time() + 0.5) is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
