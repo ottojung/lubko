@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import time
+import types
 from typing import TYPE_CHECKING
 
 import pytest
@@ -975,14 +976,8 @@ def test_unresolved_scan_uninspectable_marker_keeps_block_and_no_numeric_signal(
 
     # Deterministic enumeration: exactly one synthetic candidate (a member
     # distinct from the recorded PGID so it is not skipped as the leader slot).
-    class _FakeEntry:
-        name = "525253"
-
-        @staticmethod
-        def is_dir() -> bool:
-            return True
-
-    monkeypatch.setattr(pathlib.Path, "iterdir", lambda _self: iter([_FakeEntry()]))
+    entries = [types.SimpleNamespace(name="525253")]
+    monkeypatch.setattr(pathlib.Path, "iterdir", lambda _self: iter(entries))
     monkeypatch.setattr(agent, "open_pidfd", lambda _pid: os.dup(pin_fd))
     monkeypatch.setattr(os, "getpgid", lambda _pid: 525252)
 
@@ -995,5 +990,99 @@ def test_unresolved_scan_uninspectable_marker_keeps_block_and_no_numeric_signal(
     try:
         assert agent._unresolved_child_state(meta) == "ambiguous"
         assert agent._delete_converged(meta) is False
+    finally:
+        os.close(pin_fd)
+
+
+def test_proven_scan_fallback_eperm_is_incomplete_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed liveness probe after a failed pin is ambiguity, not a crash."""
+    pin_fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        entries = [types.SimpleNamespace(name="525253")]
+        monkeypatch.setattr(pathlib.Path, "iterdir", lambda _self: iter(entries))
+        monkeypatch.setattr(agent, "open_pidfd", lambda _pid: None)
+
+        def forbidden_kill(pid: int, sig: int) -> None:
+            del pid, sig
+            failure = PermissionError(errno.EPERM, "probe refused")
+            raise failure
+
+        monkeypatch.setattr(os, "kill", forbidden_kill)
+        members, complete = agent._proven_invocation_members(525252, "aaaaaaaa", "inv-x")
+        assert members == []
+        assert complete is False
+    finally:
+        os.close(pin_fd)
+
+
+def test_group_alive_and_wait_group_dead_fail_closed_on_enumeration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/proc ambiguity conservatively counts the exact group as still alive."""
+    aid = "aaaaaaaa"
+    iid = "inv-g"
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["pgid"] = 525252
+    seed["invocation_id"] = iid
+    seed["runner_pid"] = os.getpid()
+    seed["runner_start_time"] = agent.proc_start_ticks(os.getpid())
+    # Ensure the recorded leader itself cannot look alive: start_time mismatch.
+    seed["pid"] = 424242
+    seed["start_time"] = 1
+    agent.write_meta(aid, seed)
+
+    def broken_iterdir(_self: Path) -> object:
+        failure = OSError(errno.EIO, "procfs unavailable")
+        raise failure
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", broken_iterdir)
+    cur = agent.read_meta(aid)
+    assert cur is not None
+    assert agent.group_alive(cur) is True, "incomplete scan must count as alive"
+    assert agent.wait_group_dead(cur, 0.05) is False
+
+
+def test_proven_scan_incomplete_after_member_keeps_and_closes_fds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proven members survive an incompleting scan with their pins closable."""
+    marker_env = f"LUBKO_AGENT_ID=aaaaaaaa\0{agent.INVOCATION_ID_VAR}=inv-x\0".encode()
+    pin_fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        payloads = {
+            "525253": marker_env,  # exact member
+            "525254": None,  # uninspectable: scan becomes incomplete
+        }
+
+        entries = [
+            types.SimpleNamespace(name="525253"),
+            types.SimpleNamespace(name="525254"),
+        ]
+        monkeypatch.setattr(pathlib.Path, "iterdir", lambda _self: iter(entries))
+        monkeypatch.setattr(agent, "open_pidfd", lambda _pid: os.dup(pin_fd))
+        monkeypatch.setattr(os, "getpgid", lambda _pid: 525252)
+
+        def selective_environ(self: pathlib.Path) -> bytes:
+            path = str(self)
+            data = payloads.get("525253" if "525253" in path else "525254")
+            if data is None:
+                failure = OSError(errno.EACCES, "environ uninspectable")
+                raise failure
+            return data
+
+        monkeypatch.setattr(pathlib.Path, "read_bytes", selective_environ)
+        members, complete = agent._proven_invocation_members(525252, "aaaaaaaa", "inv-x")
+        assert complete is False
+        assert [pid for pid, _ in members] == [525253]
+        # The caller must be able to close every returned pin exactly once.
+        for _, fd in members:
+            os.close(fd)
+        for _, fd in members:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+                pytest.fail("double-close would mean a leaked or reused fd")
     finally:
         os.close(pin_fd)

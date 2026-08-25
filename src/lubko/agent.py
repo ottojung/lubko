@@ -443,11 +443,13 @@ def _proven_invocation_members(pgid: int, aid: str, iid: str) -> tuple[list[tupl
                 os.kill(member, 0)
             except ProcessLookupError:
                 continue  # positively vanished: benign race
-            return [], False  # alive but unpinnable: ambiguity
+            except OSError:
+                return members, False  # probe itself failed: ambiguity
+            return members, False  # alive but unpinnable: ambiguity
         matched = _matches_invocation_group_proven(member, pgid, aid, iid)
         if matched is None:
             os.close(fd)
-            return [], False  # marker inspection uninspectable: ambiguity
+            return members, False  # marker inspection uninspectable: ambiguity
         if not matched:
             os.close(fd)
             continue
@@ -730,15 +732,18 @@ def group_alive(meta: Meta) -> bool:
 
     When a durable invocation ID was recorded, group membership is decided by
     the invocation-exact pinned scan: a recycled PGID hosting a newer
-    invocation of the same agent never counts as this invocation's survivors.
-    Without a recorded invocation ID the plain process-group membership is
-    used (legacy metadata).
+    invocation of the same agent never counts as this invocation's survivors,
+    and an *incomplete* scan (procfs enumeration failure, unpinnable or
+    uninspectable candidate) conservatively counts as alive so convergence
+    can never fail open. Without a recorded invocation ID the plain
+    process-group membership is used (legacy metadata).
 
     Args:
         meta: Agent metadata.
 
     Returns:
-        ``True`` when the recorded invocation still has live group members.
+        ``True`` when the recorded invocation still has live group members,
+        or when their absence could not be positively proven.
     """
     pgid = meta.get("pgid")
     if not pgid:
@@ -749,9 +754,12 @@ def group_alive(meta: Meta) -> bool:
     if is_alive(meta):
         # The verified live leader implies its whole session group.
         return True
-    fds = _pinned_invocation_members(int(pgid), str(meta.get("id", "")), str(iid))
+    fds, complete = _proven_invocation_members(int(pgid), str(meta.get("id", "")), str(iid))
     for _, fd in fds:
         os.close(fd)
+    if not complete:
+        # Ambiguous evidence must never be read as a proven-empty group.
+        return True
     return bool(fds)
 
 
