@@ -384,6 +384,8 @@ def _state_with_hold(hold: UnresolvedChild) -> supervise.SupervisorState:
         unresolved_child=hold,
         ownership_hold_malformed=False,
         unresolved_hold_malformed=False,
+        spawning=None,
+        spawning_hold_malformed=False,
         intent=supervise.INTENT_RUN,
         restart_count=0,
         next_attempt_at=None,
