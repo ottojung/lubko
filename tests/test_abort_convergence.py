@@ -175,7 +175,8 @@ def test_send_signal_group_converges_owned_descendants_after_leader_exit(
 
     With the recorded leader gone, each surviving group member carrying both
     the exact agent marker and the exact invocation marker is signalled
-    individually under its own pin; foreign processes are left alone.
+    individually through its own pinned descriptor; foreign processes are
+    left alone and no numeric signal fires.
     """
     aid = "aaaaaaaa"
     iid = "inv-1"
@@ -188,20 +189,111 @@ def test_send_signal_group_converges_owned_descendants_after_leader_exit(
         assert got_iid == iid
         return [(5001, owned_fd), (6000, foreign_fd)]
 
-    killed: list[int] = []
+    delivered: list[tuple[int, int]] = []
     closed: list[int] = []
     monkeypatch.setattr(agent, "open_pidfd", lambda _pid: None)
     monkeypatch.setattr(agent, "_pinned_invocation_members", fake_members)
-    monkeypatch.setattr(os, "kill", lambda pid, _sig: killed.append(pid))
-
-    def fake_close(fd: int) -> None:
-        closed.append(fd)
-
-    monkeypatch.setattr(os, "close", fake_close)
+    monkeypatch.setattr(agent, "pidfd_send_signal", lambda fd, sig: delivered.append((fd, sig)))
+    monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
+    monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("numeric killpg fired"))
+    monkeypatch.setattr(os, "close", closed.append)
     agent.send_signal_group(meta, signal.SIGKILL)
 
-    assert killed == [5001, 6000]
+    assert delivered == [(owned_fd, signal.SIGKILL), (foreign_fd, signal.SIGKILL)]
     assert sorted(closed) == sorted([owned_fd, foreign_fd])
+
+
+def test_send_signal_group_delivers_live_leader_through_its_pin_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proven live leader is signalled through its pinned descriptor only.
+
+    Even when every proof succeeds, the recorded PID and PGID may have been
+    recycled into an unrelated session between proof and delivery: numeric
+    ``killpg``/``kill`` could retarget onto that occupant. Delivery must go
+    exclusively through ``pidfd_send_signal`` on the descriptor that pinned
+    the verified leader.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-live"
+    meta = _running_meta(aid, 424242, 111, iid)
+    closed: list[int] = []
+    monkeypatch.setattr(agent, "open_pidfd", lambda pid: 77 if pid == 424242 else None)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+    monkeypatch.setattr(agent, "env_has_invocation", lambda _pid, _iid: True)
+    monkeypatch.setattr(
+        pathlib.Path,
+        "iterdir",
+        lambda _self: iter([]),
+    )
+    monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("numeric killpg fired"))
+    monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
+    monkeypatch.setattr(os, "close", closed.append)
+    delivered: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        agent,
+        "pidfd_send_signal",
+        lambda fd, sig: delivered.append((fd, sig)),
+    )
+    agent.send_signal_group(meta, signal.SIGKILL)
+
+    assert delivered == [(77, signal.SIGKILL)]
+    assert closed == [77]
+
+
+def test_send_signal_group_member_path_survives_numeric_reuse_after_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member whose numeric PID was recycled after its proof is never hit.
+
+    Membership was already proven under the member's own pin; by delivery time
+    the numeric PID slot may host an innocent process. Delivery must address
+    the pinned kernel process itself, never the recycled number.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-m"
+    meta = _running_meta(aid, 424242, 111, iid)
+    member_fd = os.open(os.devnull, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(agent, "open_pidfd", lambda _pid: None)
+        monkeypatch.setattr(
+            agent,
+            "_pinned_invocation_members",
+            lambda _pgid, _aid, _iid: [(7777, member_fd)],
+        )
+        # Simulate full reuse: the number 7777 now resolves to an unrelated
+        # occupant; any numeric delivery here would signal that occupant.
+        monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
+        monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("numeric killpg fired"))
+        delivered: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            agent,
+            "pidfd_send_signal",
+            lambda fd, sig: delivered.append((fd, sig)),
+        )
+        monkeypatch.setattr(os, "close", lambda _fd: None)
+        agent.send_signal_group(meta, signal.SIGKILL)
+        assert delivered == [(member_fd, signal.SIGKILL)]
+    finally:
+        os.close(member_fd)
+
+
+def test_send_signal_group_fails_closed_without_invocation_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No durable invocation identity means nothing is ever signalled."""
+    meta = _running_meta("aaaaaaaa", 424242, 111, "inv-z")
+    del meta["invocation_id"]
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: None)
+    monkeypatch.setattr(
+        agent,
+        "_pinned_invocation_members",
+        lambda *_a: pytest.fail("member scan without invocation identity"),
+    )
+    monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("numeric killpg fired"))
+    monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
+    agent.send_signal_group(meta, signal.SIGKILL)
 
 
 def _observable_ticks(pid: int) -> int:
