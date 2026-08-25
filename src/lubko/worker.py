@@ -5995,7 +5995,7 @@ def signal_kill(job: ActiveJob) -> None:
 
 
 def cleanup_job(job: ActiveJob) -> None:
-    """Remove the temporary capture files and close pipe ends of a finalized job.
+    """Best-effort remove capture files and close pipe ends of a finalized job.
 
     Args:
         job: The finalized active job.
@@ -6005,8 +6005,11 @@ def cleanup_job(job: ActiveJob) -> None:
             with suppress(OSError):
                 os.close(stream.fd)
             stream.fd = None
-    job.stdout.path.unlink(missing_ok=True)
-    job.stderr.path.unlink(missing_ok=True)
+    for stream in (job.stdout, job.stderr):
+        try:
+            stream.path.unlink(missing_ok=True)
+        except OSError as exc:
+            LOGGER.warning("failed to remove capture spool %s: %s", stream.path, exc)
 
 
 def _stop_note(reason: str) -> str:
