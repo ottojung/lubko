@@ -89,9 +89,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, override
 from uuid import uuid4
 
-import psycopg
-from psycopg.rows import tuple_row
-
+from lubko._pg import psycopg, tuple_row
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config, load_worker_server
 from lubko.health import (
@@ -121,7 +119,11 @@ if TYPE_CHECKING:
 
     from lubko.config import DatabaseConfig
 
-JobsConnection = psycopg.Connection[tuple[Any, ...]]
+    JobsConnection = psycopg.Connection[tuple[Any, ...]]
+else:
+    # Annotation-only alias; resolved lazily so importing this module never
+    # executes the compiled driver.
+    JobsConnection = Any
 
 
 def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None) -> bool:
