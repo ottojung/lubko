@@ -134,6 +134,7 @@ def test_gc_preserves_desired_applied_and_override_runtimes(
             commit=first,
             child=None,
             unresolved_child=None,
+            ownership_hold_malformed=False,
             unresolved_hold_malformed=False,
             intent="run",
             restart_count=0,

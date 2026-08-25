@@ -514,6 +514,17 @@ class SupervisorDaemon:
         self._message = None
         desired = read_desired()
         state = read_state()
+        if state.ownership_hold_malformed:
+            # Materialize the hold so a later rewrite cannot turn authority
+            # corruption into apparent worker absence. Clearing it is an
+            # explicit operator repair, never an automatic recovery decision.
+            write_state(state)
+            self._message = (
+                "the durable supervisor worker-ownership state is malformed or unreadable; "
+                "holding without starting a worker until it is repaired"
+            )
+            LOGGER.error("%s", self._message)
+            return
         action, commit = self._derive_action(state)
         if (
             desired is not None
@@ -1621,7 +1632,7 @@ class SupervisorDaemon:
             ``True`` when no blocking hold remains.
         """
         state = read_state()
-        if state.unresolved_hold_malformed:
+        if state.ownership_hold_malformed or state.unresolved_hold_malformed:
             # A present-but-malformed durable hold was found on disk. The
             # blocking obligation survives its own shape corruption: a possibly
             # live unresolved spawned child may still exist, so no replacement
