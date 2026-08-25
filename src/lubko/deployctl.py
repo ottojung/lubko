@@ -638,14 +638,21 @@ def _wait_for_identity(proc: subprocess.Popen[bytes]) -> ProcessIdentity | None:
         observed identity at the timeout, or ``None`` if it died first.
     """
     deadline = time.monotonic() + IDENTITY_TIMEOUT_SECONDS
+    last_observed: ProcessIdentity | None = None
     while True:
         if proc.poll() is not None:
             return None
         identity = process_identity(proc.pid)
         if identity is not None and identity.pgid == proc.pid and identity.sid == proc.pid:
             return identity
+        if identity is not None:
+            # Keep the newest non-private observation: the final poll before
+            # the deadline can transiently return None (for example when the
+            # /proc entry is momentarily unreadable) without discarding the
+            # exact startup anchor.
+            last_observed = identity
         if time.monotonic() >= deadline:
-            return identity
+            return last_observed
         time.sleep(IDENTITY_POLL_SECONDS)
 
 

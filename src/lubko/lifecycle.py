@@ -867,12 +867,19 @@ def _wait_for_identity(pid: int) -> ProcessIdentity | None:
         before any identity could be read.
     """
     deadline = time.monotonic() + SESSION_ESTABLISH_TIMEOUT_SECONDS
+    last_observed: ProcessIdentity | None = None
     while True:
         identity = process_identity(pid)
         if identity is not None and identity.pgid == pid and identity.sid == pid:
             return identity
+        if identity is not None:
+            # Keep the newest non-private observation: the final poll before
+            # the deadline can transiently return None (for example when the
+            # /proc entry is momentarily unreadable) without discarding the
+            # exact startup anchor.
+            last_observed = identity
         if time.monotonic() >= deadline:
-            return identity
+            return last_observed
         time.sleep(SESSION_WAIT_INTERVAL_SECONDS)
 
 

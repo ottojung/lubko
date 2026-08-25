@@ -5,16 +5,17 @@ from __future__ import annotations
 import signal
 import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from lubko import deployctl as dc
 from lubko import lifecycle
 from lubko.lifecycle import (
     DeployAbortedError,
     DeployOptions,
     ProcessIdentity,
     WorkerMeta,
-    _deploy_direct,
 )
 
 COMMIT = "a" * 40
@@ -255,7 +256,7 @@ def test_private_session_child_deploys_with_exact_recorded_identity(
     monkeypatch.setattr(lifecycle, "_verify_replacement", verify)
     written = record_written(monkeypatch)
 
-    meta = _deploy_direct(options(), None, lifecycle.STATE_UNMANAGED, COMMIT)
+    meta = lifecycle._deploy_direct(options(), None, lifecycle.STATE_UNMANAGED, COMMIT)
 
     assert (meta.pid, meta.pgid, meta.sid) == (PRIVATE.pid, PRIVATE.pgid, PRIVATE.sid)
     assert meta.start_time_ticks == PRIVATE.start_time_ticks
@@ -283,7 +284,7 @@ def test_session_transition_after_timeout_converges_child_and_aborts(
     monkeypatch.setattr(lifecycle, "stop_worker", stop)
 
     with pytest.raises(DeployAbortedError):
-        _deploy_direct(options(), previous_meta(), lifecycle.STATE_RUNNING, COMMIT)
+        lifecycle._deploy_direct(options(), previous_meta(), lifecycle.STATE_RUNNING, COMMIT)
 
     # The unproven child was exactly signalled through its pin and positively
     # reaped; it can neither be forgotten nor coexist with the previous worker.
@@ -308,8 +309,54 @@ def test_reused_occupant_after_timeout_is_never_signalled(
     record_written(monkeypatch)
 
     with pytest.raises(DeployAbortedError):
-        _deploy_direct(options(), None, lifecycle.STATE_UNMANAGED, COMMIT)
+        lifecycle._deploy_direct(options(), None, lifecycle.STATE_UNMANAGED, COMMIT)
 
     assert delivered == []
     # Fail closed: the original direct child is still positively reaped.
     assert fake.poll() is not None
+
+
+def test_lifecycle_wait_preserves_anchor_through_final_transient_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient ``None`` at the deadline does not discard the anchor."""
+    monkeypatch.setattr(lifecycle, "SESSION_ESTABLISH_TIMEOUT_SECONDS", 0.0)
+    observations = iter([TRANSITIONED, None])
+
+    def identity(_pid: int) -> ProcessIdentity | None:
+        return next(observations, None)
+
+    monkeypatch.setattr(lifecycle, "process_identity", identity)
+
+    assert lifecycle._wait_for_identity(PID) == TRANSITIONED
+
+
+def test_deployctl_wait_preserves_anchor_through_final_transient_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rollback candidate waiter keeps its anchor across a final ``None``."""
+
+    class LiveProc:
+        """Direct child that stays live for the whole wait."""
+
+        def __init__(self) -> None:
+            self.pid = PID
+
+        def poll(self) -> int | None:
+            """Report the child as continuously live.
+
+            Returns:
+                Always ``None``: not exited.
+            """
+            del self
+            return None
+
+    monkeypatch.setattr(dc, "IDENTITY_TIMEOUT_SECONDS", 0.0)
+    observations = iter([TRANSITIONED, None])
+
+    def identity(_pid: int) -> ProcessIdentity | None:
+        return next(observations, None)
+
+    monkeypatch.setattr(dc, "process_identity", identity)
+
+    assert dc._wait_for_identity(cast("subprocess.Popen[bytes]", LiveProc())) == TRANSITIONED
