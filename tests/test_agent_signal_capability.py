@@ -1,10 +1,37 @@
 """Agent exact-signal delivery invariants under missing pidfd capability."""
 
 import os
+from collections.abc import Callable
 
 import pytest
 
 from lubko import agent
+
+DELIVERY_FAILURES = [
+    pytest.param(
+        AttributeError,
+        id="attribute-error",
+    ),
+    pytest.param(
+        OSError,
+        id="os-error",
+    ),
+]
+
+
+def _failing_delivery(exc: type[Exception]) -> Callable[[int, int], None]:
+    """Build a ``pidfd_send_signal`` stand-in that always fails with ``exc``.
+
+    Returns:
+        A callable raising ``exc`` for any pidfd and signal.
+    """
+
+    def fail(_pidfd: int, _sig: int) -> None:
+        """Mimic an unsupported or denied pidfd delivery by raising ``exc``."""
+        message = "pidfd_send_signal unavailable"
+        raise exc(message)
+
+    return fail
 
 
 def _fake_pin(monkeypatch: pytest.MonkeyPatch, fd: int) -> list[int]:
@@ -56,11 +83,13 @@ def _unsupported_delivery(_pidfd: int, _sig: int) -> None:
     raise AttributeError(message)
 
 
+@pytest.mark.parametrize("exc", DELIVERY_FAILURES)
 def test_identity_checked_signal_withholds_when_delivery_unsupported(
     monkeypatch: pytest.MonkeyPatch,
+    exc: type[Exception],
 ) -> None:
-    """A missing pidfd-send binding withholds the signal instead of crashing."""
-    monkeypatch.setattr(agent, "pidfd_send_signal", _unsupported_delivery)
+    """An unsupported pidfd delivery withholds the signal instead of crashing."""
+    monkeypatch.setattr(agent, "pidfd_send_signal", _failing_delivery(exc))
     kills: list[tuple[object, int]] = []
     monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append((pid, sig)))
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: kills.append((pgid, sig)))
@@ -77,11 +106,13 @@ def test_identity_checked_signal_withholds_when_delivery_unsupported(
     assert kills == []
 
 
+@pytest.mark.parametrize("exc", DELIVERY_FAILURES)
 def test_group_signal_fails_closed_when_delivery_unsupported(
     monkeypatch: pytest.MonkeyPatch,
+    exc: type[Exception],
 ) -> None:
-    """Leader and member group delivery both withhold signals without a binding."""
-    monkeypatch.setattr(agent, "pidfd_send_signal", _unsupported_delivery)
+    """Unsupported group delivery withholds signals from leader and members."""
+    monkeypatch.setattr(agent, "pidfd_send_signal", _failing_delivery(exc))
     kills: list[tuple[object, int]] = []
     monkeypatch.setattr(os, "kill", lambda pid, sig: kills.append((pid, sig)))
     monkeypatch.setattr(os, "killpg", lambda pgid, sig: kills.append((pgid, sig)))

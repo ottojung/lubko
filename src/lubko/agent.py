@@ -579,7 +579,7 @@ def signal_identity_checked(
         # Fail closed when the platform can pin PIDs but cannot deliver
         # pidfd signals: withhold the signal rather than crash or fall back
         # to a numeric kill.
-        with contextlib.suppress(ProcessLookupError, AttributeError):
+        with contextlib.suppress(OSError, AttributeError):
             pidfd_send_signal(fd, sig)
     finally:
         os.close(fd)
@@ -633,7 +633,7 @@ def send_signal_group(meta: Meta, sig: int) -> None:
                 if verified:
                     # Deliver through the pin itself: a numeric killpg on the
                     # recorded group could retarget after PGID reuse.
-                    with contextlib.suppress(ProcessLookupError, AttributeError):
+                    with contextlib.suppress(OSError, AttributeError):
                         pidfd_send_signal(fd, sig)
             finally:
                 os.close(fd)
@@ -642,7 +642,7 @@ def send_signal_group(meta: Meta, sig: int) -> None:
     # identity to authorize them.
     for _member, member_fd in _pinned_invocation_members(int(pgid), aid, str(iid)):
         try:
-            with contextlib.suppress(ProcessLookupError, AttributeError):
+            with contextlib.suppress(OSError, AttributeError):
                 pidfd_send_signal(member_fd, sig)
         finally:
             os.close(member_fd)
