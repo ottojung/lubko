@@ -3848,3 +3848,59 @@ def test_reuse_after_reproof_but_before_syscall_is_never_signalled(
 
     request_group_reap(job)
     assert delivered == []
+
+
+def test_unresolvable_pin_binding_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A platform with no pidfd binding at all refuses controlledly.
+
+    When the pin itself cannot even be resolved (AttributeError from missing
+    platform symbols), emission fails closed: nothing is delivered and no
+    error escapes.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.returncode = 0
+    job.start_ticks = 1000
+    member = job.pgid + 19
+    job.owned_members[member] = 1001
+
+    def no_symbol(_pid: int) -> int:
+        msg = "pidfd_open missing"
+        raise AttributeError(msg)
+
+    monkeypatch.setattr(worker, "_pidfd_open", no_symbol)
+    assert worker._pin_and_signal(member, signal.SIGTERM, 1001) is False
+
+
+def test_unresolvable_send_binding_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing pidfd_send_signal binding refuses without broad signalling.
+
+    The pin succeeds but delivery cannot be resolved: the emission must fail
+    closed rather than fall back to an unpinned kill.
+    """
+    job = make_active_job(tmp_path)
+    job.completed = True
+    job.returncode = 0
+    job.start_ticks = 1000
+    member = job.pgid + 23
+    job.owned_members[member] = 1001
+
+    def no_symbol(_pidfd: int, _sig: int) -> None:
+        msg = "pidfd_send_signal missing"
+        raise AttributeError(msg)
+
+    monkeypatch.setattr(worker, "_pidfd_send_signal", no_symbol)
+    pinned_fd = os.open("/dev/null", os.O_RDONLY)
+    monkeypatch.setattr(worker, "_pidfd_open", lambda _pid: pinned_fd)
+    monkeypatch.setattr(worker, "proc_start_ticks", lambda _pid: 1001)
+    unpinned: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: unpinned.append((pid, sig)))
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: unpinned.append((pgid, sig)))
+
+    assert worker._pin_and_signal(member, signal.SIGTERM, 1001) is False
+    # No unpinned fallback may ever fire when the pinned path is unavailable.
+    assert not unpinned

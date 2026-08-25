@@ -2067,7 +2067,9 @@ def _pin_and_signal(pid: int, sig: int, expected_ticks: int) -> bool:
     """
     try:
         pidfd = _pidfd_open(pid)
-    except OSError:
+    except (OSError, AttributeError):
+        # AttributeError: the platform resolves no pidfd binding at all —
+        # fail closed with a controlled refusal, never a crash.
         LOGGER.debug("process %d could not be pinned", pid)
         return False
     try:
@@ -2075,7 +2077,7 @@ def _pin_and_signal(pid: int, sig: int, expected_ticks: int) -> bool:
             LOGGER.debug("process %d no longer matches its proven identity", pid)
             return False
         _pidfd_send_signal(pidfd, sig)
-    except OSError:
+    except (OSError, AttributeError):
         LOGGER.debug("process %d already gone", pid)
         return False
     else:
