@@ -12,14 +12,16 @@ import os
 import shutil
 import subprocess
 import threading
-from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
 from lubko import cli, install, lifecycle, supervise, toolchain
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
 
 ENTRY_POINTS: Final = cli.ENTRY_POINTS
 GIT_BIN: Final = shutil.which("git") or "git"
@@ -36,7 +38,11 @@ def fake_uv_sync(_uv_path: str, root: Path, _timeout_seconds: float) -> None:
 
 
 def git(*args: str, cwd: Path) -> str:
-    """Run one git command and return its trimmed stdout."""
+    """Run one git command and return its trimmed stdout.
+
+    Returns:
+        Trimmed standard output.
+    """
     proc = subprocess.run(
         [GIT_BIN, *args],
         cwd=cwd,
@@ -173,10 +179,9 @@ def test_install_refuses_version_change_over_desired_worker(
     assert cli.current_commit() is None
 
 
-def test_refused_install_keeps_worker_runtime_startable(
+def test_same_commit_install_keeps_worker_runtime_startable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """After refusal the supervisor can still recover its maintained runtime."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
