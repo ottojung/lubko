@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import time
@@ -53,7 +54,7 @@ from lubko.durable import remove_durable, write_bytes_durable, write_json_durabl
 from lubko.state import rollback_state_path, state_root
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 SCHEMA_VERSION: Final = 1
 
@@ -334,46 +335,32 @@ class SupervisorState:
         Returns:
             The parsed state, or a fresh idle state for an empty mapping.
         """
-        child_data = data.get("child")
-        child: WorkerChild | None = None
-        ownership_hold_malformed = False
-        if isinstance(child_data, dict):
-            try:
-                child = _child_from_dict(child_data)
-            except (TypeError, ValueError, KeyError):
-                ownership_hold_malformed = True
-        elif child_data is not None:
-            ownership_hold_malformed = True
-        unresolved_data = data.get("unresolved_child")
-        unresolved: UnresolvedChild | None = None
-        unresolved_hold_malformed = False
-        if isinstance(unresolved_data, dict):
-            try:
-                unresolved = UnresolvedChild.from_dict(unresolved_data)
-            except (TypeError, ValueError):
-                # A present-but-malformed hold must never degrade to absence:
-                # the durable blocking obligation survives as a flag that the
-                # daemon treats exactly like an unresolvable hold.
-                unresolved_hold_malformed = True
-        elif unresolved_data is not None:
-            unresolved_hold_malformed = True
-        raw_generation = data.get("applied_generation")
-        generation = _strict_non_negative_int(raw_generation)
-        if "applied_generation" in data and generation is None:
+        child, ownership_hold_malformed = _parse_optional_child(data)
+        unresolved, unresolved_hold_malformed = _parse_optional_unresolved_child(data)
+        generation, generation_malformed = _parse_present_strict(
+            data, "applied_generation", _strict_non_negative_int
+        )
+        if generation_malformed:
             # A present-but-malformed applied generation must never silently
             # degrade to 0: that would let an already-applied restart intent
             # replay and retire a healthy worker. Enter the durable hold.
             ownership_hold_malformed = True
-        exit_data = data.get("last_exit")
-        last_exit: LastExit | None = None
-        if isinstance(exit_data, dict):
-            try:
-                last_exit = LastExit(
-                    returncode=_optional_int(exit_data.get("returncode")),
-                    at=float(exit_data.get("at") or 0.0),
-                )
-            except (TypeError, ValueError):
-                last_exit = None
+        restart_count, restart_malformed = _parse_present_strict(
+            data, "restart_count", _strict_non_negative_int
+        )
+        if restart_malformed:
+            # A present-but-malformed restart count must never silently degrade
+            # to 0: that would erase crash history and let reconciliation treat
+            # a repeatedly crashing worker as fresh, spawning and restarting
+            # without backoff. Enter the durable hold.
+            ownership_hold_malformed = True
+        next_attempt_at, deadline_malformed = _parse_present_nullable_float(data, "next_attempt_at")
+        if deadline_malformed:
+            # A present-but-malformed backoff deadline must never silently
+            # degrade to absence: that would clear an active crash-loop
+            # backoff and let reconciliation restart immediately from a
+            # corrupted schedule. Enter the durable hold.
+            ownership_hold_malformed = True
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
             applied_generation=generation or 0,
@@ -386,9 +373,9 @@ class SupervisorState:
             unresolved_hold_malformed=unresolved_hold_malformed
             or _strict_safety_hold(data, "unresolved_hold_malformed"),
             intent=_optional_string(data.get("intent")) or INTENT_RUN,
-            restart_count=_optional_int(data.get("restart_count")) or 0,
-            next_attempt_at=_optional_float(data.get("next_attempt_at")),
-            last_exit=last_exit,
+            restart_count=restart_count or 0,
+            next_attempt_at=next_attempt_at,
+            last_exit=_parse_last_exit(data),
             last_spawn_at=_optional_float(data.get("last_spawn_at")),
             ready=data.get("ready", False) is True,
             next_readiness_at=_optional_float(data.get("next_readiness_at")),
@@ -1338,6 +1325,24 @@ def _strict_non_negative_int(value: object) -> int | None:
     return value
 
 
+def _strict_finite_float(value: object) -> float | None:
+    """Return a finite number, or ``None`` when malformed.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        The finite float, or ``None`` for booleans, non-numeric values,
+        strings, NaN, and infinities.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    if not math.isfinite(result):
+        return None
+    return result
+
+
 def _optional_float(value: object | None) -> float | None:
     """Return a float value or ``None``.
 
@@ -1386,6 +1391,118 @@ def _strict_safety_hold(data: dict[str, object], key: str) -> bool:
         return False
     value = _optional_bool(data[key])
     return value if value is not None else True
+
+
+def _parse_present_strict(
+    data: dict[str, object],
+    key: str,
+    parser: Callable[[object], int | None],
+) -> tuple[int, bool]:
+    """Parse a strictly typed field that defaults to zero on genuine absence.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Field name.
+        parser: Strict parser returning the valid value or ``None``.
+
+    Returns:
+        A ``(value, malformed)`` pair: the parsed value (zero for genuine
+        absence) and whether a present value was malformed.
+    """
+    if key not in data:
+        return 0, False
+    value = parser(data[key])
+    return (value or 0), value is None
+
+
+def _parse_present_nullable_float(
+    data: dict[str, object],
+    key: str,
+) -> tuple[float | None, bool]:
+    """Parse an optional finite-float deadline field.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Field name.
+
+    Returns:
+        A ``(value, malformed)`` pair: the parsed deadline (``None`` for
+        genuine absence or explicit null) and whether a present non-null
+        value was malformed.
+    """
+    raw = data.get(key)
+    if raw is None:
+        return None, False
+    value = _strict_finite_float(raw)
+    return value, value is None
+
+
+def _parse_optional_child(
+    data: dict[str, object],
+) -> tuple[WorkerChild | None, bool]:
+    """Parse the optional worker-ownership record.
+
+    Args:
+        data: Decoded durable state mapping.
+
+    Returns:
+        The child, or ``None``, plus whether a present record was malformed.
+    """
+    child_data = data.get("child")
+    if child_data is None:
+        return None, False
+    if isinstance(child_data, dict):
+        try:
+            return _child_from_dict(child_data), False
+        except (TypeError, ValueError, KeyError):
+            return None, True
+    return None, True
+
+
+def _parse_optional_unresolved_child(
+    data: dict[str, object],
+) -> tuple[UnresolvedChild | None, bool]:
+    """Parse the optional unresolved-child hold.
+
+    Args:
+        data: Decoded durable state mapping.
+
+    Returns:
+        The hold, or ``None``, plus whether a present hold was malformed.
+    """
+    unresolved_data = data.get("unresolved_child")
+    if unresolved_data is None:
+        return None, False
+    if isinstance(unresolved_data, dict):
+        try:
+            return UnresolvedChild.from_dict(unresolved_data), False
+        except (TypeError, ValueError):
+            # A present-but-malformed hold must never degrade to absence:
+            # the durable blocking obligation survives as a flag that the
+            # daemon treats exactly like an unresolvable hold.
+            return None, True
+    return None, True
+
+
+def _parse_last_exit(data: dict[str, object]) -> LastExit | None:
+    """Parse the optional last-exit record, tolerating shape corruption.
+
+    Args:
+        data: Decoded durable state mapping.
+
+    Returns:
+        The last exit, or ``None``.
+    """
+    exit_data = data.get("last_exit")
+    if not isinstance(exit_data, dict):
+        return None
+    try:
+        return LastExit(
+            returncode=_optional_int(exit_data.get("returncode")),
+            at=float(exit_data.get("at") or 0.0),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _optional_dict(value: object | None) -> dict[str, object] | None:
