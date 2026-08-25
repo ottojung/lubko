@@ -1879,6 +1879,7 @@ def _hold_unrecorded(aid: str, pid: int, start: object, iid: str) -> None:
         # through the tombstone until positively proven gone.
         m["unresolved_invocation"] = {
             "pid": pid,
+            "pgid": pid,
             "start_time": start,
             "invocation_id": iid,
         }
@@ -1890,13 +1891,18 @@ def _hold_unrecorded(aid: str, pid: int, start: object, iid: str) -> None:
 
 
 def _unresolved_child_state(m: Meta) -> str:
-    """Classify the exact recorded unresolved child's survival evidence.
+    """Classify the exact recorded unresolved invocation's survival evidence.
 
-    Returns ``"live"``, ``"gone"``, or ``"ambiguous"``. Only positive proof
-    clears the record: a readable *different* start time proves the PID was
-    recycled, and a definitive ``ProcessLookupError`` proves death. Anything
-    that cannot be inspected (unreadable procfs, permission failures, other
-    probe errors) stays ambiguous so the durable block never fails open.
+    Returns ``"live"``, ``"gone"``, or ``"ambiguous"``. The obligation spans
+    the whole recorded invocation *group*, not just its leader: leader death
+    or PID recycling alone never proves it gone, because genuine descendants
+    can survive in the old process group. The record is gone only when the
+    leader is positively dead/recycled *and* the pinned per-invocation scan
+    finds no surviving member carrying both the agent marker and the exact
+    invocation marker (a recycled PGID hosting a foreign invocation never
+    counts). Anything uninspectable — unreadable procfs, permission failures,
+    malformed persisted state — stays ambiguous so the block never fails
+    open.
 
     Args:
         m: Agent metadata.
@@ -1919,44 +1925,36 @@ def _unresolved_child_state(m: Meta) -> str:
         """
         return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
-    state = "ambiguous"  # malformed persisted state fails closed as ambiguous
-    iid = rec.get("invocation_id") if isinstance(rec, dict) else None
-    iid_ok = isinstance(iid, str) and bool(iid)
-    if (
+    if not (
         isinstance(rec, dict)
         and valid_identity(rec.get("pid"))
         and isinstance(rec.get("start_time"), int)
         and not isinstance(rec.get("start_time"), bool)
-        and iid_ok
+        and valid_identity(rec.get("pgid"))
+        and isinstance(rec.get("invocation_id"), str)
+        and bool(rec["invocation_id"])
     ):
-        pid: int = rec["pid"]
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            state = "gone"
-        except OSError:
-            state = "ambiguous"  # exists but uninspectable (e.g. EPERM)
-        else:
-            ticks = proc_start_ticks(pid)
-            if ticks is None:
-                state = "ambiguous"  # unreadable procfs cannot prove death
-            elif ticks != rec["start_time"]:
-                state = "gone"  # positively recycled by an unrelated occupant
-            else:
-                state = "live"
-    return state
-
-
-def _unresolved_child_live(m: Meta) -> bool:
-    """Return whether an exact recorded unresolved child still survives.
-
-    Args:
-        m: Agent metadata.
-
-    Returns:
-        ``True`` when the recorded child is provably still alive.
-    """
-    return _unresolved_child_state(m) == "live"
+        return "ambiguous"  # malformed persisted state fails closed
+    pid: int = rec["pid"]
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass  # leader positively dead: the group scan decides below
+    except OSError:
+        return "ambiguous"  # exists but uninspectable (e.g. EPERM)
+    else:
+        ticks = proc_start_ticks(pid)
+        if ticks is None:
+            return "ambiguous"  # unreadable procfs cannot prove anything
+        if ticks == rec["start_time"]:
+            return "live"  # the recorded leader itself still lives
+        # leader positively recycled by an unrelated occupant: scan below
+    pgid: int = rec["pgid"]
+    iid: str = rec["invocation_id"]
+    members = _pinned_invocation_members(pgid, str(m.get("id", "")), iid)
+    for _, fd in members:
+        os.close(fd)
+    return "live" if members else "gone"
 
 
 def _record_running(
@@ -1994,6 +1992,7 @@ def _record_running(
             blocked["stopped"] = True
             m["unresolved_invocation"] = {
                 "pid": proc.pid,
+                "pgid": proc.pid,
                 "start_time": start,
                 "invocation_id": iid,
             }

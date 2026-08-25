@@ -557,7 +557,12 @@ def test_unresolved_child_ambiguous_inspection_blocks_prompt(
     death is not proven: the later prompt stays busy and the durable marker
     persists.
     """
-    marker = {"pid": 424242, "start_time": 111, "invocation_id": "inv-u"}
+    marker = {
+        "pid": 424242,
+        "pgid": 424242,
+        "start_time": 111,
+        "invocation_id": "inv-u",
+    }
     meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped", "stop_reason": "stop"}
     meta["unresolved_invocation"] = marker
     monkeypatch.setattr(os, "kill", lambda _pid, _sig: None)
@@ -583,10 +588,12 @@ def test_unresolved_child_malformed_marker_blocks_and_persists() -> None:
         {"pid": 0, "start_time": 111, "invocation_id": "inv-u"},
         {"pid": -5, "start_time": 111, "invocation_id": "inv-u"},
         {"pid": "424242", "start_time": 111, "invocation_id": "inv-u"},
-        {"pid": 424242, "start_time": "111", "invocation_id": "inv-u"},
-        {"pid": 424242, "start_time": None, "invocation_id": "inv-u"},
-        {"pid": 424242, "start_time": 111},
-        {"pid": 424242, "start_time": 111, "invocation_id": ""},
+        {"pid": 424242, "pgid": 424242, "start_time": "111", "invocation_id": "inv-u"},
+        {"pid": 424242, "pgid": 424242, "start_time": None, "invocation_id": "inv-u"},
+        {"pid": 424242, "start_time": 111, "invocation_id": "inv-u"},  # missing pgid
+        {"pid": 424242, "pgid": None, "start_time": 111, "invocation_id": "inv-u"},
+        {"pid": 424242, "pgid": 424242, "start_time": 111},
+        {"pid": 424242, "pgid": 424242, "start_time": 111, "invocation_id": ""},
     ]
     for broken in cases:
         meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped", "stop_reason": "stop"}
@@ -600,12 +607,18 @@ def test_unresolved_child_malformed_marker_blocks_and_persists() -> None:
 
 def test_unresolved_child_proven_recycled_clears_block() -> None:
     """A readable different start time positively proves recycling and clears."""
-    marker = {"pid": 424242, "start_time": 111, "invocation_id": "inv-u"}
+    marker = {
+        "pid": 424242,
+        "pgid": 424242,
+        "start_time": 111,
+        "invocation_id": "inv-u",
+    }
     meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped", "stop_reason": "stop"}
     meta["unresolved_invocation"] = marker
     patcher = pytest.MonkeyPatch()
     patcher.setattr(os, "kill", lambda _pid, _sig: None)
     patcher.setattr(agent, "proc_start_ticks", lambda _pid: 999)
+    patcher.setattr(agent, "_pinned_invocation_members", lambda *_a: [])
     try:
         meta, decision = _decide_with_marker(meta)
         assert decision["action"] != "busy"
@@ -645,6 +658,7 @@ def test_delete_honors_unresolved_child_until_exactly_proven_gone(
     try:
         marker = {
             "pid": proc.pid,
+            "pgid": proc.pid,
             "start_time": agent.proc_start_ticks(proc.pid),
             "invocation_id": iid,
         }
@@ -727,6 +741,7 @@ def test_spawn_gate_refusal_durably_records_child_before_any_cleanup(
         assert cur is not None
         assert cur["unresolved_invocation"] == {
             "pid": proc.pid,
+            "pgid": proc.pid,
             "start_time": start,
             "invocation_id": iid,
         }
@@ -766,3 +781,141 @@ def test_spawn_gate_refusal_durably_records_child_before_any_cleanup(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def _refused_leader_leaves_marked_descendant(
+    tmp_path: Path, aid: str, iid: str
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Spawn a refused leader that exits, leaving one exact-marked descendant.
+
+    Args:
+        tmp_path: Throwaway state root backing directory.
+        aid: Exact agent ID stamped into the descendant environment.
+        iid: Exact invocation ID stamped into the descendant environment.
+
+    Returns:
+        The (already exited) leader process and the surviving descendant PID.
+    """
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "running"
+    seed["stop_reason"] = "kill"
+    agent.write_meta(aid, seed)
+
+    env = dict(os.environ)
+    env["LUBKO_AGENT_ID"] = aid
+    env[agent.INVOCATION_ID_VAR] = iid
+    leader = subprocess.Popen(
+        ["/bin/sh", "-c", f"{SLEEP_BIN} 300 < /dev/null &"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    start = agent.proc_start_ticks(leader.pid)
+    blocked: dict[str, bool] = {}
+    agent.update_meta(aid, agent._record_running(leader, start, iid, blocked))
+    assert blocked.get("stopped") is True
+
+    # The refused leader exits; its marked descendant survives in the old
+    # session group.
+    leader.wait(timeout=5)
+    deadline = time.time() + 5
+    members: list[tuple[int, int]] = []
+    while time.time() < deadline:
+        members = agent._pinned_invocation_members(leader.pid, aid, iid)
+        for _, fd in members:
+            os.close(fd)
+        if members:
+            break
+        time.sleep(0.05)
+    assert members, "marked descendant must survive the leader's exit"
+
+    def tombstone(m: agent.Meta) -> None:
+        m["delete_pending"] = True
+        m["runner_pid"] = None
+        m["runner_start_time"] = None
+
+    agent.update_meta(aid, tombstone)
+    return leader, members[0][0]
+
+
+def test_delete_blocked_until_marked_descendants_of_dead_leader_are_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leader death alone never clears the obligation: marked descendants count.
+
+    A spawn-gate-refused leader exits before any cleanup, leaving a genuine
+    descendant with the exact agent and invocation markers alive in the old
+    group. Deletion stays non-converged, forced delete converges that exact
+    descendant through pinned per-invocation signalling, and only then may
+    deletion succeed.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-desc"
+    leader, descendant_pid = _refused_leader_leaves_marked_descendant(tmp_path, aid, iid)
+    try:
+        monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+
+        cur = agent.read_meta(aid)
+        assert cur is not None
+        assert agent._delete_converged(cur) is False, (
+            "marked descendant keeps deletion non-converged"
+        )
+        # Non-forced deletion refuses without signalling anything.
+        original_signal_unresolved = agent._signal_unresolved_child
+        monkeypatch.setattr(
+            agent,
+            "_signal_unresolved_child",
+            lambda _m: pytest.fail("non-forced delete must never signal"),
+        )
+        assert agent._converge_for_delete(aid, force=False, deadline=time.time() + 0.05) is False
+        kept = agent.read_meta(aid)
+        assert kept is not None
+        assert kept["unresolved_invocation"] is not None
+
+        # Forced delete converges the exact marked descendant through the
+        # pinned per-invocation path (send_signal_group's dead-leader branch)
+        # and only then reports convergence.
+        monkeypatch.setattr(agent, "_signal_unresolved_child", original_signal_unresolved)
+        assert agent._converge_for_delete(aid, force=True, deadline=time.time() + 5) is True
+        assert not agent.pid_alive(descendant_pid)
+        final = agent.read_meta(aid)
+        assert final is not None
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=5)
+
+
+def test_unresolved_group_reuse_by_foreign_invocation_is_gone() -> None:
+    """A recycled PGID hosting a foreign invocation proves the record gone."""
+    owner = _MarkedProcess("aaaaaaaa", "inv-foreign")
+    try:
+        marker = {
+            "pid": 424242,  # long-dead leader slot
+            "pgid": owner.pid,  # PGID recycled by a newer/foreign invocation
+            "start_time": 1,
+            "invocation_id": "inv-old",
+        }
+        recycled_pgid: int = owner.pid
+        meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped"}
+        meta["unresolved_invocation"] = marker
+        assert agent._unresolved_child_state(meta) == "gone"
+
+        # The same group occupied by an exact-marker member of *this*
+        # invocation stays live.
+        owned = _MarkedProcess("aaaaaaaa", "inv-old")
+        try:
+            os.setpgid(owned.pid, recycled_pgid)
+        except PermissionError:
+            pass
+        else:
+            try:
+                assert agent._unresolved_child_state(meta) == "live"
+            finally:
+                owned.kill_and_reap()
+    finally:
+        owner.kill_and_reap()
