@@ -3628,8 +3628,63 @@ def cmd_delete(args: argparse.Namespace) -> int:
     return EXIT_ERROR
 
 
+def _retention_clean_live(meta: Meta) -> bool:
+    """Return whether an enumerated retention candidate became live again.
+
+    Args:
+        meta: Freshly read metadata of the candidate.
+
+    Returns:
+        ``True`` when the agent can no longer be safely removed.
+    """
+    return (
+        derive_state(meta) not in TERMINAL_STATES
+        or is_alive(meta)
+        or group_alive(meta)
+        or runner_alive(meta)
+        or reservation_in_flight(meta)
+    )
+
+
+def _retention_remove(aid: str, deadline: float) -> str:
+    """Remove one terminal agent's state through the safe delete machinery.
+
+    Reuses the exact tombstone/convergence/removal path of ``delete`` so the
+    metadata lock serializes this against any runner claim or prompt that
+    starts after candidate enumeration.  A candidate that becomes live is
+    skipped and never signalled; convergence failure keeps the retryable state
+    and never reports a successful removal.
+
+    Args:
+        aid: Lubko agent ID.
+        deadline: Absolute time by which deletion must converge.
+
+    Returns:
+        One of ``"removed"``, ``"skipped"``, and ``"failed"``.
+    """
+    meta = read_meta(aid)
+    if meta is None:
+        return "skipped"
+    if _retention_clean_live(meta):
+        return "skipped"
+    _begin_delete(aid, force=False)
+    if not _converge_for_delete(aid, force=False, deadline=deadline):
+        # Fail closed: it became live between the tombstone and convergence.
+        _abort_delete(aid)
+        return "skipped"
+    if not _remove_deleted_state(aid):
+        _abort_delete(aid)
+        return "failed"
+    return "removed"
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     """Garbage-collect old finished agents.
+
+    Dry-run mode is strictly observational and never mutates any state.
+    Actual removal goes through the same lifecycle-safe delete machinery as
+    ``delete``: a candidate that turned promptable/live after enumeration is
+    skipped, its state is never raw-deleted, and no false removal is reported.
 
     Args:
         args: Parsed command arguments.
@@ -3642,17 +3697,30 @@ def cmd_clean(args: argparse.Namespace) -> int:
         _err(f"{PROG}: clean: invalid retention days: {days}")
         return EXIT_USAGE
     candidates = _clean_candidates(days)
+    removed = 0
+    failed = False
+    deadline = time.time() + KILL_WAIT_SECONDS
     for aid in candidates:
         if args.dry_run:
             _out(f"would remove agent {aid}")
-        else:
-            shutil.rmtree(agent_dir(aid), ignore_errors=True)
+            removed += 1
+            continue
+        outcome = _retention_remove(aid, deadline)
+        if outcome == "removed":
             _out(f"removed agent {aid}")
+            removed += 1
+        elif outcome == "skipped":
+            _out(f"skipped agent {aid}: became live after enumeration")
+        else:
+            failed = True
+            _err(f"{PROG}: agent {aid} could not be removed")
 
     if not candidates:
         _out("(nothing to clean)")
     else:
-        _out(f"({len(candidates)} agent(s))")
+        _out(f"({removed} agent(s))")
+    if failed:
+        return EXIT_ERROR
     return EXIT_OK
 
 
