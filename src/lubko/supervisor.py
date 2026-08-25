@@ -860,7 +860,34 @@ class SupervisorDaemon:
             and self._child_alive(state)
         )
         if not already_running:
-            self._retire_child()
+            state = read_state()
+            if not self._retire_child():
+                # Retirement did not positively converge. The old live child
+                # keeps its exact identity, so its recorded commit remains the
+                # authoritative maintained commit: advancing
+                # ``applied_generation`` or rewriting ``commit`` here would let
+                # ``_ensure_worker`` classify that same old worker as already
+                # running the requested commit. Hold fail-closed instead; a
+                # later reconciliation retries the exact retirement.
+                now = time.monotonic()
+                write_state(
+                    replace(
+                        read_state(),
+                        next_attempt_at=now + self._backoff_seconds(state.restart_count),
+                    )
+                )
+                pid = state.child.pid if state.child is not None else None
+                self._message = (
+                    "could not stop recorded worker pid "
+                    f"{pid}; holding without applying generation "
+                    f"{desired.generation}"
+                )
+                LOGGER.error(
+                    "could not stop recorded worker pid %d; holding without applying generation %d",
+                    pid,
+                    desired.generation,
+                )
+                return
         state = replace(
             read_state(),
             applied_generation=desired.generation,
