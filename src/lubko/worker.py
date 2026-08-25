@@ -2836,6 +2836,23 @@ class GatedSpawn:
     stderr_read_fd: int | None = None
 
 
+def _unlink_gated_spool_best_effort(path: Path) -> None:
+    """Best-effort remove one temporary gated capture spool file.
+
+    Called only after the unreleased gated direct child has been positively
+    converged and reaped, so a filesystem fault here can no longer affect any
+    process: it must never propagate into the higher-level start-failure or
+    connectivity outcome.
+
+    Args:
+        path: Capture spool file to remove.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        LOGGER.warning("failed to remove gated spool %s: %s", path, exc)
+
+
 def abort_gated_start(
     proc: subprocess.Popen[bytes],
     pgid: int,
@@ -2865,8 +2882,9 @@ def abort_gated_start(
 
     Returns:
         ``True`` when the direct child is terminal, reaped, and the capture
-        files were removed (the unreleased group is gone by construction);
-        ``False`` when the child remained live after the bounded first attempt,
+        files were best-effort removed (the unreleased group is gone by
+        construction; spool cleanup failure cannot propagate); ``False`` when
+        the child remained live after the bounded first attempt,
         in which case :func:`await_gated_group_gone` owns it until reap.
     """
     # Close the gate WITHOUT releasing: the wrapper reads EOF and exits.
@@ -2879,8 +2897,8 @@ def abort_gated_start(
     if proc.poll() is not None:
         with suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
-        stdout_path.unlink(missing_ok=True)
-        stderr_path.unlink(missing_ok=True)
+        _unlink_gated_spool_best_effort(stdout_path)
+        _unlink_gated_spool_best_effort(stderr_path)
         return True
     LOGGER.error(
         "gated wrapper %d (exact group %d) stayed live through the bounded "
@@ -2915,9 +2933,10 @@ def await_gated_group_gone(gated: GatedSpawn) -> None:
         gated.proc.wait(timeout=5)
     # The direct child is reaped: the original unreleased childless group is
     # gone by construction. Clean up captures now; never touch the numeric
-    # PGID again (it may already be reused by an unrelated process).
-    gated.stdout_path.unlink(missing_ok=True)
-    gated.stderr_path.unlink(missing_ok=True)
+    # PGID again (it may already be reused by an unrelated process). Cleanup
+    # is bounded best-effort and independent per stream.
+    _unlink_gated_spool_best_effort(gated.stdout_path)
+    _unlink_gated_spool_best_effort(gated.stderr_path)
     for capture_fd_attr in ("stdout_read_fd", "stderr_read_fd"):
         capture_fd = getattr(gated, capture_fd_attr)
         if capture_fd is not None:
