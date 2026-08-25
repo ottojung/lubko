@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from lubko import cli, protocol, supervise, toolchain
+from lubko import agent, cli, protocol, supervise, toolchain
 from lubko._pg import psycopg, tuple_row
 from lubko.config import load_database_config, load_worker_server
 from lubko.durable import remove_durable, write_json_durable
@@ -924,6 +924,16 @@ def stop_worker(
     its full cancel grace plus bounded finalization overhead before an emergency
     SIGKILL is even possible.
 
+    Every signal is authorized by exact worker identity *at signal time*: the
+    recorded PID is first pinned with a pidfd (a kernel-stable reference that
+    prevents PID recycling while held), and identity, lifecycle-token, and
+    group-leadership proofs are taken under that pin before the group is used
+    as signal authority. If stable proof is unavailable — no pin possible on a
+    live process, a missing or mismatched token, or a foreign group leader —
+    nothing is signalled and retirement is not claimed (fail closed). The pin
+    spans the whole retirement interval including SIGKILL escalation, so a
+    recycled PID/PGID occupant can never absorb either signal.
+
     Only if the worker ignores ``SIGTERM`` (wedged) is an emergency SIGKILL sent
     to the worker group. Owned command groups that survive a wedged worker must
     be recovered by exact process-group identity elsewhere (see
@@ -941,8 +951,45 @@ def stop_worker(
         ``True`` when the exact worker process is no longer alive afterwards
         (or was already gone / reused). ``False`` when the exact process
         instance is alive but cannot be authorized for a signal because it does
-        not carry our lifecycle token (including when none was recorded), so
+        not carry our lifecycle token (including when none was recorded), or
+        because stable kernel proof of its identity is unavailable, so
         retirement is not claimed.
+    """
+    if meta.pid is None:
+        return True
+    pin = agent.open_pidfd(meta.pid)
+    if pin is None:
+        # The pin failed either because the exact worker already exited (the
+        # numeric PID may even have been recycled since) or because the
+        # platform cannot pin PIDs at all. Distinguish by re-reading identity:
+        # a live occupant we cannot pin must never be signalled — fail closed.
+        return process_identity(meta.pid) is None
+    try:
+        return _stop_pinned(meta, grace_seconds, cancel_grace_seconds)
+    finally:
+        os.close(pin)
+
+
+def _stop_pinned(
+    meta: WorkerMeta,
+    grace_seconds: float,
+    cancel_grace_seconds: float,
+) -> bool:
+    """Run the drain/escalate retirement under a held pidfd pin.
+
+    The pin kernel-pins the recorded PID for the whole retirement interval:
+    while it is open, the kernel cannot recycle that PID for any other
+    process, so every identity proof taken under the pin remains valid at
+    each signal point and the worker's group number can only ever refer to
+    the exact proven group (or be gone).
+
+    Args:
+        meta: Recorded worker metadata.
+        grace_seconds: Intended grace period before the emergency force-kill.
+        cancel_grace_seconds: The worker's own command cancel grace.
+
+    Returns:
+        ``True`` when the exact worker process is no longer alive afterwards.
     """
     if meta.pid is None:
         return True
@@ -951,16 +998,19 @@ def stop_worker(
         # The exact worker process is gone or its identity changed (a recycled
         # PID can never be mis-signalled). Nothing to stop; retirement succeeds.
         return True
-    if meta.token is None or not process_has_token(meta.pid, meta.token):
-        # The exact process instance is alive but does NOT carry our lifecycle
-        # token: it is a live, unowned process (a wrong token, or none at all —
-        # never ours). Signal authorization requires the exact lifecycle token,
-        # so an absent token is treated identically to a mismatched one: we must
-        # not signal a process we do not own, and we must not report retirement
-        # as successful, so the caller holds rather than handing off
-        # sole-consumer authority. This is distinct from the dead/reused case
-        # above, where no live process matches the recorded identity and
-        # retirement genuinely succeeds.
+    # Signal authorization requires the exact lifecycle token AND the worker
+    # leading its own group (the pin protects the worker's own PID, not a
+    # foreign leader's). An unowned live process — wrong token, no token, or a
+    # foreign group layout — is never signalled and retirement is never claimed,
+    # so the caller holds rather than handing off sole-consumer authority. This
+    # is distinct from the dead/reused case above, where no live process matches
+    # the recorded identity and retirement genuinely succeeds.
+    authorized = (
+        meta.token is not None
+        and process_has_token(meta.pid, meta.token)
+        and identity.pgid == identity.pid
+    )
+    if not authorized:
         return False
     start = time.monotonic()
     kill_floor = start + cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS
@@ -974,9 +1024,15 @@ def stop_worker(
     if _wait_for_drain(meta, wait_deadline):
         return True
     # 3. Emergency: the worker ignored SIGTERM and never drained. Never fire the
-    #    SIGKILL before the worker's own cancel grace plus finalization slack.
+    #    SIGKILL before the worker's own cancel grace plus finalization slack,
+    #    and never fire it at all unless the exact pinned worker instance is
+    #    still alive (it may have exited during the floor wait; the held pin
+    #    guarantees any surviving occupant of the numeric identity would fail
+    #    this re-proof rather than absorb the SIGKILL).
     if time.monotonic() < kill_floor:
         time.sleep(kill_floor - time.monotonic())
+    if not _worker_process_alive(meta):
+        return True
     _signal_group(identity.pgid, signal.SIGKILL)
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline and _worker_process_alive(meta):
