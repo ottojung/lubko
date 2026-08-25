@@ -1330,24 +1330,42 @@ def test_signal_identity_checked_delivers_through_the_pin(
     assert closed == [55]
 
 
-def test_signal_identity_checked_ignores_pid_reused_after_proof(
+def test_signal_identity_checked_survives_exit_after_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A recorded PID whose start ticks no longer match is never signalled."""
-    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 56)
-    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 999)
-    monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
-    monkeypatch.setattr(
-        agent,
-        "pidfd_send_signal",
-        lambda *_a: pytest.fail("signalled a recycled PID"),
-    )
-    closed: list[int] = []
-    monkeypatch.setattr(os, "close", closed.append)
+    """A pinned process exiting after a successful proof is handled cleanly.
 
-    agent.signal_identity_checked(424242, 111, signal.SIGKILL)
+    The pin opens, the start-tick proof succeeds, and only then does the
+    pinned task exit — ``pidfd_send_signal`` reports ``ESRCH``. No numeric
+    fallback may fire (the numeric PID may already be recycled), the exit is
+    swallowed, and the pin is still closed.
+    """
+    pin = os.open(os.devnull, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(agent, "open_pidfd", lambda _pid: pin)
+        monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+        monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("numeric kill fired"))
 
-    assert closed == [56]
+        def gone(_pidfd: int, _sig: int) -> None:
+            raise ProcessLookupError
+
+        monkeypatch.setattr(agent, "pidfd_send_signal", gone)
+        closed: list[int] = []
+        real_close = os.close
+
+        def recording_close(fd: int) -> None:
+            real_close(fd)
+            closed.append(fd)
+
+        monkeypatch.setattr(os, "close", recording_close)
+
+        agent.signal_identity_checked(424242, 111, signal.SIGKILL)
+
+        assert closed == [pin]
+        assert not _fd_open(pin), "owned pin must be truly closed"
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(pin)
 
 
 def test_signal_identity_checked_fails_closed_without_a_pin(
