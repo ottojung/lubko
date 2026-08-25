@@ -554,8 +554,12 @@ def signal_identity_checked(
     The PID is pinned with a pidfd before verification, so it cannot be
     recycled between verification and delivery: a recorded runner PID that was
     already reused by an unrelated process never matches and is never
-    signalled. When the platform cannot pin PIDs the signal is withheld (fail
-    closed).
+    signalled, and delivery itself goes through ``pidfd_send_signal`` on the
+    very descriptor that pinned the verified process — a numeric ``kill``
+    could still retarget onto an unrelated occupant of the recycled PID even
+    after a successful proof, because the kernel frees a numeric PID for reuse
+    before the pinned reference is released. When the platform cannot pin PIDs
+    the signal is withheld (fail closed).
 
     Args:
         pid: Recorded runner PID to signal.
@@ -572,7 +576,7 @@ def signal_identity_checked(
         if marker_aid is not None and not env_has_marker(int(pid), marker_aid):
             return
         with contextlib.suppress(ProcessLookupError):
-            os.kill(int(pid), sig)
+            pidfd_send_signal(fd, sig)
     finally:
         os.close(fd)
 
