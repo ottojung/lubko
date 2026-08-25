@@ -1,44 +1,33 @@
 # Lubko
 
-Lubko is a small job runner for running shell-style tasks inside a dedicated
-container. You describe a command and where it should run; Lubko picks it up,
-executes it in the requested working directory, captures its output and exit
-status, and makes the results available while the job runs and after it
-finishes.
+Lubko lets you run commands and manage AI agent sessions inside a dedicated
+container, from outside it. You describe what should run; Lubko executes it in
+the working directory you choose, shows its output while it runs, records the
+result, and lets you cancel or clean up at any time.
 
 ## Why Lubko
 
-- **Delegate work safely.** Run arbitrary commands — builds, scripts, agent
-  sessions — inside a container instead of on your workstation or orchestration
-  host.
-- **See progress live.** Watch a job's output as it runs, not only after it
-  finishes.
-- **Stay in control.** Cancel running work cleanly and get a clear final status
-  (`succeeded`, `failed`, `cancelled`) either way.
-- **Survive crashes.** If a worker dies mid-job, the stuck job is detected and
-  marked failed automatically — it is never silently lost or run twice.
+- **Delegate work safely.** Run builds, scripts, and other tasks inside a
+  container instead of on your workstation or orchestration host.
+- **See progress live.** Watch a task's output as it happens, not only after
+  it finishes.
+- **Stay in control.** Cancel running work cleanly; every task ends with a
+  clear status (`succeeded`, `failed`, `cancelled`).
+- **Nothing gets lost.** Tasks that were interrupted are detected and marked,
+  never silently lost or run twice.
 
 ## When would you use it
 
-Use Lubko whenever something outside the container needs to execute commands
-*in* the container: remote task execution, background automation, or managing
-long-lived AI coding-agent sessions from an orchestrator that can only reach
-the container's queue.
+Use Lubko whenever something outside a container needs to execute work *in*
+that container: remote task execution, background automation, or managing
+long-lived AI coding-agent sessions from an orchestrator.
 
-## What you get
+## Getting started
 
-- **`lubko-worker`** — the always-on service that claims and runs jobs.
-- **`lubko-supervisor`** — keeps exactly one worker running across crashes and
-  environment restarts.
-- **`lubko-deploy`** — installs, upgrades, restarts, and repairs the worker
-  with built-in verification.
-- **`lubko-install`** — puts the maintained commands on your PATH.
-- **`lubko-agent`** — manage durable AI agent sessions: start them, prompt
-  them, steer or detach, read their logs, wait for completion, stop or clean
-  them up.
-
-Jobs are submitted through PostgreSQL (see `docs/protocol.md`), and each job's
-output is retained as a durable log.
+Install the maintained commands with `lubko-install`, start Lubko in your
+container, and submit tasks as described in `docs/`. The `lubko-agent`
+command manages AI agent sessions end to end: start them, prompt them, read
+their logs, wait for completion, stop or clean them up.
 
 ## Development
 
