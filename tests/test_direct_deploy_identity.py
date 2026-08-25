@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import cast
 
@@ -24,6 +25,33 @@ PID = 4242
 PRIVATE = ProcessIdentity(pid=PID, pgid=PID, sid=PID, start_time_ticks=555)
 TRANSITIONED = ProcessIdentity(pid=PID, pgid=1, sid=9000, start_time_ticks=555)
 PIN_BASE = 10000
+
+
+class FakeClock:
+    """Deterministic monotonic clock advanced by fake sleeps."""
+
+    def __init__(self, step: float) -> None:
+        """Start at fake time zero with one sleep crossing the deadline.
+
+        Args:
+            step: Fake time added by each sleep; large enough that exactly
+                one sleep moves the clock past any real deadline.
+        """
+        self.now = 0.0
+        self.step = step
+
+    def monotonic(self) -> float:
+        """Return the current fake time."""
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        """Advance the fake time instead of blocking.
+
+        Args:
+            seconds: How long a real sleep would have blocked (ignored).
+        """
+        del seconds
+        self.now += self.step
 
 
 class NumericSignalError(AssertionError):
@@ -320,15 +348,24 @@ def test_lifecycle_wait_preserves_anchor_through_final_transient_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A transient ``None`` at the deadline does not discard the anchor."""
-    monkeypatch.setattr(lifecycle, "SESSION_ESTABLISH_TIMEOUT_SECONDS", 0.0)
+    clock = FakeClock(step=lifecycle.SESSION_ESTABLISH_TIMEOUT_SECONDS)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
     observations = iter([TRANSITIONED, None])
+    reads: list[ProcessIdentity | None] = []
 
     def identity(_pid: int) -> ProcessIdentity | None:
-        return next(observations, None)
+        observed = next(observations, None)
+        reads.append(observed)
+        return observed
 
     monkeypatch.setattr(lifecycle, "process_identity", identity)
 
     assert lifecycle._wait_for_identity(PID) == TRANSITIONED
+    # Poll 1 observed the anchor before the deadline; poll 2 returned the
+    # transient None at/after it. Both polls really happened.
+    assert reads == [TRANSITIONED, None]
+    assert clock.now >= lifecycle.SESSION_ESTABLISH_TIMEOUT_SECONDS
 
 
 def test_deployctl_wait_preserves_anchor_through_final_transient_none(
@@ -351,12 +388,21 @@ def test_deployctl_wait_preserves_anchor_through_final_transient_none(
             del self
             return None
 
-    monkeypatch.setattr(dc, "IDENTITY_TIMEOUT_SECONDS", 0.0)
+    clock = FakeClock(step=lifecycle.SESSION_ESTABLISH_TIMEOUT_SECONDS)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
     observations = iter([TRANSITIONED, None])
+    reads: list[ProcessIdentity | None] = []
 
     def identity(_pid: int) -> ProcessIdentity | None:
-        return next(observations, None)
+        observed = next(observations, None)
+        reads.append(observed)
+        return observed
 
     monkeypatch.setattr(dc, "process_identity", identity)
 
     assert dc._wait_for_identity(cast("subprocess.Popen[bytes]", LiveProc())) == TRANSITIONED
+    # Poll 1 observed the anchor before the deadline; poll 2 returned the
+    # transient None at/after it. Both polls really happened.
+    assert reads == [TRANSITIONED, None]
+    assert clock.now >= dc.IDENTITY_TIMEOUT_SECONDS
