@@ -8,6 +8,7 @@ be signalled.
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 from typing import TYPE_CHECKING
@@ -32,7 +33,13 @@ class FakePinning:
     The fake pidfd descriptor is a plain increasing integer. Each delivery is
     recorded as ``(fd, signal_number)`` so tests can assert that both escalation
     steps address the same kernel-pinned process. A call to ``os.kill`` would
-    surface as an unexpected delivery, since it is wired to the same recorder.
+    surface as an unexpected delivery addressed to the numeric PID, since it is
+    wired to the same recorder.
+
+    After a TERM delivery the process table can be scripted: the first
+    ``alive_reads_after_term`` observations still report old process A with its
+    recorded ticks; after the last of those observations A exits and the numeric
+    PID is recycled to an unrelated process B whose ticks differ.
     """
 
     def __init__(self) -> None:
@@ -44,9 +51,25 @@ class FakePinning:
         self.fail_pin = False
         self.ticks_on_pin: int | None = None
         self.after_term: Callable[[int], None] = lambda _pidfd: None
+        self.alive_reads_after_term = 0
+        self.reuse_ticks: int | None = None
+        self.kill_esrch = False
+        self._term_delivered = False
+        self._reads_since_term = 0
+        self._a_exited = False
 
     def proc_start_ticks(self, pid: int) -> int | None:
         """Return the injected ticks for ``pid`` (``None`` when absent)."""
+        if self._term_delivered and pid in self.ticks:
+            self._reads_since_term += 1
+            if self._reads_since_term <= self.alive_reads_after_term:
+                if self._reads_since_term == self.alive_reads_after_term:
+                    # Reuse happens right AFTER this final grace observation:
+                    # old A exits and B takes over the numeric PID.
+                    self._a_exited = True
+                return self.ticks.get(pid)
+            self._a_exited = True
+            return self.reuse_ticks
         return self.ticks.get(pid)
 
     def open_pidfd(self, pid: int) -> int:
@@ -67,10 +90,30 @@ class FakePinning:
         return self.next_fd
 
     def send_signal(self, pidfd: int, sig: int) -> None:
-        """Record one delivery against the pinned descriptor."""
+        """Record one delivery against its addressed target.
+
+        A pidfd delivery goes only to the kernel-pinned process; KILL against a
+        pin whose process has already exited raises ``ESRCH``. A numeric
+        ``os.kill`` delivery would instead be addressed to whoever currently
+        owns the number — including recycled B — which tests can detect.
+
+        Raises:
+            OSError: When KILL targets a pin whose process already exited.
+        """
         self.delivered.append((pidfd, sig))
         if sig == TERMINATE:
+            self._term_delivered = True
+            self._reads_since_term = 0
             self.after_term(pidfd)
+        elif sig == KILL and self._a_exited:
+            self.kill_esrch = True
+            msg = "pinned process already exited"
+            raise OSError(errno.ESRCH, msg)
+
+    @property
+    def a_exited(self) -> bool:
+        """Whether old process A has exited in the current script."""
+        return self._a_exited
 
     def close(self, _fd: int) -> None:
         """Accept closes without effect."""
@@ -135,19 +178,31 @@ def test_recycled_pid_before_term_is_never_signalled(
 def test_reuse_between_term_and_kill_keeps_one_pin_and_no_numeric_signal(
     converge: FakePinning,
 ) -> None:
-    """TERM and KILL escalation reuse one pidfd; bare numeric kill never runs."""
+    """KILL at the escalation boundary hits only the pinned A, never recycled B.
+
+    The first post-TERM grace observation still reports old process A alive
+    with its recorded ticks. Immediately after that final observation — and
+    before KILL is delivered — A exits and the numeric PID 4242 is recycled to
+    an unrelated process B. The KILL must still be addressed through the pin
+    taken before the reuse (failing with ESRCH because A is already dead), and
+    B must receive no signal of any kind.
+    """
     fake = converge
     fake.ticks[4242] = 777
+    fake.alive_reads_after_term = 1
+    fake.reuse_ticks = 888_888
 
-    # The child keeps matching its recorded identity until the grace expires;
-    # KILL then escalates through the very same pinned descriptor.
+    # A provably survives TERM, then exits and its numeric PID is recycled by
+    # B before the KILL escalation fires.
     converged = _daemon(fake)._converge_unresolved(_hold())
 
     assert [sig for _, sig in fake.delivered] == [TERMINATE, KILL]
-    fds = {fd for fd, _ in fake.delivered}
-    assert fds == {101}
-    assert fake.pins == [4242]
-    assert converged is False
+    assert all(fd == 101 for fd, _ in fake.delivered), "both signals used one pidfd"
+    assert all(fd != 4242 for fd, _ in fake.delivered), "no numeric kill reached recycled B"
+    assert fake.pins == [4242], "the single pin predates the reuse"
+    assert fake.a_exited, "A was modelled as exited before KILL"
+    assert fake.kill_esrch, "pinned KILL surfaced ESRCH against dead A"
+    assert converged is True, "recycled B ends the hold without being signalled"
 
 
 def test_exact_pinned_delivery_converges_after_term(
