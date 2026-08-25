@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from lubko import supervise
+from lubko import supervise, supervisor
 
 
 @pytest.fixture
@@ -51,3 +51,68 @@ def test_present_corrupt_authority_is_durable_hold(state_path: Path, raw: str) -
     supervise.write_state(state)
     rewritten = supervise.read_state()
     assert rewritten.ownership_hold_malformed is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ownership_hold_malformed", None),
+        ("ownership_hold_malformed", "true"),
+        ("ownership_hold_malformed", 1),
+        ("unresolved_hold_malformed", None),
+        ("unresolved_hold_malformed", "true"),
+        ("unresolved_hold_malformed", 1),
+    ],
+)
+def test_present_non_boolean_safety_bit_is_durable_hold(
+    state_path: Path, field: str, value: object
+) -> None:
+    """A malformed persisted safety bit cannot erase its obligation."""
+    state_path.write_text(
+        json.dumps({"schema_version": supervise.SCHEMA_VERSION, field: value}),
+        encoding="utf-8",
+    )
+
+    state = supervise.read_state()
+    assert getattr(state, field) is True
+    supervise.write_state(state)
+    assert getattr(supervise.read_state(), field) is True
+
+
+@pytest.mark.parametrize("field", ["ownership_hold_malformed", "unresolved_hold_malformed"])
+@pytest.mark.parametrize("value", [False, True])
+def test_boolean_safety_bit_values_are_preserved(
+    state_path: Path, field: str, value: object
+) -> None:
+    """Actual JSON booleans retain their explicit safety-bit values."""
+    state_path.write_text(
+        json.dumps({"schema_version": supervise.SCHEMA_VERSION, field: value}),
+        encoding="utf-8",
+    )
+
+    state = supervise.read_state()
+    assert getattr(state, field) is value
+
+
+def test_reconcile_holds_before_worker_spawn_on_ownership_corruption(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reconcile returns before any worker path for a corrupt ownership bit."""
+    state_path.write_text(
+        json.dumps({
+            "schema_version": supervise.SCHEMA_VERSION,
+            "ownership_hold_malformed": "not-a-boolean",
+        }),
+        encoding="utf-8",
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        daemon,
+        "_ensure_worker",
+        lambda _commit: pytest.fail("corrupt ownership state reached worker spawn path"),
+    )
+
+    daemon.reconcile(0.0)
+
+    assert daemon._message is not None
+    assert "malformed" in daemon._message

@@ -365,9 +365,9 @@ class SupervisorState:
             child=child,
             unresolved_child=unresolved,
             ownership_hold_malformed=ownership_hold_malformed
-            or data.get("ownership_hold_malformed") is True,
+            or _strict_safety_hold(data, "ownership_hold_malformed"),
             unresolved_hold_malformed=unresolved_hold_malformed
-            or data.get("unresolved_hold_malformed") is True,
+            or _strict_safety_hold(data, "unresolved_hold_malformed"),
             intent=_optional_string(data.get("intent")) or INTENT_RUN,
             restart_count=_optional_int(data.get("restart_count")) or 0,
             next_attempt_at=_optional_float(data.get("next_attempt_at")),
@@ -1316,6 +1316,23 @@ def _optional_bool(value: object | None) -> bool | None:
         The boolean, or ``None``.
     """
     return value if isinstance(value, bool) else None
+
+
+def _strict_safety_hold(data: dict[str, object], key: str) -> bool:
+    """Decode a durable safety bit without allowing malformed data to clear it.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Safety-bit field name.
+
+    Returns:
+        ``False`` when the field is absent, its boolean value when valid, or
+        ``True`` when a present value is not a JSON boolean.
+    """
+    if key not in data:
+        return False
+    value = _optional_bool(data[key])
+    return value if value is not None else True
 
 
 def _optional_dict(value: object | None) -> dict[str, object] | None:
