@@ -72,10 +72,12 @@ from __future__ import annotations
 import argparse
 import ctypes
 import fcntl
+import importlib
 import json
 import logging
 import os
 import select
+import selectors
 import signal
 import socket
 import subprocess
@@ -86,7 +88,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, override
+from typing import TYPE_CHECKING, Any, Final, cast, override
 from uuid import uuid4
 
 from lubko._pg import psycopg, tuple_row
@@ -117,6 +119,9 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterable
     from uuid import UUID
 
+    from psycopg.abc import RV, PQGen
+
+    from lubko._pg_deadline import DeadlineConnection
     from lubko.config import DatabaseConfig
 
     JobsConnection = psycopg.Connection[tuple[Any, ...]]
@@ -124,6 +129,117 @@ else:
     # Annotation-only alias; resolved lazily so importing this module never
     # executes the compiled driver.
     JobsConnection = Any
+
+#: Explicit re-export of the lazily-loaded driver-bound connection class;
+#: listed because strict type checking disables implicit re-export.
+__all__ = ["DeadlineConnection"]
+
+_DEADLINE_EXPORTS: Final[frozenset[str]] = frozenset({"DeadlineConnection"})
+
+
+def _ensure_deadline_bindings() -> None:
+    """Bind the driver-bound deadline names into this module's globals.
+
+    A module-level ``__getattr__`` only serves *external* attribute access;
+    plain global lookups inside this module's own functions would raise
+    ``NameError``. Every runtime use site therefore calls this first, which
+    loads the compiled psycopg driver once, on the first actual database turn.
+    """
+    if "DeadlineConnection" in globals():
+        return
+    module = importlib.import_module("lubko._pg_deadline")
+    for name in _DEADLINE_EXPORTS:
+        globals()[name] = getattr(module, name)
+
+
+if not TYPE_CHECKING:
+
+    def __getattr__(name: str) -> object:
+        # External re-export hook: resolve driver-bound deadline names lazily
+        # so importing :mod:`lubko.worker` never pays the driver load cost.
+        if name in _DEADLINE_EXPORTS:
+            return getattr(importlib.import_module("lubko._pg_deadline"), name)
+        msg = f"module {__name__!r} has no attribute {name!r}"
+        raise AttributeError(msg)
+
+
+class DbOperationDeadlineError(TimeoutError):
+    """An established database operation exceeded its hard client-side deadline.
+
+    Raised by :func:`wait_with_deadline` when a libpq operation on an
+    already-established connection did not complete by the operation's
+    absolute monotonic deadline (for example because the socket silently
+    black-holes packets). The connection is failed closed before the error is
+    raised, so the supervisor classifies it as a connectivity failure and
+    converges through the outage-safety path. It deliberately needs no
+    psycopg base class: the supervisor catches it directly and treats it as a
+    connectivity-classified outage trigger.
+    """
+
+
+def wait_with_deadline(gen: PQGen[RV], fileno: int, deadline: float) -> RV:
+    """Drive a nonblocking libpq generator under an absolute monotonic deadline.
+
+    This is the application-owned hard client bound on established database
+    operations: unlike ``connect_timeout`` (which bounds only connection
+    establishment) and server-side ``statement_timeout`` (which cannot
+    guarantee the client ever notices a network black hole), this seam bounds
+    the client's own waiting on every readiness cycle of the operation. When
+    the deadline passes, the generator is abandoned and
+    :class:`DbOperationDeadlineError` is raised; the caller must fail the
+    connection closed and enter outage handling.
+
+    Args:
+        gen: A psycopg nonblocking generator performing a database operation.
+        fileno: The established connection socket descriptor to wait on.
+        deadline: Absolute monotonic time by which the operation must finish.
+
+    Returns:
+        Whatever ``gen`` returns on completion.
+    """
+    try:
+        state = next(gen)
+        with selectors.DefaultSelector() as sel:
+            sel.register(fileno, state)
+            return _drive_under_deadline(gen, sel, fileno, deadline)
+    except StopIteration as ex:
+        result: RV = ex.value
+        return result
+
+
+def _drive_under_deadline(
+    gen: PQGen[RV], sel: selectors.BaseSelector, fileno: int, deadline: float
+) -> RV:
+    """Run the readiness loop of :func:`wait_with_deadline` under ``deadline``.
+
+    Args:
+        gen: The nonblocking libpq generator being driven.
+        sel: Selector with ``fileno`` already registered.
+        fileno: The established connection socket descriptor.
+        deadline: Absolute monotonic time by which the operation must finish.
+
+    Raises:
+        DbOperationDeadlineError: If the deadline passed before completion.
+    """
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            msg = (
+                "database operation exceeded its hard client deadline on an established connection"
+            )
+            raise DbOperationDeadlineError(msg)
+        events = sel.select(timeout=remaining)
+        if not events:
+            # Mirror psycopg's own selector loop: a timeout with no readiness
+            # still probes whether the socket disappeared, then lets the
+            # generator decide how to proceed. The event mask ``0`` matches
+            # what psycopg itself sends for this probe (selectors deliver
+            # plain integer masks).
+            os.fstat(fileno)
+            gen.send(0)
+            continue
+        state = gen.send(events[0][1])
+        sel.modify(fileno, state)
 
 
 def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None) -> bool:
@@ -160,6 +276,71 @@ def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None
         and conn is not None
         and (conn.broken or conn.closed)
     )
+
+
+def operation_deadline_at(
+    now_mono: float,
+    heartbeat_origins: Collection[float],
+    settings: Settings,
+) -> float:
+    """Return the absolute monotonic deadline for this turn's database work.
+
+    The deadline is capped by the configured ``db_operation_timeout_seconds``
+    and, when any live owned group is heartbeated, additionally bounded by the
+    earliest job's local lease-safety instant
+    ``last_heartbeat_at + lease_duration - margin``. Because settings
+    validation guarantees ``db_operation_timeout_seconds < lease_duration -
+    margin - refresh_interval``, a hung established operation is always
+    detected strictly before any owned process's lease can become unsafe, no
+    matter how late in a lease cycle the operation starts.
+
+    Args:
+        now_mono: Current monotonic time.
+        heartbeat_origins: Conservative monotonic origins of the last committed
+            heartbeats of locally-owned jobs with live process groups.
+        settings: Worker runtime settings.
+
+    Returns:
+        The absolute monotonic operation deadline for this turn.
+    """
+    limit = now_mono + settings.db_operation_timeout_seconds
+    safety_instants = (
+        origin + settings.lease_duration_seconds - settings.lease_safety_margin_seconds
+        for origin in heartbeat_origins
+    )
+    earliest = min(safety_instants, default=None)
+    if earliest is not None and earliest < limit:
+        return earliest
+    return limit
+
+
+def install_operation_deadline(conn: JobsConnection | None, deadline: float) -> None:
+    """Install the hard client deadline on the supervisor's live connection.
+
+    The deadline capability is expressed as a ``operation_deadline`` class
+    attribute on the connection type: production connections are established
+    as :class:`DeadlineConnection`, which defines it, while a plain
+    production-established connection does not and therefore fails closed —
+    silently operating without the established-operation bound is never
+    acceptable. Test doubles may opt in by declaring the same class
+    attribute.
+
+    Args:
+        conn: The supervisor's current database connection (or ``None``).
+        deadline: The absolute monotonic operation deadline to install.
+
+    Raises:
+        TypeError: If the connection type lacks the deadline capability.
+    """
+    if conn is None:
+        return
+    if getattr(type(conn), "operation_deadline", None) is None:
+        msg = (
+            "database connection lacks the hard client operation-deadline "
+            "capability; refusing to operate without the lease-safety bound"
+        )
+        raise TypeError(msg)
+    cast("Any", conn).operation_deadline = deadline
 
 
 LOGGER: Final = logging.getLogger(__name__)
@@ -545,6 +726,28 @@ class Settings:
             msg = (
                 "LUBKO_LEASE_SAFETY_MARGIN_SECONDS must be non-negative and smaller "
                 "than LUBKO_LEASE_DURATION_SECONDS"
+            )
+            raise ValueError(msg)
+        # Fail-closed ordering invariant: the configured hard client deadline
+        # for an established database operation must fit inside the lease-safety
+        # budget that remains at the latest possible heartbeat attempt. A
+        # refresh starts no later than ``last_heartbeat_at + refresh_interval``
+        # and its group must be terminable before ``last_heartbeat_at +
+        # lease_duration - margin``, so the operation deadline must be strictly
+        # smaller than ``duration - margin - refresh_interval``. Otherwise a
+        # single hung database operation could outlive the safety margin and a
+        # worker would refuse to start rather than run unsafely.
+        if self.db_operation_timeout_seconds >= (
+            self.lease_duration_seconds
+            - self.lease_safety_margin_seconds
+            - self.lease_refresh_interval_seconds
+        ):
+            msg = (
+                "LUBKO_DB_OPERATION_TIMEOUT_SECONDS must be smaller than "
+                "LUBKO_LEASE_DURATION_SECONDS - LUBKO_LEASE_SAFETY_MARGIN_SECONDS "
+                "- LUBKO_LEASE_REFRESH_INTERVAL_SECONDS so a hung established "
+                "database operation can never block past the local lease-safety "
+                "deadline"
             )
             raise ValueError(msg)
 
@@ -3870,9 +4073,17 @@ class Supervisor:
         while not self._stopping:
             try:
                 self._tick(time.monotonic())
+            except DbOperationDeadlineError:
+                # A hung established operation breached its hard client
+                # deadline mid-turn. Enter outage handling and enforce lease
+                # safety immediately rather than sleeping a turn so an owned
+                # group can never outlive its database lease.
+                self._enter_outage()
+                self._enforce_lease_safety()
             except psycopg.Error as exc:
                 if self._is_connectivity_error(exc):
                     self._enter_outage()
+                    self._enforce_lease_safety()
                 else:
                     LOGGER.critical(
                         "unexpected non-connectivity database error "
@@ -3899,7 +4110,28 @@ class Supervisor:
         if self.conn is None:
             self._outage_phase()
             return
+        install_operation_deadline(self.conn, self._operation_deadline(now))
         self._db_phase(now)
+
+    def _operation_deadline(self, now_mono: float) -> float:
+        """Return the hard client deadline for this turn's database operations.
+
+        Derived from the earliest live owned job's lease-safety instant (see
+        :func:`operation_deadline_at`), so no single hung database operation
+        can ever block the supervisor past a local lease-safety deadline.
+
+        Args:
+            now_mono: Current monotonic time.
+
+        Returns:
+            The absolute monotonic operation deadline.
+        """
+        origins = [
+            job.last_heartbeat_at
+            for job in self.active.values()
+            if not job.completed and not job.term_sent and job.last_heartbeat_at > 0.0
+        ]
+        return operation_deadline_at(now_mono, origins, self.settings)
 
     def _service_processes(self) -> None:
         """Observe child exits and escalate in-flight cancellations.
@@ -5452,7 +5684,8 @@ class Supervisor:
                 invariant.
         """
         try:
-            conn = psycopg.connect(
+            _ensure_deadline_bindings()
+            conn = DeadlineConnection.connect(
                 self.database.conninfo(),
                 connect_timeout=max(1, min(5, int(self.settings.db_operation_timeout_seconds))),
                 row_factory=tuple_row,
@@ -5460,6 +5693,9 @@ class Supervisor:
                     f"-c statement_timeout={int(self.settings.db_operation_timeout_seconds * 1000)}"
                 ),
             )
+            # The invariant-verification queries below are established
+            # operations too: bound them by the same hard client deadline.
+            conn.operation_deadline = time.monotonic() + self.settings.db_operation_timeout_seconds
         except psycopg.Error:
             LOGGER.exception("database connection failed")
             self.conn = None
@@ -5516,6 +5752,9 @@ class Supervisor:
         removes the temporary capture files.
         """
         LOGGER.info("shutting down: terminating %d active job(s)", len(self.active))
+        install_operation_deadline(
+            self.conn, time.monotonic() + self.settings.db_operation_timeout_seconds
+        )
         for job in list(self.active.values()):
             if not job.completed and not job.term_sent:
                 request_stop(job, STOP_REASON_SHUTDOWN)
