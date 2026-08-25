@@ -257,6 +257,90 @@ class UnresolvedChild:
 
 
 @dataclass(frozen=True, slots=True)
+class SpawningObligation:
+    """Durable pre-spawn recovery obligation for a possibly-live worker spawn.
+
+    This is written crash-durably **before** ``Popen`` and upgraded with the
+    exact child identity immediately after a successful spawn, so a supervisor
+    death at any point after the successful ``Popen`` always leaves behind a
+    replacement-blocking record that names the first spawn's fate as
+    unresolved. A successor supervisor must positively resolve this
+    obligation before any new worker can be authorized; it never resolves by
+    process-name matching or broad numeric signalling:
+
+    - ``pid``/``start_time_ticks`` present: resolution checks exact identity
+      (live non-zombie process whose start ticks match) and converges by
+      pinned single-PID signals only;
+    - ``pid`` absent (crash between ``Popen`` and the upgrade write): the
+      spawned child carries ``PR_SET_PDEATHSIG=SIGKILL``, so the kernel has
+      already killed it when the spawning supervisor died — unless the child
+      was spawned in an earlier boot, which is trivially gone;
+    - a present-but-malformed obligation survives corruption as a durable
+      blocking flag that only operator repair clears.
+
+    ``creator_pid``/``creator_start_ticks`` identify the supervisor process
+    that performed the spawn so an obligation can never be misread as
+    resolved-or-live by the wrong incarnation.
+    """
+
+    token: str
+    commit: str
+    creator_pid: int
+    creator_start_time_ticks: int
+    pid: int | None
+    start_time_ticks: int | None
+    created_at: float
+    boot_id: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the obligation for storage.
+
+        Returns:
+            A JSON-serializable mapping.
+        """
+        return {
+            "token": self.token,
+            "commit": self.commit,
+            "creator_pid": self.creator_pid,
+            "creator_start_time_ticks": self.creator_start_time_ticks,
+            "pid": self.pid,
+            "start_time_ticks": self.start_time_ticks,
+            "created_at": self.created_at,
+            "boot_id": self.boot_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> SpawningObligation:
+        """Parse one pre-spawn obligation strictly.
+
+        Args:
+            data: Mapping produced by :meth:`to_dict`.
+
+        Returns:
+            The parsed obligation.
+
+        Raises:
+            ValueError: If a required field is missing or malformed.
+        """
+        token = _optional_string(data.get("token"))
+        creator_pid = _optional_int(data.get("creator_pid"))
+        creator_ticks = _optional_int(data.get("creator_start_time_ticks"))
+        if token is None or creator_pid is None or creator_ticks is None:
+            msg = "spawning obligation is malformed"
+            raise ValueError(msg)
+        return cls(
+            token=token,
+            commit=_optional_string(data.get("commit")) or "",
+            creator_pid=creator_pid,
+            creator_start_time_ticks=creator_ticks,
+            pid=_optional_int(data.get("pid")),
+            start_time_ticks=_optional_int(data.get("start_time_ticks")),
+            created_at=_optional_float(data.get("created_at")) or 0.0,
+            boot_id=_optional_string(data.get("boot_id")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class LastExit:
     """Durable record of the most recent worker child exit."""
 
@@ -284,6 +368,13 @@ class SupervisorState:
     # unresolved spawned child. It only ever clears through explicit operator
     # repair of the state file.
     unresolved_hold_malformed: bool
+    #: A present pre-spawn recovery obligation: a spawn may have happened and
+    #: its fate is not yet positively resolved. Replacement-blocking.
+    spawning: SpawningObligation | None
+    #: A present-but-malformed ``spawning`` obligation was found on disk. The
+    #: blocking obligation survives its own shape corruption and only clears
+    #: through explicit operator repair of the state file.
+    spawning_hold_malformed: bool
     intent: str
     restart_count: int
     next_attempt_at: float | None
@@ -310,6 +401,8 @@ class SupervisorState:
             ),
             "ownership_hold_malformed": self.ownership_hold_malformed,
             "unresolved_hold_malformed": self.unresolved_hold_malformed,
+            "spawning": (None if self.spawning is None else self.spawning.to_dict()),
+            "spawning_hold_malformed": self.spawning_hold_malformed,
             "intent": self.intent,
             "restart_count": self.restart_count,
             "next_attempt_at": self.next_attempt_at,
@@ -337,6 +430,7 @@ class SupervisorState:
         """
         child, ownership_hold_malformed = _parse_optional_child(data)
         unresolved, unresolved_hold_malformed = _parse_optional_unresolved_child(data)
+        spawning, spawning_hold_malformed = _parse_optional_spawning(data)
         generation, generation_malformed = _parse_present_strict(
             data, "applied_generation", _strict_non_negative_int
         )
@@ -372,6 +466,9 @@ class SupervisorState:
             or _strict_safety_hold(data, "ownership_hold_malformed"),
             unresolved_hold_malformed=unresolved_hold_malformed
             or _strict_safety_hold(data, "unresolved_hold_malformed"),
+            spawning=spawning,
+            spawning_hold_malformed=spawning_hold_malformed
+            or _strict_safety_hold(data, "spawning_hold_malformed"),
             intent=_optional_string(data.get("intent")) or INTENT_RUN,
             restart_count=restart_count or 0,
             next_attempt_at=next_attempt_at,
@@ -852,6 +949,8 @@ def fresh_state() -> SupervisorState:
         unresolved_child=None,
         ownership_hold_malformed=False,
         unresolved_hold_malformed=False,
+        spawning=None,
+        spawning_hold_malformed=False,
         intent=INTENT_RUN,
         restart_count=0,
         next_attempt_at=None,
@@ -1483,6 +1582,33 @@ def _parse_optional_unresolved_child(
             # A present-but-malformed hold must never degrade to absence:
             # the durable blocking obligation survives as a flag that the
             # daemon treats exactly like an unresolvable hold.
+            return None, True
+    return None, True
+
+
+def _parse_optional_spawning(
+    data: dict[str, object],
+) -> tuple[SpawningObligation | None, bool]:
+    """Parse the optional pre-spawn recovery obligation.
+
+    Args:
+        data: Decoded durable state mapping.
+
+    Returns:
+        The obligation, or ``None``, plus whether a present obligation was
+        malformed.
+    """
+    spawning_data = data.get("spawning")
+    if spawning_data is None:
+        return None, False
+    if isinstance(spawning_data, dict):
+        try:
+            return SpawningObligation.from_dict(spawning_data), False
+        except (TypeError, ValueError):
+            # A present-but-malformed obligation must never degrade to
+            # absence: a possibly live spawned child may exist, so the
+            # blocking obligation survives as a flag treated exactly like an
+            # unresolvable hold.
             return None, True
     return None, True
 

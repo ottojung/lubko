@@ -136,6 +136,8 @@ def test_gc_preserves_desired_applied_and_override_runtimes(
             unresolved_child=None,
             ownership_hold_malformed=False,
             unresolved_hold_malformed=False,
+            spawning=None,
+            spawning_hold_malformed=False,
             intent="run",
             restart_count=0,
             next_attempt_at=None,
