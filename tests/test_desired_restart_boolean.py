@@ -39,11 +39,18 @@ def test_missing_and_boolean_restart_values_parse(restart: object, expected: obj
     assert desired.restart is expected
 
 
-@pytest.mark.parametrize("malformed", [1, 0, "true", "", {}, [], [True]])
+@pytest.mark.parametrize("malformed", [None, 1, 0, "true", "", {}, [], [True]])
 def test_present_non_boolean_restart_fails_closed(malformed: object) -> None:
-    """A present non-boolean ``restart`` enters malformed-desired handling."""
+    """A present non-boolean ``restart`` (including null) enters malformed handling."""
     with pytest.raises((TypeError, ValueError), match="malformed"):
         supervise.SupervisorDesired.from_dict(intent_payload(restart=malformed))
+
+
+def test_present_null_restart_is_malformed_unlike_absent_restart() -> None:
+    """Absent ``restart`` parses as false; an explicit null is corruption."""
+    assert supervise.SupervisorDesired.from_dict(intent_payload()).restart is False
+    with pytest.raises((TypeError, ValueError), match="malformed"):
+        supervise.SupervisorDesired.from_dict(intent_payload(restart=None))
 
 
 def _write_intent(raw: dict[str, object]) -> None:
@@ -51,11 +58,22 @@ def _write_intent(raw: dict[str, object]) -> None:
     supervise.desired_path().write_text(json.dumps(raw), encoding="utf-8")
 
 
+LIVE_CHILD = supervise.WorkerChild(
+    pid=4242,
+    pgid=4242,
+    sid=4242,
+    start_time_ticks=99,
+    token=f"token-{4242}",
+    worker_id="w",
+    spawned_at=1.0,
+)
+
+
 @pytest.fixture
 def settled_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Callable[[], supervise.SupervisorState]:
-    """Isolate state and seed a durable record of an already-applied generation.
+    """Isolate state and seed a durable live worker child at the same commit.
 
     Returns:
         A callable reading the durable supervisor state.
@@ -68,23 +86,25 @@ def settled_state(
             intent="run",
             applied_generation=5,
             commit=COMMIT,
+            child=LIVE_CHILD,
         )
     )
     return supervise.read_state
 
 
-def test_malformed_restart_does_not_advance_settlement(
+def test_malformed_restart_is_never_a_settlement(
     settled_state: Callable[[], supervise.SupervisorState],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A malformed ``restart`` never lets the daemon apply the newer generation."""
+    """A malformed ``restart`` cannot settle as restart=false at the live worker."""
     del settled_state
     _write_intent(intent_payload(restart="true"))
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(daemon, "_child_alive", lambda _state: True)
     monkeypatch.setattr(
         daemon,
         "_ensure_worker",
-        lambda _commit: pytest.fail("malformed intent reached worker spawn path"),
+        lambda _commit: pytest.fail("malformed intent authorized a replacement worker"),
     )
 
     daemon.reconcile(0.0)
@@ -92,21 +112,33 @@ def test_malformed_restart_does_not_advance_settlement(
     with pytest.raises(supervise.DesiredIntentError):
         supervise.read_desired_strict()
     assert supervise.read_state().applied_generation == 5
-    assert supervise.read_state().commit == COMMIT
 
 
-def test_same_commit_settlement_advances_on_valid_restart_false(
+@pytest.mark.parametrize("restart", [None, False])
+def test_same_commit_settlement_advances_without_retirement(
     settled_state: Callable[[], supervise.SupervisorState],
     monkeypatch: pytest.MonkeyPatch,
+    restart: object,
 ) -> None:
-    """A legacy intent without ``restart`` still records the newer generation."""
+    """A valid non-restart intent records the generation and keeps the worker."""
     del settled_state
-    _write_intent(intent_payload())
+    _write_intent(intent_payload() if restart is None else intent_payload(restart=restart))
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
-    monkeypatch.setattr(daemon, "_ensure_worker", lambda _commit: None)
-    monkeypatch.setattr(daemon, "_retire_child", lambda: True)
+    monkeypatch.setattr(daemon, "_child_alive", lambda _state: True)
+    monkeypatch.setattr(
+        daemon,
+        "_retire_child",
+        lambda: pytest.fail("same-commit settlement must not retire the live worker"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_ensure_worker",
+        lambda _commit: pytest.fail("same-commit settlement must not spawn a worker"),
+    )
 
     daemon.reconcile(0.0)
 
     state = supervise.read_state()
     assert state.applied_generation == 7
+    assert state.commit == COMMIT
+    assert state.child == LIVE_CHILD
