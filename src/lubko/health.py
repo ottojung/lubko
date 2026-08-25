@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -188,16 +189,16 @@ class WorkerHealth:
             "worker_incarnation": self.worker_incarnation,
             "pid": self.pid,
             "start_time_ticks": self.start_time_ticks,
-            "started_at": self.started_at,
-            "published_at": self.published_at,
+            "started_at": _finite_or_zero(self.started_at),
+            "published_at": _finite_or_zero(self.published_at),
             "alive": self.alive,
             "db_connected": self.db_connected,
-            "db_connected_at": self.db_connected_at,
-            "db_error_at": self.db_error_at,
+            "db_connected_at": _finite_or_none(self.db_connected_at),
+            "db_error_at": _finite_or_none(self.db_error_at),
             "current_job_id": self.current_job_id,
-            "current_job_started_at": self.current_job_started_at,
+            "current_job_started_at": _finite_or_none(self.current_job_started_at),
             "last_completed_job_id": self.last_completed_job_id,
-            "last_completed_at": self.last_completed_at,
+            "last_completed_at": _finite_or_none(self.last_completed_at),
             "last_completed_status": self.last_completed_status,
             "shutting_down": self.shutting_down,
         }
@@ -218,22 +219,22 @@ class WorkerHealth:
             worker_incarnation=str(data.get("worker_incarnation") or ""),
             pid=int(data.get("pid") or 0),
             start_time_ticks=int(data.get("start_time_ticks") or 0),
-            started_at=float(data.get("started_at") or 0.0),
-            published_at=float(data.get("published_at") or 0.0),
+            started_at=_required_finite_float(data.get("started_at"), "started_at"),
+            published_at=_required_finite_float(data.get("published_at"), "published_at"),
             alive=bool(data.get("alive")),
             db_connected=bool(data.get("db_connected")),
-            db_connected_at=_optional_float(data.get("db_connected_at")),
-            db_error_at=_optional_float(data.get("db_error_at")),
+            db_connected_at=_optional_finite_float(data.get("db_connected_at")),
+            db_error_at=_optional_finite_float(data.get("db_error_at")),
             current_job_id=_optional_str(data.get("current_job_id")),
-            current_job_started_at=_optional_float(data.get("current_job_started_at")),
+            current_job_started_at=_optional_finite_float(data.get("current_job_started_at")),
             last_completed_job_id=_optional_str(data.get("last_completed_job_id")),
-            last_completed_at=_optional_float(data.get("last_completed_at")),
+            last_completed_at=_optional_finite_float(data.get("last_completed_at")),
             last_completed_status=_optional_str(data.get("last_completed_status")),
             shutting_down=bool(data.get("shutting_down")),
         )
 
 
-def _optional_float(value: object) -> float | None:
+def _coerce_float(value: object) -> float | None:
     """Coerce a JSON value to float or None.
 
     Args:
@@ -251,6 +252,62 @@ def _optional_float(value: object) -> float | None:
             return float(value)
         except ValueError:
             return None
+    return None
+
+
+def _required_finite_float(value: object, field: str) -> float:
+    """Coerce a required persisted timestamp, rejecting non-finite values.
+
+    Args:
+        value: Raw JSON value.
+        field: Field name for error reporting.
+
+    Returns:
+        The coerced finite float (``0.0`` when absent).
+
+    Raises:
+        ValueError: If the value is present but not a finite number.
+    """
+    if value is None or (isinstance(value, str) and not value):
+        return 0.0
+    result = _coerce_float(value)
+    if result is None or not math.isfinite(result):
+        msg = f"{field} must be a finite timestamp, got {value!r}"
+        raise ValueError(msg)
+    return result
+
+
+def _optional_finite_float(value: object) -> float | None:
+    """Coerce an optional persisted timestamp to a finite float or None.
+
+    Non-finite values are rejected rather than silently accepted so
+    corrupted durable state fails closed instead of leaking into memory.
+
+    Args:
+        value: Raw JSON value.
+
+    Returns:
+        The finite float, or ``None``.
+
+    Raises:
+        ValueError: If the value is non-finite.
+    """
+    result = _coerce_float(value)
+    if result is not None and not math.isfinite(result):
+        msg = f"timestamp must be finite, got {value!r}"
+        raise ValueError(msg)
+    return result
+
+
+def _finite_or_zero(value: float) -> float:
+    """Return the value when finite, else ``0.0`` for strict JSON safety."""
+    return value if math.isfinite(value) else 0.0
+
+
+def _finite_or_none(value: float | None) -> float | None:
+    """Return the value when finite, else ``None`` for strict JSON safety."""
+    if value is None or math.isfinite(value):
+        return value
     return None
 
 
@@ -549,6 +606,13 @@ def interpret_worker_health(
     """
     if snapshot is None:
         return EffectiveHealth(snapshot=None, live=False, stale=False, reason="no health snapshot")
+    if not math.isfinite(snapshot.published_at):
+        return EffectiveHealth(
+            snapshot=snapshot,
+            live=False,
+            stale=True,
+            reason="non-finite published_at in snapshot",
+        )
     now = time.time()
     age = now - snapshot.published_at
     pid = snapshot.pid
