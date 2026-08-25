@@ -688,3 +688,81 @@ def test_delete_honors_unresolved_child_until_exactly_proven_gone(
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def test_spawn_gate_refusal_durably_records_child_before_any_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The spawn-gate refusal itself hands off the child's exact obligation.
+
+    If a runner dies right after ``_record_running`` returns ``blocked``
+    (before any cleanup runs), the already-spawned child must still be
+    durably recorded as unresolved in the same locked transaction, so a
+    concurrent force-delete can never falsely remove state while it lives.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-gate"
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "running"
+    seed["stop_reason"] = "kill"
+    agent.write_meta(aid, seed)
+
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    try:
+        start = agent.proc_start_ticks(proc.pid)
+        blocked: dict[str, bool] = {}
+        update_meta = agent.update_meta
+        update_meta(aid, agent._record_running(proc, start, iid, blocked))
+
+        assert blocked.get("stopped") is True
+        cur = agent.read_meta(aid)
+        assert cur is not None
+        assert cur["unresolved_invocation"] == {
+            "pid": proc.pid,
+            "start_time": start,
+            "invocation_id": iid,
+        }
+
+        # Model runner death followed by a forced delete: the tombstone goes
+        # up while the leaked child lives and no cleanup ever ran.
+        def tombstone(m: agent.Meta) -> None:
+            m["delete_pending"] = True
+            m["runner_pid"] = None
+            m["runner_start_time"] = None
+
+        update_meta(aid, tombstone)
+
+        monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+
+        exact_signals: list[object] = []
+
+        def record_signal(meta: agent.Meta) -> None:
+            rec = meta.get("unresolved_invocation")
+            exact_signals.append(rec.get("pid") if isinstance(rec, dict) else None)
+
+        monkeypatch.setattr(agent, "_signal_unresolved_child", record_signal)
+        assert agent._delete_converged(agent.read_meta(aid)) is False
+        assert agent._converge_for_delete(aid, force=True, deadline=time.time() + 0.05) is False
+        assert exact_signals[-1] == proc.pid, "forced delete uses exact helper only"
+        kept = agent.read_meta(aid)
+        assert kept is not None
+        assert kept["delete_pending"] is True
+        assert kept["unresolved_invocation"]["pid"] == proc.pid
+
+        # Positive proof of the child's exact death lets deletion converge.
+        proc.kill()
+        proc.wait(timeout=5)
+        assert agent._delete_converged(agent.read_meta(aid)) is True
+        assert agent._converge_for_delete(aid, force=True, deadline=time.time() + 0.5) is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)

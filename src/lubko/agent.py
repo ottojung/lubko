@@ -1818,6 +1818,41 @@ def _kill_unrecorded_invocation(
         # concurrent stop/kill decision) so no replacement work can start
         # while this untracked invocation survives.
         _hold_unrecorded(aid, proc.pid, start, iid)
+        return
+    observed = {
+        "id": aid,
+        "pid": proc.pid,
+        "pgid": proc.pid,
+        "start_time": start,
+        "invocation_id": iid,
+    }
+    if wait_group_dead(observed, ABORT_WAIT_SECONDS):
+        # Positively converged: clear exactly this child's obligation, never
+        # a newer one that may have been recorded meanwhile.
+        _clear_unresolved(aid, proc.pid, start, iid)
+
+
+def _clear_unresolved(aid: str, pid: int, start: object, iid: str) -> None:
+    """Clear the unresolved obligation of exactly one converged child.
+
+    Args:
+        aid: Lubko agent ID.
+        pid: The converged child's PID.
+        start: Its observed start time in clock ticks.
+        iid: Its durable per-invocation ID.
+    """
+
+    def clear(m: Meta) -> None:
+        cur = m.get("unresolved_invocation")
+        if (
+            isinstance(cur, dict)
+            and cur.get("pid") == pid
+            and cur.get("start_time") == start
+            and cur.get("invocation_id") == iid
+        ):
+            m["unresolved_invocation"] = None
+
+    update_meta(aid, clear)
 
 
 def _hold_unrecorded(aid: str, pid: int, start: object, iid: str) -> None:
@@ -1951,7 +1986,17 @@ def _record_running(
             or m.get("intent") in STOP_REASONS
             or m.get("stop_reason") in STOP_REASONS
         ):
+            # The just-spawned child is refused tracking, but it already
+            # exists in its own session: durably hand its exact identity
+            # over as an unresolved obligation *in this same locked
+            # transaction*, so a concurrent force-delete that converges the
+            # runner can never remove state while this child still executes.
             blocked["stopped"] = True
+            m["unresolved_invocation"] = {
+                "pid": proc.pid,
+                "start_time": start,
+                "invocation_id": iid,
+            }
             return
         m["pid"] = proc.pid
         m["pgid"] = proc.pid
