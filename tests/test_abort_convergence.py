@@ -204,6 +204,31 @@ def test_send_signal_group_converges_owned_descendants_after_leader_exit(
     assert sorted(closed) == sorted([owned_fd, foreign_fd])
 
 
+def _observable_ticks(pid: int) -> int:
+    """Return the process's start ticks once positively observable in /proc.
+
+    ``Popen`` returns before fork+exec completes, so identity data may not be
+    readable yet; exact signalling must fail closed in that window and tests
+    must wait for bounded observability instead of racing it.
+
+    Args:
+        pid: The freshly spawned process ID.
+
+    Fails the test when the process never became observable.
+
+    Returns:
+        The observed start time in clock ticks.
+    """
+    deadline = time.time() + 5
+    while True:
+        ticks = agent.proc_start_ticks(pid)
+        if ticks is not None:
+            return ticks
+        if time.time() > deadline:
+            pytest.fail(f"process {pid} never became observable")
+        time.sleep(0.01)
+
+
 class _MarkedProcess:
     """A real test-owned process carrying one exact agent marker."""
 
@@ -222,6 +247,27 @@ class _MarkedProcess:
             close_fds=True,
             env=env,
         )
+        # Bounded readiness barrier: Popen returns before fork+exec completes,
+        # so start ticks, environment markers, and session identity are not
+        # yet observable. Exact signalling must fail closed in that window;
+        # tests therefore wait until every recorded identity datum is
+        # positively observable through /proc before exposing the process.
+        deadline = time.time() + 5
+        while True:
+            ticks = agent.proc_start_ticks(self.pid)
+            ready = (
+                ticks is not None
+                and agent.env_has_marker(self.pid, aid)
+                and (iid is None or agent.env_has_invocation(self.pid, iid))
+                and os.getpgid(self.pid) == self.pid
+            )
+            if ready:
+                self.start_ticks = ticks
+                break
+            if time.time() > deadline:
+                failure = TimeoutError(f"marked process {self.pid} never became observable")
+                raise failure
+            time.sleep(0.01)
 
     @property
     def pid(self) -> int:
@@ -500,7 +546,7 @@ def test_unrecorded_invocation_live_child_keeps_blocking_hold(
         close_fds=True,
     )
     try:
-        start = agent.proc_start_ticks(proc.pid)
+        start = _observable_ticks(proc.pid)
         agent._kill_unrecorded_invocation(aid, proc, start, iid)
 
         assert agent.pid_alive(proc.pid), "child must survive (fail-closed, no signal)"
@@ -529,6 +575,8 @@ def test_unrecorded_invocation_dead_child_leaves_stop_semantics_alone(
     proc = subprocess.Popen([SLEEP_BIN, "0"])
     proc.wait(timeout=5)
     monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+    # The child intentionally exited before cleanup: post-exit ticks are
+    # legitimately unobservable, and convergence must not depend on them.
     agent._kill_unrecorded_invocation(aid, proc, agent.proc_start_ticks(proc.pid), iid)
 
     final = agent.read_meta(aid)
@@ -662,7 +710,7 @@ def test_delete_honors_unresolved_child_until_exactly_proven_gone(
         marker = {
             "pid": proc.pid,
             "pgid": proc.pid,
-            "start_time": agent.proc_start_ticks(proc.pid),
+            "start_time": _observable_ticks(proc.pid),
             "invocation_id": iid,
         }
         seed["unresolved_invocation"] = marker
@@ -734,7 +782,7 @@ def test_spawn_gate_refusal_durably_records_child_before_any_cleanup(
         close_fds=True,
     )
     try:
-        start = agent.proc_start_ticks(proc.pid)
+        start = _observable_ticks(proc.pid)
         blocked: dict[str, bool] = {}
         update_meta = agent.update_meta
         update_meta(aid, agent._record_running(proc, start, iid, blocked))
