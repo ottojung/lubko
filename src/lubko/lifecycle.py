@@ -37,10 +37,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-import psycopg
-from psycopg.rows import tuple_row
-
 from lubko import cli, protocol, supervise, toolchain
+from lubko._pg import psycopg, tuple_row
 from lubko.config import load_database_config, load_worker_server
 from lubko.durable import remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root

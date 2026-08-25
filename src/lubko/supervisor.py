@@ -75,10 +75,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-import psycopg
-
 from lubko import cli, deployctl, lifecycle, supervise
 from lubko import worker as worker_mod
+from lubko._pg import psycopg
 from lubko.config import load_database_config
 from lubko.durable import remove_durable
 from lubko.health import (
