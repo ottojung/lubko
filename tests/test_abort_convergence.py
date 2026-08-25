@@ -1,0 +1,409 @@
+"""Exact-identity safety of abnormal runner cleanup.
+
+Abnormal cleanup paths (``_abort_runner`` and the exceptional
+``_spawn_and_run``/unrecorded-invocation convergence) must never signal from a
+numeric PID/PGID alone: the durable ``(pid, start_time, invocation_id)``
+identity is re-proven under a kernel-stable pin at signal time, ownership that
+cannot be proven fails closed, and genuine owned descendants are still
+converged.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import shutil
+import signal
+import subprocess
+from typing import TYPE_CHECKING
+
+import pytest
+
+from lubko import agent
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+SLEEP_BIN: str = shutil.which("sleep") or "/bin/sleep"
+
+
+@pytest.fixture(autouse=True)
+def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the agent state root at a throwaway directory.
+
+    Returns:
+        The isolated Lubko state root.
+    """
+    state = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    return state
+
+
+def _running_meta(aid: str, pid: int, start: object, iid: str) -> agent.Meta:
+    """Return running-agent metadata recording one exact invocation identity."""
+    return {
+        "id": aid,
+        "state": "running",
+        "pid": pid,
+        "pgid": pid,
+        "start_time": start,
+        "invocation_id": iid,
+        "active_runner": True,
+    }
+
+
+def test_abort_runner_signals_via_exact_identity_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abnormal runner cleanup re-proves exact invocation ownership at signal time.
+
+    ``_abort_runner`` must delegate to the kernel-stable exact-identity group
+    signalling with the full durable identity, never a bare numeric
+    ``killpg``, before finalizing terminal metadata.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-1"
+    meta = _running_meta(aid, 424242, 111, iid)
+    agent.write_meta(aid, meta)
+
+    seen: list[tuple[agent.Meta, int]] = []
+    monkeypatch.setattr(agent, "send_signal_group", lambda m, sig: seen.append((m, sig)))
+    monkeypatch.setattr(agent, "wait_group_dead", lambda _m, _t: True)
+
+    agent._abort_runner(aid)
+
+    assert len(seen) == 1
+    signalled, sig = seen[0]
+    assert sig == signal.SIGKILL
+    assert signalled["pid"] == 424242
+    assert signalled["start_time"] == 111
+    assert signalled["invocation_id"] == iid
+    assert signalled["pgid"] == 424242
+    final = agent.read_meta(aid)
+    assert final is not None
+    assert final["state"] == "failed"
+    assert final["active_runner"] is False
+
+
+def test_abort_runner_holds_safety_when_death_unproven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unproven convergence leaves a nonterminal hold that blocks replacement.
+
+    When exact group death cannot be positively proven after the identity-
+    exact signal, the agent must stay ``running`` with a stop-like intent and
+    an active runner authority, so neither a new prompt claim nor a new runner
+    can start replacement work.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-hold"
+    agent.write_meta(aid, _running_meta(aid, 424242, 111, iid))
+    monkeypatch.setattr(agent, "send_signal_group", lambda _m, _sig: None)
+    monkeypatch.setattr(agent, "wait_group_dead", lambda _m, _t: False)
+
+    agent._abort_runner(aid)
+
+    final = agent.read_meta(aid)
+    assert final is not None
+    assert final["state"] == "running", "no terminal record while unconverged"
+    assert final["intent"] == "kill"
+    assert final["active_runner"] is True
+    assert agent._claim_pending_prompt(aid, "replacement prompt") is False
+
+
+def test_abort_runner_never_terminalizes_newer_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrently recorded newer invocation is never aborted or held.
+
+    If metadata moved on to a different invocation while cleanup ran, neither
+    the terminal failure nor the safety hold may be applied to the newer
+    record.
+    """
+    aid = "aaaaaaaa"
+    old = _running_meta(aid, 424242, 111, "inv-old")
+    agent.write_meta(aid, old)
+
+    def steal_record(_m: agent.Meta, _t: float) -> bool:
+        # A newer invocation is concurrently recorded while cleanup runs.
+        newer = _running_meta(aid, 535353, 222, "inv-new")
+        newer["runner_pid"] = 777
+        newer["runner_start_time"] = 888
+        agent.write_meta(aid, newer)
+        return True
+
+    monkeypatch.setattr(agent, "send_signal_group", lambda _m, _sig: None)
+    monkeypatch.setattr(agent, "wait_group_dead", steal_record)
+
+    agent._abort_runner(aid)
+
+    final = agent.read_meta(aid)
+    assert final is not None
+    assert final["state"] == "running"
+    assert final.get("intent") is None
+    assert final["pid"] == 535353
+    assert final["invocation_id"] == "inv-new"
+
+
+def test_send_signal_group_never_signals_reused_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recycled PID hosting a different identity is never group-signalled.
+
+    When the pinned occupant of the recorded PID carries a different start
+    time / invocation identity, neither the leader ``killpg`` nor any member
+    signal may fire: fail closed instead of guessing.
+    """
+    meta = _running_meta("aaaaaaaa", 424242, 111, "inv-1")
+    pin_fd = os.open(os.devnull, os.O_RDONLY)
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: os.dup(pin_fd))
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 999)
+    monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("killpg fired on reused PID"))
+    monkeypatch.setattr(os, "kill", lambda *_a: pytest.fail("member signal fired"))
+    agent.send_signal_group(meta, signal.SIGKILL)
+    os.close(pin_fd)
+
+
+def test_send_signal_group_converges_owned_descendants_after_leader_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genuine surviving descendants of the failed invocation are converged.
+
+    With the recorded leader gone, each surviving group member carrying both
+    the exact agent marker and the exact invocation marker is signalled
+    individually under its own pin; foreign processes are left alone.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-1"
+    meta = _running_meta(aid, 424242, 111, iid)
+    owned_fd, foreign_fd = 21, 22
+
+    def fake_members(pgid: int, got_aid: str, got_iid: str) -> list[tuple[int, int]]:
+        assert pgid == 424242
+        assert got_aid == aid
+        assert got_iid == iid
+        return [(5001, owned_fd), (6000, foreign_fd)]
+
+    killed: list[int] = []
+    closed: list[int] = []
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: None)
+    monkeypatch.setattr(agent, "_pinned_invocation_members", fake_members)
+    monkeypatch.setattr(os, "kill", lambda pid, _sig: killed.append(pid))
+
+    def fake_close(fd: int) -> None:
+        closed.append(fd)
+
+    monkeypatch.setattr(os, "close", fake_close)
+    agent.send_signal_group(meta, signal.SIGKILL)
+
+    assert killed == [5001, 6000]
+    assert sorted(closed) == sorted([owned_fd, foreign_fd])
+
+
+class _MarkedProcess:
+    """A real test-owned process carrying one exact agent marker."""
+
+    def __init__(self, aid: str, iid: str | None = None) -> None:
+        env = dict(os.environ)
+        env["LUBKO_AGENT_ID"] = aid
+        self.iid = iid
+        if iid is not None:
+            env[agent.INVOCATION_ID_VAR] = iid
+        self.proc = subprocess.Popen(
+            [SLEEP_BIN, "300"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+
+    @property
+    def pid(self) -> int:
+        """The exact process ID."""
+        return self.proc.pid
+
+    def kill_and_reap(self) -> None:
+        """Converge the exact test-owned process and reap it."""
+        if self.proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.pid, signal.SIGKILL)
+        self.proc.wait(timeout=5)
+
+
+def test_send_signal_group_kills_real_live_leader_and_spares_recycled_slot() -> None:
+    """End-to-end: an exact live leader is group-killed; a stale one is not.
+
+    A real marked child acting as invocation A is killed through its recorded
+    identity. Re-running against metadata that names a PID slot occupied by an
+    unrelated marked process with a different identity delivers no signal to
+    that occupant.
+    """
+    aid = "aaaaaaaa"
+    owner = _MarkedProcess(aid, "inv-a")
+    try:
+        live = _running_meta(aid, owner.pid, agent.proc_start_ticks(owner.pid), "inv-a")
+        agent.send_signal_group(live, signal.SIGKILL)
+        assert owner.proc.wait(timeout=5) is not None
+
+        impostor = _MarkedProcess("bbbbbbbb", "inv-b")
+        try:
+            stale = _running_meta(aid, impostor.pid, 1, "inv-a")
+            agent.send_signal_group(stale, signal.SIGKILL)
+            assert impostor.proc.poll() is None, "recycled occupant must survive"
+        finally:
+            impostor.kill_and_reap()
+    finally:
+        owner.kill_and_reap()
+
+
+def test_spawn_and_run_exceptional_cleanup_uses_exact_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exceptional ``_spawn_and_run`` cleanup cannot go stale before signalling.
+
+    When waiting for the invocation raises into the abnormal-exit handler, the
+    convergence goes through the exact-identity helper with the spawn-time
+    ``(aid, pid, start, iid)`` evidence, and no bare group signal fires.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-x"
+
+    def boom(_proc: subprocess.Popen[bytes], _aid: str, *, is_continue: bool) -> int:
+        del is_continue
+        failure = RuntimeError("injected runner failure")
+        raise failure
+
+    monkeypatch.setattr(agent, "_wait_for_invocation_exit", boom)
+    bare_killpg: list[tuple[int, int]] = []
+
+    def guard_killpg(pgid: int, sig: int) -> None:
+        bare_killpg.append((pgid, sig))
+
+    monkeypatch.setattr(os, "killpg", guard_killpg)
+    seen: list[tuple[str, int, object, str]] = []
+    monkeypatch.setattr(
+        agent,
+        "_kill_spawned_invocation",
+        lambda a, p, s, i: seen.append((a, p, s, i)),
+    )
+    monkeypatch.setattr(agent, "wait_group_dead", lambda _m, _t: True)
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "running"
+    seed["invocation_id"] = iid
+    seed["runner_pid"] = os.getpid()
+    seed["runner_start_time"] = agent.proc_start_ticks(os.getpid())
+    agent.write_meta(aid, seed)
+
+    ctx = agent._RunnerContext(
+        aid=aid,
+        log_path=tmp_path / "output.log",
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+    )
+    with pytest.raises(RuntimeError):
+        agent._spawn_and_run(ctx, aid, [SLEEP_BIN, "0"], iid, is_continue=False)
+
+    assert len(seen) == 1
+    got_aid, _got_pid, got_start, got_iid = seen[0]
+    assert got_aid == aid
+    assert got_iid == iid
+    assert isinstance(got_start, int)
+    assert bare_killpg == [], "no bare group signal may fire"
+    final = agent.read_meta(aid)
+    assert final is not None
+    assert final["state"] == "failed"
+
+
+def test_unrecorded_invocation_cleanup_uses_exact_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stop-race loser is converged through the exact-identity helper too."""
+    aid = "aaaaaaaa"
+    iid = "inv-y"
+
+    monkeypatch.setattr(
+        agent,
+        "_record_running",
+        lambda _proc, _start, _iid, blocked: lambda _m: blocked.update(stopped=True),
+    )
+    seen: list[tuple[str, int, object, str]] = []
+    monkeypatch.setattr(
+        agent,
+        "_kill_spawned_invocation",
+        lambda a, p, s, i: seen.append((a, p, s, i)),
+    )
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "running"
+    seed["invocation_id"] = iid
+    seed["runner_pid"] = os.getpid()
+    seed["runner_start_time"] = agent.proc_start_ticks(os.getpid())
+    agent.write_meta(aid, seed)
+
+    ctx = agent._RunnerContext(
+        aid=aid,
+        log_path=tmp_path / "output.log",
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+    )
+    rc = agent._spawn_and_run(ctx, aid, [SLEEP_BIN, "0"], iid, is_continue=False)
+    assert rc is None
+    assert len(seen) == 1
+    got_aid, _, _, got_iid = seen[0]
+    assert got_aid == aid
+    assert got_iid == iid
+
+
+def test_spawn_and_run_exceptional_cleanup_never_touches_newer_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exceptional cleanup applies its mutation only to the exact invocation.
+
+    If a newer invocation was concurrently recorded before the abnormal-exit
+    cleanup finalizes, neither the terminal failure nor the hold may land on
+    the newer record.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-old"
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "running"
+    seed["invocation_id"] = iid
+    seed["runner_pid"] = os.getpid()
+    seed["runner_start_time"] = agent.proc_start_ticks(os.getpid())
+    agent.write_meta(aid, seed)
+
+    def steal_record(_m: agent.Meta, _t: float) -> bool:
+        newer = dict(seed)
+        newer["pid"] = 535353
+        newer["pgid"] = 535353
+        newer["start_time"] = 222
+        newer["invocation_id"] = "inv-new"
+        agent.write_meta(aid, newer)
+        return True
+
+    monkeypatch.setattr(agent, "wait_group_dead", steal_record)
+
+    def boom(_proc: subprocess.Popen[bytes], _aid: str, *, is_continue: bool) -> int:
+        del is_continue
+        failure = RuntimeError("injected runner failure")
+        raise failure
+
+    monkeypatch.setattr(agent, "_wait_for_invocation_exit", boom)
+    ctx = agent._RunnerContext(
+        aid=aid,
+        log_path=tmp_path / "output.log",
+        cwd=str(tmp_path),
+        env=dict(os.environ),
+    )
+    with pytest.raises(RuntimeError):
+        agent._spawn_and_run(ctx, aid, [SLEEP_BIN, "0"], iid, is_continue=False)
+
+    final = agent.read_meta(aid)
+    assert final is not None
+    assert final["invocation_id"] == "inv-new", "newer record must stay untouched"
+    assert final["state"] == "running"
+    assert final["intent"] is None

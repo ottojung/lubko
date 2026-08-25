@@ -98,6 +98,7 @@ SESSION_DISCOVER_TIMEOUT_SECONDS: Final = 60
 SESSION_DISCOVER_POLL_SECONDS: Final = 1
 STOP_WAIT_SECONDS: Final = 10.0
 KILL_WAIT_SECONDS: Final = 5.0
+ABORT_WAIT_SECONDS: Final = 5.0
 IDLE_BREAK_SECONDS: Final = 5
 STABLE_TERMINAL_SECONDS: Final = 0.5
 STATUS_TAIL_LINES: Final = 50
@@ -1467,9 +1468,12 @@ def _reclaim_prompt(aid: str) -> bool:
 def _abort_runner(aid: str) -> None:
     """Clean up an agent after an unexpected runner failure.
 
-    The exact recorded invocation process group is killed and the agent is
-    finalized, so an abnormal runner exit can never leave the invocation
-    running untracked with ``active_runner`` stuck true.
+    The exact recorded invocation process group is signalled through the
+    kernel-stable identity-exact path — a stale numeric PID/PGID alone is
+    never authority for SIGKILL. Terminalization happens only after exact
+    group death is positively proven *and* the metadata still records the
+    same invocation; otherwise a durable stop-like safety hold blocks
+    replacement work instead of falsely reporting convergence.
 
     Args:
         aid: Lubko agent ID.
@@ -1477,11 +1481,36 @@ def _abort_runner(aid: str) -> None:
     meta = read_meta(aid)
     if meta is None or meta.get("state") != "running":
         return
-    pid = meta.get("pid")
-    if pid:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(int(pid), signal.SIGKILL)
-    update_meta(aid, _finalize_abort())
+    identity = _invocation_identity(meta)
+    send_signal_group(meta, signal.SIGKILL)
+    if not wait_group_dead(meta, ABORT_WAIT_SECONDS):
+        # Fail closed: ownership or death could not be proven, so the agent
+        # must stay nonterminal and safety-blocked rather than admit
+        # replacement work while the old invocation may still be live.
+        _update_meta_if_same_invocation(aid, identity, _hold_abort())
+        return
+    # Terminalize only when no newer invocation has taken over the record.
+    _update_meta_if_same_invocation(aid, identity, _finalize_abort())
+
+
+def _hold_abort() -> Callable[[Meta], None]:
+    """Return a mutation that keeps an unproven abort as a blocking hold.
+
+    The stop-like intent durably refuses new prompt claims and runner work,
+    and ``active_runner`` stays set so no second runner starts, until an
+    explicit safe recovery converges or clears the invocation.
+
+    Returns:
+        The metadata mutation.
+    """
+
+    def hold(m: Meta) -> None:
+        if m.get("state") != "running":
+            return  # already finalized (e.g. by stop/kill)
+        m["intent"] = "kill"
+        m["last_activity_at"] = time.time()
+
+    return hold
 
 
 @dataclass(frozen=True, slots=True)
@@ -1588,7 +1617,7 @@ def _spawn_and_run(
         if blocked.get("stopped"):
             # The freshly spawned invocation lost the race against stop/kill;
             # converge it instead of leaving it running untracked.
-            _kill_unrecorded_invocation(proc)
+            _kill_unrecorded_invocation(aid, proc, start, iid)
             return None
 
         try:
@@ -1596,11 +1625,36 @@ def _spawn_and_run(
         except BaseException:
             # Abnormal runner exit: never leave the invocation process group
             # running untracked, and never leave the agent stuck "running".
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
+            # The earlier spawn-time observation is re-proven at signal time
+            # under a kernel-stable pin, so a recycled PID can never redirect
+            # SIGKILL to an unrelated group. Terminalization still requires
+            # positively proven group death.
+            _kill_spawned_invocation(aid, proc.pid, start, iid)
             with contextlib.suppress(OSError):
                 proc.wait()
-            update_meta(aid, _finalize_abort())
+            observed = {
+                "id": aid,
+                "pid": proc.pid,
+                "pgid": proc.pid,
+                "start_time": start,
+                "invocation_id": iid,
+            }
+            # The CAS guard keeps the terminal/hold mutation on exactly this
+            # spawned invocation: a concurrently recorded newer invocation is
+            # never clobbered by this cleanup.
+            identity = (
+                proc.pid,
+                proc.pid,
+                start,
+                os.getpid(),
+                proc_start_ticks(os.getpid()),
+            )
+            converged = wait_group_dead(observed, ABORT_WAIT_SECONDS)
+            _update_meta_if_same_invocation(
+                aid,
+                identity,
+                _finalize_abort() if converged else _hold_abort(),
+            )
             raise
         update_meta(aid, _finalize_after(rc))
 
@@ -1702,18 +1756,49 @@ def _wait_for_invocation_exit(
     return proc.wait()
 
 
-def _kill_unrecorded_invocation(proc: subprocess.Popen[bytes]) -> None:
+def _kill_spawned_invocation(aid: str, pid: int, start: object, iid: str) -> None:
+    """SIGKILL a freshly spawned invocation through exact-identity signalling.
+
+    The spawn-time observation (``pid``, ``start``, ``iid``) is re-proven at
+    signal time under a kernel-stable pidfd pin, so a numeric PID recycled
+    into an unrelated process group can never be signalled. When exact
+    ownership cannot be proven nothing is signalled: fail closed.
+
+    Args:
+        aid: Lubko agent ID whose marker the invocation environment carries.
+        pid: The recorded invocation leader PID (its own group).
+        start: The observed start time in clock ticks.
+        iid: The durable per-invocation ID stamped into its environment.
+    """
+    send_signal_group(
+        {
+            "id": aid,
+            "pid": pid,
+            "pgid": pid,
+            "start_time": start,
+            "invocation_id": iid,
+        },
+        signal.SIGKILL,
+    )
+
+
+def _kill_unrecorded_invocation(
+    aid: str, proc: subprocess.Popen[bytes], start: object, iid: str
+) -> None:
     """Kill a freshly spawned invocation that lost the stop/kill race.
 
     The spawn gate (``_record_running``) refused to track the process because a
     concurrent stop/kill durably recorded its intent first, so the invocation
-    is converged immediately instead of running untracked.
+    is converged immediately instead of running untracked — via the same
+    exact-identity signalling discipline as every other cleanup path.
 
     Args:
+        aid: Lubko agent ID whose marker the invocation environment carries.
         proc: The just-spawned agent process.
+        start: The observed start time in clock ticks.
+        iid: The durable per-invocation ID stamped into its environment.
     """
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(proc.pid, signal.SIGKILL)
+    _kill_spawned_invocation(aid, proc.pid, start, iid)
     with contextlib.suppress(OSError):
         proc.wait()
 
