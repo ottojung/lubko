@@ -357,6 +357,13 @@ class SupervisorState:
                 unresolved_hold_malformed = True
         elif unresolved_data is not None:
             unresolved_hold_malformed = True
+        raw_generation = data.get("applied_generation")
+        generation = _strict_non_negative_int(raw_generation)
+        if "applied_generation" in data and generation is None:
+            # A present-but-malformed applied generation must never silently
+            # degrade to 0: that would let an already-applied restart intent
+            # replay and retire a healthy worker. Enter the durable hold.
+            ownership_hold_malformed = True
         exit_data = data.get("last_exit")
         last_exit: LastExit | None = None
         if isinstance(exit_data, dict):
@@ -369,7 +376,7 @@ class SupervisorState:
                 last_exit = None
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
-            applied_generation=_optional_int(data.get("applied_generation")) or 0,
+            applied_generation=generation or 0,
             mode=_optional_string(data.get("mode")) or MODE_IDLE,
             commit=_optional_string(data.get("commit")),
             child=child,
@@ -1314,6 +1321,21 @@ def _optional_int(value: object | None) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _strict_non_negative_int(value: object) -> int | None:
+    """Return a non-negative integer generation, or ``None`` when malformed.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        The non-negative integer, or ``None`` for booleans, non-integers,
+        strings, and negative values.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _optional_float(value: object | None) -> float | None:
