@@ -203,7 +203,7 @@ class RollbackState:
                 uv_path=str(data["uv_path"]),
                 stop_grace_seconds=float(data["stop_grace_seconds"]),
                 git_timeout_seconds=float(data["git_timeout_seconds"]),
-                previous_retiring=data.get("previous_retiring", False) is True,
+                previous_retiring=_retiring_flag(data.get("previous_retiring", _ABSENT)),
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
                 supervisor_owned=_optional_bool(data.get("supervisor_owned")),
@@ -220,6 +220,29 @@ class GatedWorker:
     proc: subprocess.Popen[bytes]
     gate_writer: int
     meta: WorkerMeta
+
+
+_ABSENT: Final = object()
+
+
+def _retiring_flag(value: object) -> bool:
+    """Return the durable ``previous_retiring`` flag.
+
+    Args:
+        value: JSON value to inspect; the ``_ABSENT`` sentinel means the key
+            is absent.
+
+    Returns:
+        The stored boolean, or ``False`` when the key is absent.
+
+    Raises:
+        TypeError: If a present value is not a boolean (including null).
+    """
+    if value is _ABSENT:
+        return False
+    if not isinstance(value, bool):
+        raise TypeError
+    return value
 
 
 def _optional_string(value: object | None) -> str | None:
