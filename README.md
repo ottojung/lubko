@@ -1,14 +1,14 @@
 # Lubko
 
-Lubko lets you run commands and manage AI agent sessions inside a dedicated
-container, from outside it. You describe what should run; Lubko executes it in
-the working directory you choose, shows its output while it runs, records the
-result, and lets you cancel or clean up at any time.
+Lubko lets you delegate commands and AI agent sessions and manage them
+end to end. You describe what should run; Lubko runs it in the working
+directory you choose, shows its output while it runs, records the result,
+and lets you cancel or clean up at any time.
 
 ## Why Lubko
 
-- **Delegate work safely.** Run builds, scripts, and other tasks inside a
-  container instead of on your workstation or orchestration host.
+- **Delegate work safely.** Run builds, scripts, and other tasks without
+  babysitting them on your own machine.
 - **See progress live.** Watch a task's output as it happens, not only after
   it finishes.
 - **Stay in control.** Cancel running work cleanly; every task ends with a
@@ -18,16 +18,16 @@ result, and lets you cancel or clean up at any time.
 
 ## When would you use it
 
-Use Lubko whenever something outside a container needs to execute work *in*
-that container: remote task execution, background automation, or managing
-long-lived AI coding-agent sessions from an orchestrator.
+Use Lubko whenever you need to hand off work and stay informed: remote task
+execution, background automation, or managing long-lived AI coding-agent
+sessions from an orchestrator or your own tooling.
 
 ## Getting started
 
-Install the maintained commands with `lubko-install`, start Lubko in your
-container, and submit tasks as described in `docs/`. The `lubko-agent`
-command manages AI agent sessions end to end: start them, prompt them, read
-their logs, wait for completion, stop or clean them up.
+Install the maintained commands with `lubko-install`, start Lubko, and submit
+tasks as described in `docs/`. The `lubko-agent` command manages AI agent
+sessions end to end: start them, prompt them, read their logs, wait for
+completion, stop or clean them up.
 
 ## Development
 
