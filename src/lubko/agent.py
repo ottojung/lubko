@@ -292,6 +292,7 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "active_runner": False,
         "runner_gen": 0,
         "runner_reservation": None,
+        "unresolved_invocation": None,
         "steer_queue": [],
         "steer_seq": 0,
         "prompt_count": 0,
@@ -1813,30 +1814,112 @@ def _kill_unrecorded_invocation(
         proc.wait(timeout=ABORT_REAP_SECONDS)
     except (subprocess.TimeoutExpired, OSError):
         # Exact signalling failed closed and the direct child is still live:
-        # keep a durable stop-like hold (never terminalizing over the
+        # keep a durable unresolved-child hold (never terminalizing over the
         # concurrent stop/kill decision) so no replacement work can start
         # while this untracked invocation survives.
-        _hold_unrecorded(aid)
+        _hold_unrecorded(aid, proc.pid, start, iid)
 
 
-def _hold_unrecorded(aid: str) -> None:
-    """Keep durable lifecycle authority while an untracked child survives.
+def _hold_unrecorded(aid: str, pid: int, start: object, iid: str) -> None:
+    """Keep durable blocking authority while an untracked child survives.
 
-    An existing stop-like intent or reason is preserved untouched; only a
-    running record with no blocking marker gains one, so replacement work
-    stays refused without ever faking convergence.
+    The exact unresolved-child record survives terminal stop/kill metadata
+    (which clears ``intent``) so a later prompt cannot reserve replacement
+    work while the unproven invocation lives; it is cleared only once exact
+    convergence of that child is proven. An existing stop-like intent is
+    preserved untouched, delete-pending stays owned by deletion, and nothing
+    is ever terminalized here.
 
     Args:
         aid: Lubko agent ID.
+        pid: The unrecorded child's PID.
+        start: Its observed start time in clock ticks.
+        iid: Its durable per-invocation ID.
     """
 
     def hold(m: Meta) -> None:
-        if m.get("state") != "running" or m.get("intent") in STOP_REASONS:
-            return
-        m["intent"] = "kill"
-        m["last_activity_at"] = time.time()
+        if m.get("delete_pending"):
+            return  # deletion owns the lifecycle: no resurrection markers
+        m["unresolved_invocation"] = {
+            "pid": pid,
+            "start_time": start,
+            "invocation_id": iid,
+        }
+        if m.get("state") == "running" and m.get("intent") not in STOP_REASONS:
+            m["intent"] = "kill"
+            m["last_activity_at"] = time.time()
 
     update_meta(aid, hold)
+
+
+def _unresolved_child_state(m: Meta) -> str:
+    """Classify the exact recorded unresolved child's survival evidence.
+
+    Returns ``"live"``, ``"gone"``, or ``"ambiguous"``. Only positive proof
+    clears the record: a readable *different* start time proves the PID was
+    recycled, and a definitive ``ProcessLookupError`` proves death. Anything
+    that cannot be inspected (unreadable procfs, permission failures, other
+    probe errors) stays ambiguous so the durable block never fails open.
+
+    Args:
+        m: Agent metadata.
+
+    Returns:
+        The evidence classification.
+    """
+    rec = m.get("unresolved_invocation")
+    if rec is None:
+        return "gone"
+
+    def valid_identity(value: object) -> bool:
+        """Whether ``value`` is a well-formed persisted identity field.
+
+        Args:
+            value: The persisted field value.
+
+        Returns:
+            ``True`` for a positive non-bool integer.
+        """
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    state = "ambiguous"  # malformed persisted state fails closed as ambiguous
+    iid = rec.get("invocation_id") if isinstance(rec, dict) else None
+    iid_ok = isinstance(iid, str) and bool(iid)
+    if (
+        isinstance(rec, dict)
+        and valid_identity(rec.get("pid"))
+        and isinstance(rec.get("start_time"), int)
+        and not isinstance(rec.get("start_time"), bool)
+        and iid_ok
+    ):
+        pid: int = rec["pid"]
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            state = "gone"
+        except OSError:
+            state = "ambiguous"  # exists but uninspectable (e.g. EPERM)
+        else:
+            ticks = proc_start_ticks(pid)
+            if ticks is None:
+                state = "ambiguous"  # unreadable procfs cannot prove death
+            elif ticks != rec["start_time"]:
+                state = "gone"  # positively recycled by an unrelated occupant
+            else:
+                state = "live"
+    return state
+
+
+def _unresolved_child_live(m: Meta) -> bool:
+    """Return whether an exact recorded unresolved child still survives.
+
+    Args:
+        m: Agent metadata.
+
+    Returns:
+        ``True`` when the recorded child is provably still alive.
+    """
+    return _unresolved_child_state(m) == "live"
 
 
 def _record_running(
@@ -1882,6 +1965,7 @@ def _record_running(
         m["exit_signal"] = None
         m["intent"] = None
         m["active_runner"] = True
+        m["unresolved_invocation"] = None
 
     return record
 
@@ -2483,6 +2567,14 @@ def _decide_invocation(
         prompt: Instruction to run or steer.
         steer: Whether this is a steer rather than an ordinary prompt.
     """
+    if _unresolved_child_state(m) != "gone":
+        # An earlier unrecorded invocation could not be positively proven
+        # converged (still live, or inspection ambiguous); a later
+        # prompt/steer stays blocked and the marker persists until exact
+        # convergence is proven, even across terminal stop/kill metadata.
+        decision["action"] = "busy"
+        return
+    m["unresolved_invocation"] = None
     if m.get("intent") in STOP_REASONS:
         # A durably accepted stop/kill obligation for this invocation must
         # never be overwritten by a later prompt/steer: otherwise the dying

@@ -531,3 +531,83 @@ def test_unrecorded_invocation_dead_child_leaves_stop_semantics_alone(
     assert final is not None
     assert final["state"] == "running"
     assert final["intent"] == "kill"
+
+
+def _decide_with_marker(meta: agent.Meta) -> tuple[agent.Meta, dict[str, object]]:
+    """Run one locked prompt decision against ``meta``.
+
+    Args:
+        meta: Agent metadata carrying an unresolved-child record.
+
+    Returns:
+        The mutated metadata and the recorded decision.
+    """
+    decision: dict[str, object] = {}
+    agent._decide_invocation(meta, decision, prompt="replacement", steer=False)
+    return meta, decision
+
+
+def test_unresolved_child_ambiguous_inspection_blocks_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable procfs keeps the unresolved-child block; nothing fails open.
+
+    When the recorded PID still exists but its start time cannot be read,
+    death is not proven: the later prompt stays busy and the durable marker
+    persists.
+    """
+    marker = {"pid": 424242, "start_time": 111, "invocation_id": "inv-u"}
+    meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped", "stop_reason": "stop"}
+    meta["unresolved_invocation"] = marker
+    monkeypatch.setattr(os, "kill", lambda _pid, _sig: None)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: None)
+
+    meta, decision = _decide_with_marker(meta)
+
+    assert decision["action"] == "busy"
+    assert meta["unresolved_invocation"] == marker, "marker must persist"
+
+
+def test_unresolved_child_malformed_marker_blocks_and_persists() -> None:
+    """Corrupt persisted obligation state fails closed instead of erasing it.
+
+    A present-but-malformed ``unresolved_invocation`` mapping — wrong shape,
+    invalid PID, wrong-type start time, or missing/empty invocation ID — is
+    treated as ambiguous: the later prompt is blocked and the marker is never
+    cleared, even when a naive type-coercing comparison would call the
+    identity "recycled".
+    """
+    cases = [
+        {"start_time": 111},  # missing pid and invocation_id
+        {"pid": 0, "start_time": 111, "invocation_id": "inv-u"},
+        {"pid": -5, "start_time": 111, "invocation_id": "inv-u"},
+        {"pid": "424242", "start_time": 111, "invocation_id": "inv-u"},
+        {"pid": 424242, "start_time": "111", "invocation_id": "inv-u"},
+        {"pid": 424242, "start_time": None, "invocation_id": "inv-u"},
+        {"pid": 424242, "start_time": 111},
+        {"pid": 424242, "start_time": 111, "invocation_id": ""},
+    ]
+    for broken in cases:
+        meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped", "stop_reason": "stop"}
+        meta["unresolved_invocation"] = broken
+        meta_after, decision = _decide_with_marker(meta)
+        assert decision["action"] == "busy", f"malformed {broken!r} must block"
+        assert meta_after["unresolved_invocation"] == broken, (
+            f"malformed {broken!r} must never be cleared"
+        )
+
+
+def test_unresolved_child_proven_recycled_clears_block() -> None:
+    """A readable different start time positively proves recycling and clears."""
+    marker = {"pid": 424242, "start_time": 111, "invocation_id": "inv-u"}
+    meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped", "stop_reason": "stop"}
+    meta["unresolved_invocation"] = marker
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(os, "kill", lambda _pid, _sig: None)
+    patcher.setattr(agent, "proc_start_ticks", lambda _pid: 999)
+    try:
+        meta, decision = _decide_with_marker(meta)
+        assert decision["action"] != "busy"
+        assert meta["unresolved_invocation"] is None
+    finally:
+        patcher.undo()
