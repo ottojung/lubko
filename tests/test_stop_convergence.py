@@ -65,10 +65,6 @@ class _MarkedProcess:
         """The exact process ID."""
         return self.proc.pid
 
-    def start_ticks(self) -> int | None:
-        """The exact start-time identity in clock ticks."""
-        return agent.proc_start_ticks(self.pid)
-
     def kill_and_reap(self) -> None:
         """Converge the exact test-owned process and reap it."""
         if self.proc.poll() is None:
@@ -429,4 +425,3 @@ def test_invocation_spawn_gate_refuses_cancelled_prompt(
     result = agent.read_meta(aid)
     assert result is not None
     assert result["state"] == ("stopped" if mode == "stop" else "killed")
-
