@@ -1,11 +1,15 @@
 """Crash-durable write semantics: atomicity, completeness, fail-closed errors."""
 
-from collections.abc import Iterator
+import fcntl
+import os
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
 
 from lubko.durable import (
+    DURABLE_LOCK_PREFIX,
     DURABLE_TEMP_PREFIX,
     FSYNC_STAGE_DIR,
     FSYNC_STAGE_FILE,
@@ -52,9 +56,20 @@ def test_durable_writes_round_trip_without_leftovers(tmp_path: Path) -> None:
     write_symlink_durable(link, "file.json")
     for index in range(5):
         write_bytes_durable(path, str(index).encode())
-    leftovers = [p.name for p in target.iterdir() if p.name.startswith(DURABLE_TEMP_PREFIX)]
+    leftovers = [
+        p.name
+        for p in target.iterdir()
+        if p.name.startswith(DURABLE_TEMP_PREFIX) and not p.name.startswith(DURABLE_LOCK_PREFIX)
+    ]
     assert leftovers == []
-    assert sorted(p.name for p in target.iterdir()) == ["file.json", "link"]
+    # Stable per-destination lock sidecars persist by design (unlinking them
+    # would race with waiters on the old inode).
+    assert sorted(p.name for p in target.iterdir()) == [
+        ".lubko-durable-lock-file.json",
+        ".lubko-durable-lock-link",
+        "file.json",
+        "link",
+    ]
 
     names = {temporary_path(path).name for _ in range(20)}
     assert len(names) == 20
@@ -105,3 +120,152 @@ def test_symlink_switch_is_atomic_and_restores_prior_pointer(tmp_path: Path) -> 
     with pytest.raises(DurabilityError):
         write_symlink_durable(link, "b")
     assert link.readlink() == Path("a")
+
+
+def _sidecar_is_free(directory: Path, name: str) -> bool:
+    """Probe the destination sidecar flock without blocking.
+
+    Args:
+        directory: Directory holding the destination and its sidecar lock.
+        name: Destination file name the sidecar lock guards.
+
+    Returns:
+        ``True`` when the probe acquired and released the flock, meaning no
+        durable operation currently holds the destination lock.
+    """
+    fd = os.open(str(directory / f"{DURABLE_LOCK_PREFIX}{name}"), os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    finally:
+        os.close(fd)
+
+
+def _fail_dir_once_for(directory: Path, hook: Callable[[Path], None]) -> None:
+    """Install an injector that runs ``hook`` then fails A's dir fsync once."""
+
+    def inject(destination: Path, stage: str) -> None:
+        if stage == FSYNC_STAGE_DIR and Path(destination) == directory:
+            set_fsync_failure_injector(None)
+            hook(destination)
+            msg = "injected"
+            raise DurabilityError(msg)
+
+    set_fsync_failure_injector(inject)
+
+
+def test_failed_write_cannot_revert_newer_committed_writer(tmp_path: Path) -> None:
+    """A concurrent writer serialized behind a failing write is never reverted."""
+    file_path = tmp_path / "f"
+    write_bytes_durable(file_path, b"old")
+    b_done = threading.Event()
+
+    def during_a(destination: Path) -> None:
+        # A holds the destination lock for its whole critical section: writer
+        # B's durable write cannot proceed until A's cleanup has finished.
+        assert not _sidecar_is_free(destination, "f")
+
+        def writer_b() -> None:
+            write_bytes_durable(file_path, b"newer")
+            b_done.set()
+
+        threading.Thread(target=writer_b, daemon=True).start()
+        assert not b_done.is_set()
+
+    _fail_dir_once_for(tmp_path, during_a)
+    with pytest.raises(DurabilityError):
+        write_bytes_durable(file_path, b"unconfirmed")
+
+    assert b_done.wait(timeout=5.0)
+    assert file_path.read_bytes() == b"newer"
+
+
+def test_failed_symlink_switch_cannot_revert_newer_pointer(tmp_path: Path) -> None:
+    """A newer committed symlink pointer survives an older failed switch."""
+    link = tmp_path / "current"
+    write_symlink_durable(link, "gen1")
+    b_done = threading.Event()
+
+    def during_a(destination: Path) -> None:
+        assert not _sidecar_is_free(destination, "current")
+
+        def writer_b() -> None:
+            write_symlink_durable(link, "gen3")
+            b_done.set()
+
+        threading.Thread(target=writer_b, daemon=True).start()
+        assert not b_done.is_set()
+
+    _fail_dir_once_for(tmp_path, during_a)
+    with pytest.raises(DurabilityError):
+        write_symlink_durable(link, "gen2")
+
+    assert b_done.wait(timeout=5.0)
+    assert link.readlink() == Path("gen3")
+
+
+def test_failed_removal_cannot_resurrect_over_newer_writer(tmp_path: Path) -> None:
+    """A failed removal restores only before any newer writer can commit."""
+    file_path = tmp_path / "authority"
+    write_bytes_durable(file_path, b"v1")
+    b_done = threading.Event()
+
+    def during_a(destination: Path) -> None:
+        assert not _sidecar_is_free(destination, "authority")
+
+        def writer_b() -> None:
+            write_bytes_durable(file_path, b"v3")
+            b_done.set()
+
+        threading.Thread(target=writer_b, daemon=True).start()
+        assert not b_done.is_set()
+
+    _fail_dir_once_for(tmp_path, during_a)
+    with pytest.raises(DurabilityError):
+        remove_durable(file_path)
+
+    assert b_done.wait(timeout=5.0)
+    assert file_path.read_bytes() == b"v3"
+
+
+def test_single_writer_removal_still_restores_on_failure(tmp_path: Path) -> None:
+    """Without a concurrent writer, failed removal restores prior authority."""
+    file_path = tmp_path / "solo"
+    write_bytes_durable(file_path, b"prior")
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR, path=file_path.parent)
+    with pytest.raises(DurabilityError):
+        remove_durable(file_path)
+    assert file_path.read_bytes() == b"prior"
+
+
+def test_recursive_restore_releases_lock_depth(tmp_path: Path) -> None:
+    """Nested cleanup reenters the lock and fully releases it afterwards.
+
+    The failing write's restore re-enters ``_serialized`` for the same path;
+    if that recursion leaked gate depth or held the sidecar lock, this write —
+    and the follow-up write from another thread — would deadlock or corrupt
+    ownership state instead of completing.
+    """
+    file_path = tmp_path / "depthcheck"
+    write_bytes_durable(file_path, b"keep")
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR, path=tmp_path)
+    with pytest.raises(DurabilityError):
+        write_bytes_durable(file_path, b"fails")
+    assert file_path.read_bytes() == b"keep"
+    assert _sidecar_is_free(tmp_path, "depthcheck")
+
+    done = threading.Event()
+
+    def other_thread() -> None:
+        write_bytes_durable(file_path, b"after")
+        done.set()
+
+    thread = threading.Thread(target=other_thread, daemon=True)
+    thread.start()
+    assert done.wait(timeout=5.0)
+    thread.join(timeout=1.0)
+    assert file_path.read_bytes() == b"after"
