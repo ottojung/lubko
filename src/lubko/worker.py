@@ -70,7 +70,6 @@ worker) rather than letting one job poison supervision.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import fcntl
 import importlib
 import json
@@ -91,6 +90,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast, override
 from uuid import uuid4
 
+from lubko._exact_signal import open_pidfd as _shared_open_pidfd
+from lubko._exact_signal import pidfd_send_signal as _shared_pidfd_send_signal
+from lubko._exact_signal import process_pgrp as _shared_process_pgrp
 from lubko._pg import psycopg, tuple_row
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config, load_worker_server
@@ -374,8 +376,6 @@ DEFAULT_OUTPUT_SPOOL_MAX_BYTES: Final = 4 * 1024 * 1024
 LEASE_RECOVERY_LIMIT: Final = 100
 CANCEL_DISCOVERY_LIMIT: Final = 100
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
-STAT_MIN_FIELDS: Final = 3
-STAT_PGRP_FIELD_INDEX: Final = 2
 #: Maximum bytes drained from a capture pipe into a spool file per syscall.  The
 #: physical spool is bounded by ``output_spool_max_bytes``; this chunk is only
 #: the unit of a single read, never the bound.
@@ -1923,31 +1923,13 @@ def _persist_process(
 def _process_pgrp(pid: int) -> int | None:
     """Return the exact process group of a running process.
 
-    Zombie and dead processes report no group. Unreadable or unparseable
-    process table entries are ignored.
-
     Args:
         pid: Process ID to inspect.
 
     Returns:
         The process group ID, or ``None`` if the process is dead or unknown.
     """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return None
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return None
-    fields = stat[close_paren + 2 :].split()
-    if len(fields) < STAT_MIN_FIELDS:
-        return None
-    if fields[0] in {b"Z", b"X"}:
-        return None
-    try:
-        return int(fields[STAT_PGRP_FIELD_INDEX])
-    except ValueError:
-        return None
+    return _shared_process_pgrp(pid)
 
 
 def group_has_members(pgid: int) -> bool:
@@ -2183,71 +2165,11 @@ def _group_member_pids(pgid: int) -> list[int]:
     return [pgid]
 
 
-if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
-
-    def _pidfd_open(pid: int) -> int:
-        """Open a pidfd pinning ``pid`` against kernel pid reuse.
-
-        Args:
-            pid: Process id to pin.
-
-        Returns:
-            The new pid file descriptor; ``OSError`` on failure.
-        """
-        return int(os.pidfd_open(pid))
-
-    def _pidfd_send_signal(pidfd: int, sig: int) -> None:
-        """Deliver ``sig`` to exactly the process pinned by ``pidfd``.
-
-        Args:
-            pidfd: Pinned process file descriptor.
-            sig: Signal number to deliver.
-
-        OSError is raised by the platform binding on failure.
-        """
-        signal.pidfd_send_signal(pidfd, sig)
-
-else:  # pragma: no cover - platform-dependent resolution
-    _LIBC: Final = ctypes.CDLL(None, use_errno=True)
-
-    def _pidfd_open(pid: int) -> int:
-        """Open a pidfd pinning ``pid`` against kernel pid reuse.
-
-        Args:
-            pid: Process id to pin.
-
-        Returns:
-            The new pid file descriptor.
-
-        Raises:
-            OSError: If the pid cannot be pinned.
-        """
-        _LIBC.pidfd_open.argtypes = (ctypes.c_int, ctypes.c_uint)
-        _LIBC.pidfd_open.restype = ctypes.c_int
-        fd = _LIBC.pidfd_open(pid, 0)
-        if fd < 0:
-            raise OSError(ctypes.get_errno(), "pidfd_open failed")
-        return int(fd)
-
-    def _pidfd_send_signal(pidfd: int, sig: int) -> None:
-        """Deliver ``sig`` to exactly the process pinned by ``pidfd``.
-
-        Args:
-            pidfd: Pinned process file descriptor.
-            sig: Signal number to deliver.
-
-        Raises:
-            OSError: If delivery fails.
-        """
-        _LIBC.pidfd_send_signal.argtypes = (
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint,
-        )
-        _LIBC.pidfd_send_signal.restype = ctypes.c_int
-        if _LIBC.pidfd_send_signal(pidfd, sig, None, 0) != 0:
-            raise OSError(ctypes.get_errno(), "pidfd_send_signal failed")
+# Exact-signalling primitives are shared with other lifecycle paths; see
+# :mod:`lubko._exact_signal`. They remain reachable as module globals so
+# tests can substitute them per call site.
+_pidfd_open = _shared_open_pidfd
+_pidfd_send_signal = _shared_pidfd_send_signal
 
 
 def _pin_and_signal(pid: int, sig: int, expected_ticks: int) -> bool:
