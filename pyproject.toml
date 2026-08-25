@@ -109,6 +109,9 @@ convention = "google"
     "suspicious-subprocess-import",
 ]
 "tests/**/*.py" = [
+    # Tests converge private lifecycle internals (unproven-spawn identity
+    # convergence), which are deliberately not public API.
+    "import-private-name",
     # Tests assert invariants of the worker's internal state machine (outage
     # convergence, deadline derivation), which are deliberately not public API.
     "assert",

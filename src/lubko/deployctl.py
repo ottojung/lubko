@@ -44,6 +44,7 @@ from lubko.lifecycle import (
     LockTimeoutError,
     ProcessIdentity,
     WorkerMeta,
+    _converge_unproven_spawn,
     append_deploy_log,
     check_postgres,
     deploy_lock,
@@ -622,21 +623,30 @@ def _checkout(repo: Path, commit: str, timeout: float, *, force: bool) -> bool:
 def _wait_for_identity(proc: subprocess.Popen[bytes]) -> ProcessIdentity | None:
     """Wait for a candidate to establish an independent session.
 
+    On timeout the last observed identity is returned even when it does not
+    yet satisfy ``pgid == proc.pid == sid``: that observation is the exact
+    pre-transition ownership anchor for converging a live candidate whose
+    PGID/SID transitions after the deadline. Callers must explicitly reject a
+    non-private identity and hand it to
+    :func:`lubko.lifecycle._converge_unproven_spawn`.
+
     Args:
         proc: Candidate process.
 
     Returns:
-        Exact identity, or ``None`` if it dies or never establishes one.
+        Exact private-session identity once observed, otherwise the last
+        observed identity at the timeout, or ``None`` if it died first.
     """
     deadline = time.monotonic() + IDENTITY_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
+    while True:
         if proc.poll() is not None:
             return None
         identity = process_identity(proc.pid)
         if identity is not None and identity.pgid == proc.pid and identity.sid == proc.pid:
             return identity
+        if time.monotonic() >= deadline:
+            return identity
         time.sleep(IDENTITY_POLL_SECONDS)
-    return None
 
 
 def _spawn_gated_candidate(options: Options, commit: str) -> GatedWorker:
@@ -671,7 +681,7 @@ def _spawn_gated_candidate(options: Options, commit: str) -> GatedWorker:
     finally:
         os.close(reader)
     identity = _wait_for_identity(proc)
-    if identity is None:
+    if identity is None or identity.pgid != proc.pid or identity.sid != proc.pid:
         os.close(writer)
         raise DeployCtlError("candidate exited before the rollback mission could be armed")
     meta = WorkerMeta(
@@ -1045,54 +1055,6 @@ def _complete_handoff(
         raise
 
 
-def _converge_unproven_spawn(proc: subprocess.Popen[bytes], grace_seconds: float) -> None:
-    """Terminate and reap a spawned worker whose identity was never proven.
-
-    ``_wait_for_identity`` returns ``None`` for two distinct conditions: an
-    already-exited child (an ordinary retryable rollback failure) and a child
-    that is still alive when the identity deadline expires. A live child is
-    never forgotten (#182, mirroring the supervisor #177 design): while it is
-    still this controller's direct ``Popen`` child it is converged with exact
-    single-PID signals — never group signals — and its exit is positively
-    proven by reaping. If even ``SIGKILL`` cannot prove exit, this function
-    fails closed by blocking on the reap, so no caller can ever proceed to a
-    retry that would spawn a second previous-commit worker alongside the
-    unresolved first child.
-
-    Args:
-        proc: The direct ``Popen`` handle of the spawned child.
-        grace_seconds: Grace period before the emergency single-PID force-kill.
-    """
-    if proc.poll() is not None:
-        # Already exited before its identity was established: an ordinary
-        # retryable failure with nothing left to converge.
-        return
-    LOGGER.error(
-        "worker pid %d is live without an acceptable identity; converging it",
-        proc.pid,
-    )
-    grace = max(grace_seconds, 0.0)
-    with suppress(OSError):
-        proc.terminate()
-    try:
-        proc.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        pass
-    else:
-        return
-    with suppress(OSError):
-        proc.kill()
-    try:
-        proc.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        LOGGER.exception(
-            "worker pid %d cannot be converged by exact identity after SIGKILL; "
-            "failing closed until it provably exits",
-            proc.pid,
-        )
-        proc.wait()
-
-
 def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     """Restore the previous known-good worker process.
 
@@ -1130,8 +1092,13 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     except OSError:
         return None
     identity = _wait_for_identity(proc)
-    if identity is None:
-        _converge_unproven_spawn(proc, state.stop_grace_seconds)
+    if identity is None or identity.pgid != proc.pid or identity.sid != proc.pid:
+        if identity is not None:
+            LOGGER.error(
+                "worker pid %d is live without an acceptable identity; converging it",
+                proc.pid,
+            )
+        _converge_unproven_spawn(proc, state.stop_grace_seconds, identity)
         return None
     meta = WorkerMeta(
         schema_version=SCHEMA_VERSION,

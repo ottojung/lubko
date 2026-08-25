@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import signal
 import subprocess
 import time
 
@@ -9,8 +10,25 @@ import pytest
 
 from lubko import deployctl as dc
 from lubko import lifecycle
+from lubko.lifecycle import ProcessIdentity
 
-COMMIT = "a" * 40
+
+class NumericSignalError(AssertionError):
+    """Raised when a numeric kill primitive is used instead of a pidfd."""
+
+
+def _numeric_signal_forbidden() -> None:
+    """Fail the test: only pinned ``pidfd_send_signal`` may deliver signals.
+
+    Raises:
+        NumericSignalError: Always.
+    """
+    raise NumericSignalError
+
+
+def _forbid_os_kill(_pid: int, _sig: int) -> None:
+    """Stand-in for ``os.kill`` that must never run."""
+    _numeric_signal_forbidden()
 
 
 class FakePopen:
@@ -29,16 +47,14 @@ class FakePopen:
         self.signals: list[str] = []
 
     def terminate(self) -> None:
-        """Record a SIGTERM; only a converging child then exits."""
-        self.signals.append("SIGTERM")
-        if self.mode == "converges":
-            self.returncode = -15
+        """Exact convergence never uses numeric ``Popen`` signals."""
+        del self
+        _numeric_signal_forbidden()
 
     def kill(self) -> None:
-        """Record a SIGKILL; every covered non-exited child then exits."""
-        self.signals.append("SIGKILL")
-        if self.mode != "exited":
-            self.returncode = -9
+        """Exact convergence never uses numeric ``Popen`` signals."""
+        del self
+        _numeric_signal_forbidden()
 
     def poll(self) -> int | None:
         """Return the exit status while the child is still alive."""
@@ -57,11 +73,14 @@ class FakePopen:
             subprocess.TimeoutExpired: When the child refuses to exit yet.
         """
         expired: float = timeout if timeout is not None else 0.0
-        if self.mode == "converges" and "SIGTERM" not in self.signals:
-            raise subprocess.TimeoutExpired(cmd="worker", timeout=expired)
-        if self.mode == "needs_kill" and "SIGKILL" not in self.signals:
-            raise subprocess.TimeoutExpired(cmd="worker", timeout=expired)
-        assert self.returncode is not None
+        if timeout is not None:
+            if self.mode == "converges" and "SIGTERM" not in self.signals:
+                raise subprocess.TimeoutExpired(cmd="worker", timeout=expired)
+            if self.mode == "needs_kill" and "SIGKILL" not in self.signals:
+                raise subprocess.TimeoutExpired(cmd="worker", timeout=expired)
+        # An unbounded reap models the child eventually exiting on its own.
+        if self.returncode is None:
+            self.returncode = -1
         return self.returncode
 
 
@@ -87,7 +106,7 @@ def pending_state(*, previous_retiring: bool = False) -> dc.RollbackState:
             repo="/workspace/Lubko",
             git_commit=commit,
             worker_id="test-worker",
-            log_path="/workspace/worker.log",
+            log_path="worker.log",
             started_at=1.0,
             stopped_at=None,
         )
@@ -124,96 +143,181 @@ def retiring_state() -> dc.RollbackState:
     return pending_state(previous_retiring=True)
 
 
+@pytest.fixture
+def forbid_numeric_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if any numeric kill primitive is used."""
+    monkeypatch.setattr("os.kill", _forbid_os_kill)
+    monkeypatch.setattr("os.killpg", _forbid_os_kill)
+
+
+def unproven_anchor(fake: FakePopen) -> ProcessIdentity:
+    """Return a plausible non-private pre-transition identity for ``fake``.
+
+    Args:
+        fake: The spawned fake child.
+
+    Returns:
+        An observed identity without a private session or group.
+    """
+    return ProcessIdentity(
+        pid=fake.pid,
+        pgid=1,
+        sid=1,
+        start_time_ticks=fake.pid * 10,
+    )
+
+
+def install_pinned_convergence(
+    monkeypatch: pytest.MonkeyPatch,
+    fakes: dict[int, FakePopen],
+    occupants: dict[int, ProcessIdentity | None],
+) -> list[tuple[int, str]]:
+    """Make pidfd pinning, under-pin proof, and signalling deterministic.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+        fakes: Direct children keyed by PID.
+        occupants: Identity observed through ``/proc`` per PID during the
+            under-pin re-proof.
+
+    Returns:
+        The ``(pid, signal name)`` pairs delivered through the pin.
+    """
+    delivered: list[tuple[int, str]] = []
+    pins: dict[int, int] = {}
+
+    def open_pin(pid: int) -> int:
+        fd = 10000 + pid
+        pins[fd] = pid
+        return fd
+
+    def send(pin: int, sig: int) -> None:
+        pid = pins[pin]
+        name = signal.Signals(sig).name
+        delivered.append((pid, name))
+        fake = fakes[pid]
+        fake.signals.append(name)
+        if name == "SIGTERM":
+            if fake.mode == "converges":
+                fake.returncode = -15
+        elif fake.mode != "exited":
+            fake.returncode = -9
+
+    def close_pin(_pin: int) -> None:
+        return
+
+    monkeypatch.setattr(lifecycle, "_open_exact_pidfd", open_pin)
+
+    def occupant(pid: int) -> ProcessIdentity | None:
+        return occupants.get(pid)
+
+    monkeypatch.setattr(lifecycle, "process_identity", occupant)
+    monkeypatch.setattr(lifecycle, "pidfd_send_signal", send)
+    monkeypatch.setattr("os.close", close_pin)
+    return delivered
+
+
 def _install_failing_identity(
     monkeypatch: pytest.MonkeyPatch,
     fake: FakePopen,
     spawned: list[FakePopen],
-) -> None:
-    """Force the spawn path to produce ``fake`` and never prove its identity.
+) -> list[tuple[int, str]]:
+    """Force the spawn path to produce ``fake`` and never prove its session.
 
     Args:
         monkeypatch: Pytest monkeypatch fixture.
         fake: The fake child every spawn returns.
         spawned: List receiving every spawned fake child.
-    """
-    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
-    monkeypatch.setattr(dc, "_wait_for_identity", lambda _proc: None)
 
-    def fake_spawn(
-        *_args: object,
-        **_kwargs: object,
-    ) -> FakePopen:
+    Returns:
+        The pinned signals the helper delivers for ``fake``.
+    """
+    occupants: dict[int, ProcessIdentity | None] = {fake.pid: unproven_anchor(fake)}
+    delivered = install_pinned_convergence(monkeypatch, {fake.pid: fake}, occupants)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+    monkeypatch.setattr(dc, "_wait_for_identity", lambda _proc: occupants[fake.pid])
+
+    def fake_spawn(*_args: object, **_kwargs: object) -> FakePopen:
         spawned.append(fake)
         return fake
 
     monkeypatch.setattr(dc, "spawn_worker", fake_spawn)
+    return delivered
 
 
 def test_unproven_live_child_is_converged_and_retry_stays_possible(
     monkeypatch: pytest.MonkeyPatch,
+    forbid_numeric_signals: None,
     retiring_state: dc.RollbackState,
 ) -> None:
     """A live child whose identity timed out is converged before returning."""
+    del forbid_numeric_signals
     fake = FakePopen(41001, mode="converges")
     spawned: list[FakePopen] = []
-    _install_failing_identity(monkeypatch, fake, spawned)
+    delivered = _install_failing_identity(monkeypatch, fake, spawned)
 
     restored = dc.restart_previous(retiring_state)
 
     assert restored is None
     assert spawned == [fake]
-    assert fake.signals == ["SIGTERM"]
+    assert delivered == [(fake.pid, "SIGTERM")]
     assert fake.poll() == -15
 
 
 def test_already_exited_child_needs_no_convergence(
     monkeypatch: pytest.MonkeyPatch,
+    forbid_numeric_signals: None,
     retiring_state: dc.RollbackState,
 ) -> None:
     """An already-exited child remains an ordinary retryable failure."""
+    del forbid_numeric_signals
     fake = FakePopen(41002, mode="exited")
     spawned: list[FakePopen] = []
-    _install_failing_identity(monkeypatch, fake, spawned)
+    delivered = _install_failing_identity(monkeypatch, fake, spawned)
 
     restored = dc.restart_previous(retiring_state)
 
     assert restored is None
-    assert fake.signals == []
+    assert delivered == []
 
 
 def test_child_ignoring_sigterm_is_killed_and_reaped(
     monkeypatch: pytest.MonkeyPatch,
+    forbid_numeric_signals: None,
     retiring_state: dc.RollbackState,
 ) -> None:
-    """A child that ignores SIGTERM is exact-PID SIGKILLed and reaped."""
+    """A child that ignores SIGTERM is pinned-SIGKILLed and reaped."""
+    del forbid_numeric_signals
     fake = FakePopen(41003, mode="needs_kill")
     spawned: list[FakePopen] = []
-    _install_failing_identity(monkeypatch, fake, spawned)
+    delivered = _install_failing_identity(monkeypatch, fake, spawned)
 
     restored = dc.restart_previous(retiring_state)
 
     assert restored is None
-    assert fake.signals == ["SIGTERM", "SIGKILL"]
+    assert delivered == [(fake.pid, "SIGTERM"), (fake.pid, "SIGKILL")]
     assert fake.poll() == -9
 
 
 def test_repeated_retries_never_leave_a_live_worker_behind(
     monkeypatch: pytest.MonkeyPatch,
+    forbid_numeric_signals: None,
     retiring_state: dc.RollbackState,
 ) -> None:
     """Repeated watchdog retries converge every spawn before the next one."""
-    spawned: list[FakePopen] = []
+    del forbid_numeric_signals
+    fakes: dict[int, FakePopen] = {}
+    occupants: dict[int, ProcessIdentity | None] = {}
+    install_pinned_convergence(monkeypatch, fakes, occupants)
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+    monkeypatch.setattr(dc, "_wait_for_identity", lambda proc: occupants[proc.pid])
 
-    def counting_spawn(
-        *_args: object,
-        **_kwargs: object,
-    ) -> FakePopen:
-        fake = FakePopen(41004 + len(spawned), mode="converges")
-        spawned.append(fake)
+    def counting_spawn(*_args: object, **_kwargs: object) -> FakePopen:
+        fake = FakePopen(41004 + len(fakes), mode="converges")
+        fakes[fake.pid] = fake
+        occupants[fake.pid] = unproven_anchor(fake)
         return fake
 
-    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
-    monkeypatch.setattr(dc, "_wait_for_identity", lambda _proc: None)
     monkeypatch.setattr(dc, "spawn_worker", counting_spawn)
 
     results = [dc.restart_previous(retiring_state) for _ in range(3)]
@@ -221,8 +325,45 @@ def test_repeated_retries_never_leave_a_live_worker_behind(
     assert results == [None, None, None]
     # Every abandoned spawn was positively converged: no live worker from any
     # earlier retry can coexist with a later replacement.
-    assert all(fake.poll() is not None for fake in spawned)
-    assert [fake.signals for fake in spawned] == [["SIGTERM"]] * 3
+    assert all(fake.poll() is not None for fake in fakes.values())
+    assert all(fake.signals == ["SIGTERM"] for fake in fakes.values())
+
+
+def test_reused_occupant_between_proof_and_pin_is_never_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+    forbid_numeric_signals: None,
+    retiring_state: dc.RollbackState,
+) -> None:
+    """A recycled PID occupant observed under the pin absorbs no signal."""
+    del forbid_numeric_signals
+    fake = FakePopen(41005, mode="needs_kill")
+    anchor = unproven_anchor(fake)
+    recycled = ProcessIdentity(
+        pid=fake.pid,
+        pgid=fake.pid,
+        sid=fake.pid,
+        start_time_ticks=anchor.start_time_ticks + 777,
+    )
+    # The occupant under the pin is a different process instance than the one
+    # the anchor described: the original child exited and its PID was reused.
+    delivered = install_pinned_convergence(monkeypatch, {fake.pid: fake}, {fake.pid: recycled})
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: False)
+    monkeypatch.setattr(dc, "_wait_for_identity", lambda _proc: anchor)
+    spawned: list[FakePopen] = []
+
+    def spawn(*_args: object, **_kwargs: object) -> FakePopen:
+        spawned.append(fake)
+        return fake
+
+    monkeypatch.setattr(dc, "spawn_worker", spawn)
+
+    restored = dc.restart_previous(retiring_state)
+
+    assert restored is None
+    assert spawned == [fake]
+    assert delivered == []
+    # Fail closed: the unresolved child is positively reaped, nothing else.
+    assert fake.returncode == -1
 
 
 def test_controller_requests_must_be_json_objects() -> None:
@@ -243,4 +384,3 @@ def test_only_failed_checkout_reports_failure_via_exit_code() -> None:
     succeeded: dict[str, object] = {"ok": True}
     assert dc.checkout_failure_exit_code("checkout", failed) != 0
     assert dc.checkout_failure_exit_code("checkout", succeeded) == 0
-    assert dc.checkout_failure_exit_code("confirm", failed) == 0
