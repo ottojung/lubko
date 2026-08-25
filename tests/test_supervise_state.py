@@ -277,6 +277,22 @@ def test_present_malformed_backoff_deadline_is_durable_hold(
     assert rewritten.ownership_hold_malformed is True
 
 
+def test_unrepresentably_large_integer_deadline_is_durable_hold(state_path: Path) -> None:
+    """An integer beyond float range fails closed instead of raising."""
+    huge = "1" + "0" * 10000
+    state_path.write_text(
+        json.dumps({"schema_version": supervise.SCHEMA_VERSION})[:-1]
+        + f', "next_attempt_at": {huge}}}',
+        encoding="utf-8",
+    )
+    state = supervise.read_state()
+    assert state.next_attempt_at is None
+    assert state.ownership_hold_malformed is True
+
+    supervise.write_state(state)
+    assert supervise.read_state().ownership_hold_malformed is True
+
+
 def test_reconcile_holds_before_crash_handling_on_malformed_history(
     state_path: Path,
     monkeypatch: pytest.MonkeyPatch,

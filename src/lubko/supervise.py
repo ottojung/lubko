@@ -1333,11 +1333,14 @@ def _strict_finite_float(value: object) -> float | None:
 
     Returns:
         The finite float, or ``None`` for booleans, non-numeric values,
-        strings, NaN, and infinities.
+        strings, NaN, infinities, and integers too large to represent.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError:
+        return None
     if not math.isfinite(result):
         return None
     return result
