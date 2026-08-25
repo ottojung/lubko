@@ -42,11 +42,13 @@ import json
 import os
 import re
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
+from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 
@@ -909,6 +911,13 @@ def _status_identity_matches(status: SupervisorStatus) -> bool:
     is dead/replaced, or the PID was reused with a different start time, the
     status snapshot is treated as stale.
 
+    A holding pidfd does not keep a numeric PID reserved, so numeric ``/proc``
+    observations alone cannot prove a stable identity. The recorded PID is
+    pinned with a pidfd and, after numeric start-time/liveness/cmdline checks,
+    the pinned original process is re-proven alive via ``pidfd_send_signal(0)``
+    immediately before acceptance. If the original exited while the numeric PID
+    was reused, the pinned liveness proof fails and status is rejected.
+
     Args:
         status: Parsed status to validate.
 
@@ -919,14 +928,28 @@ def _status_identity_matches(status: SupervisorStatus) -> bool:
     if recorded is None:
         return False
     pid, ticks = recorded
-    return (
-        pid == status.supervisor_pid
-        and status.supervisor_start_time_ticks == ticks
-        and ticks != 0
-        and not _process_is_zombie(pid)
-        and proc_start_ticks(pid) == ticks
-        and ("lubko-supervisor" in _read_cmdline(pid) or "lubko.supervisor" in _read_cmdline(pid))
-    )
+    if pid != status.supervisor_pid or status.supervisor_start_time_ticks != ticks or ticks == 0:
+        return False
+    try:
+        pidfd = _open_supervisor_pidfd(pid)
+    except (OSError, AttributeError):
+        return False
+    try:
+        cmdline = _read_cmdline(pid)
+        if (
+            _process_is_zombie(pid)
+            or proc_start_ticks(pid) != ticks
+            or ("lubko-supervisor" not in cmdline and "lubko.supervisor" not in cmdline)
+        ):
+            return False
+        try:
+            _pidfd_send_signal(pidfd, 0)
+        except (OSError, AttributeError):
+            return False
+        return True
+    finally:
+        with suppress(OSError):
+            os.close(pidfd)
 
 
 def write_supervisor_pid(pid: int, start_time_ticks: int) -> None:
