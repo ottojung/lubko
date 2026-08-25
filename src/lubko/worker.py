@@ -3411,7 +3411,7 @@ def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, st
     return [(row[0], str(row[1])) for row in rows]
 
 
-def _read_job_status(conn: JobsConnection, job_id: UUID) -> str:
+def _read_job_status(conn: JobsConnection, job_id: UUID) -> str | None:
     """Read the current status of a job.
 
     Args:
@@ -3419,10 +3419,8 @@ def _read_job_status(conn: JobsConnection, job_id: UUID) -> str:
         job_id: Identifier of the job.
 
     Returns:
-        The current job status.
-
-    Raises:
-        RuntimeError: If the job no longer exists.
+        The current job status, or ``None`` when the root row no longer
+        exists (it was deleted concurrently during finalization).
     """
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
@@ -3431,12 +3429,12 @@ def _read_job_status(conn: JobsConnection, job_id: UUID) -> str:
         )
         row = cursor.fetchone()
     if row is None:
-        msg = f"job {job_id} disappeared while finalizing"
-        raise RuntimeError(msg)
+        LOGGER.warning("root row for job %s disappeared while finalizing", job_id)
+        return None
     return str(row[0])
 
 
-def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server: str) -> str:
+def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server: str) -> str | None:
     """Persist the final result of a job into its JSON payload.
 
     A cancellation request accepted before finalization wins over a natural
@@ -3453,7 +3451,10 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
         server: The daemon's configured server identity guarding the update.
 
     Returns:
-        The persisted final status.
+        The persisted final status, or ``None`` when the root row no longer
+        exists because it was deleted concurrently during finalization. A row
+        that still exists in another (for example lease-recovered terminal)
+        state yields that observed status instead.
     """
     # The whole result object is assembled atomically with jsonb_build_object.
     # A bare to_jsonb(NULL) inside jsonb_set would make the whole update SQL
@@ -5157,6 +5158,18 @@ class Supervisor:
                 job.quarantine_pending = True
             request_stop(job, STOP_REASON_QUARANTINE)
             return False
+        if final_status is None:
+            # The root row was deleted concurrently after output publication
+            # committed and before the terminal update. This is exact-job row
+            # loss, never a process-wide error: converge through the same
+            # local row-loss path as a publication-time disappearance.
+            LOGGER.warning(
+                "root row for job %s vanished during finalization; untracking as row loss",
+                job.id,
+            )
+            job.row_lost = True
+            cleanup_job(job)
+            return True
         duration_seconds = time.monotonic() - job.started_mono
         LOGGER.info(
             "finished job %s with status %s exit_code=%d duration=%.3fs",
