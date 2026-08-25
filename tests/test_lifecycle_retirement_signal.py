@@ -1,8 +1,10 @@
 """Lifecycle retirement signalling invariants.
 
-Retirement signals (drain SIGTERM and escalation SIGKILL) must each be
-authorized by exact worker identity at the moment of delivery under a
-kernel-stable pin, so a recycled PID/PGID occupant is never signalled.
+A holding pidfd does NOT reserve a numeric PID/PGID: the kernel frees the
+numeric ID before the pinned reference is released. Every retirement signal
+must therefore be delivered through a per-member pidfd to a process re-proven
+(group membership + lifecycle token) under its own pin, so a recycled numeric
+identity can never absorb a signal meant for the retiring worker.
 """
 
 import os
@@ -12,17 +14,16 @@ from typing import Final
 
 import pytest
 
-from lubko import agent, lifecycle
+from lubko import lifecycle
 from lubko.lifecycle import SCHEMA_VERSION, ProcessIdentity, WorkerMeta
 
 LIVE: Final = ProcessIdentity(pid=42, pgid=42, sid=7, start_time_ticks=1234)
 RECYCLED: Final = ProcessIdentity(pid=42, pgid=42, sid=7, start_time_ticks=9999)
+CHILD: Final = 4242
 
 
 class FakeClock:
     """Deterministic monotonic clock advanced by ``sleep``."""
-
-    now: float
 
     def __init__(self) -> None:
         """Start the clock at zero."""
@@ -43,54 +44,74 @@ class Harness:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Install deterministic fakes over the lifecycle signalling surface."""
         self.clock = FakeClock()
-        self.emissions: list[tuple[int, int]] = []
-        self.pin_fd: int | None = 77
+        #: Delivered signals as ``(pid, sig)`` pairs, resolved from pidfds.
+        self.sends: list[tuple[int, int]] = []
         self.closes = 0
-        #: Clock time at which the live worker exits (never when ``None``).
-        self.exit_at: float | None = None
-        #: Clock time at which the numeric PID gets recycled (never if ``None``).
-        self.recycle_at: float | None = None
-        self.has_token = True
+        #: Candidate group members returned by each live snapshot.
+        self.members: list[int] = []
+        #: Per-pid process groups observed under the pins.
+        self.pgrps: dict[int, int] = {}
+        #: Per-pid lifecycle-token ownership observed under the pins.
+        self.tokened: dict[int, bool] = {}
+        #: Pids that cannot be pinned (exited, or no pin capability).
+        self.unpinnable: set[int] = set()
+        #: Observed identity of the recorded worker PID over time.
+        self.identity: ProcessIdentity | None = LIVE
+        #: Whether a recorded token exists to prove ownership with.
+        self.has_recorded_token = True
 
-        monkeypatch.setattr(agent, "open_pidfd", lambda _pid: self.pin_fd)
-
-        def observe(_pid: int) -> ProcessIdentity | None:
-            killed = any(sig == signal.SIGKILL for _, sig in self.emissions)
-            if killed or (self.exit_at is not None and self.clock.now >= self.exit_at):
-                return None
-            if self.recycle_at is not None and self.clock.now >= self.recycle_at:
-                return RECYCLED
-            return LIVE
-
-        monkeypatch.setattr(lifecycle, "process_identity", observe)
-        monkeypatch.setattr(lifecycle, "process_has_token", lambda _pid, _token: self.has_token)
         monkeypatch.setattr(time, "monotonic", self.clock.monotonic)
         monkeypatch.setattr(time, "sleep", self.clock.sleep)
-        monkeypatch.setattr(os, "killpg", self._record_killpg)
+
+        monkeypatch.setattr(
+            lifecycle,
+            "process_identity",
+            lambda _pid: self.identity,
+        )
+        monkeypatch.setattr(
+            lifecycle,
+            "process_has_token",
+            lambda pid, _token: self.tokened.get(pid, False),
+        )
+        monkeypatch.setattr(lifecycle, "_live_group_member_pids", lambda _pgid: list(self.members))
+
+        def member_pgrp(pid: int) -> int | None:
+            return self.pgrps.get(pid)
+
+        monkeypatch.setattr(lifecycle, "process_pgrp", member_pgrp)
+
+        def open_pin(pid: int) -> int:
+            if pid in self.unpinnable:
+                message = "no such process"
+                raise OSError(message)
+            return 10000 + pid
+
+        def send(fd: int, sig: int) -> None:
+            self.sends.append((fd - 10000, sig))
+
+        def close(_fd: int) -> None:
+            self.closes += 1
+
+        monkeypatch.setattr(lifecycle, "_open_exact_pidfd", open_pin)
+        monkeypatch.setattr(lifecycle, "pidfd_send_signal", send)
+        monkeypatch.setattr(os, "close", close)
         monkeypatch.setattr(lifecycle, "drain_sentinel_matches", lambda _token: False)
-        monkeypatch.setattr(os, "close", self._record_close)
-
-    def _record_killpg(self, pgid: int, sig: int) -> None:
-        self.emissions.append((pgid, sig))
-
-    def _record_close(self, fd: int) -> None:
-        del fd
-        self.closes += 1
 
 
-def run(_h: Harness) -> bool:
+def run(h: Harness) -> bool:
     """Run ``stop_worker`` with zero grace windows.
 
     Args:
-        _h: The injected retirement world (fakes already installed).
+        h: The injected retirement world (fakes already installed).
 
     Returns:
         The retirement outcome reported by ``stop_worker``.
     """
+    del h
     return lifecycle.stop_worker(meta(), 0.0, cancel_grace_seconds=0.0)
 
 
-def meta() -> WorkerMeta:
+def meta(**overrides: object) -> WorkerMeta:
     """Return recorded worker metadata matching :data:`LIVE`."""
     defaults: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
@@ -107,7 +128,7 @@ def meta() -> WorkerMeta:
         "started_at": 1.0,
         "stopped_at": None,
     }
-    return WorkerMeta.from_dict(defaults)
+    return WorkerMeta.from_dict({**defaults, **overrides})
 
 
 @pytest.fixture
@@ -120,66 +141,136 @@ def h(monkeypatch: pytest.MonkeyPatch) -> Harness:
     return Harness(monkeypatch)
 
 
-def test_recycled_group_is_never_signalled_before_term(h: Harness) -> None:
-    """A recycled PID occupying the group before SIGTERM absorbs no signal."""
-    h.recycle_at = -1.0
-    h.pin_fd = None
+def test_recycled_leader_absorbs_no_term(h: Harness) -> None:
+    """A replacement occupant of the recorded identity proves unowned and is never signalled."""
+    h.members = [LIVE.pid]
+    h.pgrps = {LIVE.pid: LIVE.pgid}
+    h.tokened = {LIVE.pid: False}  # the recycled occupant carries no token
+    h.identity = RECYCLED
 
+    assert run(h) is True
+    assert h.sends == []
+
+
+def test_unprovable_member_is_skipped_but_exact_members_are_signalled(h: Harness) -> None:
+    """Per-member proof isolates a recycled numeric PID from genuine members."""
+    h.members = [CHILD, 7777]
+    h.pgrps = {LIVE.pid: LIVE.pgid, CHILD: LIVE.pgid, 7777: LIVE.pgid}
+    h.tokened = {LIVE.pid: True, CHILD: True, 7777: False}  # 7777 is recycled
+
+    # The wedged exact leader itself survives, so retirement is not claimed
+    # and escalation fires; the invariant under test is that the recycled
+    # replacement never receives anything while the exact member gets both.
     assert run(h) is False
-    assert h.emissions == []
-
-
-def test_recycled_group_never_receives_sigkill_escalation(h: Harness) -> None:
-    """After SIGTERM, only the exact proven instance may receive SIGKILL."""
-    h.recycle_at = 2.0  # exactly at the kill floor, after the drain wait
-
-    assert run(h) is True
-    assert h.emissions == [(LIVE.pgid, signal.SIGTERM)]
-
-
-def test_exact_worker_that_exits_after_term_retires_with_drain_only(h: Harness) -> None:
-    """An exact worker exiting after SIGTERM retires without escalation."""
-    h.exit_at = 0.5
-
-    assert run(h) is True
-    assert h.emissions == [(LIVE.pgid, signal.SIGTERM)]
-
-
-def test_wedged_exact_worker_receives_sigkill_escalation(h: Harness) -> None:
-    """A wedged exact worker is escalated to SIGKILL and then reaps."""
-    assert run(h) is True
-    assert h.emissions == [
-        (LIVE.pgid, signal.SIGTERM),
-        (LIVE.pgid, signal.SIGKILL),
+    assert sorted(h.sends) == [
+        (CHILD, signal.SIGKILL),
+        (CHILD, signal.SIGTERM),
     ]
 
 
-def test_unpinnable_live_worker_fails_closed(h: Harness) -> None:
-    """A live worker that cannot be pinned is never signalled."""
-    h.pin_fd = None
+def test_member_exit_between_snapshot_and_delivery_is_benign(h: Harness) -> None:
+    """A member that exits after the snapshot simply receives nothing."""
+    h.members = [CHILD, CHILD + 1]
+    h.pgrps = {LIVE.pid: LIVE.pgid, CHILD: LIVE.pgid}
+    h.tokened = {LIVE.pid: True, CHILD: True}
+    h.unpinnable = {CHILD + 1}
 
+    # The wedged exact leader itself survives; the exited member is benignly
+    # skipped during both passes and never signalled.
     assert run(h) is False
-    assert h.emissions == []
+    assert sorted(h.sends) == [
+        (CHILD, signal.SIGKILL),
+        (CHILD, signal.SIGTERM),
+    ]
 
 
-def test_worker_gone_before_pin_reports_retired_without_signalling(h: Harness) -> None:
-    """An already-gone worker retires successfully with nothing emitted."""
-    h.pin_fd = None
-    h.exit_at = -1.0
+def test_wedged_exact_worker_receives_sigkill_escalation(
+    h: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wedged exact worker is escalated to SIGKILL and then reaps."""
+    h.members = [LIVE.pid]
+    h.pgrps = {LIVE.pid: LIVE.pgid}
+    h.tokened = {LIVE.pid: True}
+
+    def gone_after_kill(_pid: int) -> ProcessIdentity | None:
+        return None if any(sig == signal.SIGKILL for _, sig in h.sends) else LIVE
+
+    monkeypatch.setattr(lifecycle, "process_identity", gone_after_kill)
 
     assert run(h) is True
-    assert h.emissions == []
+    assert h.sends == [(LIVE.pid, signal.SIGTERM), (LIVE.pid, signal.SIGKILL)]
+
+
+def test_escalation_never_hits_recycled_replacement(h: Harness) -> None:
+    """Between SIGTERM and SIGKILL a recycled member is re-proofed out.
+
+    The worker itself survives (the wedged instance keeps running), but the
+    replacement occupying pid 7777 fails its token re-proof under the pin and
+    receives neither signal.
+    """
+    h.members = [LIVE.pid, 7777]
+    h.pgrps = {LIVE.pid: LIVE.pgid, 7777: LIVE.pgid}
+    h.tokened = {LIVE.pid: True, 7777: False}
+
+    assert run(h) is False
+    assert sorted(h.sends) == [
+        (LIVE.pid, signal.SIGKILL),
+        (LIVE.pid, signal.SIGTERM),
+    ]
+
+
+def test_exact_worker_that_exits_after_term_retires_with_drain_only(
+    h: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exact worker exiting after SIGTERM retires without escalation."""
+    h.members = [LIVE.pid]
+    h.pgrps = {LIVE.pid: LIVE.pgid}
+    h.tokened = {LIVE.pid: True}
+
+    def gone_after_term(_pid: int) -> ProcessIdentity | None:
+        return None if any(sig == signal.SIGTERM for _, sig in h.sends) else LIVE
+
+    monkeypatch.setattr(lifecycle, "process_identity", gone_after_term)
+
+    assert run(h) is True
+    assert h.sends == [(LIVE.pid, signal.SIGTERM)]
 
 
 def test_missing_lifecycle_token_fails_closed(h: Harness) -> None:
     """Token ownership is retained: an unowned live instance is not signalled."""
-    h.has_token = False
+    h.members = [LIVE.pid]
+    h.pgrps = {LIVE.pid: LIVE.pgid}
+    h.has_recorded_token = False
+
+    assert lifecycle.stop_worker(meta(token=None), 0.0, cancel_grace_seconds=0.0) is False
+    assert h.sends == []
+
+
+def test_worker_gone_before_proof_reports_retired_without_signalling(h: Harness) -> None:
+    """An already-gone worker retires successfully with nothing emitted."""
+    h.identity = None
+    h.members = [LIVE.pid]
+    h.unpinnable.add(LIVE.pid)
+
+    assert run(h) is True
+    assert h.sends == []
+
+
+def test_live_worker_without_pin_capability_fails_closed(h: Harness) -> None:
+    """No pin capability means no signal may ever be delivered."""
+    h.members = [LIVE.pid]
+    h.unpinnable.update({LIVE.pid, CHILD})
 
     assert run(h) is False
-    assert h.emissions == []
+    assert h.sends == []
 
 
-def test_pin_descriptor_is_released_after_retirement(h: Harness) -> None:
-    """The pidfd pin never leaks across a retirement attempt."""
+def test_pins_are_released_after_retirement(h: Harness) -> None:
+    """Every opened pin descriptor is closed again."""
+    h.members = [LIVE.pid, CHILD]
+    h.pgrps = {LIVE.pid: LIVE.pgid, CHILD: LIVE.pgid}
+    h.tokened = {LIVE.pid: True, CHILD: True}
+
     run(h)
-    assert h.closes == 1
+    # one leader pin + one per signalled member (TERM), plus escalation pass
+    assert h.closes >= 3

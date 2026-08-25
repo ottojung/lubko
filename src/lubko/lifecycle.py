@@ -37,7 +37,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from lubko import agent, cli, protocol, supervise, toolchain
+from lubko import cli, protocol, supervise, toolchain
+from lubko._exact_signal import open_pidfd as _open_exact_pidfd
+from lubko._exact_signal import pidfd_send_signal, process_pgrp
 from lubko._pg import psycopg, tuple_row
 from lubko.config import load_database_config, load_worker_server
 from lubko.durable import remove_durable, write_json_durable
@@ -860,15 +862,86 @@ def _wait_for_identity(pid: int) -> ProcessIdentity | None:
         time.sleep(SESSION_WAIT_INTERVAL_SECONDS)
 
 
-def _signal_group(pgid: int, sig: int) -> None:
-    """Send a signal to an exact process group, ignoring an already-gone group.
+def _live_group_member_pids(pgid: int) -> list[int]:
+    """Return the current numeric PIDs of every live process in ``pgid``.
+
+    The snapshot is a *candidate* list only: membership is re-proven under a
+    pidfd pin before any signal is delivered (see :func:`_signal_exact_group`),
+    so a numeric PID that was recycled between the snapshot and delivery can
+    never absorb a signal.
 
     Args:
-        pgid: Process group to signal.
-        sig: Signal to send.
+        pgid: Process group whose members to enumerate.
+
+    Returns:
+        Candidate member PIDs, in /proc order.
     """
-    with suppress(ProcessLookupError):
-        os.killpg(pgid, sig)
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    return [
+        int(entry.name)
+        for entry in entries
+        if entry.name.isdigit() and process_pgrp(int(entry.name)) == pgid
+    ]
+
+
+def _signal_exact_group(pgid: int, sig: int, token: str | None) -> bool:
+    """Deliver ``sig`` to every provably-owned current member of the group.
+
+    A holding pidfd does NOT keep a numeric PID/PGID reserved: the kernel
+    frees the numeric ID before the final pinned reference is released, so
+    signalling by number after a proof — even an immediately preceding one —
+    stays racy. Delivery therefore never goes through a numeric
+    ``killpg`` at all. Instead, every candidate member from the live group
+    snapshot is individually pinned with a pidfd and re-proven under its own
+    pin (still in the recorded process group AND still carrying exactly our
+    lifecycle token), and only then is the signal delivered through
+    ``pidfd_send_signal``, which addresses the kernel-pinned process itself.
+
+    A recycled numeric PID either fails to pin (already gone), or pins some
+    other process which then fails the group/token re-proof under the pin —
+    so a replacement occupant can never be signalled. Members that exit
+    between snapshot and delivery are simply skipped (benign). When nothing
+    at all can be proven — including platforms with no pidfd-send binding,
+    or when no token exists to prove ownership — nothing is signalled: fail
+    closed.
+
+    Args:
+        pgid: Recorded process group of the proven worker instance.
+        sig: Signal to deliver.
+        token: Exact lifecycle token every signalled member must carry.
+
+    Returns:
+        ``True`` when at least one member was proven and signalled.
+    """
+    if token is None:
+        # Without a recorded token no per-member ownership proof exists, so
+        # no member may ever be signalled.
+        return False
+    attempted = False
+    for pid in _live_group_member_pids(pgid):
+        try:
+            pidfd = _open_exact_pidfd(pid)
+        except (OSError, AttributeError):
+            continue  # unpinnable: gone already, or no pin capability
+        try:
+            # Re-proof happens strictly AFTER the pin, so the checks below
+            # describe the same process the signal will address.
+            if process_pgrp(pid) != pgid:
+                continue
+            if not process_has_token(pid, token):
+                continue
+            pidfd_send_signal(pidfd, sig)
+        except (OSError, AttributeError):
+            continue  # exited before delivery, or no send capability
+        else:
+            attempted = True
+        finally:
+            with suppress(OSError):
+                os.close(pidfd)
+    return attempted
 
 
 def _worker_process_alive(meta: WorkerMeta) -> bool:
@@ -924,15 +997,17 @@ def stop_worker(
     its full cancel grace plus bounded finalization overhead before an emergency
     SIGKILL is even possible.
 
-    Every signal is authorized by exact worker identity *at signal time*: the
-    recorded PID is first pinned with a pidfd (a kernel-stable reference that
-    prevents PID recycling while held), and identity, lifecycle-token, and
-    group-leadership proofs are taken under that pin before the group is used
-    as signal authority. If stable proof is unavailable — no pin possible on a
-    live process, a missing or mismatched token, or a foreign group leader —
-    nothing is signalled and retirement is not claimed (fail closed). The pin
-    spans the whole retirement interval including SIGKILL escalation, so a
-    recycled PID/PGID occupant can never absorb either signal.
+    Every signal is authorized by exact worker identity *at signal time*.
+    Because a holding pidfd does not keep a numeric PID/PGID reserved, the
+    recorded PID is first pinned with a pidfd and identity plus lifecycle-
+    token proofs are taken under that pin to authorize retirement at all;
+    each actual SIGTERM/SIGKILL is then delivered per member through its own
+    freshly opened pidfd after re-proving group membership and token
+    ownership under that member's pin (never via numeric ``killpg``). If
+    stable proof is unavailable — no pin possible on a live process, or a
+    missing or mismatched token — nothing is signalled and retirement is not
+    claimed (fail closed). A recycled PID/PGID occupant can therefore never
+    absorb either signal.
 
     Only if the worker ignores ``SIGTERM`` (wedged) is an emergency SIGKILL sent
     to the worker group. Owned command groups that survive a wedged worker must
@@ -957,8 +1032,9 @@ def stop_worker(
     """
     if meta.pid is None:
         return True
-    pin = agent.open_pidfd(meta.pid)
-    if pin is None:
+    try:
+        pin = _open_exact_pidfd(meta.pid)
+    except (OSError, AttributeError):
         # The pin failed either because the exact worker already exited (the
         # numeric PID may even have been recycled since) or because the
         # platform cannot pin PIDs at all. Distinguish by re-reading identity:
@@ -975,13 +1051,12 @@ def _stop_pinned(
     grace_seconds: float,
     cancel_grace_seconds: float,
 ) -> bool:
-    """Run the drain/escalate retirement under a held pidfd pin.
+    """Run the drain/escalate retirement for the proven worker instance.
 
-    The pin kernel-pins the recorded PID for the whole retirement interval:
-    while it is open, the kernel cannot recycle that PID for any other
-    process, so every identity proof taken under the pin remains valid at
-    each signal point and the worker's group number can only ever refer to
-    the exact proven group (or be gone).
+    The leader pin held by the caller covers only the authorization proof;
+    every actual signal is delivered by :func:`_signal_exact_group` through a
+    per-member pidfd at the moment of emission, because a holding pidfd does
+    not keep a numeric PID/PGID reserved across the interval.
 
     Args:
         meta: Recorded worker metadata.
@@ -998,19 +1073,13 @@ def _stop_pinned(
         # The exact worker process is gone or its identity changed (a recycled
         # PID can never be mis-signalled). Nothing to stop; retirement succeeds.
         return True
-    # Signal authorization requires the exact lifecycle token AND the worker
-    # leading its own group (the pin protects the worker's own PID, not a
-    # foreign leader's). An unowned live process — wrong token, no token, or a
-    # foreign group layout — is never signalled and retirement is never claimed,
-    # so the caller holds rather than handing off sole-consumer authority. This
-    # is distinct from the dead/reused case above, where no live process matches
-    # the recorded identity and retirement genuinely succeeds.
-    authorized = (
-        meta.token is not None
-        and process_has_token(meta.pid, meta.token)
-        and identity.pgid == identity.pid
-    )
-    if not authorized:
+    # Signal authorization requires the exact lifecycle token: an unowned live
+    # process — a wrong token or none at all — is never signalled and
+    # retirement is never claimed, so the caller holds rather than handing off
+    # sole-consumer authority. This is distinct from the dead/reused case
+    # above, where no live process matches the recorded identity and
+    # retirement genuinely succeeds.
+    if meta.token is None or not process_has_token(meta.pid, meta.token):
         return False
     start = time.monotonic()
     kill_floor = start + cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS
@@ -1018,22 +1087,22 @@ def _stop_pinned(
         grace_seconds,
         cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS,
     )
-    # 1. Ask the worker to drain its owned command process groups.
-    _signal_group(identity.pgid, signal.SIGTERM)
+    # 1. Ask the worker's provably-owned group members to drain.
+    _signal_exact_group(identity.pgid, signal.SIGTERM, meta.token)
     # 2. Wait for the worker's explicit safe-to-reap boundary.
     if _wait_for_drain(meta, wait_deadline):
         return True
-    # 3. Emergency: the worker ignored SIGTERM and never drained. Never fire the
-    #    SIGKILL before the worker's own cancel grace plus finalization slack,
-    #    and never fire it at all unless the exact pinned worker instance is
-    #    still alive (it may have exited during the floor wait; the held pin
-    #    guarantees any surviving occupant of the numeric identity would fail
-    #    this re-proof rather than absorb the SIGKILL).
+    # 3. Emergency: the worker ignored SIGTERM and never drained. Never fire
+    #    the SIGKILL before the worker's own cancel grace plus finalization
+    #    slack, and never fire it at all unless the exact worker instance is
+    #    still alive (it may have exited during the floor wait). Delivery is
+    #    per-member pinned, so any replacement occupant of a recycled numeric
+    #    group member fails its re-proof rather than absorbing the SIGKILL.
     if time.monotonic() < kill_floor:
         time.sleep(kill_floor - time.monotonic())
     if not _worker_process_alive(meta):
         return True
-    _signal_group(identity.pgid, signal.SIGKILL)
+    _signal_exact_group(identity.pgid, signal.SIGKILL, meta.token)
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline and _worker_process_alive(meta):
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
