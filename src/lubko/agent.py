@@ -1809,8 +1809,34 @@ def _kill_unrecorded_invocation(
         iid: The durable per-invocation ID stamped into its environment.
     """
     _kill_spawned_invocation(aid, proc.pid, start, iid)
-    with contextlib.suppress(OSError):
-        proc.wait()
+    try:
+        proc.wait(timeout=ABORT_REAP_SECONDS)
+    except (subprocess.TimeoutExpired, OSError):
+        # Exact signalling failed closed and the direct child is still live:
+        # keep a durable stop-like hold (never terminalizing over the
+        # concurrent stop/kill decision) so no replacement work can start
+        # while this untracked invocation survives.
+        _hold_unrecorded(aid)
+
+
+def _hold_unrecorded(aid: str) -> None:
+    """Keep durable lifecycle authority while an untracked child survives.
+
+    An existing stop-like intent or reason is preserved untouched; only a
+    running record with no blocking marker gains one, so replacement work
+    stays refused without ever faking convergence.
+
+    Args:
+        aid: Lubko agent ID.
+    """
+
+    def hold(m: Meta) -> None:
+        if m.get("state") != "running" or m.get("intent") in STOP_REASONS:
+            return
+        m["intent"] = "kill"
+        m["last_activity_at"] = time.time()
+
+    update_meta(aid, hold)
 
 
 def _record_running(

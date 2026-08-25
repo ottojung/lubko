@@ -463,3 +463,71 @@ def test_spawn_and_run_unprovable_live_child_records_hold_without_wedging(
     finally:
         os.kill(victim, signal.SIGKILL)
         os.waitpid(victim, 0)
+
+
+def test_unrecorded_invocation_live_child_keeps_blocking_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live stop-race loser with unprovable ownership cannot wedge or unblock.
+
+    When exact signalling fails closed and the direct child survives, the
+    bounded reap gives up, the call returns boundedly, existing stop/kill
+    semantics stay untouched, and durable blocking authority prevents
+    replacement work while the child lives.
+    """
+    aid = "aaaaaaaa"
+    iid = "inv-loser"
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "running"
+    seed["intent"] = "stop"
+    agent.write_meta(aid, seed)
+
+    monkeypatch.setattr(agent, "_kill_spawned_invocation", lambda *_a: None)
+    monkeypatch.setattr(agent, "ABORT_REAP_SECONDS", 0.05)
+    monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    try:
+        start = agent.proc_start_ticks(proc.pid)
+        agent._kill_unrecorded_invocation(aid, proc, start, iid)
+
+        assert agent.pid_alive(proc.pid), "child must survive (fail-closed, no signal)"
+        final = agent.read_meta(aid)
+        assert final is not None
+        assert final["state"] == "running", "stop/kill decision must not be overwritten"
+        assert final["intent"] == "stop", "existing stop-like intent preserved"
+        assert agent._claim_pending_prompt(aid, "replacement prompt") is False
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_unrecorded_invocation_dead_child_leaves_stop_semantics_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A converged loser adds no metadata: stop/kill owns the lifecycle."""
+    aid = "aaaaaaaa"
+    iid = "inv-dead"
+    seed = agent.idle_meta(aid, str(tmp_path), None)
+    seed["state"] = "running"
+    seed["intent"] = "kill"
+    agent.write_meta(aid, seed)
+
+    proc = subprocess.Popen([SLEEP_BIN, "0"])
+    proc.wait(timeout=5)
+    monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+    agent._kill_unrecorded_invocation(aid, proc, agent.proc_start_ticks(proc.pid), iid)
+
+    final = agent.read_meta(aid)
+    assert final is not None
+    assert final["state"] == "running"
+    assert final["intent"] == "kill"
