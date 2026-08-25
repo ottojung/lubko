@@ -384,3 +384,4 @@ def test_only_failed_checkout_reports_failure_via_exit_code() -> None:
     succeeded: dict[str, object] = {"ok": True}
     assert dc.checkout_failure_exit_code("checkout", failed) != 0
     assert dc.checkout_failure_exit_code("checkout", succeeded) == 0
+    assert dc.checkout_failure_exit_code("confirm", failed) == 0
