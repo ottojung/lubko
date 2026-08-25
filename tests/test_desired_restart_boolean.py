@@ -101,6 +101,20 @@ def test_malformed_restart_is_never_a_settlement(
     _write_intent(intent_payload(restart="true"))
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
     monkeypatch.setattr(daemon, "_child_alive", lambda _state: True)
+    retired: list[int] = []
+
+    def confirmed_retirement() -> bool:
+        """Record the hold retirement and clear the child like a real stop.
+
+        Returns:
+            Always ``True``: the stop is treated as confirmed.
+        """
+        child = supervise.read_state().child
+        retired.append(child.pid if child is not None else 0)
+        supervise.write_state(replace(supervise.read_state(), child=None))
+        return True
+
+    monkeypatch.setattr(daemon, "_retire_child", confirmed_retirement)
     monkeypatch.setattr(
         daemon,
         "_ensure_worker",
@@ -111,6 +125,7 @@ def test_malformed_restart_is_never_a_settlement(
 
     with pytest.raises(supervise.DesiredIntentError):
         supervise.read_desired_strict()
+    assert retired == [4242]
     assert supervise.read_state().applied_generation == 5
 
 
