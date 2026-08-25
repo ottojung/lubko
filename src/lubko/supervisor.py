@@ -178,11 +178,26 @@ def _child_preexec(expected_ppid: int) -> None:
     parent dying between ``fork`` and ``prctl``) is closed by re-checking
     parentage and self-killing when the expected parent is already gone.
 
+    Installation itself fails closed: the actual prctl return value is
+    checked, and when the parent-death link cannot be established the child
+    raises instead of returning — subprocess marshals that failure to the
+    parent's ``Popen`` as :class:`subprocess.SubprocessError` **before any
+    exec**, so worker user code can never run unguarded.
+
     Args:
         expected_ppid: PID of the supervisor that performed the spawn.
+
+    Raises:
+        RuntimeError: When ``PR_SET_PDEATHSIG`` could not be installed.
     """
     libc = ctypes.CDLL(None, use_errno=True)
-    libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    result = libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    if result != 0:
+        msg = (
+            "could not install PR_SET_PDEATHSIG in the worker child "
+            f"(prctl returned {result}, errno {ctypes.get_errno()})"
+        )
+        raise RuntimeError(msg)
     if os.getppid() != expected_ppid:
         os.kill(os.getpid(), signal.SIGKILL)
 
@@ -1458,7 +1473,11 @@ class SupervisorDaemon:
                 # spawn-authority protocol depends on.
                 preexec_fn=preexec,  # ruff: ignore[subprocess-popen-preexec-fn]
             )
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
+            # SubprocessError covers a child-side preexec failure: the child
+            # raised before exec (e.g. PR_SET_PDEATHSIG could not be
+            # installed), so no worker code ran and nothing needs
+            # converging — clearing the obligation keeps the retry path open.
             write_state(replace(read_state(), spawning=None))
             LOGGER.exception("could not start the worker for commit %s", commit)
             return None

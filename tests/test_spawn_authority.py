@@ -345,3 +345,36 @@ def test_failed_runtime_check_never_leaves_an_obligation(
 
     assert daemon._spawn_worker(COMMIT) is None
     assert read_state().spawning is None
+
+
+def test_child_side_pdeathsig_failure_never_execs_worker_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed child-side parent-death install blocks exec and keeps authority safe.
+
+    Forcing the in-child ``prctl`` to fail must make ``Popen`` itself fail
+    (the child raises before exec, so worker user code can never run
+    unguarded), and the durable spawn authority must be cleared again so a
+    later retry can be authorized — safe because positively nothing was
+    spawned. The sentinel proves the real fork/exec path ran without ever
+    reaching the worker executable.
+    """
+    sentinel = tmp_path / "sentinel"
+    worker = tmp_path / "worker"
+    worker.write_text(f"#!/bin/sh\ntouch {sentinel}\n", encoding="utf-8")
+    worker.chmod(0o755)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(cli, "cli_entry_executable", lambda _commit, _name: str(worker))
+    monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: tmp_path)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
+    # An invalid prctl option makes the real in-child prctl call fail with
+    # EINVAL deterministically; the forked child inherits this patched value.
+    monkeypatch.setattr(supervisor, "PR_SET_PDEATHSIG", -1)
+    monkeypatch.setattr(supervisor, "_pdeathsig_supported", lambda: True)
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+
+    assert daemon._spawn_worker(COMMIT) is None
+    assert read_state().spawning is None, "durable authority was safely cleared"
+    assert not sentinel.exists(), "worker user code ran despite the failed install"
