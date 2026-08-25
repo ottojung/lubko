@@ -1,11 +1,20 @@
 """Worker output transformation invariants (pure and file-backed, no processes)."""
 
+import logging
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from lubko import worker
-from lubko.worker import archive_target, output_window_text, pg_safe_decode, truncate_output
+from lubko.worker import (
+    archive_target,
+    cleanup_job,
+    output_window_text,
+    pg_safe_decode,
+    truncate_output,
+)
 
 
 def test_pg_safe_decode_replaces_nul_and_invalid_bytes() -> None:
@@ -67,3 +76,72 @@ def test_output_window_offsets_are_byte_based(tmp_path: Path) -> None:
     assert (start, end) == (1, 2)
     text, start, end = output_window_text(path, 2)
     assert (text, start, end) == ("é", 0, 2)
+
+
+def test_cleanup_job_isolates_spool_removal_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed spool unlink cannot block sibling cleanup or escape."""
+    stdout_path = tmp_path / "stdout"
+    stderr_path = tmp_path / "stderr"
+    stdout_path.write_bytes(b"out")
+    stderr_path.write_bytes(b"err")
+    real_unlink = Path.unlink
+    attempted: list[Path] = []
+
+    def unlink(path: Path, *, missing_ok: bool = False) -> None:
+        attempted.append(path)
+        if path == stdout_path:
+            message = "synthetic spool cleanup failure"
+            raise PermissionError(message)
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    def stream(path: Path) -> SimpleNamespace:
+        return SimpleNamespace(fd=None, path=path)
+
+    job = cast("Any", SimpleNamespace(stdout=stream(stdout_path), stderr=stream(stderr_path)))
+    with caplog.at_level(logging.WARNING, logger="lubko.worker"):
+        cleanup_job(job)
+
+    assert attempted == [stdout_path, stderr_path]
+    assert stdout_path.exists()
+    assert not stderr_path.exists()
+    assert "failed to remove capture spool" in caplog.text
+
+
+def test_cleanup_all_files_continues_after_one_spool_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shutdown cleanup keeps visiting later jobs after one unlink failure."""
+    paths = [tmp_path / name for name in ("a-out", "a-err", "b-out", "b-err")]
+    for path in paths:
+        path.write_bytes(b"x")
+    real_unlink = Path.unlink
+    attempted: list[Path] = []
+
+    def unlink(path: Path, *, missing_ok: bool = False) -> None:
+        attempted.append(path)
+        if path == paths[0]:
+            message = "synthetic cleanup failure"
+            raise OSError(message)
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+
+    def job(stdout: Path, stderr: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            stdout=SimpleNamespace(fd=None, path=stdout),
+            stderr=SimpleNamespace(fd=None, path=stderr),
+        )
+
+    supervisor = cast(
+        "Any",
+        SimpleNamespace(active={"a": job(paths[0], paths[1]), "b": job(paths[2], paths[3])}),
+    )
+    worker.Supervisor._cleanup_all_files(supervisor)
+
+    assert attempted == paths
+    assert paths[0].exists()
+    assert all(not path.exists() for path in paths[1:])
