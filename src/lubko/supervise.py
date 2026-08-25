@@ -263,6 +263,9 @@ class SupervisorState:
     commit: str | None
     child: WorkerChild | None
     unresolved_child: UnresolvedChild | None
+    #: A present worker-ownership record or the whole state authority was
+    #: malformed/unreadable. This is durable replacement-blocking state.
+    ownership_hold_malformed: bool
     #: A present-but-malformed ``unresolved_child`` record was found on disk.
     #: The durable fail-closed hold cannot be forgotten just because its shape
     # is corrupt: this flag keeps the blocking obligation alive so no
@@ -294,6 +297,7 @@ class SupervisorState:
             "unresolved_child": (
                 None if self.unresolved_child is None else self.unresolved_child.to_dict()
             ),
+            "ownership_hold_malformed": self.ownership_hold_malformed,
             "unresolved_hold_malformed": self.unresolved_hold_malformed,
             "intent": self.intent,
             "restart_count": self.restart_count,
@@ -322,11 +326,14 @@ class SupervisorState:
         """
         child_data = data.get("child")
         child: WorkerChild | None = None
+        ownership_hold_malformed = False
         if isinstance(child_data, dict):
             try:
                 child = _child_from_dict(child_data)
             except (TypeError, ValueError, KeyError):
-                child = None
+                ownership_hold_malformed = True
+        elif child_data is not None:
+            ownership_hold_malformed = True
         unresolved_data = data.get("unresolved_child")
         unresolved: UnresolvedChild | None = None
         unresolved_hold_malformed = False
@@ -357,6 +364,8 @@ class SupervisorState:
             commit=_optional_string(data.get("commit")),
             child=child,
             unresolved_child=unresolved,
+            ownership_hold_malformed=ownership_hold_malformed
+            or data.get("ownership_hold_malformed") is True,
             unresolved_hold_malformed=unresolved_hold_malformed
             or data.get("unresolved_hold_malformed") is True,
             intent=_optional_string(data.get("intent")) or INTENT_RUN,
@@ -795,21 +804,33 @@ def write_state(state: SupervisorState) -> None:
 
 
 def read_state() -> SupervisorState:
-    """Load the daemon's durable state, defaulting to a fresh idle state.
+    """Load the daemon's durable state, preserving holds on authority failure.
 
-    A malformed state file fails closed to a fresh state rather than ever
-    launching an arbitrary commit from ambiguous metadata.
+    Genuine absence is a fresh idle state. A present state file that cannot be
+    read, decoded, shaped, or versioned is instead represented by a durable
+    replacement-blocking hold. Rewrites preserve that hold until an operator
+    explicitly repairs the state.
 
     Returns:
         The parsed state.
     """
-    data = _read_json(state_path())
-    if data is None:
+    path = state_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return fresh_state()
-    state = SupervisorState.from_dict(data)
-    if state.schema_version != SCHEMA_VERSION:
-        return fresh_state()
-    return state
+    except OSError:
+        return replace(fresh_state(), ownership_hold_malformed=True)
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return replace(fresh_state(), ownership_hold_malformed=True)
+    if not isinstance(decoded, dict):
+        return replace(fresh_state(), ownership_hold_malformed=True)
+    schema_version = _optional_int(decoded.get("schema_version"))
+    if schema_version != SCHEMA_VERSION:
+        return replace(fresh_state(), ownership_hold_malformed=True)
+    return SupervisorState.from_dict(decoded)
 
 
 def fresh_state() -> SupervisorState:
@@ -825,6 +846,7 @@ def fresh_state() -> SupervisorState:
         commit=None,
         child=None,
         unresolved_child=None,
+        ownership_hold_malformed=False,
         unresolved_hold_malformed=False,
         intent=INTENT_RUN,
         restart_count=0,
