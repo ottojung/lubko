@@ -37,6 +37,7 @@ from itertools import starmap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 
+from lubko._exact_signal import pidfd_send_signal
 from lubko.durable import write_text_durable
 from lubko.worker import group_has_members
 
@@ -580,23 +581,26 @@ def send_signal_group(meta: Meta, sig: int) -> None:
     """Deliver a signal to the agent's exact recorded invocation group.
 
     Race-free by construction: every signalled process is first pinned with a
-    pidfd (which prevents PID recycling) and then verified against the
-    recorded invocation identity at the signal point itself. Two paths:
+    pidfd and then verified against the recorded invocation identity at the
+    signal point itself — and every delivery goes through ``pidfd_send_signal``
+    on the very descriptor that pinned the proven process. No numeric
+    ``killpg``/``kill`` syscall is ever issued: the kernel frees a numeric PID
+    or PGID for reuse before the pinned process's ``struct pid`` reference is
+    released, so a numeric signal could retarget onto an unrelated occupant
+    even after a successful proof. Two paths:
 
-    - Live leader: the leader is pinned, its start time and markers are
-      verified under the pin, then the whole group is signalled via
-      ``killpg`` — safe because the pinned PID cannot be recycled, so the
-      group is either the exact recorded one or already gone.
-    - Dead leader: any surviving members of the recorded group are converged
-      one member at a time, each individually pinned and required to carry
-      the recorded PGID, the exact agent marker, *and* the exact durable
-      per-invocation marker. A newer invocation of the same agent (with a
-      different invocation ID) is therefore never signalled, no matter how
-      the OS recycled PIDs or the group ID. When no invocation ID was
-      recorded, nothing is signalled: fail closed instead of guessing.
+    - Live leader: the leader is pinned, its start time and both markers are
+      verified under the pin, and it is signalled through its own pin.
+    - Dead (or unverifiable) leader: any surviving members of the recorded
+      group are converged one member at a time, each individually pinned and
+      required to carry the recorded PGID, the exact agent marker, *and* the
+      exact durable per-invocation marker. A newer invocation of the same
+      agent (with a different invocation ID) is therefore never signalled,
+      no matter how the OS recycled PIDs or the group ID.
 
     When no process can be pinned (platform without pidfd support), nothing
-    is signalled: fail closed instead of guessing.
+    is signalled: fail closed instead of guessing. The same holds when no
+    durable invocation identity is recorded.
 
     Args:
         meta: Agent metadata.
@@ -605,6 +609,9 @@ def send_signal_group(meta: Meta, sig: int) -> None:
     leader = meta.get("pid")
     aid = str(meta.get("id", ""))
     iid = meta.get("invocation_id")
+    pgid = meta.get("pgid") or leader
+    if not pgid or iid is None or not aid:
+        return
     if leader:
         fd = open_pidfd(int(leader))
         if fd is not None:
@@ -615,25 +622,21 @@ def send_signal_group(meta: Meta, sig: int) -> None:
                 if verified and iid is not None:
                     verified = env_has_invocation(int(leader), str(iid))
                 if verified:
+                    # Deliver through the pin itself: a numeric killpg on the
+                    # recorded group could retarget after PGID reuse.
                     with contextlib.suppress(ProcessLookupError):
-                        # the agent was launched as its own session leader
-                        os.killpg(int(leader), sig)
-                    return
+                        pidfd_send_signal(fd, sig)
             finally:
                 os.close(fd)
-    # The leader could not be pinned as the exact recorded invocation (it is
-    # dead, or its PID was recycled). Converge surviving members of the
-    # recorded group through the exact per-member pinned path — but only with
-    # a durable invocation-specific identity to authorize them.
-    pgid = meta.get("pgid") or leader
-    if not pgid or iid is None:
-        return
-    for member, fd in _pinned_invocation_members(int(pgid), aid, str(iid)):
+    # Converge surviving members of the recorded group through the exact
+    # per-member pinned path — only with a durable invocation-specific
+    # identity to authorize them.
+    for _member, member_fd in _pinned_invocation_members(int(pgid), aid, str(iid)):
         try:
             with contextlib.suppress(ProcessLookupError):
-                os.kill(member, sig)
+                pidfd_send_signal(member_fd, sig)
         finally:
-            os.close(fd)
+            os.close(member_fd)
 
 
 def _pinned_invocation_members(pgid: int, aid: str, iid: str) -> list[tuple[int, int]]:
