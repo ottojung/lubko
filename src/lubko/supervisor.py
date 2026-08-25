@@ -88,6 +88,7 @@ from lubko.health import (
     read_worker_health_by_incarnation,
     worker_health_payload,
 )
+from lubko.state import rollback_state_path
 from lubko.supervise import (
     INTENT_RUN,
     MODE_RUN,
@@ -127,6 +128,9 @@ DEFAULT_PROBE_TIMEOUT_SECONDS: Final = 15.0
 DEFAULT_READINESS_INTERVAL_SECONDS: Final = 5.0
 IDENTITY_POLL_SECONDS: Final = 0.02
 DB_CHECK_INTERVAL_SECONDS: Final = 15.0
+#: Bounded per-step timeout for preparing the migrated commit's CLI
+#: environment during cold-migration completion.
+COLD_MIGRATION_CLI_TIMEOUT_SECONDS: Final = cli.DEFAULT_BUILD_TIMEOUT_SECONDS
 STAT_PPID_FIELD_INDEX: Final = 1
 STAT_PPID_MIN_FIELDS: Final = 2
 
@@ -546,6 +550,114 @@ class SupervisorDaemon:
         self._ensure_worker(commit)
         self._record_mission_progress(commit)
         self._probe_readiness(now)
+        self._complete_cold_migration()
+
+    def _complete_cold_migration(self) -> None:
+        """Converge CLI/deployctl authority onto a proven migrated commit.
+
+        ``lubko-deploy migrate`` writes one atomically durable desired intent
+        that both publishes the exact target commit and carries the
+        ``migration`` flag, so no crash can separate the two. This is the only
+        completion path for that flag:
+
+        - while the migrated worker is not yet proven queue-ready for the
+          exact migration generation/commit pair, nothing happens: the
+          maintained CLIs stay fail-closed on the previous confirmed
+          authority;
+        - once readiness is proven, the sealed CLI environment is prepared,
+          the maintained pointer converges to the target commit, the
+          superseded terminal mission record is removed so deployctl
+          authority follows the actually maintained worker, and finally the
+          flag itself is cleared under the generation lock.
+
+        The whole decision-and-mutation sequence runs under the same
+        deployment lock every deployctl writer holds, so a concurrent newer
+        checkout/confirm can never publish a mission between the re-read and
+        the CLI/rollback mutations: it either completed before this critical
+        section (and strictly outranks the migration) or afterwards (and its
+        authority survives untouched). Lock order stays deployment lock
+        before generation lock. On lock contention the completion is simply
+        retried on a later tick.
+
+        Every step is idempotent and ordered so a crash between steps leaves
+        either the old coherent authority or retries the same convergence on
+        the next tick; the flag is cleared last, so an interrupted run is
+        always resumed rather than skipped.
+        """
+        desired = read_desired()
+        if desired is None or not desired.migration:
+            return
+        try:
+            with lifecycle.deploy_lock(DEFAULT_LOCK_TIMEOUT_SECONDS):
+                self._complete_cold_migration_locked(desired)
+        except lifecycle.LockTimeoutError:
+            LOGGER.warning("cold-migration completion deferred: deployment lock is held")
+            self._message = "cold-migration completion deferred; deployment in progress"
+
+    def _complete_cold_migration_locked(self, desired: supervise.SupervisorDesired) -> None:
+        """Perform cold-migration convergence while holding the deployment lock.
+
+        All authority inputs are re-read inside the critical section so the
+        decision is serialized against deployctl writers.
+
+        Args:
+            desired: The migration intent observed before locking; re-read
+                and revalidated while locked.
+        """
+        current_desired = read_desired()
+        if (
+            current_desired is None
+            or not current_desired.migration
+            or current_desired.generation != desired.generation
+            or current_desired.commit != desired.commit
+        ):
+            return
+        try:
+            mission = deployctl.read_rollback_state()
+        except deployctl.DeployCtlError:
+            mission = None
+        if mission is not None and mission.generation > desired.generation:
+            # A strictly newer supervised-deployment mission supersedes the
+            # migration; its own confirmation path owns authority now and its
+            # record must survive untouched.
+            supervise.clear_migration_flag(desired.generation)
+            lifecycle.append_deploy_log(
+                f"cold migration to {desired.commit} superseded by newer mission "
+                f"generation {mission.generation}"
+            )
+            return
+        state = read_state()
+        if (
+            not state.ready
+            or state.applied_generation < desired.generation
+            or state.commit != desired.commit
+        ):
+            return
+        try:
+            cli.build_cli_root(
+                Path(desired.repo),
+                desired.commit,
+                desired.uv_path,
+                COLD_MIGRATION_CLI_TIMEOUT_SECONDS,
+            )
+        except cli.CliError as exc:
+            self._message = f"cold-migration CLI environment failed: {exc}"
+            LOGGER.warning("cold-migration CLI environment could not be prepared: %s", exc)
+            return
+        if cli.current_commit() != desired.commit:
+            try:
+                cli.set_current(desired.commit)
+            except cli.CliError as exc:
+                self._message = f"cold-migration CLI activation failed: {exc}"
+                LOGGER.warning("cold-migration CLI activation failed: %s", exc)
+                return
+            lifecycle.append_deploy_log(f"cold migration activated CLI commit {desired.commit}")
+        remove_durable(rollback_state_path())
+        supervise.clear_migration_flag(desired.generation)
+        lifecycle.append_deploy_log(
+            f"cold migration complete: deployment authority converged to commit {desired.commit}"
+        )
+        LOGGER.info("cold migration converged deployment authority to commit %s", desired.commit)
 
     def _record_mission_progress(self, commit: str) -> None:
         """Advance the applied generation once a mission candidate is running.

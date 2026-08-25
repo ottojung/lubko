@@ -43,7 +43,7 @@ import os
 import re
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -103,6 +103,17 @@ class SupervisorDesired:
     same-commit settlement (confirmation/rollback): only a restart force-
     replaces the running child; durable mission settlement that already has
     the exact commit running only records the newer generation.
+
+    ``migration`` marks a cold lifecycle migration intent (``lubko-deploy
+    migrate``). Because the flag travels inside this same atomically written
+    intent, publishing the target commit and recording the migration are one
+    indivisible durable transition: there is no crash window in which the
+    supervisor could run the migrated commit without the completion obligation.
+    While the flag is set and no strictly newer mission supersedes it,
+    deployment/CLI reconciliation must hold fail-closed on the previous
+    authority until the daemon proves the migrated worker queue-ready and
+    converges the maintained CLI pointer and deployctl authority onto the
+    exact target commit, then clears the flag again.
     """
 
     schema_version: int
@@ -113,6 +124,7 @@ class SupervisorDesired:
     worker_id: str | None
     restart: bool = False
     requested_at: float = 0.0
+    migration: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the desired intent for storage.
@@ -129,6 +141,7 @@ class SupervisorDesired:
             "worker_id": self.worker_id,
             "restart": self.restart,
             "requested_at": self.requested_at,
+            "migration": self.migration,
         }
 
     @classmethod
@@ -143,6 +156,7 @@ class SupervisorDesired:
 
         Raises:
             ValueError: If required fields are missing or malformed.
+            TypeError: If a present ``migration`` value is not a JSON boolean.
         """
         schema_version = _optional_int(data.get("schema_version"))
         generation = _optional_int(data.get("generation"))
@@ -150,6 +164,13 @@ class SupervisorDesired:
         if schema_version is None or generation is None or commit is None:
             msg = "supervisor desired state is malformed"
             raise ValueError(msg)
+        migration = data.get("migration", False)
+        # Absence is backward-compatible false, but a present value must be a
+        # real JSON boolean: anything else means the authoritative intent file
+        # is not trustworthy and parsing must fail closed.
+        if not isinstance(migration, bool):
+            msg = "supervisor desired state is malformed"
+            raise TypeError(msg)
         try:
             return cls(
                 schema_version=schema_version,
@@ -160,6 +181,7 @@ class SupervisorDesired:
                 worker_id=_optional_string(data.get("worker_id")),
                 restart=data.get("restart", False) is True,
                 requested_at=_optional_float(data.get("requested_at")) or 0.0,
+                migration=migration,
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervisor desired state is malformed"
@@ -529,6 +551,29 @@ def supervisor_log_path() -> Path:
     return supervisor_dir() / "supervisor.log"
 
 
+def clear_migration_flag(generation: int) -> bool:
+    """Clear the migration flag of exactly the named generation, idempotently.
+
+    The rewrite happens under the generation lock so it can never clobber or
+    be clobbered by a newer concurrent intent: if the current durable intent
+    no longer is that exact migration generation (superseded by a newer
+    deploy/restart), the flag write is skipped.
+
+    Args:
+        generation: The migration generation whose flag should clear.
+
+    Returns:
+        ``True`` when this call cleared the flag, ``False`` when the durable
+        intent had already moved on.
+    """
+    with generation_lock():
+        current = read_desired()
+        if current is None or not current.migration or current.generation != generation:
+            return False
+        write_desired(replace(current, migration=False))
+    return True
+
+
 @contextmanager
 def generation_lock() -> Iterator[None]:
     """Serialize generation allocation and desired-intent writes.
@@ -670,22 +715,65 @@ def write_desired(desired: SupervisorDesired) -> None:
     write_json_durable(desired_path(), desired.to_dict())
 
 
+class DesiredIntentError(RuntimeError):
+    """Raised when a present desired intent exists but cannot be trusted."""
+
+
+def read_desired_strict() -> SupervisorDesired | None:
+    """Load the desired intent in one authoritative snapshot read.
+
+    Returns:
+        The parsed intent, or ``None`` only for genuine absence.
+
+    Raises:
+        DesiredIntentError: If a present intent file is unreadable,
+            invalid JSON, not an object, malformed (including a present
+            non-boolean ``migration`` value), or of an unsupported schema
+            version. Callers must fail closed rather than treat this like
+            absence.
+    """
+    path = desired_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        msg = f"cannot read the supervisor desired intent: {exc}"
+        raise DesiredIntentError(msg) from exc
+    try:
+        decoded = json.loads(raw)
+    except ValueError as exc:
+        msg = "the supervisor desired intent is not valid JSON"
+        raise DesiredIntentError(msg) from exc
+    if not isinstance(decoded, dict):
+        msg = "the supervisor desired intent must be an object"
+        raise DesiredIntentError(msg)
+    try:
+        desired = SupervisorDesired.from_dict(decoded)
+    except (TypeError, ValueError) as exc:
+        msg = "the supervisor desired intent is malformed"
+        raise DesiredIntentError(msg) from exc
+    if desired.schema_version != SCHEMA_VERSION:
+        msg = f"unsupported supervisor desired intent version {desired.schema_version}"
+        raise DesiredIntentError(msg)
+    return desired
+
+
 def read_desired() -> SupervisorDesired | None:
-    """Load the desired intent, failing closed on shape corruption.
+    """Load the desired intent, treating corruption as absence.
+
+    Intentionally lenient wrapper for callers whose contract is "no usable
+    intent means do nothing": corruption never reaches them as data. Callers
+    that must distinguish observable corruption from genuine absence should
+    use :func:`read_desired_strict`.
 
     Returns:
         The parsed intent, or ``None`` when absent or malformed.
     """
-    data = _read_json(desired_path())
-    if data is None:
-        return None
     try:
-        desired = SupervisorDesired.from_dict(data)
-    except ValueError:
+        return read_desired_strict()
+    except DesiredIntentError:
         return None
-    if desired.schema_version != SCHEMA_VERSION:
-        return None
-    return desired
 
 
 def write_state(state: SupervisorState) -> None:
