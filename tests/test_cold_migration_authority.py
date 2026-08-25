@@ -10,6 +10,7 @@ never clobbers a strictly newer mission.
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -184,3 +185,45 @@ def test_absent_migration_flag_remains_backward_compatible_false() -> None:
         "commit": OLD,
     })
     assert desired.migration is False
+
+
+def test_corrupt_migration_intent_holds_instead_of_trusting_meta(
+    isolated: Path,
+) -> None:
+    """A malformed authoritative intent never falls back to live meta."""
+    del isolated
+    supervise.desired_path().parent.mkdir(parents=True, exist_ok=True)
+    corrupt = {
+        "schema_version": 1,
+        "generation": 6,
+        "commit": NEW,
+        "repo": "/workspace/repo",
+        "uv_path": "uv",
+        "migration": 1,
+    }
+    supervise.desired_path().write_text(json.dumps(corrupt), encoding="utf-8")
+    with pytest.raises(supervise.DesiredIntentError):
+        supervise.read_desired_strict()
+    assert dc._cli_target_commit(None) is None
+
+
+def test_unreadable_intent_fails_closed(isolated: Path) -> None:
+    """A present but unreadable authority file is corruption, not absence."""
+    del isolated
+    desired_dir = supervise.desired_path()
+    desired_dir.parent.mkdir(parents=True, exist_ok=True)
+    desired_dir.mkdir()  # a directory where the authority file must be
+    with pytest.raises(supervise.DesiredIntentError):
+        supervise.read_desired_strict()
+    assert dc._cli_target_commit(None) is None
+
+
+def test_genuinely_absent_intent_still_reconciles_to_live_meta(
+    isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """True absence stays backward compatible with live-worker reconciliation."""
+    del isolated
+    monkeypatch.setattr(dc, "read_meta", lambda: meta(NEW, 300))
+    assert supervise.read_desired_strict() is None
+    assert supervise.read_desired() is None
+    assert dc._cli_target_commit(None) == NEW

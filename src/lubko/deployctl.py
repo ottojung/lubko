@@ -1765,7 +1765,13 @@ def _cli_target_commit(state: RollbackState | None) -> str | None:
     Returns:
         The exact commit the CLI pointer should select, or ``None``.
     """
-    desired = supervise.read_desired()
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        # A present-but-malformed authoritative intent is observable
+        # corruption: fail closed instead of falling back to other authority
+        # surfaces (which may already name the unproven migrated commit).
+        return None
     if desired is not None and desired.migration:
         if state is None or state.generation <= desired.generation:
             return None

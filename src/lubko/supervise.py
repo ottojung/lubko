@@ -715,22 +715,65 @@ def write_desired(desired: SupervisorDesired) -> None:
     write_json_durable(desired_path(), desired.to_dict())
 
 
+class DesiredIntentError(RuntimeError):
+    """Raised when a present desired intent exists but cannot be trusted."""
+
+
+def read_desired_strict() -> SupervisorDesired | None:
+    """Load the desired intent in one authoritative snapshot read.
+
+    Returns:
+        The parsed intent, or ``None`` only for genuine absence.
+
+    Raises:
+        DesiredIntentError: If a present intent file is unreadable,
+            invalid JSON, not an object, malformed (including a present
+            non-boolean ``migration`` value), or of an unsupported schema
+            version. Callers must fail closed rather than treat this like
+            absence.
+    """
+    path = desired_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        msg = f"cannot read the supervisor desired intent: {exc}"
+        raise DesiredIntentError(msg) from exc
+    try:
+        decoded = json.loads(raw)
+    except ValueError as exc:
+        msg = "the supervisor desired intent is not valid JSON"
+        raise DesiredIntentError(msg) from exc
+    if not isinstance(decoded, dict):
+        msg = "the supervisor desired intent must be an object"
+        raise DesiredIntentError(msg)
+    try:
+        desired = SupervisorDesired.from_dict(decoded)
+    except (TypeError, ValueError) as exc:
+        msg = "the supervisor desired intent is malformed"
+        raise DesiredIntentError(msg) from exc
+    if desired.schema_version != SCHEMA_VERSION:
+        msg = f"unsupported supervisor desired intent version {desired.schema_version}"
+        raise DesiredIntentError(msg)
+    return desired
+
+
 def read_desired() -> SupervisorDesired | None:
-    """Load the desired intent, failing closed on shape corruption.
+    """Load the desired intent, treating corruption as absence.
+
+    Intentionally lenient wrapper for callers whose contract is "no usable
+    intent means do nothing": corruption never reaches them as data. Callers
+    that must distinguish observable corruption from genuine absence should
+    use :func:`read_desired_strict`.
 
     Returns:
         The parsed intent, or ``None`` when absent or malformed.
     """
-    data = _read_json(desired_path())
-    if data is None:
-        return None
     try:
-        desired = SupervisorDesired.from_dict(data)
-    except (TypeError, ValueError):
+        return read_desired_strict()
+    except DesiredIntentError:
         return None
-    if desired.schema_version != SCHEMA_VERSION:
-        return None
-    return desired
 
 
 def write_state(state: SupervisorState) -> None:
