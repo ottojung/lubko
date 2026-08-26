@@ -41,6 +41,17 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return supervise.state_path().parent
 
 
+@pytest.fixture(autouse=True)
+def default_owned_group_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub owned-group recovery as successful by default.
+
+    Every test that expects authority resolution must not depend on the
+    developer machine's database configuration; tests exercising the
+    fail-closed recovery behavior override this stub explicitly.
+    """
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _token: None)
+
+
 def _obligation(
     *,
     pid: int | None = None,
