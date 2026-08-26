@@ -367,6 +367,9 @@ def test_wait_until_ready_times_out_without_readiness(
         "monotonic",
         lambda: next(ticks) * 0.5,
     )
+    # The fake monotonic clock advances on every read, so the poll loop
+    # terminates deterministically; no real sleeping is needed.
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(supervise, "REQUEST_POLL_SECONDS", 0.5)
     monkeypatch.setattr(
         supervise,

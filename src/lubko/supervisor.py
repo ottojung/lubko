@@ -98,6 +98,7 @@ from lubko.supervise import (
     INTENT_RUN,
     MODE_RUN,
     SCHEMA_VERSION,
+    ConsumerLockTimeoutError,
     LastExit,
     SpawningObligation,
     SupervisorStatus,
@@ -112,6 +113,7 @@ from lubko.supervise import (
     read_supervisor_pid,
     supervisor_log_path,
     write_state,
+    write_state_preserving_authority,
     write_status,
     write_supervisor_pid,
 )
@@ -119,6 +121,7 @@ from lubko.toolchain import UvResolutionError, resolve_uv
 
 if TYPE_CHECKING:
     from lubko.lifecycle import ProcessIdentity, WorkerMeta
+    from lubko.supervise import SupervisorState
 
 LOGGER: Final = logging.getLogger(__name__)
 
@@ -512,16 +515,24 @@ def normalize_cross_boot_state() -> None:
     boot_id = supervise.current_boot_id()
     if state.boot_id == boot_id and boot_id is not None:
         return
-    write_state(
-        replace(
-            state,
-            boot_id=boot_id,
-            next_attempt_at=None,
-            last_spawn_at=None,
-            next_readiness_at=None,
-            ready=False,
+    try:
+        write_state_preserving_authority(
+            replace(
+                state,
+                boot_id=boot_id,
+                next_attempt_at=None,
+                last_spawn_at=None,
+                next_readiness_at=None,
+                ready=False,
+            ),
+            timeout_seconds=DEFAULT_LOCK_TIMEOUT_SECONDS,
         )
-    )
+    except supervise.ConsumerLockTimeoutError:
+        LOGGER.warning(
+            "cross-boot state normalization deferred: a consumer-establishment "
+            "decision holds the boundary; reconciliation will retry"
+        )
+        return
     if state.boot_id is not None:
         LOGGER.info(
             "durable supervisor state predates this boot; reset monotonic "
@@ -547,6 +558,45 @@ class SupervisorDaemon:
         self._message: str | None = None
         self._ownership_fd: int | None = None
         self._start_time_ticks: int = 0
+
+    def _write_state_authority_safe(self, state: SupervisorState) -> bool:
+        """Publish a supervisor transition without erasing newer consumer authority.
+
+        Every state rewrite that runs outside the shared
+        consumer-establishment lock and is capable of clearing or replacing
+        consumer-authority fields must serialize its authoritative re-read and
+        publication against recovery's critical section; otherwise a stale
+        snapshot blindly replaces durable state and silently erases a
+        concurrently established ``spawning`` obligation (a lost update that
+        would let a second queue consumer be authorized). The whole
+        read-merge-write happens under :func:`supervise.consumer_lock`; on
+        lock contention nothing is written and the caller defers: dropping an
+        authority-preserving maintenance write is always safer than
+        publishing a stale one, and reconciliation retries on a later tick.
+
+        Args:
+            state: The transition's target state (from a possibly stale
+                snapshot; its authority fields are replaced by the fresh
+                in-lock observation).
+
+        Returns:
+            ``True`` when the transition was published, ``False`` when the
+            publication was deferred because another consumer-establishment
+            decision holds the boundary.
+        """
+        try:
+            write_state_preserving_authority(
+                state,
+                timeout_seconds=self.settings.lock_timeout_seconds,
+            )
+        except ConsumerLockTimeoutError:
+            self._message = (
+                "a consumer-establishment decision is in progress elsewhere; "
+                "deferring this state update"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        return True
 
     def run(self) -> None:
         """Run the supervisor loop until a shutdown signal arrives.
@@ -598,7 +648,9 @@ class SupervisorDaemon:
             # Materialize the hold so a later rewrite cannot turn authority
             # corruption into apparent worker absence. Clearing it is an
             # explicit operator repair, never an automatic recovery decision.
-            write_state(state)
+            # The publication is serialized so a concurrent recovery authority
+            # write cannot be clobbered by this rewrite either.
+            self._write_state_authority_safe(state)
             self._message = (
                 "the durable supervisor worker-ownership state is malformed or unreadable; "
                 "holding without starting a worker until it is repaired"
@@ -782,7 +834,9 @@ class SupervisorDaemon:
             and mission.generation > current.applied_generation
             and self._child_alive(current)
         ):
-            write_state(replace(current, applied_generation=mission.generation))
+            self._write_state_authority_safe(
+                replace(current, applied_generation=mission.generation)
+            )
 
     def _derive_action(self, state: supervise.SupervisorState) -> tuple[str, str | None]:
         """Decide the intended worker from durable mission/desired generations.
@@ -948,7 +1002,7 @@ class SupervisorDaemon:
                 # running the requested commit. Hold fail-closed instead; a
                 # later reconciliation retries the exact retirement.
                 now = time.monotonic()
-                write_state(
+                self._write_state_authority_safe(
                     replace(
                         read_state(),
                         next_attempt_at=now + self._backoff_seconds(state.restart_count),
@@ -977,7 +1031,12 @@ class SupervisorDaemon:
             ready=False,
             next_readiness_at=None,
         )
-        write_state(state)
+        if not self._write_state_authority_safe(state):
+            # The desired-state publication was deferred: the applied
+            # generation is not durable, so no worker may be started from
+            # this unpublished transition and the intent must not be
+            # reported as applied. Reconciliation retries on a later tick.
+            return
         if not already_running:
             self._ensure_worker(desired.commit)
         LOGGER.info("applied supervisor run intent (generation %d)", desired.generation)
@@ -1032,7 +1091,7 @@ class SupervisorDaemon:
         state = read_state()
         if state.child is not None and self._child_alive(state) and state.commit == commit:
             return
-        if state.child is not None and not self._retire_child():
+        if state.child is not None and not self._retire_child(authority_locked=True):
             now = time.monotonic()
             write_state(
                 replace(
@@ -1158,7 +1217,11 @@ class SupervisorDaemon:
         except OSError:
             self._record_not_ready(state, now, child.pid, "stable symlink publication failed")
             return
-        write_state(replace(state, ready=True, next_readiness_at=None))
+        if not self._write_state_authority_safe(replace(state, ready=True, next_readiness_at=None)):
+            # Readiness was proven but its durable publication was deferred:
+            # no success may be reported or recorded until ``ready=True``
+            # actually survives. A later tick re-probes and republishes.
+            return
         LOGGER.info("worker child pid=%d proven to consume the queue", child.pid)
         lifecycle.append_deploy_log(
             f"supervisor verified worker pid={child.pid} consumes the queue"
@@ -1208,26 +1271,31 @@ class SupervisorDaemon:
     ) -> None:
         """Record a not-ready probe result and schedule a retry.
 
+        The retry schedule is only reported as recorded when its publication
+        was not deferred by a concurrent consumer-authority transition; a
+        deferred recording simply retries on a later tick.
+
         Args:
             state: Current daemon state.
             now: Monotonic time.
             child_pid: PID of the worker child.
             reason: Why readiness was not confirmed.
         """
-        write_state(
+        if not self._write_state_authority_safe(
             replace(
                 state,
                 ready=False,
                 next_readiness_at=now + self.settings.readiness_interval_seconds,
             )
-        )
+        ):
+            return
         LOGGER.warning(
             "worker child pid=%d not ready: %s; will retry",
             child_pid,
             reason,
         )
 
-    def _retire_child(self) -> bool:
+    def _retire_child(self, *, authority_locked: bool = False) -> bool:
         """Stop the current worker child by exact identity.
 
         ``stop_worker`` performs full identity verification (PID, start-time
@@ -1237,6 +1305,14 @@ class SupervisorDaemon:
         When the stop cannot be confirmed the durable child identity is
         preserved so the next daemon tick can retry the same exact orphan
         rather than losing track of it and spawning a duplicate consumer.
+
+        Args:
+            authority_locked: Whether the caller already holds the shared
+                consumer-establishment lock. Under the lock an in-lock fresh
+                read is authoritative and the child-clearing write publishes
+                directly; outside the lock the publication must be serialized
+                through the boundary so it cannot erase a concurrently
+                established recovery obligation.
 
         Returns:
             ``True`` when the child was successfully retired (or was already
@@ -1274,7 +1350,19 @@ class SupervisorDaemon:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
             self.proc = None
-        write_state(replace(state, child=None))
+        if authority_locked:
+            write_state(replace(read_state(), child=None))
+        elif not self._write_state_authority_safe(replace(state, child=None)):
+            # The retirement could not be durably published: the child
+            # identity stays recorded and the caller must treat the
+            # retirement as not converged rather than proceeding on an
+            # unpublished transition.
+            LOGGER.error(
+                "could not persist retirement of worker pid %d; "
+                "preserving child identity for retry",
+                child.pid,
+            )
+            return False
         LOGGER.info("retired worker child pid=%d", child.pid)
         return True
 
@@ -1285,7 +1373,7 @@ class SupervisorDaemon:
             _now: Monotonic time (unused).
         """
         self.proc = None
-        write_state(replace(read_state(), child=None))
+        self._write_state_authority_safe(replace(read_state(), child=None))
 
     @staticmethod
     def _child_alive(state: supervise.SupervisorState) -> bool:
@@ -1354,7 +1442,7 @@ class SupervisorDaemon:
                     f"owned-group recovery for crashed incarnation {child.token} "
                     "is incomplete; holding without a replacement worker"
                 )
-                write_state(
+                self._write_state_authority_safe(
                     replace(
                         state,
                         last_exit=LastExit(returncode=returncode, at=time.time()),
@@ -1375,7 +1463,11 @@ class SupervisorDaemon:
             intent=INTENT_RUN,
             child=None,
         )
-        write_state(next_state)
+        if not self._write_state_authority_safe(next_state):
+            # The crash record was not durably published: keep the direct
+            # child handle so a later tick can reclassify the exit and
+            # republish, and never report the crash as recorded.
+            return
         self.proc = None
         lifecycle.append_deploy_log(
             f"supervisor detected unexpected worker exit pid="
@@ -1430,7 +1522,12 @@ class SupervisorDaemon:
         last_spawn = state.last_spawn_at
         if last_spawn is None or now - last_spawn < self.settings.stable_window_seconds:
             return
-        write_state(replace(state, restart_count=0, next_attempt_at=None, last_exit=None))
+        if not self._write_state_authority_safe(
+            replace(state, restart_count=0, next_attempt_at=None, last_exit=None)
+        ):
+            # The reset was deferred: the crash history stays durable and no
+            # stability is reported. A later tick re-evaluates and republishes.
+            return
         LOGGER.info("worker is stable; resetting restart counter")
 
     # ------------------------------------------------------------------
@@ -2405,10 +2502,33 @@ class SupervisorDaemon:
             self._ownership_fd = None
 
     def _shutdown(self) -> None:
-        """Stop the worker child gracefully and persist a clean state."""
+        """Stop the worker child gracefully and persist a clean state.
+
+        The retirement and the authority-resolution decisions run under the
+        shared consumer-establishment lock so a concurrent manual recovery
+        cannot interleave an authority transition between this daemon's fresh
+        read and its publication (and vice versa). On lock contention the
+        destructive convergence is skipped entirely: leaving a possibly
+        resolvable obligation durable is always fail-closed-safe, erasing a
+        newer one is not.
+        """
         LOGGER.info("supervisor shutting down")
+        try:
+            with supervise.consumer_lock(self.settings.lock_timeout_seconds):
+                self._shutdown_locked()
+        except supervise.ConsumerLockTimeoutError:
+            LOGGER.exception(
+                "a consumer-establishment decision holds the boundary; shutting "
+                "down without converging blocking authority"
+            )
+        remove_durable(supervise.supervisor_pid_path())
+        self._write_status("stopped")
+        LOGGER.info("supervisor stopped")
+
+    def _shutdown_locked(self) -> None:
+        """Perform the shutdown convergence while holding the consumer lock."""
         if read_state().child is not None:
-            self._retire_child()
+            self._retire_child(authority_locked=True)
         if not self._resolve_spawning_obligation():
             # The obligation survives shutdown on purpose: a possibly live
             # spawned child must never be abandoned to make room for a
