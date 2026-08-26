@@ -215,11 +215,12 @@ def test_malformed_pid_less_obligation_never_auto_resolves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed flags cannot turn a pid-less obligation auto-resolvable."""
-    del value
     data = _obligation(pid=None, ticks=None).to_dict()
-    # The on-disk shape is exactly what an operator repair or older writer
+    # The on-disk shape is exactly what an operator repair or a buggy writer
     # could leave behind: the flag key present but not a real boolean.
-    data["parent_death_signal"] = "false"
+    data["parent_death_signal"] = value
+    with pytest.raises(ValueError, match="malformed"):
+        SpawningObligation.from_dict(data)
     supervise.state_path().write_text(
         json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": data}),
         encoding="utf-8",
@@ -254,6 +255,9 @@ def test_legacy_absent_field_keeps_pid_less_resolution(
     """A pre-field record still resolves through the kernel guarantee."""
     data = _obligation(pid=None, ticks=None).to_dict()
     del data["parent_death_signal"]
+    # The genuinely absent key is the legacy shape: the parser must default
+    # to True without any explicit flag on disk.
+    assert SpawningObligation.from_dict(data).parent_death_signal is True
     supervise.state_path().write_text(
         json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": data}),
         encoding="utf-8",
