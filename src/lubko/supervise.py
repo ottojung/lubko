@@ -684,6 +684,53 @@ def supervisor_runtime_override_path() -> Path:
     return supervisor_dir() / "supervisor-runtime"
 
 
+class ConsumerLockTimeoutError(Exception):
+    """The consumer-establishment lock could not be acquired in time."""
+
+
+CONSUMER_LOCK_POLL_SECONDS = 0.05
+
+
+@contextmanager
+def consumer_lock(timeout_seconds: float) -> Iterator[None]:
+    """Serialize queue-consumer establishment across processes.
+
+    This is the single cross-process serialization boundary for the
+    decision to create the sole queue consumer: the maintained supervisor's
+    gate-to-spawn critical section and manual ``recover``'s preflight through
+    authority-write/spawn/publication both hold it, so neither a stale
+    preflight observation nor stale supervisor state can authorize two
+    consumers. Lock order is deployment lock first, then this lock; this
+    lock is never held while acquiring the deployment or generation lock.
+
+    Args:
+        timeout_seconds: Maximum seconds to wait for the lock.
+
+    Yields:
+        Nothing while the lock is held.
+
+    Raises:
+        ConsumerLockTimeoutError: If the lock cannot be acquired in time.
+    """
+    path = supervisor_dir() / ".consumer.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    msg = "timed out waiting for the consumer-establishment lock"
+                    raise ConsumerLockTimeoutError(msg) from None
+                time.sleep(CONSUMER_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def supervisor_log_path() -> Path:
     """Return the stable path of the supervisor's own log.
 

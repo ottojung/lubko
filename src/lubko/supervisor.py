@@ -995,6 +995,33 @@ class SupervisorDaemon:
         daemon holds and backs off instead of spawning: starting a second
         consumer is never acceptable.
 
+        The whole gate-to-spawn/publication critical section runs under the
+        shared cross-process consumer-establishment lock manual recovery also
+        holds around its preflight-to-publication critical section, so from
+        one initially consumer-free state exactly one path can authorize a
+        spawn and neither a stale preflight nor stale durable state can
+        produce two queue consumers.
+
+        Args:
+            commit: Exact commit the worker must run.
+        """
+        try:
+            with supervise.consumer_lock(self.settings.lock_timeout_seconds):
+                self._ensure_consumer_locked(commit)
+        except supervise.ConsumerLockTimeoutError:
+            # No durable write here on purpose: a read-modify-write outside
+            # the consumer-establishment boundary could overwrite a concurrent
+            # manual recovery's freshly established obligation. The daemon
+            # simply retries its decision on a later tick.
+            self._message = (
+                "a consumer-establishment decision is in progress elsewhere; "
+                "holding without starting a worker"
+            )
+            LOGGER.warning("%s", self._message)
+
+    def _ensure_consumer_locked(self, commit: str) -> None:
+        """Run the worker-ownership decision while holding the consumer lock.
+
         Args:
             commit: Exact commit the worker must run.
         """
