@@ -983,6 +983,60 @@ def write_state(state: SupervisorState) -> None:
     write_json_durable(state_path(), state.to_dict())
 
 
+def write_state_preserving_authority(
+    state: SupervisorState,
+    timeout_seconds: float,
+) -> None:
+    """Persist daemon state without clobbering a newer blocking authority.
+
+    Supervisor transitions that run *outside* the shared
+    consumer-establishment lock (crash handling, retirement bookkeeping,
+    backoff/readiness maintenance) must never erase consumer authority that a
+    concurrent manual recovery established under that lock: a blind atomic
+    replacement of a stale snapshot is a lost update, and even a
+    fresh-read-then-write merge is racy unless the whole read-merge-write is
+    serialized against every other authority transition. This writer therefore
+    acquires the ``consumer_lock`` first, re-reads the durable state inside
+    that critical section, carries its blocking authority fields — the
+    pre-spawn obligation, the unresolved-child hold, the malformed-hold flags,
+    and the ownership-malformed hold — onto the snapshot being written, and
+    publishes while still holding the lock. Recovery's preflight-through-
+    publication critical section and the supervisor's gate-to-spawn section
+    share the same boundary, so no interleaving can slip an authority write
+    between the fresh read and the publication.
+
+    Callers already inside a ``consumer_lock`` critical section must NOT call
+    this (the lock is not recursive and this would self-deadlock); they use
+    :func:`write_state` directly, where their in-lock fresh reads are already
+    authoritative.
+
+    Args:
+        state: State to store (its non-authority fields are published as-is).
+        timeout_seconds: Maximum seconds to wait for the consumer lock.
+
+    This writer may propagate :class:`supervise.ConsumerLockTimeoutError`
+    when the boundary cannot be acquired in time; callers should skip the
+    publication and let a later reconciliation retry, because dropping an
+    authority-preserving maintenance write is always safer than publishing a
+    stale one. It also fails closed on durability: the write raises
+    :class:`DurabilityError` from :func:`lubko.durable.write_json_durable`
+    when it cannot be confirmed durable, so callers must not advance a
+    dependent action.
+    """
+    with consumer_lock(timeout_seconds):
+        current = read_state()
+        write_state(
+            replace(
+                state,
+                spawning=current.spawning,
+                spawning_hold_malformed=current.spawning_hold_malformed,
+                unresolved_child=current.unresolved_child,
+                unresolved_hold_malformed=current.unresolved_hold_malformed,
+                ownership_hold_malformed=current.ownership_hold_malformed,
+            )
+        )
+
+
 def read_state() -> SupervisorState:
     """Load the daemon's durable state, preserving holds on authority failure.
 
