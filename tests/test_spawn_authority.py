@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -152,6 +153,119 @@ def test_present_malformed_obligation_is_durable_hold(
     daemon._ensure_worker(COMMIT)
     assert daemon._message is not None
     assert "malformed" in daemon._message
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({}, True),
+        ({"parent_death_signal": True}, True),
+        ({"parent_death_signal": False}, False),
+    ],
+)
+def test_parent_death_signal_field_parses_strictly(
+    *,
+    raw: dict[str, object],
+    expected: bool,
+) -> None:
+    """An absent field stays legacy-True; explicit booleans round-trip."""
+    base = _obligation(pid=4242, ticks=777)
+    data = base.to_dict()
+    for key, value in raw.items():
+        data[key] = value
+    restored = SpawningObligation.from_dict(data)
+    assert restored.parent_death_signal is expected
+    assert restored.pid == 4242
+
+
+@pytest.mark.parametrize("value", [None, "true", 1, 0.0, [True], {"pds": True}])
+def test_present_malformed_parent_death_signal_is_durable_hold(
+    value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present non-boolean flag fails closed instead of claiming a kernel guarantee."""
+    data = _obligation(pid=4242, ticks=777).to_dict()
+    data["parent_death_signal"] = value
+    with pytest.raises(ValueError, match="malformed"):
+        SpawningObligation.from_dict(data)
+
+    supervise.state_path().write_text(
+        json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": data}),
+        encoding="utf-8",
+    )
+    state = supervise.read_state()
+    assert state.spawning_hold_malformed is True
+    supervise.write_state(state)
+    assert supervise.read_state().spawning_hold_malformed is True
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        daemon,
+        "_spawn_worker",
+        lambda _commit: pytest.fail("a malformed authority authorized a spawn"),
+    )
+    daemon._ensure_worker(COMMIT)
+    assert daemon._message is not None
+    assert "malformed" in daemon._message
+
+
+@pytest.mark.parametrize("value", [None, "false", 0, [False]])
+def test_malformed_pid_less_obligation_never_auto_resolves(
+    value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed flags cannot turn a pid-less obligation auto-resolvable."""
+    del value
+    data = _obligation(pid=None, ticks=None).to_dict()
+    # The on-disk shape is exactly what an operator repair or older writer
+    # could leave behind: the flag key present but not a real boolean.
+    data["parent_death_signal"] = "false"
+    supervise.state_path().write_text(
+        json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": data}),
+        encoding="utf-8",
+    )
+    observed = _patch_recovery(monkeypatch)
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+
+    assert not daemon._resolve_spawning_obligation()
+    assert observed == []
+    assert supervise.read_state().spawning_hold_malformed is True
+
+
+def test_explicit_parent_death_signal_false_blocks_pid_less_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A well-formed manual obligation without the kernel guarantee blocks."""
+    obligation = replace(_obligation(), parent_death_signal=False)
+    _write_state_with_spawning(obligation)
+    observed = _patch_recovery(monkeypatch)
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+
+    assert not daemon._resolve_spawning_obligation()
+    assert observed == []
+    assert supervise.read_state().spawning == obligation
+
+
+def test_legacy_absent_field_keeps_pid_less_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-field record still resolves through the kernel guarantee."""
+    data = _obligation(pid=None, ticks=None).to_dict()
+    del data["parent_death_signal"]
+    supervise.state_path().write_text(
+        json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": data}),
+        encoding="utf-8",
+    )
+    observed = _patch_recovery(monkeypatch)
+
+    token = json.loads(supervise.state_path().read_text())["spawning"]["token"]
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+
+    assert daemon._resolve_spawning_obligation()
+    assert observed == [("recover", token)]
+    assert supervise.read_state().spawning is None
 
 
 # ---------------------------------------------------------------------------

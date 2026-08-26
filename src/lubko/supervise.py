@@ -338,6 +338,19 @@ class SpawningObligation:
         if token is None or creator_pid is None or creator_ticks is None:
             msg = "spawning obligation is malformed"
             raise ValueError(msg)
+        # Legacy obligations predate the field and were all written by the
+        # pdeathsig-equipped supervisor spawn path, so only a genuinely
+        # absent key defaults to True. A present key must carry a real JSON
+        # boolean: anything else (including null) makes this durable
+        # authority malformed so it fails closed instead of silently claiming
+        # a kernel guarantee.
+        if "parent_death_signal" not in data:
+            parent_death_signal = True
+        elif isinstance(data["parent_death_signal"], bool):
+            parent_death_signal = bool(data["parent_death_signal"])
+        else:
+            msg = "spawning obligation parent-death-signal flag is malformed"
+            raise ValueError(msg)
         return cls(
             token=token,
             commit=_optional_string(data.get("commit")) or "",
@@ -347,9 +360,7 @@ class SpawningObligation:
             start_time_ticks=_optional_int(data.get("start_time_ticks")),
             created_at=_optional_float(data.get("created_at")) or 0.0,
             boot_id=_optional_string(data.get("boot_id")),
-            # Legacy obligations predate the field and were all written by the
-            # pdeathsig-equipped supervisor spawn path.
-            parent_death_signal=_optional_bool(data.get("parent_death_signal")) is not False,
+            parent_death_signal=parent_death_signal,
         )
 
 
