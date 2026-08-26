@@ -157,3 +157,39 @@ def test_same_commit_settlement_advances_without_retirement(
     assert state.applied_generation == 7
     assert state.commit == COMMIT
     assert state.child == LIVE_CHILD
+
+
+def test_request_run_preserves_malformed_desired_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed desired file cannot be erased by a new lifecycle request."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    _write_intent(intent_payload(generation=100, restart="true"))
+    before = supervise.desired_path().read_bytes()
+
+    with pytest.raises(supervise.DesiredIntentError):
+        supervise.request_run("b" * 40, repo="/workspace/new", uv_path="uv", worker_id="w")
+
+    assert supervise.desired_path().read_bytes() == before
+
+    supervise.desired_path().unlink()
+    generation = supervise.request_run("b" * 40, repo="/workspace/new", uv_path="uv", worker_id="w")
+    assert generation == 1
+    desired = supervise.read_desired_strict()
+    assert desired is not None
+    assert desired.generation == 1
+
+
+def test_request_run_keeps_valid_desired_generation_monotonic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid pending desired generation still participates in ordering."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    _write_intent(intent_payload(generation=41, restart=False))
+
+    generation = supervise.request_run("b" * 40, repo="/workspace/new", uv_path="uv", worker_id="w")
+
+    assert generation == 42
+    desired = supervise.read_desired_strict()
+    assert desired is not None
+    assert desired.generation == 42
