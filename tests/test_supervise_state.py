@@ -356,3 +356,100 @@ def test_reconcile_holds_before_worker_spawn_on_ownership_corruption(
 
     assert daemon._message is not None
     assert "malformed" in daemon._message
+
+
+BOOT_A = "0aaaaaaa-0000-4000-8000-00000000000a"
+BOOT_B = "0bbbbbbb-0000-4000-8000-00000000000b"
+
+
+@pytest.mark.parametrize("deadline", [0.0, 12345.75])
+def test_same_boot_keeps_active_backoff_deadline(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, deadline: float
+) -> None:
+    """A matching boot identity proves the clock domain and keeps backoff."""
+    write_raw_state(state_path, boot_id=BOOT_B, next_attempt_at=deadline)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: BOOT_B)
+
+    supervisor.normalize_cross_boot_state()
+
+    state = supervise.read_state()
+    assert state.boot_id == BOOT_B
+    assert state.next_attempt_at == deadline
+    assert state.ownership_hold_malformed is False
+
+
+def test_genuine_cross_boot_mismatch_resets_monotonic_deadlines(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A proven prior-boot record has its monotonic deadlines reset."""
+    write_raw_state(
+        state_path,
+        boot_id=BOOT_A,
+        next_attempt_at=1000.0,
+        last_spawn_at=888.25,
+        next_readiness_at=777.125,
+    )
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: BOOT_B)
+
+    supervisor.normalize_cross_boot_state()
+
+    state = supervise.read_state()
+    assert state.boot_id == BOOT_B
+    assert state.next_attempt_at is None
+    assert state.last_spawn_at is None
+    assert state.next_readiness_at is None
+    assert state.ownership_hold_malformed is False
+
+
+def test_absent_boot_identity_is_treated_as_prior_boot(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Genuine absence of the boot identity stays a resettable unknown."""
+    write_raw_state(state_path, next_attempt_at=1000.0)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: BOOT_B)
+
+    supervisor.normalize_cross_boot_state()
+
+    state = supervise.read_state()
+    assert state.boot_id == BOOT_B
+    assert state.next_attempt_at is None
+    assert state.ownership_hold_malformed is False
+
+
+@pytest.mark.parametrize("raw_boot_id", [1, True, 1.5, [], {}, ["x"], {"b": BOOT_A}])
+def test_present_malformed_boot_identity_is_durable_hold(
+    state_path: Path, raw_boot_id: object
+) -> None:
+    """A present malformed boot identifier cannot degrade to absence."""
+    write_raw_state(state_path, boot_id=raw_boot_id)
+    state = supervise.read_state()
+    assert state.ownership_hold_malformed is True
+
+    supervise.write_state(state)
+    rewritten = supervise.read_state()
+    assert rewritten.ownership_hold_malformed is True
+
+
+@pytest.mark.parametrize("raw_boot_id", [1, True, [], {}])
+def test_corrupted_boot_identity_never_erases_active_backoff(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, raw_boot_id: object
+) -> None:
+    """Corrupt boot identity holds instead of clearing an active deadline."""
+    write_raw_state(state_path, boot_id=raw_boot_id, next_attempt_at=1000.0)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: BOOT_B)
+
+    supervisor.normalize_cross_boot_state()
+
+    state = supervise.read_state()
+    assert state.next_attempt_at is not None
+    assert state.ownership_hold_malformed is True
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        daemon,
+        "_ensure_worker",
+        lambda _commit: pytest.fail("corrupted boot identity authorized spawn"),
+    )
+    daemon.reconcile(0.0)
+    assert daemon._message is not None
+    assert "malformed" in daemon._message

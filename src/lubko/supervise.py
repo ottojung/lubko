@@ -455,6 +455,13 @@ class SupervisorState:
             # backoff and let reconciliation restart immediately from a
             # corrupted schedule. Enter the durable hold.
             ownership_hold_malformed = True
+        boot_id, boot_malformed = _parse_present_optional_string(data, "boot_id")
+        if boot_malformed:
+            # A present-but-malformed boot identifier must never silently
+            # degrade to absence: cross-boot normalization would then treat
+            # the state as written by an unknown prior boot and erase an
+            # active crash-loop backoff deadline. Enter the durable hold.
+            ownership_hold_malformed = True
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
             applied_generation=generation or 0,
@@ -476,7 +483,7 @@ class SupervisorState:
             last_spawn_at=_optional_float(data.get("last_spawn_at")),
             ready=data.get("ready", False) is True,
             next_readiness_at=_optional_float(data.get("next_readiness_at")),
-            boot_id=_optional_string(data.get("boot_id")),
+            boot_id=boot_id,
         )
 
 
@@ -1515,6 +1522,27 @@ def _parse_present_strict(
         return 0, False
     value = parser(data[key])
     return (value or 0), value is None
+
+
+def _parse_present_optional_string(
+    data: dict[str, object],
+    key: str,
+) -> tuple[str | None, bool]:
+    """Parse an optional string identity field.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Field name.
+
+    Returns:
+        A ``(value, malformed)`` pair: the parsed string (``None`` for
+        genuine absence or explicit null) and whether a present non-null
+        value was malformed.
+    """
+    raw = data.get(key)
+    if raw is None:
+        return None, False
+    return (raw, False) if isinstance(raw, str) else (None, True)
 
 
 def _parse_present_nullable_float(
