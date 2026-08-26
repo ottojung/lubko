@@ -1031,7 +1031,12 @@ class SupervisorDaemon:
             ready=False,
             next_readiness_at=None,
         )
-        self._write_state_authority_safe(state)
+        if not self._write_state_authority_safe(state):
+            # The desired-state publication was deferred: the applied
+            # generation is not durable, so no worker may be started from
+            # this unpublished transition and the intent must not be
+            # reported as applied. Reconciliation retries on a later tick.
+            return
         if not already_running:
             self._ensure_worker(desired.commit)
         LOGGER.info("applied supervisor run intent (generation %d)", desired.generation)
@@ -1212,7 +1217,11 @@ class SupervisorDaemon:
         except OSError:
             self._record_not_ready(state, now, child.pid, "stable symlink publication failed")
             return
-        self._write_state_authority_safe(replace(state, ready=True, next_readiness_at=None))
+        if not self._write_state_authority_safe(replace(state, ready=True, next_readiness_at=None)):
+            # Readiness was proven but its durable publication was deferred:
+            # no success may be reported or recorded until ``ready=True``
+            # actually survives. A later tick re-probes and republishes.
+            return
         LOGGER.info("worker child pid=%d proven to consume the queue", child.pid)
         lifecycle.append_deploy_log(
             f"supervisor verified worker pid={child.pid} consumes the queue"
@@ -1262,19 +1271,24 @@ class SupervisorDaemon:
     ) -> None:
         """Record a not-ready probe result and schedule a retry.
 
+        The retry schedule is only reported as recorded when its publication
+        was not deferred by a concurrent consumer-authority transition; a
+        deferred recording simply retries on a later tick.
+
         Args:
             state: Current daemon state.
             now: Monotonic time.
             child_pid: PID of the worker child.
             reason: Why readiness was not confirmed.
         """
-        self._write_state_authority_safe(
+        if not self._write_state_authority_safe(
             replace(
                 state,
                 ready=False,
                 next_readiness_at=now + self.settings.readiness_interval_seconds,
             )
-        )
+        ):
+            return
         LOGGER.warning(
             "worker child pid=%d not ready: %s; will retry",
             child_pid,
@@ -1338,8 +1352,17 @@ class SupervisorDaemon:
             self.proc = None
         if authority_locked:
             write_state(replace(read_state(), child=None))
-        else:
-            self._write_state_authority_safe(replace(state, child=None))
+        elif not self._write_state_authority_safe(replace(state, child=None)):
+            # The retirement could not be durably published: the child
+            # identity stays recorded and the caller must treat the
+            # retirement as not converged rather than proceeding on an
+            # unpublished transition.
+            LOGGER.error(
+                "could not persist retirement of worker pid %d; "
+                "preserving child identity for retry",
+                child.pid,
+            )
+            return False
         LOGGER.info("retired worker child pid=%d", child.pid)
         return True
 
@@ -1440,7 +1463,11 @@ class SupervisorDaemon:
             intent=INTENT_RUN,
             child=None,
         )
-        self._write_state_authority_safe(next_state)
+        if not self._write_state_authority_safe(next_state):
+            # The crash record was not durably published: keep the direct
+            # child handle so a later tick can reclassify the exit and
+            # republish, and never report the crash as recorded.
+            return
         self.proc = None
         lifecycle.append_deploy_log(
             f"supervisor detected unexpected worker exit pid="
@@ -1495,9 +1522,12 @@ class SupervisorDaemon:
         last_spawn = state.last_spawn_at
         if last_spawn is None or now - last_spawn < self.settings.stable_window_seconds:
             return
-        self._write_state_authority_safe(
+        if not self._write_state_authority_safe(
             replace(state, restart_count=0, next_attempt_at=None, last_exit=None)
-        )
+        ):
+            # The reset was deferred: the crash history stays durable and no
+            # stability is reported. A later tick re-evaluates and republishes.
+            return
         LOGGER.info("worker is stable; resetting restart counter")
 
     # ------------------------------------------------------------------

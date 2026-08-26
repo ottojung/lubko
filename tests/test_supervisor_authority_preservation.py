@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from lubko import supervise, supervisor
+from lubko import lifecycle, supervise, supervisor
+from lubko import worker as worker_mod
 from lubko.supervise import (
     INTENT_RUN,
     SpawningObligation,
@@ -403,3 +404,157 @@ def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
         ):
             offenders.append(f"{current}: {stripped}")
     assert not offenders, f"out-of-lock state writes found: {offenders}"
+
+
+class _FakeExitedProc:
+    """Minimal exited-``Popen`` stand-in for crash handling."""
+
+    poll = staticmethod(lambda: 1)
+
+
+def _exit_handle(daemon: supervisor.SupervisorDaemon) -> object:
+    """Read the daemon's exit handle without flow-narrowing its type.
+
+    ``_handle_crash`` mutates ``daemon.proc``, but mypy cannot see that, so
+    asserting on the typed attribute directly would make the post-call
+    ``is None`` check unreachable. Reading through this helper keeps the
+    observation non-narrowing.
+
+    Args:
+        daemon: The daemon whose exit handle is observed.
+
+    Returns:
+        The current exit handle (or ``None``).
+    """
+    return daemon.proc
+
+
+def test_deferred_desired_publication_spawns_and_applies_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred desired-state publication starts no worker and applies nothing."""
+    write_state(fresh_state())
+    supervise.request_run(COMMIT, repo="repo", uv_path="uv", worker_id=None)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
+    monkeypatch.setattr(
+        daemon,
+        "_spawn_worker",
+        lambda _commit: pytest.fail("a worker was started from an unpublished intent"),
+    )
+
+    with supervise.consumer_lock(5.0):
+        daemon.reconcile(now=0.0)
+        final = read_state()
+        assert final.applied_generation == 0, "an unpublished generation was applied"
+        assert final.child is None
+        assert final.spawning is None
+        assert daemon._message is not None
+        assert "deferring" in daemon._message.lower()
+
+    monkeypatch.setattr(daemon, "_spawn_worker", lambda _commit: None)
+    daemon.reconcile(now=0.0)
+    assert read_state().applied_generation == 1, (
+        "the intent never converged once the boundary was free"
+    )
+
+
+def test_deferred_readiness_publication_reports_no_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readiness success is only reported once ``ready=True`` is durable."""
+    _dead_child_state()
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
+    monkeypatch.setattr(daemon, "_check_readiness", lambda _child, _cwd: (True, "ok"))
+    monkeypatch.setattr(daemon, "_child_alive", lambda _s: True)
+    published: list[str] = []
+    pruned: list[str] = []
+    deploy_log: list[str] = []
+    monkeypatch.setattr(supervisor, "publish_current_surfaces", published.append)
+    monkeypatch.setattr(supervisor, "prune_old_incarnation_artifacts", pruned.append)
+    monkeypatch.setattr(lifecycle, "append_deploy_log", deploy_log.append)
+
+    with supervise.consumer_lock(5.0):
+        daemon._probe_readiness(now=0.0)
+        assert read_state().ready is False, "readiness was persisted while deferred"
+        assert pruned == [], "incarnation pruning ran on an unpublished readiness"
+        assert deploy_log == [], "success was logged without a durable ready record"
+
+    daemon._probe_readiness(now=0.0)
+    assert read_state().ready is True
+    # The stable surfaces are republished on each probe; success side
+    # effects happen exactly once, only after ``ready=True`` is durable.
+    assert published[-1] == TOKEN
+    assert len(pruned) == 1
+    assert len(deploy_log) == 1
+
+
+def test_deferred_backoff_reset_reports_no_stability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backoff stability is only reported once the reset is durable."""
+    state = replace(
+        _dead_child_state(),
+        restart_count=3,
+        next_attempt_at=50.0,
+        last_spawn_at=0.0,
+    )
+    write_state(state)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
+    monkeypatch.setattr(daemon, "_child_alive", lambda _s: True)
+
+    with supervise.consumer_lock(5.0):
+        daemon._maybe_reset_backoff(replace(state), now=100.0)
+        final = read_state()
+        assert final.restart_count == 3, "crash history was reset while deferred"
+        assert final.next_attempt_at is not None, "the backoff deadline was cleared while deferred"
+
+    daemon._maybe_reset_backoff(replace(state), now=100.0)
+    final = read_state()
+    assert final.restart_count == 0
+    assert final.next_attempt_at is None
+
+
+def test_deferred_crash_record_keeps_the_exit_handle_and_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred crash publication keeps the handle and reports nothing."""
+    state = _dead_child_state()
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
+    monkeypatch.setattr(daemon, "proc", _FakeExitedProc())
+    recovered: list[str] = []
+    deploy_log: list[str] = []
+    monkeypatch.setattr(supervisor, "recover_owned_groups", recovered.append)
+    monkeypatch.setattr(lifecycle, "append_deploy_log", deploy_log.append)
+
+    with supervise.consumer_lock(5.0):
+        daemon._handle_crash(state, now=100.0)
+        assert read_state().child is not None, "the crash was recorded while deferred"
+        # Read through the helper so mypy does not narrow the typed
+        # attribute across the mutating _handle_crash call.
+        assert _exit_handle(daemon) is not None, "the exit handle was dropped unpublished"
+        assert deploy_log == [], "the crash was reported without being recorded"
+
+    daemon._handle_crash(state, now=100.0)
+    assert read_state().child is None
+    assert _exit_handle(daemon) is None
+    assert len(deploy_log) == 1
+
+
+def test_deferred_out_of_lock_retirement_is_not_reported_converged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retirement outside the lock fails closed when its write was deferred."""
+    _dead_child_state()
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
+    daemon.proc = None
+    monkeypatch.setattr(lifecycle, "stop_worker", lambda *_a, **_k: True)
+    monkeypatch.setattr(worker_mod, "drain_sentinel_matches", lambda _token: True)
+
+    with supervise.consumer_lock(5.0):
+        assert daemon._retire_child() is False, (
+            "retirement claimed convergence on an unpublished write"
+        )
+        assert read_state().child is not None, "the child identity was cleared unpublished"
+
+    assert daemon._retire_child() is True
+    assert read_state().child is None
