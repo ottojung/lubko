@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import logging
 import os
 import secrets
 import signal
@@ -33,7 +34,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -41,8 +42,10 @@ import psycopg
 from psycopg.rows import tuple_row
 
 from lubko import cli, protocol, supervise, toolchain
+from lubko._exact_signal import open_pidfd as _open_exact_pidfd
+from lubko._exact_signal import pidfd_send_signal, process_pgrp
 from lubko.config import load_database_config, load_worker_server
-from lubko.durable import remove_durable, write_json_durable
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import (
@@ -58,6 +61,8 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from lubko.worker import JobsConnection
+
+LOGGER = logging.getLogger(__name__)
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
@@ -846,31 +851,222 @@ def worker_env(token: str) -> dict[str, str]:
 def _wait_for_identity(pid: int) -> ProcessIdentity | None:
     """Wait until a spawned process establishes its session and group.
 
+    On timeout the *last observed* identity is returned even when it does not
+    yet satisfy ``pgid == pid == sid``: that observation is the only exact
+    pre-transition ownership anchor (PID plus start-time ticks) available for
+    converging a child whose PGID/SID transitions after the deadline, and it
+    is lost if the timeout collapses into ``None``. ``None`` therefore means
+    only that the process was never observable (already dead). Callers must
+    explicitly reject a returned identity that is not a private session and
+    hand the observed identity to :func:`_converge_unproven_spawn`.
+
     Args:
         pid: Process ID of the spawned worker.
 
     Returns:
-        The exact identity, or ``None`` if the process died first.
+        The exact private-session identity once observed, otherwise the last
+        observed identity at the timeout, or ``None`` if the process died
+        before any identity could be read.
     """
     deadline = time.monotonic() + SESSION_ESTABLISH_TIMEOUT_SECONDS
+    last_observed: ProcessIdentity | None = None
     while True:
         identity = process_identity(pid)
         if identity is not None and identity.pgid == pid and identity.sid == pid:
             return identity
+        if identity is not None:
+            # Keep the newest non-private observation: the final poll before
+            # the deadline can transiently return None (for example when the
+            # /proc entry is momentarily unreadable) without discarding the
+            # exact startup anchor.
+            last_observed = identity
         if time.monotonic() >= deadline:
-            return identity
+            return last_observed
         time.sleep(SESSION_WAIT_INTERVAL_SECONDS)
 
 
-def _signal_group(pgid: int, sig: int) -> None:
-    """Send a signal to an exact process group, ignoring an already-gone group.
+def _signal_pinned_anchor(pin: int, pid: int, anchor: ProcessIdentity, sig: int) -> None:
+    """Deliver ``sig`` to the pinned process only while its anchor still holds.
+
+    The pinned descriptor addresses the exact kernel process instance, so
+    delivery itself can never hit a recycled PID. The preceding re-proof is a
+    safety gate in the direction of refusing to signal: the occupant observed
+    through ``/proc`` must still be the exact anchored instance (same PID and
+    same start-time ticks; PGID/SID may legitimately have transitioned), so a
+    recycled numeric occupant is never signalled.
 
     Args:
-        pgid: Process group to signal.
-        sig: Signal to send.
+        pin: pidfd pinning the exact process instance.
+        pid: Numeric PID, used only for the ``/proc`` identity re-proof.
+        anchor: The exact identity observed for this child earlier.
+        sig: Signal to deliver.
     """
-    with suppress(ProcessLookupError):
-        os.killpg(pgid, sig)
+    observed = process_identity(pid)
+    if observed is None or observed.pid != anchor.pid:
+        LOGGER.error("pinned process %d is no longer observable; not signalling", pid)
+        return
+    if observed.start_time_ticks != anchor.start_time_ticks:
+        LOGGER.error(
+            "pinned process %d no longer matches its anchored start-time ticks; "
+            "it is a different process instance and is never signalled",
+            pid,
+        )
+        return
+    with suppress(OSError):
+        pidfd_send_signal(pin, sig)
+
+
+def _converge_unproven_spawn(
+    proc: subprocess.Popen[bytes],
+    grace_seconds: float,
+    anchor: ProcessIdentity | None,
+) -> None:
+    """Terminate and reap a spawned worker whose identity was never proven.
+
+    ``_wait_for_identity`` returns a non-private identity (or ``None``) for a
+    child that is still alive when the identity deadline expires. Such a child
+    is never forgotten: while it is still this deployer's direct ``Popen``
+    child — which is itself the lifecycle authority over it — it is converged
+    exactly. When the caller observed a pre-timeout identity, that observation
+    is the ownership anchor: the numeric PID is pinned with a pidfd, the
+    occupant is re-proved under the pin against the anchor's PID and
+    start-time ticks (PGID/SID transitions are tolerated), and TERM/KILL
+    escalation is delivered only through ``pidfd_send_signal`` on that pin, so
+    neither a broad group nor a recycled numeric PID can ever absorb a signal
+    — including when the original child exits between the anchor observation
+    and the pin and its PID is reused. Without an anchor, or when the anchor
+    cannot be re-proved under the pin, nothing is signalled at all and this
+    function fails closed by positively reaping the original direct child
+    before returning, so no unresolved child can coexist with another worker.
+
+    Args:
+        proc: The direct ``Popen`` handle of the spawned child.
+        grace_seconds: Grace period before the emergency force-kill.
+        anchor: The exact identity observed for the child, or ``None``.
+    """
+    if proc.poll() is not None:
+        # Already exited before its identity was established: an ordinary
+        # retryable failure with nothing left to converge.
+        return
+    LOGGER.error(
+        "worker pid %d is live without an acceptable identity; converging it",
+        proc.pid,
+    )
+    grace = max(grace_seconds, 0.0)
+    if anchor is not None:
+        try:
+            pin = _open_exact_pidfd(anchor.pid)
+        except (OSError, AttributeError):
+            LOGGER.exception(
+                "worker pid %d could not be pinned; no signal can be authorized", anchor.pid
+            )
+            pin = None
+        if pin is not None:
+            try:
+                with suppress(OSError):
+                    _signal_pinned_anchor(pin, anchor.pid, anchor, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=grace)
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    return
+                with suppress(OSError):
+                    _signal_pinned_anchor(pin, anchor.pid, anchor, signal.SIGKILL)
+            finally:
+                with suppress(OSError):
+                    os.close(pin)
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        LOGGER.exception(
+            "worker pid %d cannot be converged by exact identity; "
+            "failing closed until it provably exits",
+            proc.pid,
+        )
+        proc.wait()
+
+
+def _live_group_member_pids(pgid: int) -> list[int]:
+    """Return the current numeric PIDs of every live process in ``pgid``.
+
+    The snapshot is a *candidate* list only: membership is re-proven under a
+    pidfd pin before any signal is delivered (see :func:`_signal_exact_group`),
+    so a numeric PID that was recycled between the snapshot and delivery can
+    never absorb a signal.
+
+    Args:
+        pgid: Process group whose members to enumerate.
+
+    Returns:
+        Candidate member PIDs, in /proc order.
+    """
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    return [
+        int(entry.name)
+        for entry in entries
+        if entry.name.isdigit() and process_pgrp(int(entry.name)) == pgid
+    ]
+
+
+def _signal_exact_group(pgid: int, sig: int, token: str | None) -> bool:
+    """Deliver ``sig`` to every provably-owned current member of the group.
+
+    A holding pidfd does NOT keep a numeric PID/PGID reserved: the kernel
+    frees the numeric ID before the final pinned reference is released, so
+    signalling by number after a proof — even an immediately preceding one —
+    stays racy. Delivery therefore never goes through a numeric
+    ``killpg`` at all. Instead, every candidate member from the live group
+    snapshot is individually pinned with a pidfd and re-proven under its own
+    pin (still in the recorded process group AND still carrying exactly our
+    lifecycle token), and only then is the signal delivered through
+    ``pidfd_send_signal``, which addresses the kernel-pinned process itself.
+
+    A recycled numeric PID either fails to pin (already gone), or pins some
+    other process which then fails the group/token re-proof under the pin —
+    so a replacement occupant can never be signalled. Members that exit
+    between snapshot and delivery are simply skipped (benign). When nothing
+    at all can be proven — including platforms with no pidfd-send binding,
+    or when no token exists to prove ownership — nothing is signalled: fail
+    closed.
+
+    Args:
+        pgid: Recorded process group of the proven worker instance.
+        sig: Signal to deliver.
+        token: Exact lifecycle token every signalled member must carry.
+
+    Returns:
+        ``True`` when at least one member was proven and signalled.
+    """
+    if token is None:
+        # Without a recorded token no per-member ownership proof exists, so
+        # no member may ever be signalled.
+        return False
+    attempted = False
+    for pid in _live_group_member_pids(pgid):
+        try:
+            pidfd = _open_exact_pidfd(pid)
+        except (OSError, AttributeError):
+            continue  # unpinnable: gone already, or no pin capability
+        try:
+            # Re-proof happens strictly AFTER the pin, so the checks below
+            # describe the same process the signal will address.
+            if process_pgrp(pid) != pgid:
+                continue
+            if not process_has_token(pid, token):
+                continue
+            pidfd_send_signal(pidfd, sig)
+        except (OSError, AttributeError):
+            continue  # exited before delivery, or no send capability
+        else:
+            attempted = True
+        finally:
+            with suppress(OSError):
+                os.close(pidfd)
+    return attempted
 
 
 def _worker_process_alive(meta: WorkerMeta) -> bool:
@@ -926,6 +1122,18 @@ def stop_worker(
     its full cancel grace plus bounded finalization overhead before an emergency
     SIGKILL is even possible.
 
+    Every signal is authorized by exact worker identity *at signal time*.
+    Because a holding pidfd does not keep a numeric PID/PGID reserved, the
+    recorded PID is first pinned with a pidfd and identity plus lifecycle-
+    token proofs are taken under that pin to authorize retirement at all;
+    each actual SIGTERM/SIGKILL is then delivered per member through its own
+    freshly opened pidfd after re-proving group membership and token
+    ownership under that member's pin (never via numeric ``killpg``). If
+    stable proof is unavailable — no pin possible on a live process, or a
+    missing or mismatched token — nothing is signalled and retirement is not
+    claimed (fail closed). A recycled PID/PGID occupant can therefore never
+    absorb either signal.
+
     Only if the worker ignores ``SIGTERM`` (wedged) is an emergency SIGKILL sent
     to the worker group. Owned command groups that survive a wedged worker must
     be recovered by exact process-group identity elsewhere (see
@@ -943,8 +1151,45 @@ def stop_worker(
         ``True`` when the exact worker process is no longer alive afterwards
         (or was already gone / reused). ``False`` when the exact process
         instance is alive but cannot be authorized for a signal because it does
-        not carry our lifecycle token (including when none was recorded), so
+        not carry our lifecycle token (including when none was recorded), or
+        because stable kernel proof of its identity is unavailable, so
         retirement is not claimed.
+    """
+    if meta.pid is None:
+        return True
+    try:
+        pin = _open_exact_pidfd(meta.pid)
+    except (OSError, AttributeError):
+        # The pin failed either because the exact worker already exited (the
+        # numeric PID may even have been recycled since) or because the
+        # platform cannot pin PIDs at all. Distinguish by re-reading identity:
+        # a live occupant we cannot pin must never be signalled — fail closed.
+        return process_identity(meta.pid) is None
+    try:
+        return _stop_pinned(meta, grace_seconds, cancel_grace_seconds)
+    finally:
+        os.close(pin)
+
+
+def _stop_pinned(
+    meta: WorkerMeta,
+    grace_seconds: float,
+    cancel_grace_seconds: float,
+) -> bool:
+    """Run the drain/escalate retirement for the proven worker instance.
+
+    The leader pin held by the caller covers only the authorization proof;
+    every actual signal is delivered by :func:`_signal_exact_group` through a
+    per-member pidfd at the moment of emission, because a holding pidfd does
+    not keep a numeric PID/PGID reserved across the interval.
+
+    Args:
+        meta: Recorded worker metadata.
+        grace_seconds: Intended grace period before the emergency force-kill.
+        cancel_grace_seconds: The worker's own command cancel grace.
+
+    Returns:
+        ``True`` when the exact worker process is no longer alive afterwards.
     """
     if meta.pid is None:
         return True
@@ -953,16 +1198,13 @@ def stop_worker(
         # The exact worker process is gone or its identity changed (a recycled
         # PID can never be mis-signalled). Nothing to stop; retirement succeeds.
         return True
+    # Signal authorization requires the exact lifecycle token: an unowned live
+    # process — a wrong token or none at all — is never signalled and
+    # retirement is never claimed, so the caller holds rather than handing off
+    # sole-consumer authority. This is distinct from the dead/reused case
+    # above, where no live process matches the recorded identity and
+    # retirement genuinely succeeds.
     if meta.token is None or not process_has_token(meta.pid, meta.token):
-        # The exact process instance is alive but does NOT carry our lifecycle
-        # token: it is a live, unowned process (a wrong token, or none at all —
-        # never ours). Signal authorization requires the exact lifecycle token,
-        # so an absent token is treated identically to a mismatched one: we must
-        # not signal a process we do not own, and we must not report retirement
-        # as successful, so the caller holds rather than handing off
-        # sole-consumer authority. This is distinct from the dead/reused case
-        # above, where no live process matches the recorded identity and
-        # retirement genuinely succeeds.
         return False
     start = time.monotonic()
     kill_floor = start + cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS
@@ -970,16 +1212,22 @@ def stop_worker(
         grace_seconds,
         cancel_grace_seconds + STOP_DRAIN_OVERHEAD_SLACK_SECONDS,
     )
-    # 1. Ask the worker to drain its owned command process groups.
-    _signal_group(identity.pgid, signal.SIGTERM)
+    # 1. Ask the worker's provably-owned group members to drain.
+    _signal_exact_group(identity.pgid, signal.SIGTERM, meta.token)
     # 2. Wait for the worker's explicit safe-to-reap boundary.
     if _wait_for_drain(meta, wait_deadline):
         return True
-    # 3. Emergency: the worker ignored SIGTERM and never drained. Never fire the
-    #    SIGKILL before the worker's own cancel grace plus finalization slack.
+    # 3. Emergency: the worker ignored SIGTERM and never drained. Never fire
+    #    the SIGKILL before the worker's own cancel grace plus finalization
+    #    slack, and never fire it at all unless the exact worker instance is
+    #    still alive (it may have exited during the floor wait). Delivery is
+    #    per-member pinned, so any replacement occupant of a recycled numeric
+    #    group member fails its re-proof rather than absorbing the SIGKILL.
     if time.monotonic() < kill_floor:
         time.sleep(kill_floor - time.monotonic())
-    _signal_group(identity.pgid, signal.SIGKILL)
+    if not _worker_process_alive(meta):
+        return True
+    _signal_exact_group(identity.pgid, signal.SIGKILL, meta.token)
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline and _worker_process_alive(meta):
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
@@ -1714,7 +1962,20 @@ def _deploy_direct(
 
     identity = _wait_for_identity(proc.pid)
     if identity is None:
-        _err("replacement worker exited before establishing its identity")
+        if proc.poll() is None:
+            # Never observable yet still live: no exact anchor exists, so
+            # convergence may only fail closed and reap the direct child.
+            _err("replacement worker stayed live without an observable identity; converging it")
+        else:
+            _err("replacement worker exited before establishing its identity")
+        _converge_unproven_spawn(proc, options.stop_grace_seconds, None)
+        raise DeployAbortedError
+    if identity.pgid != proc.pid or identity.sid != proc.pid:
+        _err(
+            "replacement worker timed out before establishing its private session; "
+            "converging it before aborting"
+        )
+        _converge_unproven_spawn(proc, options.stop_grace_seconds, identity)
         raise DeployAbortedError
 
     new_meta = WorkerMeta(
@@ -2631,13 +2892,263 @@ def _recover_preflight(options: DeployOptions) -> str:
     return commit
 
 
+def _recover_owned_groups(incarnation: str) -> bool:
+    """Recover every command group owned by an exact worker incarnation.
+
+    This is a seam over the maintained supervisor's exact-incarnation
+    owned-group recovery: command jobs run in independent sessions/process
+    groups, so reaping a worker PID never implies its job groups are gone.
+    Only exact persisted process-group identities are signalled, always via
+    pidfd/start-time proof — never name matching or broad numeric kills.
+
+    Args:
+        incarnation: The worker lifecycle token whose groups must be recovered.
+
+    Returns:
+        ``True`` when recovery provably succeeded; ``False`` when it failed
+        and the incarnation's execution authority must not be dropped.
+    """
+    # ruff: ignore[import-outside-top-level] - supervisor imports this module
+    from lubko.supervisor import OwnedGroupRecoveryError, recover_owned_groups
+
+    try:
+        recover_owned_groups(incarnation)
+    except OwnedGroupRecoveryError:
+        LOGGER.exception("owned-group recovery failed for incarnation %s", incarnation)
+        return False
+    return True
+
+
+def _obligation_instance_gone(pid: int | None, start_time_ticks: int | None) -> bool:
+    """Return whether an obligation's exact recorded instance is provably gone.
+
+    Args:
+        pid: The recorded child PID, or ``None`` when never published.
+        start_time_ticks: The recorded start time ticks, or ``None``.
+
+    Returns:
+        ``True`` only when the PID is absent-and-unpublishable or a live
+        process with that PID carries different (or unreadable) start ticks.
+    """
+    if pid is None:
+        return False
+    observed = proc_start_ticks(pid)
+    if start_time_ticks is None:
+        return observed is None
+    return observed != start_time_ticks
+
+
+def _clear_spawning_obligation() -> bool:
+    """Durably clear the pre-spawn recovery obligation.
+
+    Returns:
+        ``True`` when the state write was confirmed durable.
+    """
+    try:
+        supervise.write_state(replace(supervise.read_state(), spawning=None))
+    except DurabilityError:
+        LOGGER.exception("could not durably clear the pre-spawn recovery obligation")
+        return False
+    return True
+
+
+def _write_spawning_obligation(obligation: supervise.SpawningObligation) -> bool:
+    """Durably persist ``obligation`` as the replacement-blocking authority.
+
+    Args:
+        obligation: The obligation to record.
+
+    Returns:
+        ``True`` when the state write was confirmed durable.
+    """
+    try:
+        supervise.write_state(replace(supervise.read_state(), spawning=obligation))
+    except DurabilityError:
+        LOGGER.exception(
+            "could not durably record the recovery obligation for token %s", obligation.token
+        )
+        return False
+    return True
+
+
+def _recovery_obligation(token: str, commit: str) -> supervise.SpawningObligation:
+    """Build a pid-less pre-spawn obligation for a manual recovery worker.
+
+    Args:
+        token: The recovery worker's lifecycle token.
+        commit: The commit the worker will be started for.
+
+    Returns:
+        The durable replacement-blocking obligation.
+    """
+    return supervise.SpawningObligation(
+        token=token,
+        commit=commit,
+        creator_pid=os.getpid(),
+        creator_start_time_ticks=proc_start_ticks(os.getpid()) or 0,
+        pid=None,
+        start_time_ticks=None,
+        created_at=time.time(),
+        boot_id=supervise.current_boot_id(),
+        # A manually spawned detached worker carries no kernel parent-death
+        # guarantee, so no successor may ever resolve this record by
+        # assumption; it must be positively resolved or repaired.
+        parent_death_signal=False,
+    )
+
+
+def _resolve_stale_recovery_obligation() -> bool:
+    """Resolve a leftover pre-spawn obligation before spawning a new consumer.
+
+    A previous failed or interrupted recovery durably recorded that a worker
+    token's owned command groups may be unresolved. Before this command may
+    start another queue consumer, that exact instance must be provably gone
+    *and* its owned groups successfully recovered. Anything else — including a
+    pid-less record that cannot be resolved by assumption at all, or a
+    malformed authority whose true fate is unreadable — fails
+    closed so no replacement consumer races unresolved side-effecting process
+    groups.
+
+    Returns:
+        ``True`` when no blocking obligation remains.
+    """
+    state = supervise.read_state()
+    if state.spawning_hold_malformed:
+        # The pre-spawn authority is present but unreadable: its recorded
+        # spawn may still be live and owning groups. This deliberately does
+        # not self-heal and is never overwritten; only operator repair clears
+        # it, exactly as for the maintained supervisor.
+        return False
+    obligation = state.spawning
+    if obligation is None:
+        return True
+    if obligation.pid is None:
+        return False
+    if not _obligation_instance_gone(obligation.pid, obligation.start_time_ticks):
+        return False
+    if not _recover_owned_groups(obligation.token):
+        return False
+    return _clear_spawning_obligation()
+
+
+def _converge_failed_recovery_worker(
+    proc: subprocess.Popen[bytes],
+    options: DeployOptions,
+    token: str,
+    anchor: ProcessIdentity | None,
+) -> int:
+    """Converge an unproven recovery worker without dropping owned groups.
+
+    The direct child is converged first exactly as before (pinned pidfd
+    signalling when an anchor exists, positive reap otherwise). Then every
+    command group owned by the worker's exact incarnation is recovered, since
+    worker death does not imply job-group death. Only after owned-group
+    recovery succeeds is the pre-spawn obligation released and an ordinary
+    failure returned. When owned-group recovery fails, the already-durable
+    shared supervisor-state obligation keeps blocking every later consumer —
+    manual recover and maintained supervisor alike — until it resolves.
+
+    Args:
+        proc: The direct recovery worker's ``Popen`` handle.
+        options: Deployment inputs.
+        token: The recovery worker's lifecycle token.
+        anchor: The exact identity anchor for pinned convergence, or ``None``.
+
+    Returns:
+        A process exit code.
+    """
+    _converge_unproven_spawn(proc, options.stop_grace_seconds, anchor)
+    if not _recover_owned_groups(token):
+        _err(
+            "owned command groups of the converged recovery worker could not be recovered; "
+            f"durable recovery authority for token {token} blocks any replacement consumer "
+            "until 'lubko-deploy recover' resolves it"
+        )
+        return EXIT_ERROR
+    if not _clear_spawning_obligation():
+        LOGGER.warning("recovery authority for token %s stays blocking until resolved", token)
+    append_deploy_log(f"recovered owned groups for converged recovery worker token={token}")
+    return EXIT_ERROR
+
+
+def _settle_spawned_recovery_worker(
+    proc: subprocess.Popen[bytes],
+    options: DeployOptions,
+    token: str,
+    commit: str,
+    worker_id: str,
+) -> int:
+    """Classify the spawned recovery worker and settle its fate.
+
+    Args:
+        proc: The direct ``Popen`` handle of the spawned worker.
+        options: Deployment inputs.
+        token: The recovery worker's lifecycle token.
+        commit: The commit the worker was started for.
+        worker_id: The reported worker id.
+
+    Returns:
+        A process exit code.
+    """
+    identity = _wait_for_identity(proc.pid)
+    anchor: ProcessIdentity | None
+    if identity is None:
+        if proc.poll() is None:
+            # Still live but never observable: there is no exact anchor, so
+            # convergence may only fail closed and reap the direct child.
+            _err("recovery worker stayed live without an observable identity; converging it")
+        else:
+            _err("recovery worker exited before establishing a dedicated session")
+        anchor = None
+    elif identity.pgid != proc.pid or identity.sid != proc.pid:
+        _err(
+            "recovery worker timed out before establishing its private session; "
+            "converging it before failing"
+        )
+        anchor = identity
+    elif proc.poll() is not None:
+        # The child established its session but already exited: never report
+        # an adoptable PID for a dead process. It may have consumed jobs, so
+        # its owned command groups must be recovered before the token is
+        # forgotten.
+        _err("recovery worker exited before it could be adopted")
+        anchor = None
+    elif not _clear_spawning_obligation():
+        _err(
+            "the recovery worker is healthy, but its durable recovery authority could "
+            "not be released; converging it instead of reporting an adoptable PID"
+        )
+        return _converge_failed_recovery_worker(proc, options, token, identity)
+    else:
+        append_deploy_log(f"recovery worker started pid={identity.pid} commit={commit}")
+        _out(f"recovery worker pid={identity.pid} pgid={identity.pgid} session={identity.sid}")
+        _out(f"worker id: {worker_id}")
+        _out(f"git commit: {commit}")
+        _out(
+            f"adopt it with: lubko-deploy repair --repo {options.repo} "
+            f"--recovery-worker-pid {identity.pid}"
+        )
+        return EXIT_OK
+    return _converge_failed_recovery_worker(proc, options, token, anchor)
+
+
 def _recover_locked(options: DeployOptions) -> int:
     """Start a detached recovery worker and report its adoptable identity.
 
     The worker is started with the same detached session/process-group-leader
     mechanism a deployment replacement uses, so its exact PID is a stable
     dedicated leader that ``lubko-deploy repair --recovery-worker-pid`` can
-    safely adopt later. No lifecycle metadata is written here.
+    safely adopt later. No worker lifecycle metadata (``meta.json``) is
+    written here.
+
+    A shared durable recovery authority is established in the supervisor
+    state *before* the spawn, so the spawned token's execution ownership is
+    never held without durable protection. Every failure exit after a
+    successful spawn first converges the direct child and then recovers the
+    exact incarnation's owned command groups; only then may the authority be
+    released. If that recovery fails, the obligation keeps blocking every
+    later consumer — manual recover and maintained supervisor alike — until a
+    subsequent run resolves it.
 
     Args:
         options: Deployment inputs.
@@ -2650,27 +3161,43 @@ def _recover_locked(options: DeployOptions) -> int:
     except _AdoptionError as exc:
         _err(str(exc))
         return EXIT_ERROR
+    if not _resolve_stale_recovery_obligation():
+        _err(
+            "a previously recorded recovery obligation could not be resolved; refusing "
+            "to start another consumer beside possibly-live owned command groups"
+        )
+        return EXIT_ERROR
     token = secrets.token_hex(16)
     env = worker_env(token)
     worker_id = env.get("LUBKO_WORKER_ID") or socket.gethostname()
+    # Durable shared recovery authority, written and fsync-confirmed BEFORE
+    # the spawn: from this instant the token's execution ownership is recorded
+    # in the supervisor state every consumer-establishing path honors, so no
+    # crash or failure can ever relinquish authority without durable
+    # protection. The record carries no parent-death guarantee, so no
+    # successor may resolve it by assumption.
+    obligation = _recovery_obligation(token, commit)
+    if not _write_spawning_obligation(obligation):
+        _err(
+            "could not durably establish the shared recovery authority; "
+            "not starting a recovery worker"
+        )
+        return EXIT_ERROR
     try:
         proc = spawn_worker(options.repo, options.uv_path, worker_log_path(token), env)
     except OSError as exc:
         _err(f"could not start the recovery worker: {exc}")
+        if not _clear_spawning_obligation():
+            LOGGER.warning("the pid-less authority for token %s stays blocking", token)
         return EXIT_ERROR
-    identity = _wait_for_identity(proc.pid)
-    if identity is None or not (identity.pgid == proc.pid and identity.sid == proc.pid):
-        _err("recovery worker exited before establishing a dedicated session")
-        return EXIT_ERROR
-    append_deploy_log(f"recovery worker started pid={identity.pid} commit={commit}")
-    _out(f"recovery worker pid={identity.pid} pgid={identity.pgid} session={identity.sid}")
-    _out(f"worker id: {worker_id}")
-    _out(f"git commit: {commit}")
-    _out(
-        f"adopt it with: lubko-deploy repair --repo {options.repo} "
-        f"--recovery-worker-pid {identity.pid}"
-    )
-    return EXIT_OK
+    obligation = replace(obligation, pid=proc.pid, start_time_ticks=proc_start_ticks(proc.pid))
+    if not _write_spawning_obligation(obligation):
+        LOGGER.warning(
+            "could not publish the exact identity of recovery worker %s; "
+            "the pid-less pre-spawn authority remains blocking",
+            token,
+        )
+    return _settle_spawned_recovery_worker(proc, options, token, commit, worker_id)
 
 
 def recover(options: DeployOptions) -> int:
@@ -3279,6 +3806,12 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
         mission = None
     with supervise.generation_lock():
         generation = supervise.next_generation()
+        # The migration flag travels inside this one atomically written
+        # desired intent: publishing the migrated target commit and recording
+        # the convergence obligation is a single durable transition, so no
+        # crash can leave the supervisor running the migrated commit without
+        # its completion obligation (nor an orphaned migration intent without
+        # a published commit).
         supervise.write_desired(
             supervise.SupervisorDesired(
                 schema_version=supervise.SCHEMA_VERSION,
@@ -3289,6 +3822,7 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
                 worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
                 restart=False,
                 requested_at=time.time(),
+                migration=True,
             )
         )
     if mission is None:
@@ -3298,6 +3832,20 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
         deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)
         append_deploy_log(
             f"migration archived stale pending mission generation {mission.generation}"
+        )
+    elif (
+        mission.status in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}
+        and mission.generation < generation
+    ):
+        # A strictly newer cold-migration intent supersedes older terminal
+        # mission authority: leaving a terminal ``confirmed`` record for an
+        # older commit intact would keep deployctl (and through its
+        # reconciliation the maintained CLI pointer) permanently pinned to the
+        # obsolete commit even after the migrated target is proven ready.
+        deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)
+        append_deploy_log(
+            f"migration superseded terminal {mission.status} mission generation "
+            f"{mission.generation} (commit {mission.commit})"
         )
     append_deploy_log(f"migrated lifecycle state to verified exact commit {commit}")
     _out(f"lifecycle state migrated to verified exact commit {commit}")

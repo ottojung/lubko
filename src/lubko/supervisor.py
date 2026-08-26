@@ -61,6 +61,8 @@ and exposed through the machine-readable status file.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import functools
 import json
 import logging
 import os
@@ -79,8 +81,10 @@ import psycopg
 
 from lubko import cli, deployctl, lifecycle, supervise
 from lubko import worker as worker_mod
+from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
+from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
 from lubko.config import load_database_config
-from lubko.durable import remove_durable
+from lubko.durable import DurabilityError, remove_durable
 from lubko.health import (
     interpret_worker_health,
     prune_old_incarnation_artifacts,
@@ -89,15 +93,18 @@ from lubko.health import (
     read_worker_health_by_incarnation,
     worker_health_payload,
 )
+from lubko.state import rollback_state_path
 from lubko.supervise import (
     INTENT_RUN,
     MODE_RUN,
     SCHEMA_VERSION,
     LastExit,
+    SpawningObligation,
     SupervisorStatus,
     UnresolvedChild,
     WorkerChild,
     acquire_supervisor_lock,
+    current_boot_id,
     proc_start_ticks,
     read_desired,
     read_state,
@@ -128,8 +135,72 @@ DEFAULT_PROBE_TIMEOUT_SECONDS: Final = 15.0
 DEFAULT_READINESS_INTERVAL_SECONDS: Final = 5.0
 IDENTITY_POLL_SECONDS: Final = 0.02
 DB_CHECK_INTERVAL_SECONDS: Final = 15.0
+#: Bounded per-step timeout for preparing the migrated commit's CLI
+#: environment during cold-migration completion.
+COLD_MIGRATION_CLI_TIMEOUT_SECONDS: Final = cli.DEFAULT_BUILD_TIMEOUT_SECONDS
 STAT_PPID_FIELD_INDEX: Final = 1
 STAT_PPID_MIN_FIELDS: Final = 2
+
+#: ``PR_SET_PDEATHSIG`` from ``linux/prctl.h``: ask the kernel to deliver a
+#: signal to the forked child whenever its parent thread dies.
+PR_SET_PDEATHSIG: Final = 1
+
+_pdeathsig_supported_cache: list[bool] = []
+
+
+def _pdeathsig_supported() -> bool:
+    """Return whether the kernel supports ``PR_SET_PDEATHSIG`` via prctl(2).
+
+    The check is a harmless ``prctl(PR_SET_PDEATHSIG, 0)`` probe (clearing an
+    already-clear setting) and is cached for the process lifetime.
+
+    Returns:
+        ``True`` when the spawn-time parent-death link can be established.
+    """
+    if not _pdeathsig_supported_cache:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            result = libc.prctl(PR_SET_PDEATHSIG, 0, 0, 0, 0)
+        except (OSError, AttributeError):
+            _pdeathsig_supported_cache.append(False)
+        else:
+            _pdeathsig_supported_cache.append(result == 0)
+    return _pdeathsig_supported_cache[0]
+
+
+def _child_preexec(expected_ppid: int) -> None:
+    """Run in the forked worker child before exec: pin it to its parent's fate.
+
+    Sets ``PR_SET_PDEATHSIG`` to ``SIGKILL`` so the kernel kills the worker
+    the moment the supervisor process that spawned it dies. This closes the
+    crash window between a successful ``Popen`` and the durable publication
+    of the child identity: an orphaned first spawn cannot outlive its
+    supervisor and be duplicated by a successor. The classic fork race (the
+    parent dying between ``fork`` and ``prctl``) is closed by re-checking
+    parentage and self-killing when the expected parent is already gone.
+
+    Installation itself fails closed: the actual prctl return value is
+    checked, and when the parent-death link cannot be established the child
+    raises instead of returning — subprocess marshals that failure to the
+    parent's ``Popen`` as :class:`subprocess.SubprocessError` **before any
+    exec**, so worker user code can never run unguarded.
+
+    Args:
+        expected_ppid: PID of the supervisor that performed the spawn.
+
+    Raises:
+        RuntimeError: When ``PR_SET_PDEATHSIG`` could not be installed.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    if result != 0:
+        msg = (
+            "could not install PR_SET_PDEATHSIG in the worker child "
+            f"(prctl returned {result}, errno {ctypes.get_errno()})"
+        )
+        raise RuntimeError(msg)
+    if os.getppid() != expected_ppid:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,6 +582,17 @@ class SupervisorDaemon:
         self._message = None
         desired = read_desired()
         state = read_state()
+        if state.ownership_hold_malformed:
+            # Materialize the hold so a later rewrite cannot turn authority
+            # corruption into apparent worker absence. Clearing it is an
+            # explicit operator repair, never an automatic recovery decision.
+            write_state(state)
+            self._message = (
+                "the durable supervisor worker-ownership state is malformed or unreadable; "
+                "holding without starting a worker until it is repaired"
+            )
+            LOGGER.error("%s", self._message)
+            return
         action, commit = self._derive_action(state)
         if (
             desired is not None
@@ -547,6 +629,114 @@ class SupervisorDaemon:
         self._ensure_worker(commit)
         self._record_mission_progress(commit)
         self._probe_readiness(now)
+        self._complete_cold_migration()
+
+    def _complete_cold_migration(self) -> None:
+        """Converge CLI/deployctl authority onto a proven migrated commit.
+
+        ``lubko-deploy migrate`` writes one atomically durable desired intent
+        that both publishes the exact target commit and carries the
+        ``migration`` flag, so no crash can separate the two. This is the only
+        completion path for that flag:
+
+        - while the migrated worker is not yet proven queue-ready for the
+          exact migration generation/commit pair, nothing happens: the
+          maintained CLIs stay fail-closed on the previous confirmed
+          authority;
+        - once readiness is proven, the sealed CLI environment is prepared,
+          the maintained pointer converges to the target commit, the
+          superseded terminal mission record is removed so deployctl
+          authority follows the actually maintained worker, and finally the
+          flag itself is cleared under the generation lock.
+
+        The whole decision-and-mutation sequence runs under the same
+        deployment lock every deployctl writer holds, so a concurrent newer
+        checkout/confirm can never publish a mission between the re-read and
+        the CLI/rollback mutations: it either completed before this critical
+        section (and strictly outranks the migration) or afterwards (and its
+        authority survives untouched). Lock order stays deployment lock
+        before generation lock. On lock contention the completion is simply
+        retried on a later tick.
+
+        Every step is idempotent and ordered so a crash between steps leaves
+        either the old coherent authority or retries the same convergence on
+        the next tick; the flag is cleared last, so an interrupted run is
+        always resumed rather than skipped.
+        """
+        desired = read_desired()
+        if desired is None or not desired.migration:
+            return
+        try:
+            with lifecycle.deploy_lock(DEFAULT_LOCK_TIMEOUT_SECONDS):
+                self._complete_cold_migration_locked(desired)
+        except lifecycle.LockTimeoutError:
+            LOGGER.warning("cold-migration completion deferred: deployment lock is held")
+            self._message = "cold-migration completion deferred; deployment in progress"
+
+    def _complete_cold_migration_locked(self, desired: supervise.SupervisorDesired) -> None:
+        """Perform cold-migration convergence while holding the deployment lock.
+
+        All authority inputs are re-read inside the critical section so the
+        decision is serialized against deployctl writers.
+
+        Args:
+            desired: The migration intent observed before locking; re-read
+                and revalidated while locked.
+        """
+        current_desired = read_desired()
+        if (
+            current_desired is None
+            or not current_desired.migration
+            or current_desired.generation != desired.generation
+            or current_desired.commit != desired.commit
+        ):
+            return
+        try:
+            mission = deployctl.read_rollback_state()
+        except deployctl.DeployCtlError:
+            mission = None
+        if mission is not None and mission.generation > desired.generation:
+            # A strictly newer supervised-deployment mission supersedes the
+            # migration; its own confirmation path owns authority now and its
+            # record must survive untouched.
+            supervise.clear_migration_flag(desired.generation)
+            lifecycle.append_deploy_log(
+                f"cold migration to {desired.commit} superseded by newer mission "
+                f"generation {mission.generation}"
+            )
+            return
+        state = read_state()
+        if (
+            not state.ready
+            or state.applied_generation < desired.generation
+            or state.commit != desired.commit
+        ):
+            return
+        try:
+            cli.build_cli_root(
+                Path(desired.repo),
+                desired.commit,
+                desired.uv_path,
+                COLD_MIGRATION_CLI_TIMEOUT_SECONDS,
+            )
+        except cli.CliError as exc:
+            self._message = f"cold-migration CLI environment failed: {exc}"
+            LOGGER.warning("cold-migration CLI environment could not be prepared: %s", exc)
+            return
+        if cli.current_commit() != desired.commit:
+            try:
+                cli.set_current(desired.commit)
+            except cli.CliError as exc:
+                self._message = f"cold-migration CLI activation failed: {exc}"
+                LOGGER.warning("cold-migration CLI activation failed: %s", exc)
+                return
+            lifecycle.append_deploy_log(f"cold migration activated CLI commit {desired.commit}")
+        remove_durable(rollback_state_path())
+        supervise.clear_migration_flag(desired.generation)
+        lifecycle.append_deploy_log(
+            f"cold migration complete: deployment authority converged to commit {desired.commit}"
+        )
+        LOGGER.info("cold migration converged deployment authority to commit %s", desired.commit)
 
     def _record_mission_progress(self, commit: str) -> None:
         """Advance the applied generation once a mission candidate is running.
@@ -736,7 +926,34 @@ class SupervisorDaemon:
             and self._child_alive(state)
         )
         if not already_running:
-            self._retire_child()
+            state = read_state()
+            if not self._retire_child():
+                # Retirement did not positively converge. The old live child
+                # keeps its exact identity, so its recorded commit remains the
+                # authoritative maintained commit: advancing
+                # ``applied_generation`` or rewriting ``commit`` here would let
+                # ``_ensure_worker`` classify that same old worker as already
+                # running the requested commit. Hold fail-closed instead; a
+                # later reconciliation retries the exact retirement.
+                now = time.monotonic()
+                write_state(
+                    replace(
+                        read_state(),
+                        next_attempt_at=now + self._backoff_seconds(state.restart_count),
+                    )
+                )
+                pid = state.child.pid if state.child is not None else None
+                self._message = (
+                    "could not stop recorded worker pid "
+                    f"{pid}; holding without applying generation "
+                    f"{desired.generation}"
+                )
+                LOGGER.error(
+                    "could not stop recorded worker pid %d; holding without applying generation %d",
+                    pid,
+                    desired.generation,
+                )
+                return
         state = replace(
             read_state(),
             applied_generation=desired.generation,
@@ -769,6 +986,8 @@ class SupervisorDaemon:
         Args:
             commit: Exact commit the worker must run.
         """
+        if not self._resolve_spawning_obligation():
+            return
         if not self._resolve_unresolved_child():
             return
         state = read_state()
@@ -850,6 +1069,7 @@ class SupervisorDaemon:
             last_spawn_at=now,
             ready=False,
             next_readiness_at=now + self.settings.readiness_interval_seconds,
+            spawning=None,
         )
         write_state(state)
         meta = replace(_child_to_meta(child, _runtime_dir(commit)), git_commit=commit)
@@ -1219,6 +1439,26 @@ class SupervisorDaemon:
             or socket.gethostname()
         )
         env["LUBKO_WORKER_ID"] = worker_id
+        # Durable pre-spawn obligation, written and fsync-confirmed BEFORE the
+        # Popen: from this instant until the child identity (or an equivalent
+        # replacement-blocking hold) is durably published, this record is the
+        # fail-closed authority that forbids any successor supervisor from
+        # starting a second maintained consumer beside a possibly-live first
+        # spawn.
+        creator_ticks = proc_start_ticks(os.getpid()) or 0
+        obligation = SpawningObligation(
+            token=token,
+            commit=commit,
+            creator_pid=os.getpid(),
+            creator_start_time_ticks=creator_ticks,
+            pid=None,
+            start_time_ticks=None,
+            created_at=time.time(),
+            boot_id=current_boot_id(),
+            parent_death_signal=True,
+        )
+        write_state(replace(read_state(), spawning=obligation))
+        preexec = functools.partial(_child_preexec, os.getpid()) if _pdeathsig_supported() else None
         try:
             proc = subprocess.Popen(
                 [str(executable)],
@@ -1229,11 +1469,31 @@ class SupervisorDaemon:
                 start_new_session=True,
                 close_fds=True,
                 env=env,
+                # The daemon is strictly single-threaded, and preexec_fn is
+                # the only way to install PR_SET_PDEATHSIG in the forked
+                # child before exec — the kernel link this fail-closed
+                # spawn-authority protocol depends on.
+                preexec_fn=preexec,  # ruff: ignore[subprocess-popen-preexec-fn]
             )
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
+            # SubprocessError covers a child-side preexec failure: the child
+            # raised before exec (e.g. PR_SET_PDEATHSIG could not be
+            # installed), so no worker code ran and nothing needs
+            # converging — clearing the obligation keeps the retry path open.
+            write_state(replace(read_state(), spawning=None))
             LOGGER.exception("could not start the worker for commit %s", commit)
             return None
         self.proc = proc
+        child_ticks = proc_start_ticks(proc.pid)
+        try:
+            write_state(
+                replace(
+                    read_state(),
+                    spawning=replace(obligation, pid=proc.pid, start_time_ticks=child_ticks),
+                )
+            )
+        except DurabilityError:
+            return self._recover_unpublished_spawn(proc, obligation, child_ticks)
         identity = self._wait_for_identity(proc.pid)
         if identity is None:
             return self._settle_unproven_spawn(commit, proc, token, worker_id)
@@ -1246,6 +1506,160 @@ class SupervisorDaemon:
             worker_id=worker_id,
             spawned_at=time.time(),
         )
+
+    def _recover_spawn_owned_groups(self, token: str) -> bool:
+        """Recover the exact command groups owned by a pre-publication token.
+
+        Args:
+            token: Lifecycle token of the proven-gone worker incarnation.
+
+        Returns:
+            ``True`` when every group owned by the incarnation is provably
+            reclaimed; ``False`` on the fail-closed blocking error.
+        """
+        try:
+            recover_owned_groups(token)
+        except OwnedGroupRecoveryError:
+            self._message = (
+                "the worker was proven gone, but its owned command groups could "
+                "not be recovered; holding without clearing spawn authority or "
+                "spawning a replacement"
+            )
+            LOGGER.exception("%s", self._message)
+            return False
+        return True
+
+    def _release_unproven_spawn_authority(self, token: str, *, hold_persisted: bool) -> bool:
+        """Drop pre-publication spawn authority only after group recovery.
+
+        The worker instance is already proven gone by the caller. Its owned
+        command groups must then be recovered under the same exact token; on
+        success the spawning obligation (and any persisted unresolved hold) is
+        durably cleared so the failed spawn remains an ordinary retryable
+        failure. On recovery failure nothing is cleared: the token-bearing
+        obligation stays blocking and a later tick retries the recovery.
+
+        Args:
+            token: Lifecycle token of the proven-gone spawn incarnation.
+            hold_persisted: Whether an authority-free unresolved hold for this
+                child was already recorded and must be released with it.
+
+        Returns:
+            ``True`` when every durable blocker was positively released.
+        """
+        if not self._recover_spawn_owned_groups(token):
+            return False
+        state = read_state()
+        write_state(
+            replace(
+                state,
+                spawning=None,
+                unresolved_child=None if hold_persisted else state.unresolved_child,
+            )
+        )
+        self.proc = None
+        return True
+
+    @staticmethod
+    def _preserve_blocking_obligation(
+        obligation: SpawningObligation,
+        pid: int,
+        child_ticks: int | None,
+    ) -> None:
+        """Durably keep a token-bearing spawn hold after failed group recovery.
+
+        Owned-group recovery failed while the worker itself was already proven
+        gone, so the pre-publication authority must survive: no replacement may
+        spawn while the incarnation's command groups are unresolved. The
+        surviving obligation is upgraded with the exact observed child identity
+        when possible so the retry converges precisely; if that upgrade cannot
+        be made durable, the existing obligation record stays untouched and
+        continues to block.
+
+        Args:
+            obligation: The pre-spawn obligation whose ``token`` must remain
+                the blocking authority.
+            pid: Observed PID of the spawned child.
+            child_ticks: Start-time ticks observed for the child, if any.
+        """
+        try:
+            state = read_state()
+            current = state.spawning if state.spawning is not None else obligation
+            write_state(
+                replace(
+                    state,
+                    spawning=replace(current, pid=pid, start_time_ticks=child_ticks),
+                )
+            )
+        except DurabilityError:
+            LOGGER.exception(
+                "could not durably upgrade the blocking spawn obligation for "
+                "worker pid %d; the existing token-bearing hold survives",
+                pid,
+            )
+
+    def _recover_unpublished_spawn(
+        self,
+        proc: subprocess.Popen[bytes],
+        obligation: SpawningObligation,
+        child_ticks: int | None,
+    ) -> WorkerChild | None:
+        """Recover a spawn whose identity upgrade could not be made durable.
+
+        The child is live but the durable obligation still lacks its exact
+        identity. Because this process still owns the direct ``Popen``
+        handle, it first tries to converge (terminate and positively reap)
+        its own child; on success the token's owned command groups are
+        recovered by exact incarnation, and only then is the obligation
+        cleared so the spawn remains an ordinary retryable failure. When the
+        worker convergence or the group recovery cannot be positively
+        completed, the blocking authority transfers to a durable hold carrying
+        the exact observed identity so no replacement can ever be authorized
+        beside the possibly-live first spawn or its command groups.
+
+        Args:
+            proc: The direct ``Popen`` handle of the spawned child.
+            obligation: The durable pre-spawn obligation whose ``token`` names
+                the incarnation whose owned groups must be recovered.
+            child_ticks: Start-time ticks observed for the child, if any.
+
+        Returns:
+            Always ``None``: a failed spawn never yields a usable child.
+        """
+        LOGGER.error(
+            "could not durably publish worker pid %d identity; converging the spawn",
+            proc.pid,
+        )
+        token = obligation.token
+        if self._converge_direct_child(proc):
+            self.proc = None
+            # The worker itself is proven reaped, but it may already have
+            # launched independent command process groups under this same
+            # incarnation. Recovery must succeed before any durable authority
+            # is dropped.
+            if not self._recover_spawn_owned_groups(token):
+                self._preserve_blocking_obligation(obligation, proc.pid, child_ticks)
+                return None
+            write_state(replace(read_state(), spawning=None))
+            return None
+        write_state(
+            replace(
+                read_state(),
+                unresolved_child=UnresolvedChild(
+                    pid=proc.pid,
+                    start_time_ticks=child_ticks,
+                    token=token,
+                    spawned_at=time.time(),
+                ),
+                spawning=None,
+            )
+        )
+        self._message = (
+            f"worker pid {proc.pid} could not be converged after its identity "
+            "publication failed; holding without a replacement worker"
+        )
+        LOGGER.error("%s", self._message)
+        return None
 
     def _settle_unproven_spawn(
         self,
@@ -1261,7 +1675,12 @@ class SupervisorDaemon:
         child that is still alive when the identity deadline expires. A live
         child is never forgotten: while it is still this supervisor's direct
         ``Popen`` child it is converged with exact single-PID signals and its
-        exit is positively proven by reaping. If convergence cannot be proven,
+        exit is positively proven by reaping. Because a pre-publication worker
+        may already have launched independent command process groups under its
+        token, every authority-dropping branch additionally requires
+        exact-incarnation owned-group recovery to succeed first; failure keeps
+        the durable obligation (and any persisted hold) blocking and
+        retryable. If convergence cannot be proven,
         ownership is durably retained so no later reconciliation (including
         after a supervisor restart) can start a second maintained worker
         alongside the unresolved first child. Group authority is only ever
@@ -1282,7 +1701,10 @@ class SupervisorDaemon:
         """
         if proc.poll() is not None:
             LOGGER.error("worker for commit %s exited before establishing its identity", commit)
-            self.proc = None
+            # Even an already-exited pre-publication worker may have launched
+            # independent command groups under this token; recovery must
+            # succeed before the durable authority is dropped.
+            self._release_unproven_spawn_authority(token, hold_persisted=False)
             return None
         LOGGER.error(
             "worker pid %d for commit %s is live without an acceptable identity; converging it",
@@ -1292,18 +1714,15 @@ class SupervisorDaemon:
         hold_persisted = False
         while True:
             if self._converge_direct_child(proc):
-                # Converged while a crash-safe hold was already on disk:
-                # clear it so an ordinary retryable failure can proceed.
-                if hold_persisted:
-                    write_state(replace(read_state(), unresolved_child=None))
-                self.proc = None
+                # The worker itself is positively reaped, but its owned command
+                # groups may still be alive under this same incarnation.
+                self._release_unproven_spawn_authority(token, hold_persisted=hold_persisted)
                 return None
             observed = self._await_observable_identity(proc)
             if observed is None and proc.poll() is not None:
-                # The child exited during the hold: an ordinary retryable failure.
-                if hold_persisted:
-                    write_state(replace(read_state(), unresolved_child=None))
-                self.proc = None
+                # The child exited during the hold: the exact-token groups it
+                # may have launched still owe fail-closed recovery.
+                self._release_unproven_spawn_authority(token, hold_persisted=hold_persisted)
                 return None
             if observed is not None and _identity_is_private_session(observed):
                 self._record_proven_private_child(observed, token, worker_id)
@@ -1364,6 +1783,7 @@ class SupervisorDaemon:
                     spawned_at=time.time(),
                 ),
                 unresolved_child=None,
+                spawning=None,
             )
         )
 
@@ -1402,6 +1822,7 @@ class SupervisorDaemon:
                     token=token,
                     spawned_at=time.time(),
                 ),
+                spawning=None,
             )
         )
         LOGGER.error(
@@ -1439,11 +1860,57 @@ class SupervisorDaemon:
                     token=token,
                     spawned_at=time.time(),
                 ),
+                spawning=None,
             )
         )
 
-    @staticmethod
-    def _unresolved_alive(hold: UnresolvedChild) -> bool:
+    def _owned_hold_child(self, hold: UnresolvedChild) -> subprocess.Popen[bytes] | None:
+        """Return our direct ``Popen`` child when the kernel proves the hold is its exit.
+
+        Ownership is proven by kernel parentage rather than bookkeeping alone:
+        only a live or unreaped direct child of this very process can be
+        waited for, so a successful ``waitpid(WNOHANG)`` proves the recorded
+        PID is exactly our own still-unreaped child — and simultaneously reaps
+        it when it has already exited — while ``ECHILD`` proves the PID does
+        not belong to any unreaped child of ours. A foreign or arbitrary
+        zombie is therefore never claimed, and because the kernel cannot
+        recycle the numeric PID of an unreaped child, no recycled identity can
+        slip through either. When start-time ticks were recorded they must
+        additionally still match the live instance.
+
+        Relying on ``self.proc`` as the wait target rests on a structural
+        daemon invariant: while an unresolved hold survives on disk, no
+        replacement worker can be spawned, because the only writer of a fresh
+        ``self.proc`` (``_spawn_worker``) is reachable solely through
+        ``_ensure_worker``, which first runs ``_resolve_unresolved_child()``
+        and refuses to proceed until the durable hold has been cleared; after
+        a supervisor restart ``self.proc`` is ``None``. The ``waitpid`` parentage
+        proof above remains sound independently of that invariant.
+
+        Args:
+            hold: The recorded authority-free hold.
+
+        Returns:
+            The owned direct child handle, or ``None`` when the hold does not
+            correspond to a still-owned, kernel-proven direct child.
+        """
+        proc = self.proc
+        if proc is None or proc.pid != hold.pid:
+            return None
+        try:
+            os.waitpid(proc.pid, os.WNOHANG)
+        except ChildProcessError:
+            # The kernel itself proves this PID is not an unreaped direct
+            # child of this process: nothing owned can be converged here.
+            return None
+        if (
+            hold.start_time_ticks is not None
+            and proc_start_ticks(hold.pid) != hold.start_time_ticks
+        ):
+            return None
+        return proc
+
+    def _unresolved_alive(self, hold: UnresolvedChild) -> bool:
         """Return whether the exact unresolved child instance is still alive.
 
         Args:
@@ -1452,8 +1919,15 @@ class SupervisorDaemon:
         Returns:
             ``True`` only when a live process matches the recorded PID *and*
             start time ticks (when ticks were observed), so a recycled PID can
-            never extend the hold.
+            never extend the hold. When the hold corresponds to our own
+            kernel-proven direct child, an exited child — including its
+            unreaped zombie state — has already been positively reaped by the
+            ownership proof itself and is gone instead of looking alive
+            forever.
         """
+        child = self._owned_hold_child(hold)
+        if child is not None:
+            return child.poll() is None
         if hold.start_time_ticks is None:
             return proc_start_ticks(hold.pid) is not None
         return proc_start_ticks(hold.pid) == hold.start_time_ticks
@@ -1477,10 +1951,17 @@ class SupervisorDaemon:
     def _converge_unresolved(self, hold: UnresolvedChild) -> bool:
         """Converge an unresolved direct child without any group signalling.
 
-        Only exact single-PID signals are used, each authorized by a matching
-        start-time-ticks observation (or withheld entirely when ticks were
-        never observable). A recycled PID therefore ends the hold instead of
-        being signalled.
+        The recorded PID is first pinned with a pidfd, which kernel-pins the
+        exact process instance even if the numeric PID is recycled afterwards.
+        Only when the pinned process still provably matches the recorded
+        start-time ticks are signals delivered — through ``pidfd_send_signal``
+        on that same pinned descriptor for both TERM and KILL escalation, so a
+        recycled numeric identity can never be signalled at any point.
+
+        When pinning or exact proof is unavailable, nothing is signalled and
+        the hold is preserved (fail closed). When start-time ticks were never
+        observable, no signal can be authorized and the previous no-signal
+        behavior applies.
 
         Args:
             hold: The recorded authority-free hold.
@@ -1490,27 +1971,214 @@ class SupervisorDaemon:
         """
         if not self._unresolved_alive(hold):
             return True
-        if hold.start_time_ticks is not None:
-            with suppress(OSError):
-                os.kill(hold.pid, signal.SIGTERM)
+        ticks = hold.start_time_ticks
+        if ticks is None:
+            # Ticks were never observable: no signal can be authorized. The
+            # hold resolves only when the PID itself is provably gone; a live
+            # PID keeps the hold (and blocks any replacement) no matter how
+            # long it takes.
+            return self._await_unresolved_exit(hold)
+        try:
+            pidfd = _open_unresolved_pidfd(hold.pid)
+        except (OSError, AttributeError):
+            LOGGER.debug("unresolved worker pid %d could not be pinned", hold.pid)
+            return False
+        try:
+            if proc_start_ticks(hold.pid) != ticks:
+                LOGGER.debug(
+                    "pinned process %d no longer matches its recorded start ticks",
+                    hold.pid,
+                )
+                return False
+            with suppress(OSError, AttributeError):
+                _signal_pinned_unresolved(pidfd, signal.SIGTERM)
             if self._await_unresolved_exit(hold):
                 return True
-            with suppress(OSError):
-                os.kill(hold.pid, signal.SIGKILL)
+            with suppress(OSError, AttributeError):
+                _signal_pinned_unresolved(pidfd, signal.SIGKILL)
             return self._await_unresolved_exit(hold)
-        # Ticks were never observable: no signal can be authorized. The hold
-        # resolves only when the PID itself is provably gone; a live PID keeps
-        # the hold (and blocks any replacement) no matter how long it takes.
-        return self._await_unresolved_exit(hold)
+        finally:
+            with suppress(OSError):
+                os.close(pidfd)
+
+    def _resolve_spawning_obligation(self) -> bool:
+        """Resolve any durable pre-spawn obligation before authorizing a spawn.
+
+        This is the fail-closed gate that makes the crash window between a
+        successful ``Popen`` and the durable child/meta publication safe: a
+        successor supervisor may only start its own worker once the first
+        spawn's fate has been *positively* resolved — never by process-name
+        matching and never through broad numeric PID/PGID signalling.
+
+        Returns:
+            ``True`` when no blocking obligation remains.
+        """
+        state = read_state()
+        if state.spawning_hold_malformed:
+            # The obligation survives its own shape corruption: a possibly
+            # live spawned child may exist, so this is deliberately not
+            # self-healing and only operator repair clears it.
+            now = time.monotonic()
+            write_state(
+                replace(read_state(), next_attempt_at=now + self.settings.poll_interval_seconds)
+            )
+            self._message = (
+                "the durable pre-spawn recovery obligation is malformed; failing closed "
+                "without starting any worker until the supervisor state is repaired"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        obligation = state.spawning
+        if obligation is None:
+            return True
+        if obligation.pid is None:
+            resolved = self._resolve_pidless_spawn(obligation)
+        else:
+            resolved = self._resolve_identified_spawn(obligation)
+        if not resolved:
+            return False
+        write_state(replace(read_state(), spawning=None))
+        LOGGER.info("resolved prior pre-spawn recovery obligation for commit %s", obligation.commit)
+        return True
+
+    def _resolve_pidless_spawn(self, obligation: SpawningObligation) -> bool:
+        """Resolve an obligation recorded before the child identity was durable.
+
+        Args:
+            obligation: The pre-spawn obligation without a child identity.
+
+        Returns:
+            ``True`` when no live first spawn can remain.
+        """
+        boot_id = current_boot_id()
+        if obligation.boot_id is not None and boot_id is not None and obligation.boot_id != boot_id:
+            # A previous boot's spawn cannot have survived the host reboot.
+            return True
+        if (
+            obligation.creator_start_time_ticks != 0
+            and obligation.creator_pid == os.getpid()
+            and proc_start_ticks(os.getpid()) == obligation.creator_start_time_ticks
+        ):
+            # Defensive: an in-flight record of THIS very incarnation must
+            # never be auto-resolved while it could still be mid-spawn.
+            self._message = (
+                "a pre-spawn recovery obligation of this supervisor incarnation is "
+                "outstanding; holding without starting another worker"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        if not obligation.parent_death_signal:
+            # This spawn carried no kernel parent-death guarantee (a manually
+            # started recovery worker), so the pid-less record cannot be
+            # resolved by assumption: the spawned worker may still be live
+            # and consuming. Failing closed keeps every replacement blocked.
+            self._message = (
+                "a pid-less recovery obligation without a kernel parent-death "
+                "guarantee exists; resolve it with 'lubko-deploy recover' or "
+                "operator repair before any consumer may start"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        if not _pdeathsig_supported():
+            self._message = (
+                "a pre-spawn recovery obligation without a published identity exists and "
+                "kernel parent-death signalling is unavailable; failing closed until the "
+                "supervisor state is repaired"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        # The spawning supervisor died after a successful Popen without ever
+        # publishing the child identity. Every spawn is forked with
+        # PR_SET_PDEATHSIG=SIGKILL (and a parentage re-check closing the fork
+        # race), so the kernel itself killed the first spawn at creator death:
+        # no live first consumer can remain. No name matching or signalling is
+        # needed — and none is performed.
+        LOGGER.warning(
+            "resolving pid-less pre-spawn obligation for commit %s via kernel "
+            "parent-death guarantee",
+            obligation.commit,
+        )
+        try:
+            recover_owned_groups(obligation.token)
+        except OwnedGroupRecoveryError:
+            self._message = (
+                "a pid-less pre-spawn obligation was proven dead via kernel "
+                "parent-death signalling, but its owned command groups could not "
+                "be recovered; holding without clearing the obligation or "
+                "spawning a replacement"
+            )
+            LOGGER.exception("%s", self._message)
+            return False
+        return True
+
+    def _resolve_identified_spawn(self, obligation: SpawningObligation) -> bool:
+        """Resolve an obligation carrying an exact child identity.
+
+        Args:
+            obligation: The pre-spawn obligation with ``pid`` recorded.
+
+        Returns:
+            ``True`` when the exact recorded instance is positively gone.
+        """
+        hold = UnresolvedChild(
+            pid=obligation.pid if obligation.pid is not None else 0,
+            start_time_ticks=obligation.start_time_ticks,
+            token=obligation.token,
+            spawned_at=obligation.created_at,
+        )
+        if not self._unresolved_alive(hold):
+            # Dead, zombie-reaped, or PID recycled with different start ticks:
+            # the exact instance is provably gone. Its already-launched command
+            # groups are independent process groups, so exact-incarnation group
+            # recovery must succeed before this token's authority is dropped.
+            if not self._recover_spawn_owned_groups(obligation.token):
+                return False
+            # A stale exact-identity hold left behind by an earlier failed
+            # attempt for this same instance must not outlive its resolution.
+            state = read_state()
+            leftover = state.unresolved_child
+            if leftover is not None and leftover.pid == hold.pid and leftover.token == hold.token:
+                write_state(replace(state, unresolved_child=None))
+            return True
+        # Live: converge by exact pinned single-PID signals guarded by start
+        # ticks (never group signals, never name matching).
+        write_state(replace(read_state(), unresolved_child=hold))
+        if not self._converge_unresolved(hold):
+            now = time.monotonic()
+            write_state(
+                replace(read_state(), next_attempt_at=now + self.settings.poll_interval_seconds)
+            )
+            self._message = (
+                f"the previously spawned worker pid {obligation.pid} is still live and "
+                "cannot be converged by exact identity; holding without starting a worker"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        # The worker instance is positively converged; its owned command groups
+        # may still be alive under the same incarnation. Recovery failure keeps
+        # both the obligation and the unresolved hold durable (fail closed) so
+        # no replacement can spawn and a later tick retries only the recovery.
+        if not self._recover_spawn_owned_groups(obligation.token):
+            return False
+        write_state(replace(read_state(), unresolved_child=None))
+        LOGGER.info("converged the previously spawned worker pid=%d", hold.pid)
+        return True
 
     def _resolve_unresolved_child(self) -> bool:
         """Resolve any durable unresolved-child hold before further decisions.
+
+        The exact recorded instance is converged first; because every hold
+        carries the pre-publication worker incarnation token, its owned command
+        groups must then be recovered by that exact token before the blocking
+        authority may be cleared. Recovery failure keeps the hold durable so a
+        later tick retries it instead of authorizing a replacement beside
+        still-live side-effecting process groups.
 
         Returns:
             ``True`` when no blocking hold remains.
         """
         state = read_state()
-        if state.unresolved_hold_malformed:
+        if state.ownership_hold_malformed or state.unresolved_hold_malformed:
             # A present-but-malformed durable hold was found on disk. The
             # blocking obligation survives its own shape corruption: a possibly
             # live unresolved spawned child may still exist, so no replacement
@@ -1539,6 +2207,8 @@ class SupervisorDaemon:
                 "holding without starting a worker"
             )
             LOGGER.error("%s", self._message)
+            return False
+        if not self._recover_spawn_owned_groups(hold.token):
             return False
         write_state(replace(read_state(), unresolved_child=None))
         LOGGER.info("resolved prior unresolved worker pid=%d", hold.pid)
@@ -1700,6 +2370,15 @@ class SupervisorDaemon:
         LOGGER.info("supervisor shutting down")
         if read_state().child is not None:
             self._retire_child()
+        if not self._resolve_spawning_obligation():
+            # The obligation survives shutdown on purpose: a possibly live
+            # spawned child must never be abandoned to make room for a
+            # replacement.
+            spawning = read_state().spawning
+            LOGGER.error(
+                "shutting down with an unresolved pre-spawn obligation for commit %s",
+                spawning.commit if spawning is not None else "?",
+            )
         if not self._resolve_unresolved_child():
             # The hold survives shutdown on purpose: an unresolved spawned
             # child must never be abandoned to make room for a replacement.

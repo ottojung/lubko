@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Final
 
 from lubko.durable import DurabilityError, write_symlink_durable
 from lubko.state import cli_root_dir, state_root
-from lubko.supervise import read_supervisor_runtime_override
+from lubko.supervise import read_desired, read_state, read_supervisor_runtime_override
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -705,16 +705,46 @@ def reconcile_pointer(commit: str) -> bool:
     return True
 
 
+def supervisor_authoritative_commits() -> set[str]:
+    """Return every runtime commit the supervisor may still rely on.
+
+    The union covers the durable desired intent, the daemon's applied state,
+    and the supervisor-runtime override. Any of these can name a runtime the
+    supervisor daemon or its maintained worker must still be able to start
+    (including on restart), so garbage collection must never delete them —
+    even when they are absent from an explicit keep list.
+
+    Returns:
+        The set of valid 40-hex commits that must be preserved.
+    """
+    preserved: set[str] = set()
+    desired = read_desired()
+    if desired is not None and is_valid_commit_name(desired.commit):
+        preserved.add(desired.commit)
+    state_commit = read_state().commit
+    if state_commit is not None and is_valid_commit_name(state_commit):
+        preserved.add(state_commit)
+    override = read_supervisor_runtime_override()
+    if override is not None:
+        preserved.add(override)
+    return preserved
+
+
 def remove_cli_root(commit: str) -> None:
-    """Remove one commit's CLI environment if it is not the active one.
+    """Remove one commit's CLI environment if it is not authoritative.
 
     A sealed runtime is unsealed first so the explicit removal actually works.
-    An invalid commit name is never removed (fail closed).
+    An invalid commit name is never removed, and neither is any
+    supervisor-authoritative commit (desired intent, applied state, or
+    override): deleting a runtime the supervisor may still start would create
+    worker/CLI divergence and a later outage (fail closed).
 
     Args:
         commit: Exact commit hash to remove.
     """
     if not is_valid_commit_name(commit) or commit == current_commit():
+        return
+    if commit in supervisor_authoritative_commits():
         return
     root = cli_commit_dir(commit)
     if not root.exists():
@@ -729,11 +759,12 @@ def gc_cli_roots(keep: Sequence[str]) -> None:
     The environment selected by the ``current`` symlink is always preserved,
     even when it is absent from ``keep``. Activation may have failed after
     durable state was written, so a cleanup must never delete the root that the
-    global CLIs currently resolve to.  The supervisor-runtime override commit
-    (when staged by ``lubko-deploy bootstrap``) is also preserved so the
-    override remains usable across GC passes.  Sealed environments are unsealed
-    first so the explicit GC actually removes them; commit-addressed paths are
-    validated before any unseal.
+    global CLIs currently resolve to. Every supervisor-authoritative runtime
+    (desired intent, applied state, supervisor-runtime override) is also
+    preserved: deleting a runtime the supervisor or its maintained worker may
+    still start would create worker/CLI divergence and a later outage.
+    Sealed environments are unsealed first so the explicit GC actually removes
+    them; commit-addressed paths are validated before any unseal.
 
     Args:
         keep: Commits whose environments must be retained.
@@ -742,9 +773,7 @@ def gc_cli_roots(keep: Sequence[str]) -> None:
     current = current_commit()
     if current is not None:
         keep_set.add(current)
-    override = read_supervisor_runtime_override()
-    if override is not None:
-        keep_set.add(override)
+    keep_set.update(supervisor_authoritative_commits())
     for path in cli_root_dir().iterdir() if cli_root_dir().is_dir() else ():
         if path.name in {CURRENT_LINK_NAME, CURRENT_TMP_NAME}:
             continue

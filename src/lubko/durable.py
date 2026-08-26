@@ -55,6 +55,14 @@ Temporary names are unique per write (PID + random suffix), so concurrent
 writers can never truncate or rewrite one another's in-progress temporary file
 even when a destination is reachable by more than one process.
 
+All three primitives serialize same-path durable operations: a stable per-
+destination sidecar ``flock`` (plus an in-process reentrant gate) is held from
+before the prior state is snapshotted until confirmation or fail-closed
+cleanup has fully completed.  A failing unconfirmed transition therefore
+always finishes its restore/neutralize before any other writer can proceed,
+so cleanup can never revert a newer independently committed value — including
+byte-identical (ABA) values, because the interleaving cannot occur.
+
 The module exposes fault-injection hooks (:func:`set_fsync_failure_injector`)
 used only by the test suite to deterministically simulate ``fsync``/replace
 failures at the storage-confirmation boundary.
@@ -63,12 +71,17 @@ failures at the storage-confirmation boundary.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import secrets
+import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # ``os.write`` may return fewer bytes than requested, so all durable writes
 # loop until the whole payload is written; tests can monkeypatch this alias
@@ -297,6 +310,139 @@ def set_short_write_injector(fraction: float | None) -> None:
     _short_write_fraction[0] = fraction
 
 
+DURABLE_LOCK_PREFIX: Final = ".lubko-durable-lock-"
+
+
+class _DestinationLock:
+    """Per-destination lock state, stable for the process lifetime.
+
+    Attributes:
+        gate: Thread serialization.  A reentrant lock so the *same* thread may
+            re-enter through nested fail-closed cleanup calls, while any other
+            thread blocks here until the whole snapshot → rename → confirm or
+            cleanup sequence has finished.
+        fd: The sidecar ``flock`` descriptor, held only while some thread owns
+            the gate (``None`` otherwise).
+        depth: Reentrancy depth of the owning thread; ``0`` when unowned.
+    """
+
+    def __init__(self) -> None:
+        self.gate = threading.RLock()
+        self.fd: int | None = None
+        self.depth = 0
+
+    def acquire(self) -> bool:
+        """Acquire the gate; report whether this is the outermost acquisition.
+
+        ``threading.RLock.acquire()`` reports success, not reentrancy level, so
+        the outermost/reentrant distinction is tracked with an explicit depth.
+
+        Returns:
+            ``True`` when this call transitioned the gate from unowned to
+            owned (so the caller must manage the process-wide ``flock``),
+            ``False`` for a same-thread reentrant acquisition.
+        """
+        self.gate.acquire()
+        self.depth += 1
+        return self.depth == 1
+
+    def release(self) -> None:
+        """Release one level of the gate."""
+        self.depth -= 1
+        self.gate.release()
+
+    def abandon(self) -> None:
+        """Undo a failed outermost acquisition before any flock was obtained."""
+        self.release()
+
+
+# Keys are resolved sidecar lock paths; entries live forever so every thread in
+# this process serializes on the same :class:`threading.RLock` instance.
+_held_locks: Final[dict[str, _DestinationLock]] = {}
+_held_locks_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def _serialized(destination: Path) -> Iterator[None]:
+    """Serialize same-path durable operations across processes and threads.
+
+    Two cooperating layers:
+
+    * a stable per-destination :class:`threading.RLock` ("gate") serializes
+      threads within this process — another thread blocks before it can even
+      snapshot, so it can never interleave with an in-flight operation;
+    * a stable sidecar lock file (``.lubko-durable-lock-<name>`` next to the
+      destination) held under an exclusive ``flock`` serializes processes.  The
+      ``flock`` is acquired by the outermost acquisition only and released when
+      the owning thread fully exits; same-thread nested cleanup calls re-enter
+      the gate without reacquiring a conflicting ``flock``.
+
+    Holding the lock across the entire snapshot → rename → confirm/cleanup
+    sequence makes it impossible for a newer writer to commit between an
+    ownership check and cleanup replace: there is no check-then-act window at
+    all.  A failing operation finishes its restore/neutralize before any other
+    durable operation on the path proceeds, so a failed unconfirmed transition
+    can never revert a newer independently committed writer, and identical-value
+    ABA cannot arise because the interleaving itself cannot occur.
+
+    The sidecar file is intentionally never removed: unlinking a lock file
+    races with waiters holding descriptors on the old inode and can split
+    ownership across two files.  The kernel releases a crashed process's
+    ``flock`` automatically, so crash-safety needs no cleanup.  Forking while
+    holding a destination lock is not supported: the child inherits the shared
+    open file description (and therefore the parent's lock) but not coherent
+    Python lock state; callers must complete durable operations before fork.
+
+    Args:
+        destination: Destination path whose durable operations are serialized.
+
+    Yields:
+        ``None`` while the destination lock is held by the caller.
+
+    Raises:
+        DurabilityError: If the lock file cannot be opened or locked.
+    """
+    key = str(destination.parent / f"{DURABLE_LOCK_PREFIX}{destination.name}")
+    with _held_locks_guard:
+        entry = _held_locks.get(key)
+        if entry is None:
+            entry = _DestinationLock()
+            _held_locks[key] = entry
+    outermost = entry.acquire()
+    if outermost:
+        try:
+            fd = os.open(key, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as exc:
+            entry.abandon()
+            msg = f"cannot open durable lock {key}: {exc}"
+            raise DurabilityError(msg) from exc
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            os.close(fd)
+            entry.abandon()
+            msg = f"cannot acquire durable lock {key}: {exc}"
+            raise DurabilityError(msg) from exc
+        entry.fd = fd
+    try:
+        yield
+    finally:
+        if outermost:
+            held_fd = entry.fd
+            entry.fd = None
+            # Unlock/close failures must never mask the operation's own result,
+            # so they are absorbed; the gate level is always released exactly.
+            with contextlib.suppress(OSError):
+                if held_fd is not None:
+                    try:
+                        fcntl.flock(held_fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(held_fd)
+            entry.release()
+        else:
+            entry.release()
+
+
 def _write_all(fd: int, data: bytes) -> None:
     """Write every byte of ``data`` to ``fd``, handling short writes.
 
@@ -380,42 +526,52 @@ def write_bytes_durable(path: Path, data: bytes, *, _restore: bool = True) -> No
     """
     destination = Path(path)
     make_directory_durable(destination.parent)
-    temporary = temporary_path(destination)
-    previous = destination.read_bytes() if destination.exists() else None
-    try:
-        _write_temporary_file(temporary, data)
-        _maybe_inject(temporary, FSYNC_STAGE_REPLACE)
-        Path(temporary).replace(destination)
-    except BaseException as exc:
-        temporary.unlink(missing_ok=True)
-        if isinstance(exc, DurabilityError):
+    # Serialize the whole snapshot → rename → confirm/cleanup sequence against
+    # every other durable operation on this path (across processes and
+    # threads).  Because no other writer can even snapshot — let alone commit —
+    # while this lock is held, fail-closed cleanup below can never overwrite a
+    # newer independently committed value, and payload comparison cannot be
+    # fooled by identical-value ABA: the interleaving is simply impossible.
+    with _serialized(destination):
+        temporary = temporary_path(destination)
+        previous = destination.read_bytes() if destination.exists() else None
+        try:
+            _write_temporary_file(temporary, data)
+            _maybe_inject(temporary, FSYNC_STAGE_REPLACE)
+            Path(temporary).replace(destination)
+        except BaseException as exc:
+            temporary.unlink(missing_ok=True)
+            if isinstance(exc, DurabilityError):
+                raise
+            msg = f"cannot durably write {destination}: {exc}"
+            raise DurabilityError(msg) from exc
+        try:
+            fsync_directory(destination.parent)
+        except DurabilityError:
+            # A nested restore/neutralize attempt (``_restore=False``) must never
+            # itself recurse into further restore/neutralize: if the final directory
+            # fsync fails again there is nothing more to attempt, so re-raise the
+            # current failure immediately and let the top-level best-effort cleanup
+            # absorb it.  Only the top-level ``_restore=True`` attempt performs the
+            # cleanup below.
+            if not _restore:
+                raise
+            # The rename landed but its directory entry is not confirmed durable.
+            # Best-effort fail-closed cleanup so a later reader never observes a
+            # torn transition: restore the prior authority when one existed, or
+            # durably neutralize the unconfirmed destination for a first write. This
+            # cleanup MUST NOT convert the failure into success — the original error
+            # is always re-raised so dependent actions cannot advance.  The
+            # destination lock is still held here, so the restore cannot race a
+            # concurrent writer; the nested calls re-enter the same lock
+            # reentrantly.
+            if previous is not None:
+                with contextlib.suppress(DurabilityError):
+                    write_bytes_durable(destination, previous, _restore=False)
+            else:
+                with contextlib.suppress(DurabilityError):
+                    remove_durable(destination)
             raise
-        msg = f"cannot durably write {destination}: {exc}"
-        raise DurabilityError(msg) from exc
-    try:
-        fsync_directory(destination.parent)
-    except DurabilityError:
-        # A nested restore/neutralize attempt (``_restore=False``) must never
-        # itself recurse into further restore/neutralize: if the final directory
-        # fsync fails again there is nothing more to attempt, so re-raise the
-        # current failure immediately and let the top-level best-effort cleanup
-        # absorb it.  Only the top-level ``_restore=True`` attempt performs the
-        # cleanup below.
-        if not _restore:
-            raise
-        # The rename landed but its directory entry is not confirmed durable.
-        # Best-effort fail-closed cleanup so a later reader never observes a
-        # torn transition: restore the prior authority when one existed, or
-        # durably neutralize the unconfirmed destination for a first write. This
-        # cleanup MUST NOT convert the failure into success — the original error
-        # is always re-raised so dependent actions cannot advance.
-        if previous is not None:
-            with contextlib.suppress(DurabilityError):
-                write_bytes_durable(destination, previous, _restore=False)
-        else:
-            with contextlib.suppress(DurabilityError):
-                remove_durable(destination)
-        raise
 
 
 def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> None:
@@ -432,8 +588,9 @@ def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> 
 
     When the rename succeeds but the final directory fsync cannot be confirmed,
     the write is *not* confirmed.  This implementation performs a best-effort
-    fail-closed cleanup — restoring the prior pointer durably when one existed,
-    or durably neutralizing the unconfirmed destination for a first write — but
+    fail-closed cleanup — restoring the prior entry's exact type and value
+    durably when one existed (symlink target or regular-file bytes), or
+    durably neutralizing the unconfirmed destination for a first write — but
     it never converts the failure into success: the original
     :class:`DurabilityError` is always re-raised so callers cannot advance an
     action that depended on the new pointer being committed.
@@ -449,46 +606,72 @@ def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> 
     """
     destination = Path(path)
     make_directory_durable(destination.parent)
-    temporary = temporary_path(destination)
-    previous = str(destination.readlink()) if destination.is_symlink() else None
-    try:
-        temporary.unlink(missing_ok=True)
-        temporary.symlink_to(target)
-        # The symlink carries no file contents, so the only durable boundary
-        # before the namespace switch is the rename itself; signal the file
-        # stage here so fault injection can exercise a pre-rename failure.
-        _maybe_inject(temporary, FSYNC_STAGE_FILE)
-        _maybe_inject(temporary, FSYNC_STAGE_REPLACE)
-        Path(temporary).replace(destination)
-    except BaseException as exc:
-        temporary.unlink(missing_ok=True)
-        if isinstance(exc, DurabilityError):
+    # Same-path serialization as :func:`write_bytes_durable`: the lock is held
+    # from the pointer snapshot through confirmation/failure cleanup, so a
+    # failed switch can never restore its stale prior pointer over a newer
+    # independently committed one.
+    with _serialized(destination):
+        temporary = temporary_path(destination)
+        # Snapshot the prior entry's exact type and value: a symlink's target,
+        # a true regular file's bytes, or absence.  The destination may hold any
+        # of these, and a failed confirmation must restore exactly what was
+        # there before — never delete prior regular-file contents because they
+        # are not a symlink.  The regular-file check is lstat-safe and mirrors
+        # :func:`remove_durable`: only a non-symlink regular file's bytes are
+        # read; directories, FIFOs, devices, and other unsupported entry types
+        # are never read as bytes.
+        previous_link: str | None = None
+        previous_bytes: bytes | None = None
+        if destination.is_symlink():
+            previous_link = str(destination.readlink())
+        elif destination.exists() and destination.is_file() and not destination.is_symlink():
+            previous_bytes = destination.read_bytes()
+        try:
+            temporary.unlink(missing_ok=True)
+            temporary.symlink_to(target)
+            # The symlink carries no file contents, so the only durable boundary
+            # before the rename is the rename itself; signal the file
+            # stage here so fault injection can exercise a pre-rename failure.
+            _maybe_inject(temporary, FSYNC_STAGE_FILE)
+            _maybe_inject(temporary, FSYNC_STAGE_REPLACE)
+            Path(temporary).replace(destination)
+        except BaseException as exc:
+            temporary.unlink(missing_ok=True)
+            if isinstance(exc, DurabilityError):
+                raise
+            msg = f"cannot durably write symlink {destination}: {exc}"
+            raise DurabilityError(msg) from exc
+        try:
+            fsync_directory(destination.parent)
+        except DurabilityError:
+            # A nested restore/neutralize attempt (``_restore=False``) must never
+            # itself recurse into further restore/neutralize: if the final directory
+            # fsync fails again there is nothing more to attempt, so re-raise the
+            # current failure immediately and let the top-level best-effort cleanup
+            # absorb it.  Only the top-level ``_restore=True`` attempt performs the
+            # cleanup below.
+            if not _restore:
+                raise
+            # The rename landed but its directory entry is not confirmed durable.
+            # Best-effort fail-closed cleanup: restore the prior pointer when one
+            # existed, or durably neutralize the unconfirmed destination for a first
+            # write. The failure is never converted into success — the original
+            # error is always re-raised.  The destination lock is still held here,
+            # so the restore cannot race a concurrent writer; the nested calls
+            # re-enter the same lock reentrantly.
+            # Restore exactly the prior entry: a symlink's target, a regular
+            # file's bytes, or — for a first write — durably neutralize the
+            # unconfirmed destination.
+            if previous_link is not None:
+                with contextlib.suppress(DurabilityError):
+                    write_symlink_durable(destination, previous_link, _restore=False)
+            elif previous_bytes is not None:
+                with contextlib.suppress(DurabilityError):
+                    write_bytes_durable(destination, previous_bytes, _restore=False)
+            else:
+                with contextlib.suppress(DurabilityError):
+                    remove_durable(destination)
             raise
-        msg = f"cannot durably write symlink {destination}: {exc}"
-        raise DurabilityError(msg) from exc
-    try:
-        fsync_directory(destination.parent)
-    except DurabilityError:
-        # A nested restore/neutralize attempt (``_restore=False``) must never
-        # itself recurse into further restore/neutralize: if the final directory
-        # fsync fails again there is nothing more to attempt, so re-raise the
-        # current failure immediately and let the top-level best-effort cleanup
-        # absorb it.  Only the top-level ``_restore=True`` attempt performs the
-        # cleanup below.
-        if not _restore:
-            raise
-        # The rename landed but its directory entry is not confirmed durable.
-        # Best-effort fail-closed cleanup: restore the prior pointer when one
-        # existed, or durably neutralize the unconfirmed destination for a first
-        # write. The failure is never converted into success — the original
-        # error is always re-raised.
-        if previous is not None:
-            with contextlib.suppress(DurabilityError):
-                write_symlink_durable(destination, previous, _restore=False)
-        else:
-            with contextlib.suppress(DurabilityError):
-                remove_durable(destination)
-        raise
 
 
 def write_text_durable(path: Path, text: str) -> None:
@@ -540,34 +723,41 @@ def remove_durable(path: Path) -> None:
         DurabilityError: If the removal cannot be confirmed durable.
     """
     destination = Path(path)
-    # Snapshot the prior bytes of an existing regular file so a failed
-    # confirmation can best-effort restore the authority instead of silently
-    # losing it.  The check is lstat-safe: ``is_file()`` follows symlinks, so a
-    # symlink (for example the unconfirmed first-write pointer neutralized by
-    # ``write_symlink_durable``) must NOT be treated as a regular file holding
-    # its target's bytes — restoring those bytes would turn the pointer path
-    # into a regular file.  Snapshot only a true regular file that is not a
-    # symlink; symlinks and missing entries have no prior bytes to keep.
-    previous = (
-        destination.read_bytes()
-        if (destination.exists() and destination.is_file() and not destination.is_symlink())
-        else None
-    )
-    try:
-        destination.unlink(missing_ok=True)
-    except OSError as exc:
-        msg = f"cannot remove durable state {destination}: {exc}"
-        raise DurabilityError(msg) from exc
-    # Confirm the removal is durable: the parent directory no longer references
-    # the entry.  A failure here means the removal is not confirmed, so callers
-    # must not treat the state as gone.
-    try:
-        fsync_directory(destination.parent)
-    except DurabilityError:
-        # The removal is not confirmed durable.  Best-effort restore the prior
-        # bytes so the authority is not silently lost, but always re-raise the
-        # original removal failure: a caller must never treat the state as gone.
-        if previous is not None:
-            with contextlib.suppress(DurabilityError):
-                write_bytes_durable(destination, previous, _restore=False)
-        raise
+    # Same-path serialization as the write primitives: the lock is held from
+    # the prior-state snapshot through confirmation/failure cleanup, so a
+    # failed removal can never resurrect stale authority over a newer
+    # independently committed writer.
+    with _serialized(destination):
+        # Snapshot the prior bytes of an existing regular file so a failed
+        # confirmation can best-effort restore the authority instead of silently
+        # losing it.  The check is lstat-safe: ``is_file()`` follows symlinks, so a
+        # symlink (for example the unconfirmed first-write pointer neutralized by
+        # ``write_symlink_durable``) must NOT be treated as a regular file holding
+        # its target's bytes — restoring those bytes would turn the pointer path
+        # into a regular file.  Snapshot only a true regular file that is not a
+        # symlink; symlinks and missing entries have no prior bytes to keep.
+        previous = (
+            destination.read_bytes()
+            if (destination.exists() and destination.is_file() and not destination.is_symlink())
+            else None
+        )
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError as exc:
+            msg = f"cannot remove durable state {destination}: {exc}"
+            raise DurabilityError(msg) from exc
+        # Confirm the removal is durable: the parent directory no longer references
+        # the entry.  A failure here means the removal is not confirmed, so callers
+        # must not treat the state as gone.
+        try:
+            fsync_directory(destination.parent)
+        except DurabilityError:
+            # The removal is not confirmed durable.  Best-effort restore the prior
+            # bytes so the authority is not silently lost, but always re-raise the
+            # original removal failure: a caller must never treat the state as gone.
+            # The destination lock is still held here, so the restore cannot race a
+            # concurrent writer; the nested call re-enters the same lock reentrantly.
+            if previous is not None:
+                with contextlib.suppress(DurabilityError):
+                    write_bytes_durable(destination, previous, _restore=False)
+            raise

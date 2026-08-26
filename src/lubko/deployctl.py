@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -45,6 +46,7 @@ from lubko.lifecycle import (
     LockTimeoutError,
     ProcessIdentity,
     WorkerMeta,
+    _converge_unproven_spawn,
     append_deploy_log,
     check_postgres,
     deploy_lock,
@@ -65,6 +67,8 @@ from lubko.worker import JOB_ID_ENV
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+LOGGER: Final = logging.getLogger(__name__)
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
@@ -202,7 +206,7 @@ class RollbackState:
                 uv_path=str(data["uv_path"]),
                 stop_grace_seconds=float(data["stop_grace_seconds"]),
                 git_timeout_seconds=float(data["git_timeout_seconds"]),
-                previous_retiring=data.get("previous_retiring", False) is True,
+                previous_retiring=_retiring_flag(data.get("previous_retiring", _ABSENT)),
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
                 supervisor_owned=_optional_bool(data.get("supervisor_owned")),
@@ -219,6 +223,29 @@ class GatedWorker:
     proc: subprocess.Popen[bytes]
     gate_writer: int
     meta: WorkerMeta
+
+
+_ABSENT: Final = object()
+
+
+def _retiring_flag(value: object) -> bool:
+    """Return the durable ``previous_retiring`` flag.
+
+    Args:
+        value: JSON value to inspect; the ``_ABSENT`` sentinel means the key
+            is absent.
+
+    Returns:
+        The stored boolean, or ``False`` when the key is absent.
+
+    Raises:
+        TypeError: If a present value is not a boolean (including null).
+    """
+    if value is _ABSENT:
+        return False
+    if not isinstance(value, bool):
+        raise TypeError
+    return value
 
 
 def _optional_string(value: object | None) -> str | None:
@@ -421,6 +448,54 @@ def _mission_candidate_alive(state: RollbackState) -> bool:
     return worker_alive(state.new_meta)
 
 
+def _supervised_mission_authoritative(state: RollbackState) -> bool:
+    """Return whether the live supervisor's durable state still names the mission.
+
+    A supervisor snapshot that identifies a different commit or a generation
+    other than the mission's proves the mission was superseded or abandoned:
+    generations are monotonic, so any applied generation above the mission's
+    is newer authority even when the commit matches.  Such contradictory
+    authority must fail closed regardless of the deadline.  A snapshot that
+    names exactly this mission's commit at exactly its generation keeps
+    supervisor authority with the mission, even while its worker child is
+    transiently absent during bounded restart backoff.
+
+    Args:
+        state: Pending supervised-deployment mission.
+
+    Returns:
+        ``True`` when the supervisor's durable state still targets this mission.
+    """
+    supervisor_state = supervise.read_state()
+    return (
+        supervisor_state.commit == state.commit
+        and supervisor_state.applied_generation == state.generation
+    )
+
+
+def _pending_mission_rollback_due(state: RollbackState) -> bool:
+    """Return whether a pending mission must be rolled back right now.
+
+    Under a live supervisor this mirrors the watchdog policy exactly: a
+    transient ``child=None``/restart-backoff observation for the same applied
+    target generation is retryable until the confirmation deadline, while
+    superseded or contradictory durable supervisor authority fails closed
+    immediately.  Without a live supervisor the legacy recorded candidate
+    metadata decides.
+
+    Args:
+        state: Pending supervised-deployment mission.
+
+    Returns:
+        ``True`` when the mission must roll back now.
+    """
+    if supervise.supervisor_running():
+        if not _supervised_mission_authoritative(state):
+            return True
+        return time.time() >= state.deadline and not _supervised_mission_active(state)
+    return time.time() >= state.deadline or not worker_alive(state.new_meta)
+
+
 def settle_desired(commit: str, repo: str, uv_path: str) -> int:
     """Write a desired run intent newer than any open mission and await it.
 
@@ -598,21 +673,37 @@ def _checkout(repo: Path, commit: str, timeout: float, *, force: bool) -> bool:
 def _wait_for_identity(proc: subprocess.Popen[bytes]) -> ProcessIdentity | None:
     """Wait for a candidate to establish an independent session.
 
+    On timeout the last observed identity is returned even when it does not
+    yet satisfy ``pgid == proc.pid == sid``: that observation is the exact
+    pre-transition ownership anchor for converging a live candidate whose
+    PGID/SID transitions after the deadline. Callers must explicitly reject a
+    non-private identity and hand it to
+    :func:`lubko.lifecycle._converge_unproven_spawn`.
+
     Args:
         proc: Candidate process.
 
     Returns:
-        Exact identity, or ``None`` if it dies or never establishes one.
+        Exact private-session identity once observed, otherwise the last
+        observed identity at the timeout, or ``None`` if it died first.
     """
     deadline = time.monotonic() + IDENTITY_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
+    last_observed: ProcessIdentity | None = None
+    while True:
         if proc.poll() is not None:
             return None
         identity = process_identity(proc.pid)
         if identity is not None and identity.pgid == proc.pid and identity.sid == proc.pid:
             return identity
+        if identity is not None:
+            # Keep the newest non-private observation: the final poll before
+            # the deadline can transiently return None (for example when the
+            # /proc entry is momentarily unreadable) without discarding the
+            # exact startup anchor.
+            last_observed = identity
+        if time.monotonic() >= deadline:
+            return last_observed
         time.sleep(IDENTITY_POLL_SECONDS)
-    return None
 
 
 def _spawn_gated_candidate(options: Options, commit: str) -> GatedWorker:
@@ -647,7 +738,7 @@ def _spawn_gated_candidate(options: Options, commit: str) -> GatedWorker:
     finally:
         os.close(reader)
     identity = _wait_for_identity(proc)
-    if identity is None:
+    if identity is None or identity.pgid != proc.pid or identity.sid != proc.pid:
         os.close(writer)
         raise DeployCtlError("candidate exited before the rollback mission could be armed")
     meta = WorkerMeta(
@@ -1058,7 +1149,13 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     except OSError:
         return None
     identity = _wait_for_identity(proc)
-    if identity is None:
+    if identity is None or identity.pgid != proc.pid or identity.sid != proc.pid:
+        if identity is not None:
+            LOGGER.error(
+                "worker pid %d is live without an acceptable identity; converging it",
+                proc.pid,
+            )
+        _converge_unproven_spawn(proc, state.stop_grace_seconds, identity)
         return None
     meta = WorkerMeta(
         schema_version=SCHEMA_VERSION,
@@ -1701,12 +1798,30 @@ def _cli_target_commit(state: RollbackState | None) -> str | None:
     provisional the pointer must stay on the previous confirmed commit, so a
     repair never activates candidate code before confirmation.
 
+    An in-flight cold migration is also a hold: while the durable desired
+    intent still carries its ``migration`` flag, the supervisor has not yet
+    proven the migrated target queue-ready and converged authority, so the
+    only safe target is the previous confirmed authority. Reconciliation must
+    neither activate the unproven target nor keep restoring the superseded
+    terminal record. A strictly newer deployment mission supersedes the
+    migration and resumes normal reconciliation.
+
     Args:
         state: Current supervised-deployment state, or ``None``.
 
     Returns:
         The exact commit the CLI pointer should select, or ``None``.
     """
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        # A present-but-malformed authoritative intent is observable
+        # corruption: fail closed instead of falling back to other authority
+        # surfaces (which may already name the unproven migrated commit).
+        return None
+    if desired is not None and desired.migration:
+        if state is None or state.generation <= desired.generation:
+            return None
     if state is None:
         meta = read_meta()
         return None if meta is None else meta.git_commit
@@ -1775,7 +1890,7 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     state = _read_state()
     if state is None or state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
-    if time.time() >= state.deadline or not _mission_candidate_alive(state):
+    if _pending_mission_rollback_due(state):
         _rollback_locked(state)
         raise DeployCtlError("confirmation window lapsed; deployment was rolled back")
     commit = request.get("commit")
@@ -1793,7 +1908,7 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
             "challenge": challenge,
         }
     _verify_challenge(state, answer)
-    if time.time() >= state.deadline or not _mission_candidate_alive(state):
+    if _pending_mission_rollback_due(state):
         _rollback_locked(state)
         raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
     if supervise.supervisor_running():
@@ -1848,7 +1963,7 @@ def _handle_status(options: Options) -> dict[str, object]:
         with deploy_lock(options.lock_timeout_seconds):
             state = _read_state()
             if state is not None and state.status == STATUS_PENDING:
-                if time.time() >= state.deadline or not _mission_candidate_alive(state):
+                if _pending_mission_rollback_due(state):
                     _rollback_locked(state)
                     state = _read_state()
             meta = read_meta()
@@ -2012,6 +2127,16 @@ send_helper_response = _send_helper_response
 send_helper_error = _send_helper_error
 wait_for_durable_success = _wait_for_durable_success
 handoff_durable_wait_seconds = HANDOFF_DURABLE_WAIT_SECONDS
+
+# Public protocol-parsing helpers: the JSON request/response contract of the
+# controller protocol is a stable interface exercised directly by the tests.
+parse_request = _parse_request
+request_type = _request_type
+checkout_failure_exit_code = _checkout_failure_exit_code
+
+# Public rollback-spawn convergence helper: previous-worker replacement is a
+# stable rollback contract exercised directly by the tests.
+restart_previous = _restart_previous
 
 
 def main(argv: list[str] | None = None) -> int:
