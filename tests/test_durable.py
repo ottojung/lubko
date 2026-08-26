@@ -122,6 +122,41 @@ def test_symlink_switch_is_atomic_and_restores_prior_pointer(tmp_path: Path) -> 
     assert link.readlink() == Path("a")
 
 
+def test_failed_symlink_switch_restores_prior_regular_file_bytes(tmp_path: Path) -> None:
+    """A failed symlink switch restores prior regular-file bytes exactly."""
+    file_path = tmp_path / "entry"
+    payload = b"prior regular bytes"
+    write_bytes_durable(file_path, payload)
+
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR, path=tmp_path)
+    with pytest.raises(DurabilityError):
+        write_symlink_durable(file_path, "elsewhere")
+    assert file_path.is_file()
+    assert not file_path.is_symlink()
+    assert file_path.read_bytes() == payload
+
+
+def test_failed_symlink_switch_restores_prior_symlink_target(tmp_path: Path) -> None:
+    """A failed symlink switch over a symlink restores the prior target."""
+    link = tmp_path / "entry"
+    write_symlink_durable(link, "old-target")
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR, path=tmp_path)
+    with pytest.raises(DurabilityError):
+        write_symlink_durable(link, "new-target")
+    assert link.is_symlink()
+    assert link.readlink() == Path("old-target")
+
+
+def test_failed_first_symlink_write_neutralizes_destination(tmp_path: Path) -> None:
+    """A first failed symlink write removes the unconfirmed destination."""
+    link = tmp_path / "fresh"
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR, path=tmp_path)
+    with pytest.raises(DurabilityError):
+        write_symlink_durable(link, "target")
+    assert not link.exists(follow_symlinks=False)
+    assert not link.is_symlink()
+
+
 def _sidecar_is_free(directory: Path, name: str) -> bool:
     """Probe the destination sidecar flock without blocking.
 
