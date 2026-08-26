@@ -450,11 +450,13 @@ def _supervised_mission_authoritative(state: RollbackState) -> bool:
     """Return whether the live supervisor's durable state still names the mission.
 
     A supervisor snapshot that identifies a different commit or a generation
-    below the mission's proves the mission was superseded or abandoned; such
-    contradictory authority must fail closed regardless of the deadline.  A
-    snapshot that still names exactly this mission's commit at or after its
-    generation keeps supervisor authority with the mission, even while its
-    worker child is transiently absent during bounded restart backoff.
+    other than the mission's proves the mission was superseded or abandoned:
+    generations are monotonic, so any applied generation above the mission's
+    is newer authority even when the commit matches.  Such contradictory
+    authority must fail closed regardless of the deadline.  A snapshot that
+    names exactly this mission's commit at exactly its generation keeps
+    supervisor authority with the mission, even while its worker child is
+    transiently absent during bounded restart backoff.
 
     Args:
         state: Pending supervised-deployment mission.
@@ -465,7 +467,7 @@ def _supervised_mission_authoritative(state: RollbackState) -> bool:
     supervisor_state = supervise.read_state()
     return (
         supervisor_state.commit == state.commit
-        and supervisor_state.applied_generation >= state.generation
+        and supervisor_state.applied_generation == state.generation
     )
 
 

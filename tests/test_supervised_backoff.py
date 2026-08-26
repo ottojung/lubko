@@ -308,6 +308,30 @@ def test_superseded_authority_fails_closed_before_deadline(
     assert settlement == {OLD_COMMIT: 1}
 
 
+def test_newer_generation_same_commit_authority_fails_closed(
+    mission: dc.RollbackState,
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+) -> None:
+    """A higher applied generation supersedes the mission even for the same commit."""
+    del cli_stubs, status_env
+    live_supervisor[0] = replace(live_supervisor[0], applied_generation=GENERATION + 1)
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "idle"
+    assert response["last_outcome"] == dc.STATUS_ROLLED_BACK
+    assert settlement == {OLD_COMMIT: 1}
+
+    dc._write_state(mission)
+    settlement.clear()
+    with pytest.raises(dc.DeployCtlError, match="rolled back"):
+        dc._confirm_locked({"type": "confirm", "commit": NEW_COMMIT}, _options())
+    assert settlement == {OLD_COMMIT: 1}
+
+
 def test_wait_until_ready_polls_through_transient_child_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
