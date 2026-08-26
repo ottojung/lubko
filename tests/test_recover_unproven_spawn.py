@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import signal
 import subprocess
@@ -814,3 +815,39 @@ def test_repair_failure_when_authority_became_malformed(
     assert code == lifecycle.EXIT_ERROR
     assert "became malformed" in captured.err
     assert json.loads(supervise.state_path().read_text())["spawning"]["token"] == TOKEN
+
+
+def test_repair_fails_closed_when_the_consumer_boundary_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A busy consumer-establishment boundary blocks the whole adoption."""
+    _spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    _stub_repair(monkeypatch)
+
+    def must_not_run(**_kwargs: object) -> None:
+        """Fail if any part of the transition ran without the lock.
+
+        Raises:
+            AssertionError: Always.
+        """
+        msg = "authority transition ran without the consumer lock"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", must_not_run)
+    lock_path = supervise.supervisor_dir() / ".consumer.lock"
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        code = lifecycle._repair_locked(replace(options(), lock_timeout_seconds=0.0), PID)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+    captured = capsys.readouterr()
+    assert code == lifecycle.EXIT_ERROR
+    assert "establishing a queue consumer" in captured.err
+    obligation = supervise.read_state().spawning
+    assert obligation is not None
+    assert obligation.pid == PID

@@ -2730,13 +2730,9 @@ def _release_adoption_authority(meta: WorkerMeta) -> str | None:
     The shared supervisor state is re-read immediately before releasing so a
     concurrently replaced or malformed authority is never cleared: an absent
     hold releases nothing, a malformed hold and a mismatched record both fail
-    closed. On this base the validate-then-clear is not atomic — the deploy
-    lock does not serialize supervisor-state writers, so a concurrent write
-    can still land between the re-read and the clear. Once #266's
-    cross-process consumer-establishment lock (recovery order
-    deploy->consumer, covering the authority check through publication) is
-    available, this helper must run while holding that same lock instead of
-    inventing a second one.
+    closed. The caller must hold the shared consumer-establishment lock
+    across validation and this release so recover or a supervisor
+    establishment cannot interleave with either step.
 
     Args:
         meta: The verified metadata of the adopted recovery worker.
@@ -2828,6 +2824,11 @@ def _repair_locked(options: DeployOptions, recovery_worker_pid: int) -> int:
     release that cannot be confirmed leaves the hold blocking for a later
     repair instead of reporting success with an unrepresented consumer.
 
+    The authority validation through its release runs under the shared
+    consumer-establishment lock (deployment lock first, then this lock), so a
+    concurrent recover or supervisor establishment can neither replace the
+    validated authority mid-repair nor race the release.
+
     Args:
         options: Deployment inputs.
         recovery_worker_pid: Exact PID of the running recovery worker.
@@ -2844,6 +2845,38 @@ def _repair_locked(options: DeployOptions, recovery_worker_pid: int) -> int:
     except _AdoptionError as exc:
         _err(str(exc))
         return EXIT_ERROR
+    try:
+        with supervise.consumer_lock(options.lock_timeout_seconds):
+            return _repair_authority_transition_locked(
+                options, recovery_worker_pid, commit, new_meta, worker_id
+            )
+    except supervise.ConsumerLockTimeoutError:
+        _err(
+            "the supervisor is currently establishing a queue consumer; refusing "
+            "to interleave the adoption of the recovery worker"
+        )
+        return EXIT_ERROR
+
+
+def _repair_authority_transition_locked(
+    options: DeployOptions,
+    recovery_worker_pid: int,
+    commit: str,
+    new_meta: WorkerMeta,
+    worker_id: str,
+) -> int:
+    """Run the authority validation and release under the consumer lock.
+
+    Args:
+        options: Deployment inputs.
+        recovery_worker_pid: Exact PID of the running recovery worker.
+        commit: The commit of the repair checkout.
+        new_meta: The verified metadata of the candidate recovery worker.
+        worker_id: The verified worker id.
+
+    Returns:
+        A process exit code.
+    """
     authority_error = _pre_adoption_authority_error(new_meta)
     if authority_error is not None:
         _err(authority_error)
