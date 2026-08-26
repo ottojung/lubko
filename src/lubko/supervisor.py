@@ -1980,6 +1980,17 @@ class SupervisorDaemon:
             "parent-death guarantee",
             obligation.commit,
         )
+        try:
+            recover_owned_groups(obligation.token)
+        except OwnedGroupRecoveryError:
+            self._message = (
+                "a pid-less pre-spawn obligation was proven dead via kernel "
+                "parent-death signalling, but its owned command groups could not "
+                "be recovered; holding without clearing the obligation or "
+                "spawning a replacement"
+            )
+            LOGGER.exception("%s", self._message)
+            return False
         return True
 
     def _resolve_identified_spawn(self, obligation: SpawningObligation) -> bool:
