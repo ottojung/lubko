@@ -193,3 +193,95 @@ def test_exit_boundary_forces_fresh_generation_for_late_work(
         assert final["active_runner"] is True
     finally:
         proc.kill_and_reap()
+
+
+def _dead_claimed_meta(aid: str, tmp_path: Path) -> agent.Meta:
+    """Build metadata for a runner that claimed and then died.
+
+    The recorded runner identity belongs to a fully reaped process, so
+    ``runner_alive`` deterministically probes false without any sleeping.
+
+    Returns:
+        Agent metadata in the dead claimed-runner state.
+    """
+    proc = subprocess.Popen(
+        [SLEEP_BIN, "300"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    identity = (proc.pid, agent.proc_start_ticks(proc.pid))
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=5)
+
+    meta = agent.idle_meta(aid, str(tmp_path), None)
+    meta["state"] = "running"
+    meta["active_runner"] = True
+    meta["runner_gen"] = 1
+    meta["runner_pid"], meta["runner_start_time"] = identity
+    meta["runner_reservation"] = _claimed_reservation()
+    agent.write_meta(aid, meta)
+    return meta
+
+
+def test_dead_claimed_runner_preserves_accepted_prompt_exactly_once(
+    tmp_path: Path,
+) -> None:
+    """A prompt accepted before a runner's death survives later prompts once.
+
+    When an exact runner durably claims its reservation but dies before
+    consuming the accepted pending prompt, the very next ordinary prompt must
+    not fall through to a fresh start that overwrites it. Instead the accepted
+    prompt is preserved exactly once and exactly one replacement runner under
+    a fresh generation becomes responsible for consuming it; the late caller
+    itself is explicitly busy.
+    """
+    _dead_claimed_meta("aaaaaaaa", tmp_path)
+    assert agent.read_meta("aaaaaaaa") is not None
+    stored = agent.read_meta("aaaaaaaa")
+    assert stored is not None
+    assert not agent.runner_alive(stored)
+    assert not agent.reservation_in_flight(stored)
+
+    # Accept the original prompt into the durable metadata after claim.
+    agent.update_meta("aaaaaaaa", lambda m: m.__setitem__("pending_prompt", "original"))
+
+    decision: dict[str, object] = {}
+    agent.update_meta("aaaaaaaa", lambda m: _decide_into(m, decision, "late", steer=False))
+
+    assert decision["action"] == "spawn"
+    # The late caller's own prompt was explicitly rejected as busy.
+    assert decision.get("recover_busy") is True
+    final = agent.read_meta("aaaaaaaa")
+    assert final is not None
+    # The older accepted prompt was preserved exactly once.
+    assert final["pending_prompt"] == "original"
+    assert int(final["runner_gen"]) == 2
+    res = final["runner_reservation"]
+    assert isinstance(res, dict)
+    assert res["state"] == "reserved"
+    assert final["active_runner"] is True
+
+
+def test_dead_claimed_runner_that_consumed_prompts_starts_fresh(tmp_path: Path) -> None:
+    """No replay when a dead claimed runner already consumed its prompt.
+
+    A claimed reservation whose runner died after consuming the accepted
+    prompt carries no pending work; the next ordinary prompt starts a fresh
+    generation running only that new prompt, never the consumed one.
+    """
+    meta = _dead_claimed_meta("aaaaaaaa", tmp_path)
+    assert meta.get("pending_prompt") is None
+
+    decision: dict[str, object] = {}
+    agent.update_meta("aaaaaaaa", lambda m: _decide_into(m, decision, "fresh", steer=False))
+
+    assert decision["action"] == "spawn"
+    final = agent.read_meta("aaaaaaaa")
+    assert final is not None
+    assert final["pending_prompt"] == "fresh"
+    assert int(final["runner_gen"]) == 2
+    res = final["runner_reservation"]
+    assert isinstance(res, dict)
+    assert res["state"] == "reserved"
