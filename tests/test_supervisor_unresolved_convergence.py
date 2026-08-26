@@ -128,6 +128,18 @@ def _hold(pid: int = 4242, ticks: int | None = 777) -> UnresolvedChild:
     return UnresolvedChild(pid=pid, start_time_ticks=ticks, token=lifecycle_token, spawned_at=0.0)
 
 
+@pytest.fixture(autouse=True)
+def default_owned_group_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub owned-group recovery as successful by default.
+
+    Hold resolution now requires exact-incarnation group recovery before the
+    blocking authority is cleared; tests must not depend on the developer
+    machine's database configuration. The one test exercising fail-closed
+    recovery behavior overrides this stub explicitly.
+    """
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _token: None)
+
+
 def _alive(hold: UnresolvedChild, fake: FakePinning) -> bool:
     current = fake.proc_start_ticks(hold.pid)
     if hold.start_time_ticks is None:
@@ -420,6 +432,11 @@ def test_resolve_unresolved_child_clears_the_durable_hold(
 
         daemon = supervisor.SupervisorDaemon(supervisor.Settings(stop_grace_seconds=5.0))
         daemon.proc = proc
+        monkeypatch.setattr(
+            supervisor,
+            "recover_owned_groups",
+            lambda _token: None,
+        )
 
         assert daemon._resolve_unresolved_child() is True
         assert read_state().unresolved_child is None, "the durable hold was cleared"

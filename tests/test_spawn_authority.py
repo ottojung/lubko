@@ -16,7 +16,7 @@ import os
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -39,6 +39,17 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     supervise.state_path().parent.mkdir(parents=True, exist_ok=True)
     return supervise.state_path().parent
+
+
+@pytest.fixture(autouse=True)
+def default_owned_group_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub owned-group recovery as successful by default.
+
+    Every test that expects authority resolution must not depend on the
+    developer machine's database configuration; tests exercising the
+    fail-closed recovery behavior override this stub explicitly.
+    """
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _token: None)
 
 
 def _obligation(
@@ -274,8 +285,11 @@ def test_live_first_spawn_blocks_every_new_spawn(monkeypatch: pytest.MonkeyPatch
         proc.poll()
 
 
-def test_recycled_identity_never_extends_the_obligation() -> None:
+def test_recycled_identity_never_extends_the_obligation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A PID whose start ticks differ from the record proves the instance gone."""
+    _patch_recovery(monkeypatch)
     proc = _blocking_child()
     try:
         _write_state_with_spawning(_obligation(pid=proc.pid, ticks=1))
@@ -287,6 +301,223 @@ def test_recycled_identity_never_extends_the_obligation() -> None:
     finally:
         proc.kill()
         proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# Owned-group recovery before dropping pre-publication authority
+# ---------------------------------------------------------------------------
+
+
+def test_recover_unpublished_spawn_failure_keeps_token_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed group recovery after converging an unpublished spawn blocks.
+
+    The worker itself is positively reaped, but its already-launched command
+    groups cannot be recovered: the durable token-bearing obligation must
+    survive (upgraded to the exact observed identity) so no replacement can
+    spawn, and a later successful recovery must reopen the gate.
+    """
+    obligation = _obligation()
+    _write_state_with_spawning(obligation)
+    events: list[str] = []
+    _patch_recovery(monkeypatch, calls=events, error=supervisor.OwnedGroupRecoveryError("db down"))
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    daemon.proc = cast("subprocess.Popen[bytes]", FakeProc(pid=4711))
+
+    assert (
+        daemon._recover_unpublished_spawn(
+            cast("subprocess.Popen[bytes]", FakeProc(pid=4711)), obligation, 555
+        )
+        is None
+    )
+
+    held = read_state().spawning
+    assert held is not None, "the token-bearing blocking authority survived"
+    assert held.token == obligation.token
+    assert held.pid == 4711, "the hold carries the exact observed identity for a precise retry"
+    assert held.start_time_ticks == 555
+    assert read_state().child is None
+
+    # Later recovery success releases the hold and permits the retry.
+    def recovering_recover(token: str) -> None:
+        assert read_state().spawning is not None, (
+            "recovery ran while the blocking authority was already cleared"
+        )
+        observed.append(("recover", token))
+
+    observed: list[tuple[str, str]] = []
+    monkeypatch.setattr(supervisor, "recover_owned_groups", recovering_recover)
+
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
+    assert observed == [("recover", obligation.token)]
+
+
+def test_identified_dead_worker_group_recovery_failure_keeps_the_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolved dead identified worker still owes exact group recovery.
+
+    The worker PID is provably gone (recycled identity), but its command
+    groups are independent process groups: failed recovery must keep the
+    obligation durable, and later success must recover under the exact token
+    before the authority is cleared.
+    """
+    obligation = _obligation(pid=os.getpid(), ticks=1)
+    _write_state_with_spawning(obligation)
+    events: list[str] = []
+    _patch_recovery(monkeypatch, calls=events, error=supervisor.OwnedGroupRecoveryError("db down"))
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        daemon,
+        "_spawn_worker",
+        lambda _commit: pytest.fail("unrecovered owned groups authorized a replacement"),
+    )
+    daemon._ensure_worker(COMMIT)
+
+    held = read_state().spawning
+    assert held is not None, "the blocking obligation survived"
+    assert held.token == obligation.token
+    assert read_state().child is None
+    assert daemon._message is not None
+    assert events == ["recover"], "recovery ran before any respawn decision"
+
+    observed = _patch_recovery(monkeypatch)
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
+    assert observed == [("recover", obligation.token)]
+
+
+def test_identified_converged_worker_group_recovery_failure_keeps_the_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Converging a live identified worker is not enough to drop its token.
+
+    The successor terminates and positively reaps the exact recorded instance,
+    yet failed owned-group recovery must keep both the pre-spawn obligation
+    and the unresolved hold durable; a later successful recovery clears them.
+    """
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    obligation = _obligation()
+    proc = _blocking_child()
+    try:
+        ticks = proc_start_ticks(proc.pid)
+        assert ticks is not None
+        _write_state_with_spawning(
+            _obligation(pid=proc.pid, ticks=ticks, boot_id=obligation.boot_id)
+        )
+        stored = read_state().spawning
+        assert stored is not None
+
+        daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+        daemon.proc = proc
+
+        events: list[str] = []
+        _patch_recovery(
+            monkeypatch, calls=events, error=supervisor.OwnedGroupRecoveryError("db down")
+        )
+        assert daemon._resolve_spawning_obligation() is False
+        assert proc.poll() is not None, "the worker instance was positively reaped"
+        held = read_state().spawning
+        assert held is not None, "token authority survived"
+        assert held.token == stored.token
+        assert read_state().unresolved_child is not None, "the exact-identity hold survived"
+
+        observed = _patch_recovery(monkeypatch)
+        assert daemon._resolve_spawning_obligation() is True
+        assert read_state().spawning is None
+        assert read_state().unresolved_child is None
+        assert [token for _, token in observed] == [stored.token]
+    finally:
+        proc.poll()
+
+
+class UnconvergableProc:
+    """``Popen`` stand-in whose exit can never be positively proven."""
+
+    def __init__(self, pid: int) -> None:
+        """Record the fake PID.
+
+        Args:
+            pid: The PID the fake spawn reports.
+        """
+        self.pid = pid
+
+    @staticmethod
+    def poll() -> int | None:
+        """Report the child as still running.
+
+        Returns:
+            ``None``: the fake child never exits.
+        """
+        return None
+
+    @staticmethod
+    def terminate() -> None:
+        """Nothing to terminate."""
+
+    @staticmethod
+    def kill() -> None:
+        """Nothing to kill."""
+
+    @staticmethod
+    def wait(timeout: float | None = None) -> int:
+        """Never report an exit.
+
+        Args:
+            timeout: The elapsed timeout.
+
+        Raises:
+            subprocess.TimeoutExpired: Always, simulating an unexitable child.
+        """
+        raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout or 0.0)
+
+
+def test_transferred_unresolved_hold_clears_only_after_group_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token-bearing hold from failed identity publication owes recovery.
+
+    When the unpublished spawn's worker cannot be converged in-line, its token
+    authority transfers to an unresolved-child hold. That hold may only be
+    cleared once the exact worker instance is converged *and* its owned command
+    groups are recovered under the same token; failure keeps the hold durable,
+    later success releases it.
+    """
+    obligation = _obligation()
+    _write_state_with_spawning(obligation)
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    proc = cast("subprocess.Popen[bytes]", UnconvergableProc(pid=4711))
+    daemon.proc = proc
+
+    assert daemon._recover_unpublished_spawn(proc, obligation, 555) is None
+    transferred = read_state().unresolved_child
+    assert transferred is not None, "the token authority transferred to a durable hold"
+    assert transferred.token == obligation.token
+    assert read_state().spawning is None
+
+    events: list[str] = []
+    _patch_recovery(monkeypatch, calls=events, error=supervisor.OwnedGroupRecoveryError("db down"))
+    monkeypatch.setattr(
+        daemon,
+        "_spawn_worker",
+        lambda _commit: pytest.fail("an unresolved hold authorized a replacement"),
+    )
+    daemon._ensure_worker(COMMIT)
+
+    assert read_state().unresolved_child is not None, "the blocking hold survived"
+    assert read_state().child is None
+    assert daemon._message is not None
+    assert events == ["recover"], "group recovery ran before any respawn decision"
+
+    observed = _patch_recovery(monkeypatch)
+    assert daemon._resolve_unresolved_child() is True
+    assert read_state().unresolved_child is None
+    assert observed == [("recover", obligation.token)]
 
 
 def test_live_identified_first_spawn_converges_by_exact_pinned_signal(
@@ -301,6 +532,7 @@ def test_live_identified_first_spawn_converges_by_exact_pinned_signal(
     ownership path reaps it positively.
     """
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    _patch_recovery(monkeypatch)
     proc = _blocking_child()
     try:
         ticks = proc_start_ticks(proc.pid)
@@ -446,3 +678,196 @@ def test_child_side_pdeathsig_failure_never_execs_worker_code(
     assert daemon._spawn_worker(COMMIT) is None
     assert read_state().spawning is None, "durable authority was safely cleared"
     assert not sentinel.exists(), "worker user code ran despite the failed install"
+
+
+# ---------------------------------------------------------------------------
+# Unproven-spawn settlement owes exact-token group recovery before release
+# ---------------------------------------------------------------------------
+
+
+def _settle_obligation() -> SpawningObligation:
+    """Build an identified obligation as the identity-upgrade write left it.
+
+    Returns:
+        The obligation record with an exact child identity.
+    """
+    return _obligation(pid=4711, ticks=555)
+
+
+class LiveConvergableProc:
+    """``Popen`` stand-in that is live at entry and converges immediately."""
+
+    def __init__(self, pid: int) -> None:
+        """Record the fake PID.
+
+        Args:
+            pid: The PID the fake spawn reports.
+        """
+        self.pid = pid
+
+    @staticmethod
+    def poll() -> int | None:
+        """Report the child as still running until convergence.
+
+        Returns:
+            ``None``: only ``_converge_direct_child`` ends the child.
+        """
+        return None
+
+    @staticmethod
+    def terminate() -> None:
+        """Nothing to terminate."""
+
+    @staticmethod
+    def kill() -> None:
+        """Nothing to kill."""
+
+    @staticmethod
+    def wait(timeout: float | None = None) -> int:
+        """Report an immediate exit when convergence waits for it.
+
+        Args:
+            timeout: Ignored.
+
+        Returns:
+            The fake exit code.
+        """
+        del timeout
+        return 0
+
+
+class ExitDuringObservationProc:
+    """``Popen`` stand-in that exits while its identity is being observed."""
+
+    def __init__(self, pid: int) -> None:
+        """Start with one live observation (the entry liveness check).
+
+        Args:
+            pid: The PID the fake spawn reports.
+        """
+        self.pid = pid
+        self._polls = 0
+
+    def poll(self) -> int | None:
+        """Report live on the first call and exited afterwards.
+
+        Returns:
+            ``None`` while still nominally running, then the exit code.
+        """
+        self._polls += 1
+        return None if self._polls == 1 else 0
+
+    @staticmethod
+    def terminate() -> None:
+        """Nothing to terminate."""
+
+    @staticmethod
+    def kill() -> None:
+        """Nothing to kill."""
+
+    @staticmethod
+    def wait(timeout: float | None = None) -> int:
+        """Report an immediate exit once convergence is attempted.
+
+        Args:
+            timeout: Ignored.
+
+        Returns:
+            The fake exit code.
+        """
+        del timeout
+        return 0
+
+
+def test_already_exited_unproven_spawn_recovery_failure_then_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-exited unproven spawn still owes exact group recovery."""
+    obligation = _settle_obligation()
+    _write_state_with_spawning(obligation)
+    events: list[str] = []
+    _patch_recovery(monkeypatch, calls=events, error=supervisor.OwnedGroupRecoveryError("db down"))
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    daemon.proc = cast("subprocess.Popen[bytes]", FakeProc(pid=4711))
+
+    assert daemon._settle_unproven_spawn(COMMIT, daemon.proc, obligation.token, "w") is None
+
+    held = read_state().spawning
+    assert held is not None, "token authority survived the failed recovery"
+    assert held.token == obligation.token
+    assert read_state().child is None
+    assert daemon._message is not None
+    assert events == ["recover"]
+
+    observed: list[tuple[str, str]] = []
+
+    def ordered_recover(token: str) -> None:
+        assert read_state().spawning is not None, "authority was cleared before recovery"
+        observed.append(("recover", token))
+
+    monkeypatch.setattr(supervisor, "recover_owned_groups", ordered_recover)
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
+    assert observed == [("recover", obligation.token)]
+
+
+def test_converged_unproven_spawn_recovery_failure_then_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct convergence of a live unproven spawn does not drop token authority."""
+    obligation = _settle_obligation()
+    _write_state_with_spawning(obligation)
+    proc = cast("subprocess.Popen[bytes]", LiveConvergableProc(pid=4711))
+    events: list[str] = []
+    _patch_recovery(monkeypatch, calls=events, error=supervisor.OwnedGroupRecoveryError("db down"))
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    daemon.proc = proc
+
+    assert daemon._settle_unproven_spawn(COMMIT, proc, obligation.token, "w") is None
+
+    held = read_state().spawning
+    assert held is not None
+    assert held.token == obligation.token
+    assert read_state().child is None
+    assert events == ["recover"], "recovery ran before any respawn decision"
+
+    observed = _patch_recovery(monkeypatch)
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
+    assert [token for _, token in observed] == [obligation.token]
+
+
+def test_exit_during_observation_recovery_failure_then_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child exiting during identity observation owes exact group recovery."""
+    obligation = _settle_obligation()
+    _write_state_with_spawning(obligation)
+    proc = ExitDuringObservationProc(pid=4711)
+    events: list[str] = []
+    _patch_recovery(monkeypatch, calls=events, error=supervisor.OwnedGroupRecoveryError("db down"))
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    daemon.proc = cast("subprocess.Popen[bytes]", proc)
+    monkeypatch.setattr(daemon, "_converge_direct_child", lambda _proc: False)
+    monkeypatch.setattr(daemon, "_await_observable_identity", lambda _proc: None)
+
+    assert (
+        daemon._settle_unproven_spawn(
+            COMMIT, cast("subprocess.Popen[bytes]", proc), obligation.token, "w"
+        )
+        is None
+    )
+
+    held = read_state().spawning
+    assert held is not None
+    assert held.token == obligation.token
+    assert read_state().child is None
+    assert events == ["recover"]
+
+    observed = _patch_recovery(monkeypatch)
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
+    assert [token for _, token in observed] == [obligation.token]
