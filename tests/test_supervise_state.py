@@ -416,9 +416,19 @@ def test_absent_boot_identity_is_treated_as_prior_boot(
     assert state.ownership_hold_malformed is False
 
 
+def test_fresh_state_round_trip_has_no_boot_identity_key(state_path: Path) -> None:
+    """Legacy unknown-boot state omits the key instead of writing null."""
+    supervise.write_state(supervise.fresh_state())
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "boot_id" not in payload
+    state = supervise.read_state()
+    assert state.boot_id is None
+    assert state.ownership_hold_malformed is False
+
+
 @pytest.mark.parametrize(
     "raw_boot_id",
-    [1, True, 1.5, [], {}, ["x"], {"b": BOOT_A}, ""],
+    [1, True, 1.5, [], {}, ["x"], {"b": BOOT_A}, None, ""],
 )
 def test_present_malformed_boot_identity_is_durable_hold(
     state_path: Path, raw_boot_id: object
@@ -433,22 +443,31 @@ def test_present_malformed_boot_identity_is_durable_hold(
     assert rewritten.ownership_hold_malformed is True
 
 
-def test_explicit_null_boot_identity_keeps_legacy_unknown_boot_behavior(
+def test_explicit_null_boot_identity_preserves_active_backoff(
     state_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Explicit JSON null stays the valid unknown-boot representation."""
-    write_raw_state(state_path, boot_id=None, next_attempt_at=999.5)
+    """Explicit JSON null is corruption: it holds instead of resetting."""
+    write_raw_state(state_path, boot_id=None, next_attempt_at=1000.0)
     monkeypatch.setattr(supervise, "current_boot_id", lambda: BOOT_B)
 
     supervisor.normalize_cross_boot_state()
 
     state = supervise.read_state()
-    assert state.boot_id == BOOT_B
-    assert state.next_attempt_at is None
-    assert state.ownership_hold_malformed is False
+    assert state.next_attempt_at is not None
+    assert state.ownership_hold_malformed is True
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        daemon,
+        "_ensure_worker",
+        lambda _commit: pytest.fail("corrupted boot identity authorized spawn"),
+    )
+    daemon.reconcile(0.0)
+    assert daemon._message is not None
+    assert "malformed" in daemon._message
 
 
-@pytest.mark.parametrize("raw_boot_id", ["", 1, True, [], {}])
+@pytest.mark.parametrize("raw_boot_id", [None, "", 1, True, [], {}])
 def test_corrupted_boot_identity_never_erases_active_backoff(
     state_path: Path, monkeypatch: pytest.MonkeyPatch, raw_boot_id: object
 ) -> None:

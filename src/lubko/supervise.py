@@ -415,7 +415,7 @@ class SupervisorState:
             "last_spawn_at": self.last_spawn_at,
             "ready": self.ready,
             "next_readiness_at": self.next_readiness_at,
-            "boot_id": self.boot_id,
+            **({} if self.boot_id is None else {"boot_id": self.boot_id}),
         }
 
     @classmethod
@@ -1536,16 +1536,15 @@ def _parse_present_boot_identity(
         key: Field name.
 
     Returns:
-        A ``(value, malformed)`` pair: the parsed identifier (``None`` for
-        genuine absence of the key or an explicit JSON null, which stays
-        the legacy unknown-boot representation) and whether a present
-        non-null value was not a non-empty string. Empty strings,
+        A ``(value, malformed)`` pair: the parsed identifier (``None``
+        only for genuine absence of the key) and whether a present value
+        was not a non-empty string. Explicit null, empty strings,
         booleans, numbers, and containers are all malformed: any present
-        non-null boot identity must positively prove its clock domain.
+        boot identity must positively prove its clock domain.
     """
-    raw = data.get(key)
-    if raw is None:
+    if key not in data:
         return None, False
+    raw = data[key]
     return (raw, False) if isinstance(raw, str) and raw else (None, True)
 
 
