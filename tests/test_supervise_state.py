@@ -416,7 +416,10 @@ def test_absent_boot_identity_is_treated_as_prior_boot(
     assert state.ownership_hold_malformed is False
 
 
-@pytest.mark.parametrize("raw_boot_id", [1, True, 1.5, [], {}, ["x"], {"b": BOOT_A}])
+@pytest.mark.parametrize(
+    "raw_boot_id",
+    [1, True, 1.5, [], {}, ["x"], {"b": BOOT_A}, ""],
+)
 def test_present_malformed_boot_identity_is_durable_hold(
     state_path: Path, raw_boot_id: object
 ) -> None:
@@ -430,7 +433,22 @@ def test_present_malformed_boot_identity_is_durable_hold(
     assert rewritten.ownership_hold_malformed is True
 
 
-@pytest.mark.parametrize("raw_boot_id", [1, True, [], {}])
+def test_explicit_null_boot_identity_keeps_legacy_unknown_boot_behavior(
+    state_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit JSON null stays the valid unknown-boot representation."""
+    write_raw_state(state_path, boot_id=None, next_attempt_at=999.5)
+    monkeypatch.setattr(supervise, "current_boot_id", lambda: BOOT_B)
+
+    supervisor.normalize_cross_boot_state()
+
+    state = supervise.read_state()
+    assert state.boot_id == BOOT_B
+    assert state.next_attempt_at is None
+    assert state.ownership_hold_malformed is False
+
+
+@pytest.mark.parametrize("raw_boot_id", ["", 1, True, [], {}])
 def test_corrupted_boot_identity_never_erases_active_backoff(
     state_path: Path, monkeypatch: pytest.MonkeyPatch, raw_boot_id: object
 ) -> None:

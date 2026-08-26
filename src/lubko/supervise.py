@@ -455,12 +455,13 @@ class SupervisorState:
             # backoff and let reconciliation restart immediately from a
             # corrupted schedule. Enter the durable hold.
             ownership_hold_malformed = True
-        boot_id, boot_malformed = _parse_present_optional_string(data, "boot_id")
+        boot_id, boot_malformed = _parse_present_boot_identity(data, "boot_id")
         if boot_malformed:
-            # A present-but-malformed boot identifier must never silently
-            # degrade to absence: cross-boot normalization would then treat
-            # the state as written by an unknown prior boot and erase an
-            # active crash-loop backoff deadline. Enter the durable hold.
+            # Any present boot identifier must be a non-empty string: a
+            # malformed one must never silently degrade to absence, since
+            # cross-boot normalization would then treat the state as
+            # written by an unknown prior boot and erase an active
+            # crash-loop backoff deadline. Enter the durable hold.
             ownership_hold_malformed = True
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
@@ -1524,25 +1525,28 @@ def _parse_present_strict(
     return (value or 0), value is None
 
 
-def _parse_present_optional_string(
+def _parse_present_boot_identity(
     data: dict[str, object],
     key: str,
 ) -> tuple[str | None, bool]:
-    """Parse an optional string identity field.
+    """Parse the boot identity field, distinguishing absence from corruption.
 
     Args:
         data: Decoded durable state mapping.
         key: Field name.
 
     Returns:
-        A ``(value, malformed)`` pair: the parsed string (``None`` for
-        genuine absence or explicit null) and whether a present non-null
-        value was malformed.
+        A ``(value, malformed)`` pair: the parsed identifier (``None`` for
+        genuine absence of the key or an explicit JSON null, which stays
+        the legacy unknown-boot representation) and whether a present
+        non-null value was not a non-empty string. Empty strings,
+        booleans, numbers, and containers are all malformed: any present
+        non-null boot identity must positively prove its clock domain.
     """
     raw = data.get(key)
     if raw is None:
         return None, False
-    return (raw, False) if isinstance(raw, str) else (None, True)
+    return (raw, False) if isinstance(raw, str) and raw else (None, True)
 
 
 def _parse_present_nullable_float(
