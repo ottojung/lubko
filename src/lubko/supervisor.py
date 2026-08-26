@@ -1527,6 +1527,37 @@ class SupervisorDaemon:
             return False
         return True
 
+    def _release_unproven_spawn_authority(self, token: str, *, hold_persisted: bool) -> bool:
+        """Drop pre-publication spawn authority only after group recovery.
+
+        The worker instance is already proven gone by the caller. Its owned
+        command groups must then be recovered under the same exact token; on
+        success the spawning obligation (and any persisted unresolved hold) is
+        durably cleared so the failed spawn remains an ordinary retryable
+        failure. On recovery failure nothing is cleared: the token-bearing
+        obligation stays blocking and a later tick retries the recovery.
+
+        Args:
+            token: Lifecycle token of the proven-gone spawn incarnation.
+            hold_persisted: Whether an authority-free unresolved hold for this
+                child was already recorded and must be released with it.
+
+        Returns:
+            ``True`` when every durable blocker was positively released.
+        """
+        if not self._recover_spawn_owned_groups(token):
+            return False
+        state = read_state()
+        write_state(
+            replace(
+                state,
+                spawning=None,
+                unresolved_child=None if hold_persisted else state.unresolved_child,
+            )
+        )
+        self.proc = None
+        return True
+
     @staticmethod
     def _preserve_blocking_obligation(
         obligation: SpawningObligation,
@@ -1642,7 +1673,12 @@ class SupervisorDaemon:
         child that is still alive when the identity deadline expires. A live
         child is never forgotten: while it is still this supervisor's direct
         ``Popen`` child it is converged with exact single-PID signals and its
-        exit is positively proven by reaping. If convergence cannot be proven,
+        exit is positively proven by reaping. Because a pre-publication worker
+        may already have launched independent command process groups under its
+        token, every authority-dropping branch additionally requires
+        exact-incarnation owned-group recovery to succeed first; failure keeps
+        the durable obligation (and any persisted hold) blocking and
+        retryable. If convergence cannot be proven,
         ownership is durably retained so no later reconciliation (including
         after a supervisor restart) can start a second maintained worker
         alongside the unresolved first child. Group authority is only ever
@@ -1663,8 +1699,10 @@ class SupervisorDaemon:
         """
         if proc.poll() is not None:
             LOGGER.error("worker for commit %s exited before establishing its identity", commit)
-            write_state(replace(read_state(), spawning=None))
-            self.proc = None
+            # Even an already-exited pre-publication worker may have launched
+            # independent command groups under this token; recovery must
+            # succeed before the durable authority is dropped.
+            self._release_unproven_spawn_authority(token, hold_persisted=False)
             return None
         LOGGER.error(
             "worker pid %d for commit %s is live without an acceptable identity; converging it",
@@ -1674,20 +1712,15 @@ class SupervisorDaemon:
         hold_persisted = False
         while True:
             if self._converge_direct_child(proc):
-                # Converged while a crash-safe hold was already on disk:
-                # clear it so an ordinary retryable failure can proceed.
-                if hold_persisted:
-                    write_state(replace(read_state(), unresolved_child=None))
-                write_state(replace(read_state(), spawning=None))
-                self.proc = None
+                # The worker itself is positively reaped, but its owned command
+                # groups may still be alive under this same incarnation.
+                self._release_unproven_spawn_authority(token, hold_persisted=hold_persisted)
                 return None
             observed = self._await_observable_identity(proc)
             if observed is None and proc.poll() is not None:
-                # The child exited during the hold: an ordinary retryable failure.
-                if hold_persisted:
-                    write_state(replace(read_state(), unresolved_child=None))
-                write_state(replace(read_state(), spawning=None))
-                self.proc = None
+                # The child exited during the hold: the exact-token groups it
+                # may have launched still owe fail-closed recovery.
+                self._release_unproven_spawn_authority(token, hold_persisted=hold_persisted)
                 return None
             if observed is not None and _identity_is_private_session(observed):
                 self._record_proven_private_child(observed, token, worker_id)
