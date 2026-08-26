@@ -148,14 +148,82 @@ def test_present_malformed_obligation_is_durable_hold(
 # ---------------------------------------------------------------------------
 
 
-def test_pid_less_obligation_from_dead_creator_resolves() -> None:
+def _patch_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    calls: list[str] | None = None,
+    error: Exception | None = None,
+) -> list[tuple[str, str]]:
+    """Patch owned-group recovery inside the supervisor module.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        calls: Optional ordered event log appended to during resolution.
+        error: When given, the recovery stub raises ``OwnedGroupRecoveryError``.
+
+    Returns:
+        The list of ``(event, token)`` tuples recorded so far.
+    """
+    observed: list[tuple[str, str]] = []
+    log = calls if calls is not None else []
+
+    def fake_recover(token: str) -> None:
+        observed.append(("recover", token))
+        log.append("recover")
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(supervisor, "recover_owned_groups", fake_recover)
+    return observed
+
+
+def test_pid_less_obligation_from_dead_creator_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A crash between the pre-Popen write and the identity upgrade resolves."""
-    _write_state_with_spawning(_obligation())
+    obligation = _obligation()
+    _write_state_with_spawning(obligation)
+    observed = _patch_recovery(monkeypatch)
 
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
 
     assert daemon._resolve_spawning_obligation() is True
     assert read_state().spawning is None, "the resolved obligation was durably cleared"
+    assert observed == [("recover", obligation.token)], (
+        "owned command groups were recovered under the exact worker incarnation"
+    )
+
+
+def test_owned_group_recovery_failure_keeps_the_pid_less_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed owned-group recovery keeps the hold and forbids any spawn."""
+    obligation = _obligation()
+    _write_state_with_spawning(obligation)
+    events: list[str] = []
+    _patch_recovery(monkeypatch, calls=events, error=supervisor.OwnedGroupRecoveryError("db down"))
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    spawn_attempts: list[str] = []
+
+    def record_spawn(commit: str) -> None:
+        spawn_attempts.append(commit)
+
+    monkeypatch.setattr(daemon, "_spawn_worker", record_spawn)
+
+    daemon._ensure_worker(COMMIT)
+    assert spawn_attempts == [], "a blocked obligation authorized a spawn"
+    assert read_state().spawning is not None, "the blocking obligation survived"
+    assert read_state().child is None, "no replacement worker was started"
+    assert daemon._message is not None
+    assert "holding" in daemon._message
+    assert events == ["recover"], "recovery ran before any respawn decision"
+
+    # A later successful recovery positively converges the groups and opens
+    # the gate again.
+    _patch_recovery(monkeypatch)
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
 
 
 def test_previous_boot_obligation_resolves_without_evidence() -> None:
