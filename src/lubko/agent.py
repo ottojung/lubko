@@ -2670,13 +2670,20 @@ def _recover_stale_reservation(
     prompt: str,
     steer: bool,
 ) -> bool:
-    """Recover a stale reserved runner, preserving the accepted pending prompt.
+    """Recover a stale reserved or pre-consumption claimed runner.
 
-    Returns ``True`` only when ``m`` holds a reserved runner whose spawner or
-    runner died before claiming its exact identity (nothing genuinely in
-    flight). The caller re-owns the reservation under a fresh generation so the
-    stale old generation is invalidated, and starts exactly one replacement
-    runner.
+    Preserves the accepted pending prompt. Returns ``True`` only when ``m``
+    holds a reserved runner whose spawner or
+    runner died before claiming its exact identity, or a runner that durably
+    claimed its identity but died before consuming the accepted pending prompt
+    (nothing genuinely in flight). The caller re-owns the reservation under a
+    fresh generation so the stale old generation is invalidated, and starts
+    exactly one replacement runner.
+
+    A claimed runner that already consumed its prompt (no ``pending_prompt``
+    survives) is not recovered here: the stale claimed authority is dropped and
+    the caller falls through to an ordinary fresh start, so the consumed prompt
+    is never replayed.
 
     The already-accepted pending prompt is preserved and never overwritten. When
     an accepted prompt exists:
@@ -2709,9 +2716,15 @@ def _recover_stale_reservation(
         ``True`` when a stale reservation was recovered here.
     """
     res = m.get("runner_reservation")
-    if not (isinstance(res, dict) and res.get("state") == "reserved"):
+    if not (isinstance(res, dict) and res.get("state") in {"reserved", "claimed"}):
         return False
     if reservation_in_flight(m):
+        return False
+    if res.get("state") == "claimed" and not m.get("pending_prompt"):
+        # The exact runner consumed the accepted prompt before dying; there is
+        # nothing to preserve and nothing to replay. Drop the dead claimed
+        # authority and let the caller's fresh start own the next invocation.
+        _set_active_runner(m, value=False)
         return False
     now = time.time()
     caller_pid = os.getpid()
@@ -2903,7 +2916,8 @@ def _apply_locked_transition(
         return
 
     # A stale reserved runner (spawner or runner died before claiming its exact
-    # identity) is recovered here: the accepted pending prompt is preserved and
+    # identity) or a claimed runner that died before consuming its accepted
+    # prompt is recovered here: the accepted pending prompt is preserved and
     # exactly one replacement runner is started under a fresh generation.
     if _recover_stale_reservation(m, decision, prompt=prompt, steer=steer):
         return
