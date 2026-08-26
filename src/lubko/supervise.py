@@ -1271,6 +1271,8 @@ def next_generation() -> int:
         The next monotonic generation.
     """
     applied = read_state().applied_generation
+    # A present malformed desired file is durable authority, not absence: a
+    # writer must fail closed rather than erase or outrank an unreadable intent.
     desired = read_desired_strict()
     desired_generation = desired.generation if desired is not None else 0
     return max(applied, desired_generation, _mission_generation()) + 1
