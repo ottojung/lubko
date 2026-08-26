@@ -38,3 +38,8 @@ uv run ruff check .
 uv run mypy .
 uv run pytest
 ```
+
+## License
+
+Lubko is licensed under the GNU Affero General Public License version 3 only
+(`AGPL-3.0-only`). See [LICENSE](LICENSE) for the full, canonical license text.
