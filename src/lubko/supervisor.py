@@ -1466,6 +1466,7 @@ class SupervisorDaemon:
             start_time_ticks=None,
             created_at=time.time(),
             boot_id=current_boot_id(),
+            parent_death_signal=True,
         )
         write_state(replace(read_state(), spawning=obligation))
         preexec = functools.partial(_child_preexec, os.getpid()) if _pdeathsig_supported() else None
@@ -2074,6 +2075,18 @@ class SupervisorDaemon:
             self._message = (
                 "a pre-spawn recovery obligation of this supervisor incarnation is "
                 "outstanding; holding without starting another worker"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        if not obligation.parent_death_signal:
+            # This spawn carried no kernel parent-death guarantee (a manually
+            # started recovery worker), so the pid-less record cannot be
+            # resolved by assumption: the spawned worker may still be live
+            # and consuming. Failing closed keeps every replacement blocked.
+            self._message = (
+                "a pid-less recovery obligation without a kernel parent-death "
+                "guarantee exists; resolve it with 'lubko-deploy recover' or "
+                "operator repair before any consumer may start"
             )
             LOGGER.error("%s", self._message)
             return False

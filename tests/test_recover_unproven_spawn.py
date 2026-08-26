@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import signal
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from lubko import lifecycle
+from lubko import lifecycle, supervise, supervisor
+from lubko.durable import DurabilityError
 from lubko.lifecycle import DeployOptions, ProcessIdentity
 
 COMMIT = "c" * 40
 PID = 4242
+TOKEN = "T" * 32
 PRIVATE = ProcessIdentity(pid=PID, pgid=PID, sid=PID, start_time_ticks=555)
 NON_PRIVATE = ProcessIdentity(pid=PID, pgid=1, sid=9000, start_time_ticks=555)
 PIN_BASE = 20000
@@ -96,19 +100,92 @@ def options() -> DeployOptions:
     )
 
 
-@pytest.fixture
-def recover_env(monkeypatch: pytest.MonkeyPatch) -> list[FakePopen]:
-    """Stub preflight, logging, and spawning with deterministic fakes.
+def _write_obligation() -> None:
+    """Durably record a stale recovery obligation for the forced token."""
+    supervise.write_state(
+        replace(
+            supervise.read_state(),
+            spawning=replace(
+                _pid_less_obligation(),
+                pid=PID,
+            ),
+        )
+    )
+
+
+def _pid_less_obligation() -> supervise.SpawningObligation:
+    """Build a pid-less manual recovery obligation for the forced token.
+
+    Returns:
+        The replacement-blocking obligation.
+    """
+    return supervise.SpawningObligation(
+        token=TOKEN,
+        commit=COMMIT,
+        creator_pid=999999,
+        creator_start_time_ticks=1,
+        pid=None,
+        start_time_ticks=None,
+        created_at=0.0,
+        boot_id=None,
+        parent_death_signal=False,
+    )
+
+
+def _write_pid_less_obligation() -> None:
+    """Durably record a pid-less manual recovery obligation."""
+    supervise.write_state(replace(supervise.read_state(), spawning=_pid_less_obligation()))
+
+
+@pytest.fixture(autouse=True)
+def isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Use an isolated durable supervisor-state root for each test.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        The supervisor state directory.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    supervise.state_path().parent.mkdir(parents=True, exist_ok=True)
+    return supervise.state_path().parent
+
+
+@pytest.fixture(autouse=True)
+def deterministic_token(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Force a known recovery-worker lifecycle token.
 
     Args:
         monkeypatch: Pytest monkeypatch fixture.
 
     Returns:
-        The list receiving every spawned fake child.
+        The forced token.
+    """
+    monkeypatch.setattr("secrets.token_hex", lambda _n: TOKEN)
+    return TOKEN
+
+
+@pytest.fixture
+def recover_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[FakePopen], list[tuple[str, str]]]:
+    """Stub preflight, logging, spawning, and owned-group recovery.
+
+    Owned-group recovery succeeds by default and records every
+    ``(token, event)`` observation so tests can assert exact ordering.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+
+    Returns:
+        The spawned fake children and the ordered recovery observations.
     """
     monkeypatch.setattr(lifecycle, "_recover_preflight", lambda _options: COMMIT)
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
     spawned: list[FakePopen] = []
+    events: list[tuple[str, str]] = []
 
     def spawn(*_args: object, **_kwargs: object) -> FakePopen:
         """Return a fresh fake live child."""
@@ -116,10 +193,23 @@ def recover_env(monkeypatch: pytest.MonkeyPatch) -> list[FakePopen]:
         spawned.append(fake)
         return fake
 
+    def recover(token: str) -> bool:
+        """Record the recovery attempt as successful.
+
+        Args:
+            token: The recovered worker token.
+
+        Returns:
+            Always ``True``.
+        """
+        events.append((token, "recovered"))
+        return True
+
     monkeypatch.setattr(lifecycle, "spawn_worker", spawn)
+    monkeypatch.setattr(lifecycle, "_recover_owned_groups", recover)
     monkeypatch.setattr("os.kill", lambda *_a: _numeric_signal_forbidden())
     monkeypatch.setattr("os.killpg", lambda *_a: _numeric_signal_forbidden())
-    return spawned
+    return spawned, events
 
 
 def observe(monkeypatch: pytest.MonkeyPatch, observed: ProcessIdentity | None) -> None:
@@ -173,40 +263,56 @@ def install_convergence(
 def test_recover_converges_live_child_when_identity_is_none(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    recover_env: list[FakePopen],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
 ) -> None:
     """A live child with no observable identity is converged before failing."""
+    spawned, _events = recover_env
     observe(monkeypatch, None)
-    converged: list[tuple[FakePopen, float, ProcessIdentity | None]] = []
-    monkeypatch.setattr(
-        lifecycle,
-        "_converge_unproven_spawn",
-        lambda proc, grace, anchor: converged.append((proc, grace, anchor)),
-    )
+    order: list[str] = []
+
+    def converge(proc: FakePopen, grace: float, anchor: ProcessIdentity | None) -> None:
+        """Record direct-child convergence ahead of group recovery."""
+        del proc, grace, anchor
+        order.append("converged")
+
+    def recover(token: str) -> bool:
+        """Record exact owned-group recovery for the forced token.
+
+        Args:
+            token: The recovered worker token.
+
+        Returns:
+            Always ``True``.
+        """
+        order.append(f"recovered:{token}")
+        return True
+
+    monkeypatch.setattr(lifecycle, "_converge_unproven_spawn", converge)
+    monkeypatch.setattr(lifecycle, "_recover_owned_groups", recover)
 
     code = lifecycle._recover_locked(options())
 
     assert code == lifecycle.EXIT_ERROR
     assert "converging" in capsys.readouterr().err
-    assert len(converged) == 1
-    proc, _grace, anchor = converged[0]
-    assert proc is recover_env[-1]
-    assert anchor is None
-    assert proc.poll() is None
+    assert len(spawned) == 1
+    assert spawned[0].poll() is None
+    assert order == ["converged", f"recovered:{TOKEN}"]
+    assert supervise.read_state().spawning is None
 
 
 def test_recover_converges_live_child_with_non_private_identity(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    recover_env: list[FakePopen],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
 ) -> None:
     """A live non-private session child is exactly signalled via its pin."""
+    spawned, _events = recover_env
     observe(monkeypatch, NON_PRIVATE)
     fake = FakePopen(PID)
 
     def spawn(*_args: object, **_kwargs: object) -> FakePopen:
         """Return the prebuilt non-private-session fake child."""
-        recover_env.append(fake)
+        spawned.append(fake)
         return fake
 
     monkeypatch.setattr(lifecycle, "spawn_worker", spawn)
@@ -220,12 +326,236 @@ def test_recover_converges_live_child_with_non_private_identity(
     assert fake.poll() == -15
 
 
+def test_recover_recovers_owned_groups_on_every_failure_exit(
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every post-spawn failure exit recovers the token's groups first."""
+    _spawned, events = recover_env
+
+    def converge(*_args: object) -> None:
+        """Deterministically skip direct-child convergence."""
+
+    monkeypatch.setattr(lifecycle, "_converge_unproven_spawn", converge)
+    for observed in (None, NON_PRIVATE):
+        observe(monkeypatch, observed)
+        assert lifecycle._recover_locked(options()) == lifecycle.EXIT_ERROR
+        assert "adopt it with" not in capsys.readouterr().out
+    # The dead-after-private-session exit path must also recover the groups.
+    observe(monkeypatch, PRIVATE)
+
+    def spawn_dead(*_args: object, **_kwargs: object) -> FakePopen:
+        """Return a child whose private session already exited."""
+        dead = FakePopen(PID)
+        dead.returncode = 0
+        return dead
+
+    monkeypatch.setattr(lifecycle, "spawn_worker", spawn_dead)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_ERROR
+
+    recovered = {token for token, event in events if event == "recovered"}
+    assert recovered == {TOKEN}
+
+
+def test_recover_records_durable_authority_when_group_recovery_fails(
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed owned-group recovery leaves a durable blocking obligation."""
+    _spawned, _events = recover_env
+    observe(monkeypatch, None)
+    monkeypatch.setattr(lifecycle, "_converge_unproven_spawn", lambda *_a: None)
+    monkeypatch.setattr(lifecycle, "_recover_owned_groups", lambda _token: False)
+
+    code = lifecycle._recover_locked(options())
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "could not be recovered" in captured.err
+    obligation = supervise.read_state().spawning
+    assert obligation is not None
+    assert obligation.token == TOKEN
+    assert obligation.commit == COMMIT
+    assert obligation.pid == PID
+    assert json.loads(supervise.state_path().read_text())["spawning"]["token"] == TOKEN
+
+
+def test_recover_refuses_to_spawn_until_stale_obligation_resolves(
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later recover neither races unresolved groups nor forgets them."""
+    spawned, events = recover_env
+    _write_obligation()
+    monkeypatch.setattr(lifecycle, "_recover_owned_groups", lambda _token: False)
+
+    def must_not_spawn(*_args: object, **_kwargs: object) -> FakePopen:
+        """Fail the test when a consumer is authorized despite the hold.
+
+        Raises:
+            AssertionError: Always.
+        """
+        msg = "consumer started beside unresolved groups"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(lifecycle, "spawn_worker", must_not_spawn)
+
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_ERROR
+    assert "refusing to start another consumer" in capsys.readouterr().err
+    assert not spawned
+
+    observe(monkeypatch, PRIVATE)
+
+    def recover_ok(token: str) -> bool:
+        """Record the successful stale-obligation group recovery.
+
+        Args:
+            token: The recovered worker token.
+
+        Returns:
+            Always ``True``.
+        """
+        events.append((token, "recovered"))
+        return True
+
+    monkeypatch.setattr(lifecycle, "_recover_owned_groups", recover_ok)
+
+    def spawn_ok(*_args: object, **_kwargs: object) -> FakePopen:
+        """Return a live adoptable fake child."""
+        ok = FakePopen(PID)
+        spawned.append(ok)
+        return ok
+
+    monkeypatch.setattr(lifecycle, "spawn_worker", spawn_ok)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    assert len(spawned) == 1
+    assert supervise.read_state().spawning is None
+    assert (TOKEN, "recovered") in events
+
+
+def test_recover_never_spawns_without_durable_authority(
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recovery worker may only start once its authority is durably held."""
+    spawned, _events = recover_env
+
+    def fail_write(_state: object) -> None:
+        """Model a state write that cannot be confirmed durable.
+
+        Raises:
+            DurabilityError: Always.
+        """
+        raise DurabilityError
+
+    monkeypatch.setattr(supervise, "write_state", fail_write)
+    monkeypatch.setattr(
+        lifecycle,
+        "spawn_worker",
+        lambda *_a: (_ for _ in ()).throw(AssertionError("spawned without authority")),
+    )
+
+    code = lifecycle._recover_locked(options())
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "could not durably establish" in capsys.readouterr().err
+    assert not spawned
+    # Whatever was written before the failure still blocks every consumer.
+    assert supervise.read_state().spawning is None
+
+
+def test_supervisor_never_resolves_pid_less_manual_obligation_by_assumption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pid-less manual obligation blocks even when pdeathsig is available."""
+    _write_pid_less_obligation()
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _token: None)
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+
+    assert not daemon._resolve_spawning_obligation()
+    assert supervise.read_state().spawning is not None
+
+
+def test_recover_never_spawns_over_a_malformed_spawning_authority(
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed pre-spawn authority fails closed and survives untouched."""
+    spawned, _events = recover_env
+    raw = {
+        "schema_version": supervise.SCHEMA_VERSION,
+        "spawning": {"token": TOKEN},
+    }
+    supervise.state_path().write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.setattr(
+        lifecycle,
+        "spawn_worker",
+        lambda *_a: (_ for _ in ()).throw(AssertionError("spawned over a malformed authority")),
+    )
+
+    code = lifecycle._recover_locked(options())
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "could not be resolved" in captured.err
+    assert not spawned
+    state = supervise.read_state()
+    assert state.spawning_hold_malformed is True
+    assert json.loads(supervise.state_path().read_text()) == raw
+
+
+def test_supervisor_honors_recorded_recovery_obligation(
+    monkeypatch: pytest.MonkeyPatch,
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """The maintained supervisor resolves the recorded authority before spawning."""
+    del recover_env
+    observe(monkeypatch, None)
+    monkeypatch.setattr(lifecycle, "_converge_unproven_spawn", lambda *_a: None)
+    monkeypatch.setattr(lifecycle, "_recover_owned_groups", lambda _token: False)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_ERROR
+
+    recovered: list[str] = []
+
+    def succeed(token: str) -> None:
+        """Record the supervisor's own exact owned-group recovery."""
+        recovered.append(token)
+
+    monkeypatch.setattr(supervisor, "recover_owned_groups", succeed)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    assert daemon._resolve_spawning_obligation()
+    assert recovered == [TOKEN]
+    assert supervise.read_state().spawning is None
+
+    _write_obligation()
+
+    def fail(_token: str) -> None:
+        """Model a still-unrecoverable owned command group.
+
+        Raises:
+            OwnedGroupRecoveryError: Always.
+        """
+        msg = "unresolved"
+        raise supervisor.OwnedGroupRecoveryError(msg)
+
+    monkeypatch.setattr(supervisor, "recover_owned_groups", fail)
+    assert not daemon._resolve_spawning_obligation()
+    assert supervise.read_state().spawning is not None
+
+
 def test_recover_does_not_report_success_for_dead_child(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    recover_env: list[FakePopen],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
 ) -> None:
     """A child that already exits is never reported as adoptable."""
+    spawned, _events = recover_env
     observe(monkeypatch, PRIVATE)
 
     def mark_dead(_pid: int) -> ProcessIdentity | None:
@@ -234,8 +564,8 @@ def test_recover_does_not_report_success_for_dead_child(
         Returns:
             The private identity observed before the child exited.
         """
-        if recover_env:
-            recover_env[-1].returncode = 0
+        if spawned:
+            spawned[-1].returncode = 0
         return PRIVATE
 
     monkeypatch.setattr(lifecycle, "process_identity", mark_dead)
@@ -250,15 +580,16 @@ def test_recover_does_not_report_success_for_dead_child(
 
 
 def test_recover_reports_success_for_live_private_session_child(
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    recover_env: list[FakePopen],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A live child that establishes its private session is reported."""
+    spawned, _events = recover_env
     observe(monkeypatch, PRIVATE)
 
     code = lifecycle._recover_locked(options())
 
     assert code == lifecycle.EXIT_OK
-    assert recover_env[-1].poll() is None
+    assert spawned[-1].poll() is None
     assert "adopt it with" in capsys.readouterr().out
