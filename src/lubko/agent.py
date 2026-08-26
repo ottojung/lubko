@@ -1602,6 +1602,11 @@ def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
         if not prompt:
             if _reclaim_prompt(ctx.aid):
                 continue
+            # Exit boundary seam: the runner has durably relinquished
+            # consumption authority (``active_runner`` false, reservation
+            # dropped) while its process is still alive.  Tests use this point
+            # to force a concurrent prompt into exactly this window.
+            _test_sync("reclaim_idle")
             return
         if _run_invocation(ctx, prompt, is_continue=is_continue) is None:
             return
@@ -2850,7 +2855,11 @@ def _apply_locked_transition(
     now = time.time()
     caller_pid = os.getpid()
     live_agent = is_alive(m)
-    live_runner = runner_alive(m)
+    # Consumption authority is the durable flag, not raw process liveness:
+    # once an exiting runner has relinquished it (``active_runner`` false,
+    # reservation dropped), that runner will never consume another prompt, so
+    # it must not be reused even while its process is still dying.
+    live_runner = bool(m.get("active_runner")) and runner_alive(m)
     in_flight = reservation_in_flight(m)
 
     if live_agent:
@@ -2928,8 +2937,10 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
 
     * an invocation is genuinely executing (live agent process) — an ordinary
       prompt is rejected (busy); a steer is queued and interrupts it;
-    * only a proven-live runner exists (between invocations) — the prompt is
-      queued for that runner and no second runner is spawned;
+    * only a runner with durable consumption authority exists (between
+      invocations) — the prompt is queued for that runner and no second
+      runner is spawned; a runner whose process lingers while its
+      consumption authority was already relinquished is never reused;
     * a runner is reserved but not yet claimed — an ordinary prompt is rejected
       (busy) so it cannot overwrite the pending prompt or spawn a competing
       runner; a steer is queued deterministically;
