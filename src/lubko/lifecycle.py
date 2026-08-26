@@ -34,7 +34,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -43,7 +43,7 @@ from lubko._exact_signal import open_pidfd as _open_exact_pidfd
 from lubko._exact_signal import pidfd_send_signal, process_pgrp
 from lubko._pg import psycopg, tuple_row
 from lubko.config import load_database_config, load_worker_server
-from lubko.durable import remove_durable, write_json_durable
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import (
@@ -2890,13 +2890,255 @@ def _recover_preflight(options: DeployOptions) -> str:
     return commit
 
 
+def _recover_owned_groups(incarnation: str) -> bool:
+    """Recover every command group owned by an exact worker incarnation.
+
+    This is a seam over the maintained supervisor's exact-incarnation
+    owned-group recovery: command jobs run in independent sessions/process
+    groups, so reaping a worker PID never implies its job groups are gone.
+    Only exact persisted process-group identities are signalled, always via
+    pidfd/start-time proof — never name matching or broad numeric kills.
+
+    Args:
+        incarnation: The worker lifecycle token whose groups must be recovered.
+
+    Returns:
+        ``True`` when recovery provably succeeded; ``False`` when it failed
+        and the incarnation's execution authority must not be dropped.
+    """
+    # ruff: ignore[import-outside-top-level] - supervisor imports this module
+    from lubko.supervisor import OwnedGroupRecoveryError, recover_owned_groups
+
+    try:
+        recover_owned_groups(incarnation)
+    except OwnedGroupRecoveryError:
+        LOGGER.exception("owned-group recovery failed for incarnation %s", incarnation)
+        return False
+    return True
+
+
+def _obligation_instance_gone(pid: int | None, start_time_ticks: int | None) -> bool:
+    """Return whether an obligation's exact recorded instance is provably gone.
+
+    Args:
+        pid: The recorded child PID, or ``None`` when never published.
+        start_time_ticks: The recorded start time ticks, or ``None``.
+
+    Returns:
+        ``True`` only when the PID is absent-and-unpublishable or a live
+        process with that PID carries different (or unreadable) start ticks.
+    """
+    if pid is None:
+        return False
+    observed = proc_start_ticks(pid)
+    if start_time_ticks is None:
+        return observed is None
+    return observed != start_time_ticks
+
+
+def _clear_spawning_obligation() -> bool:
+    """Durably clear the pre-spawn recovery obligation.
+
+    Returns:
+        ``True`` when the state write was confirmed durable.
+    """
+    try:
+        supervise.write_state(replace(supervise.read_state(), spawning=None))
+    except DurabilityError:
+        LOGGER.exception("could not durably clear the pre-spawn recovery obligation")
+        return False
+    return True
+
+
+def _write_spawning_obligation(obligation: supervise.SpawningObligation) -> bool:
+    """Durably persist ``obligation`` as the replacement-blocking authority.
+
+    Args:
+        obligation: The obligation to record.
+
+    Returns:
+        ``True`` when the state write was confirmed durable.
+    """
+    try:
+        supervise.write_state(replace(supervise.read_state(), spawning=obligation))
+    except DurabilityError:
+        LOGGER.exception(
+            "could not durably record the recovery obligation for token %s", obligation.token
+        )
+        return False
+    return True
+
+
+def _recovery_obligation(token: str, commit: str) -> supervise.SpawningObligation:
+    """Build a pid-less pre-spawn obligation for a manual recovery worker.
+
+    Args:
+        token: The recovery worker's lifecycle token.
+        commit: The commit the worker will be started for.
+
+    Returns:
+        The durable replacement-blocking obligation.
+    """
+    return supervise.SpawningObligation(
+        token=token,
+        commit=commit,
+        creator_pid=os.getpid(),
+        creator_start_time_ticks=proc_start_ticks(os.getpid()) or 0,
+        pid=None,
+        start_time_ticks=None,
+        created_at=time.time(),
+        boot_id=supervise.current_boot_id(),
+        # A manually spawned detached worker carries no kernel parent-death
+        # guarantee, so no successor may ever resolve this record by
+        # assumption; it must be positively resolved or repaired.
+        parent_death_signal=False,
+    )
+
+
+def _resolve_stale_recovery_obligation() -> bool:
+    """Resolve a leftover pre-spawn obligation before spawning a new consumer.
+
+    A previous failed or interrupted recovery durably recorded that a worker
+    token's owned command groups may be unresolved. Before this command may
+    start another queue consumer, that exact instance must be provably gone
+    *and* its owned groups successfully recovered. Anything else — including a
+    pid-less record that cannot be resolved by assumption at all — fails
+    closed so no replacement consumer races unresolved side-effecting process
+    groups.
+
+    Returns:
+        ``True`` when no blocking obligation remains.
+    """
+    obligation = supervise.read_state().spawning
+    if obligation is None:
+        return True
+    if obligation.pid is None:
+        return False
+    if not _obligation_instance_gone(obligation.pid, obligation.start_time_ticks):
+        return False
+    if not _recover_owned_groups(obligation.token):
+        return False
+    return _clear_spawning_obligation()
+
+
+def _converge_failed_recovery_worker(
+    proc: subprocess.Popen[bytes],
+    options: DeployOptions,
+    token: str,
+    anchor: ProcessIdentity | None,
+) -> int:
+    """Converge an unproven recovery worker without dropping owned groups.
+
+    The direct child is converged first exactly as before (pinned pidfd
+    signalling when an anchor exists, positive reap otherwise). Then every
+    command group owned by the worker's exact incarnation is recovered, since
+    worker death does not imply job-group death. Only after owned-group
+    recovery succeeds is the pre-spawn obligation released and an ordinary
+    failure returned. When owned-group recovery fails, the already-durable
+    shared supervisor-state obligation keeps blocking every later consumer —
+    manual recover and maintained supervisor alike — until it resolves.
+
+    Args:
+        proc: The direct recovery worker's ``Popen`` handle.
+        options: Deployment inputs.
+        token: The recovery worker's lifecycle token.
+        anchor: The exact identity anchor for pinned convergence, or ``None``.
+
+    Returns:
+        A process exit code.
+    """
+    _converge_unproven_spawn(proc, options.stop_grace_seconds, anchor)
+    if not _recover_owned_groups(token):
+        _err(
+            "owned command groups of the converged recovery worker could not be recovered; "
+            f"durable recovery authority for token {token} blocks any replacement consumer "
+            "until 'lubko-deploy recover' resolves it"
+        )
+        return EXIT_ERROR
+    if not _clear_spawning_obligation():
+        LOGGER.warning("recovery authority for token %s stays blocking until resolved", token)
+    append_deploy_log(f"recovered owned groups for converged recovery worker token={token}")
+    return EXIT_ERROR
+
+
+def _settle_spawned_recovery_worker(
+    proc: subprocess.Popen[bytes],
+    options: DeployOptions,
+    token: str,
+    commit: str,
+    worker_id: str,
+) -> int:
+    """Classify the spawned recovery worker and settle its fate.
+
+    Args:
+        proc: The direct ``Popen`` handle of the spawned worker.
+        options: Deployment inputs.
+        token: The recovery worker's lifecycle token.
+        commit: The commit the worker was started for.
+        worker_id: The reported worker id.
+
+    Returns:
+        A process exit code.
+    """
+    identity = _wait_for_identity(proc.pid)
+    anchor: ProcessIdentity | None
+    if identity is None:
+        if proc.poll() is None:
+            # Still live but never observable: there is no exact anchor, so
+            # convergence may only fail closed and reap the direct child.
+            _err("recovery worker stayed live without an observable identity; converging it")
+        else:
+            _err("recovery worker exited before establishing a dedicated session")
+        anchor = None
+    elif identity.pgid != proc.pid or identity.sid != proc.pid:
+        _err(
+            "recovery worker timed out before establishing its private session; "
+            "converging it before failing"
+        )
+        anchor = identity
+    elif proc.poll() is not None:
+        # The child established its session but already exited: never report
+        # an adoptable PID for a dead process. It may have consumed jobs, so
+        # its owned command groups must be recovered before the token is
+        # forgotten.
+        _err("recovery worker exited before it could be adopted")
+        anchor = None
+    elif not _clear_spawning_obligation():
+        _err(
+            "the recovery worker is healthy, but its durable recovery authority could "
+            "not be released; converging it instead of reporting an adoptable PID"
+        )
+        return _converge_failed_recovery_worker(proc, options, token, identity)
+    else:
+        append_deploy_log(f"recovery worker started pid={identity.pid} commit={commit}")
+        _out(f"recovery worker pid={identity.pid} pgid={identity.pgid} session={identity.sid}")
+        _out(f"worker id: {worker_id}")
+        _out(f"git commit: {commit}")
+        _out(
+            f"adopt it with: lubko-deploy repair --repo {options.repo} "
+            f"--recovery-worker-pid {identity.pid}"
+        )
+        return EXIT_OK
+    return _converge_failed_recovery_worker(proc, options, token, anchor)
+
+
 def _recover_locked(options: DeployOptions) -> int:
     """Start a detached recovery worker and report its adoptable identity.
 
     The worker is started with the same detached session/process-group-leader
     mechanism a deployment replacement uses, so its exact PID is a stable
     dedicated leader that ``lubko-deploy repair --recovery-worker-pid`` can
-    safely adopt later. No lifecycle metadata is written here.
+    safely adopt later. No worker lifecycle metadata (``meta.json``) is
+    written here.
+
+    A shared durable recovery authority is established in the supervisor
+    state *before* the spawn, so the spawned token's execution ownership is
+    never held without durable protection. Every failure exit after a
+    successful spawn first converges the direct child and then recovers the
+    exact incarnation's owned command groups; only then may the authority be
+    released. If that recovery fails, the obligation keeps blocking every
+    later consumer — manual recover and maintained supervisor alike — until a
+    subsequent run resolves it.
 
     Args:
         options: Deployment inputs.
@@ -2909,45 +3151,43 @@ def _recover_locked(options: DeployOptions) -> int:
     except _AdoptionError as exc:
         _err(str(exc))
         return EXIT_ERROR
+    if not _resolve_stale_recovery_obligation():
+        _err(
+            "a previously recorded recovery obligation could not be resolved; refusing "
+            "to start another consumer beside possibly-live owned command groups"
+        )
+        return EXIT_ERROR
     token = secrets.token_hex(16)
     env = worker_env(token)
     worker_id = env.get("LUBKO_WORKER_ID") or socket.gethostname()
+    # Durable shared recovery authority, written and fsync-confirmed BEFORE
+    # the spawn: from this instant the token's execution ownership is recorded
+    # in the supervisor state every consumer-establishing path honors, so no
+    # crash or failure can ever relinquish authority without durable
+    # protection. The record carries no parent-death guarantee, so no
+    # successor may resolve it by assumption.
+    obligation = _recovery_obligation(token, commit)
+    if not _write_spawning_obligation(obligation):
+        _err(
+            "could not durably establish the shared recovery authority; "
+            "not starting a recovery worker"
+        )
+        return EXIT_ERROR
     try:
         proc = spawn_worker(options.repo, options.uv_path, worker_log_path(token), env)
     except OSError as exc:
         _err(f"could not start the recovery worker: {exc}")
+        if not _clear_spawning_obligation():
+            LOGGER.warning("the pid-less authority for token %s stays blocking", token)
         return EXIT_ERROR
-    identity = _wait_for_identity(proc.pid)
-    if identity is None:
-        if proc.poll() is None:
-            # Still live but never observable: there is no exact anchor, so
-            # convergence may only fail closed and reap the direct child.
-            _err("recovery worker stayed live without an observable identity; converging it")
-        else:
-            _err("recovery worker exited before establishing a dedicated session")
-        _converge_unproven_spawn(proc, options.stop_grace_seconds, None)
-        return EXIT_ERROR
-    if identity.pgid != proc.pid or identity.sid != proc.pid:
-        _err(
-            "recovery worker timed out before establishing its private session; "
-            "converging it before failing"
+    obligation = replace(obligation, pid=proc.pid, start_time_ticks=proc_start_ticks(proc.pid))
+    if not _write_spawning_obligation(obligation):
+        LOGGER.warning(
+            "could not publish the exact identity of recovery worker %s; "
+            "the pid-less pre-spawn authority remains blocking",
+            token,
         )
-        _converge_unproven_spawn(proc, options.stop_grace_seconds, identity)
-        return EXIT_ERROR
-    if proc.poll() is not None:
-        # The child established its session but already exited: never report
-        # an adoptable PID for a dead process.
-        _err("recovery worker exited before it could be adopted")
-        return EXIT_ERROR
-    append_deploy_log(f"recovery worker started pid={identity.pid} commit={commit}")
-    _out(f"recovery worker pid={identity.pid} pgid={identity.pgid} session={identity.sid}")
-    _out(f"worker id: {worker_id}")
-    _out(f"git commit: {commit}")
-    _out(
-        f"adopt it with: lubko-deploy repair --repo {options.repo} "
-        f"--recovery-worker-pid {identity.pid}"
-    )
-    return EXIT_OK
+    return _settle_spawned_recovery_worker(proc, options, token, commit, worker_id)
 
 
 def recover(options: DeployOptions) -> int:

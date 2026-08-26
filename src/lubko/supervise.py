@@ -275,6 +275,10 @@ class SpawningObligation:
       spawned child carries ``PR_SET_PDEATHSIG=SIGKILL``, so the kernel has
       already killed it when the spawning supervisor died — unless the child
       was spawned in an earlier boot, which is trivially gone;
+    - ``parent_death_signal`` false: the spawn carried **no** kernel
+      parent-death guarantee (for example a manually started recovery
+      worker), so a pid-less obligation can never be auto-resolved and stays
+      replacement-blocking until positively resolved;
     - a present-but-malformed obligation survives corruption as a durable
       blocking flag that only operator repair clears.
 
@@ -291,6 +295,11 @@ class SpawningObligation:
     start_time_ticks: int | None
     created_at: float
     boot_id: str | None
+    #: Whether the recorded spawn was forked with ``PR_SET_PDEATHSIG`` so a
+    #: pid-less obligation may be resolved via the kernel parent-death
+    #: guarantee. Only spawns without that guarantee (legacy records predate
+    #: the field and always had it) may ever rely on it.
+    parent_death_signal: bool = True
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the obligation for storage.
@@ -307,6 +316,7 @@ class SpawningObligation:
             "start_time_ticks": self.start_time_ticks,
             "created_at": self.created_at,
             "boot_id": self.boot_id,
+            "parent_death_signal": self.parent_death_signal,
         }
 
     @classmethod
@@ -337,6 +347,9 @@ class SpawningObligation:
             start_time_ticks=_optional_int(data.get("start_time_ticks")),
             created_at=_optional_float(data.get("created_at")) or 0.0,
             boot_id=_optional_string(data.get("boot_id")),
+            # Legacy obligations predate the field and were all written by the
+            # pdeathsig-equipped supervisor spawn path.
+            parent_death_signal=_optional_bool(data.get("parent_death_signal")) is not False,
         )
 
 
