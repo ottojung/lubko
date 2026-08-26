@@ -3150,6 +3150,34 @@ def _recover_locked(options: DeployOptions) -> int:
     later consumer — manual recover and maintained supervisor alike — until a
     subsequent run resolves it.
 
+    The whole preflight-to-publication critical section runs under the
+    shared consumer-establishment lock the maintained supervisor holds
+    around its own gate-to-spawn decision, so from one initially
+    consumer-free state exactly one of the two paths can authorize a spawn:
+    a stale preflight observation can never outlive competing supervisor
+    authority, and the supervisor can never overwrite an established manual
+    recovery obligation and spawn beside it.
+
+    Args:
+        options: Deployment inputs.
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        with supervise.consumer_lock(options.lock_timeout_seconds):
+            return _recover_consumer_locked(options)
+    except supervise.ConsumerLockTimeoutError:
+        _err(
+            "the supervisor is currently establishing a queue consumer; "
+            "refusing to race it into a second consumer"
+        )
+        return EXIT_ERROR
+
+
+def _recover_consumer_locked(options: DeployOptions) -> int:
+    """Start a detached recovery worker while holding the consumer lock.
+
     Args:
         options: Deployment inputs.
 
