@@ -34,8 +34,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
+import psycopg
+from psycopg.rows import tuple_row
+
 from lubko import cli, supervise
-from lubko._pg import psycopg, tuple_row
 from lubko.config import load_database_config
 from lubko.durable import write_json_durable
 from lubko.lifecycle import (

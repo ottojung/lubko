@@ -71,7 +71,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import importlib
 import json
 import logging
 import os
@@ -90,10 +89,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast, override
 from uuid import uuid4
 
+import psycopg
+from psycopg.rows import tuple_row
+
 from lubko._exact_signal import open_pidfd as _shared_open_pidfd
 from lubko._exact_signal import pidfd_send_signal as _shared_pidfd_send_signal
 from lubko._exact_signal import process_pgrp as _shared_process_pgrp
-from lubko._pg import psycopg, tuple_row
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config, load_worker_server
 from lubko.health import (
@@ -123,46 +124,11 @@ if TYPE_CHECKING:
 
     from psycopg.abc import RV, PQGen
 
-    from lubko._pg_deadline import DeadlineConnection
     from lubko.config import DatabaseConfig
 
     JobsConnection = psycopg.Connection[tuple[Any, ...]]
 else:
-    # Annotation-only alias; resolved lazily so importing this module never
-    # executes the compiled driver.
-    JobsConnection = Any
-
-#: Explicit re-export of the lazily-loaded driver-bound connection class;
-#: listed because strict type checking disables implicit re-export.
-__all__ = ["DeadlineConnection"]
-
-_DEADLINE_EXPORTS: Final[frozenset[str]] = frozenset({"DeadlineConnection"})
-
-
-def _ensure_deadline_bindings() -> None:
-    """Bind the driver-bound deadline names into this module's globals.
-
-    A module-level ``__getattr__`` only serves *external* attribute access;
-    plain global lookups inside this module's own functions would raise
-    ``NameError``. Every runtime use site therefore calls this first, which
-    loads the compiled psycopg driver once, on the first actual database turn.
-    """
-    if "DeadlineConnection" in globals():
-        return
-    module = importlib.import_module("lubko._pg_deadline")
-    for name in _DEADLINE_EXPORTS:
-        globals()[name] = getattr(module, name)
-
-
-if not TYPE_CHECKING:
-
-    def __getattr__(name: str) -> object:
-        # External re-export hook: resolve driver-bound deadline names lazily
-        # so importing :mod:`lubko.worker` never pays the driver load cost.
-        if name in _DEADLINE_EXPORTS:
-            return getattr(importlib.import_module("lubko._pg_deadline"), name)
-        msg = f"module {__name__!r} has no attribute {name!r}"
-        raise AttributeError(msg)
+    JobsConnection = psycopg.Connection[tuple[Any, ...]]
 
 
 class DbOperationDeadlineError(TimeoutError):
@@ -242,6 +208,56 @@ def _drive_under_deadline(
             continue
         state = gen.send(events[0][1])
         sel.modify(fileno, state)
+
+
+class DeadlineConnection(psycopg.Connection[tuple[Any, ...]]):
+    """A supervisor connection whose operations obey a hard client deadline.
+
+    Every cursor execution drives its libpq generator through :meth:`wait`,
+    which enforces the absolute monotonic ``operation_deadline`` currently
+    installed by the supervisor for this turn. On breach the underlying libpq
+    connection is finished (marked closed/broken) before the deadline error
+    propagates, so no later operation can reuse a hung socket and connectivity
+    classification always succeeds.
+
+    The deadline is deliberately *not* a fixed per-operation timeout: the
+    supervisor derives it from the earliest active job's lease-safety instant
+    (capped by the configured ``db_operation_timeout_seconds``), so even an
+    operation that starts late in a lease cycle cannot outlive the margin.
+    """
+
+    #: Absolute monotonic deadline for the current operation, installed by the
+    #: supervisor before each database turn. The presence of this class
+    #: attribute is the deadline capability marker checked by
+    #: :func:`install_operation_deadline`.
+    operation_deadline: float = 0.0
+
+    @override
+    def wait(self, gen: PQGen[RV], interval: float = 0.1) -> RV:
+        """Drive ``gen`` under the currently installed operation deadline.
+
+        Args:
+            gen: The nonblocking libpq generator to drive.
+            interval: Unused compatibility parameter from psycopg's interface;
+                waiting is bounded solely by the absolute deadline.
+
+        Returns:
+            Whatever the generator returns on completion.
+
+        Raises:
+            TimeoutError: The hard client deadline passed; the libpq
+                connection is failed closed first.
+        """
+        try:
+            return wait_with_deadline(gen, self.pgconn.socket, self.operation_deadline)
+        except TimeoutError:
+            # The only timeout source inside ``wait_with_deadline`` is the
+            # application-owned hard client deadline; failing the connection
+            # closed on it is fail-safe by construction.
+            LOGGER.exception("database operation breached its client deadline")
+            with suppress(Exception):
+                self.pgconn.finish()
+            raise
 
 
 def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None) -> bool:
@@ -5638,7 +5654,6 @@ class Supervisor:
                 invariant.
         """
         try:
-            _ensure_deadline_bindings()
             conn = DeadlineConnection.connect(
                 self.database.conninfo(),
                 connect_timeout=max(1, min(5, int(self.settings.db_operation_timeout_seconds))),

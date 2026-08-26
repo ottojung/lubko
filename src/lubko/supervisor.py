@@ -77,11 +77,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+import psycopg
+
 from lubko import cli, deployctl, lifecycle, supervise
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
-from lubko._pg import psycopg
 from lubko.config import load_database_config
 from lubko.durable import DurabilityError, remove_durable
 from lubko.health import (

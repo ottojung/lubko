@@ -38,10 +38,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+import psycopg
+from psycopg.rows import tuple_row
+
 from lubko import cli, protocol, supervise, toolchain
 from lubko._exact_signal import open_pidfd as _open_exact_pidfd
 from lubko._exact_signal import pidfd_send_signal, process_pgrp
-from lubko._pg import psycopg, tuple_row
 from lubko.config import load_database_config, load_worker_server
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
