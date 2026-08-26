@@ -147,6 +147,16 @@ def test_failed_symlink_switch_restores_prior_symlink_target(tmp_path: Path) -> 
     assert link.readlink() == Path("old-target")
 
 
+def test_failed_symlink_switch_onto_directory_fails_closed(tmp_path: Path) -> None:
+    """A non-symlink non-file destination is never read as bytes."""
+    directory = tmp_path / "entry"
+    make_directory_durable(directory)
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR, path=tmp_path)
+    with pytest.raises(DurabilityError):
+        write_symlink_durable(directory, "target")
+    assert directory.is_dir()
+
+
 def test_failed_first_symlink_write_neutralizes_destination(tmp_path: Path) -> None:
     """A first failed symlink write removes the unconfirmed destination."""
     link = tmp_path / "fresh"

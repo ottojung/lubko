@@ -613,15 +613,18 @@ def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> 
     with _serialized(destination):
         temporary = temporary_path(destination)
         # Snapshot the prior entry's exact type and value: a symlink's target,
-        # a regular file's bytes, or absence.  The destination may hold any of
-        # these, and a failed confirmation must restore exactly what was there
-        # before — never delete prior regular-file contents because they are
-        # not a symlink.
+        # a true regular file's bytes, or absence.  The destination may hold any
+        # of these, and a failed confirmation must restore exactly what was
+        # there before — never delete prior regular-file contents because they
+        # are not a symlink.  The regular-file check is lstat-safe and mirrors
+        # :func:`remove_durable`: only a non-symlink regular file's bytes are
+        # read; directories, FIFOs, devices, and other unsupported entry types
+        # are never read as bytes.
         previous_link: str | None = None
         previous_bytes: bytes | None = None
         if destination.is_symlink():
             previous_link = str(destination.readlink())
-        elif destination.exists():
+        elif destination.exists() and destination.is_file() and not destination.is_symlink():
             previous_bytes = destination.read_bytes()
         try:
             temporary.unlink(missing_ok=True)
