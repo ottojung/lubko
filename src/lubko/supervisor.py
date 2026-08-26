@@ -497,6 +497,18 @@ def normalize_cross_boot_state() -> None:
     it — never duplicating a worker.
     """
     state = read_state()
+    if state.ownership_hold_malformed:
+        # The durable authority is corrupt, so the recorded boot identity
+        # cannot be trusted to prove (or disprove) a prior boot. Rewriting
+        # would erase an active crash-loop backoff deadline behind that
+        # unprovable guess; reconciliation already holds fail-closed on the
+        # corruption itself. Leave the durable state untouched.
+        LOGGER.error(
+            "durable supervisor state is malformed; not resetting monotonic "
+            "deadlines for commit %s",
+            state.commit,
+        )
+        return
     boot_id = supervise.current_boot_id()
     if state.boot_id == boot_id and boot_id is not None:
         return
