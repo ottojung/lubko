@@ -446,6 +446,52 @@ def _mission_candidate_alive(state: RollbackState) -> bool:
     return worker_alive(state.new_meta)
 
 
+def _supervised_mission_authoritative(state: RollbackState) -> bool:
+    """Return whether the live supervisor's durable state still names the mission.
+
+    A supervisor snapshot that identifies a different commit or a generation
+    below the mission's proves the mission was superseded or abandoned; such
+    contradictory authority must fail closed regardless of the deadline.  A
+    snapshot that still names exactly this mission's commit at or after its
+    generation keeps supervisor authority with the mission, even while its
+    worker child is transiently absent during bounded restart backoff.
+
+    Args:
+        state: Pending supervised-deployment mission.
+
+    Returns:
+        ``True`` when the supervisor's durable state still targets this mission.
+    """
+    supervisor_state = supervise.read_state()
+    return (
+        supervisor_state.commit == state.commit
+        and supervisor_state.applied_generation >= state.generation
+    )
+
+
+def _pending_mission_rollback_due(state: RollbackState) -> bool:
+    """Return whether a pending mission must be rolled back right now.
+
+    Under a live supervisor this mirrors the watchdog policy exactly: a
+    transient ``child=None``/restart-backoff observation for the same applied
+    target generation is retryable until the confirmation deadline, while
+    superseded or contradictory durable supervisor authority fails closed
+    immediately.  Without a live supervisor the legacy recorded candidate
+    metadata decides.
+
+    Args:
+        state: Pending supervised-deployment mission.
+
+    Returns:
+        ``True`` when the mission must roll back now.
+    """
+    if supervise.supervisor_running():
+        if not _supervised_mission_authoritative(state):
+            return True
+        return time.time() >= state.deadline and not _supervised_mission_active(state)
+    return time.time() >= state.deadline or not worker_alive(state.new_meta)
+
+
 def settle_desired(commit: str, repo: str, uv_path: str) -> int:
     """Write a desired run intent newer than any open mission and await it.
 
@@ -1840,7 +1886,7 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     state = _read_state()
     if state is None or state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
-    if time.time() >= state.deadline or not _mission_candidate_alive(state):
+    if _pending_mission_rollback_due(state):
         _rollback_locked(state)
         raise DeployCtlError("confirmation window lapsed; deployment was rolled back")
     commit = request.get("commit")
@@ -1858,7 +1904,7 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
             "challenge": challenge,
         }
     _verify_challenge(state, answer)
-    if time.time() >= state.deadline or not _mission_candidate_alive(state):
+    if _pending_mission_rollback_due(state):
         _rollback_locked(state)
         raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
     if supervise.supervisor_running():
@@ -1913,7 +1959,7 @@ def _handle_status(options: Options) -> dict[str, object]:
         with deploy_lock(options.lock_timeout_seconds):
             state = _read_state()
             if state is not None and state.status == STATUS_PENDING:
-                if time.time() >= state.deadline or not _mission_candidate_alive(state):
+                if _pending_mission_rollback_due(state):
                     _rollback_locked(state)
                     state = _read_state()
             meta = read_meta()

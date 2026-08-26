@@ -1252,11 +1252,11 @@ def wait_until_ready(generation: int, timeout_seconds: float) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         status = read_status()
-        if status is not None and status.applied_generation >= generation:
-            if status.ready:
-                return True
-            if status.child is None:
-                return False
+        # A ``child=None`` observation is the daemon's ordinary bounded
+        # restart-backoff state for the same applied generation, not a
+        # terminal failure: keep polling until readiness or this timeout.
+        if status is not None and status.applied_generation >= generation and status.ready:
+            return True
         time.sleep(REQUEST_POLL_SECONDS)
     return False
 
