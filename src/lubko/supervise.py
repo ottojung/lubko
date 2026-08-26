@@ -439,7 +439,7 @@ class SupervisorState:
             "last_spawn_at": self.last_spawn_at,
             "ready": self.ready,
             "next_readiness_at": self.next_readiness_at,
-            "boot_id": self.boot_id,
+            **({} if self.boot_id is None else {"boot_id": self.boot_id}),
         }
 
     @classmethod
@@ -479,6 +479,14 @@ class SupervisorState:
             # backoff and let reconciliation restart immediately from a
             # corrupted schedule. Enter the durable hold.
             ownership_hold_malformed = True
+        boot_id, boot_malformed = _parse_present_boot_identity(data, "boot_id")
+        if boot_malformed:
+            # Any present boot identifier must be a non-empty string: a
+            # malformed one must never silently degrade to absence, since
+            # cross-boot normalization would then treat the state as
+            # written by an unknown prior boot and erase an active
+            # crash-loop backoff deadline. Enter the durable hold.
+            ownership_hold_malformed = True
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
             applied_generation=generation or 0,
@@ -500,7 +508,7 @@ class SupervisorState:
             last_spawn_at=_optional_float(data.get("last_spawn_at")),
             ready=data.get("ready", False) is True,
             next_readiness_at=_optional_float(data.get("next_readiness_at")),
-            boot_id=_optional_string(data.get("boot_id")),
+            boot_id=boot_id,
         )
 
 
@@ -1539,6 +1547,29 @@ def _parse_present_strict(
         return 0, False
     value = parser(data[key])
     return (value or 0), value is None
+
+
+def _parse_present_boot_identity(
+    data: dict[str, object],
+    key: str,
+) -> tuple[str | None, bool]:
+    """Parse the boot identity field, distinguishing absence from corruption.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Field name.
+
+    Returns:
+        A ``(value, malformed)`` pair: the parsed identifier (``None``
+        only for genuine absence of the key) and whether a present value
+        was not a non-empty string. Explicit null, empty strings,
+        booleans, numbers, and containers are all malformed: any present
+        boot identity must positively prove its clock domain.
+    """
+    if key not in data:
+        return None, False
+    raw = data[key]
+    return (raw, False) if isinstance(raw, str) and raw else (None, True)
 
 
 def _parse_present_nullable_float(
