@@ -2918,8 +2918,26 @@ def _recover_locked(options: DeployOptions) -> int:
         _err(f"could not start the recovery worker: {exc}")
         return EXIT_ERROR
     identity = _wait_for_identity(proc.pid)
-    if identity is None or not (identity.pgid == proc.pid and identity.sid == proc.pid):
-        _err("recovery worker exited before establishing a dedicated session")
+    if identity is None:
+        if proc.poll() is None:
+            # Still live but never observable: there is no exact anchor, so
+            # convergence may only fail closed and reap the direct child.
+            _err("recovery worker stayed live without an observable identity; converging it")
+        else:
+            _err("recovery worker exited before establishing a dedicated session")
+        _converge_unproven_spawn(proc, options.stop_grace_seconds, None)
+        return EXIT_ERROR
+    if identity.pgid != proc.pid or identity.sid != proc.pid:
+        _err(
+            "recovery worker timed out before establishing its private session; "
+            "converging it before failing"
+        )
+        _converge_unproven_spawn(proc, options.stop_grace_seconds, identity)
+        return EXIT_ERROR
+    if proc.poll() is not None:
+        # The child established its session but already exited: never report
+        # an adoptable PID for a dead process.
+        _err("recovery worker exited before it could be adopted")
         return EXIT_ERROR
     append_deploy_log(f"recovery worker started pid={identity.pid} commit={commit}")
     _out(f"recovery worker pid={identity.pid} pgid={identity.pgid} session={identity.sid}")
