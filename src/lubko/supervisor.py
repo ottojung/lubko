@@ -1491,7 +1491,7 @@ class SupervisorDaemon:
                 )
             )
         except DurabilityError:
-            return self._recover_unpublished_spawn(proc, token, child_ticks)
+            return self._recover_unpublished_spawn(proc, obligation, child_ticks)
         identity = self._wait_for_identity(proc.pid)
         if identity is None:
             return self._settle_unproven_spawn(commit, proc, token, worker_id)
@@ -1505,10 +1505,70 @@ class SupervisorDaemon:
             spawned_at=time.time(),
         )
 
+    def _recover_spawn_owned_groups(self, token: str) -> bool:
+        """Recover the exact command groups owned by a pre-publication token.
+
+        Args:
+            token: Lifecycle token of the proven-gone worker incarnation.
+
+        Returns:
+            ``True`` when every group owned by the incarnation is provably
+            reclaimed; ``False`` on the fail-closed blocking error.
+        """
+        try:
+            recover_owned_groups(token)
+        except OwnedGroupRecoveryError:
+            self._message = (
+                "the worker was proven gone, but its owned command groups could "
+                "not be recovered; holding without clearing spawn authority or "
+                "spawning a replacement"
+            )
+            LOGGER.exception("%s", self._message)
+            return False
+        return True
+
+    @staticmethod
+    def _preserve_blocking_obligation(
+        obligation: SpawningObligation,
+        pid: int,
+        child_ticks: int | None,
+    ) -> None:
+        """Durably keep a token-bearing spawn hold after failed group recovery.
+
+        Owned-group recovery failed while the worker itself was already proven
+        gone, so the pre-publication authority must survive: no replacement may
+        spawn while the incarnation's command groups are unresolved. The
+        surviving obligation is upgraded with the exact observed child identity
+        when possible so the retry converges precisely; if that upgrade cannot
+        be made durable, the existing obligation record stays untouched and
+        continues to block.
+
+        Args:
+            obligation: The pre-spawn obligation whose ``token`` must remain
+                the blocking authority.
+            pid: Observed PID of the spawned child.
+            child_ticks: Start-time ticks observed for the child, if any.
+        """
+        try:
+            state = read_state()
+            current = state.spawning if state.spawning is not None else obligation
+            write_state(
+                replace(
+                    state,
+                    spawning=replace(current, pid=pid, start_time_ticks=child_ticks),
+                )
+            )
+        except DurabilityError:
+            LOGGER.exception(
+                "could not durably upgrade the blocking spawn obligation for "
+                "worker pid %d; the existing token-bearing hold survives",
+                pid,
+            )
+
     def _recover_unpublished_spawn(
         self,
         proc: subprocess.Popen[bytes],
-        token: str,
+        obligation: SpawningObligation,
         child_ticks: int | None,
     ) -> WorkerChild | None:
         """Recover a spawn whose identity upgrade could not be made durable.
@@ -1516,15 +1576,18 @@ class SupervisorDaemon:
         The child is live but the durable obligation still lacks its exact
         identity. Because this process still owns the direct ``Popen``
         handle, it first tries to converge (terminate and positively reap)
-        its own child; on success the obligation is cleared and the spawn is
-        an ordinary retryable failure. When convergence cannot be proven, the
-        blocking authority transfers to an unresolved-child hold carrying the
-        exact observed identity so no replacement can ever be authorized
-        beside the possibly-live first spawn.
+        its own child; on success the token's owned command groups are
+        recovered by exact incarnation, and only then is the obligation
+        cleared so the spawn remains an ordinary retryable failure. When the
+        worker convergence or the group recovery cannot be positively
+        completed, the blocking authority transfers to a durable hold carrying
+        the exact observed identity so no replacement can ever be authorized
+        beside the possibly-live first spawn or its command groups.
 
         Args:
             proc: The direct ``Popen`` handle of the spawned child.
-            token: Lifecycle token handed to the spawned child.
+            obligation: The durable pre-spawn obligation whose ``token`` names
+                the incarnation whose owned groups must be recovered.
             child_ticks: Start-time ticks observed for the child, if any.
 
         Returns:
@@ -1534,9 +1597,17 @@ class SupervisorDaemon:
             "could not durably publish worker pid %d identity; converging the spawn",
             proc.pid,
         )
+        token = obligation.token
         if self._converge_direct_child(proc):
-            write_state(replace(read_state(), spawning=None))
             self.proc = None
+            # The worker itself is proven reaped, but it may already have
+            # launched independent command process groups under this same
+            # incarnation. Recovery must succeed before any durable authority
+            # is dropped.
+            if not self._recover_spawn_owned_groups(token):
+                self._preserve_blocking_obligation(obligation, proc.pid, child_ticks)
+                return None
+            write_state(replace(read_state(), spawning=None))
             return None
         write_state(
             replace(
@@ -2010,7 +2081,17 @@ class SupervisorDaemon:
         )
         if not self._unresolved_alive(hold):
             # Dead, zombie-reaped, or PID recycled with different start ticks:
-            # the exact instance is provably gone.
+            # the exact instance is provably gone. Its already-launched command
+            # groups are independent process groups, so exact-incarnation group
+            # recovery must succeed before this token's authority is dropped.
+            if not self._recover_spawn_owned_groups(obligation.token):
+                return False
+            # A stale exact-identity hold left behind by an earlier failed
+            # attempt for this same instance must not outlive its resolution.
+            state = read_state()
+            leftover = state.unresolved_child
+            if leftover is not None and leftover.pid == hold.pid and leftover.token == hold.token:
+                write_state(replace(state, unresolved_child=None))
             return True
         # Live: converge by exact pinned single-PID signals guarded by start
         # ticks (never group signals, never name matching).
@@ -2026,12 +2107,25 @@ class SupervisorDaemon:
             )
             LOGGER.error("%s", self._message)
             return False
+        # The worker instance is positively converged; its owned command groups
+        # may still be alive under the same incarnation. Recovery failure keeps
+        # both the obligation and the unresolved hold durable (fail closed) so
+        # no replacement can spawn and a later tick retries only the recovery.
+        if not self._recover_spawn_owned_groups(obligation.token):
+            return False
         write_state(replace(read_state(), unresolved_child=None))
         LOGGER.info("converged the previously spawned worker pid=%d", hold.pid)
         return True
 
     def _resolve_unresolved_child(self) -> bool:
         """Resolve any durable unresolved-child hold before further decisions.
+
+        The exact recorded instance is converged first; because every hold
+        carries the pre-publication worker incarnation token, its owned command
+        groups must then be recovered by that exact token before the blocking
+        authority may be cleared. Recovery failure keeps the hold durable so a
+        later tick retries it instead of authorizing a replacement beside
+        still-live side-effecting process groups.
 
         Returns:
             ``True`` when no blocking hold remains.
@@ -2066,6 +2160,8 @@ class SupervisorDaemon:
                 "holding without starting a worker"
             )
             LOGGER.error("%s", self._message)
+            return False
+        if not self._recover_spawn_owned_groups(hold.token):
             return False
         write_state(replace(read_state(), unresolved_child=None))
         LOGGER.info("resolved prior unresolved worker pid=%d", hold.pid)
