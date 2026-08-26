@@ -630,6 +630,8 @@ def _stub_repair(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(lifecycle, "git_commit", lambda *_a: COMMIT)
     monkeypatch.setattr(lifecycle, "_adoption_candidate", lambda *_a: (_adopted_meta(), "worker"))
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: PRIVATE)
+    monkeypatch.setattr(lifecycle, "process_has_token", lambda _pid, _token: True)
     monkeypatch.setattr(cli, "reconcile_pointer", lambda _commit: True)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
     monkeypatch.setattr(lifecycle, "_cleanup_ready_markers", lambda _pid: None)
@@ -851,3 +853,165 @@ def test_repair_fails_closed_when_the_consumer_boundary_is_busy(
     obligation = supervise.read_state().spawning
     assert obligation is not None
     assert obligation.pid == PID
+
+
+def _maintained_meta() -> lifecycle.WorkerMeta:
+    """Build metadata describing a newer maintained supervisor worker.
+
+    Returns:
+        Maintained-worker metadata for an identity distinct from the
+        recovery worker.
+    """
+    return lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=5151,
+        pgid=5151,
+        sid=5151,
+        start_time_ticks=777,
+        token=TOKEN + "s",
+        repo=".",
+        git_commit=COMMIT,
+        worker_id="maintained",
+        log_path="maintained.log",
+        started_at=0.0,
+        stopped_at=None,
+    )
+
+
+def test_repair_never_publishes_a_candidate_that_exited_before_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A candidate proven outside the lock must be re-proved under the lock."""
+    _spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+
+    maintained = _maintained_meta()
+    observed = {"live": True}
+    writes: list[lifecycle.WorkerMeta] = []
+    cli_mutations: list[str] = []
+    real_write_meta = lifecycle.write_meta
+
+    def identity(_pid: int) -> ProcessIdentity | None:
+        return PRIVATE if observed["live"] else None
+
+    def publish(meta: lifecycle.WorkerMeta) -> None:
+        writes.append(meta)
+
+    real_consumer_lock = supervise.consumer_lock
+
+    def consumer_lock(timeout_seconds: float) -> object:
+        observed["live"] = False
+        supervise.write_state(replace(supervise.read_state(), spawning=None))
+        return real_consumer_lock(timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(lifecycle, "process_identity", identity)
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(lifecycle, "write_meta", publish)
+    monkeypatch.setattr(supervise, "consumer_lock", consumer_lock)
+
+    def reconcile(_c: str) -> bool:
+        cli_mutations.append("reconcile")
+        return True
+
+    def gc(_commits: tuple[str, ...]) -> None:
+        cli_mutations.append("gc")
+
+    monkeypatch.setattr(cli, "reconcile_pointer", reconcile)
+    monkeypatch.setattr(cli, "gc_cli_roots", gc)
+    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", lambda *_a: True)
+    monkeypatch.setattr(lifecycle, "_cleanup_ready_markers", lambda _pid: None)
+    monkeypatch.setattr(lifecycle, "_reconcile_toolchain", lambda _uv: None)
+    monkeypatch.setattr(lifecycle, "git_commit", lambda *_a: COMMIT)
+    monkeypatch.setattr(lifecycle, "_adoption_candidate", lambda *_a: (_adopted_meta(), "worker"))
+    monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
+
+    real_write_meta(maintained)
+    writes.clear()
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "refusing stale metadata" in captured.err
+    assert "adopted recovery worker" not in captured.out
+    assert writes == []
+    assert cli_mutations == []
+    assert lifecycle.read_meta() == maintained
+
+
+def test_repair_adopts_a_candidate_that_stays_exact_through_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A candidate still exactly live under the lock adopts successfully."""
+    spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    _stub_repair(monkeypatch)
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: PRIVATE)
+
+    code = lifecycle._repair_locked(options(), PID)
+
+    captured = capsys.readouterr()
+    assert code == lifecycle.EXIT_OK
+    assert "adopted recovery worker" in captured.out
+    published = lifecycle.read_meta()
+    assert published is not None
+    assert published.pid == PID
+    assert published.start_time_ticks == PRIVATE.start_time_ticks
+    assert supervise.read_state().spawning is None
+    assert len(spawned) == 1
+
+
+def test_repair_refuses_a_candidate_whose_lifecycle_token_no_longer_matches(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A same-identity candidate without its exact token is never published.
+
+    A recycled or re-exec'd process can retain its PID, start ticks, group,
+    and session while no longer being the validated recovery worker, so the
+    lifecycle marker itself must still be proven under the lock.
+    """
+    _spawned, _events = recover_env
+    maintained = _maintained_meta()
+    writes: list[lifecycle.WorkerMeta] = []
+    cli_mutations: list[str] = []
+
+    def reconcile(_c: str) -> bool:
+        cli_mutations.append("reconcile")
+        return True
+
+    def gc(_commits: tuple[str, ...]) -> None:
+        cli_mutations.append("gc")
+
+    monkeypatch.setattr(lifecycle, "git_commit", lambda *_a: COMMIT)
+    monkeypatch.setattr(lifecycle, "_adoption_candidate", lambda *_a: (_adopted_meta(), "worker"))
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: PRIVATE)
+    monkeypatch.setattr(lifecycle, "process_has_token", lambda _pid, _token: False)
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _meta: True)
+    real_write_meta = lifecycle.write_meta
+    monkeypatch.setattr(lifecycle, "write_meta", writes.append)
+    monkeypatch.setattr(cli, "reconcile_pointer", reconcile)
+    monkeypatch.setattr(cli, "gc_cli_roots", gc)
+
+    real_write_meta(maintained)
+    writes.clear()
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "no longer carries the exact" in captured.err
+    assert "adopted recovery worker" not in captured.out
+    assert writes == []
+    assert cli_mutations == []
+    assert lifecycle.read_meta() == maintained

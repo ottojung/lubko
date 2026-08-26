@@ -2785,6 +2785,48 @@ def _pre_adoption_authority_error(meta: WorkerMeta) -> str | None:
     return None
 
 
+def _stale_candidate_error(new_meta: WorkerMeta) -> str | None:
+    """Return why a pre-validated adoption candidate is no longer adoptable.
+
+    The candidate was proven outside the shared consumer-establishment lock.
+    Before any authoritative write under that lock it must still be the exact
+    same live private-session process carrying its lifecycle token, and no
+    newer live maintained worker may have been published meanwhile.
+
+    Args:
+        new_meta: The previously validated candidate metadata.
+
+    Returns:
+        ``None`` when the candidate is still exactly valid, otherwise a
+        failure message.
+    """
+    if new_meta.pid is None:
+        return "the adoption candidate has no process identity to re-prove"
+    identity = process_identity(new_meta.pid)
+    if (
+        identity is None
+        or identity.pgid != new_meta.pgid
+        or identity.sid != new_meta.sid
+        or identity.start_time_ticks != new_meta.start_time_ticks
+    ):
+        return (
+            f"recovery worker pid {new_meta.pid} changed or exited before its "
+            "adoption could be published; refusing stale metadata"
+        )
+    if new_meta.token is None or not process_has_token(new_meta.pid, new_meta.token):
+        return (
+            f"recovery worker pid {new_meta.pid} no longer carries the exact "
+            "lifecycle token it was validated with; refusing stale metadata"
+        )
+    previous = read_meta()
+    if previous is not None and worker_alive(previous) and previous.pid != new_meta.pid:
+        return (
+            f"a newer live maintained worker pid {previous.pid} is already recorded; "
+            "refusing to overwrite it with stale recovery-worker metadata"
+        )
+    return None
+
+
 def _report_adoption(new_meta: WorkerMeta, worker_id: str, commit: str, *, cli_ok: bool) -> int:
     """Report a completed adoption and honor CLI reconciliation failures.
 
@@ -2877,6 +2919,10 @@ def _repair_authority_transition_locked(
     Returns:
         A process exit code.
     """
+    stale_error = _stale_candidate_error(new_meta)
+    if stale_error is not None:
+        _err(stale_error)
+        return EXIT_ERROR
     authority_error = _pre_adoption_authority_error(new_meta)
     if authority_error is not None:
         _err(authority_error)
