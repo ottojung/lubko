@@ -588,8 +588,9 @@ def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> 
 
     When the rename succeeds but the final directory fsync cannot be confirmed,
     the write is *not* confirmed.  This implementation performs a best-effort
-    fail-closed cleanup — restoring the prior pointer durably when one existed,
-    or durably neutralizing the unconfirmed destination for a first write — but
+    fail-closed cleanup — restoring the prior entry's exact type and value
+    durably when one existed (symlink target or regular-file bytes), or
+    durably neutralizing the unconfirmed destination for a first write — but
     it never converts the failure into success: the original
     :class:`DurabilityError` is always re-raised so callers cannot advance an
     action that depended on the new pointer being committed.
@@ -611,12 +612,25 @@ def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> 
     # independently committed one.
     with _serialized(destination):
         temporary = temporary_path(destination)
-        previous = str(destination.readlink()) if destination.is_symlink() else None
+        # Snapshot the prior entry's exact type and value: a symlink's target,
+        # a true regular file's bytes, or absence.  The destination may hold any
+        # of these, and a failed confirmation must restore exactly what was
+        # there before — never delete prior regular-file contents because they
+        # are not a symlink.  The regular-file check is lstat-safe and mirrors
+        # :func:`remove_durable`: only a non-symlink regular file's bytes are
+        # read; directories, FIFOs, devices, and other unsupported entry types
+        # are never read as bytes.
+        previous_link: str | None = None
+        previous_bytes: bytes | None = None
+        if destination.is_symlink():
+            previous_link = str(destination.readlink())
+        elif destination.exists() and destination.is_file() and not destination.is_symlink():
+            previous_bytes = destination.read_bytes()
         try:
             temporary.unlink(missing_ok=True)
             temporary.symlink_to(target)
             # The symlink carries no file contents, so the only durable boundary
-            # before the namespace switch is the rename itself; signal the file
+            # before the rename is the rename itself; signal the file
             # stage here so fault injection can exercise a pre-rename failure.
             _maybe_inject(temporary, FSYNC_STAGE_FILE)
             _maybe_inject(temporary, FSYNC_STAGE_REPLACE)
@@ -645,9 +659,15 @@ def write_symlink_durable(path: Path, target: str, *, _restore: bool = True) -> 
             # error is always re-raised.  The destination lock is still held here,
             # so the restore cannot race a concurrent writer; the nested calls
             # re-enter the same lock reentrantly.
-            if previous is not None:
+            # Restore exactly the prior entry: a symlink's target, a regular
+            # file's bytes, or — for a first write — durably neutralize the
+            # unconfirmed destination.
+            if previous_link is not None:
                 with contextlib.suppress(DurabilityError):
-                    write_symlink_durable(destination, previous, _restore=False)
+                    write_symlink_durable(destination, previous_link, _restore=False)
+            elif previous_bytes is not None:
+                with contextlib.suppress(DurabilityError):
+                    write_bytes_durable(destination, previous_bytes, _restore=False)
             else:
                 with contextlib.suppress(DurabilityError):
                     remove_durable(destination)
