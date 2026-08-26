@@ -439,7 +439,7 @@ class SupervisorState:
             "last_spawn_at": self.last_spawn_at,
             "ready": self.ready,
             "next_readiness_at": self.next_readiness_at,
-            "boot_id": self.boot_id,
+            **({} if self.boot_id is None else {"boot_id": self.boot_id}),
         }
 
     @classmethod
@@ -479,6 +479,14 @@ class SupervisorState:
             # backoff and let reconciliation restart immediately from a
             # corrupted schedule. Enter the durable hold.
             ownership_hold_malformed = True
+        boot_id, boot_malformed = _parse_present_boot_identity(data, "boot_id")
+        if boot_malformed:
+            # Any present boot identifier must be a non-empty string: a
+            # malformed one must never silently degrade to absence, since
+            # cross-boot normalization would then treat the state as
+            # written by an unknown prior boot and erase an active
+            # crash-loop backoff deadline. Enter the durable hold.
+            ownership_hold_malformed = True
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
             applied_generation=generation or 0,
@@ -500,7 +508,7 @@ class SupervisorState:
             last_spawn_at=_optional_float(data.get("last_spawn_at")),
             ready=data.get("ready", False) is True,
             next_readiness_at=_optional_float(data.get("next_readiness_at")),
-            boot_id=_optional_string(data.get("boot_id")),
+            boot_id=boot_id,
         )
 
 
@@ -674,6 +682,53 @@ def supervisor_runtime_override_path() -> Path:
         The ``supervisor-runtime`` path (no extension, plain text).
     """
     return supervisor_dir() / "supervisor-runtime"
+
+
+class ConsumerLockTimeoutError(Exception):
+    """The consumer-establishment lock could not be acquired in time."""
+
+
+CONSUMER_LOCK_POLL_SECONDS = 0.05
+
+
+@contextmanager
+def consumer_lock(timeout_seconds: float) -> Iterator[None]:
+    """Serialize queue-consumer establishment across processes.
+
+    This is the single cross-process serialization boundary for the
+    decision to create the sole queue consumer: the maintained supervisor's
+    gate-to-spawn critical section and manual ``recover``'s preflight through
+    authority-write/spawn/publication both hold it, so neither a stale
+    preflight observation nor stale supervisor state can authorize two
+    consumers. Lock order is deployment lock first, then this lock; this
+    lock is never held while acquiring the deployment or generation lock.
+
+    Args:
+        timeout_seconds: Maximum seconds to wait for the lock.
+
+    Yields:
+        Nothing while the lock is held.
+
+    Raises:
+        ConsumerLockTimeoutError: If the lock cannot be acquired in time.
+    """
+    path = supervisor_dir() / ".consumer.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    msg = "timed out waiting for the consumer-establishment lock"
+                    raise ConsumerLockTimeoutError(msg) from None
+                time.sleep(CONSUMER_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def supervisor_log_path() -> Path:
@@ -928,6 +983,60 @@ def write_state(state: SupervisorState) -> None:
     write_json_durable(state_path(), state.to_dict())
 
 
+def write_state_preserving_authority(
+    state: SupervisorState,
+    timeout_seconds: float,
+) -> None:
+    """Persist daemon state without clobbering a newer blocking authority.
+
+    Supervisor transitions that run *outside* the shared
+    consumer-establishment lock (crash handling, retirement bookkeeping,
+    backoff/readiness maintenance) must never erase consumer authority that a
+    concurrent manual recovery established under that lock: a blind atomic
+    replacement of a stale snapshot is a lost update, and even a
+    fresh-read-then-write merge is racy unless the whole read-merge-write is
+    serialized against every other authority transition. This writer therefore
+    acquires the ``consumer_lock`` first, re-reads the durable state inside
+    that critical section, carries its blocking authority fields — the
+    pre-spawn obligation, the unresolved-child hold, the malformed-hold flags,
+    and the ownership-malformed hold — onto the snapshot being written, and
+    publishes while still holding the lock. Recovery's preflight-through-
+    publication critical section and the supervisor's gate-to-spawn section
+    share the same boundary, so no interleaving can slip an authority write
+    between the fresh read and the publication.
+
+    Callers already inside a ``consumer_lock`` critical section must NOT call
+    this (the lock is not recursive and this would self-deadlock); they use
+    :func:`write_state` directly, where their in-lock fresh reads are already
+    authoritative.
+
+    Args:
+        state: State to store (its non-authority fields are published as-is).
+        timeout_seconds: Maximum seconds to wait for the consumer lock.
+
+    This writer may propagate :class:`supervise.ConsumerLockTimeoutError`
+    when the boundary cannot be acquired in time; callers should skip the
+    publication and let a later reconciliation retry, because dropping an
+    authority-preserving maintenance write is always safer than publishing a
+    stale one. It also fails closed on durability: the write raises
+    :class:`DurabilityError` from :func:`lubko.durable.write_json_durable`
+    when it cannot be confirmed durable, so callers must not advance a
+    dependent action.
+    """
+    with consumer_lock(timeout_seconds):
+        current = read_state()
+        write_state(
+            replace(
+                state,
+                spawning=current.spawning,
+                spawning_hold_malformed=current.spawning_hold_malformed,
+                unresolved_child=current.unresolved_child,
+                unresolved_hold_malformed=current.unresolved_hold_malformed,
+                ownership_hold_malformed=current.ownership_hold_malformed,
+            )
+        )
+
+
 def read_state() -> SupervisorState:
     """Load the daemon's durable state, preserving holds on authority failure.
 
@@ -1162,7 +1271,9 @@ def next_generation() -> int:
         The next monotonic generation.
     """
     applied = read_state().applied_generation
-    desired = read_desired()
+    # A present malformed desired file is durable authority, not absence: a
+    # writer must fail closed rather than erase or outrank an unreadable intent.
+    desired = read_desired_strict()
     desired_generation = desired.generation if desired is not None else 0
     return max(applied, desired_generation, _mission_generation()) + 1
 
@@ -1539,6 +1650,29 @@ def _parse_present_strict(
         return 0, False
     value = parser(data[key])
     return (value or 0), value is None
+
+
+def _parse_present_boot_identity(
+    data: dict[str, object],
+    key: str,
+) -> tuple[str | None, bool]:
+    """Parse the boot identity field, distinguishing absence from corruption.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Field name.
+
+    Returns:
+        A ``(value, malformed)`` pair: the parsed identifier (``None``
+        only for genuine absence of the key) and whether a present value
+        was not a non-empty string. Explicit null, empty strings,
+        booleans, numbers, and containers are all malformed: any present
+        boot identity must positively prove its clock domain.
+    """
+    if key not in data:
+        return None, False
+    raw = data[key]
+    return (raw, False) if isinstance(raw, str) and raw else (None, True)
 
 
 def _parse_present_nullable_float(

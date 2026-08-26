@@ -2700,13 +2700,176 @@ def _adoption_candidate(
     ), worker_id
 
 
+def _adoption_matches_obligation(
+    obligation: supervise.SpawningObligation, meta: WorkerMeta
+) -> bool:
+    """Return whether a durable recovery authority names exactly this worker.
+
+    Only an exact match — same PID, same start ticks, same lifecycle token,
+    and the pid-less manual-recovery shape (no kernel parent-death guarantee)
+    that a ``recover`` spawn always records — releases the authority.
+
+    Args:
+        obligation: The durable pre-spawn recovery obligation.
+        meta: The verified metadata of the adopted recovery worker.
+
+    Returns:
+        ``True`` when the obligation describes exactly the adopted worker.
+    """
+    return (
+        obligation.pid == meta.pid
+        and obligation.start_time_ticks == meta.start_time_ticks
+        and obligation.token == meta.token
+        and not obligation.parent_death_signal
+    )
+
+
+def _release_adoption_authority(meta: WorkerMeta) -> str | None:
+    """Durably release the recovery authority naming exactly this worker.
+
+    The shared supervisor state is re-read immediately before releasing so a
+    concurrently replaced or malformed authority is never cleared: an absent
+    hold releases nothing, a malformed hold and a mismatched record both fail
+    closed. The caller must hold the shared consumer-establishment lock
+    across validation and this release so recover or a supervisor
+    establishment cannot interleave with either step.
+
+    Args:
+        meta: The verified metadata of the adopted recovery worker.
+
+    Returns:
+        ``None`` on success (including a genuinely absent hold), otherwise a
+        failure message for the operator.
+    """
+    current = supervise.read_state()
+    if current.spawning_hold_malformed:
+        return (
+            "the recovery worker was adopted, but its durable recovery authority "
+            "became malformed; it keeps blocking every consumer until an explicit "
+            "operator repair resolves it"
+        )
+    if current.spawning is not None and not _adoption_matches_obligation(current.spawning, meta):
+        return (
+            "the durable recovery authority changed during repair; it stays "
+            "blocking until it is resolved"
+        )
+    if current.spawning is not None and not _clear_spawning_obligation():
+        return (
+            "the recovery worker was adopted, but its durable recovery authority "
+            "could not be released; it keeps blocking every consumer until a "
+            "later repair releases it"
+        )
+    return None
+
+
+def _pre_adoption_authority_error(meta: WorkerMeta) -> str | None:
+    """Return why ``meta`` may not be adopted under the durable authority.
+
+    Args:
+        meta: The verified metadata of the candidate recovery worker.
+
+    Returns:
+        ``None`` when adoption may proceed, otherwise a failure message.
+    """
+    state = supervise.read_state()
+    if state.spawning_hold_malformed:
+        return (
+            "the durable pre-spawn recovery obligation is malformed; only an explicit "
+            "operator repair of the supervisor state may clear it before adoption"
+        )
+    if state.spawning is not None and not _adoption_matches_obligation(state.spawning, meta):
+        return (
+            "a durable recovery authority names another worker instance; resolve it "
+            "(for example with 'lubko-deploy recover') before adopting a different one"
+        )
+    return None
+
+
+def _stale_candidate_error(new_meta: WorkerMeta) -> str | None:
+    """Return why a pre-validated adoption candidate is no longer adoptable.
+
+    The candidate was proven outside the shared consumer-establishment lock.
+    Before any authoritative write under that lock it must still be the exact
+    same live private-session process carrying its lifecycle token, and no
+    newer live maintained worker may have been published meanwhile.
+
+    Args:
+        new_meta: The previously validated candidate metadata.
+
+    Returns:
+        ``None`` when the candidate is still exactly valid, otherwise a
+        failure message.
+    """
+    if new_meta.pid is None:
+        return "the adoption candidate has no process identity to re-prove"
+    identity = process_identity(new_meta.pid)
+    if (
+        identity is None
+        or identity.pgid != new_meta.pgid
+        or identity.sid != new_meta.sid
+        or identity.start_time_ticks != new_meta.start_time_ticks
+    ):
+        return (
+            f"recovery worker pid {new_meta.pid} changed or exited before its "
+            "adoption could be published; refusing stale metadata"
+        )
+    if new_meta.token is None or not process_has_token(new_meta.pid, new_meta.token):
+        return (
+            f"recovery worker pid {new_meta.pid} no longer carries the exact "
+            "lifecycle token it was validated with; refusing stale metadata"
+        )
+    previous = read_meta()
+    if previous is not None and worker_alive(previous) and previous.pid != new_meta.pid:
+        return (
+            f"a newer live maintained worker pid {previous.pid} is already recorded; "
+            "refusing to overwrite it with stale recovery-worker metadata"
+        )
+    return None
+
+
+def _report_adoption(new_meta: WorkerMeta, worker_id: str, commit: str, *, cli_ok: bool) -> int:
+    """Report a completed adoption and honor CLI reconciliation failures.
+
+    Args:
+        new_meta: The adopted worker's published metadata.
+        worker_id: The adopted worker's id.
+        commit: The commit the repair checkout is on.
+        cli_ok: Whether the maintained CLIs were reconciled.
+
+    Returns:
+        A process exit code.
+    """
+    append_deploy_log(f"repaired: adopted recovery worker pid={new_meta.pid} commit={commit}")
+    _out(f"adopted recovery worker pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
+    _out(f"worker id: {worker_id}")
+    _out(f"git commit: {commit}")
+    _out(f"log: {new_meta.log_path}")
+    if not cli_ok:
+        _err(
+            "error: maintained CLIs could not be reconciled; run 'lubko-deploy-ctl status' "
+            "to repair"
+        )
+        return EXIT_ERROR
+    return EXIT_OK
+
+
 def _repair_locked(options: DeployOptions, recovery_worker_pid: int) -> int:
     """Adopt an independently known recovery worker into coherent metadata.
 
     This is the deliberate supported recovery path for lifecycle state already
     corrupted (for example by pre-isolation test runs). Adoption is verified
     before any metadata is rewritten; only then is the maintained CLI pointer
-    reconciled and stale test-produced state removed.
+    reconciled and stale test-produced state removed. When a durable recovery
+    authority exists it must name exactly the adopted worker; it stays
+    replacement-blocking until the maintained metadata is published and the
+    post-repair queue verification succeeds, then it is released durably. A
+    release that cannot be confirmed leaves the hold blocking for a later
+    repair instead of reporting success with an unrepresented consumer.
+
+    The authority validation through its release runs under the shared
+    consumer-establishment lock (deployment lock first, then this lock), so a
+    concurrent recover or supervisor establishment can neither replace the
+    validated authority mid-repair nor race the release.
 
     Args:
         options: Deployment inputs.
@@ -2724,6 +2887,46 @@ def _repair_locked(options: DeployOptions, recovery_worker_pid: int) -> int:
     except _AdoptionError as exc:
         _err(str(exc))
         return EXIT_ERROR
+    try:
+        with supervise.consumer_lock(options.lock_timeout_seconds):
+            return _repair_authority_transition_locked(
+                options, recovery_worker_pid, commit, new_meta, worker_id
+            )
+    except supervise.ConsumerLockTimeoutError:
+        _err(
+            "the supervisor is currently establishing a queue consumer; refusing "
+            "to interleave the adoption of the recovery worker"
+        )
+        return EXIT_ERROR
+
+
+def _repair_authority_transition_locked(
+    options: DeployOptions,
+    recovery_worker_pid: int,
+    commit: str,
+    new_meta: WorkerMeta,
+    worker_id: str,
+) -> int:
+    """Run the authority validation and release under the consumer lock.
+
+    Args:
+        options: Deployment inputs.
+        recovery_worker_pid: Exact PID of the running recovery worker.
+        commit: The commit of the repair checkout.
+        new_meta: The verified metadata of the candidate recovery worker.
+        worker_id: The verified worker id.
+
+    Returns:
+        A process exit code.
+    """
+    stale_error = _stale_candidate_error(new_meta)
+    if stale_error is not None:
+        _err(stale_error)
+        return EXIT_ERROR
+    authority_error = _pre_adoption_authority_error(new_meta)
+    if authority_error is not None:
+        _err(authority_error)
+        return EXIT_ERROR
     write_meta(new_meta)
     cli_ok = cli.reconcile_pointer(commit)
     cli.gc_cli_roots((commit,))
@@ -2737,18 +2940,11 @@ def _repair_locked(options: DeployOptions, recovery_worker_pid: int) -> int:
             "consumes the queue; refusing to report success"
         )
         return EXIT_ERROR
-    append_deploy_log(f"repaired: adopted recovery worker pid={new_meta.pid} commit={commit}")
-    _out(f"adopted recovery worker pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
-    _out(f"worker id: {worker_id}")
-    _out(f"git commit: {commit}")
-    _out(f"log: {new_meta.log_path}")
-    if not cli_ok:
-        _err(
-            "error: maintained CLIs could not be reconciled; run 'lubko-deploy-ctl status' "
-            "to repair"
-        )
+    release_error = _release_adoption_authority(new_meta)
+    if release_error is not None:
+        _err(release_error)
         return EXIT_ERROR
-    return EXIT_OK
+    return _report_adoption(new_meta, worker_id, commit, cli_ok=cli_ok)
 
 
 def repair(options: DeployOptions, recovery_worker_pid: int) -> int:
@@ -3113,13 +3309,13 @@ def _settle_spawned_recovery_worker(
         # forgotten.
         _err("recovery worker exited before it could be adopted")
         anchor = None
-    elif not _clear_spawning_obligation():
-        _err(
-            "the recovery worker is healthy, but its durable recovery authority could "
-            "not be released; converging it instead of reporting an adoptable PID"
-        )
-        return _converge_failed_recovery_worker(proc, options, token, identity)
     else:
+        # The healthy path keeps the already-durable obligation naming this
+        # exact live worker: it stays the sole replacement-blocking recovery
+        # authority until 'lubko-deploy repair' adopts it (clearing the
+        # authority) or a later convergence proves the exact instance gone and
+        # recovers its owned groups. Clearing here would leave a live consumer
+        # unrepresented, letting a supervisor restart spawn a second one.
         append_deploy_log(f"recovery worker started pid={identity.pid} commit={commit}")
         _out(f"recovery worker pid={identity.pid} pgid={identity.pgid} session={identity.sid}")
         _out(f"worker id: {worker_id}")
@@ -3148,7 +3344,38 @@ def _recover_locked(options: DeployOptions) -> int:
     exact incarnation's owned command groups; only then may the authority be
     released. If that recovery fails, the obligation keeps blocking every
     later consumer — manual recover and maintained supervisor alike — until a
-    subsequent run resolves it.
+    subsequent run resolves it. On success the obligation naming the exact
+    live recovery worker stays durably in place: it is the sole authority
+    until repair adopts the worker or convergence plus owned-group recovery
+    proves the instance gone.
+
+    The whole preflight-to-publication critical section runs under the
+    shared consumer-establishment lock the maintained supervisor holds
+    around its own gate-to-spawn decision, so from one initially
+    consumer-free state exactly one of the two paths can authorize a spawn:
+    a stale preflight observation can never outlive competing supervisor
+    authority, and the supervisor can never overwrite an established manual
+    recovery obligation and spawn beside it.
+
+    Args:
+        options: Deployment inputs.
+
+    Returns:
+        A process exit code.
+    """
+    try:
+        with supervise.consumer_lock(options.lock_timeout_seconds):
+            return _recover_consumer_locked(options)
+    except supervise.ConsumerLockTimeoutError:
+        _err(
+            "the supervisor is currently establishing a queue consumer; "
+            "refusing to race it into a second consumer"
+        )
+        return EXIT_ERROR
+
+
+def _recover_consumer_locked(options: DeployOptions) -> int:
+    """Start a detached recovery worker while holding the consumer lock.
 
     Args:
         options: Deployment inputs.

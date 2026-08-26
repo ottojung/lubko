@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import signal
 import subprocess
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from lubko import lifecycle, supervise, supervisor
+from lubko import cli, lifecycle, supervise, supervisor
 from lubko.durable import DurabilityError
 from lubko.lifecycle import DeployOptions, ProcessIdentity
 
@@ -432,7 +433,10 @@ def test_recover_refuses_to_spawn_until_stale_obligation_resolves(
     monkeypatch.setattr(lifecycle, "spawn_worker", spawn_ok)
     assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
     assert len(spawned) == 1
-    assert supervise.read_state().spawning is None
+    obligation = supervise.read_state().spawning
+    assert obligation is not None
+    assert obligation.token == TOKEN
+    assert obligation.pid == PID
     assert (TOKEN, "recovered") in events
 
 
@@ -593,3 +597,421 @@ def test_recover_reports_success_for_live_private_session_child(
     assert code == lifecycle.EXIT_OK
     assert spawned[-1].poll() is None
     assert "adopt it with" in capsys.readouterr().out
+
+
+def _adopted_meta() -> lifecycle.WorkerMeta:
+    """Build metadata describing the adopted fake recovery worker.
+
+    Returns:
+        Maintained-worker metadata for the exact fake identity.
+    """
+    return lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=PRIVATE.pid,
+        pgid=PRIVATE.pgid,
+        sid=PRIVATE.sid,
+        start_time_ticks=PRIVATE.start_time_ticks,
+        token=TOKEN,
+        repo=".",
+        git_commit=COMMIT,
+        worker_id="worker",
+        log_path="worker.log",
+        started_at=0.0,
+        stopped_at=None,
+    )
+
+
+def _stub_repair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub every repair dependency except the durable state transition.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(lifecycle, "git_commit", lambda *_a: COMMIT)
+    monkeypatch.setattr(lifecycle, "_adoption_candidate", lambda *_a: (_adopted_meta(), "worker"))
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: PRIVATE)
+    monkeypatch.setattr(lifecycle, "process_has_token", lambda _pid, _token: True)
+    monkeypatch.setattr(cli, "reconcile_pointer", lambda _commit: True)
+    monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
+    monkeypatch.setattr(lifecycle, "_cleanup_ready_markers", lambda _pid: None)
+    monkeypatch.setattr(lifecycle, "_reconcile_toolchain", lambda _uv: None)
+    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", lambda *_a: True)
+    monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
+
+
+def test_recover_success_keeps_exact_authority_until_adoption(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A successful recover leaves the live worker durably represented."""
+    spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+
+    code = lifecycle._recover_locked(options())
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_OK
+    assert "adopt it with" in captured.out
+    assert len(spawned) == 1
+    obligation = supervise.read_state().spawning
+    assert obligation is not None
+    assert obligation.token == TOKEN
+    assert obligation.pid == PID
+    assert obligation.start_time_ticks == PRIVATE.start_time_ticks
+    assert obligation.parent_death_signal is False
+
+
+def test_recover_success_holds_supervisor_reconcile_while_worker_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """The retained authority stops a restarted supervisor from respawning."""
+    spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(daemon, "_unresolved_alive", lambda _hold: True)
+    monkeypatch.setattr(daemon, "_converge_unresolved", lambda _hold: False)
+    monkeypatch.setattr(daemon, "_recover_spawn_owned_groups", lambda _token: False)
+
+    assert not daemon._resolve_spawning_obligation()
+    assert supervise.read_state().spawning is not None
+    assert daemon._message is not None
+    assert "still live" in daemon._message
+    assert len(spawned) == 1
+
+
+def test_repair_adopts_and_durably_clears_exact_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A verified adoption of the named worker releases the exact authority."""
+    spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    _stub_repair(monkeypatch)
+
+    assert lifecycle._repair_locked(options(), PID) == lifecycle.EXIT_OK
+    assert "adopted recovery worker" in capsys.readouterr().out
+    assert supervise.read_state().spawning is None
+    assert len(spawned) == 1
+
+
+def test_repair_refuses_to_clear_a_mismatched_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """An obligation naming a different instance stays blocking and wins."""
+    _spawned, _events = recover_env
+    _write_obligation()
+    _stub_repair(monkeypatch)
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "names another worker instance" in captured.err
+    obligation = supervise.read_state().spawning
+    assert obligation is not None
+    assert (obligation.token, obligation.pid) == (TOKEN, PID)
+
+
+def test_repair_failure_to_release_authority_reports_no_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """Adoption without a confirmed release never reports success."""
+    _spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    _stub_repair(monkeypatch)
+    monkeypatch.setattr(lifecycle, "_clear_spawning_obligation", lambda: False)
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "could not be released" in captured.err
+    assert "adopted recovery worker" not in captured.out
+    obligation = supervise.read_state().spawning
+    assert obligation is not None
+    assert obligation.pid == PID
+
+
+def test_dead_before_repair_convergence_resolves_the_retained_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A worker that dies before repair is converged out of the authority."""
+    spawned, events = recover_env
+    ticks: dict[str, int | None] = {"value": PRIVATE.start_time_ticks}
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: ticks["value"])
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    spawned[0].returncode = 0
+    ticks["value"] = None
+
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    assert "refusing to start another consumer" not in capsys.readouterr().err
+    assert len(spawned) == 2
+    assert (TOKEN, "recovered") in events
+    obligation = supervise.read_state().spawning
+    assert obligation is not None
+    assert obligation.token == TOKEN
+
+
+def test_legacy_repair_without_authority_still_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Repair keeps working when no recovery authority was ever recorded."""
+    _stub_repair(monkeypatch)
+
+    assert lifecycle._repair_locked(options(), PID) == lifecycle.EXIT_OK
+    assert "adopted recovery worker" in capsys.readouterr().out
+    assert supervise.read_state().spawning is None
+
+
+def test_repair_failure_when_authority_became_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A concurrently malformed authority fails closed and stays durable."""
+    _spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    _stub_repair(monkeypatch)
+    real_read = supervise.read_state
+    reads = {"count": 0}
+
+    def malformed() -> supervise.SupervisorState:
+        """Model a concurrent writer corrupting the shared authority.
+
+        Returns:
+            The state with a malformed hold once repair reaches release.
+        """
+        reads["count"] += 1
+        state = real_read()
+        if reads["count"] > 1:
+            return replace(state, spawning_hold_malformed=True)
+        return state
+
+    monkeypatch.setattr(supervise, "read_state", malformed)
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "became malformed" in captured.err
+    assert json.loads(supervise.state_path().read_text())["spawning"]["token"] == TOKEN
+
+
+def test_repair_fails_closed_when_the_consumer_boundary_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A busy consumer-establishment boundary blocks the whole adoption."""
+    _spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    _stub_repair(monkeypatch)
+
+    def must_not_run(**_kwargs: object) -> None:
+        """Fail if any part of the transition ran without the lock.
+
+        Raises:
+            AssertionError: Always.
+        """
+        msg = "authority transition ran without the consumer lock"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", must_not_run)
+    lock_path = supervise.supervisor_dir() / ".consumer.lock"
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        code = lifecycle._repair_locked(replace(options(), lock_timeout_seconds=0.0), PID)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+    captured = capsys.readouterr()
+    assert code == lifecycle.EXIT_ERROR
+    assert "establishing a queue consumer" in captured.err
+    obligation = supervise.read_state().spawning
+    assert obligation is not None
+    assert obligation.pid == PID
+
+
+def _maintained_meta() -> lifecycle.WorkerMeta:
+    """Build metadata describing a newer maintained supervisor worker.
+
+    Returns:
+        Maintained-worker metadata for an identity distinct from the
+        recovery worker.
+    """
+    return lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=5151,
+        pgid=5151,
+        sid=5151,
+        start_time_ticks=777,
+        token=TOKEN + "s",
+        repo=".",
+        git_commit=COMMIT,
+        worker_id="maintained",
+        log_path="maintained.log",
+        started_at=0.0,
+        stopped_at=None,
+    )
+
+
+def test_repair_never_publishes_a_candidate_that_exited_before_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A candidate proven outside the lock must be re-proved under the lock."""
+    _spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+
+    maintained = _maintained_meta()
+    observed = {"live": True}
+    writes: list[lifecycle.WorkerMeta] = []
+    cli_mutations: list[str] = []
+    real_write_meta = lifecycle.write_meta
+
+    def identity(_pid: int) -> ProcessIdentity | None:
+        return PRIVATE if observed["live"] else None
+
+    def publish(meta: lifecycle.WorkerMeta) -> None:
+        writes.append(meta)
+
+    real_consumer_lock = supervise.consumer_lock
+
+    def consumer_lock(timeout_seconds: float) -> object:
+        observed["live"] = False
+        supervise.write_state(replace(supervise.read_state(), spawning=None))
+        return real_consumer_lock(timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(lifecycle, "process_identity", identity)
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(lifecycle, "write_meta", publish)
+    monkeypatch.setattr(supervise, "consumer_lock", consumer_lock)
+
+    def reconcile(_c: str) -> bool:
+        cli_mutations.append("reconcile")
+        return True
+
+    def gc(_commits: tuple[str, ...]) -> None:
+        cli_mutations.append("gc")
+
+    monkeypatch.setattr(cli, "reconcile_pointer", reconcile)
+    monkeypatch.setattr(cli, "gc_cli_roots", gc)
+    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", lambda *_a: True)
+    monkeypatch.setattr(lifecycle, "_cleanup_ready_markers", lambda _pid: None)
+    monkeypatch.setattr(lifecycle, "_reconcile_toolchain", lambda _uv: None)
+    monkeypatch.setattr(lifecycle, "git_commit", lambda *_a: COMMIT)
+    monkeypatch.setattr(lifecycle, "_adoption_candidate", lambda *_a: (_adopted_meta(), "worker"))
+    monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
+
+    real_write_meta(maintained)
+    writes.clear()
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "refusing stale metadata" in captured.err
+    assert "adopted recovery worker" not in captured.out
+    assert writes == []
+    assert cli_mutations == []
+    assert lifecycle.read_meta() == maintained
+
+
+def test_repair_adopts_a_candidate_that_stays_exact_through_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A candidate still exactly live under the lock adopts successfully."""
+    spawned, _events = recover_env
+    monkeypatch.setattr(lifecycle, "proc_start_ticks", lambda _pid: PRIVATE.start_time_ticks)
+    observe(monkeypatch, PRIVATE)
+    assert lifecycle._recover_locked(options()) == lifecycle.EXIT_OK
+    _stub_repair(monkeypatch)
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: PRIVATE)
+
+    code = lifecycle._repair_locked(options(), PID)
+
+    captured = capsys.readouterr()
+    assert code == lifecycle.EXIT_OK
+    assert "adopted recovery worker" in captured.out
+    published = lifecycle.read_meta()
+    assert published is not None
+    assert published.pid == PID
+    assert published.start_time_ticks == PRIVATE.start_time_ticks
+    assert supervise.read_state().spawning is None
+    assert len(spawned) == 1
+
+
+def test_repair_refuses_a_candidate_whose_lifecycle_token_no_longer_matches(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+) -> None:
+    """A same-identity candidate without its exact token is never published.
+
+    A recycled or re-exec'd process can retain its PID, start ticks, group,
+    and session while no longer being the validated recovery worker, so the
+    lifecycle marker itself must still be proven under the lock.
+    """
+    _spawned, _events = recover_env
+    maintained = _maintained_meta()
+    writes: list[lifecycle.WorkerMeta] = []
+    cli_mutations: list[str] = []
+
+    def reconcile(_c: str) -> bool:
+        cli_mutations.append("reconcile")
+        return True
+
+    def gc(_commits: tuple[str, ...]) -> None:
+        cli_mutations.append("gc")
+
+    monkeypatch.setattr(lifecycle, "git_commit", lambda *_a: COMMIT)
+    monkeypatch.setattr(lifecycle, "_adoption_candidate", lambda *_a: (_adopted_meta(), "worker"))
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: PRIVATE)
+    monkeypatch.setattr(lifecycle, "process_has_token", lambda _pid, _token: False)
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _meta: True)
+    real_write_meta = lifecycle.write_meta
+    monkeypatch.setattr(lifecycle, "write_meta", writes.append)
+    monkeypatch.setattr(cli, "reconcile_pointer", reconcile)
+    monkeypatch.setattr(cli, "gc_cli_roots", gc)
+
+    real_write_meta(maintained)
+    writes.clear()
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "no longer carries the exact" in captured.err
+    assert "adopted recovery worker" not in captured.out
+    assert writes == []
+    assert cli_mutations == []
+    assert lifecycle.read_meta() == maintained
