@@ -481,6 +481,35 @@ def test_supervisor_never_resolves_pid_less_manual_obligation_by_assumption(
     assert supervise.read_state().spawning is not None
 
 
+def test_recover_never_spawns_over_a_malformed_spawning_authority(
+    capsys: pytest.CaptureFixture[str],
+    recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed pre-spawn authority fails closed and survives untouched."""
+    spawned, _events = recover_env
+    raw = {
+        "schema_version": supervise.SCHEMA_VERSION,
+        "spawning": {"token": TOKEN},
+    }
+    supervise.state_path().write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.setattr(
+        lifecycle,
+        "spawn_worker",
+        lambda *_a: (_ for _ in ()).throw(AssertionError("spawned over a malformed authority")),
+    )
+
+    code = lifecycle._recover_locked(options())
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "could not be resolved" in captured.err
+    assert not spawned
+    state = supervise.read_state()
+    assert state.spawning_hold_malformed is True
+    assert json.loads(supervise.state_path().read_text()) == raw
+
+
 def test_supervisor_honors_recorded_recovery_obligation(
     monkeypatch: pytest.MonkeyPatch,
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],

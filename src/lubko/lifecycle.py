@@ -3002,14 +3002,22 @@ def _resolve_stale_recovery_obligation() -> bool:
     token's owned command groups may be unresolved. Before this command may
     start another queue consumer, that exact instance must be provably gone
     *and* its owned groups successfully recovered. Anything else — including a
-    pid-less record that cannot be resolved by assumption at all — fails
+    pid-less record that cannot be resolved by assumption at all, or a
+    malformed authority whose true fate is unreadable — fails
     closed so no replacement consumer races unresolved side-effecting process
     groups.
 
     Returns:
         ``True`` when no blocking obligation remains.
     """
-    obligation = supervise.read_state().spawning
+    state = supervise.read_state()
+    if state.spawning_hold_malformed:
+        # The pre-spawn authority is present but unreadable: its recorded
+        # spawn may still be live and owning groups. This deliberately does
+        # not self-heal and is never overwritten; only operator repair clears
+        # it, exactly as for the maintained supervisor.
+        return False
+    obligation = state.spawning
     if obligation is None:
         return True
     if obligation.pid is None:
