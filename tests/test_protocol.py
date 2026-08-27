@@ -155,18 +155,34 @@ def test_rejects_non_object_and_bad_json() -> None:
 
 
 def test_output_window_round_trip_and_bounds() -> None:
-    """Output windows carry offsets and honor the tail size bound."""
+    """Output windows carry offsets and honor the raw-span size bound."""
     window = build_output_window_payload(tail="abc", start=0, end=3, previous=None)
     assert window == {"tail": "abc", "start": 0, "end": 3, "previous": None}
     previous = uuid4()
     window = build_output_window_payload(tail="abc", start=1, end=3, previous=previous)
     assert window["previous"] == str(previous)
     with pytest.raises(ProtocolError):
+        build_output_window_payload(tail="a", start=5, end=4, previous=None)
+    with pytest.raises(ProtocolError):
         build_output_window_payload(
             tail="a" * (OUTPUT_TAIL_MAX_BYTES + 1), start=0, end=0, previous=None
         )
     with pytest.raises(ProtocolError):
-        build_output_window_payload(tail="a", start=5, end=4, previous=None)
+        parse_payload(
+            json.dumps(
+                command_payload()
+                | {
+                    "output": {
+                        "stdout": {
+                            "tail": "a" * (OUTPUT_TAIL_MAX_BYTES + 1),
+                            "start": 0,
+                            "end": 0,
+                            "previous": None,
+                        }
+                    }
+                }
+            )
+        )
 
 
 def test_output_window_parsed_from_payload() -> None:
@@ -237,10 +253,14 @@ def test_chunk_validation_errors() -> None:
         build_output_chunk_payload(**base | {"stream": "stdin"})
     with pytest.raises(ProtocolError, match="sequence"):
         build_output_chunk_payload(**base | {"sequence": -1})
-    with pytest.raises(ProtocolError, match="value"):
-        build_output_chunk_payload(**base | {"value": "x" * (OUTPUT_CHUNK_MAX_BYTES + 1)})
     with pytest.raises(ProtocolError, match="precedes"):
         build_output_chunk_payload(**base | {"start": 9, "end": 1})
+    with pytest.raises(ProtocolError, match="value"):
+        build_output_chunk_payload(**base | {"value": "x" * (OUTPUT_CHUNK_MAX_BYTES + 1)})
+    overlong = build_output_chunk_payload(**base)
+    overlong["value"] = "x" * (OUTPUT_CHUNK_MAX_BYTES + 1)
+    with pytest.raises(ProtocolError, match="value"):
+        parse_chunk_payload(overlong)
 
 
 def test_chunk_requires_thread_and_kind_separation() -> None:
@@ -369,3 +389,119 @@ def test_chunk_value_byte_bounds() -> None:
     over["end"] = OUTPUT_CHUNK_MAX_BYTES + 1
     with pytest.raises(ProtocolError, match="bytes"):
         parse_chunk_payload(json.dumps(over))
+
+
+def test_output_window_span_exact_limit_accepted() -> None:
+    """A live window whose raw span exactly equals the bound is accepted."""
+    assert (
+        build_output_window_payload(
+            tail="x" * OUTPUT_TAIL_MAX_BYTES, start=0, end=OUTPUT_TAIL_MAX_BYTES, previous=None
+        )["end"]
+        == OUTPUT_TAIL_MAX_BYTES
+    )
+    raw = {
+        "tail": "x" * OUTPUT_TAIL_MAX_BYTES,
+        "start": 0,
+        "end": OUTPUT_TAIL_MAX_BYTES,
+        "previous": None,
+    }
+    parsed_win = parse_payload(json.dumps(command_payload() | {"output": {"stdout": raw}}))
+    assert parsed_win.output is not None
+    assert parsed_win.output.stdout is not None
+    assert parsed_win.output.stdout.end == OUTPUT_TAIL_MAX_BYTES
+
+
+def test_output_window_span_over_limit_rejected() -> None:
+    """A live window whose raw span exceeds the bound is rejected by builder and parser.
+
+    The tail text itself stays within the character bound so the failure is
+    specifically the raw-span check, independent of the text-length check.
+    """
+    with pytest.raises(ProtocolError):
+        build_output_window_payload(
+            tail="x",
+            start=0,
+            end=OUTPUT_TAIL_MAX_BYTES + 1,
+            previous=None,
+        )
+    with pytest.raises(ProtocolError):
+        parse_payload(
+            json.dumps(
+                command_payload()
+                | {
+                    "output": {
+                        "stdout": {
+                            "tail": "x",
+                            "start": 0,
+                            "end": OUTPUT_TAIL_MAX_BYTES + 1,
+                            "previous": None,
+                        }
+                    }
+                }
+            )
+        )
+
+
+def test_output_chunk_span_exact_limit_accepted() -> None:
+    """A chunk whose raw span exactly equals the bound is accepted."""
+    payload = build_output_chunk_payload(
+        server=SERVER,
+        thread=uuid4(),
+        stream="stdout",
+        sequence=0,
+        start=0,
+        end=OUTPUT_CHUNK_MAX_BYTES,
+        value="x" * OUTPUT_CHUNK_MAX_BYTES,
+        previous=None,
+    )
+    assert parse_chunk_payload(payload).end == OUTPUT_CHUNK_MAX_BYTES
+
+
+def test_output_chunk_span_over_limit_rejected() -> None:
+    """A chunk whose raw span exceeds the bound is rejected by builder and parser."""
+    with pytest.raises(ProtocolError):
+        build_output_chunk_payload(
+            server=SERVER,
+            thread=uuid4(),
+            stream="stdout",
+            sequence=0,
+            start=0,
+            end=OUTPUT_CHUNK_MAX_BYTES + 1,
+            value="x",
+            previous=None,
+        )
+    with pytest.raises(ProtocolError):
+        parse_chunk_payload({
+            "v": PROTOCOL_VERSION,
+            "type": "output_chunk",
+            "server": SERVER,
+            "thread": str(uuid4()),
+            "stream": "stdout",
+            "sequence": 0,
+            "start": 0,
+            "end": OUTPUT_CHUNK_MAX_BYTES + 1,
+            "value": "x",
+            "previous": None,
+        })
+
+
+def test_output_span_replacement_semantics_preserved() -> None:
+    """Windows bound the raw span, not the re-encoded text length.
+
+    Invalid UTF-8 is replaced on decode, so the re-encoded text length need
+    not equal ``end - start``. The bound still applies only to the raw span.
+    """
+    invalid = b"\xff" * 10
+    text = invalid.decode("utf-8", errors="replace")
+    assert len(text.encode("utf-8")) != len(invalid)
+    window = build_output_window_payload(tail=text, start=0, end=len(invalid), previous=None)
+    assert window["end"] - window["start"] == len(invalid)
+    parsed = parse_payload(json.dumps(command_payload() | {"output": {"stdout": window}}))
+    assert parsed.output is not None
+    assert parsed.output.stdout is not None
+    assert parsed.output.stdout.end - parsed.output.stdout.start == len(invalid)
+
+    with pytest.raises(ProtocolError):
+        build_output_window_payload(
+            tail=text, start=0, end=OUTPUT_TAIL_MAX_BYTES + 1, previous=None
+        )
