@@ -644,7 +644,7 @@ class _HealthAggregates:
     active_jobs: int
     stopping_jobs: int
     oldest_active_job_age_seconds: float | None
-    min_lease_remaining_seconds: float | None
+    min_lease_safety_remaining_seconds: float | None
     capture_streams_open: int
     spool_held_bytes: int
     cancellation_scan_overdue: bool
@@ -4219,6 +4219,8 @@ class Supervisor:
         self._last_recovery_at: float | None = None
         self._last_gc_at: float | None = None
         self._gc_batch_bound_hit = False
+        self._cancellation_batch_bound_hit = False
+        self._recovery_batch_bound_hit = False
         self._next_health_publish_at = 0.0
         self._health_force = True
 
@@ -4578,6 +4580,7 @@ class Supervisor:
             return
         self._last_recovery_at = time.time()
         recovered = recover_stale_jobs(conn, self.settings.server)
+        self._recovery_batch_bound_hit = len(recovered) >= LEASE_RECOVERY_LIMIT
         for job_id, _payload in recovered:
             LOGGER.warning(
                 "recovered stale job %s: lease expired; marked failed rather than re-executed",
@@ -4700,7 +4703,9 @@ class Supervisor:
         if conn is None:
             return
         self._last_cancellation_scan_at = time.time()
-        for job_id in discover_cancellations(conn, self.settings):
+        found = discover_cancellations(conn, self.settings)
+        self._cancellation_batch_bound_hit = len(found) >= CANCEL_DISCOVERY_LIMIT
+        for job_id in found:
             job = self.active.get(job_id)
             if job is not None and not job.cancel_requested:
                 LOGGER.info("cancelling job %s by request", job_id)
@@ -5855,7 +5860,7 @@ class Supervisor:
             completed_jobs=getattr(self, "_completed_count", 0),
             oldest_active_job_age_seconds=agg.oldest_active_job_age_seconds,
             lease_safety_margin_seconds=self.settings.lease_safety_margin_seconds,
-            min_lease_remaining_seconds=agg.min_lease_remaining_seconds,
+            min_lease_safety_remaining_seconds=agg.min_lease_safety_remaining_seconds,
             db_operation_deadline_seconds=self.settings.db_operation_timeout_seconds,
             db_last_activity_at=getattr(self, "_last_db_activity_at", None),
             db_deadline_breached_at=getattr(self, "_db_deadline_breached_at", None),
@@ -5872,6 +5877,10 @@ class Supervisor:
             gc_overdue=agg.gc_overdue,
             gc_batch_limit=self.settings.gc_batch_limit,
             gc_batch_bound_hit=getattr(self, "_gc_batch_bound_hit", False),
+            cancellation_batch_limit=CANCEL_DISCOVERY_LIMIT,
+            cancellation_batch_bound_hit=getattr(self, "_cancellation_batch_bound_hit", False),
+            recovery_batch_limit=LEASE_RECOVERY_LIMIT,
+            recovery_batch_bound_hit=getattr(self, "_recovery_batch_bound_hit", False),
             shutting_down=shutting_down,
         )
 
@@ -5887,7 +5896,7 @@ class Supervisor:
         active_jobs = self.active
         stopping = 0
         oldest_age: float | None = None
-        min_lease_remaining: float | None = None
+        min_lease_safety_remaining: float | None = None
         capture_open = 0
         spool_held = 0
         for job in active_jobs.values():
@@ -5898,9 +5907,17 @@ class Supervisor:
                 if oldest_age is None or age > oldest_age:
                     oldest_age = age
             if job.last_heartbeat_at > 0.0:
-                remaining = job.last_heartbeat_at + self.settings.lease_duration_seconds - now_mono
-                if min_lease_remaining is None or remaining < min_lease_remaining:
-                    min_lease_remaining = remaining
+                # Safety remaining, not full-lease remaining: subtract the
+                # configured safety margin so a negative value means the
+                # lease-safety deadline (expiry minus margin) has passed.
+                remaining = (
+                    job.last_heartbeat_at
+                    + self.settings.lease_duration_seconds
+                    - self.settings.lease_safety_margin_seconds
+                    - now_mono
+                )
+                if min_lease_safety_remaining is None or remaining < min_lease_safety_remaining:
+                    min_lease_safety_remaining = remaining
             for name in OUTPUT_STREAMS:
                 stream = getattr(job, name)
                 if stream.fd is not None and not stream.eof:
@@ -5913,7 +5930,7 @@ class Supervisor:
             active_jobs=len(active_jobs),
             stopping_jobs=stopping,
             oldest_active_job_age_seconds=oldest_age,
-            min_lease_remaining_seconds=min_lease_remaining,
+            min_lease_safety_remaining_seconds=min_lease_safety_remaining,
             capture_streams_open=capture_open,
             spool_held_bytes=spool_held,
             cancellation_scan_overdue=now_mono > getattr(self, "_next_cancel_scan_at", 0.0),

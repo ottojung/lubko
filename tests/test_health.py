@@ -34,7 +34,7 @@ def _snapshot(**overrides: object) -> WorkerHealth:
         "completed_jobs": 0,
         "oldest_active_job_age_seconds": None,
         "lease_safety_margin_seconds": 5.0,
-        "min_lease_remaining_seconds": None,
+        "min_lease_safety_remaining_seconds": None,
         "db_operation_deadline_seconds": 3.0,
         "db_last_activity_at": 1000.0,
         "db_deadline_breached_at": None,
@@ -51,6 +51,10 @@ def _snapshot(**overrides: object) -> WorkerHealth:
         "gc_overdue": False,
         "gc_batch_limit": 32,
         "gc_batch_bound_hit": False,
+        "cancellation_batch_limit": 100,
+        "cancellation_batch_bound_hit": False,
+        "recovery_batch_limit": 100,
+        "recovery_batch_bound_hit": False,
         "shutting_down": False,
     }
     fields.update(overrides)
@@ -89,7 +93,7 @@ def test_persisted_non_finite_required_timestamps_fail_closed(bad: float, field:
         ("db_connected_at", math.nan),
         ("db_error_at", math.inf),
         ("oldest_active_job_age_seconds", -math.inf),
-        ("min_lease_remaining_seconds", math.nan),
+        ("min_lease_safety_remaining_seconds", math.nan),
         ("db_last_activity_at", math.inf),
     ],
 )
@@ -155,7 +159,7 @@ def test_concurrency_aware_aggregates_are_bounded() -> None:
         spool_held_bytes=4096,
         scan_batch_limit=16,
         last_scan_batch_size=4,
-        min_lease_remaining_seconds=-1.0,
+        min_lease_safety_remaining_seconds=-1.0,
         db_deadline_breached_at=500.0,
         db_deadline_breach_count=2,
         last_cancellation_scan_at=900.0,
@@ -166,6 +170,10 @@ def test_concurrency_aware_aggregates_are_bounded() -> None:
         gc_overdue=True,
         gc_batch_limit=32,
         gc_batch_bound_hit=True,
+        cancellation_batch_limit=100,
+        cancellation_batch_bound_hit=True,
+        recovery_batch_limit=100,
+        recovery_batch_bound_hit=True,
     )
     restored = WorkerHealth.from_dict(snapshot.to_dict())
     assert restored.active_jobs == 3
@@ -174,7 +182,7 @@ def test_concurrency_aware_aggregates_are_bounded() -> None:
     assert restored.oldest_active_job_age_seconds == pytest.approx(12.5)
     assert restored.spool_held_bytes == 4096
     assert restored.last_scan_batch_size == 4
-    assert restored.min_lease_remaining_seconds == pytest.approx(-1.0)
+    assert restored.min_lease_safety_remaining_seconds == pytest.approx(-1.0)
     assert restored.db_deadline_breached_at == pytest.approx(500.0)
     assert restored.db_deadline_breach_count == 2
     assert restored.cancellation_scan_overdue is True
@@ -182,6 +190,10 @@ def test_concurrency_aware_aggregates_are_bounded() -> None:
     assert restored.gc_overdue is True
     assert restored.gc_batch_limit == 32
     assert restored.gc_batch_bound_hit is True
+    assert restored.cancellation_batch_limit == 100
+    assert restored.cancellation_batch_bound_hit is True
+    assert restored.recovery_batch_limit == 100
+    assert restored.recovery_batch_bound_hit is True
 
 
 def test_no_job_identity_is_published() -> None:

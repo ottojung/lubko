@@ -172,9 +172,9 @@ class WorkerHealth:
     supervises an unbounded number of concurrently active jobs, so a single id
     could never describe its true state.  This schema reports aggregates
     (``active_jobs``/``stopping_jobs``/``completed_jobs``), a bounded oldest
-    active job identity/age, and bounded operational counters/timestamps for
-    lease safety, capture/spool pressure, scan batch pressure, and database
-    deadline recency.
+    active age (never a job id), and bounded operational counters/timestamps
+    for lease safety, capture/spool pressure, scan batch pressure, periodic
+    scan saturation, and database deadline recency.
     """
 
     schema_version: int
@@ -199,9 +199,12 @@ class WorkerHealth:
     oldest_active_job_age_seconds: float | None
     #: Configured lease-safety margin the worker enforces before eviction.
     lease_safety_margin_seconds: float
-    #: Remaining lease budget for the most-at-risk active job, or ``None``.
-    #: Negative means a job's lease-safety deadline has already passed.
-    min_lease_remaining_seconds: float | None
+    #: Remaining lease-safety budget for the most-at-risk active job, or
+    #: ``None``.  Computed as ``last_heartbeat + lease_duration -
+    #: lease_safety_margin - now``, so it is the safety deadline (lease expiry
+    #: minus the configured margin), not the full-lease remaining.  Negative
+    #: means the safety deadline has already passed and the job is at risk.
+    min_lease_safety_remaining_seconds: float | None
     #: Configured hard client-side database operation deadline.
     db_operation_deadline_seconds: float
     #: Wall-clock time of the last database operation, or ``None`` (recency).
@@ -239,6 +242,16 @@ class WorkerHealth:
     #: the actual capped selections/deletions rather than summed row counts.
     #: Combine with ``gc_overdue`` and ``last_gc_at`` for a "behind" diagnosis.
     gc_batch_bound_hit: bool
+    #: Configured per-turn cancellation-discovery batch cap.
+    cancellation_batch_limit: int
+    #: Whether the most recent cancellation scan saturated its batch bound (a
+    #: pressure/saturation signal), from the actual returned cancellation count.
+    cancellation_batch_bound_hit: bool
+    #: Configured per-turn stale-job recovery batch cap.
+    recovery_batch_limit: int
+    #: Whether the most recent recovery pass saturated its batch bound (a
+    #: pressure/saturation signal), from the actual returned recovered count.
+    recovery_batch_bound_hit: bool
     shutting_down: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -264,7 +277,9 @@ class WorkerHealth:
             "completed_jobs": self.completed_jobs,
             "oldest_active_job_age_seconds": _finite_or_none(self.oldest_active_job_age_seconds),
             "lease_safety_margin_seconds": _finite_or_zero(self.lease_safety_margin_seconds),
-            "min_lease_remaining_seconds": _finite_or_none(self.min_lease_remaining_seconds),
+            "min_lease_safety_remaining_seconds": _finite_or_none(
+                self.min_lease_safety_remaining_seconds
+            ),
             "db_operation_deadline_seconds": _finite_or_zero(self.db_operation_deadline_seconds),
             "db_last_activity_at": _finite_or_none(self.db_last_activity_at),
             "db_deadline_breached_at": _finite_or_none(self.db_deadline_breached_at),
@@ -281,6 +296,10 @@ class WorkerHealth:
             "gc_overdue": self.gc_overdue,
             "gc_batch_limit": self.gc_batch_limit,
             "gc_batch_bound_hit": self.gc_batch_bound_hit,
+            "cancellation_batch_limit": self.cancellation_batch_limit,
+            "cancellation_batch_bound_hit": self.cancellation_batch_bound_hit,
+            "recovery_batch_limit": self.recovery_batch_limit,
+            "recovery_batch_bound_hit": self.recovery_batch_bound_hit,
             "shutting_down": self.shutting_down,
         }
 
@@ -323,8 +342,8 @@ class WorkerHealth:
             lease_safety_margin_seconds=_required_finite_float(
                 data.get("lease_safety_margin_seconds"), "lease_safety_margin_seconds"
             ),
-            min_lease_remaining_seconds=_optional_finite_float(
-                data.get("min_lease_remaining_seconds")
+            min_lease_safety_remaining_seconds=_optional_finite_float(
+                data.get("min_lease_safety_remaining_seconds")
             ),
             db_operation_deadline_seconds=_required_finite_float(
                 data.get("db_operation_deadline_seconds"), "db_operation_deadline_seconds"
@@ -350,6 +369,14 @@ class WorkerHealth:
             gc_overdue=_coerce_bool(data.get("gc_overdue")),
             gc_batch_limit=_coerce_int(data.get("gc_batch_limit"), "gc_batch_limit"),
             gc_batch_bound_hit=_coerce_bool(data.get("gc_batch_bound_hit")),
+            cancellation_batch_limit=_coerce_int(
+                data.get("cancellation_batch_limit"), "cancellation_batch_limit"
+            ),
+            cancellation_batch_bound_hit=_coerce_bool(data.get("cancellation_batch_bound_hit")),
+            recovery_batch_limit=_coerce_int(
+                data.get("recovery_batch_limit"), "recovery_batch_limit"
+            ),
+            recovery_batch_bound_hit=_coerce_bool(data.get("recovery_batch_bound_hit")),
             shutting_down=bool(data.get("shutting_down")),
         )
 
