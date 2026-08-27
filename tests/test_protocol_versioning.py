@@ -328,7 +328,7 @@ def test_migration_0004_version_validation_is_total_and_fail_closed() -> None:
     weaken the durable gate that the per-daemon parser mirrors.
     """
     migration = (
-        Path(__file__).resolve().parent.parent / "migrations" / "0004_protocol_version_window.sql"
+        Path(__file__).resolve().parent.parent / "migrations" / "0005_protocol_version_window.sql"
     ).read_text(encoding="utf-8")
 
     # Missing `v` / JSON `null` `v` / non-number `v`: the type test must treat a

@@ -130,7 +130,7 @@ access contract.
   two-column schema is unchanged and window versions share one payload shape,
   in-flight jobs and immutable `output_chunk` history are preserved across the
   rollout, and a staggered one-server-at-a-time upgrade is deterministic. The
-  SQL constraint is generalized by `migrations/0004_protocol_version_window.sql`
+  SQL constraint is generalized by `migrations/0005_protocol_version_window.sql`
   from a hard-coded `v = 4` to a bounded `v::int between min and max`.
 - **The v3 → v4 cutover was a one-time destructive legacy event, not a template.**
   Version `3` rows carried no required top-level `server` routing identity, so v4
@@ -495,7 +495,18 @@ and an unbounded in-memory registry of active jobs. There is **no
 application-level concurrency limit** and no thread or connection per job; each
 job process runs as its own OS process/session/process group, executed directly
 from its `request.process` argv (never through a shell), and the daemon
-observes it with `Popen.poll()`-style checks. The supervisor loop services
+observes it with `Popen.poll()`-style checks. This is a deliberate,
+durable decision (see `docs/adr/0001-no-application-concurrency-cap.md`): each
+job's local capture spool and live tail are bounded, and the machine-readable
+health snapshot is a fixed-size aggregate with no per-job entries, but a
+long-running job can still accumulate arbitrarily many immutable history chunks
+until termination, and aggregate output, spool, and active-row database work
+(including lease heartbeat, which refreshes every active root in one statement)
+still scale with the number of concurrently active jobs. The application therefore
+uses one shared DB connection, set-based operations, operation deadlines, and
+bounded claim/cancellation/recovery/GC scans where they exist, and leaves the hard
+ceiling on *execution* concurrency to the surrounding container/host/OS rather than
+acting as a scheduler. The supervisor loop services
 running jobs (observe exits, escalate cancellations, publish output, finalize),
 refreshes leases, runs recovery, and claims a bounded batch of new pending
 jobs each turn, so an endless pending queue can never starve heartbeats,
@@ -585,7 +596,7 @@ constraint change; the physical schema stays the canonical two-column table.
 
 Every upgrade **after** v4 is non-destructive and uses the bounded mixed-version
 window model (`docs/protocol_upgrades.md` and
-`migrations/0004_protocol_version_window.sql`): the two-column schema is
+`migrations/0005_protocol_version_window.sql`): the two-column schema is
 untouched, in-flight jobs and `output_chunk` history are preserved, and a
 staggered rollout is deterministic. There is no `truncate` and no data migration
 for those upgrades.

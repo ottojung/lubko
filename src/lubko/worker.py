@@ -1966,84 +1966,6 @@ def _output_update_params(
     return {"job_id": job_id, "output": json.dumps(output), "server": server}
 
 
-# ---------------------------------------------------------------------------
-# Process helpers
-# ---------------------------------------------------------------------------
-
-
-_CLAIM_JOBS_TEMPLATE: Final = """\
-WITH next AS (
-    SELECT id
-    FROM lubko.jobs
-    WHERE (payload::jsonb)->>'type' = 'command'
-        AND (payload::jsonb)->'state'->>'status' = 'pending'
-    ORDER BY (payload::jsonb)->'state'->>'created_at', id
-    FOR UPDATE SKIP LOCKED
-    LIMIT %(limit)s
-)
-UPDATE lubko.jobs AS job
-SET payload = __SET_CHAIN__::text
-FROM next
-WHERE job.id = next.id
-RETURNING job.id, job.payload
-"""
-
-_RECOVER_STALE_JOBS_TEMPLATE: Final = """\
-WITH stale AS (
-    SELECT id
-    FROM lubko.jobs
-    WHERE (payload::jsonb)->>'type' = 'command'
-        AND (payload::jsonb)->'state'->>'status' = 'running'
-        AND (payload::jsonb)->'state'->>'lease_expires_at' IS NOT NULL
-        AND ((payload::jsonb)->'state'->>'lease_expires_at') < __ISO_NOW__
-    ORDER BY id
-    FOR UPDATE SKIP LOCKED
-    LIMIT %(limit)s
-)
-UPDATE lubko.jobs AS job
-SET payload = __SET_CHAIN__::text
-FROM stale
-WHERE job.id = stale.id
-RETURNING job.id, job.payload
-"""
-
-
-def _claim_jobs_sql(set_chain: str) -> str:
-    """Compose the bounded claiming ``UPDATE`` statement.
-
-    The SQL is assembled from internal constant literals and the prebuilt
-    ``jsonb_set`` chain; the chain is slotted into the template with a string
-    replacement (never by concatenating a query fragment into a ``SELECT``-bearing
-    string) so no external input reaches the query and the template stays a safe
-    constant. The only runtime inputs are bound parameters.
-
-    Args:
-        set_chain: The prebuilt ``jsonb_set`` chain for the claim state.
-
-    Returns:
-        The full claiming statement text.
-    """
-    return _CLAIM_JOBS_TEMPLATE.replace("__SET_CHAIN__", set_chain)
-
-
-def _recover_stale_jobs_sql(set_chain: str) -> str:
-    """Compose the bounded lease-recovery ``UPDATE`` statement.
-
-    As with :func:`_claim_jobs_sql`, the statement is built only from the
-    internal template and the prebuilt chain; the only runtime inputs are bound
-    parameters.
-
-    Args:
-        set_chain: The prebuilt ``jsonb_set`` chain for the failed state.
-
-    Returns:
-        The full recovery statement text.
-    """
-    return _RECOVER_STALE_JOBS_TEMPLATE.replace("__SET_CHAIN__", set_chain).replace(
-        "__ISO_NOW__", UTC_ISO_TEXT_SQL
-    )
-
-
 def _streams_at_eof(job: ActiveJob) -> bool:
     """Return whether both of a job's capture streams have reached EOF.
 
@@ -4349,6 +4271,125 @@ def verify_protocol_schema(conn: JobsConnection) -> None:
         raise SchemaInvariantError(msg)
 
 
+SERVER_ISOLATION_FUNCTION: Final = "lubko.session_server"
+JOBS_RLS_POLICY_PREFIX: Final = "jobs_isolation"
+
+
+def verify_server_isolation(conn: JobsConnection) -> None:
+    """Assert the PostgreSQL per-server authorization boundary is in place.
+
+    The worker still scopes every query by its configured server identity
+    (defense in depth), but cross-server isolation must also be enforced at the
+    database authorization boundary so a compromised or misconfigured worker
+    credential cannot read, mutate, or spoof another execution server's rows, and
+    so an output chunk can only reference a command root of its own server. The
+    boundary is row-level security on ``lubko.jobs``, the trusted
+    ``lubko.session_server()`` identity function, the same-server chunk
+    enforcement (the ``enforce_chunk_root_server()`` trigger function, which
+    inlines the root lookup), and the per-server isolation policies. The worker
+    refuses to run without it, failing closed.
+
+    Args:
+        conn: Open PostgreSQL connection.
+
+    Raises:
+        SchemaInvariantError: If row-level security is not enabled, the
+            session-server identity function is missing, the same-server chunk
+            enforcement is missing, or no isolation policy is present.
+    """
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT relrowsecurity\nFROM pg_class\nWHERE oid = to_regclass(%s)\n",
+            (f"{JOBS_SCHEMA}.{JOBS_TABLE}",),
+        )
+        rls_row = cursor.fetchone()
+        rls_enabled = bool(rls_row and rls_row[0])
+        cursor.execute(
+            "SELECT 1\n"
+            "FROM pg_proc p\n"
+            "JOIN pg_namespace n ON n.oid = p.pronamespace\n"
+            "WHERE n.nspname = %s AND p.proname = 'session_server'\n",
+            (JOBS_SCHEMA,),
+        )
+        session_function_exists = cursor.fetchone() is not None
+        cursor.execute(
+            "SELECT 1\n"
+            "FROM pg_proc p\n"
+            "JOIN pg_namespace n ON n.oid = p.pronamespace\n"
+            "WHERE n.nspname = %s AND p.proname = 'enforce_chunk_root_server'\n",
+            (JOBS_SCHEMA,),
+        )
+        chunk_function_exists = cursor.fetchone() is not None
+        cursor.execute(
+            "SELECT 1\n"
+            "FROM pg_trigger t\n"
+            "JOIN pg_class c ON c.oid = t.tgrelid\n"
+            "WHERE c.relnamespace = to_regnamespace(%s) AND c.relname = %s\n"
+            "    AND t.tgname = 'jobs_chunk_root_server'\n",
+            (JOBS_SCHEMA, JOBS_TABLE),
+        )
+        chunk_trigger_exists = cursor.fetchone() is not None
+        cursor.execute(
+            "SELECT polname\nFROM pg_policies\nWHERE schemaname = %s AND tablename = %s\n",
+            (JOBS_SCHEMA, JOBS_TABLE),
+        )
+        policies = [str(row[0]) for row in cursor.fetchall()]
+    missing: list[str] = []
+    if not rls_enabled:
+        missing.append("row-level security on lubko.jobs")
+    if not session_function_exists:
+        missing.append(f"{SERVER_ISOLATION_FUNCTION}() identity function")
+    if not chunk_function_exists:
+        missing.append("lubko.enforce_chunk_root_server() same-server ownership function")
+    if not chunk_trigger_exists:
+        missing.append("jobs_chunk_root_server same-server chunk trigger")
+    if not any(p.startswith(JOBS_RLS_POLICY_PREFIX) for p in policies):
+        missing.append("per-server isolation policies on lubko.jobs")
+    if missing:
+        detail = ", ".join(missing)
+        msg = (
+            "lubko.jobs is not protected by the per-server PostgreSQL "
+            f"authorization boundary: missing {detail}. Apply the server "
+            "isolation migration migrations/0004_server_isolation_boundary.sql "
+            "and provision per-server worker roles. "
+            f"{TWO_COLUMN_INVARIANT}"
+        )
+        raise SchemaInvariantError(msg)
+
+
+def verify_server_identity(conn: JobsConnection, server: str) -> None:
+    """Bind the live session to the configured execution-server identity.
+
+    Resolves the server identity the database has assigned to the connected
+    login principal through ``lubko.session_server()`` and refuses to run unless
+    it exactly matches the daemon's configured server. This makes the PostgreSQL
+    session provably bound to exactly one execution-server identity: a worker
+    cannot run under a principal mapped to a different server, and a principal
+    with no mapping (or the wrong one) is rejected fail-closed.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        server: The daemon's configured, non-empty server identity.
+
+    Raises:
+        SchemaInvariantError: If the database-assigned server is ``None`` or
+            differs from the configured ``server``.
+    """
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute("SELECT lubko.session_server()")
+        identity_row = cursor.fetchone()
+    bound = str(identity_row[0]) if identity_row and identity_row[0] is not None else None
+    if bound != server:
+        msg = (
+            f"database session is not bound to server {server!r}: the connected "
+            f"principal resolves to {bound!r} via {SERVER_ISOLATION_FUNCTION}(). "
+            "Check the lubko.server_principals mapping and the per-server worker "
+            "role in database.conf (user=). The worker refuses to run against a "
+            "session that is not bound to exactly one execution-server identity."
+        )
+        raise SchemaInvariantError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Supervisor
 # ---------------------------------------------------------------------------
@@ -6205,6 +6246,8 @@ class Supervisor:
         try:
             verify_jobs_table_invariant(conn)
             verify_protocol_schema(conn)
+            verify_server_isolation(conn)
+            verify_server_identity(conn, self.settings.server)
         except SchemaInvariantError:
             LOGGER.exception(
                 "refusing to run against a table that is not a migrated protocol v4 schema"

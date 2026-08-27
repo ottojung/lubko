@@ -77,7 +77,7 @@ payload. Because window versions are mutually compatible, the *same* parser
 handles every version in the window; a future breaking generation would register
 its own parser and raise `min` only after the prior version has drained.
 
-The SQL side is generalized by `migrations/0004_protocol_version_window.sql`,
+The SQL side is generalized by `migrations/0005_protocol_version_window.sql`,
 which replaces the hard-coded `(payload::jsonb)->'v' = '4'` check with a bounded
 window `v::int between MIN_PROTOCOL_VERSION and MAX_PROTOCOL_VERSION`. The two
 bounds are plain constants at the top of the file: to open the next compatible
