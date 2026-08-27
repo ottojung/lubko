@@ -285,7 +285,10 @@ def _install_repo(repo: Path, uv: str | None) -> int:
         return EXIT_ERROR
     write_toolchain(uv_path)
 
-    if _verify_installed() != EXIT_OK:
+    install_error = startup_contract.install_and_validate_startup_definition(bin_home())
+    if _verify_installed() != EXIT_OK or install_error is not None:
+        if install_error is not None:
+            _err(install_error)
         return EXIT_ERROR
     if not bin_home_on_path():
         _err(f"warning: {bin_home()} is not on the current PATH; log in again to pick it up")
@@ -295,7 +298,8 @@ def _install_repo(repo: Path, uv: str | None) -> int:
     startup_contract.write_contract()
     _out(
         f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION} recorded; "
-        "ensure the container starts 'tini-static -- lubko-supervisor'"
+        f"point the container entrypoint at '{startup_contract.STARTUP_LAUNCHER_NAME}' "
+        "(tini-static -- lubko-supervisor)"
     )
     return EXIT_OK
 
