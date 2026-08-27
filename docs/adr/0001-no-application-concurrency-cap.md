@@ -209,13 +209,21 @@ upstream, alert) with real numbers rather than guessing why work disappeared.
 
 A single integer ceiling on concurrently running jobs was rejected.
 
-- It converts a fairness concern into a rejection policy: jobs past the limit
-  must be dropped, queued-but-not-started, or errored, each introducing a new
-  failure mode the current design does not have.
+- It converts a fairness concern into an admission/gating policy: jobs past the
+  limit must be dropped, admitted but not started (left pending), or errored,
+  each introducing a new failure mode the current design does not have.
+- It creates head-of-line blocking and unnecessary serialization of independent
+  work. A worker-wide count ceiling holds otherwise-runnable jobs behind the cap
+  even when they are light or when the host has resources other than the count
+  available (CPU, memory, file descriptors, database capacity). The ceiling
+  therefore gates work on an artificial scalar that does not reflect the real
+  constraint.
 - It directly contradicts the product contract that submitting several
   independent jobs lets them genuinely run at the same time.
-- It hides overload: a worker at the cap looks healthy while work silently
-  fails to start, defeating the observability stance above.
+- It masks the actual heterogeneous resource pressure behind an artificial slot
+  boundary: a worker at the cap looks healthy while admitted work merely remains
+  pending, so the real pressure (CPU, memory, descriptors, database) is invisible,
+  defeating the observability stance above.
 - It is a static number that cannot account for heterogeneous job sizes (a few
   heavy jobs vs. many light ones occupy the same "slot" count differently), so
   it both wastes capacity and fails to protect against the heavy case.
