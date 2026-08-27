@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from lubko.protocol_versioning import (
+    DEFAULT_VERSION_RANGE,
+    ProtocolVersionError,
+    ProtocolVersionRange,
+)
+
 DATABASE_CONFIG_ENV: Final = "LUBKO_DATABASE_CONFIG"
 CONFIG_HOME_ENV: Final = "XDG_CONFIG_HOME"
 CONFIG_HOME_FALLBACK: Final = ".config"
@@ -203,3 +209,58 @@ def load_worker_server(path: Path | None = None) -> str:
         )
         raise ValueError(msg)
     return server
+
+
+def load_worker_protocol_range(path: Path | None = None) -> ProtocolVersionRange:
+    """Load the supported protocol version window from the worker config.
+
+    The window is optional. When the ``protocol_min_version`` /
+    ``protocol_max_version`` keys are absent the daemon defaults to the current
+    single-version window (:data:`DEFAULT_VERSION_RANGE`). When present, both
+    bounds must be integers and form a valid bounded window; an invalid value
+    fails closed so a misconfigured daemon cannot start with a window it cannot
+    actually serve. The execution-server protocol window is never environmental:
+    it is read from the restricted worker configuration file.
+
+    Args:
+        path: Configuration path, or ``None`` to use :func:`worker_config_path`.
+
+    Returns:
+        The supported protocol version window.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        PermissionError: If the file is accessible by group or others.
+        ValueError: If a present window is missing, non-integer, or invalid.
+    """
+    config_path = path if path is not None else worker_config_path()
+    try:
+        file_stat = config_path.stat()
+    except FileNotFoundError as exc:
+        msg = f"worker configuration file not found: {config_path}"
+        raise FileNotFoundError(msg) from exc
+    if file_stat.st_mode & PRIVATE_MODE_MASK:
+        msg = f"worker configuration file must not be readable by group or others: {config_path}"
+        raise PermissionError(msg)
+    values = parse_database_config(config_path.read_text(encoding="utf-8"))
+    min_raw = values.get("protocol_min_version")
+    max_raw = values.get("protocol_max_version")
+    if min_raw is None and max_raw is None:
+        return DEFAULT_VERSION_RANGE
+    if min_raw is None or max_raw is None:
+        msg = (
+            "worker configuration must set both protocol_min_version and "
+            "protocol_max_version, or neither"
+        )
+        raise ValueError(msg)
+    try:
+        parsed_min = int(min_raw)
+        parsed_max = int(max_raw)
+    except (TypeError, ValueError):
+        msg = "worker configuration protocol_min_version/protocol_max_version must be integers"
+        raise ValueError(msg) from None
+    try:
+        return ProtocolVersionRange(min=parsed_min, max=parsed_max)
+    except ProtocolVersionError as exc:
+        msg = f"invalid worker protocol window in {config_path}: {exc}"
+        raise ValueError(msg) from None
