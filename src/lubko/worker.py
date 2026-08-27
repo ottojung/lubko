@@ -6286,13 +6286,56 @@ class Supervisor:
         self._next_reconnect_at = 0.0
         self._publish_health_force()
 
+    def _discard_db_connection(self) -> None:
+        """Discard the database connection so it is never reused or misreported.
+
+        Closes the connection (ignoring any error) and clears the handle. After
+        this, the final health snapshot reports ``db_connected=False`` and no
+        later remote finalization is attempted on a known-unusable connection.
+        """
+        if self.conn is not None:
+            with suppress(Exception):
+                self.conn.close()
+        self.conn = None
+
     def _shutdown(self) -> None:
         """Gracefully terminate, reap, and finalize every tracked process group.
 
-        Stops claiming, requests termination of every active group, reaps the
-        children, escalates to ``SIGKILL`` after the bounded grace period where
-        necessary, finalizes the affected jobs when PostgreSQL is available, and
-        removes the temporary capture files.
+        Local ownership convergence (reaping and, where provable, killing every
+        exact process group) and local cleanup (removing every capture file)
+        plus the final local health snapshot are **unconditional**: a remote
+        database deadline breach (:class:`DbOperationDeadlineError`) or a
+        connectivity loss during finalization must never prevent them. Remote DB
+        terminalization is best-effort and fail-closed — its deadline/connectivity
+        failures are caught at their narrow boundary, discard the connection, and
+        stop further remote attempts, while the affected rows stay safely
+        recoverable. The exact drain sentinel is written only after a *clean*
+        local drain, so a failed drain never produces a false sentinel. Any other
+        (deterministic/schema/programming) fault propagates naturally: Python runs
+        the ``finally`` cleanup and final health publication first, then re-raises.
+        """
+        try:
+            self._shutdown_finalize()
+        finally:
+            # Unconditional local convergence cleanup: remove every capture file
+            # regardless of any remote terminalization outcome.
+            self._cleanup_all_files()
+            # Discard the connection so the final health snapshot never falsely
+            # reports db_connected=True after a deadline breach or connectivity
+            # loss, and no further remote step can use a known-unusable handle.
+            self._discard_db_connection()
+            health = self._build_health(alive=False, shutting_down=True)
+            try:
+                write_worker_health(health)
+            except OSError:
+                LOGGER.debug("failed to write shutdown health snapshot", exc_info=True)
+
+    def _shutdown_finalize(self) -> None:
+        """Stop, drain, and remote-finalize every tracked group.
+
+        See :meth:`_shutdown` for the invariant: this helper performs the
+        remote-touching work, and any non-best-effort exception it lets escape
+        is handled by the caller's ``finally`` boundary.
         """
         LOGGER.info("shutting down: terminating %d active job(s)", len(self.active))
         install_operation_deadline(
@@ -6303,10 +6346,9 @@ class Supervisor:
                 request_stop(job, STOP_REASON_SHUTDOWN)
         if not self._drain_active_groups():
             # Positive post-SIGKILL proof failed for at least one exact active
-            # group. This is NOT a clean drain: never emit the sentinel, never
-            # terminalize/untrack those jobs (their running rows keep the exact
-            # persisted identity recoverable by emergency recovery), and fail
-            # loudly in the log so the outer authority holds instead of reaping.
+            # group. This is NOT a clean drain: never emit the sentinel, and
+            # retain those jobs (their running rows keep the exact persisted
+            # identity recoverable by emergency recovery).
             surviving = [job.pgid for job in self.active.values() if _owned_group_alive(job)]
             LOGGER.error(
                 "shutdown cannot prove groups %s member-free; withholding the "
@@ -6316,21 +6358,14 @@ class Supervisor:
             )
             self._finalize_all_for_shutdown(retain_groups=surviving)
         else:
+            # Clean local drain: the worker proved every owned group is gone, so
+            # the sentinel may be written exactly once. Remote finalization below
+            # is best-effort.
             try:
                 write_drain_sentinel(self.settings.worker_incarnation)
             except OSError:
                 LOGGER.debug("could not write drain sentinel", exc_info=True)
             self._finalize_all_for_shutdown()
-        self._cleanup_all_files()
-        if self.conn is not None:
-            with suppress(Exception):
-                self.conn.close()
-            self.conn = None
-        health = self._build_health(alive=False, shutting_down=True)
-        try:
-            write_worker_health(health)
-        except OSError:
-            LOGGER.debug("failed to write shutdown health snapshot", exc_info=True)
 
     def _drain_active_groups(self) -> bool:
         """Wait for every active process group to exit, escalating to SIGKILL.
@@ -6403,19 +6438,21 @@ class Supervisor:
     def _finalize_all_for_shutdown(self, *, retain_groups: list[int] | None = None) -> None:
         """Finalize every tracked job when PostgreSQL is available.
 
-        Connectivity errors are re-raised so the caller can handle outage
-        before continuing shutdown.  Deterministic per-job errors are logged
-        and the job is quarantined, preserving lease/row safety. Jobs whose
-        exact group could not be proven member-free (``retain_groups``) are
-        retained in the active set and their rows stay recoverable: they are
-        never terminalized or untracked here.
+        This is the only step that touches the remote database during shutdown,
+        so it is the only step that can fail with a database operation deadline
+        breach (:class:`DbOperationDeadlineError`) or a connectivity loss. Both
+        are best-effort and fail-closed here: the connection is discarded (so no
+        later job attempts a remote finalization on a known-unusable handle) and
+        the loop stops, leaving every not-yet-finalized job's row safely
+        recoverable. Deterministic per-job errors are logged and the job is
+        quarantined, preserving lease/row safety. Jobs whose exact group could
+        not be proven member-free (``retain_groups``) are retained in the active
+        set and their rows stay recoverable: they are never terminalized or
+        untracked here.
 
         Args:
             retain_groups: Exact group ids that failed post-SIGKILL proof;
                 their jobs are retained instead of finalized.
-
-        Raises:
-            psycopg.Error: When the error is a connectivity issue.
         """
         if self.conn is None:
             return
@@ -6433,9 +6470,30 @@ class Supervisor:
             # disk or silently discarding.
             try:
                 self.finalize_completed_job_bounded(job)
+            except DbOperationDeadlineError:
+                # The hard client deadline breached while terminalizing this
+                # job's remote rows. This is a best-effort remote step: the row
+                # stays recoverable and the connection is now unusable, so stop
+                # attempting further remote finalizations and let shutdown
+                # proceed with its unconditional local cleanup.
+                LOGGER.exception(
+                    "shutdown finalization hit the database operation deadline for job %s",
+                    job.id,
+                )
+                self._discard_db_connection()
+                return
             except psycopg.Error as exc:
                 if self._is_connectivity_error(exc):
-                    raise
+                    # Connectivity loss during shutdown finalization is
+                    # best-effort: the row stays recoverable and the connection
+                    # is unusable, so stop further remote attempts and let
+                    # shutdown finish locally.
+                    LOGGER.exception(
+                        "shutdown finalization lost database connectivity for job %s",
+                        job.id,
+                    )
+                    self._discard_db_connection()
+                    return
                 # Deterministic per-job error already quarantined inside the
                 # bounded finalizer.
                 LOGGER.exception("deterministic failure finalizing job %s", job.id)
