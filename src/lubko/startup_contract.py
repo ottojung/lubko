@@ -43,7 +43,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from lubko.durable import write_json_durable
+from lubko import config as _config
+from lubko.durable import (
+    DurabilityError,
+    fsync_directory,
+    write_bytes_durable,
+    write_json_durable,
+)
 from lubko.state import state_root
 from lubko.supervise import (
     read_status,
@@ -70,6 +76,12 @@ UNSUPPORTED_SUPERVISOR_MARKERS: Final = ("sleep infinity",)
 #: Name of the generated, versioned startup launcher the container should run.
 STARTUP_LAUNCHER_NAME: Final = "lubko-startup"
 
+#: Name of the generated, versioned container/service startup definition.
+STARTUP_DEFINITION_NAME: Final = "lubko-startup-definition.json"
+
+#: Schema version of the startup definition artifact.
+STARTUP_DEFINITION_SCHEMA_VERSION: Final = 1
+
 #: Environment variable through which an orchestrator may inject the live
 #: restart policy for a fail-closed deployment-seam check.
 RESTART_POLICY_ENV: Final = "LUBKO_SUPERVISOR_RESTART_POLICY"
@@ -78,8 +90,39 @@ RESTART_POLICY_ENV: Final = "LUBKO_SUPERVISOR_RESTART_POLICY"
 #: systemd ``Restart=always``).
 DEFAULT_RESTART_POLICY: Final = "always"
 
-#: Required permission mode for the contract's state directories.
+#: Required permission mode for the contract's state directories: private to
+#: the owner, no group or world access.
 DEFAULT_STATE_DIR_MODE: Final = 0o700
+
+#: Mask of permission bits that must never be set on a private state or config
+#: path: any group or world access fails closed.
+PRIVATE_MODE_MASK: Final = 0o077
+
+#: The private config files the current config subsystem requires. These are
+#: derived from :mod:`lubko.config` at module load so the versioned contract
+#: records the exact private worker/database config path expectations, and are
+#: re-resolved by :func:`private_config_paths` (for validation) so env overrides
+#: and monkeypatching behave consistently.
+DEFAULT_CONFIG_FILES: Final = (
+    str(_config.database_config_path()),
+    str(_config.worker_config_path()),
+)
+
+#: Required executable mode for the installed startup launcher.
+STARTUP_LAUNCHER_MODE: Final = 0o755
+
+
+def private_config_paths() -> tuple[Path, ...]:
+    """Return the private config paths the contract requires to be private.
+
+    The paths are the exact worker/database config locations used by the current
+    config subsystem (see :mod:`lubko.config`); the contract validates their
+    existence and permission mode without ever reading their contents.
+
+    Returns:
+        The resolved private config paths.
+    """
+    return (_config.database_config_path(), _config.worker_config_path())
 
 
 class StartupContractError(RuntimeError):
@@ -109,6 +152,7 @@ class StartupContract:
     restart_policy: str
     restart_authority: str
     required_state_dirs: tuple[str, ...]
+    required_config_files: tuple[str, ...]
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the contract for storage.
@@ -126,6 +170,7 @@ class StartupContract:
             "restart_policy": self.restart_policy,
             "restart_authority": self.restart_authority,
             "required_state_dirs": list(self.required_state_dirs),
+            "required_config_files": list(self.required_config_files),
         }
 
     @classmethod
@@ -156,6 +201,9 @@ class StartupContract:
         required_state_dirs = _require_str_tuple(
             data.get("required_state_dirs"), "required_state_dirs"
         )
+        required_config_files = _require_str_tuple(
+            data.get("required_config_files"), "required_config_files"
+        )
         worker_relationship = data.get("worker_relationship")
         restart_policy = data.get("restart_policy")
         restart_authority = data.get("restart_authority")
@@ -178,6 +226,7 @@ class StartupContract:
             restart_policy=restart_policy,
             restart_authority=restart_authority,
             required_state_dirs=required_state_dirs,
+            required_config_files=required_config_files,
         )
 
 
@@ -195,6 +244,7 @@ CURRENT_CONTRACT: Final = StartupContract(
         "tini-static is init/reaper/signal-forwarder only"
     ),
     required_state_dirs=("supervisor", "worker", "deploy"),
+    required_config_files=DEFAULT_CONFIG_FILES,
 )
 
 
@@ -355,14 +405,18 @@ def read_contract_strict() -> StartupContract | None:
     if not isinstance(decoded, dict):
         msg = "the startup contract must be an object"
         raise StartupContractError(msg)
+    raw_version = decoded.get("schema_version")
+    if not isinstance(raw_version, int) or isinstance(raw_version, bool):
+        msg = "the startup contract is malformed"
+        raise StartupContractError(msg)
+    if raw_version != CONTRACT_SCHEMA_VERSION:
+        msg = f"unsupported startup contract version {raw_version}"
+        raise StartupContractError(msg)
     try:
         contract = StartupContract.from_dict(decoded)
     except (ValueError, TypeError) as exc:
         msg = "the startup contract is malformed"
         raise StartupContractError(msg) from exc
-    if contract.schema_version != CONTRACT_SCHEMA_VERSION:
-        msg = f"unsupported startup contract version {contract.schema_version}"
-        raise StartupContractError(msg)
     return contract
 
 
@@ -449,14 +503,31 @@ def write_startup_launcher(bin_home: Path) -> None:
         msg = f"bin directory {bin_home} does not exist"
         raise OSError(msg)
     target = bin_home / STARTUP_LAUNCHER_NAME
-    temporary = bin_home / f"{STARTUP_LAUNCHER_NAME}.tmp"
     expected = generate_startup_launcher_content().encode("utf-8")
-    temporary.write_bytes(expected)
-    temporary.chmod(0o755)
-    temporary.replace(target)
+    # Crash-durable, atomic install: write the bytes (temp + fsync + rename +
+    # directory fsync) via the repository durable machinery, then durably
+    # establish the executable mode so the installed launcher is confirmed active
+    # before the deployment records success.
+    write_bytes_durable(target, expected)
+    Path(target).chmod(STARTUP_LAUNCHER_MODE)
+    _fsync_file(target)
+    fsync_directory(bin_home)
     if target.read_bytes() != expected:
         msg = f"startup launcher content mismatch after installation: {target}"
         raise OSError(msg)
+
+
+def _fsync_file(path: Path) -> None:
+    """Fsync a file's metadata and data so a mode change is durable.
+
+    Args:
+        path: File to fsync.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def validate_startup_launcher(bin_home: Path) -> bool:
@@ -499,10 +570,7 @@ def validate_contract_paths(contract: StartupContract = CURRENT_CONTRACT) -> Con
         except OSError:
             missing.append(relative)
             continue
-        if (
-            mode != DEFAULT_STATE_DIR_MODE
-            and mode & DEFAULT_STATE_DIR_MODE != DEFAULT_STATE_DIR_MODE
-        ):
+        if mode != DEFAULT_STATE_DIR_MODE:
             mode_mismatched.append(relative)
     if missing or mode_mismatched:
         detail = ""
@@ -537,23 +605,172 @@ def create_contract_state_dirs(contract: StartupContract = CURRENT_CONTRACT) -> 
     """
     root = state_root()
     for relative in contract.required_state_dirs:
-        (root / relative).mkdir(mode=DEFAULT_STATE_DIR_MODE, parents=True, exist_ok=True)
+        directory = root / relative
+        directory.mkdir(mode=DEFAULT_STATE_DIR_MODE, parents=True, exist_ok=True)
+        # The deploy state directory may already exist (created under the umask
+        # by the durable writes of the contract/definition artifacts), so enforce
+        # the exact required mode explicitly rather than relying on mkdir.
+        directory.chmod(DEFAULT_STATE_DIR_MODE)
+
+
+def validate_contract_config() -> ContractPathValidation:
+    """Validate the contract's private config file expectations.
+
+    The contract records the private worker/database config paths used by the
+    current config subsystem (see :mod:`lubko.config`). Each must exist as a
+    regular file and carry no group or world access bits; the check reads only
+    ``stat`` metadata and never reveals the file contents.
+
+    Returns:
+        The config path validation result.
+    """
+    missing: list[str] = []
+    mode_mismatched: list[str] = []
+    for path in private_config_paths():
+        if not path.is_file():
+            missing.append(str(path))
+            continue
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            missing.append(str(path))
+            continue
+        if mode & PRIVATE_MODE_MASK != 0:
+            mode_mismatched.append(str(path))
+    if missing or mode_mismatched:
+        detail = ""
+        if missing:
+            detail += f"missing private config files: {', '.join(missing)}; "
+        if mode_mismatched:
+            detail += f"world/group-readable config files: {', '.join(mode_mismatched)}"
+        return ContractPathValidation(
+            ok=False,
+            missing=tuple(missing),
+            mode_mismatched=tuple(mode_mismatched),
+            message=detail.strip(),
+        )
+    return ContractPathValidation(
+        ok=True,
+        missing=(),
+        mode_mismatched=(),
+        message="all private config files are present with the required permissions",
+    )
+
+
+def startup_definition_path() -> Path:
+    """Return the path of the versioned startup definition artifact.
+
+    Returns:
+        The ``lubko-startup-definition.json`` path under the deploy state dir.
+    """
+    return state_root() / "deploy" / STARTUP_DEFINITION_NAME
+
+
+def generate_startup_definition() -> dict[str, object]:
+    """Return the concrete, repository-owned container/service startup definition.
+
+    The definition is the authoritative, versioned description of how the
+    supported deployment must start the supervisor: the exact
+    ``tini-static -- lubko-supervisor`` command, the external restart policy,
+    the required state mounts, and the private config path expectations. It is
+    consumed by the supported install/bootstrap/deploy path and validated exactly
+    by the maintained verifier — unlike a prose instruction, it controls startup.
+
+    Returns:
+        A JSON-serializable mapping of the startup definition.
+    """
+    return {
+        "schema_version": STARTUP_DEFINITION_SCHEMA_VERSION,
+        "command": list(canonical_startup_command()),
+        "restart_policy": DEFAULT_RESTART_POLICY,
+        "restart_authority": CURRENT_CONTRACT.restart_authority,
+        "required_state_dirs": list(CURRENT_CONTRACT.required_state_dirs),
+        "required_config_files": list(CURRENT_CONTRACT.required_config_files),
+    }
+
+
+def write_startup_definition() -> None:
+    """Crash-durably publish the current startup definition artifact.
+
+    The definition is deployment authority: the supported install/bootstrap path
+    installs it and the verifier requires it to match exactly, so the write must
+    be confirmed durable before the definition it asserts is treated as active.
+    """
+    write_json_durable(startup_definition_path(), generate_startup_definition())
+
+
+def read_startup_definition() -> dict[str, object] | None:
+    """Load the startup definition artifact, treating unreadable data as absence.
+
+    Returns:
+        The parsed definition, or ``None`` when absent, unreadable, or invalid.
+    """
+    try:
+        raw = startup_definition_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    return decoded
+
+
+def validate_startup_definition() -> ContractPathValidation:
+    """Validate the installed startup definition matches the current contract.
+
+    A missing or divergent definition means the supported deployment path did
+    not install the authoritative startup definition (or it drifted), so the
+    restart/topology proof must not report the supported topology as active.
+
+    Returns:
+        The startup definition validation result.
+    """
+    recorded = read_startup_definition()
+    if recorded is None:
+        return ContractPathValidation(
+            ok=False,
+            missing=(),
+            mode_mismatched=(),
+            message="startup definition is not installed by the supported deployment path",
+        )
+    if recorded != generate_startup_definition():
+        return ContractPathValidation(
+            ok=False,
+            missing=(),
+            mode_mismatched=(),
+            message="installed startup definition does not match the current contract",
+        )
+    return ContractPathValidation(
+        ok=True,
+        missing=(),
+        mode_mismatched=(),
+        message="installed startup definition matches the current contract",
+    )
 
 
 def install_and_validate_startup_definition(bin_home: Path) -> str | None:
-    """Install the versioned startup launcher and validate the deployment seams.
+    """Install the repository-owned startup launcher and definition; validate seams.
 
-    Combines the launcher install/validation and the required state-directory
-    validation into one fail-closed step so callers (install/bootstrap) cannot
-    record a successful deployment while the repository-owned startup
-    definition or its state mounts are missing or have drifted.
+    Combines the launcher install/validation, the concrete startup-definition
+    install/validation, and the required state-directory validation into one
+    fail-closed step so callers (install/bootstrap) cannot record a successful
+    deployment while the repository-owned startup definition or its state mounts
+    are missing or have drifted. The deployment remains container-agnostic: it
+    installs the authoritative definition this repo owns, but cannot mutate the
+    outer container manager, so the restart authority itself is proven separately
+    by the verifier against injected deployment-seam evidence.
 
     Args:
         bin_home: Directory containing the launcher scripts.
 
     Returns:
-        ``None`` on success, or a user-facing error message when the launcher
-        or required state directories are missing or have drifted.
+        ``None`` on success, or a user-facing error message when the launcher,
+        definition, or required state directories are missing or have drifted.
     """
     try:
         write_startup_launcher(bin_home)
@@ -561,6 +778,13 @@ def install_and_validate_startup_definition(bin_home: Path) -> str | None:
         return f"could not install the startup launcher: {exc}"
     if not validate_startup_launcher(bin_home):
         return "startup launcher is missing or has drifted after install"
+    try:
+        write_startup_definition()
+    except (DurabilityError, OSError) as exc:
+        return f"could not install the startup definition: {exc}"
+    definition = validate_startup_definition()
+    if not definition.ok:
+        return f"startup definition is not satisfied: {definition.message}"
     create_contract_state_dirs()
     paths = validate_contract_paths()
     if not paths.ok:
@@ -576,11 +800,15 @@ def prove_restart_authority(
     """Prove the external restart authority recorded by the contract.
 
     Tini reaps and forwards signals but does not restart the supervisor; the
-    container/service restart policy is the restart authority.  When an
-    orchestrator injects the live policy through :data:`RESTART_POLICY_ENV` the
-    recorded policy must equal it (fail closed on divergence).  When no live
-    policy is injected, the recorded contract policy is the authority of record
-    and must equal :data:`CURRENT_CONTRACT`'s required policy.
+    container/service restart policy is the restart authority.  The contract of
+    record alone is **not** activation proof: this repo cannot observe or mutate
+    the outer container/service restart policy, so a present contract that merely
+    says ``restart_policy == "always"`` must never satisfy the proof.  Concrete,
+    configured restart-authority evidence from the supported deployment seam is
+    required.  The optional :data:`RESTART_POLICY_ENV` (or an explicit
+    ``configured_policy`` from the deployment seam) is that evidence; when it is
+    absent the proof fails closed rather than reporting the supported topology as
+    active.
 
     Args:
         contract: The recorded (or current) contract.
@@ -593,54 +821,61 @@ def prove_restart_authority(
     live = (
         configured_policy if configured_policy is not None else os.environ.get(RESTART_POLICY_ENV)
     )
-    if live is not None:
-        if live != contract.restart_policy:
-            return RestartAuthorityProof(
-                ok=False,
-                policy=live,
-                source=f"deployment-seam:{RESTART_POLICY_ENV}",
-                message=(
-                    f"configured restart policy {live!r} differs from the contract "
-                    f"policy {contract.restart_policy!r}"
-                ),
-            )
-        return RestartAuthorityProof(
-            ok=True,
-            policy=live,
-            source=f"deployment-seam:{RESTART_POLICY_ENV}",
-            message="configured restart policy matches the contract",
-        )
-    if contract.restart_policy != DEFAULT_RESTART_POLICY:
+    if live is None:
         return RestartAuthorityProof(
             ok=False,
             policy=contract.restart_policy,
-            source="contract-of-record",
+            source="no-evidence",
             message=(
-                f"contract restart policy {contract.restart_policy!r} is not "
-                f"{DEFAULT_RESTART_POLICY!r}"
+                "no configured/activated restart-policy evidence is available; the "
+                "contract of record alone is not startup-activation proof (supply "
+                f"{RESTART_POLICY_ENV} from the deployment seam)"
+            ),
+        )
+    if live != contract.restart_policy:
+        return RestartAuthorityProof(
+            ok=False,
+            policy=live,
+            source=f"deployment-seam:{RESTART_POLICY_ENV}",
+            message=(
+                f"configured restart policy {live!r} differs from the contract "
+                f"policy {contract.restart_policy!r}"
             ),
         )
     return RestartAuthorityProof(
         ok=True,
-        policy=contract.restart_policy,
-        source="contract-of-record",
-        message="contract restart policy is the required authority of record",
+        policy=live,
+        source=f"deployment-seam:{RESTART_POLICY_ENV}",
+        message="configured restart policy matches the contract",
     )
 
 
-def read_process_info(pid: int) -> ProcessInfo | None:
-    """Return the exact identity of a live process, or ``None`` if unknown.
+def _read_proc_stat(pid: int) -> bytes | None:
+    """Read the raw ``/proc/<pid>/stat`` bytes, or ``None`` if unreadable.
 
     Args:
         pid: Process ID to inspect.
 
     Returns:
-        The process identity, or ``None`` when the process is gone or its
-        ``/proc`` entries are unreadable.
+        The raw stat bytes, or ``None`` when the process is gone.
     """
     try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+        return (Path("/proc") / str(pid) / "stat").read_bytes()
     except OSError:
+        return None
+
+
+def _parse_stat_fields(stat: bytes | None) -> tuple[int, int, str] | None:
+    """Extract the minimal identity fields from ``/proc/<pid>/stat`` bytes.
+
+    Args:
+        stat: Raw ``/proc/<pid>/stat`` bytes, or ``None`` when unreadable.
+
+    Returns:
+        ``(ppid, start_time_ticks, state)`` when the line is parseable, else
+        ``None``.
+    """
+    if stat is None:
         return None
     close_paren = stat.rfind(b")")
     if close_paren == -1:
@@ -654,7 +889,38 @@ def read_process_info(pid: int) -> ProcessInfo | None:
         state = fields[STAT_STATE_FIELD_INDEX].decode("ascii", "replace")
     except (ValueError, UnicodeDecodeError):
         return None
+    return ppid, start_time_ticks, state
+
+
+def read_process_info(pid: int) -> ProcessInfo | None:
+    """Return the exact identity of a live process, or ``None`` if unknown.
+
+    The process identity is captured atomically with respect to the command-line
+    read: the stat (PID/PPID/start-ticks/state) is read first, the command line
+    is read second, and then the stat is re-read. If the second stat diverges
+    from the first, the PID was recycled between the two reads, so the identity
+    is rejected rather than returned as a spliced (and therefore forgeable)
+    combination of an old start tick with a new occupant's command line. This
+    closes the splice a recycled PID would otherwise open against the later
+    start-tick comparison in :func:`evaluate_topology`.
+
+    Args:
+        pid: Process ID to inspect.
+
+    Returns:
+        The process identity, or ``None`` when the process is gone, unreadable,
+        or its identity changed across the observation.
+    """
+    stat_first = _read_proc_stat(pid)
+    first = _parse_stat_fields(stat_first)
+    if first is None:
+        return None
     cmdline = _read_cmdline(pid)
+    stat_second = _read_proc_stat(pid)
+    second = _parse_stat_fields(stat_second)
+    if second is None or second != first:
+        return None
+    ppid, start_time_ticks, state = first
     return ProcessInfo(
         pid=pid,
         ppid=ppid,

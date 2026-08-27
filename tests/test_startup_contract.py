@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
@@ -21,9 +21,6 @@ from lubko.startup_contract import (
     TopologyProof,
     TopologyTargets,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _proc(pid: int, ppid: int, cmdline: str, *, zombie: bool = False) -> ProcessInfo:
@@ -354,6 +351,7 @@ def test_contract_semantic_mismatch_is_distinct(
         restart_policy="never",
         restart_authority="divergent",
         required_state_dirs=CURRENT_CONTRACT.required_state_dirs,
+        required_config_files=CURRENT_CONTRACT.required_config_files,
     )
     sc.write_contract(divergent)
     assessment = sc.assess_recorded_contract()
@@ -372,12 +370,19 @@ def test_assess_recorded_contract_states(tmp_path: Path, monkeypatch: pytest.Mon
     assert sc.assess_recorded_contract().state == "current"
 
 
-def test_prove_restart_authority_contract_of_record() -> None:
-    """Without an injected policy the contract is the authority of record."""
+def test_prove_restart_authority_fails_without_evidence() -> None:
+    """Without configured evidence the contract of record must fail closed."""
     rap = sc.prove_restart_authority(CURRENT_CONTRACT)
-    assert rap.ok is True
-    assert rap.source == "contract-of-record"
+    assert rap.ok is False
+    assert rap.source == "no-evidence"
     assert rap.policy == "always"
+
+
+def test_prove_restart_authority_env_seam_matches() -> None:
+    """An injected live policy equal to the contract passes the proof."""
+    rap = sc.prove_restart_authority(CURRENT_CONTRACT, configured_policy="always")
+    assert rap.ok is True
+    assert rap.source == f"deployment-seam:{sc.RESTART_POLICY_ENV}"
 
 
 def test_prove_restart_authority_env_seam(
@@ -500,9 +505,19 @@ def _patch_status_surface(monkeypatch: pytest.MonkeyPatch, proof: TopologyProof)
     monkeypatch.setattr(sc, "verify_live_topology", lambda: proof)
     monkeypatch.setattr(
         sc,
+        "validate_startup_definition",
+        lambda: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+    )
+    monkeypatch.setattr(
+        sc,
+        "validate_contract_config",
+        lambda: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+    )
+    monkeypatch.setattr(
+        sc,
         "prove_restart_authority",
         lambda _c, **_k: RestartAuthorityProof(
-            ok=True, policy="always", source="contract-of-record", message="ok"
+            ok=True, policy="always", source="deployment-seam", message="ok"
         ),
     )
 
@@ -605,6 +620,17 @@ def test_startup_contract_command_writes_and_proves(
     monkeypatch.setattr(sc, "contract_path", lambda: tmp_path / "startup-contract.json")
     monkeypatch.setattr(sc, "write_startup_launcher", lambda _b: None)
     monkeypatch.setattr(sc, "validate_startup_launcher", lambda _b: True)
+    monkeypatch.setattr(sc, "write_startup_definition", lambda: None)
+    monkeypatch.setattr(
+        sc,
+        "validate_startup_definition",
+        lambda: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+    )
+    monkeypatch.setattr(
+        sc,
+        "validate_contract_config",
+        lambda: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+    )
     proof = TopologyProof(
         ok=True,
         contract_version=CONTRACT_SCHEMA_VERSION,
@@ -628,7 +654,7 @@ def test_startup_contract_command_writes_and_proves(
         sc,
         "prove_restart_authority",
         lambda _c, **_k: RestartAuthorityProof(
-            ok=True, policy="always", source="contract-of-record", message="ok"
+            ok=True, policy="always", source="deployment-seam", message="ok"
         ),
     )
     assert lifecycle.startup_contract_cmd(argparse.Namespace(write=True)) == lifecycle.EXIT_OK
@@ -695,3 +721,125 @@ def test_install_creates_required_state_dirs(
         assert directory.is_dir()
         mode = directory.stat().st_mode & 0o777
         assert mode == sc.DEFAULT_STATE_DIR_MODE
+
+
+def test_validate_contract_paths_rejects_insecure_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Group/world-accessible state directories fail the private-mode contract."""
+    monkeypatch.setattr(sc, "state_root", lambda: tmp_path)
+    (tmp_path / "supervisor").mkdir(mode=0o755)
+    (tmp_path / "worker").mkdir(mode=0o777)
+    (tmp_path / "deploy").mkdir(mode=0o700)
+    result = sc.validate_contract_paths()
+    assert result.ok is False
+    assert "supervisor" in result.mode_mismatched
+    assert "worker" in result.mode_mismatched
+
+
+def test_validate_contract_config_private_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Private config files must exist with no group/world access bits."""
+    private_a = tmp_path / "database.conf"
+    private_b = tmp_path / "worker.conf"
+    private_a.write_text("", encoding="utf-8")
+    private_b.write_text("", encoding="utf-8")
+    Path(private_a).chmod(0o600)
+    Path(private_b).chmod(0o640)
+    monkeypatch.setattr(sc, "private_config_paths", lambda: (private_a, private_b))
+    result = sc.validate_contract_config()
+    assert result.ok is False
+    assert str(private_b) in result.mode_mismatched
+    assert str(private_a) not in result.mode_mismatched
+    Path(private_b).chmod(0o600)
+    assert sc.validate_contract_config().ok is True
+    private_a.unlink()
+    assert "missing" in sc.validate_contract_config().message
+
+
+def test_startup_definition_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The installed startup definition matches the current contract exactly."""
+    monkeypatch.setattr(sc, "state_root", lambda: tmp_path)
+    sc.write_startup_definition()
+    assert sc.validate_startup_definition().ok is True
+    definition = sc.read_startup_definition()
+    assert definition == sc.generate_startup_definition()
+    assert definition is not None
+    assert definition["command"] == ["tini-static", "--", "lubko-supervisor"]
+    assert definition["restart_policy"] == "always"
+    assert definition["schema_version"] == sc.STARTUP_DEFINITION_SCHEMA_VERSION
+    (tmp_path / "deploy" / sc.STARTUP_DEFINITION_NAME).write_text(
+        '{"schema_version": 1, "command": ["sleep", "infinity"]}', encoding="utf-8"
+    )
+    assert sc.validate_startup_definition().ok is False
+
+
+def test_read_process_info_stable_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stable process identity across stat/cmdline reads is returned intact."""
+    stat = b"10 (svc) S 1 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 1010 0"
+    monkeypatch.setattr(sc, "_read_proc_stat", lambda _pid: stat)
+    monkeypatch.setattr(sc, "_read_cmdline", lambda _pid: "/usr/bin/lubko-supervisor")
+    info = sc.read_process_info(10)
+    assert info is not None
+    assert info.pid == 10
+    assert info.ppid == 1
+    assert info.start_time_ticks == 1010
+    assert info.cmdline == "/usr/bin/lubko-supervisor"
+
+
+def test_read_process_info_rejects_pid_reuse_between_stat_and_cmdline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PID recycled between stat and cmdline must not yield a spliced identity."""
+    stat_first = b"10 (svc) S 1 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 1010 0"
+    stat_reused = b"10 (svc) S 1 0 0 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 0 7777 0"
+    calls = {"n": 0}
+
+    def _stat(_pid: int) -> bytes:
+        calls["n"] += 1
+        return stat_first if calls["n"] == 1 else stat_reused
+
+    monkeypatch.setattr(sc, "_read_proc_stat", _stat)
+    monkeypatch.setattr(sc, "_read_cmdline", lambda _pid: "/usr/bin/lubko-supervisor")
+    assert sc.read_process_info(10) is None
+
+
+def test_startup_contract_command_fails_without_restart_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'lubko-deploy startup-contract' fails closed without restart evidence."""
+    monkeypatch.setattr(sc, "state_root", lambda: tmp_path)
+    monkeypatch.setattr(sc, "write_startup_launcher", lambda _b: None)
+    monkeypatch.setattr(sc, "validate_startup_launcher", lambda _b: True)
+    monkeypatch.setattr(
+        sc,
+        "validate_contract_config",
+        lambda: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+    )
+    sc.write_contract()
+    sc.write_startup_definition()
+    proof = TopologyProof(
+        ok=True,
+        contract_version=CONTRACT_SCHEMA_VERSION,
+        init_pid=1,
+        init_cmdline="/usr/bin/tini-static -- lubko-supervisor",
+        init_is_tini=True,
+        supervisor_pid=10,
+        supervisor_cmdline="uv run lubko-supervisor",
+        supervisor_present=True,
+        supervisor_is_contract_binary=True,
+        supervisor_under_init=True,
+        supervisor_identity_matches=True,
+        uses_sleep_placeholder=False,
+        worker_pid=None,
+        worker_is_direct_child=False,
+        worker_identity_matches=True,
+        message="startup contract satisfied (tini -> supervisor; no worker claimed yet)",
+    )
+    monkeypatch.setattr(sc, "verify_live_topology", lambda: proof)
+    monkeypatch.delenv(sc.RESTART_POLICY_ENV, raising=False)
+    assert lifecycle.startup_contract_cmd(argparse.Namespace(write=False)) == lifecycle.EXIT_ERROR
