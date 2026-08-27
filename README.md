@@ -33,7 +33,9 @@ completion, stop or clean them up.
 
 Lubko targets exactly CPython 3.12 and pins a single `uv` version; see
 [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the supported toolchain and the
-explicit upgrade procedure.
+explicit upgrade procedure. How a change becomes the tip of `main` is governed
+by a GitHub ruleset; see [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) for the
+change-integrity contract.
 
 ```sh
 uv sync
