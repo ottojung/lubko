@@ -200,6 +200,32 @@ def parse_server(value: object) -> str:
     return value
 
 
+def _validate_cwd(cwd: object) -> str:
+    """Validate a request working directory as a non-empty absolute path.
+
+    The protocol documents ``cwd`` as an absolute working directory passed
+    directly to ``Popen``. Relative paths are rejected here rather than
+    resolved, so a daemon never enters a caller-relative directory.
+
+    Args:
+        cwd: The raw ``request.cwd`` value.
+
+    Returns:
+        The validated absolute working directory.
+
+    Raises:
+        ProtocolError: If the value is missing, not a string, empty, or not an
+            absolute POSIX path beginning with ``/``.
+    """
+    if not isinstance(cwd, str) or not cwd:
+        msg = "request.cwd must be a non-empty string"
+        raise ProtocolError(msg)
+    if not cwd.startswith("/"):
+        msg = "request.cwd must be an absolute POSIX path beginning with '/'"
+        raise ProtocolError(msg)
+    return cwd
+
+
 def build_payload(
     *, server: str, cwd: str, process: list[str], version: object = PROTOCOL_VERSION
 ) -> dict[str, Any]:
@@ -214,7 +240,9 @@ def build_payload(
 
     Args:
         server: Non-empty identity of the target execution server.
-        cwd: Absolute working directory for the job.
+        cwd: Absolute working directory for the job; passed directly to the
+            worker's ``Popen`` and therefore required to be a non-empty absolute
+            POSIX path beginning with ``/``.
         process: Non-empty list of non-empty argv strings to execute directly.
         version: Negotiated protocol version for the submission.
 
@@ -231,11 +259,9 @@ def build_payload(
         msg = "payload version must be a positive integer"
         raise ProtocolError(msg)
     validated_server = parse_server(server)
-    request: dict[str, object] = {"cwd": cwd}
+    validated_cwd = _validate_cwd(cwd)
+    request: dict[str, object] = {"cwd": validated_cwd}
     request["process"] = list(_parse_process(process))
-    if not cwd:
-        msg = "request.cwd must be a non-empty string"
-        raise ProtocolError(msg)
     return {
         "v": version,
         "type": JOB_TYPE_COMMAND,
@@ -397,10 +423,7 @@ def _parse_request(raw_request: object) -> JobRequest:
             "are not accepted in v4"
         )
         raise ProtocolError(msg)
-    cwd = raw_request.get("cwd")
-    if not isinstance(cwd, str) or not cwd:
-        msg = "request.cwd must be a non-empty string"
-        raise ProtocolError(msg)
+    cwd = _validate_cwd(raw_request.get("cwd"))
     return JobRequest(cwd=cwd, process=_parse_process(raw_request.get("process")))
 
 
