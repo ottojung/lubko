@@ -293,6 +293,9 @@ def build_output_window_payload(
         msg = f"output tail must be at most {OUTPUT_TAIL_MAX_BYTES} characters"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
+    if end - start > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"output window span must be at most {OUTPUT_TAIL_MAX_BYTES} raw bytes"
+        raise ProtocolError(msg)
     window: dict[str, Any] = {
         "tail": tail,
         "start": start,
@@ -352,6 +355,9 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments] -- every fie
         msg = f"output_chunk.value must be at most {OUTPUT_CHUNK_MAX_BYTES} characters"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
+    if end - start > OUTPUT_CHUNK_MAX_BYTES:
+        msg = f"output_chunk span must be at most {OUTPUT_CHUNK_MAX_BYTES} raw bytes"
+        raise ProtocolError(msg)
     chunk: dict[str, Any] = {
         "v": version,
         "type": JOB_TYPE_OUTPUT_CHUNK,
@@ -500,6 +506,9 @@ def _parse_window(raw: object) -> OutputWindow:
         msg = "output window end must be an integer"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
+    if end - start > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"output window span must be at most {OUTPUT_TAIL_MAX_BYTES} raw bytes"
+        raise ProtocolError(msg)
     previous = _parse_uuid(raw.get("previous"))
     return OutputWindow(tail=tail, start=start, end=end, previous=previous)
 
@@ -709,6 +718,9 @@ def parse_chunk_payload(data: object, supported: ProtocolVersionRange | None = N
         msg = "output_chunk.end must be an integer"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
+    if end - start > OUTPUT_CHUNK_MAX_BYTES:
+        msg = f"output_chunk span must be at most {OUTPUT_CHUNK_MAX_BYTES} raw bytes"
+        raise ProtocolError(msg)
     value = decoded.get("value")
     if not isinstance(value, str) or len(value) > OUTPUT_CHUNK_MAX_BYTES:
         msg = f"output_chunk.value must be a string of at most {OUTPUT_CHUNK_MAX_BYTES} characters"
