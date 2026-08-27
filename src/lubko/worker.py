@@ -96,7 +96,11 @@ from lubko._exact_signal import open_pidfd as _shared_open_pidfd
 from lubko._exact_signal import pidfd_send_signal as _shared_pidfd_send_signal
 from lubko._exact_signal import process_pgrp as _shared_process_pgrp
 from lubko._start_gate import GATE_RELEASE_BYTE
-from lubko.config import load_database_config, load_worker_server
+from lubko.config import (
+    load_database_config,
+    load_worker_protocol_range,
+    load_worker_server,
+)
 from lubko.health import (
     WORKER_HEALTH_SCHEMA_VERSION,
     WorkerHealth,
@@ -117,6 +121,13 @@ from lubko.protocol import (
     build_output_window_payload,
     parse_payload,
 )
+from lubko.protocol_versioning import (
+    DEFAULT_VERSION_RANGE,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    JobVersionDisposition,
+    claim_version_predicate,
+    reaper_disposition,
+)
 from lubko.state import state_root
 
 if TYPE_CHECKING:
@@ -126,6 +137,7 @@ if TYPE_CHECKING:
     from psycopg.abc import RV, PQGen
 
     from lubko.config import DatabaseConfig
+    from lubko.protocol_versioning import ProtocolVersionRange
 
     JobsConnection = psycopg.Connection[tuple[Any, ...]]
 else:
@@ -599,6 +611,11 @@ class ActiveJob:
     pgid: int
     started_mono: float
     claimed_at: float
+    #: Protocol version of the root command payload that owns this job. Every
+    #: immutable output_chunk this worker publishes for the job is stamped with
+    #: this same version, so chunk history can never drift to a different
+    #: protocol generation than its root.
+    version: int
     stdout: OutputStream = field(init=False)
     stderr: OutputStream = field(init=False)
     completed: bool = False
@@ -711,13 +728,20 @@ class Settings:
     gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     gc_batch_limit: int = DEFAULT_GC_BATCH_LIMIT
     output_spool_max_bytes: int = DEFAULT_OUTPUT_SPOOL_MAX_BYTES
+    #: Supported protocol version window for this daemon. A daemon claims and
+    #: executes only jobs whose ``v`` lies inside this window, so a fleet can
+    #: run a bounded mixed-version set during a staggered, non-destructive
+    #: upgrade while older in-flight jobs keep running on daemons that still
+    #: advertise the older version. The window may never include a version this
+    #: build cannot parse.
+    supported_protocol_range: ProtocolVersionRange = DEFAULT_VERSION_RANGE
 
     def __post_init__(self) -> None:
         """Validate lease timing so a live worker's lease never expires idle.
 
         Raises:
-            ValueError: If the server identity is empty or any timing value
-                is unusable.
+            ValueError: If the server identity is empty, any timing value is
+                unusable, or the supported protocol window is invalid.
         """
         if not self.server:
             msg = (
@@ -729,6 +753,25 @@ class Settings:
         self._validate_lease_timing()
         self._validate_output_and_gc()
         self._validate_spool()
+        self._validate_protocol_range()
+
+    def _validate_protocol_range(self) -> None:
+        """Fail closed if the window includes an unparseable version.
+
+        Raises:
+            ValueError: If any version in the window exceeds what this build can
+                parse and execute.
+        """
+        window = self.supported_protocol_range
+        for version in range(window.min, window.max + 1):
+            if version not in SUPPORTED_PROTOCOL_VERSIONS:
+                msg = (
+                    f"supported protocol range [{window.min}, {window.max}] "
+                    f"includes version {version} which this build cannot parse; "
+                    "the daemon refuses to start rather than claim jobs it "
+                    "cannot safely execute"
+                )
+                raise ValueError(msg)
 
     def _validate_lease_timing(self) -> None:
         """Validate lease-related settings are consistent.
@@ -822,22 +865,30 @@ class Settings:
             raise ValueError(msg)
 
     @classmethod
-    def from_environment(cls, *, server: str) -> Settings:
+    def from_environment(
+        cls, *, server: str, supported_protocol_range: ProtocolVersionRange | None = None
+    ) -> Settings:
         """Load worker settings from environment variables.
 
-        The execution-server identity is never environmental: it must be
-        supplied explicitly, loaded from the restricted worker configuration
-        file by the entry point.
+        The execution-server identity and the supported protocol version window
+        are never environmental: they must be supplied explicitly, loaded from the
+        restricted worker configuration file by the entry point.
 
         Args:
             server: Non-empty execution-server identity from the config file.
+            supported_protocol_range: The daemon's supported protocol window from
+                the config file, or ``None`` to use the default current-version
+                window.
 
         Returns:
             Settings derived from the process environment plus the configured
-            server identity.
+            server identity and protocol window.
         """
         return cls(
             server=server,
+            supported_protocol_range=supported_protocol_range
+            if supported_protocol_range is not None
+            else DEFAULT_VERSION_RANGE,
             worker_id=os.getenv("LUBKO_WORKER_ID", socket.gethostname()),
             poll_interval_seconds=float(
                 os.getenv(
@@ -1762,7 +1813,7 @@ def _plan_streams(
                 stream.path, OUTPUT_TAIL_MAX_BYTES, base=stream.spool_start
             )
             chunks, archived_upto, last_chunk, sequence = _plan_chunks(
-                job.id, name, stream, tail_end, server
+                job.id, name, stream, tail_end, server, version=job.version
             )
         except OSError as exc:
             # Never silently omit a stream: a stat/read/disappearance failure on
@@ -1791,12 +1842,14 @@ def _plan_streams(
     return plans
 
 
-def _plan_chunks(
+def _plan_chunks(  # ruff: ignore[too-many-arguments] -- the chunk identity/offset/version fields are each required; bundling them hides intent
     job_id: UUID,
     name: str,
     stream: OutputStream,
     tail_end: int,
     server: str,
+    *,
+    version: int,
 ) -> tuple[tuple[tuple[UUID, str], ...], int, UUID | None, int]:
     """Compute the immutable chunks to archive for one stream.
 
@@ -1805,6 +1858,10 @@ def _plan_chunks(
         name: Stream name.
         stream: The stream's current publication state.
         tail_end: Current byte size of the stream (end of the live tail).
+        server: The daemon's configured server identity stamped onto chunks.
+        version: Protocol version of the owning root job; every emitted chunk is
+            stamped with this same version so chunk history cannot drift to a
+            different protocol generation.
         server: The daemon's configured server identity stamped onto chunks.
 
     Returns:
@@ -1845,6 +1902,7 @@ def _plan_chunks(
                 end=chunk_end,
                 value=value,
                 previous=last_chunk,
+                version=version,
             )
         )
         chunks.append((chunk_id, chunk_payload))
@@ -3131,7 +3189,12 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
     execute the same root job. Only ``command`` rows whose top-level
     ``server`` exactly equals the daemon's configured server identity are
     claimed; jobs addressed to other servers stay pending, and immutable
-    ``output_chunk`` rows are never claim candidates.
+    ``output_chunk`` rows are never claim candidates. The claim is further gated
+    to rows whose protocol ``v`` lies inside the daemon's supported version
+    window (see :mod:`lubko.protocol_versioning`), so a daemon never locks a job
+    it cannot parse or execute and a mixed-version fleet can run a
+    non-destructive, staggered upgrade while older in-flight jobs keep running
+    on daemons that still advertise the older version.
 
     The claim records the worker's incarnation and grants each job a lease by
     writing ``state.lease_expires_at``; the owning worker refreshes those
@@ -3168,13 +3231,17 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
             ("state,updated_at", UTC_ISO_SQL),
         ],
     )
+    version_fragment, version_params = claim_version_predicate(settings.supported_protocol_range)
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "WITH next AS (\n"
             "    SELECT id\n"
             "    FROM lubko.jobs\n"
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
-            "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
+            + version_fragment
+            + "        AND "
+            + SERVER_MATCH_SQL
+            + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status' = 'pending'\n"
             "    ORDER BY (payload::jsonb)->'state'->>'created_at', id\n"
             "    FOR UPDATE SKIP LOCKED\n"
@@ -3191,6 +3258,7 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
                 "worker_incarnation": settings.worker_incarnation,
                 "lease_duration_seconds": settings.lease_duration_seconds,
                 "limit": limit,
+                **version_params,
             },
         )
         rows = cursor.fetchall()
@@ -3693,6 +3761,120 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str, *, server: 
     # RETURNING found no row: either already terminal or type mismatch.
     # Either way the row is safe — nothing more to write.
     return True
+
+
+_REAP_UNSUPPORTED_TEMPLATE: Final = """\
+SELECT id, ((payload::jsonb)->'v')::int AS version
+FROM lubko.jobs
+WHERE (payload::jsonb)->>'type' = 'command'
+    AND jsonb_typeof((payload::jsonb)->'server') = 'string'
+    AND (payload::jsonb)->>'server' = %(server)s
+    AND (payload::jsonb)->'state'->>'status' = 'pending'
+ORDER BY (payload::jsonb)->'state'->>'created_at', id
+LIMIT %(limit)s
+FOR UPDATE SKIP LOCKED
+"""
+
+
+def fail_unsupported_job(
+    conn: JobsConnection, job_id: UUID, diagnostic: str, *, server: str
+) -> bool:
+    """Fail a pending job closed because its protocol version is unservable.
+
+    Mirrors :func:`_quarantine_job` in bypassing the normal finalization CAS
+    (which only matches ``running`` rows) so a never-claimed pending job can be
+    durably terminalized. The write is scoped to the daemon's server and to
+    non-terminal rows, so it can never finalize another server's row or a row
+    already terminal.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        job_id: Identifier of the job to fail closed.
+        diagnostic: Human-readable reason (no NUL bytes).
+        server: The daemon's configured server identity guarding the update.
+
+    Returns:
+        ``True`` when the row was terminalized or was already safe; ``False`` when
+        the write failed and must be retried.
+
+    Raises:
+        psycopg.Error: When the error is a connectivity issue.
+    """
+    safe_diagnostic = diagnostic.replace("\x00", "\ufffd")
+    try:
+        with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = (\n"
+                "  jsonb_set(\n"
+                "    jsonb_set(\n"
+                "      jsonb_set(\n"
+                "        jsonb_set(payload::jsonb, '{state,status}', to_jsonb('failed'::text)),\n"
+                "        '{state,finished_at}', " + UTC_ISO_SQL + "\n"
+                "      ),\n"
+                "      '{state,updated_at}', " + UTC_ISO_SQL + "\n"
+                "    ),\n"
+                "    '{state,unsupported_protocol_version_reason}', to_jsonb(%(reason)s::text)\n"
+                "  )\n"
+                ")::text\n"
+                "WHERE id = %(job_id)s\n"
+                "  AND (payload::jsonb)->>'type' = 'command'\n"
+                "  AND " + SERVER_MATCH_SQL + "%(server)s\n"
+                "  AND (payload::jsonb)->'state'->>'status'\n"
+                "      NOT IN ('succeeded','failed','cancelled')\n"
+                "RETURNING id\n",
+                {"job_id": job_id, "reason": safe_diagnostic, "server": server},
+            )
+            cursor.fetchone()
+    except psycopg.Error as exc:
+        if _is_connectivity_error_check(exc, conn):
+            raise
+        LOGGER.exception(
+            "unsupported-version terminalization for job %s failed (SQLSTATE %s)",
+            job_id,
+            exc.sqlstate or "N/A",
+        )
+        return False
+    return True
+
+
+def reap_unsupported_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[UUID]:
+    """Fail closed pending jobs whose protocol version no daemon can serve.
+
+    A fleet-wide safety net so a pending ``command`` job submitted at a version no
+    running daemon understands can never sit stranded forever. The reaper only
+    touches jobs whose version is unservable by the *entire* fleet, decided by
+    :func:`lubko.protocol_versioning.reaper_disposition`, so it never destroys
+    work a different daemon could still execute (for example a ``v5`` job during a
+    ``[4,5]`` staggered upgrade while older ``[4,4]`` daemons still run). The pass
+    is bounded to ``limit`` rows per turn.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        settings: Worker runtime settings (server identity and supported window).
+        limit: Maximum number of candidate rows to scan and potentially reap.
+
+    Returns:
+        The identifiers of the jobs failed closed this pass.
+    """
+    reaped: list[UUID] = []
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(_REAP_UNSUPPORTED_TEMPLATE, {"server": settings.server, "limit": limit})
+        for job_id, version in cursor.fetchall():
+            if version is None:
+                continue
+            if (
+                reaper_disposition(int(version), settings.supported_protocol_range)
+                is JobVersionDisposition.FAIL_CLOSED
+            ):
+                diagnostic = (
+                    f"protocol version {version} is unsupported by every running "
+                    f"daemon (supported window [{settings.supported_protocol_range.min}, "
+                    f"{settings.supported_protocol_range.max}]); the job is failed closed"
+                )
+                if fail_unsupported_job(conn, job_id, diagnostic, server=settings.server):
+                    reaped.append(job_id)
+    return reaped
 
 
 def delete_job_and_chunks(conn: JobsConnection, job_id: UUID, *, server: str) -> None:
@@ -4244,6 +4426,7 @@ class Supervisor:
         self._next_cancel_scan_at = 0.0
         self._next_reconnect_at = 0.0
         self._next_gc_at = 0.0
+        self._next_reaper_at = 0.0
         self._started_at = time.time()
         self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
         self._db_connected_at: float | None = None
@@ -4401,6 +4584,9 @@ class Supervisor:
         if now >= self._next_gc_at:
             self._run_gc()
             self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
+        if now >= self._next_reaper_at:
+            self._run_reaper()
+            self._next_reaper_at = time.monotonic() + self.settings.gc_interval_seconds
         if not self._stopping:
             self._claim_batch()
 
@@ -4609,6 +4795,7 @@ class Supervisor:
                 self._next_recovery_at = 0.0
                 self._next_lease_refresh_at = 0.0
                 self._next_gc_at = 0.0
+                self._next_reaper_at = 0.0
             else:
                 self._next_reconnect_at = time.monotonic() + max(
                     self.settings.poll_interval_seconds, 0.5
@@ -4631,6 +4818,17 @@ class Supervisor:
             if job is not None:
                 job.row_lost = True
                 request_stop(job, STOP_REASON_ROW_LOST)
+
+    def _run_reaper(self) -> None:
+        """Fail closed pending jobs at a protocol version no daemon can serve."""
+        conn = self.conn
+        if conn is None:
+            return
+        reaped = reap_unsupported_jobs(conn, self.settings, LEASE_RECOVERY_LIMIT)
+        if reaped:
+            LOGGER.warning(
+                "reaped %d pending job(s) at an unsupported protocol version", len(reaped)
+            )
 
     def _run_gc(self) -> None:
         """Run the transport garbage collection pass.
@@ -5526,7 +5724,9 @@ class Supervisor:
         if conn is None:
             return
         try:
-            payload = parse_payload(claimed.payload)
+            payload = parse_payload(
+                claimed.payload, supported=self.settings.supported_protocol_range
+            )
         except ProtocolError as exc:
             LOGGER.warning("rejecting unparseable job %s: %s", claimed.id, exc)
             self._finalize_immediate(
@@ -5604,6 +5804,7 @@ class Supervisor:
             job_spec,
             gated,
             claim_mono=claim_mono,
+            version=payload.version,
         )
         if job is None:
             # The gated start was aborted and finalized; close the capture fds
@@ -5724,7 +5925,7 @@ class Supervisor:
         )
         return "unable to record exact process identity; job not started", 0
 
-    def _activate_gated_job(
+    def _activate_gated_job(  # ruff: ignore[too-many-arguments] -- each field is required by the activation contract
         self,
         conn: JobsConnection,
         job_id: UUID,
@@ -5732,6 +5933,7 @@ class Supervisor:
         gated: GatedSpawn,
         *,
         claim_mono: float,
+        version: int,
     ) -> ActiveJob | None:
         """Persist the exact identity, release the gate, and build the active job.
 
@@ -5747,6 +5949,8 @@ class Supervisor:
             job_spec: The claimed job specification.
             gated: Handles and exact identity of the gated start to activate.
             claim_mono: Monotonic claim instant carried onto the active job.
+            version: Protocol version of the root command payload; stored on the
+                active job so every emitted output chunk is stamped with it.
 
         Returns:
             The :class:`ActiveJob` for normal supervision, or ``None`` when the
@@ -5774,6 +5978,7 @@ class Supervisor:
                     pgid=gated.pgid,
                     started_mono=time.monotonic(),
                     claimed_at=claim_mono,
+                    version=version,
                     start_ticks=start_ticks,
                     owned_members={gated.proc.pid: start_ticks},
                 )
@@ -6423,12 +6628,17 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.exception("unable to load the worker server configuration")
         raise SystemExit(1) from None
     try:
+        protocol_range = load_worker_protocol_range()
+    except (OSError, ValueError):
+        LOGGER.exception("unable to load the worker protocol window configuration")
+        raise SystemExit(1) from None
+    try:
         database = load_database_config()
     except (OSError, ValueError):
         LOGGER.exception("unable to load database configuration")
         raise SystemExit(1) from None
     try:
-        settings = Settings.from_environment(server=server)
+        settings = Settings.from_environment(server=server, supported_protocol_range=protocol_range)
     except ValueError:
         LOGGER.exception("invalid worker runtime settings")
         raise SystemExit(1) from None

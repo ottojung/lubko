@@ -122,24 +122,30 @@ access contract.
 - Version `4` is the current binding. Within a version, fields may be added
   additively. Breaking changes (renaming or removing fields, changing types or
   semantics) require a new version and a new worker generation.
-- **The v3 → v4 cutover is destructive.** Version `3` is unsupported: v4
-  parsers, builders, and workers accept only payloads carrying a required
-  non-empty top-level `server` string field, which v3 rows lack; there is **no
-  compatibility path and no data migration**. The two-column transport schema
-  itself does not change between versions — only the payload-shape constraint
-  and the routing-aware queue index do — so the cutover replaces the constraint
-  via `migrations/0003_protocol_v4_server_routing.sql`. A valid procedure is:
-  quiesce new submissions, let any in-flight work become durably terminal,
-  `truncate lubko.jobs` while quiescent (the row cutover is destructive: every
+- **Upgrades use the bounded mixed-version window model, never a `truncate`.**
+  Future protocol generations are rolled out non-destructively: a daemon
+  advertises a bounded `[min, max]` window of mutually compatible versions (see
+  `docs/protocol_upgrades.md`), claims and executes only jobs whose `v` lies
+  inside that window, and fails closed on any version outside it. Because the
+  two-column schema is unchanged and window versions share one payload shape,
+  in-flight jobs and immutable `output_chunk` history are preserved across the
+  rollout, and a staggered one-server-at-a-time upgrade is deterministic. The
+  SQL constraint is generalized by `migrations/0005_protocol_version_window.sql`
+  from a hard-coded `v = 4` to a retained-history range `[RETAINED_MIN,
+  RETAINED_MAX]` that is broader than any daemon's execution window, so raising
+  the execution floor never rejects old terminal `v=4` rows or their
+  `output_chunk` history.
+- **The v3 → v4 cutover was a one-time destructive legacy event, not a template.**
+  Version `3` rows carried no required top-level `server` routing identity, so v4
+  parsers, builders, and workers cannot accept them; there is no compatibility
+  path and no data migration. That single cutover `truncate`s `lubko.jobs` (every
   old root `command` row and its `output_chunk` history is discarded, and there
-  is no default server), apply the migration (drop + recreate + validate the
-  constraint and rebuild the queue index), then start the daemon with its
-  configured server identity and prove a fresh v4 round trip. Applying the
-  migration against a table that still holds nonconforming rows fails fast with
-  an explicit diagnostic instead of leaving the transport half-upgraded;
-  truncating first is what makes validation trivially succeed.
-- A v4 worker rejects any payload whose version it does not understand; the job
-  is failed with a diagnostic instead of being stuck in the queue.
+  is no default server) and is performed via
+  `migrations/0003_protocol_v4_server_routing.sql` only when moving a pre-v4
+  queue to v4. Every upgrade **after** v4 uses the non-destructive window model
+  above, which is version-agnostic and never names v4 specifically.
+- A worker rejects any payload whose `v` lies outside its supported window; the
+  job is failed with a diagnostic instead of being stuck in the queue.
 
 ## Server routing
 
@@ -578,17 +584,22 @@ The job runs only on the daemon whose configured server identity (the
 non-empty `server` setting of its restricted worker configuration file) is
 `alpha-server`; jobs addressed to other servers stay pending untouched.
 
-Upgrading an existing transport from v3 is a destructive cutover that replaces
-the payload-shape constraint via
-`migrations/0003_protocol_v4_server_routing.sql`: v4 rejects every v3 payload,
-because v3 rows carry no required top-level `server` routing identity. Run it
-against the live queue: quiesce new submissions, let any in-flight v3 work
-become durably terminal, `truncate lubko.jobs` while quiescent (discarding
-every old root `command` row and `output_chunk` history — truncating before
-applying is **required**; applying against nonconforming rows fails fast with
-an explicit diagnostic), apply the migration, start each daemon with its
-configured server identity, and prove a fresh v4 round trip.
-Old v3 contents are discarded; there is no protocol-data drain/migration path,
-and no v3 row is transformed or preserved. Only the payload protocol version
-and the shape constraint change; the physical schema stays the canonical
-two-column table.
+Upgrading an existing transport **from v3** is the one-time destructive cutover
+described above, performed via `migrations/0003_protocol_v4_server_routing.sql`:
+v4 rejects every v3 payload because v3 rows carry no required top-level `server`
+routing identity. Run it against the live queue: quiesce new submissions, let any
+in-flight v3 work become durably terminal, `truncate lubko.jobs` while quiescent
+(discarding every old root `command` row and `output_chunk` history —
+truncating before applying is **required**; applying against nonconforming rows
+fails fast with an explicit diagnostic), apply the migration, start each daemon
+with its configured server identity, and prove a fresh v4 round trip. Old v3
+contents are discarded; there is no protocol-data drain/migration path, and no v3
+row is transformed or preserved. Only the payload protocol version and the shape
+constraint change; the physical schema stays the canonical two-column table.
+
+Every upgrade **after** v4 is non-destructive and uses the bounded mixed-version
+window model (`docs/protocol_upgrades.md` and
+`migrations/0005_protocol_version_window.sql`): the two-column schema is
+untouched, in-flight jobs and `output_chunk` history are preserved, and a
+staggered rollout is deterministic. There is no `truncate` and no data migration
+for those upgrades.

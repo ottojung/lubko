@@ -12,6 +12,7 @@ import pytest
 
 from lubko import worker
 from lubko.health import WORKER_HEALTH_SCHEMA_VERSION, WorkerHealth
+from lubko.protocol import PROTOCOL_VERSION
 from lubko.worker import CANCEL_DISCOVERY_LIMIT, LEASE_RECOVERY_LIMIT, Supervisor
 
 if TYPE_CHECKING:
@@ -139,6 +140,7 @@ def _fake_active(last_heartbeat_at: float, *, claimed_at: float = 0.0) -> worker
     job.last_heartbeat_at = last_heartbeat_at
     job.stdout = worker.OutputStream(path=Path("/dev/null"))
     job.stderr = worker.OutputStream(path=Path("/dev/null"))
+    job.version = PROTOCOL_VERSION
     return job
 
 

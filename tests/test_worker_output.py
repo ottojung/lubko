@@ -11,7 +11,11 @@ from typing import Any, cast
 import pytest
 
 from lubko import worker
-from lubko.protocol import OUTPUT_CHUNK_MAX_BYTES, OUTPUT_TAIL_MAX_BYTES
+from lubko.protocol import (
+    OUTPUT_CHUNK_MAX_BYTES,
+    OUTPUT_TAIL_MAX_BYTES,
+    PROTOCOL_VERSION,
+)
 from lubko.worker import (
     OutputStream,
     align_code_point_end,
@@ -111,7 +115,12 @@ def test_cleanup_job_isolates_spool_removal_failures(
     def stream(path: Path) -> SimpleNamespace:
         return SimpleNamespace(fd=None, path=path)
 
-    job = cast("Any", SimpleNamespace(stdout=stream(stdout_path), stderr=stream(stderr_path)))
+    job = cast(
+        "Any",
+        SimpleNamespace(
+            stdout=stream(stdout_path), stderr=stream(stderr_path), version=PROTOCOL_VERSION
+        ),
+    )
     with caplog.at_level(logging.WARNING, logger="lubko.worker"):
         cleanup_job(job)
 
@@ -144,6 +153,7 @@ def test_cleanup_all_files_continues_after_one_spool_failure(
         return SimpleNamespace(
             stdout=SimpleNamespace(fd=None, path=stdout),
             stderr=SimpleNamespace(fd=None, path=stderr),
+            version=PROTOCOL_VERSION,
         )
 
     supervisor = cast(
@@ -249,7 +259,7 @@ def test_archive_chunk_preserves_multibyte_rune_across_boundary(tmp_path: Path) 
     path.write_bytes(content)
     stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     chunks, _archived, _last, _seq = worker._plan_chunks(
-        uuid.UUID(int=1), "stdout", stream, len(content), "server"
+        uuid.UUID(int=1), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
     )
     assert chunks
     parsed_chunks = [json.loads(payload) for _cid, payload in chunks]
@@ -276,7 +286,12 @@ def test_repeated_trim_publication_cycles_preserve_runes(tmp_path: Path) -> None
     """
     path = tmp_path / "stdout"
     path.write_bytes(b"")
-    job = cast("Any", SimpleNamespace(id=uuid.UUID(int=0), stdout=OutputStream(path=path)))
+    job = cast(
+        "Any",
+        SimpleNamespace(
+            id=uuid.UUID(int=0), stdout=OutputStream(path=path), version=PROTOCOL_VERSION
+        ),
+    )
     full = bytearray()
     published: list[tuple[int, int, str]] = []
     # Deliberately awkward per-cycle lengths so boundaries cross runes.
@@ -326,7 +341,7 @@ def test_invalid_utf8_policy_is_deterministic_and_safe(tmp_path: Path) -> None:
     # Archive chunks: no exception, exact canonical decode of each range.
     stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     chunks, _archived, _last, _seq = worker._plan_chunks(
-        uuid.UUID(int=2), "stdout", stream, len(content), "server"
+        uuid.UUID(int=2), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
     )
     for _cid, payload in chunks:
         parsed = json.loads(payload)
@@ -349,7 +364,7 @@ def test_plan_chunks_makes_progress_through_invalid_continuation_run(tmp_path: P
     path.write_bytes(content)
     stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     chunks, archived_upto, _last, _seq = worker._plan_chunks(
-        uuid.UUID(int=3), "stdout", stream, len(content), "server"
+        uuid.UUID(int=3), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
     )
     assert chunks  # positive progress: at least one chunk planned
     assert archived_upto > 0  # and the loop advanced, i.e. terminated
@@ -404,7 +419,9 @@ def test_plan_chunks_uses_bounded_reads(tmp_path: Path, monkeypatch: pytest.Monk
 
     monkeypatch.setattr(worker, "read_range", spy)
     stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
-    worker._plan_chunks(uuid.UUID(int=5), "stdout", stream, len(content), "server")
+    worker._plan_chunks(
+        uuid.UUID(int=5), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
+    )
     assert seen, "read_range must be the read seam used"
     # No single read may exceed a chunk plus its small boundary lookaround.
     assert max(seen) <= OUTPUT_CHUNK_MAX_BYTES + 8
@@ -442,7 +459,7 @@ def test_semantically_invalid_sequences_stay_within_pg_safe_decode(tmp_path: Pat
             path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0
         )
         chunks, _archived, _last, _seq = worker._plan_chunks(
-            uuid.UUID(int=7), "stdout", stream, len(content), "server"
+            uuid.UUID(int=7), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
         )
         for _cid, payload in chunks:
             parsed = json.loads(payload)
