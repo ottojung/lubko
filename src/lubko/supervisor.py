@@ -79,7 +79,7 @@ from typing import TYPE_CHECKING, Final
 
 import psycopg
 
-from lubko import cli, deployctl, lifecycle, supervise
+from lubko import cli, deployctl, lifecycle, lifecycle_state, supervise
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
@@ -438,6 +438,7 @@ def recover_owned_groups(incarnation: str) -> None:
     """
     if not incarnation:
         return
+    lifecycle_state.failpoint("db_recovery")
     try:
         database = load_database_config()
     except (OSError, ValueError) as exc:
@@ -1420,6 +1421,20 @@ class SupervisorDaemon:
         if child is None:
             return True
         meta = _child_to_meta(child, _runtime_dir(state.commit))
+        # Exact-authority gate: a live worker may only be retired when its exact
+        # identity is proven to be our own direct child; an unproven (reparented,
+        # recycled, or PID-reused) live process must never be signalled, and a
+        # malformed durable authority refuses by failing closed. A dead recorded
+        # child is cleared without a signal, so the gate does not block it.
+        if lifecycle.worker_alive(meta) and not lifecycle_state.authorize_retirement(
+            lifecycle_state.reconcile_authority_facts()
+        ):
+            self._message = (
+                "authority refuses retirement of the recorded worker; preserving child "
+                "identity and holding without signalling or clearing"
+            )
+            LOGGER.error("%s", self._message)
+            return False
         stopped = lifecycle.stop_worker(meta, self.settings.stop_grace_seconds)
         # A live exact worker that stop_worker could not authorize or stop (e.g.
         # a wrong/absent lifecycle token, or PID reuse) must not be signalled
@@ -1631,15 +1646,15 @@ class SupervisorDaemon:
     # Spawning
     # ------------------------------------------------------------------
 
-    def _spawn_worker(self, commit: str) -> WorkerChild | None:
-        """Spawn the worker for ``commit`` as a direct child from the sealed runtime.
+    def _resolve_spawn_executable(self, commit: str) -> Path | None:
+        """Resolve the exact worker executable for ``commit``, or refuse.
 
         Args:
             commit: Exact commit whose sealed per-commit runtime runs the worker.
 
         Returns:
-            The exact child identity, or ``None`` if the worker could not be
-            started or did not establish a session.
+            The executable path, or ``None`` when the maintained runtime is
+            missing, corrupt, incomplete, or not sealed.
         """
         if not cli.runtime_is_usable(commit):
             self._message = (
@@ -1662,6 +1677,21 @@ class SupervisorDaemon:
                 "worker",
                 commit,
             )
+            return None
+        return executable
+
+    def _spawn_worker(self, commit: str) -> WorkerChild | None:
+        """Spawn the worker for ``commit`` as a direct child from the sealed runtime.
+
+        Args:
+            commit: Exact commit whose sealed per-commit runtime runs the worker.
+
+        Returns:
+            The exact child identity, or ``None`` if the worker could not be
+            started or did not establish a session.
+        """
+        executable = self._resolve_spawn_executable(commit)
+        if executable is None:
             return None
         token = secrets.token_hex(16)
         env = lifecycle.worker_env(token)
@@ -1690,6 +1720,13 @@ class SupervisorDaemon:
             boot_id=current_boot_id(),
             parent_death_signal=True,
         )
+        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_SPAWNING_WRITE)
+        if not lifecycle_state.authorize_spawn(lifecycle_state.reconcile_authority_facts()):
+            self._message = (
+                "authority blocks the pre-spawn obligation (unresolved fate or live "
+                "consumer present); holding without starting a worker"
+            )
+            return None
         write_state(replace(read_state(), spawning=obligation))
         preexec = functools.partial(_child_preexec, os.getpid()) if _pdeathsig_supported() else None
         try:
@@ -1718,6 +1755,44 @@ class SupervisorDaemon:
             return None
         self.proc = proc
         child_ticks = proc_start_ticks(proc.pid)
+        return self._publish_spawned_child(proc, obligation, child_ticks, token, worker_id)
+
+    def _publish_spawned_child(
+        self,
+        proc: subprocess.Popen[bytes],
+        obligation: SpawningObligation,
+        child_ticks: int | None,
+        token: str,
+        worker_id: str,
+    ) -> WorkerChild | None:
+        """Publish the durable identity of an already-spawned child.
+
+        After a successful ``Popen`` this finishes the fail-closed publication
+        protocol: it upgrades the durable obligation with the exact child
+        identity, proves the queue identity, and returns the exact worker child.
+        Any authority-invariant refusal or durability failure converges the live
+        child through :meth:`_recover_unpublished_spawn` rather than forgetting
+        it, so no orphan is left running and no replacement is authorized.
+
+        Args:
+            proc: The live direct ``Popen`` handle of the spawned child.
+            obligation: The durable pre-spawn obligation whose ``token`` names
+                the incarnation.
+            child_ticks: Start-time ticks observed for the child, if any.
+            token: Lifecycle token handed to the spawned child.
+            worker_id: Worker identity handed to the spawned child.
+
+        Returns:
+            The exact child identity, or ``None`` when the spawn could not be
+            published (and was converged).
+        """
+        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_PID_UPGRADE)
+        if lifecycle_state.check_authority_invariants(lifecycle_state.reconcile_authority_facts()):
+            self._message = (
+                "authority invariant violation before pid-upgrade publication; "
+                "converging the live child rather than forgetting it"
+            )
+            return self._recover_unpublished_spawn(proc, obligation, child_ticks)
         try:
             write_state(
                 replace(
@@ -1729,7 +1804,7 @@ class SupervisorDaemon:
             return self._recover_unpublished_spawn(proc, obligation, child_ticks)
         identity = self._wait_for_identity(proc.pid)
         if identity is None:
-            return self._settle_unproven_spawn(commit, proc, token, worker_id)
+            return self._settle_unproven_spawn(obligation.commit, proc, token, worker_id)
         return WorkerChild(
             pid=identity.pid,
             pgid=identity.pgid,
@@ -1875,6 +1950,7 @@ class SupervisorDaemon:
                 return None
             write_state(replace(read_state(), spawning=None))
             return None
+        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_UNRESOLVED_CHILD)
         write_state(
             replace(
                 read_state(),
@@ -2003,6 +2079,7 @@ class SupervisorDaemon:
             token: Lifecycle token handed to the spawned child.
             worker_id: Worker identity handed to the spawned child.
         """
+        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_SPAWNING_CLEARANCE)
         write_state(
             replace(
                 read_state(),
@@ -2516,6 +2593,21 @@ class SupervisorDaemon:
         hold = state.unresolved_child
         if hold is None:
             return True
+        # Exact-authority gate: the unresolved child may only be converged and
+        # its command groups recovered when the durable authority permits
+        # recovery — a competing proven live consumer or malformed authority
+        # refuses, keeping the hold blocking so no replacement is authorized.
+        if not lifecycle_state.authorize_recovery(lifecycle_state.reconcile_authority_facts()):
+            now = time.monotonic()
+            write_state(
+                replace(read_state(), next_attempt_at=now + self.settings.poll_interval_seconds)
+            )
+            self._message = (
+                "authority refuses recovery of the unresolved worker; holding without "
+                "converging or clearing"
+            )
+            LOGGER.error("%s", self._message)
+            return False
         if not self._converge_unresolved(hold):
             now = time.monotonic()
             write_state(

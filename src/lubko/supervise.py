@@ -1665,6 +1665,37 @@ def child_alive(child: WorkerChild) -> bool:
     return proc_start_ticks(child.pid) == child.start_time_ticks
 
 
+def child_is_our_direct_child(child: WorkerChild) -> bool:
+    """Return whether the recorded child is our live direct child.
+
+    Combines the liveness check of :func:`child_alive` with an exact parent
+    proof: the recorded child must be live *and* its parent PID must be this
+    process, so a child reparented to PID 1 after a supervisor restart is
+    never mistaken for our own.  This is the exact identity proof the
+    retirement authority requires before any signal is delivered.
+
+    Args:
+        child: Exact child identity recorded by the supervisor.
+
+    Returns:
+        ``True`` only when the live process is provably our direct child.
+    """
+    if not child_alive(child):
+        return False
+    try:
+        status = (Path("/proc") / str(child.pid) / "status").read_bytes()
+    except (OSError, AttributeError, ValueError):
+        return False
+    for raw in status.splitlines():
+        if raw.startswith(b"PPid:"):
+            try:
+                ppid = int(raw.split()[1])
+            except (ValueError, IndexError):
+                return False
+            return ppid == os.getpid()
+    return False
+
+
 def _read_cmdline(pid: int) -> str:
     """Read the joined command line of a live process.
 
