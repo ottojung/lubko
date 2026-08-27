@@ -1691,6 +1691,7 @@ class SupervisorDaemon:
             boot_id=current_boot_id(),
             parent_death_signal=True,
         )
+        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_SPAWNING_WRITE)
         write_state(replace(read_state(), spawning=obligation))
         preexec = functools.partial(_child_preexec, os.getpid()) if _pdeathsig_supported() else None
         try:
@@ -1719,6 +1720,7 @@ class SupervisorDaemon:
             return None
         self.proc = proc
         child_ticks = proc_start_ticks(proc.pid)
+        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_PID_UPGRADE)
         try:
             write_state(
                 replace(
@@ -1876,6 +1878,7 @@ class SupervisorDaemon:
                 return None
             write_state(replace(read_state(), spawning=None))
             return None
+        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_UNRESOLVED_CHILD)
         write_state(
             replace(
                 read_state(),
@@ -2004,6 +2007,7 @@ class SupervisorDaemon:
             token: Lifecycle token handed to the spawned child.
             worker_id: Worker identity handed to the spawned child.
         """
+        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_SPAWNING_CLEARANCE)
         write_state(
             replace(
                 read_state(),

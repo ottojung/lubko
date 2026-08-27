@@ -514,6 +514,7 @@ def write_meta(meta: WorkerMeta) -> None:
         :func:`lubko.durable.write_json_durable` when it cannot be confirmed
         durable, so callers must not advance a dependent action.
     """
+    lifecycle_state.failpoint(lifecycle_state.FAILPOINT_METADATA_PUBLICATION)
     write_json_durable(meta_path(), meta.to_dict())
 
 
