@@ -365,3 +365,85 @@ def test_plan_chunks_makes_progress_through_invalid_continuation_run(tmp_path: P
         # Deterministic invalid-byte handling is delegated to pg_safe_decode.
         assert value == pg_safe_decode(content[start:end])
     assert prev_end == archived_upto
+
+
+def test_output_window_text_uses_bounded_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live-tail decoding must read only a bounded tail, not the whole spool."""
+    path = tmp_path / "s"
+    # The spool dwarfs the bounded tail so a whole-file read would be huge.
+    path.write_bytes(b"x" * (OUTPUT_TAIL_MAX_BYTES + 5000))
+    seen: list[int] = []
+    real_read_range = worker.read_range
+
+    def spy(p: Path, start: int, end: int) -> bytes:
+        seen.append(end - start)
+        return real_read_range(p, start, end)
+
+    monkeypatch.setattr(worker, "read_range", spy)
+    output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+    assert seen, "read_range must be the read seam used"
+    # At most the tail plus three lookahead bytes for code-point classification.
+    assert max(seen) <= OUTPUT_TAIL_MAX_BYTES + 3
+    # The entire spool is never materialized in a single read.
+    assert max(seen) < OUTPUT_TAIL_MAX_BYTES + 5000
+
+
+def test_plan_chunks_uses_bounded_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Archive planning must read only bounded neighborhoods, not the whole spool."""
+    path = tmp_path / "s"
+    content = b"x" * 100 + b"y" * (OUTPUT_CHUNK_MAX_BYTES * 3 + 100)
+    path.write_bytes(content)
+    seen: list[int] = []
+    real_read_range = worker.read_range
+
+    def spy(p: Path, start: int, end: int) -> bytes:
+        seen.append(end - start)
+        return real_read_range(p, start, end)
+
+    monkeypatch.setattr(worker, "read_range", spy)
+    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    worker._plan_chunks(uuid.UUID(int=5), "stdout", stream, len(content), "server")
+    assert seen, "read_range must be the read seam used"
+    # No single read may exceed a chunk plus its small boundary lookaround.
+    assert max(seen) <= OUTPUT_CHUNK_MAX_BYTES + 8
+    # The whole spool is never materialized in a single read.
+    assert max(seen) < len(content)
+
+
+def test_semantically_invalid_sequences_do_not_move_boundaries() -> None:
+    """Structurally shaped but illegal scalars stay on the raw boundary.
+
+    ``E0 80 80`` (overlong), ``ED A0 80`` (surrogate), ``F0 80 80 80`` (overlong)
+    and ``F4 90 80 80`` (> U+10FFFF) look like valid leads but decode to illegal
+    scalars; boundary detection must treat them as invalid so they are not moved
+    and ``pg_safe_decode`` alone defines their replacement.
+    """
+    cases = [b"\xe0\x80\x80", b"\xed\xa0\x80", b"\xf0\x80\x80\x80", b"\xf4\x90\x80\x80"]
+    for seq in cases:
+        data = b"a" * 5 + seq + b"b" * 5
+        candidate = 5 + 1  # a continuation byte inside the invalid sequence
+        assert align_code_point_end(data, candidate) == candidate
+        assert align_code_point_start(data, candidate) == candidate
+
+
+def test_semantically_invalid_sequences_stay_within_pg_safe_decode(tmp_path: Path) -> None:
+    """Invalid sequences spanning boundaries match the canonical decode exactly."""
+    cases = [b"\xe0\x80\x80", b"\xed\xa0\x80", b"\xf0\x80\x80\x80", b"\xf4\x90\x80\x80"]
+    for seq in cases:
+        path = tmp_path / "s"
+        # Place the invalid sequence so a chunk boundary would otherwise cut it.
+        content = b"x" * (OUTPUT_CHUNK_MAX_BYTES - 1) + seq + b"y" * (OUTPUT_TAIL_MAX_BYTES + 5)
+        path.write_bytes(content)
+        text, start, end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+        assert text == pg_safe_decode(content[start:end])
+        stream = OutputStream(
+            path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0
+        )
+        chunks, _archived, _last, _seq = worker._plan_chunks(
+            uuid.UUID(int=7), "stdout", stream, len(content), "server"
+        )
+        for _cid, payload in chunks:
+            parsed = json.loads(payload)
+            assert parsed["value"] == pg_safe_decode(content[parsed["start"] : parsed["end"]])

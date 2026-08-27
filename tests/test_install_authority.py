@@ -91,7 +91,15 @@ def installable_bin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     uv_dir = tmp_path / "uv-dir"
     uv_dir.mkdir()
     uv = uv_dir / "uv"
-    uv.write_text("#!/bin/sh\nexit 0\n")
+    uv.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then\n'
+        f'  echo "uv {toolchain.SUPPORTED_UV_VERSION} (fake)"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     uv.chmod(0o755)
     bin_dir = tmp_path / "bin"
     cli.install_launchers(bin_dir)

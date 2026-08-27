@@ -957,18 +957,6 @@ def truncate_output(data: bytes, limit: int) -> str:
     return result
 
 
-def read_output(path: Path) -> bytes:
-    """Read all bytes captured so far into an output file.
-
-    Args:
-        path: Capture file for the stream.
-
-    Returns:
-        The captured bytes.
-    """
-    return path.read_bytes()
-
-
 def stream_size(path: Path) -> int:
     """Return the current byte size of a capture file.
 
@@ -1331,6 +1319,10 @@ _UTF8_FOUR_BYTE_MIN: Final = 0xF0
 _UTF8_FOUR_BYTE_MAX: Final = 0xF4
 _UTF8_MIN_CODE_POINT_LEN: Final = 2
 _UTF8_MAX_CODE_POINT_LEN: Final = 4
+_UNICODE_MAX_CODE_POINT: Final = 0x10FFFF
+_UTF16_SURROGATE_MIN: Final = 0xD800
+_UTF16_SURROGATE_MAX: Final = 0xDFFF
+_CODE_POINT_MIN_VALUE: Final[dict[int, int]] = {2: 0x80, 3: 0x800, 4: 0x10000}
 
 
 def _is_utf8_continuation_byte(byte: int) -> bool:
@@ -1354,12 +1346,44 @@ def _code_point_length(lead: int) -> int:
     return 0
 
 
+def _code_point_scalar(lead: int, cont: bytes, length: int) -> int | None:
+    """Decode the Unicode scalar of a structurally-shaped code point, or ``None``.
+
+    The lead/continuation byte shapes are assumed already checked by the caller;
+    this only rejects *overlong* encodings (whose scalar could be written in fewer
+    bytes) by returning ``None`` when the decoded value is below the minimum for
+    ``length``. Callers additionally reject surrogates and values above U+10FFFF so
+    that semantically invalid sequences are not treated as valid code points for
+    boundary movement.
+
+    Args:
+        lead: The lead byte.
+        cont: The ``length - 1`` continuation bytes.
+        length: The code-point byte length (2, 3 or 4).
+
+    Returns:
+        The decoded scalar, or ``None`` when the encoding is overlong.
+    """
+    lead_mask = (1 << (7 - length)) - 1
+    cp = lead & lead_mask
+    for byte in cont:
+        cp = (cp << 6) | (byte & 0x3F)
+    if cp < _CODE_POINT_MIN_VALUE[length]:
+        return None
+    return cp
+
+
 def _valid_code_point_at(data: bytes, start: int, length: int) -> bool:
     """Return ``True`` if ``data[start:start + length]`` is a valid code point.
 
     A valid code point has a structurally correct lead byte whose declared length
-    matches ``length`` and the remaining ``length - 1`` bytes are all continuation
-    bytes. The check inspects only ``length`` bytes, never scanning further.
+    matches ``length``, whose continuation bytes are all continuation bytes, and
+    whose decoded scalar is a legal Unicode value (not overlong, not a UTF-16
+    surrogate, not above U+10FFFF). Semantically invalid sequences such as
+    ``E0 80 80`` (overlong), ``ED A0 80`` (surrogate), ``F0 80 80 80`` (overlong)
+    and ``F4 90 80 80`` (> U+10FFFF) are rejected so they stay on the raw boundary
+    and ``pg_safe_decode`` defines their deterministic replacement. The check
+    inspects only ``length`` bytes, never scanning further.
     """
     if length < _UTF8_MIN_CODE_POINT_LEN or length > _UTF8_MAX_CODE_POINT_LEN:
         return False
@@ -1367,7 +1391,13 @@ def _valid_code_point_at(data: bytes, start: int, length: int) -> bool:
         return False
     if _code_point_length(data[start]) != length:
         return False
-    return all(_is_utf8_continuation_byte(data[start + i]) for i in range(1, length))
+    cont = data[start + 1 : start + length]
+    if not all(_is_utf8_continuation_byte(byte) for byte in cont):
+        return False
+    cp = _code_point_scalar(data[start], cont, length)
+    if cp is None or cp > _UNICODE_MAX_CODE_POINT:
+        return False
+    return not (_UTF16_SURROGATE_MIN <= cp <= _UTF16_SURROGATE_MAX)
 
 
 def align_code_point_start(data: bytes, candidate: int) -> int:
@@ -1462,12 +1492,18 @@ def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[st
     Returns:
         A ``(text, start, end)`` tuple where ``end`` is the logical file size.
     """
-    data = read_output(path)
-    size = len(data) + base
+    size = stream_size(path) + base
     window = min(size, max_chars)
     start = size - window
-    head = align_code_point_start(data, start - base)
-    return pg_safe_decode(data[head:]), head + base, size
+    physical_head = start - base
+    # Read only the bounded tail plus the at most three prefix bytes needed to
+    # classify a code-point crossing; the whole spool is never materialized.
+    read_from = max(0, physical_head - 3)
+    tail = read_range(path, read_from, size - base)
+    local_candidate = physical_head - read_from
+    aligned_local = align_code_point_start(tail, local_candidate)
+    aligned_physical = read_from + aligned_local
+    return pg_safe_decode(tail[aligned_local:]), aligned_physical + base, size
 
 
 def archive_target(size: int) -> int:
@@ -1763,20 +1799,25 @@ def _plan_chunks(
     last_chunk = stream.last_chunk
     sequence = stream.sequence
     target = archive_target(tail_end)
-    data = read_output(stream.path)
     while target - archived_upto >= OUTPUT_CHUNK_MAX_BYTES:
         chunk_start = archived_upto
+        candidate = chunk_start + OUTPUT_CHUNK_MAX_BYTES - stream.spool_start
+        # Classify the boundary with a bounded neighborhood read: a few bytes before
+        # the candidate (for the lead) and up to three after it (the longest a
+        # 4-byte rune can extend), so the whole spool is never materialized.
+        n_from = max(0, candidate - 3)
+        neighborhood = read_range(stream.path, n_from, candidate + 4)
         # End the chunk on a complete code point so its decoded value is exactly
         # the decode of its byte range and never collides mid-rune with the
-        # adjacent chunk or the live tail. The alignment moves the end backward
-        # by at most three bytes, so the chunk stays within OUTPUT_CHUNK_MAX_BYTES.
+        # adjacent chunk or the live tail. The alignment moves the end backward by
+        # at most three bytes, so the chunk stays within OUTPUT_CHUNK_MAX_BYTES.
         chunk_end = (
-            align_code_point_end(data, chunk_start + OUTPUT_CHUNK_MAX_BYTES - stream.spool_start)
-            + stream.spool_start
+            n_from + align_code_point_end(neighborhood, candidate - n_from) + stream.spool_start
         )
-        value = pg_safe_decode(
-            data[chunk_start - stream.spool_start : chunk_end - stream.spool_start]
-        )
+        # Decode only the bounded chunk bytes for the immutable value.
+        chunk_lo = chunk_start - stream.spool_start
+        chunk_hi = chunk_end - stream.spool_start
+        value = pg_safe_decode(read_range(stream.path, chunk_lo, chunk_hi))
         chunk_id = uuid4()
         chunk_payload = json.dumps(
             build_output_chunk_payload(
