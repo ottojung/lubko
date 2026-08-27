@@ -31,6 +31,10 @@ completion, stop or clean them up.
 
 ## Development
 
+Lubko targets exactly CPython 3.12 and pins a single `uv` version; see
+[`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the supported toolchain and the
+explicit upgrade procedure.
+
 ```sh
 uv sync
 uv run ruff format --check .
