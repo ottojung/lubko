@@ -1,7 +1,7 @@
 """Protocol v4 payload construction and parsing invariants."""
 
 import json
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -74,13 +74,21 @@ def test_rejects_relative_cwd_on_build() -> None:
         build_payload(server=SERVER, cwd="srv/jobs", process=["echo"])
     with pytest.raises(ProtocolError, match="absolute"):
         build_payload(server=SERVER, cwd="./srv", process=["echo"])
+    with pytest.raises(ProtocolError, match="absolute"):
+        build_payload(server=SERVER, cwd="../srv", process=["echo"])
     with pytest.raises(ProtocolError, match="non-empty"):
         build_payload(server=SERVER, cwd="", process=["echo"])
 
 
+def test_rejects_non_string_cwd_on_build() -> None:
+    """Build rejects a truthy non-string cwd instead of emitting it."""
+    with pytest.raises(ProtocolError):
+        build_payload(server=SERVER, cwd=cast("str", 5), process=["echo"])
+
+
 def test_rejects_relative_cwd_on_parse() -> None:
     """Parse rejects relative working directories without resolving them."""
-    for bad in ("srv/jobs", "./srv", "", 5, None):
+    for bad in ("srv/jobs", "./srv", "../srv", "", 5, None):
         raw = command_payload()
         raw["request"] = {"cwd": bad, "process": ["echo"]}
         with pytest.raises(ProtocolError):
