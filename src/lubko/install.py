@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from lubko import cli
+from lubko import cli, startup_contract
 from lubko import lifecycle as _lifecycle
 from lubko.toolchain import UvResolutionError, resolve_uv, write_toolchain
 
@@ -292,6 +292,11 @@ def _install_repo(repo: Path, uv: str | None) -> int:
 
     _out("Lubko tools installed and resolvable on PATH:")
     _out_cli_resolution()
+    startup_contract.write_contract()
+    _out(
+        f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION} recorded; "
+        "ensure the container starts 'tini-static -- lubko-supervisor'"
+    )
     return EXIT_OK
 
 
