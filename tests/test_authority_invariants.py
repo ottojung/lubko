@@ -19,11 +19,12 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from lubko import cli, lifecycle, lifecycle_state, supervise, supervisor
+from lubko import cli, deployctl, lifecycle, lifecycle_state, supervise, supervisor
 from lubko.lifecycle_state import (
     INVARIANT_CRASH_CONVERGES_TO_ONE_OR_ZERO,
     INVARIANT_GENERATION_MONOTONIC,
@@ -88,7 +89,6 @@ def _facts(**overrides: Any) -> AuthorityFacts:  # ruff: ignore[any-type]
         owned_worker_identity_proven=False,
         pre_spawn_obligation=False,
         unresolved_child=False,
-        recovery_authority=False,
         candidate_ready=False,
         rollback_pending=False,
         durable_malformed=False,
@@ -239,6 +239,95 @@ def test_authorize_decisions() -> None:
         authorize_mission_rollback(_facts(durable_malformed=True, mission_status="pending"))
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# Reconciler fail-closed and desired-generation regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_unreadable_supervisor_state_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable supervisor state fails closed: spawn is not authorized.
+
+    The reconciler must treat an exception from ``supervise.read_state`` as
+    malformed durable authority, not as absent authority, so ``authorize_spawn``
+    cannot fail open and start a second worker.
+    """
+    monkeypatch_state_running()
+    monkeypatch.setattr(
+        supervise, "read_state", lambda: (_ for _ in ()).throw(RuntimeError("disk gone"))
+    )
+    facts = reconcile_authority_facts()
+    assert facts.durable_malformed is True
+    assert authorize_spawn(facts) is False
+
+
+def test_unreadable_meta_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreadable worker meta fails closed: spawn is not authorized."""
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: (_ for _ in ()).throw(OSError("meta gone")))
+    facts = reconcile_authority_facts()
+    assert facts.durable_malformed is True
+    assert authorize_spawn(facts) is False
+
+
+def test_unreadable_supervisor_state_holds_spawn_in_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime spawn decision holds (no worker) when supervisor state is unreadable."""
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: True)
+    monkeypatch.setattr(cli, "cli_entry_executable", _fake_entry)
+    monkeypatch.setattr(cli, "cli_commit_dir", _fake_commit_dir)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _t: {})
+    monkeypatch.setattr(supervisor, "read_desired", lambda: None)
+    monkeypatch.setattr(supervise, "read_desired", lambda: None)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    # Unreadable supervisor state fails closed at the spawn decision, after construction.
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: (_ for _ in ()).throw(RuntimeError("disk gone")),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "read_state",
+        lambda: (_ for _ in ()).throw(RuntimeError("disk gone")),
+    )
+    assert daemon._spawn_worker(COMMIT) is None
+
+
+def test_desired_generation_read_from_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The actual desired generation participates in the monotonic invariant.
+
+    The reconciler must read the desired run intent (not alias it to the applied
+    generation), so a supervisor that has applied a generation above the desired
+    intent is flagged by GENERATION_MONOTONIC.
+    """
+    intent = SimpleNamespace(generation=7)
+    monkeypatch.setattr(supervise, "read_desired", lambda: intent)
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: SimpleNamespace(
+            applied_generation=5,
+            child=None,
+            spawning=None,
+            unresolved_child=None,
+            ownership_hold_malformed=False,
+            unresolved_hold_malformed=False,
+            spawning_hold_malformed=False,
+            ready=False,
+        ),
+    )
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
+
+    facts = reconcile_authority_facts()
+    assert facts.desired_generation == 7
+    assert facts.applied_generation == 5
+    assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(facts)
+
+    skewed = replace(facts, applied_generation=9)
+    assert INVARIANT_GENERATION_MONOTONIC in check_authority_invariants(skewed)
 
 
 # ---------------------------------------------------------------------------

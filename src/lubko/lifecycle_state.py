@@ -184,7 +184,6 @@ class AuthorityFacts:
         owned_worker_identity_proven: Whether the maintained worker is proven alive.
         pre_spawn_obligation: A durable pre-``Popen`` spawning obligation exists.
         unresolved_child: An unresolved spawned child hold exists (recovery due).
-        recovery_authority: Recovery-worker authority is active (an unresolved child).
         candidate_ready: The candidate worker has proven queue readiness.
         rollback_pending: A supervised rollback is pending confirmation.
         durable_malformed: Any durable authority source is unreadable/corrupt.
@@ -204,7 +203,6 @@ class AuthorityFacts:
     owned_worker_identity_proven: bool
     pre_spawn_obligation: bool
     unresolved_child: bool
-    recovery_authority: bool
     candidate_ready: bool
     rollback_pending: bool
     durable_malformed: bool
@@ -216,8 +214,11 @@ class AuthorityFacts:
     def live_consumers(self) -> int:
         """Return the count of live, authorized queue consumers.
 
-        The proven owned worker, an unresolved child, and a ready recovery worker
-        are mutually exclusive consumer roles; their sum must never exceed one.
+        The proven owned worker and an unresolved child (the worker awaiting
+        owned-group recovery) are mutually exclusive consumer roles; their sum
+        must never exceed one. A ready recovery worker is the *resolution* of an
+        unresolved child, not a second consumer, so the two are never counted
+        twice.
 
         Returns:
             The number of currently live consumers (``0`` or ``1`` in any valid
@@ -226,7 +227,6 @@ class AuthorityFacts:
         roles = (
             self.owned_worker_identity_proven or self.supervisor_child_present,
             self.unresolved_child,
-            self.recovery_authority and self.candidate_ready,
         )
         return sum(1 for role in roles if role)
 
@@ -247,11 +247,13 @@ def reconcile_authority_facts() -> AuthorityFacts:
     owned_pid: int | None = None
     owned_commit: str | None = None
     owned_proven = False
-    mission_status: str | None = None
-    mission_generation: int | None = None
-    mission_commit: str | None = None
-    applied_generation = 0
-    meta = lifecycle.read_meta()
+    desired_generation = 0
+
+    try:
+        meta = lifecycle.read_meta()
+    except Exception:  # ruff: ignore[blind-except] - unreadable meta fails closed
+        meta = None
+        malformed = True
     if meta is not None:
         owned_pid = meta.pid
         owned_commit = meta.git_commit
@@ -262,15 +264,20 @@ def reconcile_authority_facts() -> AuthorityFacts:
     except deployctl.DeployCtlError:
         malformed = True
         mission = None
-    if mission is not None:
-        mission_status = mission.status
-        mission_generation = mission.generation
-        mission_commit = mission.commit
+
+    try:
+        desired_intent = supervise.read_desired()
+    except Exception:  # ruff: ignore[blind-except] - unreadable desired intent fails closed
+        desired_intent = None
+        malformed = True
+    else:
+        desired_generation = desired_intent.generation if desired_intent is not None else 0
 
     try:
         state = supervise.read_state()
-    except Exception:  # ruff: ignore[blind-except] - any read failure fails closed
+    except Exception:  # ruff: ignore[blind-except] - unreadable supervisor state fails closed
         state = None
+        malformed = True
 
     applied_generation = state.applied_generation if state is not None else 0
     if state is not None:
@@ -284,19 +291,18 @@ def reconcile_authority_facts() -> AuthorityFacts:
     unresolved = state.unresolved_child if state is not None else None
 
     return AuthorityFacts(
-        desired_generation=applied_generation,
+        desired_generation=desired_generation,
         applied_generation=applied_generation,
-        mission_status=mission_status,
-        mission_generation=mission_generation,
-        mission_commit=mission_commit,
+        mission_status=mission.status if mission is not None else None,
+        mission_generation=mission.generation if mission is not None else None,
+        mission_commit=mission.commit if mission is not None else None,
         owned_worker_pid=owned_pid,
         owned_worker_commit=owned_commit,
         owned_worker_identity_proven=owned_proven,
         pre_spawn_obligation=spawning is not None,
         unresolved_child=unresolved is not None,
-        recovery_authority=unresolved is not None,
         candidate_ready=state.ready if state is not None else False,
-        rollback_pending=mission_status == "pending",
+        rollback_pending=mission.status == "pending" if mission is not None else False,
         durable_malformed=malformed,
         supervisor_child_present=child is not None and supervise.child_alive(child),
         ownership_hold_malformed=state.ownership_hold_malformed if state is not None else False,
@@ -503,8 +509,9 @@ def authorize_spawn(facts: AuthorityFacts) -> bool:
 def authorize_recovery(facts: AuthorityFacts) -> bool:
     """Decide whether owned-command-group recovery may proceed.
 
-    Recovery is appropriate only when an unresolved child hold exists, no proven
-    live consumer competes, and the durable authority is not malformed.
+    Recovery is appropriate only when an unresolved child hold exists (the
+    recovery authority is active), no proven live consumer competes, and the
+    durable authority is not malformed.
 
     Args:
         facts: The reconciled authority snapshot at the recovery boundary.

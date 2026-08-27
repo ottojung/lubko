@@ -50,15 +50,20 @@ the durable facts below are what is persisted. The phase is computed by
 
 `AuthorityFacts` is the reconciled durable + observed snapshot the authority
 decides on. It is built by `reconcile_authority_facts()`, which reads the genuine
-sources (maintained `meta.json`, the rollback/deploy mission state, and the
-supervisor `SupervisorState`) and fails closed on unreadable/corrupt state:
+sources (maintained `meta.json`, the rollback/deploy mission state, the desired
+run intent, and the supervisor `SupervisorState`) and fails closed on
+unreadable/corrupt state: an exception from any read — including
+`supervise.read_state()` — sets `durable_malformed` rather than being treated as
+absent authority, so the authority can never fail open. The desired generation is
+read from the desired run intent (`supervise.read_desired()`), never aliased to
+the applied generation, so `GENERATION_MONOTONIC` can detect desired/applied
+skew:
 
 - `desired_generation`, `applied_generation`
 - `mission_status`, `mission_generation`, `mission_commit`
 - `owned_worker_pid`, `owned_worker_commit`, `owned_worker_identity_proven`
 - `pre_spawn_obligation`
 - `unresolved_child`
-- `recovery_authority`
 - `candidate_ready`
 - `rollback_pending`
 - `durable_malformed`
