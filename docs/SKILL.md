@@ -1102,6 +1102,26 @@ Deployment behavior:
 
 Per-user lifecycle state and logs live under `$XDG_STATE_HOME/lubko` (default `~/.local/state/lubko`), with `worker/meta.json`, `worker/worker.log`, `worker/deploy.log`, a `worker/.deploy.lock` serializing concurrent deployments, `supervisor/` holding the external supervisor's durable desired/state/status files, and `toolchain.json` recording the maintained `uv` executable.
 
+`lubko-supervisor --status` emits one of two clearly distinct machine-readable
+surfaces. When the supervisor process is alive and its exact identity verifies,
+it emits a live `SupervisorStatus` (`live: true`) carrying the confirmed child,
+intent, crash-loop `restart_count`/`next_attempt_at` backoff, queue `ready`/
+`db_ready` readiness, and a derived `holding` flag. When the supervisor is
+dead, replaced, or PID-reused — so no live status survives — it emits a
+`SupervisorDiagnostic` (`live: false`, `source: "durable-state"`) derived
+solely from the durable `state.json` and the recorded identity file. The
+diagnostic never pretends to be current health: it reports holding/backoff/
+readiness from durable authority only, and is safe to read after a crash
+without mistaking stale records for a running supervisor.
+
+The worker itself publishes a bounded, concurrency-aware health snapshot
+(`health/health-{incarnation}.json`, symlinked as `worker/health.json`) that
+exposes job aggregates (`active_jobs`/`stopping_jobs`/`completed_jobs`/oldest
+active age), lease-safety margin and remaining budget, capture/spool pressure
+(`capture_streams_open`/`spool_held_bytes`), scan batch pressure
+(`scan_batch_limit`/`last_scan_batch_size`), and database deadline recency —
+never a single job id, command text, or secret.
+
 ## Bootstrap and the unmanaged legacy worker
 
 Before the first managed deployment the running worker is an unmanaged legacy daemon with no recorded identity. `lubko-deploy status` reports `unmanaged`, and `deploy` refuses to claim it can stop it by identity. The one-time migration is a single manual stop of the legacy worker followed by:

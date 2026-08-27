@@ -106,6 +106,8 @@ from lubko.supervise import (
     WorkerChild,
     acquire_supervisor_lock,
     current_boot_id,
+    derive_durable_diagnostic,
+    is_holding,
     proc_start_ticks,
     read_desired,
     read_state,
@@ -2627,6 +2629,7 @@ class SupervisorDaemon:
                 ready=state.ready if state.child is not None else None,
                 message=self._message if message is None else message,
                 worker_health=worker_health,
+                holding=is_holding(state),
             )
         )
 
@@ -2634,15 +2637,20 @@ class SupervisorDaemon:
 def _status_cmd() -> int:
     """Print the machine-readable supervisor status and exit.
 
+    When the supervisor process is dead, replaced, or PID-reused (so no live
+    status survives), a clearly non-live durable diagnostic is emitted instead
+    of pretending the durable records are current health.
+
     Returns:
-        A process exit code.
+        A process exit code (0 when a live status is available).
     """
     status = read_status()
-    if status is None:
-        sys.stdout.write("supervisor: not running\n")
-        return 1
-    sys.stdout.write(json.dumps(status.to_dict(), sort_keys=True, indent=2) + "\n")
-    return 0
+    if status is not None:
+        sys.stdout.write(json.dumps(status.to_dict(), sort_keys=True, indent=2) + "\n")
+        return 0
+    diagnostic = derive_durable_diagnostic()
+    sys.stdout.write(json.dumps(diagnostic.to_dict(), sort_keys=True, indent=2) + "\n")
+    return 1
 
 
 def _run_daemon(settings: Settings) -> int:
