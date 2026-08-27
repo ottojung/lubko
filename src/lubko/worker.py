@@ -117,6 +117,7 @@ from lubko.protocol import (
     OUTPUT_TAIL_MAX_BYTES,
     TWO_COLUMN_INVARIANT,
     ProtocolError,
+    _utf8_byte_length,
     build_output_chunk_payload,
     build_output_window_payload,
     parse_payload,
@@ -1538,6 +1539,76 @@ def align_code_point_end(data: bytes, candidate: int) -> int:
     return candidate
 
 
+def _bounded_suffix(raw: bytes, limit: int) -> tuple[int, str]:
+    """Keep the newest ``raw`` bytes whose decoded text fits a UTF-8 byte limit.
+
+    The newest tail of ``raw`` is retained: the returned ``keep`` offset is the
+    smallest code-point boundary at which ``pg_safe_decode(raw[keep:])`` encodes
+    to at most ``limit`` UTF-8 bytes. Offsets stay on raw byte boundaries, so the
+    returned text is exactly the decode of its ``[keep, len(raw))`` range and the
+    canonical invalid-byte replacement policy is unchanged; only the represented
+    byte interval is shortened (from the oldest end) when sanitizing invalid
+    bytes would otherwise expand the encoded payload past the protocol's ceiling.
+
+    Args:
+        raw: The candidate raw byte window (already code-point aligned at the start).
+        limit: Maximum UTF-8 byte length of the returned decoded text.
+
+    Returns:
+        A ``(keep, text)`` pair where ``text`` is the bounded decoded suffix.
+    """
+    full = pg_safe_decode(raw)
+    if _utf8_byte_length(full) <= limit:
+        return 0, full
+    boundaries = [k for k in range(len(raw) + 1) if align_code_point_end(raw, k) == k]
+    lo, hi = 0, len(boundaries) - 1
+    keep = len(raw)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        k = boundaries[mid]
+        if _utf8_byte_length(pg_safe_decode(raw[k:])) <= limit:
+            keep = k
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return keep, pg_safe_decode(raw[keep:])
+
+
+def _bounded_prefix(raw: bytes, limit: int) -> tuple[int, str]:
+    """Keep the oldest ``raw`` bytes whose decoded text fits a UTF-8 byte limit.
+
+    The oldest prefix of ``raw`` is retained: the returned ``end`` offset is the
+    largest code-point boundary at which ``pg_safe_decode(raw[:end])`` encodes to
+    at most ``limit`` UTF-8 bytes, and ``end`` is always at least one byte so the
+    represented range makes forward progress. Offsets stay on raw byte boundaries,
+    so the returned text is exactly the decode of its ``[0, end)`` range and the
+    canonical invalid-byte replacement policy is unchanged; only the represented
+    byte interval is shortened (from the newest end) when sanitizing invalid
+    bytes would otherwise expand the encoded payload past the protocol's ceiling.
+
+    Args:
+        raw: The candidate raw byte window (already code-point aligned at both ends).
+        limit: Maximum UTF-8 byte length of the returned decoded text.
+
+    Returns:
+        An ``(end, text)`` pair where ``text`` is the bounded decoded prefix.
+    """
+    if not raw:
+        return 0, ""
+    boundaries = [k for k in range(1, len(raw) + 1) if align_code_point_end(raw, k) == k]
+    lo, hi = 0, len(boundaries) - 1
+    end = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        k = boundaries[mid]
+        if _utf8_byte_length(pg_safe_decode(raw[:k])) <= limit:
+            end = k
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return end, pg_safe_decode(raw[:end])
+
+
 def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[str, int, int]:
     """Return the newest at most ``max_chars`` bytes as decoded text.
 
@@ -1570,7 +1641,9 @@ def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[st
     local_candidate = physical_head - read_from
     aligned_local = align_code_point_start(tail, local_candidate)
     aligned_physical = read_from + aligned_local
-    return pg_safe_decode(tail[aligned_local:]), aligned_physical + base, size
+    raw_window = tail[aligned_local:]
+    keep, text = _bounded_suffix(raw_window, max_chars)
+    return text, aligned_physical + keep + base, size
 
 
 def archive_target(size: int) -> int:
@@ -1888,9 +1961,18 @@ def _plan_chunks(  # ruff: ignore[too-many-arguments] -- the chunk identity/offs
             n_from + align_code_point_end(neighborhood, candidate - n_from) + stream.spool_start
         )
         # Decode only the bounded chunk bytes for the immutable value.
-        chunk_lo = chunk_start - stream.spool_start
-        chunk_hi = chunk_end - stream.spool_start
-        value = pg_safe_decode(read_range(stream.path, chunk_lo, chunk_hi))
+        chunk_bytes = read_range(
+            stream.path, chunk_start - stream.spool_start, chunk_end - stream.spool_start
+        )
+        value = pg_safe_decode(chunk_bytes)
+        # Invalid bytes sanitize to the three-byte U+FFFD, so the decoded value
+        # can encode to more UTF-8 bytes than the raw range holds. Shrink the
+        # represented interval from the newest end to the oldest boundary that
+        # fits the protocol byte ceiling, keeping offsets and replacement
+        # semantics intact and preserving forward progress.
+        if _utf8_byte_length(value) > OUTPUT_CHUNK_MAX_BYTES:
+            end, value = _bounded_prefix(chunk_bytes, OUTPUT_CHUNK_MAX_BYTES)
+            chunk_end = chunk_start + end
         chunk_id = uuid4()
         chunk_payload = json.dumps(
             build_output_chunk_payload(

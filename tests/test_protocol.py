@@ -27,6 +27,21 @@ def command_payload() -> dict[str, object]:
     return build_payload(server=SERVER, cwd="/srv/jobs", process=["echo", "hi"])
 
 
+def _text_of_byte_length(total: int) -> str:
+    """Build a decoded string whose UTF-8 encoding is exactly ``total`` bytes.
+
+    The text mixes a three-byte rune with ASCII padding so its codepoint count
+    is strictly below the byte total, isolating the byte-length bound from the
+    codepoint-count bound that previously went unchecked.
+
+    Returns:
+        The decoded text whose UTF-8 encoding is exactly ``total`` bytes.
+    """
+    rune = "€"
+    rune_bytes = len(rune.encode("utf-8"))
+    return rune * (total // rune_bytes) + "x" * (total % rune_bytes)
+
+
 def test_build_payload_shape() -> None:
     """Built command payloads carry the versioned binding fields exactly."""
     payload = command_payload()
@@ -265,6 +280,115 @@ def test_chunk_requires_thread_and_kind_separation() -> None:
         parse_chunk_payload(raw)
     with pytest.raises(ProtocolError, match="output_chunk"):
         parse_payload(raw)
+
+
+def test_output_window_ascii_exactly_at_limit() -> None:
+    """An ASCII tail at exactly the byte bound is accepted; one byte over is not."""
+    at_limit = "a" * OUTPUT_TAIL_MAX_BYTES
+    assert len(at_limit.encode("utf-8")) == OUTPUT_TAIL_MAX_BYTES
+    window = build_output_window_payload(
+        tail=at_limit, start=0, end=OUTPUT_TAIL_MAX_BYTES, previous=None
+    )
+    assert window["tail"] == at_limit
+    with pytest.raises(ProtocolError, match="bytes"):
+        build_output_window_payload(
+            tail=at_limit + "a", start=0, end=OUTPUT_TAIL_MAX_BYTES + 1, previous=None
+        )
+
+
+def test_output_window_multibyte_exactly_at_limit() -> None:
+    """A multibyte tail whose encoded bytes equal the bound is accepted."""
+    at_limit = _text_of_byte_length(OUTPUT_TAIL_MAX_BYTES)
+    assert len(at_limit.encode("utf-8")) == OUTPUT_TAIL_MAX_BYTES
+    assert len(at_limit) < OUTPUT_TAIL_MAX_BYTES
+    window = build_output_window_payload(
+        tail=at_limit, start=0, end=OUTPUT_TAIL_MAX_BYTES, previous=None
+    )
+    assert window["tail"] == at_limit
+
+
+def test_output_window_multibyte_over_limit() -> None:
+    """A multibyte tail whose encoded bytes exceed the bound is rejected."""
+    over = _text_of_byte_length(OUTPUT_TAIL_MAX_BYTES + 1)
+    assert len(over.encode("utf-8")) > OUTPUT_TAIL_MAX_BYTES
+    assert len(over) <= OUTPUT_TAIL_MAX_BYTES
+    with pytest.raises(ProtocolError, match="bytes"):
+        build_output_window_payload(
+            tail=over, start=0, end=OUTPUT_TAIL_MAX_BYTES + 1, previous=None
+        )
+
+
+def test_output_window_parsed_byte_bound() -> None:
+    """Parsing enforces the UTF-8 byte bound on a raw multibyte payload."""
+    raw = command_payload()
+    raw["output"] = {
+        "stdout": {
+            "tail": _text_of_byte_length(OUTPUT_TAIL_MAX_BYTES + 1),
+            "start": 0,
+            "end": OUTPUT_TAIL_MAX_BYTES + 1,
+            "previous": None,
+        },
+    }
+    with pytest.raises(ProtocolError, match="bytes"):
+        parse_payload(json.dumps(raw))
+    raw["output"] = {
+        "stdout": {
+            "tail": _text_of_byte_length(OUTPUT_TAIL_MAX_BYTES),
+            "start": 0,
+            "end": OUTPUT_TAIL_MAX_BYTES,
+            "previous": None,
+        },
+    }
+    parsed = parse_payload(json.dumps(raw))
+    assert parsed.output is not None
+    assert parsed.output.stdout is not None
+
+
+def test_result_stdout_stderr_byte_bounds() -> None:
+    """Terminal result stdout/stderr enforce the UTF-8 byte bound, not codepoints."""
+    raw = command_payload()
+    raw["result"] = {
+        "stdout": _text_of_byte_length(OUTPUT_TAIL_MAX_BYTES + 1),
+        "stderr": "",
+        "exit_code": 0,
+        "cancellation_note": None,
+        "recovery_note": None,
+    }
+    with pytest.raises(ProtocolError, match="bytes"):
+        parse_payload(json.dumps(raw))
+    result = raw["result"]
+    assert isinstance(result, dict)
+    result["stdout"] = _text_of_byte_length(OUTPUT_TAIL_MAX_BYTES)
+    result["stderr"] = _text_of_byte_length(OUTPUT_TAIL_MAX_BYTES)
+    parsed = parse_payload(json.dumps(raw))
+    assert parsed.result is not None
+    assert len(parsed.result.stdout.encode("utf-8")) == OUTPUT_TAIL_MAX_BYTES
+
+
+def test_chunk_value_byte_bounds() -> None:
+    """Output chunk value enforces the UTF-8 byte bound on build and parse."""
+    thread = uuid4()
+    base: dict[str, Any] = {
+        "server": SERVER,
+        "thread": thread,
+        "stream": "stdout",
+        "sequence": 0,
+        "start": 0,
+        "end": OUTPUT_CHUNK_MAX_BYTES,
+        "value": _text_of_byte_length(OUTPUT_CHUNK_MAX_BYTES),
+        "previous": None,
+    }
+    chunk = build_output_chunk_payload(**base)
+    assert chunk["value"] == base["value"]
+    with pytest.raises(ProtocolError, match="bytes"):
+        build_output_chunk_payload(
+            **base | {"value": _text_of_byte_length(OUTPUT_CHUNK_MAX_BYTES + 1)}
+        )
+    over: dict[str, Any] = dict(chunk)
+    over["value"] = _text_of_byte_length(OUTPUT_CHUNK_MAX_BYTES + 1)
+    over["end"] = OUTPUT_CHUNK_MAX_BYTES + 1
+    with pytest.raises(ProtocolError, match="bytes"):
+        parse_chunk_payload(json.dumps(over))
 
 
 def test_output_window_span_exact_limit_accepted() -> None:

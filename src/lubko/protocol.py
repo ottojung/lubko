@@ -71,14 +71,15 @@ KNOWN_STATUSES: Final = frozenset({
 
 CHUNK_STREAMS: Final = ("stdout", "stderr")
 
-#: Strict maximum size (in raw bytes) of a root live output tail window.
-#: UTF-8 decoding of at most this many bytes yields at most this many
-#: characters, so the decoded ``tail`` text is bounded by the same number.
+#: Strict maximum size (in UTF-8 encoded bytes) of a root live output tail
+#: window. The bound is enforced on the encoded bytes of the decoded ``tail``
+#: text, never on its codepoint count, so a multibyte rune is counted as the
+#: bytes it occupies on disk.
 OUTPUT_TAIL_MAX_BYTES: Final = 4000
 
-#: Strict maximum size (in raw bytes) of one immutable output chunk value.
-#: UTF-8 decoding of at most this many bytes yields at most this many
-#: characters, so the decoded ``value`` text is bounded by the same number.
+#: Strict maximum size (in UTF-8 encoded bytes) of one immutable output chunk
+#: value. The bound is enforced on the encoded bytes of the decoded ``value``
+#: text, never on its codepoint count.
 OUTPUT_CHUNK_MAX_BYTES: Final = 2000
 
 TWO_COLUMN_INVARIANT: Final = (
@@ -88,6 +89,17 @@ TWO_COLUMN_INVARIANT: Final = (
     "process-identity/output data lives inside that JSON payload. Never add a "
     "third column."
 )
+
+
+def _utf8_byte_length(text: str) -> int:
+    """Return the number of UTF-8 encoded bytes ``text`` occupies.
+
+    The protocol's byte-named bounds (``OUTPUT_TAIL_MAX_BYTES``,
+    ``OUTPUT_CHUNK_MAX_BYTES``) constrain the on-disk UTF-8 payload size, so
+    callers must measure encoded bytes rather than the decoded codepoint count
+    returned by ``len``; a single decoded character can span up to four bytes.
+    """
+    return len(text.encode("utf-8"))
 
 
 class ProtocolError(ValueError):
@@ -289,8 +301,8 @@ def build_output_window_payload(
     Raises:
         ProtocolError: If the window violates the size bound.
     """
-    if len(tail) > OUTPUT_TAIL_MAX_BYTES:
-        msg = f"output tail must be at most {OUTPUT_TAIL_MAX_BYTES} characters"
+    if _utf8_byte_length(tail) > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"output tail must be at most {OUTPUT_TAIL_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
     if end - start > OUTPUT_TAIL_MAX_BYTES:
@@ -351,8 +363,8 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments] -- every fie
     if sequence < 0:
         msg = "output_chunk.sequence must be a non-negative integer"
         raise ProtocolError(msg)
-    if len(value) > OUTPUT_CHUNK_MAX_BYTES:
-        msg = f"output_chunk.value must be at most {OUTPUT_CHUNK_MAX_BYTES} characters"
+    if _utf8_byte_length(value) > OUTPUT_CHUNK_MAX_BYTES:
+        msg = f"output_chunk.value must be at most {OUTPUT_CHUNK_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
     if end - start > OUTPUT_CHUNK_MAX_BYTES:
@@ -494,8 +506,8 @@ def _parse_window(raw: object) -> OutputWindow:
         msg = "output window must be an object"
         raise ProtocolError(msg)
     tail = raw.get("tail")
-    if not isinstance(tail, str) or len(tail) > OUTPUT_TAIL_MAX_BYTES:
-        msg = f"output window tail must be a string of at most {OUTPUT_TAIL_MAX_BYTES} characters"
+    if not isinstance(tail, str) or _utf8_byte_length(tail) > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"output window tail must be a string of at most {OUTPUT_TAIL_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     start = raw.get("start")
     end = raw.get("end")
@@ -554,11 +566,11 @@ def _parse_result(raw: object) -> ResultView | None:
         raise ProtocolError(msg)
     stdout = raw.get("stdout")
     stderr = raw.get("stderr")
-    if not isinstance(stdout, str) or len(stdout) > OUTPUT_TAIL_MAX_BYTES:
-        msg = f"result.stdout must be a string of at most {OUTPUT_TAIL_MAX_BYTES} characters"
+    if not isinstance(stdout, str) or _utf8_byte_length(stdout) > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"result.stdout must be a string of at most {OUTPUT_TAIL_MAX_BYTES} bytes"
         raise ProtocolError(msg)
-    if not isinstance(stderr, str) or len(stderr) > OUTPUT_TAIL_MAX_BYTES:
-        msg = f"result.stderr must be a string of at most {OUTPUT_TAIL_MAX_BYTES} characters"
+    if not isinstance(stderr, str) or _utf8_byte_length(stderr) > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"result.stderr must be a string of at most {OUTPUT_TAIL_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     exit_code = raw.get("exit_code")
     if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
@@ -722,8 +734,8 @@ def parse_chunk_payload(data: object, supported: ProtocolVersionRange | None = N
         msg = f"output_chunk span must be at most {OUTPUT_CHUNK_MAX_BYTES} raw bytes"
         raise ProtocolError(msg)
     value = decoded.get("value")
-    if not isinstance(value, str) or len(value) > OUTPUT_CHUNK_MAX_BYTES:
-        msg = f"output_chunk.value must be a string of at most {OUTPUT_CHUNK_MAX_BYTES} characters"
+    if not isinstance(value, str) or _utf8_byte_length(value) > OUTPUT_CHUNK_MAX_BYTES:
+        msg = f"output_chunk.value must be a string of at most {OUTPUT_CHUNK_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     previous = _parse_uuid(decoded.get("previous"))
     return OutputChunk(
