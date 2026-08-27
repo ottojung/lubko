@@ -1,18 +1,28 @@
--- Lubko per-server PostgreSQL authorization boundary (issue #285).
+-- Lubko per-server PostgreSQL authorization boundary.
 --
 -- TRUST / AUTHORITY MODEL
 --
 -- The PostgreSQL instance is the authoritative trust boundary for queue
 -- isolation, not only the worker's application-layer predicates. Every
 -- execution server owns exactly one non-empty server identity, and its worker
--- daemon connects as a dedicated login principal lubko_worker_<server> that is a
--- member of the lubko_worker_role group. The server identity bound to a database
--- session is derived from the authenticated login role (current_user), which is
--- immutable for the session and can never be changed into another server's
--- principal, so a worker credential is cryptographically/role-bound to exactly
--- one execution server and cannot impersonate another.
+-- daemon (and its local host processes: the outer supervisor, lifecycle
+-- probes, and deploy control) connects as a dedicated login principal
+-- lubko_worker_<server> that is a member of the lubko_worker_role group. The
+-- server identity bound to a database session is derived from the immutable
+-- authenticated login role (session_user), which can never be changed into
+-- another server's principal, so a local process is role-bound to exactly one
+-- execution server and cannot impersonate another.
 --
--- Isolation is enforced three ways, all at the database authorization boundary:
+-- CRITICAL: a SECOND config file or env var on the SAME host is NOT a boundary.
+-- The local worker-host processes therefore hold NO broad (BYPASSRLS)
+-- credential at all; every local operation is server-scoped by RLS. The only
+-- broad credential is lubko_admin, which is granted BYPASSRLS strictly for the
+-- EXTERNAL orchestrator / control plane and must be provisioned only on a
+-- separate host/account. It is never present on an execution-server host, so the
+-- worker cannot read or inherit it. That is a real OS/account boundary, not a
+-- filename distinction.
+--
+-- Isolation is enforced at the database authorization boundary three ways:
 --
 --   1. Row-level security is enabled on lubko.jobs.
 --   2. lubko.session_server() returns the server mapped to the authenticated
@@ -24,23 +34,30 @@
 --      principal. Using current_user would collapse every caller to the same
 --      identity and destroy the isolation boundary.
 --   3. Per-server policies restrict the worker group to rows/chunks whose
---      server equals the session's bound identity, both for reads and for
---      writes (INSERT WITH CHECK prevents spoofing another server's rows).
+--      server equals the session's bound identity, both for reads and for writes
+--      (INSERT WITH CHECK prevents spoofing another server's rows).
 --
--- The orchestrator/admin principal (lubko_worker) is granted BYPASSRLS and
--- retains its intended broader, cross-server privileges (GC across servers,
--- lifecycle/recovery control). The worker application keeps its own exact
--- server-match predicate on every query as defense in depth; the database
--- boundary is what makes cross-server access impossible even if that predicate
--- were removed or bypassed.
+-- ADDITIONALLY, an output_chunk may only reference a command root of the SAME
+-- server: the trigger jobs_chunk_root_server enforces, at the database
+-- authority, that chunk.thread points to a root whose server equals the chunk's
+-- own server. It uses the SECURITY DEFINER lubko.chunk_root_server() so the
+-- root lookup is not subject to (and does not recurse through) the session's RLS.
+--
+-- The worker application keeps its own exact server-match predicate on every
+-- query as defense in depth; the database boundary is what makes cross-server
+-- access impossible even if that predicate were removed or bypassed.
 --
 -- PROVISIONING (operator responsibility, not performed here because server and
 -- role names are deployment-specific):
 --
+--   -- Per execution server (on the server host, restricted to that host only):
 --   CREATE ROLE lubko_worker_alpha LOGIN PASSWORD '...';
 --   GRANT lubko_worker_role TO lubko_worker_alpha;
 --   INSERT INTO lubko.server_principals (server, principal)
 --       VALUES ('alpha', 'lubko_worker_alpha');
+--
+--   -- External orchestrator / control plane (separate host/account ONLY):
+--   ALTER ROLE lubko_admin PASSWORD '...';   -- role created by this migration
 --
 -- The worker refuses to run unless the boundary is present AND its connected
 -- principal resolves (via lubko.session_server()) to its configured server,
@@ -66,13 +83,13 @@ comment on table lubko.server_principals is
     'database session to exactly one execution server. This is the root of trust '
     'for per-server queue isolation.';
 
--- Trusted session identity: the server bound to the current login principal.
+-- Trusted session identity: the server bound to the authenticated login role.
 -- SECURITY DEFINER + restricted search_path so the caller cannot influence the
--- lookup. CRITICAL SEMANTIC: it reads session_user (the authenticated login
--- role), NOT current_user, because inside SECURITY DEFINER current_user becomes
--- the function definer and would make every caller resolve to the same identity.
--- session_user is immutable for the session and cannot be changed via SET ROLE,
--- so it is the only non-spoofable per-session login identity.
+-- lookup. CRITICAL SEMANTIC: it reads session_user (the immutable authenticated
+-- login role), NOT current_user, because inside SECURITY DEFINER current_user
+-- becomes the function definer and would make every caller resolve to the same
+-- identity. session_user cannot be changed via SET ROLE, so it is the only
+-- non-spoofable per-session login identity.
 create or replace function lubko.session_server() returns text
 language sql stable security definer set search_path = lubko as $$
     select server from lubko.server_principals where principal = session_user;
@@ -86,18 +103,27 @@ comment on function lubko.session_server() is
     'server. session_user (not current_user) is used on purpose: current_user is '
     'the definer inside SECURITY DEFINER and must never be used here.';
 
--- Group that holds the table grants; both the per-server worker principals and
--- the orchestrator/admin principal are members.
+-- Group that holds the table grants; per-server worker principals are members.
 do $$
 begin
     if to_regrole('lubko_worker_role') is null then
         execute 'create role lubko_worker_role nologin';
     end if;
+    -- lubko_worker (legacy shared login) stays a plain, RLS-scoped member: it
+    -- receives NO bypassrls and therefore cannot exceed its own server's rows.
+    -- It is provisioned on execution-server hosts only.
     if to_regrole('lubko_worker') is not null then
-        -- Orchestrator/admin keeps its broader, cross-server privileges.
         execute 'grant lubko_worker_role to lubko_worker';
-        execute 'alter role lubko_worker bypassrls';
     end if;
+    -- lubko_admin is the EXTERNAL orchestrator/control-plane credential. It is
+    -- granted BYPASSRLS but MUST be provisioned only on a separate host/account;
+    -- it must never exist on an execution-server host, so the worker cannot read
+    -- or inherit it. This is a real OS/account boundary, not a config-file name.
+    if to_regrole('lubko_admin') is null then
+        execute 'create role lubko_admin login';
+    end if;
+    execute 'grant lubko_worker_role to lubko_admin';
+    execute 'alter role lubko_admin bypassrls';
 end
 $$;
 
@@ -128,5 +154,50 @@ drop policy if exists jobs_isolation_delete on lubko.jobs;
 create policy jobs_isolation_delete on lubko.jobs
     for delete to lubko_worker_role
     using ((payload::jsonb)->>'server' = lubko.session_server());
+
+-- Same-server chunk ownership enforced at the database authority. A chunk must
+-- reference a command root of the SAME server. The lookup is performed by a
+-- SECURITY DEFINER function so it is independent of, and does not recurse
+-- through, the session's RLS scope.
+create or replace function lubko.chunk_root_server(p_thread text) returns text
+language sql stable security definer set search_path = lubko as $$
+    select (payload::jsonb)->>'server'
+    from lubko.jobs
+    where id = p_thread::uuid
+        and (payload::jsonb)->>'type' = 'command'
+$$;
+
+comment on function lubko.chunk_root_server(text) is
+    'Return the server of the command root referenced by an output_chunk thread, '
+    'or NULL if the thread does not reference an existing command root. SECURITY '
+    'DEFINER so the lookup is not filtered by (and does not recurse through) the '
+    'session row-level-security scope.';
+
+create or replace function lubko.enforce_chunk_root_server() returns trigger
+language plpgsql as $$
+declare
+    root_server text;
+begin
+    if (new.payload::jsonb)->>'type' = 'output_chunk' then
+        root_server := lubko.chunk_root_server((new.payload::jsonb)->>'thread');
+        if root_server is distinct from (new.payload::jsonb)->>'server' then
+            raise exception using
+                message = 'output_chunk.thread references a command root of a '
+                    'different server (chunk server '
+                    || coalesce((new.payload::jsonb)->>'server', 'null')
+                    || ', root server ' || coalesce(root_server, 'null')
+                    || '); cross-server chunk ownership is forbidden',
+                hint = 'ensure the chunk thread references a command root owned '
+                    'by the same execution server';
+        end if;
+    end if;
+    return new;
+end;
+$$;
+
+drop trigger if exists jobs_chunk_root_server on lubko.jobs;
+create trigger jobs_chunk_root_server
+    before insert or update on lubko.jobs
+    for each row execute function lubko.enforce_chunk_root_server();
 
 commit;
