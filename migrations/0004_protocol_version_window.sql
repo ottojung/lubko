@@ -55,13 +55,17 @@ begin
     end if;
 
     -- Preflight: refuse to apply if any command/output_chunk row already sits
-    -- outside the new window. Raising here leaves the original constraint and
-    -- table completely intact; the cutover is non-destructive and fail-closed.
+    -- outside the new window. The integral check (v must equal its own floor)
+    -- rejects fractional JSON numbers such as 4.9, which PostgreSQL would
+    -- otherwise round into the window on a bare ::int cast. Raising here leaves
+    -- the original constraint and table completely intact; the cutover is
+    -- non-destructive and fail-closed.
     select count(*) into nonconforming
     from lubko.jobs
     where (payload::jsonb)->>'type' in ('command', 'output_chunk')
         and (
             jsonb_typeof((payload::jsonb)->'v') <> 'number'
+            or ((payload::jsonb)->'v')::numeric <> floor(((payload::jsonb)->'v')::numeric)
             or ((payload::jsonb)->'v')::int not between min_version and max_version
         );
 
@@ -80,6 +84,7 @@ begin
         'case
             when (payload::jsonb)->>''type'' = ''command'' then
                 jsonb_typeof((payload::jsonb)->''v'') = ''number''
+                and ((payload::jsonb)->''v'')::numeric = floor(((payload::jsonb)->''v'')::numeric)
                 and ((payload::jsonb)->''v'')::int between %L and %L
                 and jsonb_typeof((payload::jsonb)->''request'') = ''object''
                 and (((payload::jsonb)->''state''->>''status'') is not null)
@@ -87,6 +92,7 @@ begin
                 and coalesce((payload::jsonb)->>''server'', '''') <> ''''
             when (payload::jsonb)->>''type'' = ''output_chunk'' then
                 jsonb_typeof((payload::jsonb)->''v'') = ''number''
+                and ((payload::jsonb)->''v'')::numeric = floor(((payload::jsonb)->''v'')::numeric)
                 and ((payload::jsonb)->''v'')::int between %L and %L
                 and jsonb_typeof((payload::jsonb)->''value'') = ''string''
                 and (((payload::jsonb)->>''thread'') is not null)
