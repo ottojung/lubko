@@ -629,7 +629,9 @@ def test_startup_contract_command_writes_and_proves(
     monkeypatch.setattr(
         sc,
         "validate_contract_paths",
-        lambda *_a, **_k: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+        lambda *_a, **_k: ContractPathValidation(
+            ok=True, missing=(), mode_mismatched=(), message="ok"
+        ),
     )
     monkeypatch.setattr(
         sc,
