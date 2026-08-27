@@ -248,10 +248,16 @@ def test_deferred_publication_retries_then_clears_on_next_tick(
     assert meta_log[0].pid == child.pid
 
 
-def test_deferred_publication_meta_failure_retries_without_clearing(
+def test_deferred_publication_meta_failure_stops_reconciliation_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A meta failure during reconciliation keeps the obligation blocking."""
+    """A meta failure during reconciliation blocks the turn and keeps authority.
+
+    When the deferred publication cannot write its lifecycle meta, the obligation
+    is not reported resolved: the reconciliation turn stops (no retirement, no
+    adoption, no new spawn) and the spawning obligation stays durably blocking
+    until the next tick can retry.
+    """
     child = _published_child()
     _in_progress_state(child)
     monkeypatch.setattr(
@@ -261,8 +267,26 @@ def test_deferred_publication_meta_failure_retries_without_clearing(
     )
 
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
-    assert daemon._resolve_spawning_obligation() is True
+    spawn_attempts: list[str] = []
+
+    def blocked_spawn(c: str) -> WorkerChild:
+        spawn_attempts.append(c)
+        return _published_child()
+
+    monkeypatch.setattr(daemon, "_spawn_worker", blocked_spawn)
+    assert daemon._resolve_spawning_obligation() is False
     assert read_state().spawning is not None, "the obligation stayed blocking"
+    assert read_state().child is not None, "the in-progress child was not retired"
+
+    # The whole consumer-establishment turn aborts before any spawn.
+    daemon._ensure_consumer_locked(COMMIT)
+    assert spawn_attempts == [], "no replacement spawn happened while obligation blocked"
+    assert read_state().spawning is not None, "obligation still blocking after the turn"
+
+    # Once the publication succeeds, the turn resolves and clears the obligation.
+    monkeypatch.setattr(lifecycle, "write_meta", lambda _meta: None)
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
     assert read_state().child is not None
 
 

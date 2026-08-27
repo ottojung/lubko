@@ -2270,9 +2270,11 @@ class SupervisorDaemon:
             # publication (or the durable residue of a crash during it), not a
             # pending convergence. Finish the publication — retry the lifecycle
             # meta and clear the obligation — instead of converging or killing
-            # the very worker we are publishing.
-            self._finish_publication(state, obligation)
-            return True
+            # the very worker we are publishing. The obligation is only
+            # considered resolved once the spawning clearance is durably written,
+            # so a meta/durability failure keeps the turn blocked and the
+            # obligation replacement-blocking.
+            return self._finish_publication(state, obligation)
         if obligation.pid is None:
             resolved = self._resolve_pidless_spawn(obligation)
         else:
@@ -2314,23 +2316,28 @@ class SupervisorDaemon:
 
     def _finish_publication(
         self, state: supervise.SupervisorState, obligation: SpawningObligation
-    ) -> None:
+    ) -> bool:
         """Complete a deferred child+spawning publication after a crash or retry.
 
         Writes the maintained lifecycle meta for the already-published child and
         clears the durable spawning obligation in a final state write. A meta
         write failure keeps the obligation durable (replacement-blocking) so a
         later supervisor tick or restart retries the publication rather than
-        duplicating the worker.
+        duplicating the worker. The obligation is only reported resolved once the
+        spawning clearance is durably written, so any meta or durable-state
+        failure leaves it blocking.
 
         Args:
             state: Current durable state holding the published child.
             obligation: The durable pre-spawn obligation being finished.
+
+        Returns:
+            ``True`` only when the spawning obligation was durably cleared.
         """
         commit = obligation.commit
         child = state.child
         if child is None:
-            return
+            return False
         meta = replace(_child_to_meta(child, _runtime_dir(commit)), git_commit=commit)
         try:
             lifecycle.write_meta(meta)
@@ -2340,9 +2347,18 @@ class SupervisorDaemon:
                 "keeping the spawning obligation durable until the next tick"
             )
             LOGGER.exception("%s", self._message)
-            return
-        write_state(replace(read_state(), spawning=None))
+            return False
+        try:
+            write_state(replace(read_state(), spawning=None))
+        except DurabilityError:
+            self._message = (
+                "deferred worker publication cleared the obligation in memory but "
+                "could not durably persist it; keeping it blocking until the next tick"
+            )
+            LOGGER.exception("%s", self._message)
+            return False
         LOGGER.info("finished deferred publication of worker pid=%d", child.pid)
+        return True
 
     def _resolve_pidless_spawn(self, obligation: SpawningObligation) -> bool:
         """Resolve an obligation recorded before the child identity was durable.
