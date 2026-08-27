@@ -48,7 +48,13 @@ CURRENT_PROTOCOL_VERSION: Final = 4
 #: contiguous subset of this set; raising the window upper bound for a new
 #: compatible version means adding that version here and in the worker's
 #: supported range. Bound the set: see :data:`MAX_VERSION_SPAN`.
-SUPPORTED_PROTOCOL_VERSIONS: Final = frozenset({CURRENT_PROTOCOL_VERSION})
+#:
+#: ``5`` is included as a representative shape-compatible successor to ``4``: the
+#: two versions share the identical payload shape (the same two kinds and required
+#: fields, differing only additively), so the same parser and builder serve both.
+#: A ``[4, 5]`` daemon window is therefore genuinely executable by this build, which
+#: is what makes a staggered, non-destructive ``[4, 5]`` rollout actually runnable.
+SUPPORTED_PROTOCOL_VERSIONS: Final = frozenset({CURRENT_PROTOCOL_VERSION, 5})
 
 #: Hard cap on the width of a supported version window. A wider window would
 #: force every daemon to carry compatibility code for arbitrarily many past
@@ -169,6 +175,33 @@ def negotiate_version(
     return overlap_max
 
 
+def negotiate_submission_version(server_range: ProtocolVersionRange) -> int:
+    """Pick the protocol version a client should stamp when submitting a job.
+
+    A client speaks every version in its build's
+    :data:`SUPPORTED_PROTOCOL_VERSIONS`; it stamps the highest version it shares
+    with the target server's supported window, so new work converges onto the
+    newest supported generation while older in-flight jobs keep running on daemons
+    that still advertise the older version. This is the operational submission
+    path: callers that write jobs to ``lubko.jobs`` use the returned version.
+
+    Args:
+        server_range: The target daemon's supported version window.
+
+    Returns:
+        The negotiated protocol version to stamp on the new job payload.
+    """
+    client_range = ProtocolVersionRange(
+        min=min(SUPPORTED_PROTOCOL_VERSIONS),
+        max=max(SUPPORTED_PROTOCOL_VERSIONS),
+    )
+    return negotiate_version(
+        client_min=client_range.min,
+        client_max=client_range.max,
+        server_range=server_range,
+    )
+
+
 def version_supported(version: int, supported: ProtocolVersionRange) -> bool:
     """Return whether ``version`` lies inside ``supported``.
 
@@ -228,6 +261,47 @@ def classify_job_version(version: int, supported: ProtocolVersionRange) -> JobVe
     if supported.contains(version):
         return JobVersionDisposition.CLAIMABLE
     return JobVersionDisposition.FAIL_CLOSED
+
+
+#: The highest protocol version any running build of this code can parse and
+#: execute. A daemon running the newest build therefore knows the ceiling of
+#: every version the fleet could possibly serve.
+_MAX_SUPPORTED_VERSION: Final = max(SUPPORTED_PROTOCOL_VERSIONS)
+
+
+def reaper_disposition(version: int, supported: ProtocolVersionRange) -> JobVersionDisposition:
+    """Decide whether the fleet-wide reaper may fail closed a pending job.
+
+    A single daemon cannot see the whole fleet's window, so the reaper must be
+    conservative: it may only fail closed a pending job that *no* running daemon
+    could ever execute.
+
+    * A version below the window's ``min`` is a retired generation: no current
+      daemon serves it, so it is safe to fail closed on any daemon.
+    * A version above the window's ``max`` is a newer generation. A daemon whose
+      own ``max`` already equals the newest version this build knows
+      (``_MAX_SUPPORTED_VERSION``) knows nothing newer can serve it, so it may
+      fail the job closed. A daemon still running an older build (``max`` below
+      the fleet ceiling) must leave the job alone: a newer daemon exists that can
+      execute it, and failing it would destroy otherwise-runnable work during a
+      staggered upgrade.
+
+    Args:
+        version: The pending job's protocol version.
+        supported: This daemon's supported window.
+
+    Returns:
+        :attr:`JobVersionDisposition.FAIL_CLOSED` only when no daemon in the
+        fleet could serve ``version``, otherwise
+        :attr:`JobVersionDisposition.CLAIMABLE`.
+    """
+    if version < supported.min:
+        return JobVersionDisposition.FAIL_CLOSED
+    if version > supported.max:
+        if supported.max >= _MAX_SUPPORTED_VERSION:
+            return JobVersionDisposition.FAIL_CLOSED
+        return JobVersionDisposition.CLAIMABLE
+    return JobVersionDisposition.CLAIMABLE
 
 
 def claim_version_predicate(
