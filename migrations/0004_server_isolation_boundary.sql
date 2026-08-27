@@ -155,38 +155,35 @@ create policy jobs_isolation_delete on lubko.jobs
     for delete to lubko_worker_role
     using ((payload::jsonb)->>'server' = lubko.session_server());
 
--- Same-server chunk ownership enforced at the database authority. A chunk must
--- reference a command root of the SAME server. The lookup is performed by a
--- SECURITY DEFINER function so it is independent of, and does not recurse
--- through, the session's RLS scope.
-create or replace function lubko.chunk_root_server(p_thread text) returns text
-language sql stable security definer set search_path = lubko as $$
-    select (payload::jsonb)->>'server'
-    from lubko.jobs
-    where id = p_thread::uuid
-        and (payload::jsonb)->>'type' = 'command'
-$$;
-
-comment on function lubko.chunk_root_server(text) is
-    'Return the server of the command root referenced by an output_chunk thread, '
-    'or NULL if the thread does not reference an existing command root. SECURITY '
-    'DEFINER so the lookup is not filtered by (and does not recurse through) the '
-    'session row-level-security scope.';
-
+-- Same-server chunk ownership enforced at the database authority. An
+-- output_chunk must reference a command root of the SAME server. The root lookup
+-- is performed ONLY inside this single SECURITY DEFINER trigger function; there is
+-- no standalone, externally callable privileged helper that returns a foreign
+-- root's server. SECURITY DEFINER + restricted search_path so the lookup runs as
+-- the owner (independent of, and not filtered by, the session RLS) and cannot be
+-- influenced by search_path. EXECUTE is revoked from PUBLIC and granted only to the
+-- worker/admin roles so the trigger still fires for them, but no worker-facing
+-- principal can directly invoke a cross-server lookup.
 create or replace function lubko.enforce_chunk_root_server() returns trigger
-language plpgsql as $$
+language plpgsql security definer set search_path = lubko as $$
 declare
     root_server text;
 begin
     if (new.payload::jsonb)->>'type' = 'output_chunk' then
-        root_server := lubko.chunk_root_server((new.payload::jsonb)->>'thread');
+        select (payload::jsonb)->>'server'
+        into root_server
+        from lubko.jobs
+        where id = ((new.payload::jsonb)->>'thread')::uuid
+            and (payload::jsonb)->>'type' = 'command';
         if root_server is distinct from (new.payload::jsonb)->>'server' then
+            -- Generic diagnostic only: never reveal the foreign root's server
+            -- value, which would turn this trigger into a cross-server metadata
+            -- oracle (a worker could probe arbitrary root UUIDs and read their
+            -- server from the error text).
             raise exception using
-                message = 'output_chunk.thread references a command root of a '
-                    'different server (chunk server '
-                    || coalesce((new.payload::jsonb)->>'server', 'null')
-                    || ', root server ' || coalesce(root_server, 'null')
-                    || '); cross-server chunk ownership is forbidden',
+                message = 'output_chunk.thread references a command root owned by '
+                    'a different execution server; cross-server chunk ownership '
+                    'is forbidden',
                 hint = 'ensure the chunk thread references a command root owned '
                     'by the same execution server';
         end if;
@@ -194,6 +191,20 @@ begin
     return new;
 end;
 $$;
+
+comment on function lubko.enforce_chunk_root_server() is
+    'BEFORE INSERT/UPDATE trigger enforcing that an output_chunk.thread references '
+    'a command root of the same server. The root lookup is inlined here and runs '
+    'as the function owner (SECURITY DEFINER), so it is not a callable, '
+    'data-returning helper: no worker-facing principal can invoke a cross-server '
+    'lookup directly. EXECUTE is revoked from PUBLIC.';
+
+-- Remove the default PUBLIC EXECUTE and grant only to the roles that legitimately
+-- fire the trigger (workers, and the external orchestrator). The owner retains
+-- EXECUTE implicitly, so the trigger body can read the root.
+revoke execute on function lubko.enforce_chunk_root_server() from public;
+grant execute on function lubko.enforce_chunk_root_server() to lubko_worker_role;
+grant execute on function lubko.enforce_chunk_root_server() to lubko_admin;
 
 drop trigger if exists jobs_chunk_root_server on lubko.jobs;
 create trigger jobs_chunk_root_server

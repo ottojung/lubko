@@ -4134,7 +4134,7 @@ def verify_server_isolation(conn: JobsConnection) -> None:
             "SELECT 1\n"
             "FROM pg_proc p\n"
             "JOIN pg_namespace n ON n.oid = p.pronamespace\n"
-            "WHERE n.nspname = %s AND p.proname = 'chunk_root_server'\n",
+            "WHERE n.nspname = %s AND p.proname = 'enforce_chunk_root_server'\n",
             (JOBS_SCHEMA,),
         )
         chunk_function_exists = cursor.fetchone() is not None
@@ -4158,7 +4158,7 @@ def verify_server_isolation(conn: JobsConnection) -> None:
     if not session_function_exists:
         missing.append(f"{SERVER_ISOLATION_FUNCTION}() identity function")
     if not chunk_function_exists:
-        missing.append("lubko.chunk_root_server() same-server ownership function")
+        missing.append("lubko.enforce_chunk_root_server() same-server ownership function")
     if not chunk_trigger_exists:
         missing.append("jobs_chunk_root_server same-server chunk trigger")
     if not any(p.startswith(JOBS_RLS_POLICY_PREFIX) for p in policies):

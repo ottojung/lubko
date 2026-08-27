@@ -171,7 +171,7 @@ def test_verify_server_isolation_passes_when_boundary_present() -> None:
     [
         (0, ("one", (False,)), "row-level security"),
         (1, ("one", None), "session_server"),
-        (2, ("one", None), "chunk_root_server"),
+        (2, ("one", None), "enforce_chunk_root_server"),
         (3, ("one", None), "jobs_chunk_root_server"),
         (4, ("all", []), "isolation polic"),
         (4, ("all", [("unrelated_policy",)]), "isolation polic"),
@@ -242,14 +242,28 @@ def test_migration_declares_rls_boundary() -> None:
 def test_migration_enforces_same_server_chunk_ownership() -> None:
     """A chunk must reference a same-server command root, enforced by a trigger.
 
-    The lookup is delegated to a SECURITY DEFINER function so it avoids recursive
-    RLS. The boundary is asserted to declare both the function and the trigger.
+    The root lookup is inlined in a single SECURITY DEFINER trigger function and is
+    NOT a standalone, externally callable helper: a worker cannot call a privileged
+    cross-server lookup directly. EXECUTE on the trigger function is revoked from
+    PUBLIC and granted only to the worker/admin roles, while the trigger itself
+    still fires for them.
     """
     text = MIGRATION_PATH.read_text(encoding="utf-8").lower()
-    assert "create or replace function lubko.chunk_root_server" in text
+    # No standalone, data-returning cross-server lookup helper exists.
+    assert "create or replace function lubko.chunk_root_server" not in text
+    # The enforcement lives only inside the trigger function.
     assert "create or replace function lubko.enforce_chunk_root_server" in text
+    assert "security definer" in text
+    assert "set search_path = lubko" in text
     assert "create trigger jobs_chunk_root_server" in text
-    assert "cross-server chunk ownership is forbidden" in text
+    # The diagnostic must not leak the foreign root's server value: a worker could
+    # otherwise probe arbitrary root UUIDs and read their server from the error
+    # text, turning the trigger into a cross-server metadata oracle.
+    assert "root server" not in text
+    assert "cross-server chunk ownership" in text
+    # Direct privileged invocation is closed: PUBLIC EXECUTE is revoked.
+    assert "revoke execute on function lubko.enforce_chunk_root_server" in text
+    assert "grant execute on function lubko.enforce_chunk_root_server" in text
 
 
 def test_migration_session_server_uses_session_user_not_current_user() -> None:
