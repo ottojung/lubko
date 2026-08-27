@@ -55,30 +55,39 @@ change:
   alive at once. This is intentionally **unbounded by the application**. It is a
   property of the host, not of the queue logic.
 
-- **Output state** is **bounded by construction** and independent of job count.
-  Each job's live tail is recomputed as the newest 4000 bytes; immutable output
-  is archived into bounded chunks; terminal rows and owned chunks are reclaimed
-  by a garbage-collection pass under `LUBKO_GC_RETENTION_SECONDS` and
-  `LUBKO_GC_BATCH_LIMIT`. A worker with ten thousand active jobs still stores
-  at most a bounded window of live output per job and a bounded total of
-  retained history. Output cost does not scale with concurrency in an unbounded
-  way.
+- **Output state** has **bounded per-job windows**, not a bounded total. Each
+  job's live tail is recomputed as the newest 4000 bytes, so one job's live
+  output window is capped regardless of how much it produced; immutable output
+  is archived into bounded chunks; terminal rows and owned chunks are eventually
+  reclaimed by a garbage-collection pass under `LUBKO_GC_RETENTION_SECONDS` and
+  `LUBKO_GC_BATCH_LIMIT`. These bounds are *per job* (or per GC pass), not a
+  global cap: the aggregate live-tail, spool, and retained-history footprint
+  grows with the number of concurrently active jobs, because every active job
+  contributes its own bounded window. The real distinction is bounded
+  *per-job* output windows, bounded *chunks/passes*, and a bounded
+  machine-readable interface surface, while the aggregate output and storage
+  cost scales with concurrency.
 
-- **Interface state** is **bounded by construction** and independent of job
-  count. The machine-readable health snapshot
+- **Interface state** has a **bounded, fixed-size surface** and no per-job
+  entries. The machine-readable health snapshot
   (`src/lubko/health.py::WorkerHealth`) publishes aggregates
   (`active_jobs`, `stopping_jobs`, `completed_jobs`), a bounded oldest-active-job
   *age* (never a job id), and bounded operational counters. It never embeds a
-  job id list, command text, secret, or unbounded payload. The published
-  interface therefore stays O(1) in size and O(1) in write cost no matter how
-  many jobs run.
+  job id list, command text, secret, or unbounded payload, so its serialized
+  size stays fixed no matter how many jobs run. Producing it still requires
+  scanning the active registry, so its *computation* cost grows with active
+  count; the bound is on the published *surface* (no per-job data, fixed fields),
+  not on the work behind it.
 
-The trap to avoid is conflating the two: because the *interface* and *output*
-are already bounded, there is no representational or storage reason to cap
-*execution* concurrency. The bounded artifacts are what the rest of the system
-(secrets-free snapshot, bounded tail, GC-bounded retention) depends on, and they
-hold regardless of whether one job or a million are active. Capping execution to
-defend the interface would be defending a boundary that is already defended.
+The trap to avoid is conflating the two: although the *interface surface* and
+each job's *output window* are bounded per job / in size, the aggregate output,
+spool, and active-row work do grow with concurrency. What is already defended is
+the representational and per-job boundary — a secret-free snapshot with no
+per-job entries, a bounded live tail per job, and per-pass GC bounds — which
+hold no matter how many jobs run. Capping *execution* to defend the interface
+would be defending a boundary that is already defended at the per-job level; the
+aggregate scaling is instead left to the host/OS boundary and made observable
+through the health snapshot.
 
 ## Acceptable resource-safety mechanisms
 
@@ -106,16 +115,29 @@ are encouraged:
   database outage, so there is never a live command process Lubko has knowingly
   allowed to become unowned. This bounds the blast radius of an outage.
 
-- **Bounded I/O and storage pressure.** The 4000-byte live tail, bounded chunk
-  archiving, and GC retention/batch limits bound disk and memory used by output
-  irrespective of active count.
+- **Bounded per-job I/O and storage windows.** The 4000-byte live tail and
+  bounded chunk archiving cap what *one* job contributes to disk and memory; the
+  GC retention and batch limits bound how much terminal history is kept and how
+  much is reclaimed per pass. These are per-job and per-pass bounds, not a global
+  cap: the aggregate output/spool storage still scales with the number of
+  concurrently active jobs. They keep any individual job's footprint bounded
+  even under many concurrent jobs.
 
-- **Bounded database load.** `LUBKO_DB_OPERATION_TIMEOUT_SECONDS` and bulk,
-  set-based statements (heartbeat, recovery, cancellation, GC) keep per-turn
-  database cost bounded regardless of how many jobs exist.
+- **One shared connection and set-based operations, not per-job resources.** The
+  worker holds a *single* PostgreSQL connection for its whole lifetime and
+  services every job through that one connection — there is no connection or
+  thread allocated per job. Heartbeat, recovery, cancellation, and GC run as
+  bulk, set-based statements guarded by `LUBKO_DB_OPERATION_TIMEOUT_SECONDS`, and
+  the supervisor applies explicit per-turn batch/scan caps (e.g.
+  `LUBKO_CLAIM_BATCH_LIMIT`, `LUBKO_GC_BATCH_LIMIT`) and scan-interval deadlines
+  where they exist. These prevent any one turn from doing unbounded work, but the
+  total active-row work (heartbeating N running jobs, scanning N active leases)
+  scales with the number of active jobs. The benefit is bounded *per-turn* cost
+  and a single shared connection, not a total that is independent of job count.
 
-These are *rate, size, and deadline* bounds — they make the system's resource
-use predictable — and they are orthogonal to a concurrency ceiling.
+These are *rate, size, and deadline* bounds — they make the system's per-job and
+per-turn resource use predictable — and they are orthogonal to a concurrency
+ceiling.
 
 ## Resource-boundary enforcement
 
@@ -136,8 +158,8 @@ that actually owns the boundary, not to the queue logic:
   owns and nothing else.
 
 Lubko should continue to *cooperate* with these boundaries (clean
-process-group termination, bounded spool, lease eviction) rather than *replicate*
-them with an internal counter. An application counter cannot see other
+process-group termination, per-job spool windows, lease eviction) rather than
+*replicate* them with an internal counter. An application counter cannot see other
 processes on the host, cannot account for heterogeneous job sizes, and silently
 drifts from reality on crash unless it is itself made crash-proof — which is a
 harder problem than letting the OS enforce the real limit.
@@ -221,10 +243,12 @@ removes any technical reason to do so.
 
 ## Consequences
 
-- **Positive:** the parallel-execution contract is preserved; output and
-  interface state stay bounded and secret-free regardless of concurrency;
-  overload is observable rather than hidden; the application does not duplicate
-  OS-level scheduling or crash-recovery responsibilities.
+- **Positive:** the parallel-execution contract is preserved; each job's output
+  window and the machine-readable interface surface stay bounded per job / in
+  size (no per-job entries, no secrets) even as concurrency grows, while the
+  aggregate output, spool, and active-row work that scale with concurrency are
+  made observable rather than hidden; the application does not duplicate OS-level
+  scheduling or crash-recovery responsibilities.
 - **Negative / required discipline:** hard ceilings, when needed, must be
   supplied by the deployment (cgroups, ulimits, host sizing). Lubko will not
   save an operator who configures an unbounded host with no OS limits; the

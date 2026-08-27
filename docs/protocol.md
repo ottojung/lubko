@@ -493,11 +493,14 @@ application-level concurrency limit** and no thread or connection per job; each
 job process runs as its own OS process/session/process group, executed directly
 from its `request.process` argv (never through a shell), and the daemon
 observes it with `Popen.poll()`-style checks. This is a deliberate,
-durable decision (see `docs/adr/0001-no-application-concurrency-cap.md`): the
-bounded size of the published health snapshot and the bounded output window
-make the *interface* and *output* cost independent of job count, so only the
-surrounding container/host/OS should bound execution concurrency; the
-application stays out of scheduling. The supervisor loop services
+durable decision (see `docs/adr/0001-no-application-concurrency-cap.md`): each
+job's live/output window is bounded and the machine-readable health snapshot is a
+fixed-size aggregate with no per-job entries, but aggregate output, spool, and
+active-row database work still scale with the number of concurrently active jobs.
+The application therefore keeps per-job and per-turn costs bounded (one shared
+connection, set-based operations, explicit batch/scan/deadline caps) and leaves
+the hard ceiling on *execution* concurrency to the surrounding container/host/OS
+rather than acting as a scheduler. The supervisor loop services
 running jobs (observe exits, escalate cancellations, publish output, finalize),
 refreshes leases, runs recovery, and claims a bounded batch of new pending
 jobs each turn, so an endless pending queue can never starve heartbeats,
