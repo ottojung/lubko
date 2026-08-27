@@ -588,7 +588,10 @@ def test_post_popen_invariant_refusal_converges_child(
     monkeypatch.setattr(supervisor.subprocess, "Popen", spy_popen)  # type: ignore[attr-defined]
     calls = {"n": 0}
     valid = _facts()
-    violating = _facts(supervisor_child_present=True, pre_spawn_obligation=True)
+    # A genuine authority-invariant violation: two live consumers are present
+    # (a published child AND an unresolved child hold) at the post-Popen
+    # publication boundary, which must refuse and converge the live spawn.
+    violating = _facts(supervisor_child_present=True, unresolved_child=True)
 
     def fake_reconcile() -> AuthorityFacts:
         calls["n"] += 1
