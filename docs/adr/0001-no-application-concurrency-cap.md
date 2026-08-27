@@ -25,8 +25,9 @@ conflicts with Lubko's core contract and solves the wrong layer's problem.
 
 This record settles the question. Lubko must **not** impose an
 application-level maximum on active jobs. It records why, what the real
-boundary between *bounded interface/output state* and *unbounded execution
-concurrency* is, which resource-safety mechanisms remain acceptable, how
+boundary between *bounded interface state and bounded per-job output windows*
+and *unbounded execution concurrency with aggregate output that scales* is, which
+resource-safety mechanisms remain acceptable, how
 resource boundaries are enforced, how overload is made observable, and which
 capsule designs were considered and rejected.
 
@@ -46,7 +47,7 @@ jobs" and reports aggregates rather than a single job id for exactly that
 reason. This ADR makes that stance an explicit, durable architectural decision
 rather than an incidental consequence of the current implementation.
 
-## Bounded output/interface state vs. execution concurrency
+## Bounded interface state and per-job output windows vs. unbounded execution concurrency and aggregate output
 
 The decision rests on a sharp separation that must be preserved in every future
 change:
@@ -55,18 +56,23 @@ change:
   alive at once. This is intentionally **unbounded by the application**. It is a
   property of the host, not of the queue logic.
 
-- **Output state** has **bounded per-job windows**, not a bounded total. Each
-  job's live tail is recomputed as the newest 4000 bytes, so one job's live
-  output window is capped regardless of how much it produced; immutable output
-  is archived into bounded chunks; terminal rows and owned chunks are eventually
-  reclaimed by a garbage-collection pass under `LUBKO_GC_RETENTION_SECONDS` and
-  `LUBKO_GC_BATCH_LIMIT`. These bounds are *per job* (or per GC pass), not a
-  global cap: the aggregate live-tail, spool, and retained-history footprint
-  grows with the number of concurrently active jobs, because every active job
-  contributes its own bounded window. The real distinction is bounded
-  *per-job* output windows, bounded *chunks/passes*, and a bounded
-  machine-readable interface surface, while the aggregate output and storage
-  cost scales with concurrency.
+- **Output state** separates a bounded local live spool from unbounded-while-active
+  history. Each job's local capture spool is capped by
+  `LUBKO_OUTPUT_SPOOL_MAX_BYTES` (default 4 MiB), and each live tail / published
+  chunk payload is itself bounded (the live tail is recomputed as the newest 4000
+  bytes). Immutable historical chunks, however, are appended as output is
+  produced, and a long-running or high-output job can accumulate **arbitrarily
+  many** immutable history chunks while it stays active; they are only reclaimed
+  once the job reaches a terminal state and passes the GC retention window
+  (`LUBKO_GC_RETENTION_SECONDS`, `LUBKO_GC_BATCH_LIMIT`). Chunk archiving and
+  retention therefore bound the *terminal* history and each *GC pass*, not the
+  total per-job history of a still-active job. The aggregate live-tail, spool,
+  and retained-history footprint grows both with the number of concurrently
+  active jobs and with the lifetime/output of each active job. The real
+  distinction is a bounded *per-job local spool* and *per-payload* size versus a
+  history chunk *count* that scales with active-job output until termination,
+  plus a bounded machine-readable interface surface — while the aggregate output
+  and storage cost scales with concurrency.
 
 - **Interface state** has a **bounded, fixed-size surface** and no per-job
   entries. The machine-readable health snapshot
@@ -115,29 +121,35 @@ are encouraged:
   database outage, so there is never a live command process Lubko has knowingly
   allowed to become unowned. This bounds the blast radius of an outage.
 
-- **Bounded per-job I/O and storage windows.** The 4000-byte live tail and
-  bounded chunk archiving cap what *one* job contributes to disk and memory; the
-  GC retention and batch limits bound how much terminal history is kept and how
-  much is reclaimed per pass. These are per-job and per-pass bounds, not a global
-  cap: the aggregate output/spool storage still scales with the number of
-  concurrently active jobs. They keep any individual job's footprint bounded
-  even under many concurrent jobs.
+- **Bounded per-job local spool and per-payload sizes, not a bounded total.** The
+  `LUBKO_OUTPUT_SPOOL_MAX_BYTES` local capture spool and the per-payload 4000-byte
+  live tail cap what *one job's live, in-flight output* contributes to disk and
+  memory. The GC retention and batch limits bound how much terminal history is
+  kept and how much is reclaimed per pass, but they do **not** bound a still-active
+  job's accumulating history-chunk count. The aggregate output/spool storage
+  therefore scales with both the number of concurrently active jobs and the
+  lifetime/output of each; a single long-lived active job is not footprint-bounded.
 
-- **One shared connection and set-based operations, not per-job resources.** The
-  worker holds a *single* PostgreSQL connection for its whole lifetime and
-  services every job through that one connection — there is no connection or
-  thread allocated per job. Heartbeat, recovery, cancellation, and GC run as
-  bulk, set-based statements guarded by `LUBKO_DB_OPERATION_TIMEOUT_SECONDS`, and
-  the supervisor applies explicit per-turn batch/scan caps (e.g.
-  `LUBKO_CLAIM_BATCH_LIMIT`, `LUBKO_GC_BATCH_LIMIT`) and scan-interval deadlines
-  where they exist. These prevent any one turn from doing unbounded work, but the
-  total active-row work (heartbeating N running jobs, scanning N active leases)
-  scales with the number of active jobs. The benefit is bounded *per-turn* cost
-  and a single shared connection, not a total that is independent of job count.
+- **One shared connection, set-based operations, deadlines, and bounded scans
+  where they exist — not bounded total work.** The worker holds a *single*
+  PostgreSQL connection for its whole lifetime and services every job through that
+  one connection — there is no connection or thread allocated per job. Recovery,
+  cancellation, GC, and claiming run as bulk, set-based statements guarded by
+  `LUBKO_DB_OPERATION_TIMEOUT_SECONDS`, and the supervisor applies explicit
+  per-turn batch/scan caps for *claiming*, *cancellation*, *recovery*, and *GC*
+  (`LUBKO_CLAIM_BATCH_LIMIT`, `LUBKO_GC_BATCH_LIMIT`, and the scan-interval
+  deadlines) where those scans actually exist. Lease heartbeat, by contrast, is
+  intentionally unscoped: `bulk_refresh_leases` heartbeats **every eligible active
+  root ID** in one statement (`src/lubko/worker.py::bulk_refresh_leases`), so
+  heartbeat work scales with the number of active jobs. Aggregate and heartbeat
+  database work can therefore scale with active rows; the benefit is one shared
+  connection, set-based operations, operation deadlines, and bounded scans on the
+  non-heartbeat passes — not a total that is independent of job count.
 
-These are *rate, size, and deadline* bounds — they make the system's per-job and
-per-turn resource use predictable — and they are orthogonal to a concurrency
-ceiling.
+These bounds (local spool, per-payload size, set-based scans, operation deadlines)
+make the parts of the system that *are* bounded predictable, while the parts that
+scale — history-chunk accumulation, heartbeat, and aggregate active-row work —
+are instead made observable; all are orthogonal to a concurrency ceiling.
 
 ## Resource-boundary enforcement
 
@@ -238,8 +250,10 @@ A pre-allocated pool of execution "slots" that jobs occupy was rejected.
   avoids.
 
 All three share a root flaw: they make the application pretend to be a scheduler
-for a boundary it does not own, while the bounded output/interface state already
-removes any technical reason to do so.
+for a boundary it does not own, while the bounded interface state and bounded
+per-job output windows already remove any representational or per-job reason to
+do so (the aggregate output and active-row scaling that remains is left to the
+host/OS boundary and made observable).
 
 ## Consequences
 

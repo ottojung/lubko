@@ -494,13 +494,16 @@ job process runs as its own OS process/session/process group, executed directly
 from its `request.process` argv (never through a shell), and the daemon
 observes it with `Popen.poll()`-style checks. This is a deliberate,
 durable decision (see `docs/adr/0001-no-application-concurrency-cap.md`): each
-job's live/output window is bounded and the machine-readable health snapshot is a
-fixed-size aggregate with no per-job entries, but aggregate output, spool, and
-active-row database work still scale with the number of concurrently active jobs.
-The application therefore keeps per-job and per-turn costs bounded (one shared
-connection, set-based operations, explicit batch/scan/deadline caps) and leaves
-the hard ceiling on *execution* concurrency to the surrounding container/host/OS
-rather than acting as a scheduler. The supervisor loop services
+job's local capture spool and live tail are bounded, and the machine-readable
+health snapshot is a fixed-size aggregate with no per-job entries, but a
+long-running job can still accumulate arbitrarily many immutable history chunks
+until termination, and aggregate output, spool, and active-row database work
+(including lease heartbeat, which refreshes every active root in one statement)
+still scale with the number of concurrently active jobs. The application therefore
+uses one shared DB connection, set-based operations, operation deadlines, and
+bounded claim/cancellation/recovery/GC scans where they exist, and leaves the hard
+ceiling on *execution* concurrency to the surrounding container/host/OS rather than
+acting as a scheduler. The supervisor loop services
 running jobs (observe exits, escalate cancellations, publish output, finalize),
 refreshes leases, runs recovery, and claims a bounded batch of new pending
 jobs each turn, so an endless pending queue can never starve heartbeats,
