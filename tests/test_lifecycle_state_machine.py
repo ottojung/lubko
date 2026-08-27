@@ -174,6 +174,8 @@ def _patch_sources(monkeypatch: pytest.MonkeyPatch, scenario: _Scenario) -> None
             ),
         )
     state = SimpleNamespace(
+        applied_generation=0,
+        ready=False,
         child=SimpleNamespace() if scenario.sup_child_alive else None,
         spawning=SimpleNamespace() if scenario.spawning else None,
         unresolved_child=SimpleNamespace() if scenario.unresolved else None,

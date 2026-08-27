@@ -1692,6 +1692,12 @@ class SupervisorDaemon:
             parent_death_signal=True,
         )
         lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_SPAWNING_WRITE)
+        if not lifecycle_state.authorize_spawn(lifecycle_state.reconcile_authority_facts()):
+            self._message = (
+                "authority blocks the pre-spawn obligation (unresolved fate or live "
+                "consumer present); holding without starting a worker"
+            )
+            return None
         write_state(replace(read_state(), spawning=obligation))
         preexec = functools.partial(_child_preexec, os.getpid()) if _pdeathsig_supported() else None
         try:
@@ -1721,6 +1727,11 @@ class SupervisorDaemon:
         self.proc = proc
         child_ticks = proc_start_ticks(proc.pid)
         lifecycle_state.failpoint(lifecycle_state.FAILPOINT_SUPERVISOR_PID_UPGRADE)
+        if lifecycle_state.check_authority_invariants(lifecycle_state.reconcile_authority_facts()):
+            self._message = (
+                "authority invariant violation before pid-upgrade publication; holding the spawn"
+            )
+            return None
         try:
             write_state(
                 replace(

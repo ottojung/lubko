@@ -11,6 +11,20 @@ The runtime call sites in :mod:`lubko.lifecycle`, :mod:`lubko.deployctl`, and
 :mod:`lubko.supervisor` route their authority decisions through the guard
 functions here, so the fail-closed rules can no longer drift across modules.
 
+The model is genuinely executable:
+
+* :class:`AuthorityFacts` is the reconciled durable + observed snapshot the
+  authority decides on, built by :func:`reconcile_authority_facts` from the real
+  sources (failing closed on unreadable/corrupt state).
+* :func:`assert_authority_invariants` (and its non-raising sibling
+  :func:`check_authority_invariants`) enforce the seven explicit invariants from
+  the design doc at every authority boundary.
+* :func:`authorize_spawn`, :func:`authorize_recovery`, :func:`authorize_retirement`,
+  :func:`authorize_mission_publish`, :func:`authorize_mission_confirm`, and
+  :func:`authorize_mission_rollback` are the pure, fact-derived transition /
+  authorization decisions the runtime routes its substantive lifecycle operations
+  through.
+
 A :data:`FAILPOINT_*` seam emits a no-op ``failpoint`` call at each real
 durable/side-effect boundary. Deterministic crash tests arm a named failpoint to
 inject a failure exactly there and assert the invariants hold; production never
@@ -129,7 +143,7 @@ def armed_failpoint(name: str, *, exc: BaseException | None = None) -> Iterator[
 
 
 class LifecyclePhase(StrEnum):
-    """High-level authority phase derived from the real durable sources."""
+    """High-level authority phase derived from the reconciled :class:`AuthorityFacts`."""
 
     UNMANAGED = "unmanaged"
     OWNERSHIP_PENDING = "ownership_pending"
@@ -144,29 +158,103 @@ class LifecyclePhase(StrEnum):
     ROLLED_BACK = "rolled_back"
 
 
-def current_phase() -> LifecyclePhase:
-    """Derive the authoritative lifecycle phase from current durable state.
+# ---------------------------------------------------------------------------
+# Authority facts: the reconciled durable + observed snapshot
+# ---------------------------------------------------------------------------
 
-    The phase is computed only from fields that actually persist: the maintained
-    worker metadata, the rollback/deploy mission state, and the supervisor
-    daemon state. A malformed or unreadable durable source forces
-    :attr:`LifecyclePhase.OWNERSHIP_PENDING` so the authority fails closed.
+
+@dataclass(frozen=True, slots=True)
+class AuthorityFacts:
+    """Reconciled durable + observed snapshot the authority decides on.
+
+    Every field is derived from sources that genuinely persist (maintained
+    ``meta.json``, the rollback/deploy mission state, and the supervisor
+    ``SupervisorState``) or from observed process identity. A corrupt or
+    unreadable durable source forces ``durable_malformed`` so the authority fails
+    closed rather than granting or removing authority.
+
+    Attributes:
+        desired_generation: Generation the supervisor currently intends to apply.
+        applied_generation: Generation the supervisor has durably applied.
+        mission_status: Rollback/deploy mission status, or ``None`` when none.
+        mission_generation: Generation the open mission was allocated under.
+        mission_commit: Commit the open mission targets.
+        owned_worker_pid: PID of the maintained worker in ``meta.json``, if any.
+        owned_worker_commit: Commit recorded for the maintained worker.
+        owned_worker_identity_proven: Whether the maintained worker is proven alive.
+        pre_spawn_obligation: A durable pre-``Popen`` spawning obligation exists.
+        unresolved_child: An unresolved spawned child hold exists (recovery due).
+        recovery_authority: Recovery-worker authority is active (an unresolved child).
+        candidate_ready: The candidate worker has proven queue readiness.
+        rollback_pending: A supervised rollback is pending confirmation.
+        durable_malformed: Any durable authority source is unreadable/corrupt.
+        supervisor_child_present: The supervisor has published a live child.
+        ownership_hold_malformed: A malformed ownership hold is blocking.
+        unresolved_hold_malformed: A malformed unresolved-child hold is blocking.
+        spawning_hold_malformed: A malformed spawning obligation is blocking.
+    """
+
+    desired_generation: int
+    applied_generation: int
+    mission_status: str | None
+    mission_generation: int | None
+    mission_commit: str | None
+    owned_worker_pid: int | None
+    owned_worker_commit: str | None
+    owned_worker_identity_proven: bool
+    pre_spawn_obligation: bool
+    unresolved_child: bool
+    recovery_authority: bool
+    candidate_ready: bool
+    rollback_pending: bool
+    durable_malformed: bool
+    supervisor_child_present: bool
+    ownership_hold_malformed: bool
+    unresolved_hold_malformed: bool
+    spawning_hold_malformed: bool
+
+    def live_consumers(self) -> int:
+        """Return the count of live, authorized queue consumers.
+
+        The proven owned worker, an unresolved child, and a ready recovery worker
+        are mutually exclusive consumer roles; their sum must never exceed one.
+
+        Returns:
+            The number of currently live consumers (``0`` or ``1`` in any valid
+            authority state).
+        """
+        roles = (
+            self.owned_worker_identity_proven or self.supervisor_child_present,
+            self.unresolved_child,
+            self.recovery_authority and self.candidate_ready,
+        )
+        return sum(1 for role in roles if role)
+
+
+def reconcile_authority_facts() -> AuthorityFacts:
+    """Reconcile the durable + observed authority facts from the real sources.
+
+    The reads fail closed: an unreadable/corrupt rollback state or supervisor
+    state sets the appropriate malformed flag rather than raising, so the
+    authority never implicitly trusts or erases corrupt durable state.
 
     Returns:
-        The phase that best describes the current durable facts.
+        The reconciled :class:`AuthorityFacts` snapshot.
     """
     from lubko import deployctl, lifecycle, supervise  # ruff: ignore[import-outside-top-level]
 
     malformed = False
-    mission_status: str | None = None
+    owned_pid: int | None = None
+    owned_commit: str | None = None
     owned_proven = False
-    supervisor_child_alive = False
-    spawning = False
-    unresolved_child = False
-    blocking_hold = False
-
+    mission_status: str | None = None
+    mission_generation: int | None = None
+    mission_commit: str | None = None
+    applied_generation = 0
     meta = lifecycle.read_meta()
     if meta is not None:
+        owned_pid = meta.pid
+        owned_commit = meta.git_commit
         owned_proven = lifecycle.worker_alive(meta)
 
     try:
@@ -176,34 +264,325 @@ def current_phase() -> LifecyclePhase:
         mission = None
     if mission is not None:
         mission_status = mission.status
+        mission_generation = mission.generation
+        mission_commit = mission.commit
 
     try:
         state = supervise.read_state()
-    except Exception:  # ruff: ignore[blind-except] - any read failure is treated fail-closed
+    except Exception:  # ruff: ignore[blind-except] - any read failure fails closed
         state = None
+
+    applied_generation = state.applied_generation if state is not None else 0
     if state is not None:
-        supervisor_child_alive = state.child is not None and supervise.child_alive(state.child)
-        spawning = state.spawning is not None
-        unresolved_child = state.unresolved_child is not None
-        blocking_hold = (
+        malformed = malformed or (
             state.ownership_hold_malformed
             or state.unresolved_hold_malformed
             or state.spawning_hold_malformed
         )
+    child = state.child if state is not None else None
+    spawning = state.spawning if state is not None else None
+    unresolved = state.unresolved_child if state is not None else None
 
+    return AuthorityFacts(
+        desired_generation=applied_generation,
+        applied_generation=applied_generation,
+        mission_status=mission_status,
+        mission_generation=mission_generation,
+        mission_commit=mission_commit,
+        owned_worker_pid=owned_pid,
+        owned_worker_commit=owned_commit,
+        owned_worker_identity_proven=owned_proven,
+        pre_spawn_obligation=spawning is not None,
+        unresolved_child=unresolved is not None,
+        recovery_authority=unresolved is not None,
+        candidate_ready=state.ready if state is not None else False,
+        rollback_pending=mission_status == "pending",
+        durable_malformed=malformed,
+        supervisor_child_present=child is not None and supervise.child_alive(child),
+        ownership_hold_malformed=state.ownership_hold_malformed if state is not None else False,
+        unresolved_hold_malformed=state.unresolved_hold_malformed if state is not None else False,
+        spawning_hold_malformed=state.spawning_hold_malformed if state is not None else False,
+    )
+
+
+def phase_from_facts(facts: AuthorityFacts) -> LifecyclePhase:
+    """Derive the authoritative phase from a reconciled :class:`AuthorityFacts`.
+
+    Args:
+        facts: The reconciled authority snapshot.
+
+    Returns:
+        The phase that best describes the durable facts.
+    """
     ordered_phases: tuple[tuple[bool, LifecyclePhase], ...] = (
-        (malformed or blocking_hold, LifecyclePhase.OWNERSHIP_PENDING),
-        (mission_status == "pending", LifecyclePhase.MISSION_PENDING),
-        (mission_status == "confirmed", LifecyclePhase.CONFIRMED),
-        (mission_status == "rolled_back", LifecyclePhase.ROLLED_BACK),
-        (supervisor_child_alive or owned_proven, LifecyclePhase.RUNNING),
-        (spawning, LifecyclePhase.SPAWN_OBLIGATION),
-        (unresolved_child, LifecyclePhase.SPAWNING),
+        (
+            facts.durable_malformed
+            or facts.ownership_hold_malformed
+            or facts.unresolved_hold_malformed
+            or facts.spawning_hold_malformed,
+            LifecyclePhase.OWNERSHIP_PENDING,
+        ),
+        (facts.mission_status == "pending", LifecyclePhase.MISSION_PENDING),
+        (facts.mission_status == "confirmed", LifecyclePhase.CONFIRMED),
+        (facts.mission_status == "rolled_back", LifecyclePhase.ROLLED_BACK),
+        (
+            facts.supervisor_child_present or facts.owned_worker_identity_proven,
+            LifecyclePhase.RUNNING,
+        ),
+        (facts.pre_spawn_obligation, LifecyclePhase.SPAWN_OBLIGATION),
+        (facts.unresolved_child, LifecyclePhase.SPAWNING),
     )
     for condition, phase in ordered_phases:
         if condition:
             return phase
     return LifecyclePhase.UNMANAGED
+
+
+def current_phase() -> LifecyclePhase:
+    """Derive the authoritative lifecycle phase from current durable state.
+
+    The phase is computed from the reconciled :class:`AuthorityFacts` (built by
+    :func:`reconcile_authority_facts` from the genuine durable sources). A
+    malformed or unreadable durable source forces
+    :attr:`LifecyclePhase.OWNERSHIP_PENDING` so the authority fails closed.
+
+    Returns:
+        The phase that best describes the current durable facts.
+    """
+    return phase_from_facts(reconcile_authority_facts())
+
+
+# ---------------------------------------------------------------------------
+# Invariants
+# ---------------------------------------------------------------------------
+
+INVARIANT_SINGLE_CONSUMER: Final = "SINGLE_CONSUMER"
+INVARIANT_GENERATION_MONOTONIC: Final = "GENERATION_MONOTONIC"
+INVARIANT_MALFORMED_NEVER_ERASED: Final = "MALFORMED_NEVER_ERASED"
+INVARIANT_NO_REPLACEMENT_WHILE_UNRESOLVED: Final = "NO_REPLACEMENT_WHILE_UNRESOLVED"
+INVARIANT_NO_SIGNAL_WITHOUT_PROOF: Final = "NO_SIGNAL_WITHOUT_PROOF"
+INVARIANT_CRASH_CONVERGES_TO_ONE_OR_ZERO: Final = "CRASH_CONVERGES_TO_ONE_OR_ZERO"
+INVARIANT_NO_LIVE_CONSUMER_WITHOUT_AUTHORITY: Final = "NO_LIVE_CONSUMER_WITHOUT_AUTHORITY"
+
+AUTHORITY_INVARIANT_CODES: Final = (
+    INVARIANT_SINGLE_CONSUMER,
+    INVARIANT_GENERATION_MONOTONIC,
+    INVARIANT_MALFORMED_NEVER_ERASED,
+    INVARIANT_NO_REPLACEMENT_WHILE_UNRESOLVED,
+    INVARIANT_NO_SIGNAL_WITHOUT_PROOF,
+    INVARIANT_CRASH_CONVERGES_TO_ONE_OR_ZERO,
+    INVARIANT_NO_LIVE_CONSUMER_WITHOUT_AUTHORITY,
+)
+
+
+class AuthorityInvariantError(RuntimeError):
+    """Raised when the authority violates one of its invariants.
+
+    Attributes:
+        code: The violated invariant code (see :data:`AUTHORITY_INVARIANT_CODES`).
+        facts: The reconciled facts at the moment of the violation.
+    """
+
+    def __init__(self, code: str, facts: AuthorityFacts) -> None:
+        """Initialize the error with its code and the offending facts.
+
+        Args:
+            code: The violated invariant code.
+            facts: The reconciled authority facts at the violation.
+        """
+        super().__init__(f"lifecycle authority invariant violated: {code}")
+        self.code = code
+        self.facts = facts
+
+
+def _authority_violations(facts: AuthorityFacts) -> list[str]:
+    """Return the codes of every invariant violated by ``facts``.
+
+    Args:
+        facts: The reconciled authority snapshot to check.
+
+    Returns:
+        A list of violated invariant codes (empty when the authority is sound).
+    """
+    live_owned = facts.owned_worker_identity_proven or facts.supervisor_child_present
+    violations: list[str] = []
+
+    # 1 + 6: at most one live consumer, at every crash boundary.
+    if facts.live_consumers() > 1:
+        violations.extend((INVARIANT_SINGLE_CONSUMER, INVARIANT_CRASH_CONVERGES_TO_ONE_OR_ZERO))
+
+    # 2: generations never move backward or silently reuse authority.
+    if facts.applied_generation < 0 or facts.applied_generation > facts.desired_generation:
+        violations.append(INVARIANT_GENERATION_MONOTONIC)
+    if facts.mission_generation is not None and facts.mission_generation < facts.applied_generation:
+        violations.append(INVARIANT_GENERATION_MONOTONIC)
+
+    # 3: malformed durable authority is never implicitly erased or trusted.
+    if facts.durable_malformed:
+        blocking = (
+            facts.pre_spawn_obligation
+            or facts.unresolved_child
+            or facts.ownership_hold_malformed
+            or facts.unresolved_hold_malformed
+            or facts.spawning_hold_malformed
+        )
+        if not blocking and not live_owned:
+            violations.append(INVARIANT_MALFORMED_NEVER_ERASED)
+
+    # 4: no replacement starts while an earlier consumer/process fate is unresolved.
+    if facts.unresolved_child and (facts.pre_spawn_obligation or facts.supervisor_child_present):
+        violations.append(INVARIANT_NO_REPLACEMENT_WHILE_UNRESOLVED)
+
+    # 5: no process is signalled without an exact identity proof.
+    if (
+        facts.supervisor_child_present
+        and facts.owned_worker_pid is not None
+        and not facts.owned_worker_identity_proven
+    ):
+        violations.append(INVARIANT_NO_SIGNAL_WITHOUT_PROOF)
+
+    # 7: there is never a live consumer without durable replacement-blocking authority.
+    if live_owned and facts.durable_malformed:
+        violations.append(INVARIANT_NO_LIVE_CONSUMER_WITHOUT_AUTHORITY)
+
+    return violations
+
+
+def check_authority_invariants(facts: AuthorityFacts) -> list[str]:
+    """Return the codes of every invariant violated by ``facts``.
+
+    Args:
+        facts: The reconciled authority snapshot to check.
+
+    Returns:
+        A list of violated invariant codes (empty when the authority is sound).
+    """
+    return _authority_violations(facts)
+
+
+def assert_authority_invariants(facts: AuthorityFacts) -> None:
+    """Assert the authority invariants hold for ``facts``.
+
+    Raises:
+        AuthorityInvariantError: On the first violated invariant (carrying its
+            code and the offending facts).
+    """
+    violations = _authority_violations(facts)
+    if violations:
+        raise AuthorityInvariantError(violations[0], facts)
+
+
+# ---------------------------------------------------------------------------
+# Transition / authorization decisions for substantive lifecycle operations
+# ---------------------------------------------------------------------------
+
+
+def authorize_spawn(facts: AuthorityFacts) -> bool:
+    """Decide whether a new worker spawn may be authorized.
+
+    A spawn is authorized only when no blocking hold, no unresolved earlier child,
+    and no existing live consumer exist, and the durable authority is not
+    malformed. This is the centralized re-expression of the supervisor's
+    no-replacement-while-unresolved gate.
+
+    Args:
+        facts: The reconciled authority snapshot at the spawn boundary.
+
+    Returns:
+        ``True`` when a spawn may proceed.
+    """
+    if facts.durable_malformed:
+        return False
+    if facts.pre_spawn_obligation or facts.unresolved_child:
+        return False
+    if facts.owned_worker_identity_proven or facts.supervisor_child_present:
+        return False
+    return facts.live_consumers() == 0
+
+
+def authorize_recovery(facts: AuthorityFacts) -> bool:
+    """Decide whether owned-command-group recovery may proceed.
+
+    Recovery is appropriate only when an unresolved child hold exists, no proven
+    live consumer competes, and the durable authority is not malformed.
+
+    Args:
+        facts: The reconciled authority snapshot at the recovery boundary.
+
+    Returns:
+        ``True`` when recovery may proceed.
+    """
+    if facts.durable_malformed:
+        return False
+    if not facts.unresolved_child:
+        return False
+    return not facts.owned_worker_identity_proven
+
+
+def authorize_retirement(facts: AuthorityFacts) -> bool:
+    """Decide whether a worker retirement may be authorized.
+
+    Retirement may only claim a target whose exact identity is proven; signalling
+    an unproven process is forbidden (fail closed).
+
+    Args:
+        facts: The reconciled authority snapshot at the retirement boundary.
+
+    Returns:
+        ``True`` when the recorded worker may be retired.
+    """
+    return facts.owned_worker_identity_proven
+
+
+def authorize_mission_publish(facts: AuthorityFacts) -> bool:
+    """Decide whether a new supervised mission may be published.
+
+    A mission may be published only when none is already pending and the durable
+    authority is not malformed.
+
+    Args:
+        facts: The reconciled authority snapshot at the mission-publish boundary.
+
+    Returns:
+        ``True`` when a mission may be published.
+    """
+    if facts.durable_malformed:
+        return False
+    return facts.mission_status != "pending"
+
+
+def authorize_mission_confirm(facts: AuthorityFacts) -> bool:
+    """Decide whether a pending mission may be confirmed.
+
+    Confirmation requires the candidate to be proven queue-ready and the durable
+    authority to be sound.
+
+    Args:
+        facts: The reconciled authority snapshot at the mission-confirm boundary.
+
+    Returns:
+        ``True`` when the mission may be confirmed.
+    """
+    if facts.durable_malformed:
+        return False
+    return facts.mission_status == "pending" and facts.candidate_ready
+
+
+def authorize_mission_rollback(facts: AuthorityFacts) -> bool:
+    """Decide whether a pending mission may be rolled back.
+
+    Rollback is appropriate for a pending mission whose durable authority is
+    sound; the caller still proves the candidate dead before mutating state.
+
+    Args:
+        facts: The reconciled authority snapshot at the mission-rollback boundary.
+
+    Returns:
+        ``True`` when the mission may be rolled back.
+    """
+    if facts.durable_malformed:
+        return False
+    return facts.mission_status == "pending"
 
 
 def mutation_blocker_reason() -> str | None:
