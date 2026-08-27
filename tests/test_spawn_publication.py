@@ -16,7 +16,7 @@ import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -379,6 +379,82 @@ def test_pre_popen_obligation_carries_no_child(
     # no child until the spawn succeeds.
     assert read_state().spawning is None
     assert read_state().child is None
+
+
+class _FakeDirectProc:
+    """Minimal direct-Popen stand-in that records its own convergence."""
+
+    def __init__(self, pid: int) -> None:
+        """Record the fake PID.
+
+        Args:
+            pid: The PID the fake spawn reports.
+        """
+        self.pid = pid
+        self.terminated = False
+
+    def terminate(self) -> None:
+        """Record the termination request."""
+        self.terminated = True
+
+    @staticmethod
+    def wait(timeout: float | None = None) -> int:
+        """Report an immediate clean exit.
+
+        Args:
+            timeout: Ignored.
+
+        Returns:
+            The fake exit code.
+        """
+        del timeout
+        return 0
+
+    def kill(self) -> None:
+        """Record the kill request."""
+        self.terminated = True
+
+
+def test_missing_pre_popen_obligation_fails_closed_without_synthesis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live child without its pre-Popen obligation is converged, never published.
+
+    Synthesizing a fresh obligation after Popen cannot prove the required
+    pre-Popen durability boundary, so the spawn must fail closed: the direct
+    child is converged by exact single-PID signalling, no child is published,
+    no replacement obligation is fabricated, and a backoff is recorded so no
+    second consumer can be authorized.
+    """
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: FAKE_RUNTIME_ROOT)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
+
+    meta_calls: list[object] = []
+
+    def fake_write_meta(meta: lifecycle.WorkerMeta) -> None:
+        meta_calls.append(meta)
+
+    monkeypatch.setattr(lifecycle, "write_meta", fake_write_meta)
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+
+    def fake_spawn_without_obligation(_commit: str) -> WorkerChild:
+        daemon.proc = cast("subprocess.Popen[bytes]", _FakeDirectProc(4711))
+        return _published_child()
+
+    monkeypatch.setattr(daemon, "_spawn_worker", fake_spawn_without_obligation)
+    daemon._spawn_and_publish(COMMIT)
+
+    # No authority was published and no obligation was synthesized.
+    state = read_state()
+    assert state.child is None, "no child was published without its obligation"
+    assert state.spawning is None, "no replacement obligation was fabricated"
+    assert meta_calls == [], "no lifecycle meta was written"
+    assert daemon.proc is None, "the direct child was converged and released"
+    assert state.next_attempt_at is not None, "a backoff hold was recorded"
+    assert daemon._message is not None
+    assert "pre-Popen obligation" in daemon._message
 
 
 # Keep ``subprocess`` referenced for parity with sibling spawn tests.

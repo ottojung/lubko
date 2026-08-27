@@ -1178,20 +1178,26 @@ class SupervisorDaemon:
         # finish, never a silently duplicated consumer.
         obligation = read_state().spawning
         if obligation is None:
-            # _spawn_worker always durably records the obligation before returning
-            # a child, so a missing obligation here is unreachable; guard it so
-            # the publication protocol can never publish a child without the
-            # matching blocking authority.
-            obligation = SpawningObligation(
-                token=child.token,
-                commit=commit,
-                creator_pid=os.getpid(),
-                creator_start_time_ticks=proc_start_ticks(os.getpid()) or 0,
-                pid=child.pid,
-                start_time_ticks=child.start_time_ticks,
-                created_at=time.time(),
-                boot_id=current_boot_id(),
+            # The live child exists but the durable pre-Popen obligation is
+            # missing. Synthesizing a fresh obligation now cannot prove the
+            # required pre-Popen durability boundary, so it would defeat the
+            # entire crash-safety protocol. Fail closed instead: converge our own
+            # direct child by exact single-PID signalling and hold with backoff.
+            # No child is published and no replacement obligation is fabricated,
+            # so no second consumer can be authorized and no orphan is left
+            # running. The next spawn attempt (if still required) writes the
+            # obligation correctly before Popen.
+            self._message = (
+                "spawned worker has no durable pre-Popen obligation; "
+                "converging it and holding without publishing authority"
             )
+            LOGGER.error("%s", self._message)
+            if self.proc is not None:
+                self._converge_direct_child(self.proc)
+                self.proc = None
+            next_attempt_at = now + self._backoff_seconds(read_state().restart_count)
+            write_state(replace(read_state(), next_attempt_at=next_attempt_at))
+            return
         published = replace(
             read_state(),
             mode=MODE_RUN,
