@@ -1321,22 +1321,124 @@ def pg_safe_decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace").replace("\x00", "\ufffd")
 
 
-def decode_range(path: Path, start: int, end: int) -> str:
-    """Decode the bytes in ``[start, end)`` as PostgreSQL-safe UTF-8 text.
+_UTF8_CONTINUATION_MIN: Final = 0x80
+_UTF8_CONTINUATION_MAX: Final = 0xBF
+_UTF8_TWO_BYTE_MIN: Final = 0xC2
+_UTF8_TWO_BYTE_MAX: Final = 0xDF
+_UTF8_THREE_BYTE_MIN: Final = 0xE0
+_UTF8_THREE_BYTE_MAX: Final = 0xEF
+_UTF8_FOUR_BYTE_MIN: Final = 0xF0
+_UTF8_FOUR_BYTE_MAX: Final = 0xF4
+_UTF8_MIN_CODE_POINT_LEN: Final = 2
+_UTF8_MAX_CODE_POINT_LEN: Final = 4
 
-    The canonical conversion uses :func:`pg_safe_decode`: invalid UTF-8 byte
-    sequences become U+FFFD and NUL (U+0000) is replaced with U+FFFD so the
-    result is always safe for PostgreSQL ``text`` / ``jsonb``.
+
+def _is_utf8_continuation_byte(byte: int) -> bool:
+    """Return ``True`` when ``byte`` continues a multi-byte UTF-8 sequence."""
+    return _UTF8_CONTINUATION_MIN <= byte <= _UTF8_CONTINUATION_MAX
+
+
+def _code_point_length(lead: int) -> int:
+    """Return the byte length (2/3/4) of a structurally valid multi-byte lead.
+
+    ASCII (``< 0x80``) and invalid lead bytes (including the overlong ``0xC0``/
+    ``0xC1`` heads and the ``0xF5..0xFF`` range) return ``0``; the caller then
+    leaves the raw boundary unchanged so ``pg_safe_decode`` defines the behavior.
+    """
+    if _UTF8_TWO_BYTE_MIN <= lead <= _UTF8_TWO_BYTE_MAX:
+        return 2
+    if _UTF8_THREE_BYTE_MIN <= lead <= _UTF8_THREE_BYTE_MAX:
+        return 3
+    if _UTF8_FOUR_BYTE_MIN <= lead <= _UTF8_FOUR_BYTE_MAX:
+        return 4
+    return 0
+
+
+def _valid_code_point_at(data: bytes, start: int, length: int) -> bool:
+    """Return ``True`` if ``data[start:start + length]`` is a valid code point.
+
+    A valid code point has a structurally correct lead byte whose declared length
+    matches ``length`` and the remaining ``length - 1`` bytes are all continuation
+    bytes. The check inspects only ``length`` bytes, never scanning further.
+    """
+    if length < _UTF8_MIN_CODE_POINT_LEN or length > _UTF8_MAX_CODE_POINT_LEN:
+        return False
+    if start < 0 or start + length > len(data):
+        return False
+    if _code_point_length(data[start]) != length:
+        return False
+    return all(_is_utf8_continuation_byte(data[start + i]) for i in range(1, length))
+
+
+def align_code_point_start(data: bytes, candidate: int) -> int:
+    """Return the smallest code-point boundary at or after ``candidate``.
+
+    The live-tail head only moves when ``candidate`` is strictly inside a
+    structurally valid 2/3/4-byte code point: the head snaps forward to that
+    code point's end (the next boundary) so the newest tail never begins
+    mid-rune. Because a code point is at most four bytes, the lead lies within
+    three bytes before ``candidate``; only those few bytes are inspected and a
+    continuation run with no valid lead nearby is left untouched. The head moves
+    at most three bytes forward, so the window stays within its byte bound, and
+    genuinely invalid bytes are left to ``pg_safe_decode``.
 
     Args:
-        path: Capture file for the stream.
-        start: Inclusive byte offset.
-        end: Exclusive byte offset.
+        data: Raw bytes of the capture file.
+        candidate: Requested head offset, clamped into ``[0, len(data)]``.
 
     Returns:
-        The decoded text.
+        The aligned head offset (a code-point boundary or the bounds of ``data``).
     """
-    return pg_safe_decode(read_range(path, start, end))
+    n = len(data)
+    if candidate <= 0:
+        return 0
+    if candidate >= n:
+        return n
+    for lead_back in (1, 2, 3):
+        lead = candidate - lead_back
+        if lead < 0:
+            break
+        length = _code_point_length(data[lead])
+        if length == 0 or lead_back >= length:
+            continue
+        if _valid_code_point_at(data, lead, length):
+            return lead + length
+    return candidate
+
+
+def align_code_point_end(data: bytes, candidate: int) -> int:
+    """Return the largest code-point boundary at or before ``candidate``.
+
+    An archive chunk end only moves when ``candidate`` is strictly inside a
+    structurally valid 2/3/4-byte code point: the end snaps back to that code
+    point's start so the immutable chunk never splits a rune and only ever holds
+    complete code points. Only the few bytes around ``candidate`` are inspected;
+    a continuation run with no valid lead within three bytes is left untouched and
+    decoded deterministically by ``pg_safe_decode``. The chunk stays within its
+    byte bound because the end only moves backward (toward older bytes).
+
+    Args:
+        data: Raw bytes of the capture file.
+        candidate: Requested end offset, clamped into ``[0, len(data)]``.
+
+    Returns:
+        The aligned end offset (a code-point boundary or the bounds of ``data``).
+    """
+    n = len(data)
+    if candidate <= 0:
+        return 0
+    if candidate >= n:
+        return n
+    for lead_back in (1, 2, 3):
+        lead = candidate - lead_back
+        if lead < 0:
+            break
+        length = _code_point_length(data[lead])
+        if length == 0 or lead_back >= length:
+            continue
+        if _valid_code_point_at(data, lead, length):
+            return lead
+    return candidate
 
 
 def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[str, int, int]:
@@ -1344,9 +1446,13 @@ def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[st
 
     Byte offsets are used for the window bounds and decoding is UTF-8 with
     replacement, so offsets are deterministic even when a window starts inside
-    a multi-byte sequence. ``base`` is the logical offset of the first physical
+    a multi-byte sequence. The window head is aligned forward to the next
+    code-point boundary so a multi-byte rune is never split across the live-tail
+    boundary: the returned text is exactly the decode of its ``[start, end)``
+    byte range, with no partial rune replaced by U+FFFD, while the window stays
+    within ``max_chars``. ``base`` is the logical offset of the first physical
     byte in the file (``OutputStream.spool_start``); the returned ``start`` and
-    ``end`` are logical offsets and the physical read is translated by ``base``.
+    ``end`` are logical offsets.
 
     Args:
         path: Capture file for the stream.
@@ -1356,10 +1462,12 @@ def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[st
     Returns:
         A ``(text, start, end)`` tuple where ``end`` is the logical file size.
     """
-    size = stream_size(path) + base
+    data = read_output(path)
+    size = len(data) + base
     window = min(size, max_chars)
     start = size - window
-    return decode_range(path, start - base, size - base), start, size
+    head = align_code_point_start(data, start - base)
+    return pg_safe_decode(data[head:]), head + base, size
 
 
 def archive_target(size: int) -> int:
@@ -1655,13 +1763,19 @@ def _plan_chunks(
     last_chunk = stream.last_chunk
     sequence = stream.sequence
     target = archive_target(tail_end)
+    data = read_output(stream.path)
     while target - archived_upto >= OUTPUT_CHUNK_MAX_BYTES:
         chunk_start = archived_upto
-        chunk_end = chunk_start + OUTPUT_CHUNK_MAX_BYTES
-        value = decode_range(
-            stream.path,
-            chunk_start - stream.spool_start,
-            chunk_end - stream.spool_start,
+        # End the chunk on a complete code point so its decoded value is exactly
+        # the decode of its byte range and never collides mid-rune with the
+        # adjacent chunk or the live tail. The alignment moves the end backward
+        # by at most three bytes, so the chunk stays within OUTPUT_CHUNK_MAX_BYTES.
+        chunk_end = (
+            align_code_point_end(data, chunk_start + OUTPUT_CHUNK_MAX_BYTES - stream.spool_start)
+            + stream.spool_start
+        )
+        value = pg_safe_decode(
+            data[chunk_start - stream.spool_start : chunk_end - stream.spool_start]
         )
         chunk_id = uuid4()
         chunk_payload = json.dumps(
