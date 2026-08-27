@@ -4099,18 +4099,21 @@ def verify_server_isolation(conn: JobsConnection) -> None:
     The worker still scopes every query by its configured server identity
     (defense in depth), but cross-server isolation must also be enforced at the
     database authorization boundary so a compromised or misconfigured worker
-    credential cannot read, mutate, or spoof another execution server's rows.
-    The boundary is row-level security on ``lubko.jobs``, the trusted
-    ``lubko.session_server()`` identity function, and the per-server isolation
-    policies. The worker refuses to run without it, failing closed.
+    credential cannot read, mutate, or spoof another execution server's rows, and
+    so an output chunk can only reference a command root of its own server. The
+    boundary is row-level security on ``lubko.jobs``, the trusted
+    ``lubko.session_server()`` identity function, the same-server chunk
+    enforcement (``lubko.chunk_root_server()`` + the ``jobs_chunk_root_server``
+    trigger), and the per-server isolation policies. The worker refuses to run
+    without it, failing closed.
 
     Args:
         conn: Open PostgreSQL connection.
 
     Raises:
         SchemaInvariantError: If row-level security is not enabled, the
-            session-server identity function is missing, or no isolation policy
-            is present.
+            session-server identity function is missing, the same-server chunk
+            enforcement is missing, or no isolation policy is present.
     """
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
@@ -4126,7 +4129,24 @@ def verify_server_isolation(conn: JobsConnection) -> None:
             "WHERE n.nspname = %s AND p.proname = 'session_server'\n",
             (JOBS_SCHEMA,),
         )
-        function_exists = cursor.fetchone() is not None
+        session_function_exists = cursor.fetchone() is not None
+        cursor.execute(
+            "SELECT 1\n"
+            "FROM pg_proc p\n"
+            "JOIN pg_namespace n ON n.oid = p.pronamespace\n"
+            "WHERE n.nspname = %s AND p.proname = 'chunk_root_server'\n",
+            (JOBS_SCHEMA,),
+        )
+        chunk_function_exists = cursor.fetchone() is not None
+        cursor.execute(
+            "SELECT 1\n"
+            "FROM pg_trigger t\n"
+            "JOIN pg_class c ON c.oid = t.tgrelid\n"
+            "WHERE c.relnamespace = to_regnamespace(%s) AND c.relname = %s\n"
+            "    AND t.tgname = 'jobs_chunk_root_server'\n",
+            (JOBS_SCHEMA, JOBS_TABLE),
+        )
+        chunk_trigger_exists = cursor.fetchone() is not None
         cursor.execute(
             "SELECT polname\nFROM pg_policies\nWHERE schemaname = %s AND tablename = %s\n",
             (JOBS_SCHEMA, JOBS_TABLE),
@@ -4135,8 +4155,12 @@ def verify_server_isolation(conn: JobsConnection) -> None:
     missing: list[str] = []
     if not rls_enabled:
         missing.append("row-level security on lubko.jobs")
-    if not function_exists:
+    if not session_function_exists:
         missing.append(f"{SERVER_ISOLATION_FUNCTION}() identity function")
+    if not chunk_function_exists:
+        missing.append("lubko.chunk_root_server() same-server ownership function")
+    if not chunk_trigger_exists:
+        missing.append("jobs_chunk_root_server same-server chunk trigger")
     if not any(p.startswith(JOBS_RLS_POLICY_PREFIX) for p in policies):
         missing.append("per-server isolation policies on lubko.jobs")
     if missing:
