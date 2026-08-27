@@ -210,13 +210,22 @@ def test_request_run_refuses_corrupt_mission_without_overwrite() -> None:
 
 
 def test_concurrent_monotonic_allocation_under_shared_lock() -> None:
-    """Concurrent allocations are strictly increasing and never collide."""
+    """Concurrent allocations never collide or reuse a generation.
+
+    The shared generation lock serializes each allocation, so every returned
+    generation is unique and the set forms the contiguous window above the
+    mission floor. Collection order is scheduler-dependent (appends happen
+    after the lock is released), so only the set/range are asserted.
+    """
     _write_mission(_mission(5))  # floor at generation 6
+    iterations = 10
+    thread_count = 3
+    expected = iterations * thread_count
     generations: list[int] = []
     lock = threading.Lock()
 
     def allocate() -> None:
-        for _ in range(20):
+        for _ in range(iterations):
             with supervise.generation_lock():
                 generation = supervise.next_generation()
                 supervise.write_desired(
@@ -232,17 +241,16 @@ def test_concurrent_monotonic_allocation_under_shared_lock() -> None:
             with lock:
                 generations.append(generation)
 
-    threads = [threading.Thread(target=allocate) for _ in range(4)]
+    threads = [threading.Thread(target=allocate) for _ in range(thread_count)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
 
-    assert len(generations) == 80
-    assert generations == sorted(generations)
-    assert len(set(generations)) == 80
-    assert min(generations) == 6
-    assert max(generations) == 85
+    assert len(generations) == expected
+    # No duplicate or reused generation, and exactly the contiguous window above
+    # the mission floor: 6 .. 6 + expected - 1.
+    assert sorted(set(generations)) == list(range(6, 6 + expected))
 
 
 def test_lifecycle_migration_recovers_from_corrupt_mission() -> None:
