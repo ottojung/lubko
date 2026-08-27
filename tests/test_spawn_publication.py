@@ -429,6 +429,8 @@ def test_missing_pre_popen_obligation_fails_closed_without_synthesis(
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
     monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: FAKE_RUNTIME_ROOT)
     monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
+    # Owned-group recovery succeeds, so the clean release path is exercised.
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _token: None)
 
     meta_calls: list[object] = []
 
@@ -452,9 +454,177 @@ def test_missing_pre_popen_obligation_fails_closed_without_synthesis(
     assert state.spawning is None, "no replacement obligation was fabricated"
     assert meta_calls == [], "no lifecycle meta was written"
     assert daemon.proc is None, "the direct child was converged and released"
+    assert state.unresolved_child is None, "authority released cleanly after recovery"
     assert state.next_attempt_at is not None, "a backoff hold was recorded"
     assert daemon._message is not None
     assert "pre-Popen obligation" in daemon._message
+
+
+def test_missing_obligation_convergence_failure_keeps_durable_blocking_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-converging direct child is durably held, never forgotten or replaced.
+
+    When the live child cannot be positively reaped, the possibly-live direct
+    child must not be dropped (which would forget it with no blocking authority)
+    and no replacement may be authorized. The exact-identity unresolved-child
+    hold is persisted durably (carrying the child's token so later convergence
+    can also recover owned command groups) and the direct handle is retained so
+    a later tick can converge it by pinned single-PID signals.
+    """
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: FAKE_RUNTIME_ROOT)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
+    monkeypatch.setattr(lifecycle, "write_meta", lambda _meta: None)
+    # Simulate the child still being live so reconciliation cannot converge it.
+    monkeypatch.setattr(
+        supervisor.SupervisorDaemon, "_converge_unresolved", lambda _self, _h: False
+    )
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    # Force direct-child convergence to fail so the fail-closed hold path runs.
+    monkeypatch.setattr(daemon, "_converge_direct_child", lambda _proc: False)
+
+    published = _published_child()
+
+    def fake_spawn_without_obligation(_commit: str) -> WorkerChild:
+        daemon.proc = cast("subprocess.Popen[bytes]", _FakeDirectProc(published.pid))
+        return published
+
+    monkeypatch.setattr(daemon, "_spawn_worker", fake_spawn_without_obligation)
+    daemon._spawn_and_publish(COMMIT)
+
+    state = read_state()
+    assert state.child is None, "no child was published without its obligation"
+    assert state.spawning is None, "no replacement obligation was fabricated"
+    # The possibly-live child is durably recorded as a blocking hold carrying
+    # the exact child identity/token, and the direct handle is retained.
+    held = state.unresolved_child
+    assert held is not None, "a durable blocking hold was persisted for the live child"
+    assert held.pid == published.pid
+    assert held.start_time_ticks == published.start_time_ticks
+    assert held.token == published.token, "the exact incarnation token is preserved"
+    assert daemon.proc is not None, "the direct child handle was not dropped"
+    assert state.next_attempt_at is not None, "a backoff hold was recorded"
+    assert daemon._message is not None
+    assert "pre-Popen obligation" in daemon._message
+
+    # The durable hold keeps replacement blocked: while the child is still live,
+    # a fresh spawn attempt cannot publish a second consumer.
+    spawn_attempts: list[str] = []
+
+    def blocked_spawn(c: str) -> WorkerChild:
+        spawn_attempts.append(c)
+        return published
+
+    monkeypatch.setattr(daemon, "_spawn_worker", blocked_spawn)
+    daemon._ensure_worker(COMMIT)
+    assert spawn_attempts == [], "the durable hold blocked any replacement spawn"
+    assert read_state().unresolved_child is not None, "the hold stayed durable"
+
+
+def test_missing_obligation_without_direct_handle_keeps_durable_blocking_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A returned child with no usable Popen handle is still durably held.
+
+    Defensively, if the direct handle is unexpectedly unavailable, the possibly
+    live child must not be merely backed off without authority: the exact-identity
+    blocking hold (carrying the child's token) is persisted so a later tick can
+    converge it by pinned single-PID signals, and no replacement is authorized.
+    """
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: FAKE_RUNTIME_ROOT)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
+    monkeypatch.setattr(lifecycle, "write_meta", lambda _meta: None)
+    monkeypatch.setattr(
+        supervisor.SupervisorDaemon, "_converge_unresolved", lambda _self, _h: False
+    )
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    published = _published_child()
+
+    def fake_spawn_without_handle(_commit: str) -> WorkerChild:
+        # No direct Popen handle is recorded despite a returned child.
+        daemon.proc = None
+        return published
+
+    monkeypatch.setattr(daemon, "_spawn_worker", fake_spawn_without_handle)
+    daemon._spawn_and_publish(COMMIT)
+
+    state = read_state()
+    assert state.child is None, "no child was published without its obligation"
+    assert state.spawning is None, "no replacement obligation was fabricated"
+    held = state.unresolved_child
+    assert held is not None, "a durable blocking hold was persisted for the live child"
+    assert held.pid == published.pid
+    assert held.token == published.token, "the exact incarnation token is preserved"
+    assert daemon.proc is None, "no direct handle was available to retain"
+
+    spawn_attempts: list[str] = []
+
+    def blocked_spawn(c: str) -> WorkerChild:
+        spawn_attempts.append(c)
+        return published
+
+    monkeypatch.setattr(daemon, "_spawn_worker", blocked_spawn)
+    daemon._ensure_worker(COMMIT)
+    assert spawn_attempts == [], "the durable hold blocked any replacement spawn"
+
+
+def test_missing_obligation_converged_but_group_recovery_fails_keeps_token_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker reaped but owned-group recovery fails: keep a token-bearing hold.
+
+    A returned worker may already have launched independent command groups under
+    its lifecycle token. Even after the direct child is positively reaped, if the
+    exact-incarnation owned-group recovery fails the durable token-bearing hold
+    must survive so no replacement can start with stale side-effecting groups.
+    """
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: FAKE_RUNTIME_ROOT)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
+    monkeypatch.setattr(lifecycle, "write_meta", lambda _meta: None)
+    monkeypatch.setattr(
+        supervisor,
+        "recover_owned_groups",
+        lambda _token: (_ for _ in ()).throw(supervisor.OwnedGroupRecoveryError("db down")),
+    )
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    published = _published_child()
+
+    def fake_spawn_without_obligation(_commit: str) -> WorkerChild:
+        daemon.proc = cast("subprocess.Popen[bytes]", _FakeDirectProc(published.pid))
+        return published
+
+    monkeypatch.setattr(daemon, "_spawn_worker", fake_spawn_without_obligation)
+    daemon._spawn_and_publish(COMMIT)
+
+    state = read_state()
+    assert state.child is None, "no child was published without its obligation"
+    assert state.spawning is None, "no replacement obligation was fabricated"
+    assert daemon.proc is None, "the reaped child handle was released"
+    # A durable token-bearing hold blocks any replacement.
+    held = state.unresolved_child
+    assert held is not None, "a token-bearing blocking hold survived the group recovery failure"
+    assert held.token == published.token, "the exact incarnation token is preserved"
+    assert held.pid == published.pid
+    assert state.next_attempt_at is not None, "a backoff hold was recorded"
+    assert daemon._message is not None
+    assert "owned command groups" in daemon._message
+
+    # The durable hold keeps replacement blocked on the next tick.
+    spawn_attempts: list[str] = []
+
+    def blocked_spawn(c: str) -> WorkerChild:
+        spawn_attempts.append(c)
+        return published
+
+    monkeypatch.setattr(daemon, "_spawn_worker", blocked_spawn)
+    daemon._ensure_worker(COMMIT)
+    assert spawn_attempts == [], "the durable hold blocked any replacement spawn"
 
 
 # Keep ``subprocess`` referenced for parity with sibling spawn tests.

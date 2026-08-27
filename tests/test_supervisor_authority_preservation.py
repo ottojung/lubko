@@ -385,6 +385,7 @@ def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
         "_record_shared_group_hold",
         "_resolve_spawning_obligation",
         "_finish_publication",
+        "_persist_missing_obligation_hold",
         "_spawn_and_publish",
         "_resolve_pidless_spawn",
         "_resolve_identified_spawn",

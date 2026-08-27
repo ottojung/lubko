@@ -1192,11 +1192,54 @@ class SupervisorDaemon:
                 "converging it and holding without publishing authority"
             )
             LOGGER.error("%s", self._message)
-            if self.proc is not None:
-                self._converge_direct_child(self.proc)
+            backoff = self._backoff_seconds(read_state().restart_count)
+            next_attempt_at = now + backoff
+
+            def _persist_missing_obligation_hold() -> None:
+                # The returned child already carries the exact lifecycle token and
+                # start-time identity, so the durable blocking hold names the
+                # exact incarnation: a later tick converges the possibly-live
+                # instance by pinned single-PID signals and recovers any owned
+                # command groups under the exact token. A retroactive fake
+                # pre-Popen obligation is deliberately not fabricated.
+                write_state(
+                    replace(
+                        read_state(),
+                        unresolved_child=UnresolvedChild(
+                            pid=child.pid,
+                            start_time_ticks=child.start_time_ticks,
+                            token=child.token,
+                            spawned_at=time.time(),
+                        ),
+                        next_attempt_at=next_attempt_at,
+                    )
+                )
+
+            if self.proc is not None and self._converge_direct_child(self.proc):
+                # The direct child was positively reaped by exact single-PID
+                # signalling. A returned worker may already have launched
+                # independent command groups under its lifecycle token, so the
+                # exact-incarnation owned-group recovery must also succeed before
+                # any authority is released; otherwise a durable token-bearing
+                # blocking hold is kept so no replacement can start.
                 self.proc = None
-            next_attempt_at = now + self._backoff_seconds(read_state().restart_count)
-            write_state(replace(read_state(), next_attempt_at=next_attempt_at))
+                if self._recover_spawn_owned_groups(child.token):
+                    write_state(replace(read_state(), next_attempt_at=next_attempt_at))
+                    return
+                self._message = (
+                    "spawned worker reaped but its owned command groups could not "
+                    "be recovered; holding a token-bearing blocking authority "
+                    "without publishing a replacement"
+                )
+                LOGGER.error("%s", self._message)
+                _persist_missing_obligation_hold()
+                return
+            # Convergence failed (or the direct handle is unexpectedly
+            # unavailable): the possibly-live child must not be forgotten and no
+            # replacement may be authorized. Persist the durable exact-identity
+            # blocking hold and retain the direct handle when present so the next
+            # tick can re-prove and converge it.
+            _persist_missing_obligation_hold()
             return
         published = replace(
             read_state(),
