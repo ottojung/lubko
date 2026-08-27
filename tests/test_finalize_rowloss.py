@@ -18,6 +18,7 @@ import psycopg
 import pytest
 
 from lubko import worker
+from lubko.protocol import PROTOCOL_VERSION
 from lubko.worker import ActiveJob, JobResult, OutputStream, Supervisor, finish_job
 
 if TYPE_CHECKING:
@@ -107,6 +108,7 @@ def make_active_job(tmp_path: Path, *, completed: bool) -> ActiveJob:
         stream.eof = True
     job.completed = completed
     job.returncode = 0 if completed else None
+    job.version = PROTOCOL_VERSION
     return job
 
 

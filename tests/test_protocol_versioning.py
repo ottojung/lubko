@@ -10,11 +10,16 @@ All tests run without a database.
 """
 
 import json
-from uuid import uuid4
+from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
 
+from lubko import worker
+from lubko.config import load_worker_protocol_range
 from lubko.protocol import (
+    OUTPUT_CHUNK_MAX_BYTES,
+    OUTPUT_TAIL_MAX_BYTES,
     ProtocolError,
     build_output_chunk_payload,
     build_payload,
@@ -25,16 +30,19 @@ from lubko.protocol_versioning import (
     CURRENT_PROTOCOL_VERSION,
     DEFAULT_VERSION_RANGE,
     MAX_VERSION_SPAN,
+    SUPPORTED_PROTOCOL_VERSIONS,
     JobVersionDisposition,
     ProtocolVersionError,
     ProtocolVersionRange,
     VersionNegotiationError,
     claim_version_predicate,
     classify_job_version,
+    negotiate_submission_version,
     negotiate_version,
+    reaper_disposition,
     unsupported_version_diagnostic,
 )
-from lubko.worker import Settings
+from lubko.worker import OutputStream, Settings
 
 
 def _settings(supported_protocol_range: ProtocolVersionRange | None = None) -> Settings:
@@ -173,11 +181,152 @@ def test_parser_still_rejects_non_integer_version() -> None:
 
 def test_worker_refuses_window_it_cannot_parse() -> None:
     """Startup fails closed if the window includes an unparseable version."""
+    # 6 is not in SUPPORTED_PROTOCOL_VERSIONS, so a [6, 6] window cannot be served
+    # (the span is fine, but the version itself is unparseable by this build).
     with pytest.raises(ValueError, match="cannot parse"):
-        _settings(supported_protocol_range=ProtocolVersionRange(min=4, max=5))
+        _settings(supported_protocol_range=ProtocolVersionRange(min=6, max=6))
 
 
 def test_worker_accepts_default_window() -> None:
     """The default window is always valid for this build."""
     settings = _settings()
     assert settings.supported_protocol_range == DEFAULT_VERSION_RANGE
+
+
+# ---------------------------------------------------------------------------
+# Representative shape-compatible v5: a [4, 5] rollout is genuinely executable.
+# ---------------------------------------------------------------------------
+
+
+def test_v5_is_a_supported_shape_compatible_version() -> None:
+    """v5 is in the supported set, so a [4, 5] daemon window is executable."""
+    assert 5 in SUPPORTED_PROTOCOL_VERSIONS
+    # Every version a [4, 5] window spans must be parseable by this build.
+    assert all(v in SUPPORTED_PROTOCOL_VERSIONS for v in range(4, 6))
+
+
+def test_negotiation_converges_to_newest_supported_version() -> None:
+    """A [4, 5] server makes new submissions stamp v5, not v4.
+
+    This is the operational submission path: clients converge onto the newest
+    version the fleet supports while older in-flight v4 jobs keep running on
+    daemons that still advertise [4, 4].
+    """
+    assert negotiate_submission_version(ProtocolVersionRange(min=4, max=5)) == 5
+    assert negotiate_submission_version(ProtocolVersionRange(min=4, max=4)) == 4
+
+
+def test_claim_predicate_admits_the_widened_window() -> None:
+    """A [4, 5] daemon's claim filter accepts v5 (and v4) jobs."""
+    _fragment, params = claim_version_predicate(ProtocolVersionRange(min=4, max=5))
+    assert params == {"min_version": 4, "max_version": 5}
+
+
+# ---------------------------------------------------------------------------
+# Fleet-wide fail-closed reaper: stranded pending jobs cannot remain forever.
+# ---------------------------------------------------------------------------
+
+
+def test_reaper_fails_closed_only_unservable_versions() -> None:
+    """The reaper never destroys a job some daemon could still execute.
+
+    A v5 job during a [4, 5] rollout is left for the [4, 5] daemons even while
+    an older [4, 4] daemon is still running, but a v6 job (above the newest
+    version any build serves) is failed closed by the newest [4, 5] daemon.
+    """
+    old_daemon = ProtocolVersionRange(min=4, max=4)
+    new_daemon = ProtocolVersionRange(min=4, max=5)
+
+    # v4 and v5 are always claimable by a daemon that supports them.
+    assert reaper_disposition(4, old_daemon) is JobVersionDisposition.CLAIMABLE
+    assert reaper_disposition(5, new_daemon) is JobVersionDisposition.CLAIMABLE
+    # A v5 job is NOT reaped by an older [4, 4] daemon: a [4, 5] daemon exists.
+    assert reaper_disposition(5, old_daemon) is JobVersionDisposition.CLAIMABLE
+    # A retired v3 job is failed closed on any daemon.
+    assert reaper_disposition(3, old_daemon) is JobVersionDisposition.FAIL_CLOSED
+    # A future v6 job is failed closed only by the newest build ([4, 5]).
+    assert reaper_disposition(6, new_daemon) is JobVersionDisposition.FAIL_CLOSED
+    assert reaper_disposition(6, old_daemon) is JobVersionDisposition.CLAIMABLE
+
+
+# ---------------------------------------------------------------------------
+# Output chunks preserve their root job's protocol version.
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_emission_preserves_root_version(tmp_path: Path) -> None:
+    """Every chunk a worker emits carries the root command's version.
+
+    The worker plans chunks from the active job's version, so chunk history can
+    never drift to a different protocol generation than its root.
+    """
+    content = b"x" * (OUTPUT_CHUNK_MAX_BYTES + OUTPUT_TAIL_MAX_BYTES + 200)
+    path = tmp_path / "stdout"
+    path.write_bytes(content)
+    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    chunks, _archived, _last, _seq = worker._plan_chunks(
+        UUID(int=1), "stdout", stream, len(content), "server", version=5
+    )
+    assert chunks, "expected at least one archived chunk"
+    for _chunk_id, payload in chunks:
+        assert json.loads(payload)["v"] == 5
+
+
+def test_parser_rejects_fractional_version() -> None:
+    """A fractional JSON version is not rounded into the window; it fails closed."""
+    raw = build_payload(server="s", cwd="/srv", process=["echo"])
+    raw["v"] = 4.5
+    with pytest.raises(ProtocolError, match="integer"):
+        parse_payload(raw)
+
+
+# ---------------------------------------------------------------------------
+# Durable configuration of the supported window.
+# ---------------------------------------------------------------------------
+
+
+def test_worker_config_defaults_to_current_window(tmp_path: Path) -> None:
+    """Without explicit bounds the worker config yields the current window."""
+    path = tmp_path / "worker.conf"
+    path.write_text("server = alpha\n")
+    path.chmod(0o600)
+    assert load_worker_protocol_range(path) == DEFAULT_VERSION_RANGE
+
+
+def test_worker_config_loads_explicit_window(tmp_path: Path) -> None:
+    """The configured [4, 5] window is loaded from the worker config file."""
+    path = tmp_path / "worker.conf"
+    path.write_text("server = alpha\nprotocol_min_version = 4\nprotocol_max_version = 5\n")
+    path.chmod(0o600)
+    assert load_worker_protocol_range(path) == ProtocolVersionRange(min=4, max=5)
+
+
+@pytest.mark.parametrize("body", ["protocol_max_version = 9\n", "protocol_max_version = abc\n"])
+def test_worker_config_rejects_invalid_window(tmp_path: Path, body: str) -> None:
+    """A malformed window in the worker config fails closed at load time."""
+    path = tmp_path / "worker.conf"
+    path.write_text(f"server = alpha\n{body}")
+    path.chmod(0o600)
+    with pytest.raises(ValueError, match="protocol"):
+        load_worker_protocol_range(path)
+
+
+# ---------------------------------------------------------------------------
+# Migration 0004 must reject fractional JSON versions before any integer cast.
+# ---------------------------------------------------------------------------
+
+
+def test_migration_0004_rejects_fractional_version() -> None:
+    """The window constraint treats `v` as an integer, never rounding 4.9 -> 5.
+
+    PostgreSQL would otherwise round a fractional JSON number on a bare ``::int``
+    cast and admit it into the window. The constraint must require the value to
+    equal its own floor (an integral number) before the bound check.
+    """
+    migration = (
+        Path(__file__).resolve().parent.parent / "migrations" / "0004_protocol_version_window.sql"
+    ).read_text(encoding="utf-8")
+    # The integral guard must appear in both the command and output_chunk branches.
+    integral_guard = "floor(((payload::jsonb)->''v'')::numeric)"
+    assert integral_guard in migration
+    assert "::numeric = " in migration
