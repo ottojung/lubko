@@ -98,6 +98,7 @@ from lubko._exact_signal import process_pgrp as _shared_process_pgrp
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config, load_worker_server
 from lubko.health import (
+    WORKER_HEALTH_SCHEMA_VERSION,
     WorkerHealth,
     configure_worker_logging,
     install_worker_exception_hooks,
@@ -634,6 +635,21 @@ class ActiveJob:
     # (leader exited, PGID possibly recycled) ONLY by exact (pid, ticks) match
     # against this ledger; anything else fails closed and is never signalled.
     owned_members: dict[int, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _HealthAggregates:
+    """Bounded per-job aggregates for one health snapshot."""
+
+    active_jobs: int
+    stopping_jobs: int
+    oldest_active_job_age_seconds: float | None
+    min_lease_safety_remaining_seconds: float | None
+    capture_streams_open: int
+    spool_held_bytes: int
+    cancellation_scan_overdue: bool
+    recovery_overdue: bool
+    gc_overdue: bool
 
 
 @dataclass(slots=True)
@@ -3818,7 +3834,38 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID, *, server: str) ->
         )
 
 
-def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UUID], int, int]:
+def _gc_phase_bound_hit(
+    marked: int, gc_roots: int, chunk_counts: list[int], orphans: int, limit: int
+) -> bool:
+    """Return whether any GC phase saturated its per-phase batch bound.
+
+    Each GC phase selects/deletes through an independent ``LIMIT``.  A bound is
+    hit only when one phase's own capped selection reached ``limit`` (a
+    saturation-pressure signal).  This is deliberately *not* the summed row
+    count: the phases are independently capped, so their total can equal or
+    exceed ``limit`` even when no single phase was saturated, which would be a
+    false-positive saturation signal.
+
+    Args:
+        marked: Phase-1 marked-root count.
+        gc_roots: Phase-2 selected GC-root count.
+        chunk_counts: Per-root phase-2 chunk-deletion counts.
+        orphans: Phase-3 orphan-deletion count.
+        limit: The configured ``gc_batch_limit``.
+
+    Returns:
+        ``True`` when at least one phase reached its bound (saturated).
+    """
+    if limit <= 0:
+        return False
+    if marked >= limit or gc_roots >= limit or orphans >= limit:
+        return True
+    return any(count >= limit for count in chunk_counts)
+
+
+def collect_transport(
+    conn: JobsConnection, settings: Settings
+) -> tuple[list[UUID], int, int, bool]:
     """Collect terminal command rows, their owned chunks, and orphan chunks.
 
     Three bounded phases run in separate transactions, each with ``FOR UPDATE
@@ -3857,17 +3904,27 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     the owning root is already gone, so no concurrent publication can create
     new chunks for it.
 
+    The returned ``gc_batch_bound_hit`` flag is the accurate saturation
+    signal: it is ``True`` only when an actual bounded selection/deletion
+    reached its per-phase ``LIMIT`` (a pressure/saturation condition).  It is
+    intentionally *not* derived from the aggregate row counts, because the
+    phases are independently capped and their sum can reach or exceed the
+    limit even when no single phase was saturated.
+
     Args:
         conn: Open PostgreSQL connection.
         settings: Worker runtime settings.
 
     Returns:
-        A ``(roots_marked, chunks_deleted, orphans_deleted)`` triple.
+        A ``(roots_marked, chunks_deleted, orphans_deleted, gc_batch_bound_hit)``
+        tuple.
     """
+    limit = settings.gc_batch_limit
     roots_marked: list[UUID] = []
     roots_deleted = 0
     total_chunks = 0
     total_orphans = 0
+    per_root_chunk_counts: list[int] = []
 
     # --- Phase 1: mark terminal roots as GC ---
     # The retention cutoff is pre-computed in a CTE so the main query string
@@ -3901,7 +3958,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             {
                 "server": settings.server,
                 "gc_retention_seconds": settings.gc_retention_seconds,
-                "limit": settings.gc_batch_limit,
+                "limit": limit,
             },
         )
         roots_marked = [row[0] for row in cursor.fetchall()]
@@ -3917,7 +3974,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
             "LIMIT %(limit)s\n",
-            {"server": settings.server, "limit": settings.gc_batch_limit},
+            {"server": settings.server, "limit": limit},
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
         for root_id in gc_roots:
@@ -3937,10 +3994,11 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 {
                     "server": settings.server,
                     "thread": str(root_id),
-                    "limit": settings.gc_batch_limit,
+                    "limit": limit,
                 },
             )
             total_chunks += cursor.rowcount
+            per_root_chunk_counts.append(cursor.rowcount)
             # Delete root only if no chunks remain.
             cursor.execute(
                 "SELECT NOT EXISTS (\n"
@@ -3982,7 +4040,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
-            {"server": settings.server, "limit": settings.gc_batch_limit},
+            {"server": settings.server, "limit": limit},
         )
         orphan_ids = [row[0] for row in cursor.fetchall()]
         if orphan_ids:
@@ -3992,9 +4050,12 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             )
             total_orphans += len(orphan_ids)
 
+    batch_bound_hit = _gc_phase_bound_hit(
+        len(roots_marked), len(gc_roots), per_root_chunk_counts, len(orphan_ids), limit
+    )
     if roots_deleted:
         LOGGER.info("gc deleted %d root(s)", roots_deleted)
-    return roots_marked, total_chunks, total_orphans
+    return roots_marked, total_chunks, total_orphans, batch_bound_hit
 
 
 def verify_jobs_table_invariant(conn: JobsConnection) -> None:
@@ -4149,6 +4210,17 @@ class Supervisor:
         self._last_completed_job_id: str | None = None
         self._last_completed_at: float | None = None
         self._last_completed_status: str | None = None
+        self._completed_count = 0
+        self._last_claim_batch = 0
+        self._last_db_activity_at: float | None = None
+        self._db_deadline_breached_at: float | None = None
+        self._db_deadline_breach_count = 0
+        self._last_cancellation_scan_at: float | None = None
+        self._last_recovery_at: float | None = None
+        self._last_gc_at: float | None = None
+        self._gc_batch_bound_hit = False
+        self._cancellation_batch_bound_hit = False
+        self._recovery_batch_bound_hit = False
         self._next_health_publish_at = 0.0
         self._health_force = True
 
@@ -4188,9 +4260,11 @@ class Supervisor:
                 self._tick(time.monotonic())
             except DbOperationDeadlineError:
                 # A hung established operation breached its hard client
-                # deadline mid-turn. Enter outage handling and enforce lease
-                # safety immediately rather than sleeping a turn so an owned
-                # group can never outlive its database lease.
+                # deadline mid-turn. Record the breach explicitly (distinct
+                # from mere DB activity recency), then enter outage handling
+                # and enforce lease safety immediately rather than sleeping a
+                # turn so an owned group can never outlive its database lease.
+                self._record_db_deadline_breach()
                 self._enter_outage()
                 self._enforce_lease_safety()
             except psycopg.Error as exc:
@@ -4264,6 +4338,7 @@ class Supervisor:
         Args:
             now: Monotonic time at the start of the turn.
         """
+        self._last_db_activity_at = time.time()
         if now >= self._next_recovery_at:
             self._run_recovery()
             self._next_recovery_at = (
@@ -4503,7 +4578,9 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
+        self._last_recovery_at = time.time()
         recovered = recover_stale_jobs(conn, self.settings.server)
+        self._recovery_batch_bound_hit = len(recovered) >= LEASE_RECOVERY_LIMIT
         for job_id, _payload in recovered:
             LOGGER.warning(
                 "recovered stale job %s: lease expired; marked failed rather than re-executed",
@@ -4525,13 +4602,16 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
-        roots, chunks, orphans = collect_transport(conn, self.settings)
+        self._last_gc_at = time.time()
+        roots, chunks, orphans, bound_hit = collect_transport(conn, self.settings)
+        self._gc_batch_bound_hit = bound_hit
         if roots or chunks or orphans:
             LOGGER.info(
-                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)",
+                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)%s",
                 len(roots),
                 chunks,
                 orphans,
+                "; batch bound hit (saturated)" if bound_hit else "",
             )
 
     def _heartbeat_root_ids(self) -> set[UUID]:
@@ -4622,7 +4702,10 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
-        for job_id in discover_cancellations(conn, self.settings):
+        self._last_cancellation_scan_at = time.time()
+        found = discover_cancellations(conn, self.settings)
+        self._cancellation_batch_bound_hit = len(found) >= CANCEL_DISCOVERY_LIMIT
+        for job_id in found:
             job = self.active.get(job_id)
             if job is not None and not job.cancel_requested:
                 LOGGER.info("cancelling job %s by request", job_id)
@@ -5352,6 +5435,7 @@ class Supervisor:
         self._last_completed_job_id = str(job.id)
         self._last_completed_at = time.time()
         self._last_completed_status = final_status
+        self._completed_count = getattr(self, "_completed_count", 0) + 1
         cleanup_job(job)
         self._publish_health_force()
         return True
@@ -5374,6 +5458,7 @@ class Supervisor:
             return
         claim_mono = time.monotonic()
         claimed = claim_jobs(conn, self.settings, self.settings.claim_batch_limit)
+        self._last_claim_batch = len(claimed)
         for claimed_job in claimed:
             self._start_job(claimed_job, claim_mono)
 
@@ -5745,6 +5830,9 @@ class Supervisor:
     def _build_health(self, *, alive: bool = True, shutting_down: bool = False) -> WorkerHealth:
         """Build a health snapshot from the current supervisor state.
 
+        The snapshot is concurrency-aware: it reports job counts and bounded
+        per-job aggregates rather than a single misleading ``current_job_id``.
+
         Args:
             alive: Whether the worker is alive.
             shutting_down: Whether the worker is shutting down.
@@ -5752,31 +5840,114 @@ class Supervisor:
         Returns:
             A fresh health snapshot.
         """
-        current_job_id: str | None = None
-        current_job_started_at: float | None = None
-        if self.active:
-            first_job = next(iter(self.active.values()))
-            current_job_id = str(first_job.id)
-            current_job_started_at = first_job.claimed_at
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        agg = self._collect_health_aggregates(now_mono)
         return WorkerHealth(
-            schema_version=1,
+            schema_version=WORKER_HEALTH_SCHEMA_VERSION,
             worker_id=self.settings.worker_id,
             worker_incarnation=self.settings.worker_incarnation,
             pid=os.getpid(),
             start_time_ticks=self._start_time_ticks,
             started_at=self._started_at,
-            published_at=time.time(),
+            published_at=now_wall,
             alive=alive,
             db_connected=self.conn is not None,
             db_connected_at=self._db_connected_at,
             db_error_at=self._db_error_at,
-            current_job_id=current_job_id,
-            current_job_started_at=current_job_started_at,
-            last_completed_job_id=self._last_completed_job_id,
-            last_completed_at=self._last_completed_at,
-            last_completed_status=self._last_completed_status,
+            active_jobs=agg.active_jobs,
+            stopping_jobs=agg.stopping_jobs,
+            completed_jobs=getattr(self, "_completed_count", 0),
+            oldest_active_job_age_seconds=agg.oldest_active_job_age_seconds,
+            lease_safety_margin_seconds=self.settings.lease_safety_margin_seconds,
+            min_lease_safety_remaining_seconds=agg.min_lease_safety_remaining_seconds,
+            db_operation_deadline_seconds=self.settings.db_operation_timeout_seconds,
+            db_last_activity_at=getattr(self, "_last_db_activity_at", None),
+            db_deadline_breached_at=getattr(self, "_db_deadline_breached_at", None),
+            db_deadline_breach_count=getattr(self, "_db_deadline_breach_count", 0),
+            capture_streams_open=agg.capture_streams_open,
+            spool_held_bytes=agg.spool_held_bytes,
+            scan_batch_limit=self.settings.claim_batch_limit,
+            last_scan_batch_size=getattr(self, "_last_claim_batch", 0),
+            last_cancellation_scan_at=getattr(self, "_last_cancellation_scan_at", None),
+            last_recovery_at=getattr(self, "_last_recovery_at", None),
+            last_gc_at=getattr(self, "_last_gc_at", None),
+            cancellation_scan_overdue=agg.cancellation_scan_overdue,
+            recovery_overdue=agg.recovery_overdue,
+            gc_overdue=agg.gc_overdue,
+            gc_batch_limit=self.settings.gc_batch_limit,
+            gc_batch_bound_hit=getattr(self, "_gc_batch_bound_hit", False),
+            cancellation_batch_limit=CANCEL_DISCOVERY_LIMIT,
+            cancellation_batch_bound_hit=getattr(self, "_cancellation_batch_bound_hit", False),
+            recovery_batch_limit=LEASE_RECOVERY_LIMIT,
+            recovery_batch_bound_hit=getattr(self, "_recovery_batch_bound_hit", False),
             shutting_down=shutting_down,
         )
+
+    def _collect_health_aggregates(self, now_mono: float) -> _HealthAggregates:
+        """Aggregate bounded concurrency/capture metrics from active jobs.
+
+        Args:
+            now_mono: Current monotonic time for age/lease computation.
+
+        Returns:
+            The bounded per-job aggregates for the health snapshot.
+        """
+        active_jobs = self.active
+        stopping = 0
+        oldest_age: float | None = None
+        min_lease_safety_remaining: float | None = None
+        capture_open = 0
+        spool_held = 0
+        for job in active_jobs.values():
+            if job.term_sent or job.kill_sent or job.stop_started is not None:
+                stopping += 1
+            if job.claimed_at > 0.0:
+                age = now_mono - job.claimed_at
+                if oldest_age is None or age > oldest_age:
+                    oldest_age = age
+            if job.last_heartbeat_at > 0.0:
+                # Safety remaining, not full-lease remaining: subtract the
+                # configured safety margin so a negative value means the
+                # lease-safety deadline (expiry minus margin) has passed.
+                remaining = (
+                    job.last_heartbeat_at
+                    + self.settings.lease_duration_seconds
+                    - self.settings.lease_safety_margin_seconds
+                    - now_mono
+                )
+                if min_lease_safety_remaining is None or remaining < min_lease_safety_remaining:
+                    min_lease_safety_remaining = remaining
+            for name in OUTPUT_STREAMS:
+                stream = getattr(job, name)
+                if stream.fd is not None and not stream.eof:
+                    capture_open += 1
+                with suppress(OSError):
+                    size = stream.path.stat().st_size
+                    if size > 0:
+                        spool_held += size
+        return _HealthAggregates(
+            active_jobs=len(active_jobs),
+            stopping_jobs=stopping,
+            oldest_active_job_age_seconds=oldest_age,
+            min_lease_safety_remaining_seconds=min_lease_safety_remaining,
+            capture_streams_open=capture_open,
+            spool_held_bytes=spool_held,
+            cancellation_scan_overdue=now_mono > getattr(self, "_next_cancel_scan_at", 0.0),
+            recovery_overdue=now_mono > getattr(self, "_next_recovery_at", 0.0),
+            gc_overdue=now_mono > getattr(self, "_next_gc_at", 0.0),
+        )
+
+    def _record_db_deadline_breach(self) -> None:
+        """Record that a hard client database deadline was breached.
+
+        Called from the actual deadline-failure path so the bounded health
+        signal ``db_deadline_breached_at``/``db_deadline_breach_count`` answers
+        whether a database operation recently exceeded its deadline, which
+        ``db_last_activity_at`` alone cannot prove.
+        """
+        self._db_deadline_breached_at = time.time()
+        self._db_deadline_breach_count = getattr(self, "_db_deadline_breach_count", 0) + 1
 
     def _publish_health(self, *, force: bool = False) -> None:
         """Write an atomic health snapshot, throttled unless forced.

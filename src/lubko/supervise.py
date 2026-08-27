@@ -539,6 +539,11 @@ class SupervisorStatus:
     ready: bool | None
     message: str | None
     worker_health: dict[str, object] | None
+    #: Whether the supervisor is intentionally not running a confirmed worker
+    #: it owns (a durable hold, backoff, pending migration/retire, or an
+    #: unresolved/spawning obligation).  Distinct from ``ready``: a held
+    #: supervisor is alive but deliberately not serving a worker.
+    holding: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -569,6 +574,7 @@ class SupervisorStatus:
             "ready": self.ready,
             "message": self.message,
             "worker_health": self.worker_health,
+            "holding": self.holding,
         }
 
     @classmethod
@@ -616,7 +622,185 @@ class SupervisorStatus:
             ready=_optional_bool(data.get("ready")),
             message=_optional_string(data.get("message")),
             worker_health=_optional_dict(data.get("worker_health")),
+            holding=bool(_optional_bool(data.get("holding"))),
         )
+
+
+def is_holding(state: SupervisorState) -> bool:
+    """Return whether the supervisor is intentionally not serving a worker.
+
+    A held supervisor is alive but deliberately not running a confirmed worker
+    it owns: a durable replacement-blocking hold (any ``*_hold_malformed``
+    flag, an unresolved/spawning obligation), a non-run intent (migration or
+    retire), or simply the idle/retiring mode without an owned child.
+
+    Args:
+        state: The durable supervisor state.
+
+    Returns:
+        ``True`` when the supervisor is holding rather than actively serving.
+    """
+    if state.ownership_hold_malformed or state.unresolved_hold_malformed:
+        return True
+    if state.spawning_hold_malformed:
+        return True
+    if state.unresolved_child is not None or state.spawning is not None:
+        return True
+    if state.intent != INTENT_RUN:
+        return True
+    return state.mode != MODE_RUN or state.child is None
+
+
+@dataclass(frozen=True, slots=True)
+class SupervisorDiagnostic:
+    """Non-live diagnostic derived solely from durable supervisor state.
+
+    This is explicitly **not** a live health snapshot.  It is produced only when
+    the supervisor process is dead, replaced, or otherwise cannot publish a
+    live :class:`SupervisorStatus`, so operators never mistake stale durable
+    records for a running supervisor.  ``live`` is always ``False`` and
+    ``source`` names the durable origin that was read.
+
+    Field semantics mirror the durable state authority (``state.json``) plus
+    the recorded supervisor identity file; no live process observation is
+    trusted here beyond what the durable records already prove.
+    """
+
+    live: bool
+    source: str
+    supervisor_present: bool
+    supervisor_alive: bool | None
+    mode: str
+    intent: str
+    commit: str | None
+    applied_generation: int
+    restart_count: int
+    next_attempt_at: float | None
+    ready: bool
+    next_readiness_at: float | None
+    holding: bool
+    ownership_hold_malformed: bool
+    unresolved_hold_malformed: bool
+    spawning_hold_malformed: bool
+    child_present: bool
+    unresolved_child_present: bool
+    spawning_present: bool
+    last_exit: LastExit | None
+    message: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the durable diagnostic for operators.
+
+        Returns:
+            A JSON-serializable mapping marked non-live.
+        """
+        return {
+            "live": self.live,
+            "source": self.source,
+            "supervisor_present": self.supervisor_present,
+            "supervisor_alive": self.supervisor_alive,
+            "mode": self.mode,
+            "intent": self.intent,
+            "commit": self.commit,
+            "applied_generation": self.applied_generation,
+            "restart_count": self.restart_count,
+            "next_attempt_at": self.next_attempt_at,
+            "ready": self.ready,
+            "next_readiness_at": self.next_readiness_at,
+            "holding": self.holding,
+            "ownership_hold_malformed": self.ownership_hold_malformed,
+            "unresolved_hold_malformed": self.unresolved_hold_malformed,
+            "spawning_hold_malformed": self.spawning_hold_malformed,
+            "child_present": self.child_present,
+            "unresolved_child_present": self.unresolved_child_present,
+            "spawning_present": self.spawning_present,
+            "last_exit": None
+            if self.last_exit is None
+            else {"returncode": self.last_exit.returncode, "at": self.last_exit.at},
+            "message": self.message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> SupervisorDiagnostic:
+        """Rebuild a durable diagnostic from a stored mapping.
+
+        Args:
+            data: Mapping produced by :meth:`to_dict`.
+
+        Returns:
+            The reconstructed diagnostic.
+        """
+        exit_data = data.get("last_exit")
+        last_exit: LastExit | None = None
+        if isinstance(exit_data, dict):
+            try:
+                last_exit = LastExit(
+                    returncode=_optional_int(exit_data.get("returncode")),
+                    at=float(exit_data.get("at") or 0.0),
+                )
+            except (TypeError, ValueError):
+                last_exit = None
+        return cls(
+            live=bool(data.get("live")),
+            source=_optional_string(data.get("source")) or "durable-state",
+            supervisor_present=bool(data.get("supervisor_present")),
+            supervisor_alive=_optional_bool(data.get("supervisor_alive")),
+            mode=_optional_string(data.get("mode")) or MODE_IDLE,
+            intent=_optional_string(data.get("intent")) or INTENT_RUN,
+            commit=_optional_string(data.get("commit")),
+            applied_generation=_optional_int(data.get("applied_generation")) or 0,
+            restart_count=_optional_int(data.get("restart_count")) or 0,
+            next_attempt_at=_optional_float(data.get("next_attempt_at")),
+            ready=bool(data.get("ready")),
+            next_readiness_at=_optional_float(data.get("next_readiness_at")),
+            holding=bool(_optional_bool(data.get("holding"))),
+            ownership_hold_malformed=bool(_optional_bool(data.get("ownership_hold_malformed"))),
+            unresolved_hold_malformed=bool(_optional_bool(data.get("unresolved_hold_malformed"))),
+            spawning_hold_malformed=bool(_optional_bool(data.get("spawning_hold_malformed"))),
+            child_present=bool(_optional_bool(data.get("child_present"))),
+            unresolved_child_present=bool(_optional_bool(data.get("unresolved_child_present"))),
+            spawning_present=bool(_optional_bool(data.get("spawning_present"))),
+            last_exit=last_exit,
+            message=_optional_string(data.get("message")),
+        )
+
+
+def derive_durable_diagnostic() -> SupervisorDiagnostic:
+    """Build a non-live diagnostic from the durable supervisor records.
+
+    Reads ``state.json`` and the recorded supervisor identity, never a live
+    process snapshot.  The result is explicitly marked ``live=False`` so it can
+    never be confused with a running supervisor's health.
+
+    Returns:
+        The durable-state-derived diagnostic.
+    """
+    state = read_state()
+    recorded = read_supervisor_pid()
+    supervisor_present = recorded is not None
+    return SupervisorDiagnostic(
+        live=False,
+        source="durable-state",
+        supervisor_present=supervisor_present,
+        supervisor_alive=supervisor_running() if supervisor_present else None,
+        mode=state.mode,
+        intent=state.intent,
+        commit=state.commit,
+        applied_generation=state.applied_generation,
+        restart_count=state.restart_count,
+        next_attempt_at=state.next_attempt_at,
+        ready=state.ready,
+        next_readiness_at=state.next_readiness_at,
+        holding=is_holding(state),
+        ownership_hold_malformed=state.ownership_hold_malformed,
+        unresolved_hold_malformed=state.unresolved_hold_malformed,
+        spawning_hold_malformed=state.spawning_hold_malformed,
+        child_present=state.child is not None,
+        unresolved_child_present=state.unresolved_child is not None,
+        spawning_present=state.spawning is not None,
+        last_exit=state.last_exit,
+        message=None,
+    )
 
 
 # ---------------------------------------------------------------------------

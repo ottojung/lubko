@@ -47,6 +47,14 @@ WORKER_LOG_SYMLINK_FILENAME: Final = "worker.log"
 WORKER_LOG_MAX_BYTES: Final = 2 * 1024 * 1024  # 2 MiB per file
 WORKER_LOG_BACKUP_COUNT: Final = 3
 
+#: Current on-disk schema version for the per-incarnation worker health
+#: snapshot.  Version 1 exposed a singular ``current_job_id`` that could only
+#: ever describe one of potentially many concurrently active jobs and therefore
+#: misrepresented a busy worker as idle-or-single-job.  Version 2 replaces it
+#: with concurrency-aware aggregates and bounded operational counters.  Old
+#: snapshots are never treated as current (they fail closed in the reader).
+WORKER_HEALTH_SCHEMA_VERSION: Final = 2
+
 LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
 
 #: Regex matching safe filename components (hex tokens, alphanumerics, hyphens).
@@ -152,11 +160,21 @@ def worker_log_current_path() -> Path:
 
 @dataclass(frozen=True, slots=True)
 class WorkerHealth:
-    """Machine-readable snapshot of the worker's live state.
+    """Machine-readable snapshot of the worker's live, concurrency-aware state.
 
-    Every field is JSON-serialisable.  ``pid`` and ``start_time_ticks`` anchor
-    identity to a specific process incarnation so a stale snapshot from a dead
-    or PID-reused worker is never mistaken for current.
+    Every field is JSON-serialisable and bounded: no job id list, command
+    text, secret, or unbounded payload ever reaches the snapshot.  ``pid`` and
+    ``start_time_ticks`` anchor identity to a specific process incarnation so a
+    stale snapshot from a dead or PID-reused worker is never mistaken for
+    current.
+
+    The singular ``current_job_id`` of earlier schemas was misleading: a worker
+    supervises an unbounded number of concurrently active jobs, so a single id
+    could never describe its true state.  This schema reports aggregates
+    (``active_jobs``/``stopping_jobs``/``completed_jobs``), a bounded oldest
+    active age (never a job id), and bounded operational counters/timestamps
+    for lease safety, capture/spool pressure, scan batch pressure, periodic
+    scan saturation, and database deadline recency.
     """
 
     schema_version: int
@@ -170,11 +188,70 @@ class WorkerHealth:
     db_connected: bool
     db_connected_at: float | None
     db_error_at: float | None
-    current_job_id: str | None
-    current_job_started_at: float | None
-    last_completed_job_id: str | None
-    last_completed_at: float | None
-    last_completed_status: str | None
+    #: Number of jobs this worker incarnation is currently supervising.
+    active_jobs: int
+    #: Number of currently active jobs in a terminal stop/escalation phase.
+    stopping_jobs: int
+    #: Total jobs this worker incarnation has finalized (bounded lifetime count).
+    completed_jobs: int
+    #: Wall-clock-agnostic age (seconds) of the oldest active job, or ``None``.
+    #: No job id is ever published: identity is intentionally not exposed.
+    oldest_active_job_age_seconds: float | None
+    #: Configured lease-safety margin the worker enforces before eviction.
+    lease_safety_margin_seconds: float
+    #: Remaining lease-safety budget for the most-at-risk active job, or
+    #: ``None``.  Computed as ``last_heartbeat + lease_duration -
+    #: lease_safety_margin - now``, so it is the safety deadline (lease expiry
+    #: minus the configured margin), not the full-lease remaining.  Negative
+    #: means the safety deadline has already passed and the job is at risk.
+    min_lease_safety_remaining_seconds: float | None
+    #: Configured hard client-side database operation deadline.
+    db_operation_deadline_seconds: float
+    #: Wall-clock time of the last database operation, or ``None`` (recency).
+    db_last_activity_at: float | None
+    #: Wall-clock time of the most recent hard client deadline breach, or
+    #: ``None``.  This is the explicit signal that a database operation actually
+    #: exceeded its deadline; ``db_last_activity_at`` alone cannot prove it.
+    db_deadline_breached_at: float | None
+    #: Count of hard client deadline breaches observed this incarnation.
+    db_deadline_breach_count: int
+    #: Count of active capture streams still draining (open, non-EOF pipes).
+    capture_streams_open: int
+    #: Aggregate bytes currently held in active on-disk capture spool files.
+    spool_held_bytes: int
+    #: Configured fairness cap on one claiming turn's batch size.
+    scan_batch_limit: int
+    #: Number of jobs actually claimed in the most recent scan batch (pressure).
+    last_scan_batch_size: int
+    #: Wall-clock time of the most recent cancellation-scan turn, or ``None``.
+    last_cancellation_scan_at: float | None
+    #: Wall-clock time of the most recent recovery pass, or ``None``.
+    last_recovery_at: float | None
+    #: Wall-clock time of the most recent GC pass, or ``None``.
+    last_gc_at: float | None
+    #: Whether the cancellation scan is overdue (next due time already passed).
+    cancellation_scan_overdue: bool
+    #: Whether the recovery pass is overdue (next due time already passed).
+    recovery_overdue: bool
+    #: Whether the GC pass is overdue (next due time already passed).
+    gc_overdue: bool
+    #: Configured per-turn GC batch cap.
+    gc_batch_limit: int
+    #: Whether the most recent GC pass saturated a per-phase batch bound (a
+    #: pressure/saturation signal), derived inside ``collect_transport`` from
+    #: the actual capped selections/deletions rather than summed row counts.
+    #: Combine with ``gc_overdue`` and ``last_gc_at`` for a "behind" diagnosis.
+    gc_batch_bound_hit: bool
+    #: Configured per-turn cancellation-discovery batch cap.
+    cancellation_batch_limit: int
+    #: Whether the most recent cancellation scan saturated its batch bound (a
+    #: pressure/saturation signal), from the actual returned cancellation count.
+    cancellation_batch_bound_hit: bool
+    #: Configured per-turn stale-job recovery batch cap.
+    recovery_batch_limit: int
+    #: Whether the most recent recovery pass saturated its batch bound (a
+    #: pressure/saturation signal), from the actual returned recovered count.
+    recovery_batch_bound_hit: bool
     shutting_down: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -195,11 +272,34 @@ class WorkerHealth:
             "db_connected": self.db_connected,
             "db_connected_at": _finite_or_none(self.db_connected_at),
             "db_error_at": _finite_or_none(self.db_error_at),
-            "current_job_id": self.current_job_id,
-            "current_job_started_at": _finite_or_none(self.current_job_started_at),
-            "last_completed_job_id": self.last_completed_job_id,
-            "last_completed_at": _finite_or_none(self.last_completed_at),
-            "last_completed_status": self.last_completed_status,
+            "active_jobs": self.active_jobs,
+            "stopping_jobs": self.stopping_jobs,
+            "completed_jobs": self.completed_jobs,
+            "oldest_active_job_age_seconds": _finite_or_none(self.oldest_active_job_age_seconds),
+            "lease_safety_margin_seconds": _finite_or_zero(self.lease_safety_margin_seconds),
+            "min_lease_safety_remaining_seconds": _finite_or_none(
+                self.min_lease_safety_remaining_seconds
+            ),
+            "db_operation_deadline_seconds": _finite_or_zero(self.db_operation_deadline_seconds),
+            "db_last_activity_at": _finite_or_none(self.db_last_activity_at),
+            "db_deadline_breached_at": _finite_or_none(self.db_deadline_breached_at),
+            "db_deadline_breach_count": self.db_deadline_breach_count,
+            "capture_streams_open": self.capture_streams_open,
+            "spool_held_bytes": self.spool_held_bytes,
+            "scan_batch_limit": self.scan_batch_limit,
+            "last_scan_batch_size": self.last_scan_batch_size,
+            "last_cancellation_scan_at": _finite_or_none(self.last_cancellation_scan_at),
+            "last_recovery_at": _finite_or_none(self.last_recovery_at),
+            "last_gc_at": _finite_or_none(self.last_gc_at),
+            "cancellation_scan_overdue": self.cancellation_scan_overdue,
+            "recovery_overdue": self.recovery_overdue,
+            "gc_overdue": self.gc_overdue,
+            "gc_batch_limit": self.gc_batch_limit,
+            "gc_batch_bound_hit": self.gc_batch_bound_hit,
+            "cancellation_batch_limit": self.cancellation_batch_limit,
+            "cancellation_batch_bound_hit": self.cancellation_batch_bound_hit,
+            "recovery_batch_limit": self.recovery_batch_limit,
+            "recovery_batch_bound_hit": self.recovery_batch_bound_hit,
             "shutting_down": self.shutting_down,
         }
 
@@ -212,9 +312,17 @@ class WorkerHealth:
 
         Returns:
             The reconstructed health snapshot.
+
+        Raises:
+            ValueError: If the mapping is schema-incompatible or holds a
+                non-finite timestamp.
         """
+        version = int(data.get("schema_version") or 0)
+        if version != WORKER_HEALTH_SCHEMA_VERSION:
+            msg = f"unsupported worker health schema version: {version}"
+            raise ValueError(msg)
         return cls(
-            schema_version=int(data.get("schema_version") or 1),
+            schema_version=version,
             worker_id=str(data.get("worker_id") or ""),
             worker_incarnation=str(data.get("worker_incarnation") or ""),
             pid=int(data.get("pid") or 0),
@@ -225,11 +333,50 @@ class WorkerHealth:
             db_connected=bool(data.get("db_connected")),
             db_connected_at=_optional_finite_float(data.get("db_connected_at")),
             db_error_at=_optional_finite_float(data.get("db_error_at")),
-            current_job_id=_optional_str(data.get("current_job_id")),
-            current_job_started_at=_optional_finite_float(data.get("current_job_started_at")),
-            last_completed_job_id=_optional_str(data.get("last_completed_job_id")),
-            last_completed_at=_optional_finite_float(data.get("last_completed_at")),
-            last_completed_status=_optional_str(data.get("last_completed_status")),
+            active_jobs=_coerce_int(data.get("active_jobs"), "active_jobs"),
+            stopping_jobs=_coerce_int(data.get("stopping_jobs"), "stopping_jobs"),
+            completed_jobs=_coerce_int(data.get("completed_jobs"), "completed_jobs"),
+            oldest_active_job_age_seconds=_optional_finite_float(
+                data.get("oldest_active_job_age_seconds")
+            ),
+            lease_safety_margin_seconds=_required_finite_float(
+                data.get("lease_safety_margin_seconds"), "lease_safety_margin_seconds"
+            ),
+            min_lease_safety_remaining_seconds=_optional_finite_float(
+                data.get("min_lease_safety_remaining_seconds")
+            ),
+            db_operation_deadline_seconds=_required_finite_float(
+                data.get("db_operation_deadline_seconds"), "db_operation_deadline_seconds"
+            ),
+            db_last_activity_at=_optional_finite_float(data.get("db_last_activity_at")),
+            db_deadline_breached_at=_optional_finite_float(data.get("db_deadline_breached_at")),
+            db_deadline_breach_count=_coerce_int(
+                data.get("db_deadline_breach_count"), "db_deadline_breach_count"
+            ),
+            capture_streams_open=_coerce_int(
+                data.get("capture_streams_open"), "capture_streams_open"
+            ),
+            spool_held_bytes=_coerce_int(data.get("spool_held_bytes"), "spool_held_bytes"),
+            scan_batch_limit=_coerce_int(data.get("scan_batch_limit"), "scan_batch_limit"),
+            last_scan_batch_size=_coerce_int(
+                data.get("last_scan_batch_size"), "last_scan_batch_size"
+            ),
+            last_cancellation_scan_at=_optional_finite_float(data.get("last_cancellation_scan_at")),
+            last_recovery_at=_optional_finite_float(data.get("last_recovery_at")),
+            last_gc_at=_optional_finite_float(data.get("last_gc_at")),
+            cancellation_scan_overdue=_coerce_bool(data.get("cancellation_scan_overdue")),
+            recovery_overdue=_coerce_bool(data.get("recovery_overdue")),
+            gc_overdue=_coerce_bool(data.get("gc_overdue")),
+            gc_batch_limit=_coerce_int(data.get("gc_batch_limit"), "gc_batch_limit"),
+            gc_batch_bound_hit=_coerce_bool(data.get("gc_batch_bound_hit")),
+            cancellation_batch_limit=_coerce_int(
+                data.get("cancellation_batch_limit"), "cancellation_batch_limit"
+            ),
+            cancellation_batch_bound_hit=_coerce_bool(data.get("cancellation_batch_bound_hit")),
+            recovery_batch_limit=_coerce_int(
+                data.get("recovery_batch_limit"), "recovery_batch_limit"
+            ),
+            recovery_batch_bound_hit=_coerce_bool(data.get("recovery_batch_bound_hit")),
             shutting_down=bool(data.get("shutting_down")),
         )
 
@@ -253,6 +400,54 @@ def _coerce_float(value: object) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def _coerce_int(value: object, field: str) -> int:
+    """Coerce a JSON value to a non-negative bounded int.
+
+    Args:
+        value: Raw JSON value.
+        field: Field name for error reporting.
+
+    Returns:
+        The int (``0`` when absent).
+
+    Raises:
+        TypeError: If the value is present but of a non-numeric type.
+        ValueError: If the value is present but not an integer.
+    """
+    if value is None or (isinstance(value, str) and not value):
+        return 0
+    if isinstance(value, bool):
+        msg = f"{field} must be an integer, got boolean"
+        raise TypeError(msg)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not value.is_integer():
+            msg = f"{field} must be an integer, got {value!r}"
+            raise ValueError(msg)
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError as exc:
+            msg = f"{field} must be an integer, got {value!r}"
+            raise ValueError(msg) from exc
+    msg = f"{field} must be an integer, got {value!r}"
+    raise TypeError(msg)
+
+
+def _coerce_bool(value: object) -> bool:
+    """Coerce a JSON value to a bool, treating absence as ``False``.
+
+    Args:
+        value: Raw JSON value.
+
+    Returns:
+        The boolean (``False`` when absent or not a JSON boolean).
+    """
+    return value is True
 
 
 def _required_finite_float(value: object, field: str) -> float:
@@ -514,7 +709,7 @@ def _read_health_file(path: Path) -> WorkerHealth | None:
     if not isinstance(data, dict):
         return None
     schema_version = int(data.get("schema_version") or 0)
-    if schema_version != 1:
+    if schema_version != WORKER_HEALTH_SCHEMA_VERSION:
         return None
     try:
         return WorkerHealth.from_dict(data)
