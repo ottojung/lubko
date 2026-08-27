@@ -15,10 +15,14 @@
 -- Isolation is enforced three ways, all at the database authorization boundary:
 --
 --   1. Row-level security is enabled on lubko.jobs.
---   2. lubko.session_server() returns the server mapped to the current login
---      principal. It is SECURITY DEFINER so it reads lubko.server_principals
+--   2. lubko.session_server() returns the server mapped to the authenticated
+--      login principal. It is SECURITY DEFINER so it reads lubko.server_principals
 --      regardless of the caller's own grants, and its result cannot be forged by
---      the session because it depends only on current_user.
+--      the session. CRITICAL: inside SECURITY DEFINER, current_user is the
+--      function *definer*, not the caller, so the function must read session_user
+--      (the immutable authenticated login role) to reflect the connecting
+--      principal. Using current_user would collapse every caller to the same
+--      identity and destroy the isolation boundary.
 --   3. Per-server policies restrict the worker group to rows/chunks whose
 --      server equals the session's bound identity, both for reads and for
 --      writes (INSERT WITH CHECK prevents spoofing another server's rows).
@@ -63,18 +67,24 @@ comment on table lubko.server_principals is
     'for per-server queue isolation.';
 
 -- Trusted session identity: the server bound to the current login principal.
--- SECURITY DEFINER + restricted search_path so the result depends only on
--- current_user and cannot be influenced by the caller's search_path or grants.
+-- SECURITY DEFINER + restricted search_path so the caller cannot influence the
+-- lookup. CRITICAL SEMANTIC: it reads session_user (the authenticated login
+-- role), NOT current_user, because inside SECURITY DEFINER current_user becomes
+-- the function definer and would make every caller resolve to the same identity.
+-- session_user is immutable for the session and cannot be changed via SET ROLE,
+-- so it is the only non-spoofable per-session login identity.
 create or replace function lubko.session_server() returns text
 language sql stable security definer set search_path = lubko as $$
-    select server from lubko.server_principals where principal = current_user;
+    select server from lubko.server_principals where principal = session_user;
 $$;
 
 comment on function lubko.session_server() is
-    'Return the execution-server identity bound to the current login principal, '
-    'or NULL if the principal is unmapped. SECURITY DEFINER: the result is '
-    'derived solely from current_user and the admin-owned server_principals '
-    'table, so a worker session cannot rebind to another server.';
+    'Return the execution-server identity bound to the authenticated login role '
+    '(session_user), or NULL if the principal is unmapped. SECURITY DEFINER: the '
+    'result is derived solely from session_user and the admin-owned '
+    'server_principals table, so a worker session cannot rebind to another '
+    'server. session_user (not current_user) is used on purpose: current_user is '
+    'the definer inside SECURITY DEFINER and must never be used here.';
 
 -- Group that holds the table grants; both the per-server worker principals and
 -- the orchestrator/admin principal are members.

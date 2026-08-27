@@ -17,7 +17,7 @@ bypassed, or spoofed.
    `server` setting of its restricted worker configuration file). Its worker
    daemon connects as a dedicated login principal `lubko_worker_<server>` that is
    a member of the `lubko_worker_role` group. The server bound to a session is
-   derived from the authenticated login role (`current_user`), which is immutable
+   derived from the authenticated login role (`session_user`), which is immutable
    for the session and is never granted to another server's principal. A worker
    therefore cannot rebind to, or impersonate, another server.
 3. **Output chunks obey the same ownership.** Chunks are rows in the same
@@ -35,8 +35,12 @@ bypassed, or spoofed.
   mapping from execution-server identity to its dedicated login principal. This
   is the root of trust.
 - `lubko.session_server()` — `SECURITY DEFINER` function returning the server
-  mapped to `current_user`. Because it depends only on the login role and reads
-  the owner-owned mapping, the result cannot be forged by the session.
+  mapped to `session_user` (the authenticated login role). Because it depends only
+  on the login role and reads the owner-owned mapping, the result cannot be forged
+  by the session. It must read `session_user`, **not** `current_user`: inside
+  `SECURITY DEFINER`, `current_user` is the function *definer*, so using it would
+  make every caller resolve to the same identity and silently destroy the
+  boundary.
 - Row-level security is enabled on `lubko.jobs`.
 - Four policies (`jobs_isolation_select/insert/update/delete`) for the
   `lubko_worker_role` group restrict every operation to rows whose

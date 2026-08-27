@@ -225,3 +225,19 @@ def test_migration_declares_rls_boundary() -> None:
     assert "bypassrls" in text
     # The trusted mapping root of trust is created.
     assert "server_principals" in text
+
+
+def test_migration_session_server_uses_session_user_not_current_user() -> None:
+    """The identity function must key off session_user, never current_user.
+
+    Inside SECURITY DEFINER, current_user is the function *definer*, so using it
+    would collapse every caller to the same identity and silently destroy the
+    per-server boundary. This guards against a future refactor reverting it.
+    """
+    text = MIGRATION_PATH.read_text(encoding="utf-8")
+    # The function body must reference session_user as the principal source.
+    assert "principal = session_user" in text
+    # A bare current_user reference inside the function body is forbidden.
+    body = text[text.index("create or replace function lubko.session_server") :]
+    body = body[: body.index("$$;")] if "$$;" in body else body
+    assert "current_user" not in body
