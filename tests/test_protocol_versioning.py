@@ -316,17 +316,72 @@ def test_worker_config_rejects_invalid_window(tmp_path: Path, body: str) -> None
 # ---------------------------------------------------------------------------
 
 
-def test_migration_0004_rejects_fractional_version() -> None:
-    """The window constraint treats `v` as an integer, never rounding 4.9 -> 5.
+def test_migration_0004_version_validation_is_total_and_fail_closed() -> None:
+    """The window constraint rejects every malformed `v`, never silently passing.
 
-    PostgreSQL would otherwise round a fractional JSON number on a bare ``::int``
-    cast and admit it into the window. The constraint must require the value to
-    equal its own floor (an integral number) before the bound check.
+    The version check must be total (it can never evaluate to SQL NULL, which a
+    CHECK would accept) and must never rely on an unguarded ``::int`` cast (which
+    would raise on an oversized value). Concretely it must reject, for every
+    command/output_chunk row: a missing `v`, a JSON ``null`` `v`, a non-number
+    `v`, a fractional `v`, an out-of-range `v`, and an oversized/unrepresentable
+    `v`. These are encoded in the SQL as greppable guards whose absence would
+    weaken the durable gate that the per-daemon parser mirrors.
     """
     migration = (
         Path(__file__).resolve().parent.parent / "migrations" / "0004_protocol_version_window.sql"
     ).read_text(encoding="utf-8")
-    # The integral guard must appear in both the command and output_chunk branches.
+
+    # Missing `v` / JSON `null` `v` / non-number `v`: the type test must treat a
+    # missing key (SQL NULL from jsonb extraction) and a JSON null ('null') as
+    # decisively NOT a number. `is not distinct from 'number'` is the only
+    # comparison that returns false (never NULL) for both.
+    assert "is not distinct from ''number''" in migration
+
+    # Fractional `v` (e.g. 4.9): the value must equal its own floor, an integral
+    # number, before the bound check.
     integral_guard = "floor(((payload::jsonb)->''v'')::numeric)"
     assert integral_guard in migration
-    assert "::numeric = " in migration
+    assert "= floor(((payload::jsonb)->''v'')::numeric)" in migration
+
+    # Out-of-range `v`: the integral value must lie inside the window, compared
+    # as numeric (so an oversized value is rejected by the bound, not by a cast
+    # error or an integer wrap).
+    assert "between %L and %L" in migration
+
+    # Oversized / unrepresentable `v`: the constraint must NOT cast `v` to int,
+    # which would raise or wrap on a huge JSON number. The version check uses
+    # ::numeric only.
+    assert "->''v'')::int" not in migration
+
+
+def test_parser_rejects_missing_and_null_version() -> None:
+    """The per-daemon parser fails closed on a missing or JSON-null `v`.
+
+    This mirrors the migration's total version gate: a row that slips past the
+    schema constraint must still be rejected by the runtime parser rather than
+    becoming an unclaimable, unreaped orphan.
+    """
+    base = build_payload(server="s", cwd="/srv", process=["echo"])
+    missing = dict(base)
+    missing.pop("v", None)
+    with pytest.raises(ProtocolError, match="v"):
+        parse_payload(missing)
+    nulled = dict(base)
+    nulled["v"] = None
+    with pytest.raises(ProtocolError, match="v"):
+        parse_payload(nulled)
+    chunk = build_output_chunk_payload(
+        server="s",
+        thread=uuid4(),
+        stream="stdout",
+        sequence=0,
+        start=0,
+        end=2,
+        value="ok",
+        previous=None,
+        version=4,
+    )
+    chunk.pop("v", None)
+    with pytest.raises(ProtocolError, match="v"):
+        # parse_chunk_payload takes raw JSON text; emulate a missing `v` there.
+        parse_chunk_payload(json.dumps(chunk))

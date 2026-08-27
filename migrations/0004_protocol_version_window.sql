@@ -37,6 +37,26 @@
 -- For a breaking change, keep MIN_PROTOCOL_VERSION = MAX_PROTOCOL_VERSION =
 -- the new generation after the old version has fully drained; the same
 -- constraint refuses legacy rows.
+--
+-- TOTAL, FAIL-CLOSED VERSION VALIDATION
+--
+-- The version check below admits a row only when its `v` is a JSON number that
+-- is integral and lies inside the window. It is written so it can NEVER return
+-- SQL NULL and NEVER raises on a malformed value, so a bad row is always
+-- rejected rather than silently admitted (a NULL/TRUE in a CHECK would pass,
+-- and an unguarded ::int cast would raise on an oversized value):
+--
+--   * a missing `v` key            (jsonb extraction yields SQL NULL),
+--   * a JSON `null` `v`           (jsonb_typeof reports 'null', not 'number'),
+--   * a non-number `v`            (string / boolean / object / array),
+--   * a fractional `v`            (e.g. 4.9 would be rounded by a bare ::int),
+--   * an out-of-range `v`,        (below MIN or above MAX of the window),
+--   * an oversized `v`            (far larger than INT4; compared as numeric,
+--                                  never cast to int, so it cannot raise or
+--                                  slip through as a wrapped small integer).
+-- The numeric comparison is performed with ::numeric (safe for every JSON
+-- number) and the type test uses `is not distinct from 'number'` so missing
+-- keys and JSON null are treated as decisively NOT a number.
 
 do $$
 declare
@@ -55,18 +75,29 @@ begin
     end if;
 
     -- Preflight: refuse to apply if any command/output_chunk row already sits
-    -- outside the new window. The integral check (v must equal its own floor)
-    -- rejects fractional JSON numbers such as 4.9, which PostgreSQL would
-    -- otherwise round into the window on a bare ::int cast. Raising here leaves
-    -- the original constraint and table completely intact; the cutover is
-    -- non-destructive and fail-closed.
+    -- outside the new window. Raising here leaves the original constraint and
+    -- table completely intact; the cutover is non-destructive and fail-closed.
+    --
+    -- The version test is a single boolean expression that can never be NULL and
+    -- never casts a non-number: the numeric comparisons live inside a CASE that
+    -- only runs them when the value is provably a JSON number, so a
+    -- string/object/null/boolean `v` short-circuits to `false` without ever
+    -- touching ::numeric. A missing key yields SQL NULL from jsonb_typeof, which
+    -- is `not distinct from 'number'` => false; a JSON null yields 'null', also
+    -- false.
     select count(*) into nonconforming
     from lubko.jobs
     where (payload::jsonb)->>'type' in ('command', 'output_chunk')
-        and (
-            jsonb_typeof((payload::jsonb)->'v') <> 'number'
-            or ((payload::jsonb)->'v')::numeric <> floor(((payload::jsonb)->'v')::numeric)
-            or ((payload::jsonb)->'v')::int not between min_version and max_version
+        and not (
+            case
+                when jsonb_typeof((payload::jsonb)->'v')
+                     is not distinct from 'number'
+                then ((payload::jsonb)->'v')::numeric
+                         = floor(((payload::jsonb)->'v')::numeric)
+                     and ((payload::jsonb)->'v')::numeric
+                         between min_version and max_version
+                else false
+            end
         );
 
     if nonconforming > 0 then
@@ -83,20 +114,34 @@ begin
     constraint_text := format(
         'case
             when (payload::jsonb)->>''type'' = ''command'' then
-                jsonb_typeof((payload::jsonb)->''v'') = ''number''
-                and ((payload::jsonb)->''v'')::numeric = floor(((payload::jsonb)->''v'')::numeric)
-                and ((payload::jsonb)->''v'')::int between %L and %L
-                and jsonb_typeof((payload::jsonb)->''request'') = ''object''
+                (case
+                    when jsonb_typeof((payload::jsonb)->''v'')
+                         is not distinct from ''number''
+                    then ((payload::jsonb)->''v'')::numeric
+                             = floor(((payload::jsonb)->''v'')::numeric)
+                         and ((payload::jsonb)->''v'')::numeric between %L and %L
+                    else false
+                 end)
+                and coalesce(jsonb_typeof((payload::jsonb)->''request''), '''')
+                    = ''object''
                 and (((payload::jsonb)->''state''->>''status'') is not null)
-                and coalesce(jsonb_typeof((payload::jsonb)->''server''), '''') = ''string''
+                and coalesce(jsonb_typeof((payload::jsonb)->''server''), '''')
+                    = ''string''
                 and coalesce((payload::jsonb)->>''server'', '''') <> ''''
             when (payload::jsonb)->>''type'' = ''output_chunk'' then
-                jsonb_typeof((payload::jsonb)->''v'') = ''number''
-                and ((payload::jsonb)->''v'')::numeric = floor(((payload::jsonb)->''v'')::numeric)
-                and ((payload::jsonb)->''v'')::int between %L and %L
-                and jsonb_typeof((payload::jsonb)->''value'') = ''string''
+                (case
+                    when jsonb_typeof((payload::jsonb)->''v'')
+                         is not distinct from ''number''
+                    then ((payload::jsonb)->''v'')::numeric
+                             = floor(((payload::jsonb)->''v'')::numeric)
+                         and ((payload::jsonb)->''v'')::numeric between %L and %L
+                    else false
+                 end)
+                and coalesce(jsonb_typeof((payload::jsonb)->''value''), '''')
+                    = ''string''
                 and (((payload::jsonb)->>''thread'') is not null)
-                and coalesce(jsonb_typeof((payload::jsonb)->''server''), '''') = ''string''
+                and coalesce(jsonb_typeof((payload::jsonb)->''server''), '''')
+                    = ''string''
                 and coalesce((payload::jsonb)->>''server'', '''') <> ''''
                 and (((payload::jsonb)->>''stream'') in (''stdout'', ''stderr''))
                 and (((payload::jsonb)->>''sequence'') ~ ''^[0-9]+$'')
