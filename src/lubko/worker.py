@@ -98,6 +98,7 @@ from lubko._exact_signal import process_pgrp as _shared_process_pgrp
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import load_database_config, load_worker_server
 from lubko.health import (
+    WORKER_HEALTH_SCHEMA_VERSION,
     WorkerHealth,
     configure_worker_logging,
     install_worker_exception_hooks,
@@ -634,6 +635,19 @@ class ActiveJob:
     # (leader exited, PGID possibly recycled) ONLY by exact (pid, ticks) match
     # against this ledger; anything else fails closed and is never signalled.
     owned_members: dict[int, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _HealthAggregates:
+    """Bounded per-job aggregates for one health snapshot."""
+
+    active_jobs: int
+    stopping_jobs: int
+    oldest_active_job_id: str | None
+    oldest_active_job_age_seconds: float | None
+    min_lease_remaining_seconds: float | None
+    capture_streams_open: int
+    spool_held_bytes: int
 
 
 @dataclass(slots=True)
@@ -4149,6 +4163,9 @@ class Supervisor:
         self._last_completed_job_id: str | None = None
         self._last_completed_at: float | None = None
         self._last_completed_status: str | None = None
+        self._completed_count = 0
+        self._last_claim_batch = 0
+        self._last_db_activity_at: float | None = None
         self._next_health_publish_at = 0.0
         self._health_force = True
 
@@ -4264,6 +4281,7 @@ class Supervisor:
         Args:
             now: Monotonic time at the start of the turn.
         """
+        self._last_db_activity_at = time.time()
         if now >= self._next_recovery_at:
             self._run_recovery()
             self._next_recovery_at = (
@@ -5352,6 +5370,7 @@ class Supervisor:
         self._last_completed_job_id = str(job.id)
         self._last_completed_at = time.time()
         self._last_completed_status = final_status
+        self._completed_count = getattr(self, "_completed_count", 0) + 1
         cleanup_job(job)
         self._publish_health_force()
         return True
@@ -5374,6 +5393,7 @@ class Supervisor:
             return
         claim_mono = time.monotonic()
         claimed = claim_jobs(conn, self.settings, self.settings.claim_batch_limit)
+        self._last_claim_batch = len(claimed)
         for claimed_job in claimed:
             self._start_job(claimed_job, claim_mono)
 
@@ -5745,6 +5765,9 @@ class Supervisor:
     def _build_health(self, *, alive: bool = True, shutting_down: bool = False) -> WorkerHealth:
         """Build a health snapshot from the current supervisor state.
 
+        The snapshot is concurrency-aware: it reports job counts and bounded
+        per-job aggregates rather than a single misleading ``current_job_id``.
+
         Args:
             alive: Whether the worker is alive.
             shutting_down: Whether the worker is shutting down.
@@ -5752,30 +5775,81 @@ class Supervisor:
         Returns:
             A fresh health snapshot.
         """
-        current_job_id: str | None = None
-        current_job_started_at: float | None = None
-        if self.active:
-            first_job = next(iter(self.active.values()))
-            current_job_id = str(first_job.id)
-            current_job_started_at = first_job.claimed_at
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        agg = self._collect_health_aggregates(now_mono)
         return WorkerHealth(
-            schema_version=1,
+            schema_version=WORKER_HEALTH_SCHEMA_VERSION,
             worker_id=self.settings.worker_id,
             worker_incarnation=self.settings.worker_incarnation,
             pid=os.getpid(),
             start_time_ticks=self._start_time_ticks,
             started_at=self._started_at,
-            published_at=time.time(),
+            published_at=now_wall,
             alive=alive,
             db_connected=self.conn is not None,
             db_connected_at=self._db_connected_at,
             db_error_at=self._db_error_at,
-            current_job_id=current_job_id,
-            current_job_started_at=current_job_started_at,
-            last_completed_job_id=self._last_completed_job_id,
-            last_completed_at=self._last_completed_at,
-            last_completed_status=self._last_completed_status,
+            active_jobs=agg.active_jobs,
+            stopping_jobs=agg.stopping_jobs,
+            completed_jobs=getattr(self, "_completed_count", 0),
+            oldest_active_job_id=agg.oldest_active_job_id,
+            oldest_active_job_age_seconds=agg.oldest_active_job_age_seconds,
+            lease_safety_margin_seconds=self.settings.lease_safety_margin_seconds,
+            min_lease_remaining_seconds=agg.min_lease_remaining_seconds,
+            db_operation_deadline_seconds=self.settings.db_operation_timeout_seconds,
+            db_last_activity_at=getattr(self, "_last_db_activity_at", None),
+            capture_streams_open=agg.capture_streams_open,
+            spool_held_bytes=agg.spool_held_bytes,
+            scan_batch_limit=self.settings.claim_batch_limit,
+            last_scan_batch_size=getattr(self, "_last_claim_batch", 0),
             shutting_down=shutting_down,
+        )
+
+    def _collect_health_aggregates(self, now_mono: float) -> _HealthAggregates:
+        """Aggregate bounded concurrency/capture metrics from active jobs.
+
+        Args:
+            now_mono: Current monotonic time for age/lease computation.
+
+        Returns:
+            The bounded per-job aggregates for the health snapshot.
+        """
+        active_jobs = self.active
+        stopping = 0
+        oldest_job_id: str | None = None
+        oldest_age: float | None = None
+        min_lease_remaining: float | None = None
+        capture_open = 0
+        spool_held = 0
+        for job in active_jobs.values():
+            if job.term_sent or job.kill_sent or job.stop_started is not None:
+                stopping += 1
+            if job.claimed_at > 0.0:
+                age = now_mono - job.claimed_at
+                if oldest_age is None or age > oldest_age:
+                    oldest_age = age
+                    oldest_job_id = str(job.id)
+            if job.last_heartbeat_at > 0.0:
+                remaining = job.last_heartbeat_at + self.settings.lease_duration_seconds - now_mono
+                if min_lease_remaining is None or remaining < min_lease_remaining:
+                    min_lease_remaining = remaining
+            for name in OUTPUT_STREAMS:
+                stream = getattr(job, name)
+                if stream.fd is not None and not stream.eof:
+                    capture_open += 1
+                with suppress(OSError):
+                    size = stream.path.stat().st_size
+                    if size > 0:
+                        spool_held += size
+        return _HealthAggregates(
+            active_jobs=len(active_jobs),
+            stopping_jobs=stopping,
+            oldest_active_job_id=oldest_job_id,
+            oldest_active_job_age_seconds=oldest_age,
+            min_lease_remaining_seconds=min_lease_remaining,
+            capture_streams_open=capture_open,
+            spool_held_bytes=spool_held,
         )
 
     def _publish_health(self, *, force: bool = False) -> None:
