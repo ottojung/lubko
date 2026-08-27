@@ -1144,6 +1144,14 @@ class SupervisorDaemon:
                 # spawn a replacement alongside stale groups.
                 if not (meta.token and worker_mod.drain_sentinel_matches(meta.token)):
                     recover_owned_groups(meta.token or "")
+        self._spawn_and_publish(commit)
+
+    def _spawn_and_publish(self, commit: str) -> None:
+        """Spawn the worker and run the fail-closed child+meta publication.
+
+        Args:
+            commit: Exact commit the worker must run.
+        """
         child = self._spawn_worker(commit)
         now = time.monotonic()
         if child is None:
@@ -1159,7 +1167,81 @@ class SupervisorDaemon:
             write_state(state)
             LOGGER.error("could not start a worker for commit %s; backing off", commit)
             return
-        state = replace(
+        # Publication protocol (fail-closed against manual recovery):
+        #   1) publish state.child WHILE the exact pid-bearing spawning
+        #      obligation stays durable, so a concurrent manual recovery reads a
+        #      blocking authority and cannot authorize a second consumer;
+        #   2) write the maintained lifecycle meta.json;
+        #   3) only then clear spawning in a final durable state write.
+        # A crash or a meta write failure between steps leaves the durable
+        # obligation intact (replacement-blocking) for a later tick/restart to
+        # finish, never a silently duplicated consumer.
+        obligation = read_state().spawning
+        if obligation is None:
+            # The live child exists but the durable pre-Popen obligation is
+            # missing. Synthesizing a fresh obligation now cannot prove the
+            # required pre-Popen durability boundary, so it would defeat the
+            # entire crash-safety protocol. Fail closed instead: converge our own
+            # direct child by exact single-PID signalling and hold with backoff.
+            # No child is published and no replacement obligation is fabricated,
+            # so no second consumer can be authorized and no orphan is left
+            # running. The next spawn attempt (if still required) writes the
+            # obligation correctly before Popen.
+            self._message = (
+                "spawned worker has no durable pre-Popen obligation; "
+                "converging it and holding without publishing authority"
+            )
+            LOGGER.error("%s", self._message)
+            backoff = self._backoff_seconds(read_state().restart_count)
+            next_attempt_at = now + backoff
+
+            def _persist_missing_obligation_hold() -> None:
+                # The returned child already carries the exact lifecycle token and
+                # start-time identity, so the durable blocking hold names the
+                # exact incarnation: a later tick converges the possibly-live
+                # instance by pinned single-PID signals and recovers any owned
+                # command groups under the exact token. A retroactive fake
+                # pre-Popen obligation is deliberately not fabricated.
+                write_state(
+                    replace(
+                        read_state(),
+                        unresolved_child=UnresolvedChild(
+                            pid=child.pid,
+                            start_time_ticks=child.start_time_ticks,
+                            token=child.token,
+                            spawned_at=time.time(),
+                        ),
+                        next_attempt_at=next_attempt_at,
+                    )
+                )
+
+            if self.proc is not None and self._converge_direct_child(self.proc):
+                # The direct child was positively reaped by exact single-PID
+                # signalling. A returned worker may already have launched
+                # independent command groups under its lifecycle token, so the
+                # exact-incarnation owned-group recovery must also succeed before
+                # any authority is released; otherwise a durable token-bearing
+                # blocking hold is kept so no replacement can start.
+                self.proc = None
+                if self._recover_spawn_owned_groups(child.token):
+                    write_state(replace(read_state(), next_attempt_at=next_attempt_at))
+                    return
+                self._message = (
+                    "spawned worker reaped but its owned command groups could not "
+                    "be recovered; holding a token-bearing blocking authority "
+                    "without publishing a replacement"
+                )
+                LOGGER.error("%s", self._message)
+                _persist_missing_obligation_hold()
+                return
+            # Convergence failed (or the direct handle is unexpectedly
+            # unavailable): the possibly-live child must not be forgotten and no
+            # replacement may be authorized. Persist the durable exact-identity
+            # blocking hold and retain the direct handle when present so the next
+            # tick can re-prove and converge it.
+            _persist_missing_obligation_hold()
+            return
+        published = replace(
             read_state(),
             mode=MODE_RUN,
             commit=commit,
@@ -1169,11 +1251,24 @@ class SupervisorDaemon:
             last_spawn_at=now,
             ready=False,
             next_readiness_at=now + self.settings.readiness_interval_seconds,
-            spawning=None,
+            spawning=replace(
+                obligation,
+                pid=child.pid,
+                start_time_ticks=child.start_time_ticks,
+            ),
         )
-        write_state(state)
+        write_state(published)
         meta = replace(_child_to_meta(child, _runtime_dir(commit)), git_commit=commit)
-        lifecycle.write_meta(meta)
+        try:
+            lifecycle.write_meta(meta)
+        except (OSError, DurabilityError):
+            self._message = (
+                "worker child published but lifecycle meta could not be written; "
+                "keeping the spawning obligation durable until the next tick"
+            )
+            LOGGER.exception("%s", self._message)
+            return
+        write_state(replace(read_state(), spawning=None))
         lifecycle.append_deploy_log(
             f"supervisor started worker pid={child.pid} commit={commit} "
             f"incarnation={child.worker_id}"
@@ -2169,6 +2264,17 @@ class SupervisorDaemon:
         obligation = state.spawning
         if obligation is None:
             return True
+        if self._publication_in_progress(state, obligation):
+            # The durable state already carries both the published child and the
+            # exact pid-bearing obligation: this is the in-flight child+meta
+            # publication (or the durable residue of a crash during it), not a
+            # pending convergence. Finish the publication — retry the lifecycle
+            # meta and clear the obligation — instead of converging or killing
+            # the very worker we are publishing. The obligation is only
+            # considered resolved once the spawning clearance is durably written,
+            # so a meta/durability failure keeps the turn blocked and the
+            # obligation replacement-blocking.
+            return self._finish_publication(state, obligation)
         if obligation.pid is None:
             resolved = self._resolve_pidless_spawn(obligation)
         else:
@@ -2177,6 +2283,81 @@ class SupervisorDaemon:
             return False
         write_state(replace(read_state(), spawning=None))
         LOGGER.info("resolved prior pre-spawn recovery obligation for commit %s", obligation.commit)
+        return True
+
+    @staticmethod
+    def _publication_in_progress(
+        state: supervise.SupervisorState, obligation: SpawningObligation
+    ) -> bool:
+        """Return whether child+spawning names an in-flight publication.
+
+        The exact pid-bearing obligation is left durable while state.child is
+        published and the lifecycle meta is written, so a concurrent manual
+        recovery observes blocking authority. A successor supervisor that finds
+        this exact combination must finish the publication (retry meta, clear
+        spawning) rather than converge or duplicate the worker.
+
+        Args:
+            state: Current durable state.
+            obligation: The durable pre-spawn obligation.
+
+        Returns:
+            ``True`` when the obligation names exactly the already-published child.
+        """
+        child = state.child
+        if child is None or obligation.pid is None:
+            return False
+        return (
+            state.commit == obligation.commit
+            and child.token == obligation.token
+            and child.pid == obligation.pid
+            and child.start_time_ticks == obligation.start_time_ticks
+        )
+
+    def _finish_publication(
+        self, state: supervise.SupervisorState, obligation: SpawningObligation
+    ) -> bool:
+        """Complete a deferred child+spawning publication after a crash or retry.
+
+        Writes the maintained lifecycle meta for the already-published child and
+        clears the durable spawning obligation in a final state write. A meta
+        write failure keeps the obligation durable (replacement-blocking) so a
+        later supervisor tick or restart retries the publication rather than
+        duplicating the worker. The obligation is only reported resolved once the
+        spawning clearance is durably written, so any meta or durable-state
+        failure leaves it blocking.
+
+        Args:
+            state: Current durable state holding the published child.
+            obligation: The durable pre-spawn obligation being finished.
+
+        Returns:
+            ``True`` only when the spawning obligation was durably cleared.
+        """
+        commit = obligation.commit
+        child = state.child
+        if child is None:
+            return False
+        meta = replace(_child_to_meta(child, _runtime_dir(commit)), git_commit=commit)
+        try:
+            lifecycle.write_meta(meta)
+        except (OSError, DurabilityError):
+            self._message = (
+                "deferred worker publication could not write lifecycle meta; "
+                "keeping the spawning obligation durable until the next tick"
+            )
+            LOGGER.exception("%s", self._message)
+            return False
+        try:
+            write_state(replace(read_state(), spawning=None))
+        except DurabilityError:
+            self._message = (
+                "deferred worker publication cleared the obligation in memory but "
+                "could not durably persist it; keeping it blocking until the next tick"
+            )
+            LOGGER.exception("%s", self._message)
+            return False
+        LOGGER.info("finished deferred publication of worker pid=%d", child.pid)
         return True
 
     def _resolve_pidless_spawn(self, obligation: SpawningObligation) -> bool:
