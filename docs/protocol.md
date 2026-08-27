@@ -492,7 +492,18 @@ and an unbounded in-memory registry of active jobs. There is **no
 application-level concurrency limit** and no thread or connection per job; each
 job process runs as its own OS process/session/process group, executed directly
 from its `request.process` argv (never through a shell), and the daemon
-observes it with `Popen.poll()`-style checks. The supervisor loop services
+observes it with `Popen.poll()`-style checks. This is a deliberate,
+durable decision (see `docs/adr/0001-no-application-concurrency-cap.md`): each
+job's local capture spool and live tail are bounded, and the machine-readable
+health snapshot is a fixed-size aggregate with no per-job entries, but a
+long-running job can still accumulate arbitrarily many immutable history chunks
+until termination, and aggregate output, spool, and active-row database work
+(including lease heartbeat, which refreshes every active root in one statement)
+still scale with the number of concurrently active jobs. The application therefore
+uses one shared DB connection, set-based operations, operation deadlines, and
+bounded claim/cancellation/recovery/GC scans where they exist, and leaves the hard
+ceiling on *execution* concurrency to the surrounding container/host/OS rather than
+acting as a scheduler. The supervisor loop services
 running jobs (observe exits, escalate cancellations, publish output, finalize),
 refreshes leases, runs recovery, and claims a bounded batch of new pending
 jobs each turn, so an endless pending queue can never starve heartbeats,
