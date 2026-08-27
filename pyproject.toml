@@ -110,6 +110,10 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
+"src/lubko/toolchain.py" = [
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
 "tests/**/*.py" = [
     # Tests assert invariants of the worker's internal state machine (outage
     # convergence, deadline derivation), which are deliberately not public API.

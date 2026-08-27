@@ -1,8 +1,9 @@
 """Toolchain policy invariants: one supported Python series, one pinned uv.
 
-The supported toolchain is documented in ``docs/TOOLCHAIN.md`` and must stay
-consistent with the project metadata (``pyproject.toml``) and CI
-(``.github/workflows/ci.yml``). These checks fail when any one of those places
+The supported toolchain is enforced at runtime by :data:`lubko.toolchain
+.SUPPORTED_UV_VERSION` and must stay consistent with the project metadata
+(``pyproject.toml``), CI (``.github/workflows/ci.yml``), and the human-facing
+policy (``docs/TOOLCHAIN.md``). These checks fail when any one of those places
 drifts, so an unsupported or untested version cannot be claimed silently.
 """
 
@@ -10,6 +11,8 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+
+from lubko import toolchain
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -31,6 +34,19 @@ def test_supported_python_is_single_series() -> None:
     assert version == "==3.12.*", version
 
 
+def test_runtime_uv_pin_is_consistent_everywhere() -> None:
+    """The runtime uv pin matches CI and the documented policy exactly."""
+    pinned = toolchain.SUPPORTED_UV_VERSION
+    assert re.fullmatch(r"\d+\.\d+\.\d+", pinned), pinned
+
+    ci = _read(CI)
+    assert f'uv=={pinned}"' in ci, "CI uv pin must match the runtime constant"
+    assert "python -m pip install uv" not in ci
+
+    doc = _read(TOOLCHAIN_DOC)
+    assert f"uv=={pinned}" in doc, "docs/TOOLCHAIN.md must match the runtime constant"
+
+
 def test_ci_pins_exactly_one_uv_version() -> None:
     """CI installs a single, explicitly pinned uv version with no drift."""
     text = _read(CI)
@@ -38,18 +54,3 @@ def test_ci_pins_exactly_one_uv_version() -> None:
     assert "python -m pip install uv " not in text
     pins = UV_PIN_RE.findall(text)
     assert pins == [pins[0]], f"CI must pin exactly one uv version, found: {pins}"
-
-
-def test_toolchain_doc_is_consistent_source_of_truth() -> None:
-    """The documented versions match the metadata and CI exactly."""
-    doc = _read(TOOLCHAIN_DOC)
-    uv_version = UV_PIN_RE.search(doc)
-    assert uv_version is not None, "TOOLCHAIN.md must state an explicit uv==VERSION"
-    pinned = uv_version.group(1)
-
-    pyproject = _read(PYPROJECT)
-    assert 'requires-python = "==3.12.*"' in pyproject
-
-    ci = _read(CI)
-    assert f'uv=={pinned}"' in ci, "CI uv pin must match docs/TOOLCHAIN.md"
-    assert "python -m pip install uv" not in ci

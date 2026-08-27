@@ -29,8 +29,18 @@ pinned version is `0.10.12`.
   recorded executable when `uv` is not on `PATH` (see `src/lubko/toolchain.py`).
   The pin above is the version that must be recorded.
 
-Because `uv` is installed from an explicit `==` pin, an upstream `uv` release
-cannot change validation behavior for an unchanged Lubko commit.
+Every resolved `uv` candidate — explicit `--uv`, `uv` on `PATH`, and the
+recorded fallback — is verified at resolution time by running `uv --version`
+and comparing the reported version against the runtime pin
+(`SUPPORTED_UV_VERSION` in `src/lubko/toolchain.py`). Resolution fails closed
+on a missing/unreadable executable, a non-zero `uv --version`, malformed
+output, a version mismatch, or a timeout. The recorded candidate is
+re-validated at use time, so a binary swapped in place at the recorded path
+cannot bypass the pin.
+
+Because `uv` is installed from an explicit `==` pin and every candidate is
+re-checked against that pin, an upstream `uv` release cannot change validation
+behavior for an unchanged Lubko commit.
 
 ## Dependency lock
 
