@@ -464,3 +464,115 @@ def test_semantically_invalid_sequences_stay_within_pg_safe_decode(tmp_path: Pat
         for _cid, payload in chunks:
             parsed = json.loads(payload)
             assert parsed["value"] == pg_safe_decode(content[parsed["start"] : parsed["end"]])
+
+
+def test_invalid_utf8_4000_bytes_leave_no_gap(tmp_path: Path) -> None:
+    """Exactly 4000 invalid raw bytes leave no uncovered gap before the tail.
+
+    A 4000-byte invalid stream decodes to ~12000 UTF-8 bytes, so the live-tail
+    window drops from its oldest end and ``tail_start`` lands at 2667. The stream
+    is no larger than ``OUTPUT_TAIL_MAX_BYTES``, so ``archive_target`` is 0; the
+    archive must still reach ``tail_start`` or the 2667-byte prefix is trimmed
+    away as an uncovered gap.
+    """
+    path = tmp_path / "s"
+    content = b"\x80" * OUTPUT_TAIL_MAX_BYTES
+    path.write_bytes(content)
+    # The live tail head is where archiving must reach (no gap).
+    _tail_text, tail_start, _tail_end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    chunks, archived_upto, _last, _seq = worker._plan_chunks(
+        uuid.UUID(int=10),
+        "stdout",
+        stream,
+        len(content),
+        "server",
+        version=PROTOCOL_VERSION,
+        tail_start=tail_start,
+    )
+    # No gap: the archive end meets exactly where the live tail begins.
+    assert archived_upto == tail_start
+    # Chunks are contiguous from the start and lead exactly into the tail.
+    prev_end = 0
+    for _cid, payload in chunks:
+        parsed = json.loads(payload)
+        assert parsed["start"] == prev_end
+        assert parsed["end"] <= tail_start
+        assert parsed["value"] == pg_safe_decode(content[parsed["start"] : parsed["end"]])
+        prev_end = parsed["end"]
+    assert prev_end == archived_upto == tail_start
+    # The live tail is the exact canonical decode of its own window.
+    tail_text, start, end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+    assert tail_text == pg_safe_decode(content[start:end])
+
+
+def test_larger_invalid_stream_archive_meets_live_tail(tmp_path: Path) -> None:
+    """A longer invalid stream leaves no gap between chunks and the tail.
+
+    With 12000 invalid bytes the live tail head advances past the
+    ``ARCHIVE_MARGIN_CHARS`` overlap ``archive_target`` would stop at, so a naive
+    plan would leave a gap between the last archived chunk and the live tail that
+    a subsequent trim could drop. Coverage must reach ``tail_start`` itself.
+    """
+    path = tmp_path / "s"
+    content = b"\x80" * (OUTPUT_TAIL_MAX_BYTES * 3)
+    path.write_bytes(content)
+    _tail_text, tail_start, _tail_end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    chunks, archived_upto, _last, _seq = worker._plan_chunks(
+        uuid.UUID(int=11),
+        "stdout",
+        stream,
+        len(content),
+        "server",
+        version=PROTOCOL_VERSION,
+        tail_start=tail_start,
+    )
+    # No gap: archiving reaches at least where the live tail begins.
+    assert archived_upto == tail_start
+    # Chunks are contiguous from the start and cover up to the tail head.
+    prev_end = 0
+    for _cid, payload in chunks:
+        parsed = json.loads(payload)
+        assert parsed["start"] == prev_end
+        assert parsed["value"] == pg_safe_decode(content[parsed["start"] : parsed["end"]])
+        prev_end = parsed["end"]
+    assert prev_end == archived_upto == tail_start
+
+
+def test_repeated_trim_cycles_keep_continuous_invalid_coverage(tmp_path: Path) -> None:
+    """Append/plan/trim with invalid bytes never drops a covered prefix.
+
+    Each cycle appends more invalid (U+FFFD) bytes, advancing the live-tail head
+    past the archive margin; every publication must archive up to ``tail_start``
+    so no chunk range is left as an uncovered gap before the next trim rewrites
+    the spool head.
+    """
+    path = tmp_path / "stdout"
+    path.write_bytes(b"")
+    job = cast(
+        "Any",
+        SimpleNamespace(
+            id=uuid.UUID(int=0), stdout=OutputStream(path=path), version=PROTOCOL_VERSION
+        ),
+    )
+    full = bytearray()
+    for cycle in range(20):
+        delta = b"\x80" * (700 + (cycle % 5) * 211)
+        full += delta
+        with path.open("r+b") as fh:
+            fh.seek(0, 2)
+            fh.write(delta)
+        plans = worker._plan_streams(job, ["stdout"], server="server", force=True)
+        plan = plans["stdout"]
+        # No gap: the archive end meets (or passes) the live tail head.
+        assert plan.archived_upto >= plan.tail_start
+        # Every published chunk is the exact decode of its absolute byte range.
+        for _cid, payload in plan.chunks:
+            parsed = json.loads(payload)
+            assert parsed["value"] == pg_safe_decode(bytes(full)[parsed["start"] : parsed["end"]])
+        worker._apply_plan(job.stdout, plan, time.monotonic())
+        worker._trim_published(job, plans)
+    # Final coverage: the archive end meets the live tail head with no gap.
+    stream = job.stdout
+    assert stream.archived_upto >= stream.tail_start
