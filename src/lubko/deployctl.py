@@ -191,9 +191,18 @@ class RollbackState:
             replacement = data["new_meta"]
             if not isinstance(previous, dict) or not isinstance(replacement, dict):
                 raise TypeError
-            generation = int(data["generation"])
-            if generation < 1:
+            # The generation is recovery authority: it must be a genuine positive
+            # JSON integer. Booleans, numeric/string/numeric-float values, and
+            # zero or negative numbers are corruption; they must never silently
+            # degrade to a usable generation that another allocation could reuse.
+            raw_generation = data["generation"]
+            if (
+                not isinstance(raw_generation, int)
+                or isinstance(raw_generation, bool)
+                or raw_generation < 1
+            ):
                 raise ValueError
+            generation = raw_generation
             return cls(
                 schema_version=int(data["schema_version"]),
                 generation=generation,
@@ -366,9 +375,17 @@ def next_mission_generation() -> int:
 
     Returns:
         The next strictly greater positive generation.
+
+    Raises:
+        DeployCtlError: If a present supervised-mission authority is unreadable
+            or malformed; allocation must fail closed rather than silently
+            outrank an untrustworthy open mission.
     """
     with supervise.generation_lock():
-        return supervise.next_generation()
+        try:
+            return supervise.next_generation()
+        except supervise.MissionAuthorityError as exc:
+            raise DeployCtlError(str(exc)) from exc
 
 
 def _placeholder_meta(commit: str, repo: str) -> WorkerMeta:

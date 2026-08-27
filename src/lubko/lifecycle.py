@@ -4031,6 +4031,15 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
         mission = deployctl.read_rollback_state()
     except deployctl.DeployCtlError:
         mission = None
+    if mission is None:
+        # The supervised-deployment authority is absent or already corrupt: this
+        # migration intentionally supersedes it, so remove any present file
+        # before allocating a generation. Allocation then observes genuine
+        # absence rather than failing closed on authority we are about to
+        # replace, and no malformed authority is silently deleted outside an
+        # explicit recovery path.
+        remove_durable(rollback_state_path())
+        append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
     with supervise.generation_lock():
         generation = supervise.next_generation()
         # The migration flag travels inside this one atomically written
@@ -4052,16 +4061,18 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
                 migration=True,
             )
         )
-    if mission is None:
-        remove_durable(rollback_state_path())
-        append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
-    elif mission.status == deployctl.STATUS_PENDING and mission.generation < generation:
+    if (
+        mission is not None
+        and mission.status == deployctl.STATUS_PENDING
+        and mission.generation < generation
+    ):
         deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)
         append_deploy_log(
             f"migration archived stale pending mission generation {mission.generation}"
         )
     elif (
-        mission.status in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}
+        mission is not None
+        and mission.status in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}
         and mission.generation < generation
     ):
         # A strictly newer cold-migration intent supersedes older terminal

@@ -51,7 +51,7 @@ from typing import TYPE_CHECKING, Final
 from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
-from lubko.state import rollback_state_path, state_root
+from lubko.state import state_root
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -908,6 +908,10 @@ class DesiredIntentError(RuntimeError):
     """Raised when a present desired intent exists but cannot be trusted."""
 
 
+class MissionAuthorityError(RuntimeError):
+    """Raised when a present supervised-mission authority exists but cannot be trusted."""
+
+
 def read_desired_strict() -> SupervisorDesired | None:
     """Load the desired intent in one authoritative snapshot read.
 
@@ -1232,29 +1236,40 @@ def read_supervisor_pid() -> tuple[int, int] | None:
 def _mission_generation() -> int:
     """Return the durable supervised-mission generation, or 0 when absent.
 
-    The mission is deployctl-owned and lives under the worker state; only the
-    ``generation`` field is observed here so generation allocation can never
-    be outranked by an open mission without forming an import cycle with
-    :mod:`lubko.deployctl`. A corrupt, absent, or legacy mission contributes
-    0.
+    The mission is deployctl-owned and lives under the worker state. Generation
+    allocation must observe any open mission so a newer intent can never be
+    outranked by an older one, but the authoritative read is the canonical
+    mission parser in :mod:`lubko.deployctl`; a local import keeps the shared
+    absence-vs-corruption rule in exactly one place without forming a load-time
+    cycle with that module.
+
+    The rule is shared with :func:`read_desired_strict` and
+    :func:`lubko.deployctl.read_rollback_state`:
+
+    * genuine absence (no mission file exists) contributes ``0``;
+    * a present mission authority that is unreadable, invalid JSON, not a
+      supported object, or missing/non-positive its ``generation`` is corrupt
+      and blocks allocation rather than silently degrading to ``0``.
+
+    Blocking on corruption preserves the "never outranked by an open mission"
+    invariant: a newer allocation must never reuse or undercut a mission
+    generation that may already be live.
 
     Returns:
-        The mission's generation, or ``0`` when none is usable.
+        The mission's generation, or ``0`` when no mission authority exists.
+
+    Raises:
+        MissionAuthorityError: If a present mission authority cannot be trusted.
     """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - avoids the deployctl<->supervise import cycle
+        deployctl,
+    )
+
     try:
-        data = json.loads(rollback_state_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return 0
-    if isinstance(data, dict):
-        value = data.get("generation")
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            try:
-                return int(value)
-            except ValueError:
-                pass
-    return 0
+        mission = deployctl.read_rollback_state()
+    except deployctl.DeployCtlError as exc:
+        raise MissionAuthorityError(str(exc)) from exc
+    return mission.generation if mission is not None else 0
 
 
 def next_generation() -> int:
