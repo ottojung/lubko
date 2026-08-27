@@ -79,7 +79,7 @@ from typing import TYPE_CHECKING, Final
 
 import psycopg
 
-from lubko import cli, deployctl, lifecycle, supervise
+from lubko import cli, deployctl, lifecycle, lifecycle_state, supervise
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
@@ -438,6 +438,7 @@ def recover_owned_groups(incarnation: str) -> None:
     """
     if not incarnation:
         return
+    lifecycle_state.failpoint("db_recovery")
     try:
         database = load_database_config()
     except (OSError, ValueError) as exc:

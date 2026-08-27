@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, protocol, startup_contract, supervise, toolchain
+from lubko import cli, lifecycle_state, protocol, startup_contract, supervise, toolchain
 from lubko._exact_signal import open_pidfd as _open_exact_pidfd
 from lubko._exact_signal import pidfd_send_signal, process_pgrp
 from lubko.config import (
@@ -800,6 +800,7 @@ def spawn_worker(
         The started worker process.
     """
     del log_path
+    lifecycle_state.failpoint("popen")
     return subprocess.Popen(
         _worker_command(uv_path),
         cwd=repo,
@@ -1162,6 +1163,7 @@ def stop_worker(
     """
     if meta.pid is None:
         return True
+    lifecycle_state.failpoint("process_retirement")
     try:
         pin = _open_exact_pidfd(meta.pid)
     except (OSError, AttributeError):
@@ -2025,36 +2027,16 @@ def _supervised_mutation_blocker() -> str | None:
     must invoke this under the deployment lock so no guard-to-mutation TOCTOU
     window remains.
 
+    The decision is delegated to :func:`lubko.lifecycle_state.mutation_blocker_reason`,
+    the single authority-state model, so the refusal logic cannot diverge from
+    the documented invariants.
+
     Returns:
         ``None`` when mutation may proceed, otherwise a human-readable refusal
         reason.
 
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
-        deployctl,
-    )
-
-    try:
-        mission = deployctl.read_rollback_state()
-    except deployctl.DeployCtlError as exc:
-        return (
-            f"supervised deployment state is unreadable or corrupt ({exc}); refusing to mutate "
-            "lifecycle state; inspect with 'lubko-deploy-ctl status'"
-        )
-    if mission is None:
-        return None
-    if mission.status == deployctl.STATUS_PENDING:
-        return (
-            f"a supervised checkout of commit {mission.commit} (generation {mission.generation}) "
-            "is still pending confirmation; lifecycle mutation is blocked until it is resolved "
-            "with 'lubko-deploy-ctl confirm' or 'lubko-deploy-ctl rollback'"
-        )
-    if mission.status not in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}:
-        return (
-            f"supervised deployment state has unknown status {mission.status!r}; refusing to "
-            "mutate lifecycle state"
-        )
-    return None
+    return lifecycle_state.mutation_blocker_reason()
 
 
 def _refuse_version_changing_deploy(previous: WorkerMeta | None, commit: str) -> bool:
@@ -2066,6 +2048,11 @@ def _refuse_version_changing_deploy(previous: WorkerMeta | None, commit: str) ->
     clean first installation (no metadata) and a same-commit invocation are
     allowed.
 
+    The decision is delegated to
+    :func:`lubko.lifecycle_state.refuses_version_change`, the single authority
+    model, so the recorded-version rule cannot diverge from the documented
+    invariants.
+
     Args:
         previous: Previously recorded worker metadata, or ``None``.
         commit: Exact validated target commit.
@@ -2073,7 +2060,8 @@ def _refuse_version_changing_deploy(previous: WorkerMeta | None, commit: str) ->
     Returns:
         ``True`` when the deploy must be refused.
     """
-    return previous is not None and previous.git_commit != commit
+    previous_commit = previous.git_commit if previous is not None else None
+    return lifecycle_state.refuses_version_change(previous, commit, git_commit=previous_commit)
 
 
 def _deploy_locked(options: DeployOptions) -> int:

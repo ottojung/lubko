@@ -37,7 +37,7 @@ from uuid import UUID
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, supervise
+from lubko import cli, lifecycle_state, supervise
 from lubko.config import load_database_config
 from lubko.durable import write_json_durable
 from lubko.lifecycle import (
@@ -540,6 +540,7 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
         uv_path=uv_path,
         worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
     )
+    lifecycle_state.failpoint("mission_confirm")
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         msg = "the external supervisor did not apply the settlement intent"
         raise DeployCtlError(msg)
@@ -557,6 +558,7 @@ def publish_mission(state: RollbackState, lock_timeout_seconds: float) -> None:
         lock_timeout_seconds: Deployment-lock timeout for the watchdog.
     """
     _write_state(state)
+    lifecycle_state.failpoint("mission_publish")
     try:
         _fork_watchdog(lock_timeout_seconds)
     except DeployCtlError:
@@ -1274,6 +1276,7 @@ def _rollback_locked(state: RollbackState) -> bool:
     """
     if state.status != STATUS_PENDING:
         return True
+    lifecycle_state.failpoint("mission_rollback")
     if supervise.supervisor_running():
         try:
             settle_desired(state.previous_commit, state.repo, state.uv_path)
