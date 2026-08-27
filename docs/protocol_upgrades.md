@@ -78,13 +78,26 @@ handles every version in the window; a future breaking generation would register
 its own parser and raise `min` only after the prior version has drained.
 
 The SQL side is generalized by `migrations/0005_protocol_version_window.sql`,
-which replaces the hard-coded `(payload::jsonb)->'v' = '4'` check with a bounded
-window `v::int between MIN_PROTOCOL_VERSION and MAX_PROTOCOL_VERSION`. The two
-bounds are plain constants at the top of the file: to open the next compatible
-window you edit them and re-apply the idempotent migration. A preflight refuses
-to apply against any row already outside the target window, so a failed cutover
-leaves the table and its constraint completely intact — there is no half-upgraded
-state.
+which replaces the hard-coded `(payload::jsonb)->'v' = '4'` check with a
+**retained-history** range check: `v` must be a well-formed integer in
+`[RETAINED_MIN, RETAINED_MAX]`. This range is deliberately broader than any
+single daemon's execution window — it covers every protocol version the fleet
+has ever written and must keep queryable as immutable terminal history, so
+raising the execution floor never invalidates old `command` rows or
+`output_chunk` history. The daemon's *execution* window (which versions it will
+claim, parse, and run) is a runtime property of each daemon
+(`Settings.supported_protocol_range` in `lubko.protocol_versioning`), applied
+through the claim predicate and the fail-closed reaper; it is never the table
+constraint. The two bounds are plain constants at the top of the migration:
+`RETAINED_MIN` is the oldest version this build still treats as valid retained
+history (v4 in the current generation; v1-v3 were never valid post-cutover v4+
+history and are rejected to keep the fail-closed DB boundary tight), and
+`RETAINED_MAX` is the highest version this build of the code can parse and store.
+Bump `RETAINED_MAX` when a new compatible version becomes writable and re-apply
+the idempotent migration. A preflight refuses to apply against any row whose `v`
+is malformed, fractional, out of the retained range, or a future/unrepresentable
+value, so a failed cutover leaves the table and its constraint completely intact
+— there is no half-upgraded state.
 
 ## Deterministic staggered server upgrade procedure
 
@@ -94,19 +107,23 @@ The window makes a one-server-at-a-time rollout safe and deterministic:
    highest version common to it and each target server's window. While every
    server still advertises only `[C, C]`, new jobs are submitted at `C`.
 2. **Widen the window (non-destructive).** Roll out a new daemon build that
-   advertises `[C, C+1]` (with the `C+1` parser/constraint in place). Because
-   the table schema is unchanged and `C+1` is mutually compatible with `C`, this
-   requires no migration of existing rows. Apply `0004` with `MAX_PROTOCOL_VERSION
-   = C+1` so the table will accept both versions. In-flight `C` jobs keep running
+   advertises `[C, C+1]` (with the `C+1` parser in place). Because the table
+   schema is unchanged and `C+1` is mutually compatible with `C`, this requires
+   no immediate migration of existing rows. When you are ready for the table to
+   also accept `C+1` writes, apply `0005` with `RETAINED_MAX = C+1` so the
+   retained-history range admits both versions. In-flight `C` jobs keep running
    on daemons that still advertise `[C, C]`.
 3. **Converge new work.** Submitters now negotiate `C+1` against the widened
    window, so every *new* job is stamped `v = C+1`, while old `C` jobs drain
    naturally as they finish.
-4. **Drain the old version.** Once the queue contains no `command` rows at `C`
-   (they are all terminal and collected, or have finished), raise the floor by
-   rolling out daemons that advertise `[C+1, C+1]` and, finally, applying `0004`
-   with `MIN_PROTOCOL_VERSION = C+1`. This is again non-destructive: the only
-   `C` rows left are none.
+4. **Drain the old version and raise the execution floor (non-destructive).**
+   Once the queue contains no *pending* `command` rows at `C` (they are all
+   terminal and collected, or have finished), roll out daemons that advertise
+   `[C+1, C+1]`. The execution floor moves at the daemon level only; the table
+   constraint's retained range already spans `C` through `C+1`, so the terminal
+   `C` rows and their `output_chunk` history remain valid and queryable. No
+   migration re-application is required to raise the floor, and old history is
+   never rejected.
 5. **Breaking change?** A breaking generation `C+2` is handled the same way, but
    `C+1` and `C+2` are *not* mutually compatible, so they are never in the same
    window; you drain `C+1` completely (step 4) before opening `[C+2, C+2]`.

@@ -131,7 +131,10 @@ access contract.
   in-flight jobs and immutable `output_chunk` history are preserved across the
   rollout, and a staggered one-server-at-a-time upgrade is deterministic. The
   SQL constraint is generalized by `migrations/0005_protocol_version_window.sql`
-  from a hard-coded `v = 4` to a bounded `v::int between min and max`.
+  from a hard-coded `v = 4` to a retained-history range `[RETAINED_MIN,
+  RETAINED_MAX]` that is broader than any daemon's execution window, so raising
+  the execution floor never rejects old terminal `v=4` rows or their
+  `output_chunk` history.
 - **The v3 → v4 cutover was a one-time destructive legacy event, not a template.**
   Version `3` rows carried no required top-level `server` routing identity, so v4
   parsers, builders, and workers cannot accept them; there is no compatibility

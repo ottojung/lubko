@@ -1,9 +1,9 @@
--- Lubko non-destructive mixed-version protocol window.
+-- Lubko non-destructive mixed-version protocol window: RETAINED-HISTORY range.
 --
 -- This migration generalizes the protocol-v4 payload-shape constraint so it no
 -- longer hard-codes a single version. Instead of demanding `(payload::jsonb)->'v'
--- = '4'`, it admits every version inside a bounded, mutually compatible window
--- `[MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION]`.
+-- = '4'`, it admits every version inside a *retained-history* range
+-- `[RETAINED_MIN, RETAINED_MAX]`.
 --
 -- THE MODEL (see docs/protocol_upgrades.md)
 --
@@ -17,40 +17,48 @@
 --     kinds (`command`, `output_chunk`) and all required fields are identical,
 --     and evolution between window versions is strictly additive. A breaking
 --     change is handled by draining the old version out of the window before
---     raising MIN_PROTOCOL_VERSION, never by altering the table or truncating.
---   * The window is bounded (see MAX_VERSION_SPAN in lubko.protocol_versioning);
---     this migration enforces the same bound at the schema level so a row can
---     never enter the table at a version the fleet cannot converge on.
---   * A daemon claims and executes only jobs whose `v` lies inside its own
---     configured window (lubko.worker claim predicate) and fails closed on any
---     version outside it.
+--     raising the execution floor, never by altering the table or truncating.
+--   * The daemon's EXECUTION window (which versions it will claim, parse, and
+--     run) is a runtime property of each daemon -- `Settings.supported_protocol_range`
+--     in lubko.protocol_versioning -- applied through the claim predicate and the
+--     fail-closed reaper. It is NEVER the table constraint. The execution floor
+--     can move forward (for example `[4,4]` -> `[5,5]`) while old terminal `v=4`
+--     command rows and their `output_chunk` history stay stored and queryable.
+--   * This migration's CHECK therefore validates `v` against the RETAINED-HISTORY
+--     range, which is deliberately broader than any single daemon's execution
+--     window. It covers every protocol version the fleet has ever written and
+--     must keep: raising the execution floor never invalidates that history.
 --
--- UPGRADING TO A NEW COMPATIBLE VERSION
+-- RETAINED-HISTORY RANGE vs EXECUTION WINDOW
 --
--- To widen the window for the next generation (for example v4 -> v5), edit the
--- two constants below (MAX_PROTOCOL_VERSION = 5, once the v5 parser and builder
--- exist in lubko.protocol_versioning.SUPPORTED_PROTOCOL_VERSIONS) and re-apply
--- this idempotent migration. The preflight refuses to apply against any row
--- whose version is already outside the new window, so the table is left
--- completely intact on a failed cutover -- there is no half-upgraded state.
---
--- For a breaking change, keep MIN_PROTOCOL_VERSION = MAX_PROTOCOL_VERSION =
--- the new generation after the old version has fully drained; the same
--- constraint refuses legacy rows.
+--   * RETAINED_MIN / RETAINED_MAX are the bounds of versions the table may store.
+--     RETAINED_MIN is the oldest version this build still treats as valid
+--     retained history (v4 in the current generation; v1-v3 were never valid
+--     post-cutover v4+ history and are rejected to keep the fail-closed DB
+--     boundary tight). RETAINED_MAX is the highest version THIS BUILD of the code
+--     can parse and store. Bump RETAINED_MAX only when a new compatible version
+--     becomes writable (for example v4 -> v5, once the v5 parser and builder
+--     exist in lubko.protocol_versioning.SUPPORTED_PROTOCOL_VERSIONS). The
+--     execution window is configured separately, per daemon, at runtime.
+--   * Because the retained range is the superset, a row at an older version such
+--     as `v=4` remains valid even after every daemon's execution floor has risen
+--     to `[5,5]`. The constraint rejects only malformed, fractional,
+--     out-of-retained-range, or future/unrepresentable `v` values -- never
+--     legitimate historical versions.
 --
 -- TOTAL, FAIL-CLOSED VERSION VALIDATION
 --
 -- The version check below admits a row only when its `v` is a JSON number that
--- is integral and lies inside the window. It is written so it can NEVER return
--- SQL NULL and NEVER raises on a malformed value, so a bad row is always
--- rejected rather than silently admitted (a NULL/TRUE in a CHECK would pass,
--- and an unguarded ::int cast would raise on an oversized value):
+-- is integral and lies inside the retained-history range. It is written so it
+-- can NEVER return SQL NULL and NEVER raises on a malformed value, so a bad row
+-- is always rejected rather than silently admitted (a NULL/TRUE in a CHECK would
+-- pass, and an unguarded ::int cast would raise on an oversized value):
 --
 --   * a missing `v` key            (jsonb extraction yields SQL NULL),
 --   * a JSON `null` `v`           (jsonb_typeof reports 'null', not 'number'),
 --   * a non-number `v`            (string / boolean / object / array),
 --   * a fractional `v`            (e.g. 4.9 would be rounded by a bare ::int),
---   * an out-of-range `v`,        (below MIN or above MAX of the window),
+--   * an out-of-retained-range `v` (below RETAINED_MIN or above RETAINED_MAX),
 --   * an oversized `v`            (far larger than INT4; compared as numeric,
 --                                  never cast to int, so it cannot raise or
 --                                  slip through as a wrapped small integer).
@@ -60,23 +68,34 @@
 
 do $$
 declare
-    -- The bounded, mutually compatible version window for this deployment.
-    min_version integer := 4;
-    max_version integer := 4;
+    -- Retained-history range: every version the table may store as immutable
+    -- terminal history. This is broader than any daemon's execution window, so
+    -- advancing the execution floor never rejects old command/output_chunk rows.
+    -- RETAINED_MIN is the oldest version this build still treats as valid
+    -- retained history (v4 in the current generation): v1-v3 were never valid
+    -- post-cutover v4+ history, and admitting shape-compatible v1-v3 direct
+    -- writes would weaken the fail-closed DB boundary, so they are rejected.
+    -- RETAINED_MAX is the highest version this build can parse and store; widen
+    -- it only when a new compatible version becomes writable.
+    retained_min integer := 4;
+    retained_max integer := 5;
     nonconforming bigint;
     constraint_text text;
 begin
-    if max_version < min_version then
+    if retained_max < retained_min then
         raise exception using
             message = format(
-                'protocol window is invalid: min %s exceeds max %s',
-                min_version, max_version
+                'retained protocol range is invalid: min %s exceeds max %s',
+                retained_min, retained_max
             );
     end if;
 
     -- Preflight: refuse to apply if any command/output_chunk row already sits
-    -- outside the new window. Raising here leaves the original constraint and
-    -- table completely intact; the cutover is non-destructive and fail-closed.
+    -- outside the retained-history range (malformed, fractional, future, or
+    -- unrepresentable). Raising here leaves the original constraint and table
+    -- completely intact; the cutover is non-destructive and fail-closed. Valid
+    -- historical rows (for example a `v=4` row once the execution floor is `5`)
+    -- are inside the retained range and are NOT rejected.
     --
     -- The version test is a single boolean expression that can never be NULL and
     -- never casts a non-number: the numeric comparisons live inside a CASE that
@@ -95,7 +114,7 @@ begin
                 then ((payload::jsonb)->'v')::numeric
                          = floor(((payload::jsonb)->'v')::numeric)
                      and ((payload::jsonb)->'v')::numeric
-                         between min_version and max_version
+                         between retained_min and retained_max
                 else false
             end
         );
@@ -104,10 +123,10 @@ begin
         raise exception using
             message = format(
                 'lubko.jobs still holds %s command/output_chunk payload(s) whose '
-                'protocol version is outside the target window [%s, %s]. Widen '
-                'the window or drain those jobs before applying; the constraint '
-                'is unchanged.',
-                nonconforming, min_version, max_version
+                'protocol version is outside the retained range [%s, %s]. Fix the '
+                'malformed/future row or widen RETAINED_MAX before applying; the '
+                'constraint is unchanged.',
+                nonconforming, retained_min, retained_max
             );
     end if;
 
@@ -149,7 +168,7 @@ begin
                 and (((payload::jsonb)->>''end'') ~ ''^[0-9]+$'')
             else true
         end',
-        min_version, max_version, min_version, max_version
+        retained_min, retained_max, retained_min, retained_max
     );
 
     alter table lubko.jobs drop constraint if exists jobs_payload_type_shape;

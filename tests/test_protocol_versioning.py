@@ -312,11 +312,11 @@ def test_worker_config_rejects_invalid_window(tmp_path: Path, body: str) -> None
 
 
 # ---------------------------------------------------------------------------
-# Migration 0004 must reject fractional JSON versions before any integer cast.
+# Migration 0005: total, fail-closed version gate AND retained-history range.
 # ---------------------------------------------------------------------------
 
 
-def test_migration_0004_version_validation_is_total_and_fail_closed() -> None:
+def test_migration_0005_version_validation_is_total_and_fail_closed() -> None:
     """The window constraint rejects every malformed `v`, never silently passing.
 
     The version check must be total (it can never evaluate to SQL NULL, which a
@@ -343,15 +343,49 @@ def test_migration_0004_version_validation_is_total_and_fail_closed() -> None:
     assert integral_guard in migration
     assert "= floor(((payload::jsonb)->''v'')::numeric)" in migration
 
-    # Out-of-range `v`: the integral value must lie inside the window, compared
-    # as numeric (so an oversized value is rejected by the bound, not by a cast
-    # error or an integer wrap).
+    # Out-of-range `v`: the integral value must lie inside the retained range,
+    # compared as numeric (so an oversized value is rejected by the bound, not by
+    # a cast error or an integer wrap).
     assert "between %L and %L" in migration
 
     # Oversized / unrepresentable `v`: the constraint must NOT cast `v` to int,
     # which would raise or wrap on a huge JSON number. The version check uses
     # ::numeric only.
     assert "->''v'')::int" not in migration
+
+
+def test_migration_0005_retains_old_history_when_execution_floor_advances() -> None:
+    """The stored-history range is broader than the daemon execution window.
+
+    Raising the daemon execution floor (for example from ``[4,4]`` to ``[5,5]``)
+    must NOT invalidate old terminal ``v=4`` command rows or their ``output_chunk``
+    history. The table constraint therefore validates ``v`` against a retained
+    range that spans the oldest supported version (``v4``) through the newest
+    compatible version this build can store (``v5``), independent of any daemon's
+    execution window. The execution window is a runtime-only property (applied via
+    the claim predicate and the fail-closed reaper), never the table constraint.
+    """
+    migration = (
+        Path(__file__).resolve().parent.parent / "migrations" / "0005_protocol_version_window.sql"
+    ).read_text(encoding="utf-8")
+
+    # The stored-history floor is v4 (not v1): admitting shape-compatible v1-v3
+    # direct writes would weaken the fail-closed DB boundary, so they are rejected.
+    assert "retained_min integer := 4" in migration
+    # The retained range covers the newly supported compatible v5; future max only
+    # widens.
+    assert "retained_max integer := 5" in migration
+
+    # The CHECK/preflight bound is the retained range, not an execution window:
+    # the format() call feeds the retained bounds into the `between` check.
+    assert "between %L and %L" in migration
+    assert "retained_min, retained_max, retained_min, retained_max" in migration
+
+    # The execution window is explicitly a runtime-only concern, never the table
+    # constraint, so advancing it cannot reject old history.
+    assert "execution window" in migration
+    assert "NEVER the table constraint" in migration
+    assert "Settings.supported_protocol_range" in migration
 
 
 def test_parser_rejects_missing_and_null_version() -> None:
