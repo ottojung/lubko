@@ -117,6 +117,11 @@ from lubko.protocol import (
     build_output_window_payload,
     parse_payload,
 )
+from lubko.protocol_versioning import (
+    DEFAULT_VERSION_RANGE,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    claim_version_predicate,
+)
 from lubko.state import state_root
 
 if TYPE_CHECKING:
@@ -126,6 +131,7 @@ if TYPE_CHECKING:
     from psycopg.abc import RV, PQGen
 
     from lubko.config import DatabaseConfig
+    from lubko.protocol_versioning import ProtocolVersionRange
 
     JobsConnection = psycopg.Connection[tuple[Any, ...]]
 else:
@@ -711,13 +717,20 @@ class Settings:
     gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     gc_batch_limit: int = DEFAULT_GC_BATCH_LIMIT
     output_spool_max_bytes: int = DEFAULT_OUTPUT_SPOOL_MAX_BYTES
+    #: Supported protocol version window for this daemon. A daemon claims and
+    #: executes only jobs whose ``v`` lies inside this window, so a fleet can
+    #: run a bounded mixed-version set during a staggered, non-destructive
+    #: upgrade while older in-flight jobs keep running on daemons that still
+    #: advertise the older version. The window may never include a version this
+    #: build cannot parse.
+    supported_protocol_range: ProtocolVersionRange = DEFAULT_VERSION_RANGE
 
     def __post_init__(self) -> None:
         """Validate lease timing so a live worker's lease never expires idle.
 
         Raises:
-            ValueError: If the server identity is empty or any timing value
-                is unusable.
+            ValueError: If the server identity is empty, any timing value is
+                unusable, or the supported protocol window is invalid.
         """
         if not self.server:
             msg = (
@@ -729,6 +742,25 @@ class Settings:
         self._validate_lease_timing()
         self._validate_output_and_gc()
         self._validate_spool()
+        self._validate_protocol_range()
+
+    def _validate_protocol_range(self) -> None:
+        """Fail closed if the window includes an unparseable version.
+
+        Raises:
+            ValueError: If any version in the window exceeds what this build can
+                parse and execute.
+        """
+        window = self.supported_protocol_range
+        for version in range(window.min, window.max + 1):
+            if version not in SUPPORTED_PROTOCOL_VERSIONS:
+                msg = (
+                    f"supported protocol range [{window.min}, {window.max}] "
+                    f"includes version {version} which this build cannot parse; "
+                    "the daemon refuses to start rather than claim jobs it "
+                    "cannot safely execute"
+                )
+                raise ValueError(msg)
 
     def _validate_lease_timing(self) -> None:
         """Validate lease-related settings are consistent.
@@ -3209,7 +3241,12 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
     execute the same root job. Only ``command`` rows whose top-level
     ``server`` exactly equals the daemon's configured server identity are
     claimed; jobs addressed to other servers stay pending, and immutable
-    ``output_chunk`` rows are never claim candidates.
+    ``output_chunk`` rows are never claim candidates. The claim is further gated
+    to rows whose protocol ``v`` lies inside the daemon's supported version
+    window (see :mod:`lubko.protocol_versioning`), so a daemon never locks a job
+    it cannot parse or execute and a mixed-version fleet can run a
+    non-destructive, staggered upgrade while older in-flight jobs keep running
+    on daemons that still advertise the older version.
 
     The claim records the worker's incarnation and grants each job a lease by
     writing ``state.lease_expires_at``; the owning worker refreshes those
@@ -3246,13 +3283,17 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
             ("state,updated_at", UTC_ISO_SQL),
         ],
     )
+    version_fragment, version_params = claim_version_predicate(settings.supported_protocol_range)
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "WITH next AS (\n"
             "    SELECT id\n"
             "    FROM lubko.jobs\n"
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
-            "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
+            + version_fragment
+            + "        AND "
+            + SERVER_MATCH_SQL
+            + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status' = 'pending'\n"
             "    ORDER BY (payload::jsonb)->'state'->>'created_at', id\n"
             "    FOR UPDATE SKIP LOCKED\n"
@@ -3269,6 +3310,7 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
                 "worker_incarnation": settings.worker_incarnation,
                 "lease_duration_seconds": settings.lease_duration_seconds,
                 "limit": limit,
+                **version_params,
             },
         )
         rows = cursor.fetchall()
@@ -5485,7 +5527,9 @@ class Supervisor:
         if conn is None:
             return
         try:
-            payload = parse_payload(claimed.payload)
+            payload = parse_payload(
+                claimed.payload, supported=self.settings.supported_protocol_range
+            )
         except ProtocolError as exc:
             LOGGER.warning("rejecting unparseable job %s: %s", claimed.id, exc)
             self._finalize_immediate(
