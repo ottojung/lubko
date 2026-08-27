@@ -17,10 +17,15 @@ spawning anything.
 from __future__ import annotations
 
 import os
+import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import pytest
 
@@ -93,6 +98,7 @@ def _facts(**overrides: Any) -> AuthorityFacts:  # ruff: ignore[any-type]
         rollback_pending=False,
         durable_malformed=False,
         supervisor_child_present=False,
+        current_child_identity_proven=False,
         ownership_hold_malformed=False,
         unresolved_hold_malformed=False,
         spawning_hold_malformed=False,
@@ -223,7 +229,8 @@ def test_authorize_decisions() -> None:
     )
     assert authorize_recovery(_facts()) is False
 
-    assert authorize_retirement(_facts(owned_worker_identity_proven=True)) is True
+    assert authorize_retirement(_facts(current_child_identity_proven=True)) is True
+    assert authorize_retirement(_facts(durable_malformed=True)) is False
     assert authorize_retirement(_facts()) is False
 
     assert authorize_mission_publish(_facts()) is True
@@ -233,8 +240,11 @@ def test_authorize_decisions() -> None:
     assert (
         authorize_mission_confirm(_facts(mission_status="pending", candidate_ready=False)) is False
     )
-    assert authorize_mission_confirm(_facts(mission_status="confirmed")) is False
+    # Same-mission replay is explicitly safe: confirming an already-confirmed
+    # mission is a no-op, not a conflicting transition.
+    assert authorize_mission_confirm(_facts(mission_status="confirmed")) is True
     assert authorize_mission_rollback(_facts(mission_status="pending")) is True
+    assert authorize_mission_rollback(_facts(mission_status="rolled_back")) is True
     assert (
         authorize_mission_rollback(_facts(durable_malformed=True, mission_status="pending"))
         is False
@@ -475,3 +485,415 @@ def test_current_phase_derived_from_reconciled_facts(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: True)
     monkeypatch.setattr(supervise, "child_alive", lambda _c: True)
     assert current_phase() is lifecycle_state.LifecyclePhase.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# Real runtime paths consult the authority model (gates wired, not decorative)
+# ---------------------------------------------------------------------------
+
+
+def _make_meta(commit: str, *, pid: int = 1) -> lifecycle.WorkerMeta:
+    """Build a minimal valid worker metadata record for mission fixtures.
+
+    Returns:
+        A valid :class:`lubko.lifecycle.WorkerMeta` for the given commit.
+    """
+    return lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=pid,
+        pgid=pid,
+        sid=pid,
+        start_time_ticks=pid * 10,
+        token=f"tok-{pid}",
+        repo="/r",
+        git_commit=commit,
+        worker_id="w",
+        log_path="/l",
+        started_at=1.0,
+        stopped_at=None,
+    )
+
+
+def _make_mission(
+    status: str, *, commit: str = COMMIT, challenge_hash: str | None = None
+) -> deployctl.RollbackState:
+    """Build a minimal valid rollback mission in ``status``.
+
+    Returns:
+        A valid :class:`lubko.deployctl.RollbackState` in the given status.
+    """
+    return deployctl.RollbackState(
+        schema_version=deployctl.ROLLBACK_SCHEMA_VERSION,
+        generation=5,
+        status=status,
+        commit=commit,
+        previous_commit="0" * 40,
+        challenge_hash=challenge_hash,
+        deadline=time.time() + 60.0,
+        repo="/r",
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=1.0,
+        previous_retiring=False,
+        previous_meta=_make_meta("0" * 40),
+        new_meta=_make_meta(commit),
+        supervisor_owned=True,
+    )
+
+
+def _options() -> deployctl.Options:
+    """Return runtime options for the deployment handlers."""
+    return deployctl.Options(
+        repo=Path("/r"),
+        uv_path="uv",
+        confirm_window_seconds=60.0,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=1.0,
+        cli_timeout_seconds=1.0,
+    )
+
+
+def test_post_popen_invariant_refusal_converges_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-Popen authority-invariant refusal converges the live child.
+
+    The review requires the supervisor to never ``return None`` and forget a
+    child it just spawned: an authority-invariant refusal after a successful
+    ``Popen`` must route through the existing ``_recover_unpublished_spawn``
+    convergence path so the child is reaped, never orphaned.
+    """
+    script = tmp_path / "sleeper.sh"
+    script.write_text("#!/bin/sh\nsleep 30\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: True)
+    monkeypatch.setattr(cli, "cli_entry_executable", lambda _c, _n: script)
+    monkeypatch.setattr(cli, "cli_commit_dir", lambda _c: tmp_path)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _t: {})
+    monkeypatch.setattr(supervisor, "read_desired", lambda: None)
+    monkeypatch.setattr(supervise, "read_desired", lambda: None)
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _t: None)
+    captured: list[subprocess.Popen[bytes]] = []
+    real_popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen
+
+    def spy_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        proc = real_popen(*args, **kwargs)
+        captured.append(proc)
+        return proc
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", spy_popen)  # type: ignore[attr-defined]
+    calls = {"n": 0}
+    valid = _facts()
+    violating = _facts(supervisor_child_present=True, pre_spawn_obligation=True)
+
+    def fake_reconcile() -> AuthorityFacts:
+        calls["n"] += 1
+        return violating if calls["n"] >= 2 else valid
+
+    monkeypatch.setattr(lifecycle_state, "reconcile_authority_facts", fake_reconcile)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    assert daemon._spawn_worker(COMMIT) is None
+    assert captured, "a real child was spawned before the refusal"
+    assert captured[0].poll() is not None, (
+        "the live child was converged (reaped), not forgotten after the refusal"
+    )
+
+
+def test_recovery_gate_refuses_conflicting_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_resolve_unresolved_child holds (no convergence) when authority refuses."""
+    monkeypatch.setattr(
+        lifecycle_state,
+        "reconcile_authority_facts",
+        lambda: _facts(unresolved_child=True, owned_worker_identity_proven=True),
+    )
+    state = supervise.read_state()
+    supervise.write_state(
+        replace(
+            state,
+            unresolved_child=supervise.UnresolvedChild(
+                pid=1, start_time_ticks=1, token="tok" + "a" * 20, spawned_at=0.0
+            ),
+        )
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    converged: list[bool] = []
+
+    def spy_converge(_h: object) -> bool:
+        converged.append(True)
+        return False
+
+    monkeypatch.setattr(daemon, "_converge_unresolved", spy_converge)
+    assert daemon._resolve_unresolved_child() is False
+    assert converged == [], (
+        "convergence must not run when the authority refuses recovery (conflicting consumer)"
+    )
+
+
+def test_recovery_gate_allows_when_authority_permitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_resolve_unresolved_child converges when the authority permits recovery."""
+    monkeypatch.setattr(
+        lifecycle_state,
+        "reconcile_authority_facts",
+        lambda: _facts(unresolved_child=True),
+    )
+    state = supervise.read_state()
+    supervise.write_state(
+        replace(
+            state,
+            unresolved_child=supervise.UnresolvedChild(
+                pid=1, start_time_ticks=1, token="tok" + "a" * 20, spawned_at=0.0
+            ),
+        )
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    converged: list[bool] = []
+
+    def _converge(_h: object) -> bool:
+        converged.append(True)
+        return True
+
+    monkeypatch.setattr(daemon, "_converge_unresolved", _converge)
+    monkeypatch.setattr(daemon, "_recover_spawn_owned_groups", lambda _t: True)
+    assert daemon._resolve_unresolved_child() is True
+    assert converged == [True]
+
+
+def test_retirement_gate_refuses_unproven_live_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_retire_child refuses (no signal) when authority denies retirement."""
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: True)
+    monkeypatch.setattr(
+        lifecycle_state,
+        "reconcile_authority_facts",
+        lambda: _facts(current_child_identity_proven=False),
+    )
+    state = supervise.read_state()
+    supervise.write_state(
+        replace(
+            state,
+            child=supervise.WorkerChild(
+                pid=1,
+                pgid=1,
+                sid=1,
+                start_time_ticks=1,
+                token="tok" + "a" * 20,
+                worker_id="w",
+                spawned_at=0.0,
+            ),
+        )
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    signalled: list[bool] = []
+
+    def _stop(_m: object, _g: object) -> bool:
+        signalled.append(True)
+        return True
+
+    monkeypatch.setattr(lifecycle, "stop_worker", _stop)
+    assert daemon._retire_child() is False
+    assert signalled == [], "no signal may be delivered when authority refuses retirement"
+
+
+def test_retirement_gate_allows_proven_live_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_retire_child signals and clears a provably-our-direct-child worker."""
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: True)
+    monkeypatch.setattr(
+        lifecycle_state,
+        "reconcile_authority_facts",
+        lambda: _facts(current_child_identity_proven=True),
+    )
+    state = supervise.read_state()
+    supervise.write_state(
+        replace(
+            state,
+            child=supervise.WorkerChild(
+                pid=1,
+                pgid=1,
+                sid=1,
+                start_time_ticks=1,
+                token="tok" + "a" * 20,
+                worker_id="w",
+                spawned_at=0.0,
+            ),
+        )
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(lifecycle, "stop_worker", lambda _m, _g: True)
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _t: None)
+    assert daemon._retire_child() is True
+
+
+def test_retirement_gate_clears_dead_recorded_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead recorded child is cleared (no destructive signal) despite the gate."""
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: False)
+    monkeypatch.setattr(
+        lifecycle_state,
+        "reconcile_authority_facts",
+        lambda: _facts(current_child_identity_proven=False),
+    )
+    state = supervise.read_state()
+    supervise.write_state(
+        replace(
+            state,
+            child=supervise.WorkerChild(
+                pid=1,
+                pgid=1,
+                sid=1,
+                start_time_ticks=1,
+                token="tok" + "a" * 20,
+                worker_id="w",
+                spawned_at=0.0,
+            ),
+        )
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(lifecycle, "stop_worker", lambda _m, _g: True)
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _t: None)
+    assert daemon._retire_child() is True
+
+
+def test_confirm_gate_refuses_malformed_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_confirm_locked rolls back and refuses when durable authority is malformed."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(
+        deployctl,
+        "read_rollback_state",
+        lambda: (_ for _ in ()).throw(deployctl.DeployCtlError("malformed")),
+    )
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    challenge = deployctl._generate_challenge()
+    monkeypatch.setattr(
+        deployctl,
+        "_read_state",
+        lambda: replace(mission, challenge_hash=deployctl._challenge_digest(challenge)),
+    )
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
+    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
+    with pytest.raises(deployctl.DeployCtlError, match="authority refuses confirmation"):
+        deployctl._confirm_locked(
+            {"type": "confirm", "commit": mission.commit, "challenge": challenge[::-1]},
+            _options(),
+        )
+    # Fail closed: the malformed mission was NOT rolled back or mutated.
+    recorded = deployctl._read_state()
+    assert recorded is not None
+    assert recorded.status == deployctl.STATUS_PENDING
+
+
+def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_confirm_locked proceeds when the authority permits the transition."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    challenge = deployctl._generate_challenge()
+    monkeypatch.setattr(
+        deployctl,
+        "_read_state",
+        lambda: replace(mission, challenge_hash=deployctl._challenge_digest(challenge)),
+    )
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
+    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
+    monkeypatch.setattr(cli, "set_current", lambda _c: None)
+    monkeypatch.setattr(cli, "gc_cli_roots", lambda _c: None)
+    monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
+    written: list[deployctl.RollbackState] = []
+    monkeypatch.setattr(deployctl, "_write_state", written.append)
+    response = deployctl._confirm_locked(
+        {"type": "confirm", "commit": mission.commit, "challenge": challenge[::-1]},
+        _options(),
+    )
+    assert response["confirmed"] is True
+    assert written[-1].status == deployctl.STATUS_CONFIRMED
+
+
+def test_rollback_gate_refuses_malformed_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_rollback_locked holds (no destructive mutation) when authority is malformed."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(
+        deployctl,
+        "read_rollback_state",
+        lambda: (_ for _ in ()).throw(deployctl.DeployCtlError("malformed")),
+    )
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
+    assert deployctl._rollback_locked(mission) is False
+    assert deployctl._read_state() is mission
+
+
+def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_rollback_locked proceeds when the authority permits the transition."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
+    monkeypatch.setattr(cli, "remove_cli_root", lambda _c: None)
+    monkeypatch.setattr(cli, "reconcile_pointer", lambda _c: True)
+    monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
+    assert deployctl._rollback_locked(mission) is True
+    recorded = deployctl._read_state()
+    assert recorded is not None
+    assert recorded.status == deployctl.STATUS_ROLLED_BACK
+
+
+def test_publish_gate_refuses_conflicting_mission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_prepare_locked refuses a new pending mission while one is already pending."""
+    existing = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: existing)
+    # Keep the abandoned-pending cleaner from rolling the existing mission back.
+    monkeypatch.setattr(deployctl, "_cleanup_pending_locked", lambda: None)
+    monkeypatch.setattr(deployctl, "read_meta", lambda: _make_meta("0" * 40))
+    monkeypatch.setattr(deployctl, "worker_alive", lambda _m: True)
+    monkeypatch.setattr(deployctl, "_require_exact_commit", lambda *_, **__: None)
+    monkeypatch.setattr(deployctl, "_require_clean_checkout", lambda *_, **__: None)
+    monkeypatch.setattr(deployctl, "_checkout", lambda *_, **__: True)
+    monkeypatch.setattr(deployctl, "run_validation", lambda *_, **__: SimpleNamespace(ok=True))
+    monkeypatch.setattr(cli, "build_cli_root", lambda *_, **__: None)
+    monkeypatch.setattr(
+        deployctl, "_candidate_identity", lambda *_, **__: (None, _make_meta(COMMIT))
+    )
+    monkeypatch.setattr(deployctl, "check_postgres", lambda *_, **__: True)
+    monkeypatch.setattr(deployctl, "_restore_previous_prep", lambda *_, **__: None)
+    with pytest.raises(deployctl.DeployCtlError, match="authority refuses a new pending mission"):
+        deployctl._prepare_locked(_options(), COMMIT, supervised=True)
+
+
+def test_publish_gate_allows_when_no_pending_mission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_prepare_locked creates the pending mission when no conflict exists."""
+    monkeypatch.setattr(deployctl, "_read_state", lambda: None)
+    monkeypatch.setattr(deployctl, "_cleanup_pending_locked", lambda: None)
+    monkeypatch.setattr(deployctl, "read_meta", lambda: _make_meta("0" * 40))
+    monkeypatch.setattr(deployctl, "worker_alive", lambda _m: True)
+    monkeypatch.setattr(deployctl, "_require_exact_commit", lambda *_, **__: None)
+    monkeypatch.setattr(deployctl, "_require_clean_checkout", lambda *_, **__: None)
+    monkeypatch.setattr(deployctl, "_checkout", lambda *_, **__: True)
+    monkeypatch.setattr(deployctl, "run_validation", lambda *_, **__: SimpleNamespace(ok=True))
+    monkeypatch.setattr(cli, "build_cli_root", lambda *_, **__: None)
+    monkeypatch.setattr(
+        deployctl, "_candidate_identity", lambda *_, **__: (None, _make_meta(COMMIT))
+    )
+    monkeypatch.setattr(deployctl, "check_postgres", lambda *_, **__: True)
+    state, _gated = deployctl._prepare_locked(_options(), COMMIT, supervised=True)
+    assert state.status == deployctl.STATUS_PENDING

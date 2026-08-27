@@ -1277,6 +1277,13 @@ def _rollback_locked(state: RollbackState) -> bool:
     if state.status != STATUS_PENDING:
         return True
     lifecycle_state.failpoint("mission_rollback")
+    # Exact-authority gate: the pending->rolled_back transition may only run when
+    # the durable authority is sound (an unreadable/corrupt mission refuses by
+    # failing closed); the caller still proves the candidate dead before mutating
+    # state, so this is purely the authority decision boundary.
+    if not lifecycle_state.authorize_mission_rollback(_mission_authority_facts(state.status)):
+        append_deploy_log("lifecycle authority refuses rollback of the pending mission; holding")
+        return False
     if supervise.supervisor_running():
         try:
             settle_desired(state.previous_commit, state.repo, state.uv_path)
@@ -1462,6 +1469,53 @@ def _cleanup_pending_locked() -> None:
         raise DeployCtlError("an unresolved rollback is still pending")
 
 
+def _mission_authority_facts(
+    status: str | None, *, candidate_ready: bool = False
+) -> lifecycle_state.AuthorityFacts:
+    """Reconcile the mission-authority facts for a transition gate.
+
+    The mission transitions consult the authority model with the exact mission
+    status already loaded by the runtime (the genuine source of the handoff),
+    plus an independent malformed-authority probe of the durable rollback state.
+    Unrelated durable sources (owned worker meta, desired intent) are not part of
+    the mission authority and stay at their safe defaults.
+
+    Args:
+        status: The current mission status the runtime is acting on, or ``None``
+            when no mission is durable.
+        candidate_ready: Whether the candidate has already proven queue readiness
+            (the exact readiness proof obtained by the calling branch).
+
+    Returns:
+        The mission-authority snapshot for :mod:`lubko.lifecycle_state` gates.
+    """
+    malformed = False
+    try:
+        read_rollback_state()
+    except DeployCtlError:
+        malformed = True
+    return lifecycle_state.AuthorityFacts(
+        desired_generation=0,
+        applied_generation=0,
+        mission_status=status,
+        mission_generation=None,
+        mission_commit=None,
+        owned_worker_pid=None,
+        owned_worker_commit=None,
+        owned_worker_identity_proven=False,
+        pre_spawn_obligation=False,
+        unresolved_child=False,
+        candidate_ready=candidate_ready,
+        rollback_pending=status == STATUS_PENDING,
+        durable_malformed=malformed,
+        supervisor_child_present=False,
+        current_child_identity_proven=False,
+        ownership_hold_malformed=False,
+        unresolved_hold_malformed=False,
+        spawning_hold_malformed=False,
+    )
+
+
 def _prepare_locked(
     options: Options,
     commit: str,
@@ -1520,6 +1574,19 @@ def _prepare_locked(
             _abort_gated_candidate(gated)
         _restore_previous_prep(options, previous_commit, commit)
         raise DeployCtlError("stable wrapper cannot reach PostgreSQL before handoff")
+    # Exact-authority gate: a NEW pending mission may only be created when no
+    # mission is already pending and the durable authority is not malformed. An
+    # abandoned pending mission was already resolved by _cleanup_pending_locked,
+    # so a refusal here is a genuine conflict or fail-closed authority.
+    existing = _read_state()
+    if not lifecycle_state.authorize_mission_publish(
+        _mission_authority_facts(existing.status if existing is not None else None)
+    ):
+        _restore_previous_prep(options, previous_commit, commit)
+        raise DeployCtlError(
+            "lifecycle authority refuses a new pending mission: a supervised checkout "
+            "is already pending or durable authority is malformed"
+        )
     state = RollbackState(
         schema_version=ROLLBACK_SCHEMA_VERSION,
         generation=next_mission_generation(),
@@ -1931,6 +1998,19 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     if _pending_mission_rollback_due(state):
         _rollback_locked(state)
         raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
+    # Exact-authority gate for the pending->confirmed transition. The candidate's
+    # readiness is the exact proof already obtained by the calling branch (the
+    # daemon proved queue readiness for the supervised path; the just-built CLI
+    # root is the proof for the legacy path), so candidate_ready is set from it.
+    # A malformed durable authority refuses by failing closed and rolling back.
+    if not lifecycle_state.authorize_mission_confirm(
+        _mission_authority_facts(state.status, candidate_ready=True)
+    ):
+        _rollback_locked(state)
+        raise DeployCtlError(
+            "lifecycle authority refuses confirmation (candidate not proven ready or "
+            "durable authority malformed); deployment was rolled back"
+        )
     if supervise.supervisor_running():
         settle_desired(state.commit, state.repo, state.uv_path)
     else:

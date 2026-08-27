@@ -104,7 +104,6 @@ convention = "google"
     "raise-vanilla-args",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
-    "too-many-return-statements",
 ]
 "src/lubko/cli.py" = [
     "start-process-with-partial-path",

@@ -188,6 +188,8 @@ class AuthorityFacts:
         rollback_pending: A supervised rollback is pending confirmation.
         durable_malformed: Any durable authority source is unreadable/corrupt.
         supervisor_child_present: The supervisor has published a live child.
+        current_child_identity_proven: The recorded child is our exact live
+            direct child (the retirement proof).
         ownership_hold_malformed: A malformed ownership hold is blocking.
         unresolved_hold_malformed: A malformed unresolved-child hold is blocking.
         spawning_hold_malformed: A malformed spawning obligation is blocking.
@@ -207,6 +209,7 @@ class AuthorityFacts:
     rollback_pending: bool
     durable_malformed: bool
     supervisor_child_present: bool
+    current_child_identity_proven: bool
     ownership_hold_malformed: bool
     unresolved_hold_malformed: bool
     spawning_hold_malformed: bool
@@ -289,6 +292,7 @@ def reconcile_authority_facts() -> AuthorityFacts:
     child = state.child if state is not None else None
     spawning = state.spawning if state is not None else None
     unresolved = state.unresolved_child if state is not None else None
+    current_child_identity_proven = child is not None and supervise.child_is_our_direct_child(child)
 
     return AuthorityFacts(
         desired_generation=desired_generation,
@@ -305,6 +309,7 @@ def reconcile_authority_facts() -> AuthorityFacts:
         rollback_pending=mission.status == "pending" if mission is not None else False,
         durable_malformed=malformed,
         supervisor_child_present=child is not None and supervise.child_alive(child),
+        current_child_identity_proven=current_child_identity_proven,
         ownership_hold_malformed=state.ownership_hold_malformed if state is not None else False,
         unresolved_hold_malformed=state.unresolved_hold_malformed if state is not None else False,
         spawning_hold_malformed=state.spawning_hold_malformed if state is not None else False,
@@ -529,8 +534,10 @@ def authorize_recovery(facts: AuthorityFacts) -> bool:
 def authorize_retirement(facts: AuthorityFacts) -> bool:
     """Decide whether a worker retirement may be authorized.
 
-    Retirement may only claim a target whose exact identity is proven; signalling
-    an unproven process is forbidden (fail closed).
+    Retirement may only claim a target whose exact identity is *proven to be our
+    own live direct child*; signalling an unproven, reparented, or recycled
+    process is forbidden (fail closed). A malformed durable authority also
+    refuses, so an unreadable state never authorizes a destructive signal.
 
     Args:
         facts: The reconciled authority snapshot at the retirement boundary.
@@ -538,7 +545,9 @@ def authorize_retirement(facts: AuthorityFacts) -> bool:
     Returns:
         ``True`` when the recorded worker may be retired.
     """
-    return facts.owned_worker_identity_proven
+    if facts.durable_malformed:
+        return False
+    return facts.current_child_identity_proven
 
 
 def authorize_mission_publish(facts: AuthorityFacts) -> bool:
@@ -562,16 +571,21 @@ def authorize_mission_confirm(facts: AuthorityFacts) -> bool:
     """Decide whether a pending mission may be confirmed.
 
     Confirmation requires the candidate to be proven queue-ready and the durable
-    authority to be sound.
+    authority to be sound.  The transition is idempotent: an already-confirmed
+    mission replays safely (a same-mission no-op), so it is authorized rather
+    than refused.
 
     Args:
         facts: The reconciled authority snapshot at the mission-confirm boundary.
 
     Returns:
-        ``True`` when the mission may be confirmed.
+        ``True`` when the mission may be confirmed (or is already confirmed).
     """
     if facts.durable_malformed:
         return False
+    if facts.mission_status == "confirmed":
+        # Same-mission replay is explicitly safe.
+        return True
     return facts.mission_status == "pending" and facts.candidate_ready
 
 
@@ -580,15 +594,20 @@ def authorize_mission_rollback(facts: AuthorityFacts) -> bool:
 
     Rollback is appropriate for a pending mission whose durable authority is
     sound; the caller still proves the candidate dead before mutating state.
+    The transition is idempotent: an already-rolled-back mission replays safely,
+    so it is authorized rather than refused.
 
     Args:
         facts: The reconciled authority snapshot at the mission-rollback boundary.
 
     Returns:
-        ``True`` when the mission may be rolled back.
+        ``True`` when the mission may be rolled back (or is already rolled back).
     """
     if facts.durable_malformed:
         return False
+    if facts.mission_status == "rolled_back":
+        # Same-mission replay is explicitly safe.
+        return True
     return facts.mission_status == "pending"
 
 

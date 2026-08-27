@@ -377,6 +377,7 @@ def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
     locked_methods = {
         "_ensure_consumer_locked",
         "_spawn_worker",
+        "_publish_spawned_child",
         "_settle_unproven_spawn",
         "_recover_unpublished_spawn",
         "_release_unproven_spawn_authority",
