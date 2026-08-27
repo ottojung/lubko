@@ -643,11 +643,13 @@ class _HealthAggregates:
 
     active_jobs: int
     stopping_jobs: int
-    oldest_active_job_id: str | None
     oldest_active_job_age_seconds: float | None
     min_lease_remaining_seconds: float | None
     capture_streams_open: int
     spool_held_bytes: int
+    cancellation_scan_overdue: bool
+    recovery_overdue: bool
+    gc_overdue: bool
 
 
 @dataclass(slots=True)
@@ -3832,7 +3834,38 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID, *, server: str) ->
         )
 
 
-def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UUID], int, int]:
+def _gc_phase_bound_hit(
+    marked: int, gc_roots: int, chunk_counts: list[int], orphans: int, limit: int
+) -> bool:
+    """Return whether any GC phase saturated its per-phase batch bound.
+
+    Each GC phase selects/deletes through an independent ``LIMIT``.  A bound is
+    hit only when one phase's own capped selection reached ``limit`` (a
+    saturation-pressure signal).  This is deliberately *not* the summed row
+    count: the phases are independently capped, so their total can equal or
+    exceed ``limit`` even when no single phase was saturated, which would be a
+    false-positive saturation signal.
+
+    Args:
+        marked: Phase-1 marked-root count.
+        gc_roots: Phase-2 selected GC-root count.
+        chunk_counts: Per-root phase-2 chunk-deletion counts.
+        orphans: Phase-3 orphan-deletion count.
+        limit: The configured ``gc_batch_limit``.
+
+    Returns:
+        ``True`` when at least one phase reached its bound (saturated).
+    """
+    if limit <= 0:
+        return False
+    if marked >= limit or gc_roots >= limit or orphans >= limit:
+        return True
+    return any(count >= limit for count in chunk_counts)
+
+
+def collect_transport(
+    conn: JobsConnection, settings: Settings
+) -> tuple[list[UUID], int, int, bool]:
     """Collect terminal command rows, their owned chunks, and orphan chunks.
 
     Three bounded phases run in separate transactions, each with ``FOR UPDATE
@@ -3871,17 +3904,27 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     the owning root is already gone, so no concurrent publication can create
     new chunks for it.
 
+    The returned ``gc_batch_bound_hit`` flag is the accurate saturation
+    signal: it is ``True`` only when an actual bounded selection/deletion
+    reached its per-phase ``LIMIT`` (a pressure/saturation condition).  It is
+    intentionally *not* derived from the aggregate row counts, because the
+    phases are independently capped and their sum can reach or exceed the
+    limit even when no single phase was saturated.
+
     Args:
         conn: Open PostgreSQL connection.
         settings: Worker runtime settings.
 
     Returns:
-        A ``(roots_marked, chunks_deleted, orphans_deleted)`` triple.
+        A ``(roots_marked, chunks_deleted, orphans_deleted, gc_batch_bound_hit)``
+        tuple.
     """
+    limit = settings.gc_batch_limit
     roots_marked: list[UUID] = []
     roots_deleted = 0
     total_chunks = 0
     total_orphans = 0
+    per_root_chunk_counts: list[int] = []
 
     # --- Phase 1: mark terminal roots as GC ---
     # The retention cutoff is pre-computed in a CTE so the main query string
@@ -3915,7 +3958,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             {
                 "server": settings.server,
                 "gc_retention_seconds": settings.gc_retention_seconds,
-                "limit": settings.gc_batch_limit,
+                "limit": limit,
             },
         )
         roots_marked = [row[0] for row in cursor.fetchall()]
@@ -3931,7 +3974,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
             "LIMIT %(limit)s\n",
-            {"server": settings.server, "limit": settings.gc_batch_limit},
+            {"server": settings.server, "limit": limit},
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
         for root_id in gc_roots:
@@ -3951,10 +3994,11 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 {
                     "server": settings.server,
                     "thread": str(root_id),
-                    "limit": settings.gc_batch_limit,
+                    "limit": limit,
                 },
             )
             total_chunks += cursor.rowcount
+            per_root_chunk_counts.append(cursor.rowcount)
             # Delete root only if no chunks remain.
             cursor.execute(
                 "SELECT NOT EXISTS (\n"
@@ -3996,7 +4040,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
-            {"server": settings.server, "limit": settings.gc_batch_limit},
+            {"server": settings.server, "limit": limit},
         )
         orphan_ids = [row[0] for row in cursor.fetchall()]
         if orphan_ids:
@@ -4006,9 +4050,12 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             )
             total_orphans += len(orphan_ids)
 
+    batch_bound_hit = _gc_phase_bound_hit(
+        len(roots_marked), len(gc_roots), per_root_chunk_counts, len(orphan_ids), limit
+    )
     if roots_deleted:
         LOGGER.info("gc deleted %d root(s)", roots_deleted)
-    return roots_marked, total_chunks, total_orphans
+    return roots_marked, total_chunks, total_orphans, batch_bound_hit
 
 
 def verify_jobs_table_invariant(conn: JobsConnection) -> None:
@@ -4166,6 +4213,12 @@ class Supervisor:
         self._completed_count = 0
         self._last_claim_batch = 0
         self._last_db_activity_at: float | None = None
+        self._db_deadline_breached_at: float | None = None
+        self._db_deadline_breach_count = 0
+        self._last_cancellation_scan_at: float | None = None
+        self._last_recovery_at: float | None = None
+        self._last_gc_at: float | None = None
+        self._gc_batch_bound_hit = False
         self._next_health_publish_at = 0.0
         self._health_force = True
 
@@ -4205,9 +4258,11 @@ class Supervisor:
                 self._tick(time.monotonic())
             except DbOperationDeadlineError:
                 # A hung established operation breached its hard client
-                # deadline mid-turn. Enter outage handling and enforce lease
-                # safety immediately rather than sleeping a turn so an owned
-                # group can never outlive its database lease.
+                # deadline mid-turn. Record the breach explicitly (distinct
+                # from mere DB activity recency), then enter outage handling
+                # and enforce lease safety immediately rather than sleeping a
+                # turn so an owned group can never outlive its database lease.
+                self._record_db_deadline_breach()
                 self._enter_outage()
                 self._enforce_lease_safety()
             except psycopg.Error as exc:
@@ -4521,6 +4576,7 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
+        self._last_recovery_at = time.time()
         recovered = recover_stale_jobs(conn, self.settings.server)
         for job_id, _payload in recovered:
             LOGGER.warning(
@@ -4543,13 +4599,16 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
-        roots, chunks, orphans = collect_transport(conn, self.settings)
+        self._last_gc_at = time.time()
+        roots, chunks, orphans, bound_hit = collect_transport(conn, self.settings)
+        self._gc_batch_bound_hit = bound_hit
         if roots or chunks or orphans:
             LOGGER.info(
-                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)",
+                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)%s",
                 len(roots),
                 chunks,
                 orphans,
+                "; batch bound hit (saturated)" if bound_hit else "",
             )
 
     def _heartbeat_root_ids(self) -> set[UUID]:
@@ -4640,6 +4699,7 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
+        self._last_cancellation_scan_at = time.time()
         for job_id in discover_cancellations(conn, self.settings):
             job = self.active.get(job_id)
             if job is not None and not job.cancel_requested:
@@ -5793,16 +5853,25 @@ class Supervisor:
             active_jobs=agg.active_jobs,
             stopping_jobs=agg.stopping_jobs,
             completed_jobs=getattr(self, "_completed_count", 0),
-            oldest_active_job_id=agg.oldest_active_job_id,
             oldest_active_job_age_seconds=agg.oldest_active_job_age_seconds,
             lease_safety_margin_seconds=self.settings.lease_safety_margin_seconds,
             min_lease_remaining_seconds=agg.min_lease_remaining_seconds,
             db_operation_deadline_seconds=self.settings.db_operation_timeout_seconds,
             db_last_activity_at=getattr(self, "_last_db_activity_at", None),
+            db_deadline_breached_at=getattr(self, "_db_deadline_breached_at", None),
+            db_deadline_breach_count=getattr(self, "_db_deadline_breach_count", 0),
             capture_streams_open=agg.capture_streams_open,
             spool_held_bytes=agg.spool_held_bytes,
             scan_batch_limit=self.settings.claim_batch_limit,
             last_scan_batch_size=getattr(self, "_last_claim_batch", 0),
+            last_cancellation_scan_at=getattr(self, "_last_cancellation_scan_at", None),
+            last_recovery_at=getattr(self, "_last_recovery_at", None),
+            last_gc_at=getattr(self, "_last_gc_at", None),
+            cancellation_scan_overdue=agg.cancellation_scan_overdue,
+            recovery_overdue=agg.recovery_overdue,
+            gc_overdue=agg.gc_overdue,
+            gc_batch_limit=self.settings.gc_batch_limit,
+            gc_batch_bound_hit=getattr(self, "_gc_batch_bound_hit", False),
             shutting_down=shutting_down,
         )
 
@@ -5817,7 +5886,6 @@ class Supervisor:
         """
         active_jobs = self.active
         stopping = 0
-        oldest_job_id: str | None = None
         oldest_age: float | None = None
         min_lease_remaining: float | None = None
         capture_open = 0
@@ -5829,7 +5897,6 @@ class Supervisor:
                 age = now_mono - job.claimed_at
                 if oldest_age is None or age > oldest_age:
                     oldest_age = age
-                    oldest_job_id = str(job.id)
             if job.last_heartbeat_at > 0.0:
                 remaining = job.last_heartbeat_at + self.settings.lease_duration_seconds - now_mono
                 if min_lease_remaining is None or remaining < min_lease_remaining:
@@ -5845,12 +5912,25 @@ class Supervisor:
         return _HealthAggregates(
             active_jobs=len(active_jobs),
             stopping_jobs=stopping,
-            oldest_active_job_id=oldest_job_id,
             oldest_active_job_age_seconds=oldest_age,
             min_lease_remaining_seconds=min_lease_remaining,
             capture_streams_open=capture_open,
             spool_held_bytes=spool_held,
+            cancellation_scan_overdue=now_mono > getattr(self, "_next_cancel_scan_at", 0.0),
+            recovery_overdue=now_mono > getattr(self, "_next_recovery_at", 0.0),
+            gc_overdue=now_mono > getattr(self, "_next_gc_at", 0.0),
         )
+
+    def _record_db_deadline_breach(self) -> None:
+        """Record that a hard client database deadline was breached.
+
+        Called from the actual deadline-failure path so the bounded health
+        signal ``db_deadline_breached_at``/``db_deadline_breach_count`` answers
+        whether a database operation recently exceeded its deadline, which
+        ``db_last_activity_at`` alone cannot prove.
+        """
+        self._db_deadline_breached_at = time.time()
+        self._db_deadline_breach_count = getattr(self, "_db_deadline_breach_count", 0) + 1
 
     def _publish_health(self, *, force: bool = False) -> None:
         """Write an atomic health snapshot, throttled unless forced.

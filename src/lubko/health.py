@@ -194,9 +194,8 @@ class WorkerHealth:
     stopping_jobs: int
     #: Total jobs this worker incarnation has finalized (bounded lifetime count).
     completed_jobs: int
-    #: Bounded identity of the longest-running active job, or ``None`` when idle.
-    oldest_active_job_id: str | None
     #: Wall-clock-agnostic age (seconds) of the oldest active job, or ``None``.
+    #: No job id is ever published: identity is intentionally not exposed.
     oldest_active_job_age_seconds: float | None
     #: Configured lease-safety margin the worker enforces before eviction.
     lease_safety_margin_seconds: float
@@ -207,6 +206,12 @@ class WorkerHealth:
     db_operation_deadline_seconds: float
     #: Wall-clock time of the last database operation, or ``None`` (recency).
     db_last_activity_at: float | None
+    #: Wall-clock time of the most recent hard client deadline breach, or
+    #: ``None``.  This is the explicit signal that a database operation actually
+    #: exceeded its deadline; ``db_last_activity_at`` alone cannot prove it.
+    db_deadline_breached_at: float | None
+    #: Count of hard client deadline breaches observed this incarnation.
+    db_deadline_breach_count: int
     #: Count of active capture streams still draining (open, non-EOF pipes).
     capture_streams_open: int
     #: Aggregate bytes currently held in active on-disk capture spool files.
@@ -215,6 +220,25 @@ class WorkerHealth:
     scan_batch_limit: int
     #: Number of jobs actually claimed in the most recent scan batch (pressure).
     last_scan_batch_size: int
+    #: Wall-clock time of the most recent cancellation-scan turn, or ``None``.
+    last_cancellation_scan_at: float | None
+    #: Wall-clock time of the most recent recovery pass, or ``None``.
+    last_recovery_at: float | None
+    #: Wall-clock time of the most recent GC pass, or ``None``.
+    last_gc_at: float | None
+    #: Whether the cancellation scan is overdue (next due time already passed).
+    cancellation_scan_overdue: bool
+    #: Whether the recovery pass is overdue (next due time already passed).
+    recovery_overdue: bool
+    #: Whether the GC pass is overdue (next due time already passed).
+    gc_overdue: bool
+    #: Configured per-turn GC batch cap.
+    gc_batch_limit: int
+    #: Whether the most recent GC pass saturated a per-phase batch bound (a
+    #: pressure/saturation signal), derived inside ``collect_transport`` from
+    #: the actual capped selections/deletions rather than summed row counts.
+    #: Combine with ``gc_overdue`` and ``last_gc_at`` for a "behind" diagnosis.
+    gc_batch_bound_hit: bool
     shutting_down: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -238,16 +262,25 @@ class WorkerHealth:
             "active_jobs": self.active_jobs,
             "stopping_jobs": self.stopping_jobs,
             "completed_jobs": self.completed_jobs,
-            "oldest_active_job_id": self.oldest_active_job_id,
             "oldest_active_job_age_seconds": _finite_or_none(self.oldest_active_job_age_seconds),
             "lease_safety_margin_seconds": _finite_or_zero(self.lease_safety_margin_seconds),
             "min_lease_remaining_seconds": _finite_or_none(self.min_lease_remaining_seconds),
             "db_operation_deadline_seconds": _finite_or_zero(self.db_operation_deadline_seconds),
             "db_last_activity_at": _finite_or_none(self.db_last_activity_at),
+            "db_deadline_breached_at": _finite_or_none(self.db_deadline_breached_at),
+            "db_deadline_breach_count": self.db_deadline_breach_count,
             "capture_streams_open": self.capture_streams_open,
             "spool_held_bytes": self.spool_held_bytes,
             "scan_batch_limit": self.scan_batch_limit,
             "last_scan_batch_size": self.last_scan_batch_size,
+            "last_cancellation_scan_at": _finite_or_none(self.last_cancellation_scan_at),
+            "last_recovery_at": _finite_or_none(self.last_recovery_at),
+            "last_gc_at": _finite_or_none(self.last_gc_at),
+            "cancellation_scan_overdue": self.cancellation_scan_overdue,
+            "recovery_overdue": self.recovery_overdue,
+            "gc_overdue": self.gc_overdue,
+            "gc_batch_limit": self.gc_batch_limit,
+            "gc_batch_bound_hit": self.gc_batch_bound_hit,
             "shutting_down": self.shutting_down,
         }
 
@@ -284,7 +317,6 @@ class WorkerHealth:
             active_jobs=_coerce_int(data.get("active_jobs"), "active_jobs"),
             stopping_jobs=_coerce_int(data.get("stopping_jobs"), "stopping_jobs"),
             completed_jobs=_coerce_int(data.get("completed_jobs"), "completed_jobs"),
-            oldest_active_job_id=_optional_str(data.get("oldest_active_job_id")),
             oldest_active_job_age_seconds=_optional_finite_float(
                 data.get("oldest_active_job_age_seconds")
             ),
@@ -298,6 +330,10 @@ class WorkerHealth:
                 data.get("db_operation_deadline_seconds"), "db_operation_deadline_seconds"
             ),
             db_last_activity_at=_optional_finite_float(data.get("db_last_activity_at")),
+            db_deadline_breached_at=_optional_finite_float(data.get("db_deadline_breached_at")),
+            db_deadline_breach_count=_coerce_int(
+                data.get("db_deadline_breach_count"), "db_deadline_breach_count"
+            ),
             capture_streams_open=_coerce_int(
                 data.get("capture_streams_open"), "capture_streams_open"
             ),
@@ -306,6 +342,14 @@ class WorkerHealth:
             last_scan_batch_size=_coerce_int(
                 data.get("last_scan_batch_size"), "last_scan_batch_size"
             ),
+            last_cancellation_scan_at=_optional_finite_float(data.get("last_cancellation_scan_at")),
+            last_recovery_at=_optional_finite_float(data.get("last_recovery_at")),
+            last_gc_at=_optional_finite_float(data.get("last_gc_at")),
+            cancellation_scan_overdue=_coerce_bool(data.get("cancellation_scan_overdue")),
+            recovery_overdue=_coerce_bool(data.get("recovery_overdue")),
+            gc_overdue=_coerce_bool(data.get("gc_overdue")),
+            gc_batch_limit=_coerce_int(data.get("gc_batch_limit"), "gc_batch_limit"),
+            gc_batch_bound_hit=_coerce_bool(data.get("gc_batch_bound_hit")),
             shutting_down=bool(data.get("shutting_down")),
         )
 
@@ -365,6 +409,18 @@ def _coerce_int(value: object, field: str) -> int:
             raise ValueError(msg) from exc
     msg = f"{field} must be an integer, got {value!r}"
     raise TypeError(msg)
+
+
+def _coerce_bool(value: object) -> bool:
+    """Coerce a JSON value to a bool, treating absence as ``False``.
+
+    Args:
+        value: Raw JSON value.
+
+    Returns:
+        The boolean (``False`` when absent or not a JSON boolean).
+    """
+    return value is True
 
 
 def _required_finite_float(value: object, field: str) -> float:

@@ -1117,10 +1117,17 @@ without mistaking stale records for a running supervisor.
 The worker itself publishes a bounded, concurrency-aware health snapshot
 (`health/health-{incarnation}.json`, symlinked as `worker/health.json`) that
 exposes job aggregates (`active_jobs`/`stopping_jobs`/`completed_jobs`/oldest
-active age), lease-safety margin and remaining budget, capture/spool pressure
-(`capture_streams_open`/`spool_held_bytes`), scan batch pressure
-(`scan_batch_limit`/`last_scan_batch_size`), and database deadline recency —
-never a single job id, command text, or secret.
+active age — never a job id), lease-safety margin and remaining budget,
+capture/spool pressure (`capture_streams_open`/`spool_held_bytes`), claim-batch
+pressure (`scan_batch_limit`/`last_scan_batch_size`), cancellation/recovery/GC
+scan recency and overdue signals (`last_cancellation_scan_at`/
+`last_recovery_at`/`last_gc_at`/`cancellation_scan_overdue`/`recovery_overdue`/
+`gc_overdue`), an explicit GC batch-saturation flag `gc_batch_bound_hit`
+derived inside the GC pass from the actual per-phase capped selections (not
+summed row counts), and a hard database-deadline breach signal
+(`db_deadline_breached_at`/`db_deadline_breach_count`) that proves a database
+operation actually exceeded its deadline — never a single job id, command
+text, or secret.
 
 ## Bootstrap and the unmanaged legacy worker
 

@@ -32,16 +32,25 @@ def _snapshot(**overrides: object) -> WorkerHealth:
         "active_jobs": 0,
         "stopping_jobs": 0,
         "completed_jobs": 0,
-        "oldest_active_job_id": None,
         "oldest_active_job_age_seconds": None,
         "lease_safety_margin_seconds": 5.0,
         "min_lease_remaining_seconds": None,
         "db_operation_deadline_seconds": 3.0,
         "db_last_activity_at": 1000.0,
+        "db_deadline_breached_at": None,
+        "db_deadline_breach_count": 0,
         "capture_streams_open": 0,
         "spool_held_bytes": 0,
         "scan_batch_limit": 16,
         "last_scan_batch_size": 0,
+        "last_cancellation_scan_at": None,
+        "last_recovery_at": None,
+        "last_gc_at": None,
+        "cancellation_scan_overdue": False,
+        "recovery_overdue": False,
+        "gc_overdue": False,
+        "gc_batch_limit": 32,
+        "gc_batch_bound_hit": False,
         "shutting_down": False,
     }
     fields.update(overrides)
@@ -141,23 +150,46 @@ def test_concurrency_aware_aggregates_are_bounded() -> None:
         active_jobs=3,
         stopping_jobs=1,
         completed_jobs=7,
-        oldest_active_job_id="abc",
         oldest_active_job_age_seconds=12.5,
         capture_streams_open=2,
         spool_held_bytes=4096,
         scan_batch_limit=16,
         last_scan_batch_size=4,
         min_lease_remaining_seconds=-1.0,
+        db_deadline_breached_at=500.0,
+        db_deadline_breach_count=2,
+        last_cancellation_scan_at=900.0,
+        last_recovery_at=901.0,
+        last_gc_at=902.0,
+        cancellation_scan_overdue=True,
+        recovery_overdue=False,
+        gc_overdue=True,
+        gc_batch_limit=32,
+        gc_batch_bound_hit=True,
     )
     restored = WorkerHealth.from_dict(snapshot.to_dict())
     assert restored.active_jobs == 3
     assert restored.stopping_jobs == 1
     assert restored.completed_jobs == 7
-    assert restored.oldest_active_job_id == "abc"
     assert restored.oldest_active_job_age_seconds == pytest.approx(12.5)
     assert restored.spool_held_bytes == 4096
     assert restored.last_scan_batch_size == 4
     assert restored.min_lease_remaining_seconds == pytest.approx(-1.0)
+    assert restored.db_deadline_breached_at == pytest.approx(500.0)
+    assert restored.db_deadline_breach_count == 2
+    assert restored.cancellation_scan_overdue is True
+    assert restored.recovery_overdue is False
+    assert restored.gc_overdue is True
+    assert restored.gc_batch_limit == 32
+    assert restored.gc_batch_bound_hit is True
+
+
+def test_no_job_identity_is_published() -> None:
+    """The health schema never carries a per-job identifier."""
+    payload = _snapshot().to_dict()
+    assert "oldest_active_job_id" not in payload
+    assert "current_job_id" not in payload
+    assert "worker_id" in payload  # bounded process identity, not a job id
 
 
 def test_unsupported_schema_version_fails_closed() -> None:
