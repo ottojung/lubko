@@ -4103,9 +4103,9 @@ def verify_server_isolation(conn: JobsConnection) -> None:
     so an output chunk can only reference a command root of its own server. The
     boundary is row-level security on ``lubko.jobs``, the trusted
     ``lubko.session_server()`` identity function, the same-server chunk
-    enforcement (``lubko.chunk_root_server()`` + the ``jobs_chunk_root_server``
-    trigger), and the per-server isolation policies. The worker refuses to run
-    without it, failing closed.
+    enforcement (the ``enforce_chunk_root_server()`` trigger function, which
+    inlines the root lookup), and the per-server isolation policies. The worker
+    refuses to run without it, failing closed.
 
     Args:
         conn: Open PostgreSQL connection.

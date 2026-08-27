@@ -40,8 +40,10 @@
 -- ADDITIONALLY, an output_chunk may only reference a command root of the SAME
 -- server: the trigger jobs_chunk_root_server enforces, at the database
 -- authority, that chunk.thread points to a root whose server equals the chunk's
--- own server. It uses the SECURITY DEFINER lubko.chunk_root_server() so the
--- root lookup is not subject to (and does not recurse through) the session's RLS.
+-- own server. The root lookup is inlined in the SECURITY DEFINER
+-- enforce_chunk_root_server() trigger function (restricted search_path, PUBLIC
+-- EXECUTE revoked), so it is not subject to (and does not recurse through) the
+-- session's RLS and is not an externally callable privileged helper.
 --
 -- The worker application keeps its own exact server-match predicate on every
 -- query as defense in depth; the database boundary is what makes cross-server

@@ -53,20 +53,24 @@ bypassed, or spoofed.
   `server = lubko.session_server()`. The `INSERT` policy uses `WITH CHECK`, so a
   worker cannot spoof rows for another server. A principal with no mapping resolves
   to `NULL` and matches nothing and can insert nothing — fail closed.
-- `lubko.chunk_root_server(thread)` — `SECURITY DEFINER` function returning the
-  `server` of the command root referenced by an output chunk's `thread`. It is
-  `SECURITY DEFINER` so the lookup is independent of, and does not recurse through,
-  the session's RLS scope.
+- `lubko.enforce_chunk_root_server()` — `SECURITY DEFINER` trigger function (restricted
+  `search_path`, `PUBLIC EXECUTE` revoked) that enforces same-server chunk
+  ownership by inlining the root lookup. It is **not** a standalone,
+  data-returning helper: a worker cannot call a privileged cross-server lookup
+  directly. `EXECUTE` is granted only to `lubko_worker_role` and `lubko_admin`, so
+  the trigger still fires for workers and the external orchestrator.
 - `jobs_chunk_root_server` — `BEFORE INSERT OR UPDATE` trigger on `lubko.jobs` that,
-  for `output_chunk` rows, raises unless the referenced root's server equals the
-  chunk's own `server`. This enforces at the database authority that a chunk cannot
-  be attached to a command root owned by a different execution server, regardless
-  of the application predicate.
+  for `output_chunk` rows, raises with a generic diagnostic unless the referenced
+  root's server equals the chunk's own `server`. This enforces at the database
+  authority that a chunk cannot be attached to a command root owned by a different
+  execution server, regardless of the application predicate. The diagnostic reveals
+  no foreign-row-derived value, so the trigger is not a cross-server metadata
+  oracle.
 
 The worker additionally verifies, at connect time:
 
 - `verify_server_isolation(conn)` — refuses to run unless RLS is enabled, the
-  `session_server()` and `chunk_root_server()` functions exist, the
+  `session_server()` and `enforce_chunk_root_server()` functions exist, the
   `jobs_chunk_root_server` trigger is installed, and the isolation policies are
   present.
 - `verify_server_identity(conn, server)` — refuses to run unless the connected
