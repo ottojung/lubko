@@ -106,17 +106,23 @@ The window makes a one-server-at-a-time rollout safe and deterministic:
 1. **Quiesce nothing.** New submissions continue; the submitter negotiates the
    highest version common to it and each target server's window. While every
    server still advertises only `[C, C]`, new jobs are submitted at `C`.
-2. **Widen the window (non-destructive).** Roll out a new daemon build that
-   advertises `[C, C+1]` (with the `C+1` parser in place). Because the table
-   schema is unchanged and `C+1` is mutually compatible with `C`, this requires
-   no immediate migration of existing rows. When you are ready for the table to
-   also accept `C+1` writes, apply `0005` with `RETAINED_MAX = C+1` so the
-   retained-history range admits both versions. In-flight `C` jobs keep running
-   on daemons that still advertise `[C, C]`.
-3. **Converge new work.** Submitters now negotiate `C+1` against the widened
-   window, so every *new* job is stamped `v = C+1`, while old `C` jobs drain
-   naturally as they finish.
-4. **Drain the old version and raise the execution floor (non-destructive).**
+2. **Widen the DB retained/admission max first (non-destructive).** While every
+   daemon still advertises only `[C, C]`, apply `0005` with `RETAINED_MAX = C+1`
+   so the table's stored-history (admission) range already accepts both `C` and
+   `C+1` writes. No daemon writes `C+1` yet, because none advertises it, so
+   in-flight `C` jobs keep running untouched. **This must precede any daemon
+   advertising `C+1`:** the DB admission max is the ceiling the daemon execution
+   max may not exceed, so widening it first guarantees a daemon never advertises
+   an execution window whose max the DB would reject.
+3. **Widen the daemon execution window.** Only now roll out daemons that
+   advertise `[C, C+1]` (with the `C+1` parser in place). Because the DB
+   admission max already admits `C+1`, the execution max a daemon advertises can
+   never exceed the DB-admitted max. `C` jobs keep running on daemons that still
+   advertise `[C, C]`.
+4. **Converge new work.** Submitters now negotiate `C+1` against the widened
+   daemon windows, so every *new* job is stamped `v = C+1`, while old `C` jobs
+   drain naturally as they finish.
+5. **Drain the old version and raise the execution floor (non-destructive).**
    Once the queue contains no *pending* `command` rows at `C` (they are all
    terminal and collected, or have finished), roll out daemons that advertise
    `[C+1, C+1]`. The execution floor moves at the daemon level only; the table
@@ -124,9 +130,9 @@ The window makes a one-server-at-a-time rollout safe and deterministic:
    `C` rows and their `output_chunk` history remain valid and queryable. No
    migration re-application is required to raise the floor, and old history is
    never rejected.
-5. **Breaking change?** A breaking generation `C+2` is handled the same way, but
+6. **Breaking change?** A breaking generation `C+2` is handled the same way, but
    `C+1` and `C+2` are *not* mutually compatible, so they are never in the same
-   window; you drain `C+1` completely (step 4) before opening `[C+2, C+2]`.
+   window; you drain `C+1` completely (step 5) before opening `[C+2, C+2]`.
 
 Determinism comes from the explicit integer `v` on every payload and the strict
 claim gate: at every moment, the set of claimable versions for a given daemon is

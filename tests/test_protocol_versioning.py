@@ -10,6 +10,7 @@ All tests run without a database.
 """
 
 import json
+import re
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -386,6 +387,53 @@ def test_migration_0005_retains_old_history_when_execution_floor_advances() -> N
     assert "execution window" in migration
     assert "NEVER the table constraint" in migration
     assert "Settings.supported_protocol_range" in migration
+
+
+def _migration_retained_bounds() -> tuple[int, int]:
+    """Parse the RETAINED_MIN/RETAINED_MAX constants from the 0005 migration.
+
+    Returns:
+        A ``(retained_min, retained_max)`` pair of integers.
+    """
+    migration = (
+        Path(__file__).resolve().parent.parent / "migrations" / "0005_protocol_version_window.sql"
+    ).read_text(encoding="utf-8")
+    min_match = re.search(r"retained_min integer := (\d+)", migration)
+    max_match = re.search(r"retained_max integer := (\d+)", migration)
+    assert min_match is not None
+    assert max_match is not None
+    return int(min_match.group(1)), int(max_match.group(1))
+
+
+def test_retained_max_admits_daemon_execution_max() -> None:
+    """The DB-admitted max is the ceiling the daemon execution max may not exceed.
+
+    Rollout order must widen the DB retained/admission max to ``C+1`` before any
+    daemon advertises an execution window whose max is ``C+1``. Deterministically,
+    the migration's ``RETAINED_MAX`` must be at least the highest version a daemon
+    could ever advertise as an execution-window max: every valid daemon window is
+    validated against ``SUPPORTED_PROTOCOL_VERSIONS``, so the largest advertiseable
+    execution max equals ``max(SUPPORTED_PROTOCOL_VERSIONS)``. Asserting
+    ``RETAINED_MAX >= max(SUPPORTED_PROTOCOL_VERSIONS)`` guarantees no daemon can
+    advertise an execution max above the DB-admitted max. The retained floor stays
+    ``4`` (history separation), never collapsing to the execution floor.
+    """
+    retained_min, retained_max = _migration_retained_bounds()
+    assert retained_min == 4
+    assert retained_max >= max(SUPPORTED_PROTOCOL_VERSIONS)
+
+    # The code enforces the same ceiling itself: a daemon cannot be configured to
+    # advertise an execution window whose max exceeds the supported (admitted) max.
+    supported_top = max(SUPPORTED_PROTOCOL_VERSIONS)
+    with pytest.raises(ValueError, match="cannot parse"):
+        Settings(
+            worker_id="w",
+            poll_interval_seconds=1.0,
+            process_poll_interval_seconds=0.1,
+            cancel_grace_seconds=5.0,
+            server="s",
+            supported_protocol_range=ProtocolVersionRange(min=supported_top, max=supported_top + 1),
+        )
 
 
 def test_parser_rejects_missing_and_null_version() -> None:
