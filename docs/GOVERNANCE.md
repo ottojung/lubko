@@ -15,17 +15,20 @@ For the default branch (`main`, `~DEFAULT_BRANCH` in the ruleset condition):
 1. **No direct pushes.** Every change reaches `main` through a pull request.
    The ruleset's `pull_request` rule blocks updates that are not made via a
    merged PR.
-2. **Canonical CI must pass.** The single canonical check, the `test` job in
-   `.github/workflows/ci.yml`, must complete successfully on the commit that is
-   merged into `main`. The ruleset's `required_status_checks` rule blocks a
-   merge whose head commit lacks a passing `test` check.
+2. **Canonical CI must pass on an up-to-date integration.** The single
+   canonical check, the `test` job in `.github/workflows/ci.yml`, must complete
+   successfully, and the pull request's integration must be up to date with the
+   base branch before merge. The ruleset's `required_status_checks` rule (with
+   strict policy enabled) blocks a merge unless a passing `test` check exists on
+   an integration that includes the latest base-branch state.
 3. **No silent bypass.** The ruleset has no bypass actors. Administrators and
    bots cannot override the contract through a normal path. The only way around
    it is the explicit emergency procedure below, which is itself a visible,
    reviewed ruleset change.
-4. **One test command.** The governance rule does not introduce a second test
-   command. The `test` job runs exactly `uv run pytest`, which is the complete
-   suite; the same command developers run locally.
+4. **One test-suite command.** The governance rule does not introduce a second
+   test command. The `test` job additionally gates frozen-sync, formatting,
+   lint, and strict types, but `uv run pytest` remains the single, complete test
+   suite command — the same command developers run locally.
 
 This is deliberately fail-closed: if the required `test` check cannot be found
 on a commit (because the job was renamed or removed), no commit can satisfy the
@@ -45,10 +48,18 @@ The `test` job runs, in order, the same checks developers run locally:
 
 The contract requires a pull request rather than permitting unrestricted direct
 pushes. A pull request is the only supported update path that guarantees the
-canonical CI runs on the exact commit that will become `main`'s tip and that
-the result is visible before the merge. Direct pushes would let `main` move
-before CI reports, which is exactly the gap this contract closes. Reliability,
-not convenience, drives the choice.
+canonical CI runs on the integration and that the result is visible before the
+merge. With strict status-check policy, the integration must also be up to date
+with the base branch, so a PR whose base advanced after its last green check
+cannot merge until CI passes again on current state. Direct pushes would let
+`main` move before CI reports, which is exactly the gap this contract closes.
+Reliability, not convenience, drives the choice.
+
+Note that GitHub may create a fresh merge or squash commit when the PR is
+merged; the literal final commit SHA is not necessarily the commit that CI
+executed. The enforced invariant is therefore that the PR/integration was up to
+date with the base branch and that canonical CI passed on it before merge — not
+that the merged commit's exact SHA itself ran CI.
 
 ## Required check name is part of the contract
 
