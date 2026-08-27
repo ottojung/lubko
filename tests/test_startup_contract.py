@@ -628,6 +628,11 @@ def test_startup_contract_command_writes_and_proves(
     )
     monkeypatch.setattr(
         sc,
+        "validate_contract_paths",
+        lambda *_a, **_k: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+    )
+    monkeypatch.setattr(
+        sc,
         "validate_contract_config",
         lambda: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
     )
@@ -842,4 +847,72 @@ def test_startup_contract_command_fails_without_restart_evidence(
     )
     monkeypatch.setattr(sc, "verify_live_topology", lambda: proof)
     monkeypatch.delenv(sc.RESTART_POLICY_ENV, raising=False)
+    assert lifecycle.startup_contract_cmd(argparse.Namespace(write=False)) == lifecycle.EXIT_ERROR
+
+
+def _patch_startup_contract_command_green(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    launcher_ok: bool = True,
+    paths_ok: bool = True,
+) -> None:
+    """Force every startup-contract boundary green except the one under test."""
+    monkeypatch.setattr(sc, "state_root", lambda: tmp_path)
+    monkeypatch.setattr(sc, "write_startup_launcher", lambda _b: None)
+    monkeypatch.setattr(sc, "validate_startup_launcher", lambda _b: launcher_ok)
+    monkeypatch.setattr(
+        sc,
+        "validate_startup_definition",
+        lambda: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+    )
+    monkeypatch.setattr(
+        sc,
+        "validate_contract_paths",
+        lambda *_a, **_k: ContractPathValidation(
+            ok=paths_ok, missing=(), mode_mismatched=(), message="ok"
+        ),
+    )
+    monkeypatch.setattr(
+        sc,
+        "validate_contract_config",
+        lambda: ContractPathValidation(ok=True, missing=(), mode_mismatched=(), message="ok"),
+    )
+    sc.write_contract()
+    sc.write_startup_definition()
+    proof = TopologyProof(
+        ok=True,
+        contract_version=CONTRACT_SCHEMA_VERSION,
+        init_pid=1,
+        init_cmdline="/usr/bin/tini-static -- lubko-supervisor",
+        init_is_tini=True,
+        supervisor_pid=10,
+        supervisor_cmdline="uv run lubko-supervisor",
+        supervisor_present=True,
+        supervisor_is_contract_binary=True,
+        supervisor_under_init=True,
+        supervisor_identity_matches=True,
+        uses_sleep_placeholder=False,
+        worker_pid=None,
+        worker_is_direct_child=False,
+        worker_identity_matches=True,
+        message="startup contract satisfied (tini -> supervisor; no worker claimed yet)",
+    )
+    monkeypatch.setattr(sc, "verify_live_topology", lambda: proof)
+    monkeypatch.setenv(sc.RESTART_POLICY_ENV, "always")
+
+
+def test_startup_contract_command_fails_on_launcher_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing/drifted launcher forces EXIT_ERROR with every other boundary green."""
+    _patch_startup_contract_command_green(monkeypatch, tmp_path, launcher_ok=False)
+    assert lifecycle.startup_contract_cmd(argparse.Namespace(write=False)) == lifecycle.EXIT_ERROR
+
+
+def test_startup_contract_command_fails_on_state_path_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing/insecure state path forces EXIT_ERROR with every other boundary green."""
+    _patch_startup_contract_command_green(monkeypatch, tmp_path, paths_ok=False)
     assert lifecycle.startup_contract_cmd(argparse.Namespace(write=False)) == lifecycle.EXIT_ERROR

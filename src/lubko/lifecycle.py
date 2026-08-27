@@ -3650,13 +3650,23 @@ def startup_contract_cmd(args: argparse.Namespace) -> int:
     if not contract_ok:
         _out(f"startup contract: {assessment.state.upper()} ({assessment.message})")
     _print_startup_contract()
+    launcher_ok = startup_contract.validate_startup_launcher(_resolve_bin_home())
     definition_ok = startup_contract.validate_startup_definition().ok
+    paths_ok = startup_contract.validate_contract_paths().ok
     config_ok = startup_contract.validate_contract_config().ok
     proof = startup_contract.verify_live_topology()
     rap = startup_contract.prove_restart_authority(startup_contract.CURRENT_CONTRACT)
     return (
         EXIT_OK
-        if (contract_ok and definition_ok and config_ok and proof.ok and rap.ok)
+        if (
+            contract_ok
+            and launcher_ok
+            and definition_ok
+            and paths_ok
+            and config_ok
+            and proof.ok
+            and rap.ok
+        )
         else EXIT_ERROR
     )
 
