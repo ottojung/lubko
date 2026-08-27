@@ -64,9 +64,11 @@ change:
   produced, and a long-running or high-output job can accumulate **arbitrarily
   many** immutable history chunks while it stays active; they are only reclaimed
   once the job reaches a terminal state and passes the GC retention window
-  (`LUBKO_GC_RETENTION_SECONDS`, `LUBKO_GC_BATCH_LIMIT`). Chunk archiving and
-  retention therefore bound the *terminal* history and each *GC pass*, not the
-  total per-job history of a still-active job. The aggregate live-tail, spool,
+  (`LUBKO_GC_RETENTION_SECONDS`, `LUBKO_GC_BATCH_LIMIT`). Retention governs *how
+  long* terminal history is kept before it becomes eligible for reclamation and
+  the batch limit bounds *how much* is reclaimed per pass; neither caps the amount
+  of terminal history waiting at once, nor the total per-job history of a
+  still-active job. The aggregate live-tail, spool,
   and retained-history footprint grows both with the number of concurrently
   active jobs and with the lifetime/output of each active job. The real
   distinction is a bounded *per-job local spool* and *per-payload* size versus a
@@ -124,9 +126,11 @@ are encouraged:
 - **Bounded per-job local spool and per-payload sizes, not a bounded total.** The
   `LUBKO_OUTPUT_SPOOL_MAX_BYTES` local capture spool and the per-payload 4000-byte
   live tail cap what *one job's live, in-flight output* contributes to disk and
-  memory. The GC retention and batch limits bound how much terminal history is
-  kept and how much is reclaimed per pass, but they do **not** bound a still-active
-  job's accumulating history-chunk count. The aggregate output/spool storage
+  memory. Retention bounds *how long* terminal history is kept before it becomes
+  eligible for reclamation, and the batch limit bounds *how much* is reclaimed per
+  pass; neither caps the amount of terminal history waiting at once, and they do
+  **not** bound a still-active job's accumulating history-chunk count. The
+  aggregate output/spool storage
   therefore scales with both the number of concurrently active jobs and the
   lifetime/output of each; a single long-lived active job is not footprint-bounded.
 
