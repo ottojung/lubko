@@ -456,7 +456,11 @@ def recover_owned_groups(incarnation: str) -> None:
         result = worker_mod.recover_owned_job_groups(
             conn, incarnation, worker_mod.DEFAULT_CANCEL_GRACE_SECONDS
         )
-    except psycopg.Error as exc:
+    except (psycopg.Error, OSError, worker_mod.DbOperationDeadlineError) as exc:
+        # A database operation deadline breach (:class:`DbOperationDeadlineError`)
+        # and a connectivity loss (``OSError``) are both remote-terminalization
+        # failures; they are fail-closed into the same blocking obligation as any
+        # query error so every caller treats them identically.
         msg = f"error recovering owned groups for incarnation {incarnation}"
         raise OwnedGroupRecoveryError(msg) from exc
     finally:
@@ -1297,7 +1301,52 @@ class SupervisorDaemon:
             reason,
         )
 
-    def _retire_child(self, *, authority_locked: bool = False) -> bool:
+    @staticmethod
+    def _terminate_remote_owned_groups(token: str, *, on_shutdown: bool) -> bool:
+        """Attempt remote owned-group terminalization; report whether to proceed.
+
+        Owned-group recovery terminates, through the durable database, any
+        command process group still owned by ``token`` after its worker
+        incarnation is gone. It is the only step of shutdown that touches a
+        remote system, so it is the only step that can fail with a database
+        operation deadline breach (:class:`worker.DbOperationDeadlineError`) or
+        a connectivity loss (``OSError``).
+
+        The terminalization is best-effort and fail-closed. When it cannot be
+        confirmed it raises :class:`OwnedGroupRecoveryError` so the non-shutdown
+        callers hold fail-closed (preserving authority so no replacement spawns
+        beside possibly-live groups). During shutdown (``on_shutdown=True``) a
+        remote failure must never block the supervisor's *local* convergence or
+        cleanup, so the failure is logged and the caller is told to proceed with
+        the local steps anyway.
+
+        Args:
+            token: Lifecycle token whose owned groups to terminate.
+            on_shutdown: Whether this is the unconditional shutdown path.
+
+        Returns:
+            ``True`` when terminalization succeeded, or when a remote failure
+            should not block local shutdown convergence.
+
+        Raises:
+            OwnedGroupRecoveryError: When ``on_shutdown`` is ``False`` and the
+                remote terminalization could not be confirmed.
+        """
+        try:
+            recover_owned_groups(token)
+        except OwnedGroupRecoveryError:
+            if on_shutdown:
+                LOGGER.exception(
+                    "remote owned-group terminalization for %s could not be "
+                    "confirmed during shutdown; proceeding with local convergence "
+                    "(best-effort, fail-closed)",
+                    token,
+                )
+                return True
+            raise
+        return True
+
+    def _retire_child(self, *, authority_locked: bool = False, on_shutdown: bool = False) -> bool:
         """Stop the current worker child by exact identity.
 
         ``stop_worker`` performs full identity verification (PID, start-time
@@ -1308,6 +1357,13 @@ class SupervisorDaemon:
         preserved so the next daemon tick can retry the same exact orphan
         rather than losing track of it and spawning a duplicate consumer.
 
+        The exact drain-sentinel check is the local proof that the worker
+        terminated its own owned groups: when it matches, no remote
+        terminalization is attempted at all. When it does not match, remote
+        recovery is attempted; on shutdown a remote failure is best-effort and
+        does not block the local child-clearing write (see
+        :meth:`_terminate_remote_owned_groups`).
+
         Args:
             authority_locked: Whether the caller already holds the shared
                 consumer-establishment lock. Under the lock an in-lock fresh
@@ -1315,6 +1371,8 @@ class SupervisorDaemon:
                 directly; outside the lock the publication must be serialized
                 through the boundary so it cannot erase a concurrently
                 established recovery obligation.
+            on_shutdown: Whether this is the unconditional shutdown path; when
+                ``True`` a remote terminalization failure is best-effort.
 
         Returns:
             ``True`` when the child was successfully retired (or was already
@@ -1345,9 +1403,13 @@ class SupervisorDaemon:
         # no database round-trip that could fail). Otherwise recovery is a
         # durable blocking obligation: a DB/config/SQL failure or a surviving/
         # unresolved group raises, which preserves the retired child and prevents
-        # spawning a replacement alongside stale groups.
+        # spawning a replacement alongside stale groups. The drain-sentinel check
+        # is exact and must not be widened: when it matches, no remote
+        # terminalization is attempted at all. On shutdown a remote
+        # terminalization failure is best-effort and must not block the local
+        # child-clearing write below (see :meth:`_terminate_remote_owned_groups`).
         if not (child.token and worker_mod.drain_sentinel_matches(child.token)):
-            recover_owned_groups(child.token)
+            self._terminate_remote_owned_groups(child.token, on_shutdown=on_shutdown)
         if self.proc is not None:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
@@ -1645,19 +1707,30 @@ class SupervisorDaemon:
             spawned_at=time.time(),
         )
 
-    def _recover_spawn_owned_groups(self, token: str) -> bool:
+    def _recover_spawn_owned_groups(self, token: str, *, on_shutdown: bool = False) -> bool:
         """Recover the exact command groups owned by a pre-publication token.
 
         Args:
             token: Lifecycle token of the proven-gone worker incarnation.
+            on_shutdown: Whether this is the unconditional shutdown path; when
+                ``True`` a remote terminalization failure is best-effort and
+                does not block local convergence.
 
         Returns:
             ``True`` when every group owned by the incarnation is provably
-            reclaimed; ``False`` on the fail-closed blocking error.
+            reclaimed, or when a remote failure should not block local shutdown
+            convergence; ``False`` (fail-closed hold) otherwise.
         """
         try:
             recover_owned_groups(token)
         except OwnedGroupRecoveryError:
+            if on_shutdown:
+                LOGGER.exception(
+                    "the worker was proven gone, but its owned command groups "
+                    "could not be recovered during shutdown; proceeding with "
+                    "local convergence (best-effort, fail-closed)"
+                )
+                return True
             self._message = (
                 "the worker was proven gone, but its owned command groups could "
                 "not be recovered; holding without clearing spawn authority or "
@@ -2139,7 +2212,7 @@ class SupervisorDaemon:
             with suppress(OSError):
                 os.close(pidfd)
 
-    def _resolve_spawning_obligation(self) -> bool:
+    def _resolve_spawning_obligation(self, *, on_shutdown: bool = False) -> bool:
         """Resolve any durable pre-spawn obligation before authorizing a spawn.
 
         This is the fail-closed gate that makes the crash window between a
@@ -2147,6 +2220,10 @@ class SupervisorDaemon:
         successor supervisor may only start its own worker once the first
         spawn's fate has been *positively* resolved — never by process-name
         matching and never through broad numeric PID/PGID signalling.
+
+        Args:
+            on_shutdown: Whether this is the unconditional shutdown path; when
+                ``True`` a remote terminalization failure is best-effort.
 
         Returns:
             ``True`` when no blocking obligation remains.
@@ -2170,20 +2247,24 @@ class SupervisorDaemon:
         if obligation is None:
             return True
         if obligation.pid is None:
-            resolved = self._resolve_pidless_spawn(obligation)
+            resolved = self._resolve_pidless_spawn(obligation, on_shutdown=on_shutdown)
         else:
-            resolved = self._resolve_identified_spawn(obligation)
+            resolved = self._resolve_identified_spawn(obligation, on_shutdown=on_shutdown)
         if not resolved:
             return False
         write_state(replace(read_state(), spawning=None))
         LOGGER.info("resolved prior pre-spawn recovery obligation for commit %s", obligation.commit)
         return True
 
-    def _resolve_pidless_spawn(self, obligation: SpawningObligation) -> bool:
+    def _resolve_pidless_spawn(
+        self, obligation: SpawningObligation, *, on_shutdown: bool = False
+    ) -> bool:
         """Resolve an obligation recorded before the child identity was durable.
 
         Args:
             obligation: The pre-spawn obligation without a child identity.
+            on_shutdown: Whether this is the unconditional shutdown path; when
+                ``True`` a remote terminalization failure is best-effort.
 
         Returns:
             ``True`` when no live first spawn can remain.
@@ -2239,21 +2320,34 @@ class SupervisorDaemon:
         try:
             recover_owned_groups(obligation.token)
         except OwnedGroupRecoveryError:
-            self._message = (
-                "a pid-less pre-spawn obligation was proven dead via kernel "
-                "parent-death signalling, but its owned command groups could not "
-                "be recovered; holding without clearing the obligation or "
-                "spawning a replacement"
-            )
-            LOGGER.exception("%s", self._message)
-            return False
+            if on_shutdown:
+                # Best-effort: the local obligation clearance below may still
+                # proceed because no replacement will be spawned during shutdown.
+                LOGGER.exception(
+                    "pid-less pre-spawn obligation proven dead but its owned "
+                    "command groups could not be recovered during shutdown; "
+                    "proceeding with local convergence (best-effort, fail-closed)"
+                )
+            else:
+                self._message = (
+                    "a pid-less pre-spawn obligation was proven dead via kernel "
+                    "parent-death signalling, but its owned command groups could not "
+                    "be recovered; holding without clearing the obligation or "
+                    "spawning a replacement"
+                )
+                LOGGER.exception("%s", self._message)
+                return False
         return True
 
-    def _resolve_identified_spawn(self, obligation: SpawningObligation) -> bool:
+    def _resolve_identified_spawn(
+        self, obligation: SpawningObligation, *, on_shutdown: bool = False
+    ) -> bool:
         """Resolve an obligation carrying an exact child identity.
 
         Args:
             obligation: The pre-spawn obligation with ``pid`` recorded.
+            on_shutdown: Whether this is the unconditional shutdown path; when
+                ``True`` a remote terminalization failure is best-effort.
 
         Returns:
             ``True`` when the exact recorded instance is positively gone.
@@ -2269,7 +2363,7 @@ class SupervisorDaemon:
             # the exact instance is provably gone. Its already-launched command
             # groups are independent process groups, so exact-incarnation group
             # recovery must succeed before this token's authority is dropped.
-            if not self._recover_spawn_owned_groups(obligation.token):
+            if not self._recover_spawn_owned_groups(obligation.token, on_shutdown=on_shutdown):
                 return False
             # A stale exact-identity hold left behind by an earlier failed
             # attempt for this same instance must not outlive its resolution.
@@ -2296,13 +2390,13 @@ class SupervisorDaemon:
         # may still be alive under the same incarnation. Recovery failure keeps
         # both the obligation and the unresolved hold durable (fail closed) so
         # no replacement can spawn and a later tick retries only the recovery.
-        if not self._recover_spawn_owned_groups(obligation.token):
+        if not self._recover_spawn_owned_groups(obligation.token, on_shutdown=on_shutdown):
             return False
         write_state(replace(read_state(), unresolved_child=None))
         LOGGER.info("converged the previously spawned worker pid=%d", hold.pid)
         return True
 
-    def _resolve_unresolved_child(self) -> bool:
+    def _resolve_unresolved_child(self, *, on_shutdown: bool = False) -> bool:
         """Resolve any durable unresolved-child hold before further decisions.
 
         The exact recorded instance is converged first; because every hold
@@ -2311,6 +2405,10 @@ class SupervisorDaemon:
         authority may be cleared. Recovery failure keeps the hold durable so a
         later tick retries it instead of authorizing a replacement beside
         still-live side-effecting process groups.
+
+        Args:
+            on_shutdown: Whether this is the unconditional shutdown path; when
+                ``True`` a remote terminalization failure is best-effort.
 
         Returns:
             ``True`` when no blocking hold remains.
@@ -2346,7 +2444,7 @@ class SupervisorDaemon:
             )
             LOGGER.error("%s", self._message)
             return False
-        if not self._recover_spawn_owned_groups(hold.token):
+        if not self._recover_spawn_owned_groups(hold.token, on_shutdown=on_shutdown):
             return False
         write_state(replace(read_state(), unresolved_child=None))
         LOGGER.info("resolved prior unresolved worker pid=%d", hold.pid)
@@ -2528,10 +2626,22 @@ class SupervisorDaemon:
         LOGGER.info("supervisor stopped")
 
     def _shutdown_locked(self) -> None:
-        """Perform the shutdown convergence while holding the consumer lock."""
+        """Perform the shutdown convergence while holding the consumer lock.
+
+        Local ownership convergence (detaching the local worker child and
+        clearing every durable ownership authority: ``child``, ``spawning``,
+        ``unresolved_child``) and local cleanup (removing the pidfile and
+        publishing the ``stopped`` status) are **unconditional**: a remote
+        database operation deadline breach or connectivity loss during
+        finalization must never prevent them. Remote DB terminalization (owned-
+        group recovery) is the only step that touches a remote system; it is
+        best-effort and fail-closed (see :meth:`_terminate_remote_owned_groups`)
+        — attempted, but when it cannot be confirmed the failure is logged
+        while the local convergence and cleanup still complete.
+        """
         if read_state().child is not None:
-            self._retire_child(authority_locked=True)
-        if not self._resolve_spawning_obligation():
+            self._retire_child(authority_locked=True, on_shutdown=True)
+        if not self._resolve_spawning_obligation(on_shutdown=True):
             # The obligation survives shutdown on purpose: a possibly live
             # spawned child must never be abandoned to make room for a
             # replacement.
@@ -2540,7 +2650,7 @@ class SupervisorDaemon:
                 "shutting down with an unresolved pre-spawn obligation for commit %s",
                 spawning.commit if spawning is not None else "?",
             )
-        if not self._resolve_unresolved_child():
+        if not self._resolve_unresolved_child(on_shutdown=True):
             # The hold survives shutdown on purpose: an unresolved spawned
             # child must never be abandoned to make room for a replacement.
             hold = read_state().unresolved_child
