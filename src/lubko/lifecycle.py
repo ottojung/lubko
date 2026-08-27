@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Final
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, protocol, supervise, toolchain
+from lubko import cli, protocol, startup_contract, supervise, toolchain
 from lubko._exact_signal import open_pidfd as _open_exact_pidfd
 from lubko._exact_signal import pidfd_send_signal, process_pgrp
 from lubko.config import (
@@ -3529,9 +3529,11 @@ def status_cmd() -> int:
         _out(UNMANAGED_WORKER_MESSAGE)
         _out("after stopping the legacy worker manually once, run: lubko-deploy deploy --bootstrap")
         _print_supervisor_status()
+        _print_startup_contract()
         return EXIT_OK
     if meta is None:
         _print_supervisor_status()
+        _print_startup_contract()
         return EXIT_OK
     _out(f"pid: {meta.pid}")
     _out(f"pgid: {meta.pgid}")
@@ -3553,7 +3555,120 @@ def status_cmd() -> int:
                 f"worker commit {meta.git_commit}; run lubko-deploy-ctl status to reconcile"
             )
     _print_supervisor_status()
+    _print_startup_contract()
     return EXIT_OK
+
+
+def _print_startup_contract() -> None:
+    """Report the versioned startup contract and its live topology proof.
+
+    The contract is the authoritative, repository-owned definition of how the
+    container must start the supervisor; the proof demonstrates the live
+    process topology actually matches it, rather than merely inferring worker
+    liveness from queue state.
+    """
+    assessment = startup_contract.assess_recorded_contract()
+    if assessment.state == "current" and assessment.contract is not None:
+        _out(f"startup contract: current (version {assessment.contract.schema_version})")
+    elif assessment.state == "missing":
+        _out("startup contract: MISSING (run 'lubko-install' or 'lubko-deploy bootstrap')")
+    elif assessment.state == "corrupt":
+        _out(f"startup contract: CORRUPT ({assessment.message})")
+    else:
+        _out(f"startup contract: MISMATCH ({assessment.message})")
+    launcher_ok = startup_contract.validate_startup_launcher(_resolve_bin_home())
+    launcher_state = "installed" if launcher_ok else "MISSING"
+    _out(f"startup launcher ({startup_contract.STARTUP_LAUNCHER_NAME}): {launcher_state}")
+    definition = startup_contract.validate_startup_definition()
+    _out(f"startup definition: {'OK' if definition.ok else 'FAIL'} ({definition.message})")
+    paths = startup_contract.validate_contract_paths()
+    _out(f"startup state paths: {'OK' if paths.ok else 'FAIL'} ({paths.message})")
+    config_paths = startup_contract.validate_contract_config()
+    _out(f"private config paths: {'OK' if config_paths.ok else 'FAIL'} ({config_paths.message})")
+    proof = startup_contract.verify_live_topology()
+    _out(f"startup topology: {'OK' if proof.ok else 'FAIL'}")
+    _out(f"  init (pid {proof.init_pid}): {proof.init_cmdline or 'unknown'}")
+    _out(f"  init is supported tini: {proof.init_is_tini}")
+    if proof.supervisor_pid:
+        _out(f"  supervisor (pid {proof.supervisor_pid}): {proof.supervisor_cmdline or 'unknown'}")
+    _out(f"  supervisor under tini: {proof.supervisor_under_init}")
+    _out(f"  supervisor is lubko-supervisor: {proof.supervisor_is_contract_binary}")
+    _out(f"  supervisor identity matches recorded: {proof.supervisor_identity_matches}")
+    _out(f"  uses sleep-infinity placeholder: {proof.uses_sleep_placeholder}")
+    if proof.worker_pid is not None:
+        _out(
+            f"  worker (pid {proof.worker_pid}) direct child of supervisor: "
+            f"{proof.worker_is_direct_child}"
+        )
+        _out(f"  worker identity matches recorded: {proof.worker_identity_matches}")
+    _out(f"  proof: {proof.message}")
+    rap = startup_contract.prove_restart_authority(startup_contract.CURRENT_CONTRACT)
+    _out(f"restart authority: {'OK' if rap.ok else 'FAIL'} ({rap.source}: {rap.message})")
+
+
+def startup_contract_cmd(args: argparse.Namespace) -> int:
+    """Verify, and optionally publish, the live supervisor startup contract.
+
+    The command requires every supported-deployment boundary to hold before it
+    reports the startup contract active, and it fails closed on any missing
+    piece. Concretely it requires:
+
+    * the recorded contract to exactly equal the code's current contract
+      (missing/malformed/unsupported/mismatch all fail closed);
+    * the repository-owned startup launcher to be installed and match the versioned
+      source;
+    * the installed startup definition to match the current contract exactly;
+    * the required private state directories to exist with the exact safe mode;
+    * the private config files to exist with no group/world access;
+    * the live Tini -> supervisor -> worker topology to be proven; and
+    * concrete, configured restart-authority evidence from the deployment seam
+      (the contract of record alone is not activation proof).
+
+    It exits non-zero unless every check passes — for example when the container
+    still uses the ``sleep infinity`` placeholder, the recorded contract has
+    silently drifted, the startup definition is missing, or no restart-policy
+    evidence is supplied.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        A process exit code.
+    """
+    if getattr(args, "write", False):
+        startup_contract.write_contract()
+        startup_contract.write_startup_launcher(_resolve_bin_home())
+        startup_contract.write_startup_definition()
+        _out(
+            f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION}, "
+            f"launcher, and startup definition written; the container must run "
+            f"'{startup_contract.STARTUP_LAUNCHER_NAME}' and the deployment seam must "
+            f"supply {startup_contract.RESTART_POLICY_ENV} for restart authority"
+        )
+    assessment = startup_contract.assess_recorded_contract()
+    contract_ok = assessment.state == "current"
+    if not contract_ok:
+        _out(f"startup contract: {assessment.state.upper()} ({assessment.message})")
+    _print_startup_contract()
+    launcher_ok = startup_contract.validate_startup_launcher(_resolve_bin_home())
+    definition_ok = startup_contract.validate_startup_definition().ok
+    paths_ok = startup_contract.validate_contract_paths().ok
+    config_ok = startup_contract.validate_contract_config().ok
+    proof = startup_contract.verify_live_topology()
+    rap = startup_contract.prove_restart_authority(startup_contract.CURRENT_CONTRACT)
+    return (
+        EXIT_OK
+        if (
+            contract_ok
+            and launcher_ok
+            and definition_ok
+            and paths_ok
+            and config_ok
+            and proof.ok
+            and rap.ok
+        )
+        else EXIT_ERROR
+    )
 
 
 def restart_cmd(_args: argparse.Namespace) -> int:
@@ -4216,6 +4331,12 @@ def _bootstrap_locked(
         _err("refusing to continue without a verified launcher")
         return EXIT_ERROR
 
+    _out("bootstrap: installing versioned startup launcher ...")
+    if (err := startup_contract.install_and_validate_startup_definition(bin_home)) is not None:
+        _err(err)
+        _err("refusing to continue without a verified startup definition")
+        return EXIT_ERROR
+
     _out(f"bootstrap: publishing supervisor-runtime override for {commit} ...")
     supervise.write_supervisor_runtime_override(commit)
 
@@ -4231,6 +4352,13 @@ def _bootstrap_locked(
     _out("  1. restart the container/environment to load the new supervisor code")
     _out("  2. the new supervisor will restore the confirmed worker from desired state")
     _out("  3. run 'lubko-deploy deploy <target>' to confirm the target and advance cli/current")
+    startup_contract.write_contract()
+    _out(f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION} recorded")
+    _out(
+        f"startup definition installed; the container must run "
+        f"'{startup_contract.STARTUP_LAUNCHER_NAME}' and the deployment seam must supply "
+        f"{startup_contract.RESTART_POLICY_ENV} for restart authority"
+    )
     return EXIT_OK
 
 
@@ -4418,6 +4546,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("status", help="show worker lifecycle state")
+
+    contract_parser = subparsers.add_parser(
+        "startup-contract",
+        help="prove the live supervisor startup topology (tini -> supervisor -> worker)",
+    )
+    contract_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="publish the current versioned startup contract artifact before proving the topology",
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy",
@@ -4675,6 +4813,7 @@ def main(argv: list[str] | None = None) -> int:
         "restart": restart_cmd,
         "migrate": migrate_cmd,
         "bootstrap": bootstrap_cmd,
+        "startup-contract": startup_contract_cmd,
         "repair": repair_cmd,
         "recover": recover_cmd,
         "log": lambda namespace: log_cmd(namespace.lines),

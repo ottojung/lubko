@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from lubko import cli
+from lubko import cli, startup_contract
 from lubko import lifecycle as _lifecycle
 from lubko.toolchain import UvResolutionError, resolve_uv, write_toolchain
 
@@ -285,13 +285,24 @@ def _install_repo(repo: Path, uv: str | None) -> int:
         return EXIT_ERROR
     write_toolchain(uv_path)
 
-    if _verify_installed() != EXIT_OK:
+    install_error = startup_contract.install_and_validate_startup_definition(bin_home())
+    if _verify_installed() != EXIT_OK or install_error is not None:
+        if install_error is not None:
+            _err(install_error)
         return EXIT_ERROR
     if not bin_home_on_path():
         _err(f"warning: {bin_home()} is not on the current PATH; log in again to pick it up")
 
     _out("Lubko tools installed and resolvable on PATH:")
     _out_cli_resolution()
+    startup_contract.write_contract()
+    _out(
+        f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION}, launcher, "
+        f"and startup definition installed; the container must run "
+        f"'{startup_contract.STARTUP_LAUNCHER_NAME}' (tini-static -- lubko-supervisor) and "
+        f"the deployment seam must supply {startup_contract.RESTART_POLICY_ENV} so restart "
+        f"authority is proven"
+    )
     return EXIT_OK
 
 
