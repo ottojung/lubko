@@ -4,6 +4,7 @@ import json
 import math
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -262,5 +263,58 @@ def test_unsupported_schema_version_fails_closed() -> None:
     data = json.loads(json.dumps(_snapshot().to_dict()))
     data["schema_version"] = 1
     with pytest.raises(ValueError, match="schema"):
+        WorkerHealth.from_dict(data)
+    assert _from_dict_or_none(data) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("schema_version", "2"),
+        ("schema_version", 2.0),
+        ("schema_version", True),
+        ("pid", "1"),
+        ("pid", 1.5),
+        ("pid", True),
+        ("pid", 0),
+        ("start_time_ticks", "100"),
+        ("start_time_ticks", 100.0),
+        ("start_time_ticks", True),
+        ("start_time_ticks", 0),
+    ],
+)
+def test_process_identity_fields_require_exact_json_integers(field: str, bad: object) -> None:
+    """Persisted process identity never gains authority through numeric coercion."""
+    data = json.loads(json.dumps(_snapshot().to_dict()))
+    data[field] = bad
+    with pytest.raises((TypeError, ValueError), match=field):
+        WorkerHealth.from_dict(data)
+    assert _from_dict_or_none(data) is None
+
+
+@pytest.mark.parametrize("bad_schema", ["bogus", [], {}, 2.0, "2"])
+def test_health_file_reader_fails_closed_on_malformed_schema(
+    tmp_path: Path, bad_schema: object
+) -> None:
+    """Malformed schema authority never escapes the fail-closed disk reader."""
+    data = _snapshot().to_dict()
+    data["schema_version"] = bad_schema
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert health_module._read_health_file(path) is None
+
+
+def test_fractional_pid_cannot_be_truncated_into_live_health() -> None:
+    """A malformed fractional PID cannot normalize to this process and become live."""
+    pid = os.getpid()
+    ticks = proc_start_ticks(pid)
+    assert ticks is not None
+    data = _snapshot(
+        pid=pid,
+        start_time_ticks=ticks,
+        published_at=time.time(),
+    ).to_dict()
+    data["pid"] = float(pid) + 0.9
+    with pytest.raises(TypeError, match="pid"):
         WorkerHealth.from_dict(data)
     assert _from_dict_or_none(data) is None
