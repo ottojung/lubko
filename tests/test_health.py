@@ -1,4 +1,4 @@
-"""Non-finite worker health timestamps fail closed; finite behavior is kept."""
+"""Persisted worker health fails closed on malformed scalar authority."""
 
 import json
 import math
@@ -256,6 +256,40 @@ def test_no_job_identity_is_published() -> None:
     assert "oldest_active_job_id" not in payload
     assert "current_job_id" not in payload
     assert "worker_id" in payload  # bounded process identity, not a job id
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("schema_version", "2"),
+        ("worker_id", 7),
+        ("worker_incarnation", ["inc"]),
+        ("pid", "1"),
+        ("pid", 1.0),
+        ("start_time_ticks", "100"),
+        ("started_at", "1000.0"),
+        ("published_at", "1000.0"),
+        ("db_connected_at", "1000.0"),
+        ("active_jobs", "1"),
+        ("active_jobs", 1.0),
+    ],
+)
+def test_present_scalar_fields_require_their_json_schema_types(field: str, bad: object) -> None:
+    """Present scalar fields are never normalized from malformed JSON types."""
+    data = json.loads(json.dumps(_snapshot().to_dict()))
+    data[field] = bad
+    with pytest.raises((TypeError, ValueError)):
+        WorkerHealth.from_dict(data)
+    assert _from_dict_or_none(data) is None
+
+
+def test_malformed_identity_file_is_not_usable_health(tmp_path: Path) -> None:
+    """A persisted malformed identity cannot become effective live health."""
+    data = json.loads(json.dumps(_snapshot().to_dict()))
+    data["pid"] = "1"
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert health_module._read_health_file(path) is None
 
 
 def test_unsupported_schema_version_fails_closed() -> None:

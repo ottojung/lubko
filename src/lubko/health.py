@@ -325,8 +325,8 @@ class WorkerHealth:
             raise ValueError(msg)
         return cls(
             schema_version=version,
-            worker_id=str(data.get("worker_id") or ""),
-            worker_incarnation=str(data.get("worker_incarnation") or ""),
+            worker_id=_coerce_str(data.get("worker_id"), "worker_id"),
+            worker_incarnation=_coerce_str(data.get("worker_incarnation"), "worker_incarnation"),
             pid=_required_json_int(data.get("pid"), "pid", minimum=1),
             start_time_ticks=_required_json_int(
                 data.get("start_time_ticks"), "start_time_ticks", minimum=1
@@ -335,25 +335,29 @@ class WorkerHealth:
             published_at=_required_finite_float(data.get("published_at"), "published_at"),
             alive=_strict_bool(data, "alive"),
             db_connected=_strict_bool(data, "db_connected"),
-            db_connected_at=_optional_finite_float(data.get("db_connected_at")),
-            db_error_at=_optional_finite_float(data.get("db_error_at")),
+            db_connected_at=_optional_finite_float(data.get("db_connected_at"), "db_connected_at"),
+            db_error_at=_optional_finite_float(data.get("db_error_at"), "db_error_at"),
             active_jobs=_coerce_int(data.get("active_jobs"), "active_jobs"),
             stopping_jobs=_coerce_int(data.get("stopping_jobs"), "stopping_jobs"),
             completed_jobs=_coerce_int(data.get("completed_jobs"), "completed_jobs"),
             oldest_active_job_age_seconds=_optional_finite_float(
-                data.get("oldest_active_job_age_seconds")
+                data.get("oldest_active_job_age_seconds"), "oldest_active_job_age_seconds"
             ),
             lease_safety_margin_seconds=_required_finite_float(
                 data.get("lease_safety_margin_seconds"), "lease_safety_margin_seconds"
             ),
             min_lease_safety_remaining_seconds=_optional_finite_float(
-                data.get("min_lease_safety_remaining_seconds")
+                data.get("min_lease_safety_remaining_seconds"), "min_lease_safety_remaining_seconds"
             ),
             db_operation_deadline_seconds=_required_finite_float(
                 data.get("db_operation_deadline_seconds"), "db_operation_deadline_seconds"
             ),
-            db_last_activity_at=_optional_finite_float(data.get("db_last_activity_at")),
-            db_deadline_breached_at=_optional_finite_float(data.get("db_deadline_breached_at")),
+            db_last_activity_at=_optional_finite_float(
+                data.get("db_last_activity_at"), "db_last_activity_at"
+            ),
+            db_deadline_breached_at=_optional_finite_float(
+                data.get("db_deadline_breached_at"), "db_deadline_breached_at"
+            ),
             db_deadline_breach_count=_coerce_int(
                 data.get("db_deadline_breach_count"), "db_deadline_breach_count"
             ),
@@ -365,9 +369,13 @@ class WorkerHealth:
             last_scan_batch_size=_coerce_int(
                 data.get("last_scan_batch_size"), "last_scan_batch_size"
             ),
-            last_cancellation_scan_at=_optional_finite_float(data.get("last_cancellation_scan_at")),
-            last_recovery_at=_optional_finite_float(data.get("last_recovery_at")),
-            last_gc_at=_optional_finite_float(data.get("last_gc_at")),
+            last_cancellation_scan_at=_optional_finite_float(
+                data.get("last_cancellation_scan_at"), "last_cancellation_scan_at"
+            ),
+            last_recovery_at=_optional_finite_float(
+                data.get("last_recovery_at"), "last_recovery_at"
+            ),
+            last_gc_at=_optional_finite_float(data.get("last_gc_at"), "last_gc_at"),
             cancellation_scan_overdue=_strict_bool(data, "cancellation_scan_overdue"),
             recovery_overdue=_strict_bool(data, "recovery_overdue"),
             gc_overdue=_strict_bool(data, "gc_overdue"),
@@ -401,29 +409,29 @@ def _required_json_int(value: object, field: str, *, minimum: int) -> int:
     return value
 
 
-def _coerce_float(value: object) -> float | None:
-    """Coerce a JSON value to float or None.
+def _coerce_float(value: object, field: str) -> float | None:
+    """Coerce an absent value or require a JSON number.
 
     Args:
         value: Raw JSON value.
+        field: Field name for error reporting.
 
     Returns:
-        The float, or ``None``.
+        The float, or ``None`` when absent.
+
+    Raises:
+        TypeError: If a present value is not a JSON number.
     """
-    if isinstance(value, bool):
+    if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"{field} must be a number, got {value!r}"
+        raise TypeError(msg)
+    return float(value)
 
 
 def _coerce_int(value: object, field: str) -> int:
-    """Coerce a JSON value to a non-negative bounded int.
+    """Require a JSON integer while preserving absent-field defaults.
 
     Args:
         value: Raw JSON value.
@@ -433,29 +441,35 @@ def _coerce_int(value: object, field: str) -> int:
         The int (``0`` when absent).
 
     Raises:
-        TypeError: If the value is present but of a non-numeric type.
-        ValueError: If the value is present but not an integer.
+        TypeError: If the value is present but is not a JSON integer.
     """
-    if value is None or (isinstance(value, str) and not value):
+    if value is None:
         return 0
-    if isinstance(value, bool):
-        msg = f"{field} must be an integer, got boolean"
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"{field} must be an integer, got {value!r}"
         raise TypeError(msg)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        if not value.is_integer():
-            msg = f"{field} must be an integer, got {value!r}"
-            raise ValueError(msg)
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError as exc:
-            msg = f"{field} must be an integer, got {value!r}"
-            raise ValueError(msg) from exc
-    msg = f"{field} must be an integer, got {value!r}"
-    raise TypeError(msg)
+    return value
+
+
+def _coerce_str(value: object, field: str) -> str:
+    """Require a JSON string while preserving absent-field defaults.
+
+    Args:
+        value: Raw JSON value.
+        field: Field name for error reporting.
+
+    Returns:
+        The string (empty when absent).
+
+    Raises:
+        TypeError: If the value is present but is not a JSON string.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        msg = f"{field} must be a string, got {value!r}"
+        raise TypeError(msg)
+    return value
 
 
 def _strict_bool(data: dict[str, Any], field: str) -> bool:
@@ -493,16 +507,16 @@ def _required_finite_float(value: object, field: str) -> float:
     Raises:
         ValueError: If the value is present but not a finite number.
     """
-    if value is None or (isinstance(value, str) and not value):
+    if value is None:
         return 0.0
-    result = _coerce_float(value)
+    result = _coerce_float(value, field)
     if result is None or not math.isfinite(result):
         msg = f"{field} must be a finite timestamp, got {value!r}"
         raise ValueError(msg)
     return result
 
 
-def _optional_finite_float(value: object) -> float | None:
+def _optional_finite_float(value: object, field: str) -> float | None:
     """Coerce an optional persisted timestamp to a finite float or None.
 
     Non-finite values are rejected rather than silently accepted so
@@ -510,6 +524,7 @@ def _optional_finite_float(value: object) -> float | None:
 
     Args:
         value: Raw JSON value.
+        field: Field name for error reporting.
 
     Returns:
         The finite float, or ``None``.
@@ -517,7 +532,7 @@ def _optional_finite_float(value: object) -> float | None:
     Raises:
         ValueError: If the value is non-finite.
     """
-    result = _coerce_float(value)
+    result = _coerce_float(value, field)
     if result is not None and not math.isfinite(result):
         msg = f"timestamp must be finite, got {value!r}"
         raise ValueError(msg)
