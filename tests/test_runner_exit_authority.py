@@ -144,6 +144,61 @@ def test_authoritative_runner_accepts_exactly_one_prompt(
         proc.kill_and_reap()
 
 
+def test_invocation_liveness_stays_bound_to_pinned_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invocation liveness is accepted only through the pinned process."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"state": "running", "pid": 4242, "start_time": 111})
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+    monkeypatch.setattr(agent, "pidfd_send_signal", lambda fd, sig: probes.append((fd, sig)))
+    monkeypatch.setattr(os, "close", closed.append)
+
+    assert agent.is_alive(meta)
+    assert probes == [(77, 0)]
+    assert closed == [77]
+
+
+def test_dead_pinned_invocation_cannot_authorize_prompt_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished invocation makes ordinary prompts and steers start fresh."""
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+
+    def dead_pinned_invocation(fd: int, sig: int) -> None:
+        probes.append((fd, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(agent, "pidfd_send_signal", dead_pinned_invocation)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    for steer in (False, True):
+        meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+        meta.update({"state": "running", "pid": 4242, "start_time": 111})
+
+        decision = _decide(meta, prompt="work", steer=steer)
+
+        assert decision["action"] == "spawn"
+        assert meta["pending_prompt"] == "work"
+        assert meta["active_runner"] is True
+        reservation = meta["runner_reservation"]
+        assert isinstance(reservation, dict)
+        assert reservation["state"] == "reserved"
+
+    assert probes == [(77, 0), (77, 0)]
+    assert closed == [77, 77]
+
+
 def test_runner_disappearing_during_identity_proof_gets_fresh_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
