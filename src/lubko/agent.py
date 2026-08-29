@@ -713,30 +713,40 @@ def _matches_invocation_group(member: int, pgid: int, aid: str, iid: str) -> boo
 
 
 def is_alive(meta: Meta) -> bool:
-    """Return whether the recorded process is really our agent process.
+    """Return whether the recorded process is exactly our live agent process.
 
-    A PID alone is not trusted: the process start time (ticks) and a
-    per-agent environment marker must both match, so a reused or recycled
-    PID can never be mistaken for our agent.
+    The numeric PID is pinned before start-time and per-agent marker checks.
+    Final liveness is proven through that same pidfd, so an exit and PID reuse
+    after identity proof cannot make an unrelated process appear to be the
+    recorded invocation. Platforms that cannot provide the stable pin or
+    pidfd liveness probe fail closed.
 
     Args:
         meta: Agent metadata.
 
     Returns:
-        ``True`` only when a live process matches every recorded identity.
+        ``True`` only when the same pinned live process matches every recorded
+        invocation identity field.
     """
     pid = meta.get("pid")
     if not pid:
         return False
-    if proc_start_ticks(pid) != meta.get("start_time"):
-        return False
-    if not env_has_marker(pid, meta.get("id", "")):
+    invocation_pid = int(pid)
+    fd = open_pidfd(invocation_pid)
+    if fd is None:
         return False
     try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+        if proc_start_ticks(invocation_pid) != meta.get("start_time"):
+            return False
+        if not env_has_marker(invocation_pid, meta.get("id", "")):
+            return False
+        try:
+            pidfd_send_signal(fd, 0)
+        except (OSError, AttributeError):
+            return False
+        return True
+    finally:
+        os.close(fd)
 
 
 def _recorded_leader_state(meta: Meta) -> str:
