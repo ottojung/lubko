@@ -441,6 +441,8 @@ print a tool version
 run one already-known command
 ```
 
+Or if the agent usage limit is reached. In this case, use other means of editing code. Do not try to circumvent to usage limit.
+
 Two useful defaults:
 
 > **If the task needs judgment, context, iteration, or more than a couple of obvious shell commands, use `lubko-agent` — unless the task is code review.**
