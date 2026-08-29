@@ -994,26 +994,37 @@ def _is_zombie(pid: int) -> bool:
 def _owner_alive(owner: object, owner_ticks: object) -> bool:
     """Return whether ``owner`` is still the exact live reservation owner.
 
-    A PID alone is not trusted: the process must be live (not a zombie), its
-    start time (ticks) must be readable, and it must match the recorded owner
-    identity.  Unavailable ticks or a zombie owner fail closed, so a reused PID
-    or a defunct owner can never justify the reservation.
+    The recorded PID is pinned before its start-time proof and final liveness
+    acceptance. This prevents an owner that exits during validation, or a later
+    process that reuses its numeric PID, from justifying the reservation.
+    Unavailable pidfd/procfs evidence and zombie owners fail closed.
 
     Args:
         owner: Recorded owner process ID, or ``None``.
         owner_ticks: Recorded owner start time in clock ticks, or ``None``.
 
     Returns:
-        ``True`` only when the live process is the exact recorded owner.
+        ``True`` only when the same pinned live process is the exact recorded
+        reservation owner.
     """
-    if not isinstance(owner, int) or not pid_alive(owner):
+    if not isinstance(owner, int) or isinstance(owner, bool):
         return False
-    if _is_zombie(owner):
+    owner_pid = int(owner)
+    fd = open_pidfd(owner_pid)
+    if fd is None:
         return False
-    current = proc_start_ticks(owner)
-    if current is None:
-        return False
-    return current == owner_ticks
+    try:
+        if proc_start_ticks(owner_pid) != owner_ticks:
+            return False
+        if _is_zombie(owner_pid):
+            return False
+        try:
+            pidfd_send_signal(fd, 0)
+        except (OSError, AttributeError):
+            return False
+        return True
+    finally:
+        os.close(fd)
 
 
 def reservation_in_flight(meta: Meta) -> bool:
