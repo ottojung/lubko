@@ -319,7 +319,7 @@ class WorkerHealth:
             ValueError: If the mapping is schema-incompatible or holds a
                 non-finite timestamp.
         """
-        version = int(data.get("schema_version") or 0)
+        version = _required_json_int(data.get("schema_version"), "schema_version", minimum=0)
         if version != WORKER_HEALTH_SCHEMA_VERSION:
             msg = f"unsupported worker health schema version: {version}"
             raise ValueError(msg)
@@ -327,8 +327,10 @@ class WorkerHealth:
             schema_version=version,
             worker_id=str(data.get("worker_id") or ""),
             worker_incarnation=str(data.get("worker_incarnation") or ""),
-            pid=int(data.get("pid") or 0),
-            start_time_ticks=int(data.get("start_time_ticks") or 0),
+            pid=_required_json_int(data.get("pid"), "pid", minimum=1),
+            start_time_ticks=_required_json_int(
+                data.get("start_time_ticks"), "start_time_ticks", minimum=1
+            ),
             started_at=_required_finite_float(data.get("started_at"), "started_at"),
             published_at=_required_finite_float(data.get("published_at"), "published_at"),
             alive=bool(data.get("alive")),
@@ -381,6 +383,22 @@ class WorkerHealth:
             recovery_batch_bound_hit=_coerce_bool(data.get("recovery_batch_bound_hit")),
             shutting_down=bool(data.get("shutting_down")),
         )
+
+
+def _required_json_int(value: object, field: str, *, minimum: int) -> int:
+    """Return a required JSON integer without coercing malformed authority.
+
+    Raises:
+        TypeError: If the persisted value is not an actual JSON integer.
+        ValueError: If the integer is below the allowed minimum.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"{field} must be a JSON integer, got {value!r}"
+        raise TypeError(msg)
+    if value < minimum:
+        msg = f"{field} must be >= {minimum}, got {value!r}"
+        raise ValueError(msg)
+    return value
 
 
 def _coerce_float(value: object) -> float | None:
@@ -709,9 +727,6 @@ def _read_health_file(path: Path) -> WorkerHealth | None:
     except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(data, dict):
-        return None
-    schema_version = int(data.get("schema_version") or 0)
-    if schema_version != WORKER_HEALTH_SCHEMA_VERSION:
         return None
     try:
         return WorkerHealth.from_dict(data)
