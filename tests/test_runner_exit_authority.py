@@ -269,6 +269,65 @@ def _dead_claimed_meta(aid: str, tmp_path: Path) -> agent.Meta:
     return meta
 
 
+def test_dead_pinned_reservation_owner_recovers_accepted_steer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished reservation owner cannot authorize queued work reuse."""
+    m = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    m.update({
+        "state": "running",
+        "active_runner": True,
+        "runner_gen": 1,
+        "runner_reservation": {
+            "gen": 1,
+            "owner_pid": 4242,
+            "owner_start_ticks": 111,
+            "state": "reserved",
+            "mode": "new",
+        },
+        "pending_prompt": "original",
+    })
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "_is_zombie", lambda _pid: False)
+    monkeypatch.setattr(agent, "_runner_marker_alive", lambda _aid, _gen: False)
+
+    def dead_owner(fd: int, sig: int) -> None:
+        probes.append((fd, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(agent, "pidfd_send_signal", dead_owner)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    decision: dict[str, object] = {}
+    agent._apply_locked_transition(m, decision, prompt="steer", steer=True, mode="new")
+
+    assert probes == [(77, 0), (77, 0)]
+    assert closed == [77, 77]
+    assert decision["action"] == "spawn"
+    assert decision.get("steer_accepted") is True
+    assert m["pending_prompt"] == "original"
+    assert int(m["runner_gen"]) == 2
+    reservation = m["runner_reservation"]
+    assert isinstance(reservation, dict)
+    assert reservation["state"] == "reserved"
+    assert reservation["gen"] == 2
+    assert m["steer_queue"][0]["prompt"] == "steer"
+
+    # The same helper accepts a genuinely live pinned owner and rejects a
+    # start-time-mismatched (reused) numeric PID without probing it as live.
+    monkeypatch.setattr(agent, "pidfd_send_signal", lambda fd, sig: probes.append((fd, sig)))
+    assert agent._owner_alive(4242, 111)
+    assert not agent._owner_alive(4242, 999)
+    assert probes == [(77, 0), (77, 0), (77, 0)]
+    assert closed == [77, 77, 77, 77]
+
+
 def test_dead_claimed_runner_preserves_accepted_prompt_exactly_once(
     tmp_path: Path,
 ) -> None:
