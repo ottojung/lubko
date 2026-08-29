@@ -2327,23 +2327,57 @@ def drain_sentinel_matches(incarnation: str) -> bool:
         return False
 
 
+def _parse_owned_running_group_row(
+    row_id: object,
+    pgid: object,
+    start_ticks: object | None,
+) -> tuple[int | None, int | None, str]:
+    """Parse one selected owned-command identity without dropping corruption.
+
+    A malformed or non-positive *present* PGID becomes ``None`` so the caller
+    can retain the job as an explicit blocking obligation instead of silently
+    treating it as absent. Start ticks preserve the existing fail-closed rule:
+    malformed values become ``None`` and therefore can never authorize a signal.
+
+    Returns:
+        Parsed PGID (or ``None`` for malformed/non-positive authority), parsed
+        start ticks (or ``None`` when unprovable), and the job id as text.
+    """
+    try:
+        parsed_pgid = int(str(pgid))
+    except ValueError:
+        pgid_i: int | None = None
+    else:
+        pgid_i = parsed_pgid if parsed_pgid > 0 else None
+
+    start_i: int | None = None
+    if start_ticks is not None:
+        try:
+            start_i = int(str(start_ticks))
+        except ValueError:
+            start_i = None
+    return pgid_i, start_i, str(row_id)
+
+
 def _owned_running_groups(
     conn: JobsConnection,
     incarnation: str,
-) -> list[tuple[int, int | None, str]]:
-    """Return the exact identity of owned commands for one incarnation.
+) -> list[tuple[int | None, int | None, str]]:
+    """Return persisted owned-command identities for one incarnation.
 
     Args:
         conn: Open PostgreSQL connection.
         incarnation: The worker incarnation (lifecycle token) to match.
 
     Returns:
-        Triples of the exact process group id, the persisted command start-time
-        ticks (``None`` when the legacy row never recorded ticks), and the job
-        row id (as text, usable as the ``LUBKO_JOB_ID`` marker) for every
-        running command owned by the incarnation.
+        Triples of the process group id, persisted command start-time ticks,
+        and job row id for every selected owned running command. A ``None``
+        group id means the durable ``process_pgid`` was present (the query
+        excludes genuine absence) but malformed or non-positive, and therefore
+        remains an explicit blocking recovery obligation. ``None`` start ticks
+        likewise mean missing or malformed exact-start identity.
     """
-    groups: list[tuple[int, int | None, str]] = []
+    groups: list[tuple[int | None, int | None, str]] = []
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT id, (payload::jsonb)->'state'->>'process_pgid',\n"
@@ -2361,17 +2395,7 @@ def _owned_running_groups(
             start_ticks = row[2]
             if pgid is None:
                 continue
-            try:
-                pgid_i = int(str(pgid))
-            except ValueError:
-                continue
-            start_i: int | None = None
-            if start_ticks is not None:
-                try:
-                    start_i = int(str(start_ticks))
-                except ValueError:
-                    start_i = None
-            groups.append((pgid_i, start_i, str(row_id)))
+            groups.append(_parse_owned_running_group_row(row_id, pgid, start_ticks))
     return groups
 
 
@@ -2774,14 +2798,17 @@ class ReclaimedGroups:
         unresolved: Exact process-group ids that have live members but whose
             exact identity could not be proven (missing/malformed/unreadable/
             mismatched persisted start-time ticks). They are never signalled,
-            but remain a durable blocking obligation exactly like ``surviving``:
-            the orchestrator must hold and retry rather than clear authority or
-            start a replacement.
+            but remain a durable blocking obligation exactly like ``surviving``.
+        malformed: Job ids whose durable ``process_pgid`` was present but could
+            not be parsed as a positive process-group id. They cannot be safely
+            inspected or signalled and therefore remain explicit blocking
+            recovery obligations until durable authority is repaired.
     """
 
     reaped: list[int]
     surviving: list[int]
     unresolved: list[int]
+    malformed: list[str]
 
 
 def _terminate_one_group(
@@ -2884,11 +2911,15 @@ def recover_owned_job_groups(
     """
     groups = _owned_running_groups(conn, incarnation)
     if not groups:
-        return ReclaimedGroups(reaped=[], surviving=[], unresolved=[])
+        return ReclaimedGroups(reaped=[], surviving=[], unresolved=[], malformed=[])
     reaped: list[int] = []
     surviving: list[int] = []
     unresolved: list[int] = []
+    malformed: list[str] = []
     for pgid, start_ticks, marker in groups:
+        if pgid is None:
+            malformed.append(marker)
+            continue
         decision = _group_reclaim_decision(pgid, start_ticks)
         if decision is GroupReclaimDecision.GONE:
             continue
@@ -2899,7 +2930,12 @@ def recover_owned_job_groups(
                 surviving.append(pgid)
         else:
             unresolved.append(pgid)
-    return ReclaimedGroups(reaped=reaped, surviving=surviving, unresolved=unresolved)
+    return ReclaimedGroups(
+        reaped=reaped,
+        surviving=surviving,
+        unresolved=unresolved,
+        malformed=malformed,
+    )
 
 
 def _wait_for_session(pid: int) -> int:

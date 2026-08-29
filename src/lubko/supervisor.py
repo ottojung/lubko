@@ -463,6 +463,31 @@ def recover_owned_groups(incarnation: str) -> None:
     finally:
         with suppress(Exception):
             conn.close()
+    _require_owned_group_recovery_converged(result, incarnation)
+    if result.reaped:
+        LOGGER.info(
+            "recovered %d owned command group(s) for incarnation %s",
+            len(result.reaped),
+            incarnation,
+        )
+
+
+def _require_owned_group_recovery_converged(
+    result: worker_mod.ReclaimedGroups, incarnation: str
+) -> None:
+    """Raise while any durable owned-group recovery obligation remains.
+
+    Raises:
+        OwnedGroupRecoveryError: If malformed, surviving, or unresolved owned
+            command-group authority still blocks safe lifecycle handoff.
+    """
+    if result.malformed:
+        msg = (
+            f"owned command job(s) {result.malformed} have malformed persisted "
+            f"process-group authority during recovery for incarnation {incarnation}; "
+            "holding without clearing authority or spawning a replacement"
+        )
+        raise OwnedGroupRecoveryError(msg)
     if result.surviving:
         msg = (
             f"owned command group(s) {result.surviving} still alive after "
@@ -477,12 +502,6 @@ def recover_owned_groups(incarnation: str) -> None:
             "holding without clearing authority or spawning a replacement"
         )
         raise OwnedGroupRecoveryError(msg)
-    if result.reaped:
-        LOGGER.info(
-            "recovered %d owned command group(s) for incarnation %s",
-            len(result.reaped),
-            incarnation,
-        )
 
 
 def normalize_cross_boot_state() -> None:
