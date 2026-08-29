@@ -6,7 +6,6 @@ import pytest
 
 from lubko.health import WORKER_HEALTH_SCHEMA_VERSION, WorkerHealth
 
-
 BOOLEAN_FIELDS = (
     "alive",
     "db_connected",
