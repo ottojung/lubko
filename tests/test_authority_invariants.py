@@ -205,6 +205,18 @@ def test_invariant_generation_monotonic_pending_mission_authority() -> None:
             desired_generation=0,
         )
     )
+    # Terminal mission history no longer acts as current generation authority.
+    # Settlement intentionally advances desired/applied beyond the mission.
+    for terminal_status in ("confirmed", "rolled_back"):
+        assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(
+            _facts(
+                mission_status=terminal_status,
+                mission_generation=4,
+                applied_generation=5,
+                desired_generation=5,
+            )
+        )
+
     # Applied below a pending mission (progress not yet recorded) is fine.
     assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(
         _facts(
