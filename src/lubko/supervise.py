@@ -1453,7 +1453,9 @@ def _mission_generation() -> int:
         mission = deployctl.read_rollback_state()
     except deployctl.DeployCtlError as exc:
         raise MissionAuthorityError(str(exc)) from exc
-    return mission.generation if mission is not None else 0
+    if mission is None:
+        return 0
+    return max(mission.generation, mission.settlement_generation or 0)
 
 
 def next_generation() -> int:

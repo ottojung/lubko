@@ -15,8 +15,15 @@ from pathlib import Path
 
 import pytest
 
-from lubko import cli, lifecycle, supervise
-from lubko import deployctl as dc
+import lubko.cli
+import lubko.deployctl
+import lubko.lifecycle
+import lubko.supervise
+
+cli = lubko.cli
+dc = lubko.deployctl
+lifecycle = lubko.lifecycle
+supervise = lubko.supervise
 
 OLD_COMMIT = "1" * 40
 NEW_COMMIT = "2" * 40
@@ -378,3 +385,171 @@ def test_wait_until_ready_times_out_without_readiness(
     )
 
     assert supervise.wait_until_ready(GENERATION, timeout_seconds=2.0) is False
+
+
+def _desired(generation: int, commit: str) -> supervise.SupervisorDesired:
+    """Return one exact desired supervisor intent."""
+    return supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=generation,
+        commit=commit,
+        repo="/workspace/Lubko",
+        uv_path="uv",
+        worker_id="test-worker",
+        requested_at=1.0,
+    )
+
+
+def test_applied_confirmation_handoff_recovers_idempotently(
+    mission: dc.RollbackState,
+    live_supervisor: list[supervise.SupervisorState],
+    cli_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exactly applied confirmation handoff becomes terminal after restart."""
+    del cli_stubs
+    generation = GENERATION + 1
+    pending = replace(
+        mission,
+        settlement_transition=dc.SETTLEMENT_CONFIRM,
+        settlement_generation=generation,
+        settlement_commit=NEW_COMMIT,
+    )
+    dc._write_state(pending)
+    live_supervisor[0] = replace(
+        live_supervisor[0],
+        applied_generation=generation,
+        commit=NEW_COMMIT,
+        ready=True,
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: _desired(generation, NEW_COMMIT),
+    )
+
+    recovered = dc._recover_applied_settlement(pending)
+    repeated = dc._recover_applied_settlement(recovered)
+
+    assert recovered.status == dc.STATUS_CONFIRMED
+    assert recovered.settlement_transition is None
+    assert recovered.settlement_generation is None
+    assert recovered.settlement_commit is None
+    assert repeated == recovered
+    assert dc._read_state() == recovered
+
+
+def test_applied_rollback_handoff_recovers_idempotently(
+    mission: dc.RollbackState,
+    live_supervisor: list[supervise.SupervisorState],
+    cli_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exactly applied rollback handoff becomes terminal after restart."""
+    del cli_stubs
+    generation = GENERATION + 1
+    pending = replace(
+        mission,
+        settlement_transition=dc.SETTLEMENT_ROLLBACK,
+        settlement_generation=generation,
+        settlement_commit=OLD_COMMIT,
+    )
+    dc._write_state(pending)
+    live_supervisor[0] = replace(
+        live_supervisor[0],
+        applied_generation=generation,
+        commit=OLD_COMMIT,
+        ready=True,
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: _desired(generation, OLD_COMMIT),
+    )
+
+    recovered = dc._recover_applied_settlement(pending)
+    repeated = dc._recover_applied_settlement(recovered)
+
+    assert recovered.status == dc.STATUS_ROLLED_BACK
+    assert recovered.settlement_transition is None
+    assert recovered.settlement_generation is None
+    assert recovered.settlement_commit is None
+    assert repeated == recovered
+    assert dc._read_state() == recovered
+
+
+def test_newer_same_commit_authority_supersedes_reserved_handoff(
+    mission: dc.RollbackState,
+    live_supervisor: list[supervise.SupervisorState],
+    cli_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A higher unrelated generation never masquerades as a reserved handoff."""
+    del cli_stubs
+    settlement_generation = GENERATION + 1
+    newer_generation = GENERATION + 2
+    pending = replace(
+        mission,
+        settlement_transition=dc.SETTLEMENT_CONFIRM,
+        settlement_generation=settlement_generation,
+        settlement_commit=NEW_COMMIT,
+    )
+    dc._write_state(pending)
+    live_supervisor[0] = replace(
+        live_supervisor[0],
+        applied_generation=newer_generation,
+        commit=NEW_COMMIT,
+        ready=True,
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: _desired(newer_generation, NEW_COMMIT),
+    )
+
+    assert dc._recover_applied_settlement(pending) == pending
+    assert dc._supervised_mission_authoritative(pending) is False
+    assert dc._pending_mission_rollback_due(pending) is True
+
+
+def test_confirmation_handoff_survives_readiness_failure_and_retries(
+    mission: dc.RollbackState,
+    live_supervisor: list[supervise.SupervisorState],
+    cli_stubs: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reserved confirmation remains recoverable when readiness initially fails."""
+    del cli_stubs
+    generation = GENERATION + 1
+    desired: list[supervise.SupervisorDesired | None] = [None]
+    monkeypatch.setattr(supervise, "next_generation", lambda: generation)
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: desired[0])
+    monkeypatch.setattr(supervise, "write_desired", lambda value: desired.__setitem__(0, value))
+    monkeypatch.setattr(supervise, "wait_for_generation", lambda *_args: True)
+    monkeypatch.setattr(supervise, "wait_until_ready", lambda *_args: False)
+
+    with pytest.raises(dc.DeployCtlError, match="did not prove"):
+        dc.settle_desired(NEW_COMMIT, mission.repo, mission.uv_path)
+
+    pending = dc._read_state()
+    assert pending is not None
+    assert pending.status == dc.STATUS_PENDING
+    assert pending.settlement_transition == dc.SETTLEMENT_CONFIRM
+    assert pending.settlement_generation == generation
+    assert pending.settlement_commit == NEW_COMMIT
+    published = desired[0]
+    assert published is not None
+    assert published.generation == generation
+    assert published.commit == NEW_COMMIT
+    assert published.repo == mission.repo
+    assert published.uv_path == mission.uv_path
+    assert published.restart is False
+
+    live_supervisor[0] = replace(
+        live_supervisor[0],
+        applied_generation=generation,
+        commit=NEW_COMMIT,
+        ready=True,
+    )
+    recovered = dc._recover_applied_settlement(pending)
+    assert recovered.status == dc.STATUS_CONFIRMED
