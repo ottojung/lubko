@@ -333,8 +333,8 @@ class WorkerHealth:
             ),
             started_at=_required_finite_float(data.get("started_at"), "started_at"),
             published_at=_required_finite_float(data.get("published_at"), "published_at"),
-            alive=bool(data.get("alive")),
-            db_connected=bool(data.get("db_connected")),
+            alive=_strict_bool(data, "alive"),
+            db_connected=_strict_bool(data, "db_connected"),
             db_connected_at=_optional_finite_float(data.get("db_connected_at")),
             db_error_at=_optional_finite_float(data.get("db_error_at")),
             active_jobs=_coerce_int(data.get("active_jobs"), "active_jobs"),
@@ -368,20 +368,20 @@ class WorkerHealth:
             last_cancellation_scan_at=_optional_finite_float(data.get("last_cancellation_scan_at")),
             last_recovery_at=_optional_finite_float(data.get("last_recovery_at")),
             last_gc_at=_optional_finite_float(data.get("last_gc_at")),
-            cancellation_scan_overdue=_coerce_bool(data.get("cancellation_scan_overdue")),
-            recovery_overdue=_coerce_bool(data.get("recovery_overdue")),
-            gc_overdue=_coerce_bool(data.get("gc_overdue")),
+            cancellation_scan_overdue=_strict_bool(data, "cancellation_scan_overdue"),
+            recovery_overdue=_strict_bool(data, "recovery_overdue"),
+            gc_overdue=_strict_bool(data, "gc_overdue"),
             gc_batch_limit=_coerce_int(data.get("gc_batch_limit"), "gc_batch_limit"),
-            gc_batch_bound_hit=_coerce_bool(data.get("gc_batch_bound_hit")),
+            gc_batch_bound_hit=_strict_bool(data, "gc_batch_bound_hit"),
             cancellation_batch_limit=_coerce_int(
                 data.get("cancellation_batch_limit"), "cancellation_batch_limit"
             ),
-            cancellation_batch_bound_hit=_coerce_bool(data.get("cancellation_batch_bound_hit")),
+            cancellation_batch_bound_hit=_strict_bool(data, "cancellation_batch_bound_hit"),
             recovery_batch_limit=_coerce_int(
                 data.get("recovery_batch_limit"), "recovery_batch_limit"
             ),
-            recovery_batch_bound_hit=_coerce_bool(data.get("recovery_batch_bound_hit")),
-            shutting_down=bool(data.get("shutting_down")),
+            recovery_batch_bound_hit=_strict_bool(data, "recovery_batch_bound_hit"),
+            shutting_down=_strict_bool(data, "shutting_down"),
         )
 
 
@@ -458,16 +458,26 @@ def _coerce_int(value: object, field: str) -> int:
     raise TypeError(msg)
 
 
-def _coerce_bool(value: object) -> bool:
-    """Coerce a JSON value to a bool, treating absence as ``False``.
+def _strict_bool(data: dict[str, Any], field: str) -> bool:
+    """Parse an optional persisted JSON boolean without truthiness coercion.
 
     Args:
-        value: Raw JSON value.
+        data: Persisted worker-health mapping.
+        field: Boolean field to parse.
 
     Returns:
-        The boolean (``False`` when absent or not a JSON boolean).
+        The stored boolean, or ``False`` when the field is genuinely absent.
+
+    Raises:
+        TypeError: If the field is present but is not a JSON boolean.
     """
-    return value is True
+    if field not in data:
+        return False
+    value = data[field]
+    if not isinstance(value, bool):
+        msg = f"{field} must be a boolean, got {value!r}"
+        raise TypeError(msg)
+    return value
 
 
 def _required_finite_float(value: object, field: str) -> float:
