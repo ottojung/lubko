@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -223,22 +224,28 @@ class RollbackState:
             settlement_transition, settlement_generation, settlement_commit = _settlement_fields(
                 data
             )
+            schema_version = _required_json_int(data["schema_version"])
+            status = _required_json_string(data["status"])
+            if status not in {STATUS_PENDING, STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
+                raise ValueError
+            commit = _required_commit(data["commit"])
+            previous_commit = _required_commit(data["previous_commit"])
             return cls(
-                schema_version=int(data["schema_version"]),
+                schema_version=schema_version,
                 generation=generation,
-                status=str(data["status"]),
-                commit=str(data["commit"]),
-                previous_commit=str(data["previous_commit"]),
-                challenge_hash=_optional_string(data.get("challenge_hash")),
-                deadline=float(data["deadline"]),
-                repo=str(data["repo"]),
-                uv_path=str(data["uv_path"]),
-                stop_grace_seconds=float(data["stop_grace_seconds"]),
-                git_timeout_seconds=float(data["git_timeout_seconds"]),
+                status=status,
+                commit=commit,
+                previous_commit=previous_commit,
+                challenge_hash=_optional_json_string(data.get("challenge_hash")),
+                deadline=_required_finite_json_number(data["deadline"]),
+                repo=_required_json_string(data["repo"]),
+                uv_path=_required_json_string(data["uv_path"]),
+                stop_grace_seconds=_required_finite_json_number(data["stop_grace_seconds"]),
+                git_timeout_seconds=_required_finite_json_number(data["git_timeout_seconds"]),
                 previous_retiring=_retiring_flag(data.get("previous_retiring", _ABSENT)),
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
-                supervisor_owned=_optional_bool(data.get("supervisor_owned")),
+                supervisor_owned=_optional_json_bool(data.get("supervisor_owned")),
                 settlement_transition=settlement_transition,
                 settlement_generation=settlement_generation,
                 settlement_commit=settlement_commit,
@@ -311,33 +318,52 @@ def _retiring_flag(value: object) -> bool:
     return value
 
 
-def _optional_string(value: object | None) -> str | None:
-    """Return a string value or ``None``.
-
-    Args:
-        value: JSON value to inspect.
-
-    Returns:
-        The string, or ``None``.
-    """
-    return value if isinstance(value, str) else None
+def _required_json_int(value: object) -> int:
+    """Return an exact JSON integer, rejecting booleans and coercion."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError
+    return value
 
 
-def _optional_bool(value: object | None) -> bool | None:
-    """Return a boolean value or ``None`` when absent.
+def _required_json_string(value: object) -> str:
+    """Return an exact JSON string without normalizing other values."""
+    if not isinstance(value, str):
+        raise TypeError
+    return value
 
-    ``None`` signals unknown lifecycle authority: the caller must fail closed
-    rather than granting legacy rollback permission.
 
-    Args:
-        value: JSON value to inspect.
+def _required_commit(value: object) -> str:
+    """Return an exact full commit id."""
+    commit = _required_json_string(value)
+    if COMMIT_RE.fullmatch(commit) is None:
+        raise ValueError
+    return commit
 
-    Returns:
-        ``True``, ``False``, or ``None`` when the key is absent.
-    """
-    if isinstance(value, bool):
-        return value
-    return None
+
+def _required_finite_json_number(value: object) -> float:
+    """Return a finite JSON number, rejecting booleans and numeric strings."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError
+    return result
+
+
+def _optional_json_string(value: object | None) -> str | None:
+    """Return a nullable exact JSON string."""
+    if value is None:
+        return None
+    return _required_json_string(value)
+
+
+def _optional_json_bool(value: object | None) -> bool | None:
+    """Return a nullable exact JSON boolean."""
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise TypeError
+    return value
 
 
 def _write_state(state: RollbackState) -> None:
