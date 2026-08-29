@@ -1886,7 +1886,13 @@ def _plan_streams(
                 stream.path, OUTPUT_TAIL_MAX_BYTES, base=stream.spool_start
             )
             chunks, archived_upto, last_chunk, sequence = _plan_chunks(
-                job.id, name, stream, tail_end, server, version=job.version
+                job.id,
+                name,
+                stream,
+                tail_end,
+                server,
+                version=job.version,
+                tail_start=tail_start,
             )
         except OSError as exc:
             # Never silently omit a stream: a stat/read/disappearance failure on
@@ -1923,6 +1929,7 @@ def _plan_chunks(  # ruff: ignore[too-many-arguments] -- the chunk identity/offs
     server: str,
     *,
     version: int,
+    tail_start: int = 0,
 ) -> tuple[tuple[tuple[UUID, str], ...], int, UUID | None, int]:
     """Compute the immutable chunks to archive for one stream.
 
@@ -1935,7 +1942,16 @@ def _plan_chunks(  # ruff: ignore[too-many-arguments] -- the chunk identity/offs
         version: Protocol version of the owning root job; every emitted chunk is
             stamped with this same version so chunk history cannot drift to a
             different protocol generation.
-        server: The daemon's configured server identity stamped onto chunks.
+        tail_start: Logical offset where the live tail begins. Archiving must
+            reach at least this offset so the immutable chunks and the live tail
+            cover every raw byte of the stream with no gap: byte offsets strictly
+            before ``tail_start`` are historical and belong in chunks, while the
+            tail owns ``[tail_start, tail_end)``. ``archive_target`` overlaps the
+            tail by ``ARCHIVE_MARGIN_CHARS`` (intentional, offset-disambiguated),
+            but invalid UTF-8 expands to U+FFFD on decode and can push the tail
+            head forward past that margin; when it does, archiving must extend to
+            ``tail_start`` itself rather than stopping short and leaving an
+            uncovered, and ultimately trimmed-away, gap.
 
     Returns:
         The planned ``(chunks, archived_upto, last_chunk, sequence)`` tuple.
@@ -1945,6 +1961,11 @@ def _plan_chunks(  # ruff: ignore[too-many-arguments] -- the chunk identity/offs
     last_chunk = stream.last_chunk
     sequence = stream.sequence
     target = archive_target(tail_end)
+    # Emit full-size chunks toward the margin target. Each aligned end moves
+    # backward by at most three bytes, so every full chunk makes guaranteed
+    # forward progress and the loop terminates; the leftover partial window is
+    # intentionally left in the live-tail overlap (it is archived by a later
+    # publication once it forms a full chunk).
     while target - archived_upto >= OUTPUT_CHUNK_MAX_BYTES:
         chunk_start = archived_upto
         candidate = chunk_start + OUTPUT_CHUNK_MAX_BYTES - stream.spool_start
@@ -1991,6 +2012,49 @@ def _plan_chunks(  # ruff: ignore[too-many-arguments] -- the chunk identity/offs
         last_chunk = chunk_id
         sequence += 1
         archived_upto = chunk_end
+    # Invalid UTF-8 expands to U+FFFD on decode and can push the live-tail head
+    # (``tail_start``) forward past the margin ``target``. ``tail_start`` is
+    # recomputed as a code-point boundary by ``output_window_text``, so when it
+    # exceeds ``target`` the historical prefix up to ``tail_start`` must still be
+    # archived; otherwise those raw bytes are never covered and a later trim
+    # drops them as an uncovered gap between the chunks and the live tail.
+    if tail_start > target:
+        while archived_upto < tail_start:
+            chunk_start = archived_upto
+            candidate = tail_start - stream.spool_start
+            # ``tail_start`` is itself a code-point boundary, so the aligned end
+            # never snaps backward past the chunk start; this loop therefore
+            # always makes forward progress and terminates.
+            n_from = max(0, candidate - 3)
+            neighborhood = read_range(stream.path, n_from, candidate + 4)
+            chunk_end = (
+                n_from + align_code_point_end(neighborhood, candidate - n_from) + stream.spool_start
+            )
+            chunk_bytes = read_range(
+                stream.path, chunk_start - stream.spool_start, chunk_end - stream.spool_start
+            )
+            value = pg_safe_decode(chunk_bytes)
+            if _utf8_byte_length(value) > OUTPUT_CHUNK_MAX_BYTES:
+                end, value = _bounded_prefix(chunk_bytes, OUTPUT_CHUNK_MAX_BYTES)
+                chunk_end = chunk_start + end
+            chunk_id = uuid4()
+            chunk_payload = json.dumps(
+                build_output_chunk_payload(
+                    server=server,
+                    thread=job_id,
+                    stream=name,
+                    sequence=sequence,
+                    start=chunk_start,
+                    end=chunk_end,
+                    value=value,
+                    previous=last_chunk,
+                    version=version,
+                )
+            )
+            chunks.append((chunk_id, chunk_payload))
+            last_chunk = chunk_id
+            sequence += 1
+            archived_upto = chunk_end
     return tuple(chunks), archived_upto, last_chunk, sequence
 
 
