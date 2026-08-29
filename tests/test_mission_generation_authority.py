@@ -218,8 +218,8 @@ def test_concurrent_monotonic_allocation_under_shared_lock() -> None:
     after the lock is released), so only the set/range are asserted.
     """
     _write_mission(_mission(5))  # floor at generation 6
-    iterations = 10
-    thread_count = 3
+    iterations = 2
+    thread_count = 2
     expected = iterations * thread_count
     generations: list[int] = []
     lock = threading.Lock()

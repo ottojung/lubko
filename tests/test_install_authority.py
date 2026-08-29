@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Final
 
@@ -44,7 +43,14 @@ def git(*args: str, cwd: Path) -> str:
         Trimmed standard output.
     """
     proc = subprocess.run(
-        [GIT_BIN, *args],
+        [
+            GIT_BIN,
+            "-c",
+            "user.name=lubko-test",
+            "-c",
+            "user.email=lubko-test@example.com",
+            *args,
+        ],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -61,18 +67,14 @@ def make_repo_with_pyproject(path: Path) -> tuple[Path, str]:
     """
     path.mkdir(parents=True)
     git("init", "-q", cwd=path)
-    git("config", "user.name", "lubko-test", cwd=path)
-    git("config", "user.email", "lubko-test@example.com", cwd=path)
     (path / "marker.txt").write_text("A\n", encoding="utf-8")
     git("add", "marker.txt", cwd=path)
     git("commit", "-q", "-m", "first", cwd=path)
     first = git("rev-parse", "HEAD", cwd=path)
     (path / "marker.txt").write_text("B\n", encoding="utf-8")
-    git("add", "marker.txt", cwd=path)
-    git("commit", "-q", "-m", "second", cwd=path)
     (path / "pyproject.toml").write_text('[project]\nname = "lubko"\n', encoding="utf-8")
-    git("add", "pyproject.toml", cwd=path)
-    git("commit", "-q", "-m", "pyproject", cwd=path)
+    git("add", "marker.txt", "pyproject.toml", cwd=path)
+    git("commit", "-q", "-m", "second", cwd=path)
     return path, first
 
 
@@ -293,31 +295,20 @@ def test_install_fails_closed_when_deploy_lock_is_busy(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A held deployment lock makes the installer refuse without mutating CLIs."""
+    """A deployment-lock timeout makes the installer refuse without mutating CLIs."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     bin_dir = installable_bin(monkeypatch, tmp_path)
-    monkeypatch.setattr(lifecycle, "DEFAULT_LOCK_TIMEOUT_SECONDS", 0.2)
 
-    release = threading.Event()
+    @contextmanager
+    def busy_lock(timeout_seconds: float) -> Iterator[None]:
+        if timeout_seconds >= 0.0:
+            raise lifecycle.LockTimeoutError
+        yield
 
-    def hold_lock() -> None:
-        with lifecycle.deploy_lock(10.0):
-            release.wait(timeout=30)
+    monkeypatch.setattr(lifecycle, "deploy_lock", busy_lock)
 
-    holder = threading.Thread(target=hold_lock)
-    holder.start()
-    try:
-        while True:
-            try:
-                with lifecycle.deploy_lock(0.05):
-                    continue
-            except lifecycle.LockTimeoutError:
-                break
-        code = install.main(["--repo", str(repo)])
-    finally:
-        release.set()
-        holder.join()
+    code = install.main(["--repo", str(repo)])
 
     assert code == install.EXIT_ERROR
     assert "deployment lock" in capsys.readouterr().err

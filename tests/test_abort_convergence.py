@@ -600,7 +600,7 @@ def test_spawn_and_run_unprovable_live_child_records_hold_without_wedging(
 
     # Exact signalling fails closed: no signal reaches the child.
     monkeypatch.setattr(agent, "_kill_spawned_invocation", lambda *_a: None)
-    monkeypatch.setattr(agent, "ABORT_REAP_SECONDS", 0.05)
+    monkeypatch.setattr(agent, "ABORT_REAP_SECONDS", 0.0)
     monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
 
     def boom(_proc: subprocess.Popen[bytes], _aid: str, *, is_continue: bool) -> int:
@@ -654,7 +654,7 @@ def test_unrecorded_invocation_live_child_keeps_blocking_hold(
     agent.write_meta(aid, seed)
 
     monkeypatch.setattr(agent, "_kill_spawned_invocation", lambda *_a: None)
-    monkeypatch.setattr(agent, "ABORT_REAP_SECONDS", 0.05)
+    monkeypatch.setattr(agent, "ABORT_REAP_SECONDS", 0.0)
     monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
 
     proc = subprocess.Popen(
@@ -1210,7 +1210,7 @@ def test_group_alive_and_wait_group_dead_fail_closed_on_enumeration_failure(
     cur = agent.read_meta(aid)
     assert cur is not None
     assert agent.group_alive(cur) is True, "incomplete scan must count as alive"
-    assert agent.wait_group_dead(cur, 0.05) is False
+    assert agent.wait_group_dead(cur, 0.0) is False
 
 
 def test_proven_scan_incomplete_after_member_keeps_and_closes_fds(
@@ -1290,7 +1290,7 @@ def test_group_alive_stays_true_when_live_leader_environ_unreadable(
         assert agent.group_alive(cur) is True
         with monkeypatch.context() as guard:
             guard.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
-            assert agent.wait_group_dead(cur, 0.05) is False
+            assert agent.wait_group_dead(cur, 0.0) is False
 
         # A positively recycled leader slot (different ticks) still falls
         # through to the exact member scan, which proves the group empty.
