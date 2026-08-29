@@ -25,6 +25,7 @@ import argparse
 import fcntl
 import json
 import logging
+import math
 import os
 import secrets
 import signal
@@ -188,21 +189,28 @@ class WorkerMeta:
 
         Returns:
             The reconstructed metadata.
+
+        Raises:
+            ValueError: If required metadata is missing or outside its valid domain.
         """
+        schema_version = _required_meta_int(data, "schema_version", minimum=1)
+        if schema_version != SCHEMA_VERSION:
+            msg = f"unsupported worker metadata schema version {schema_version}"
+            raise ValueError(msg)
         return cls(
-            schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
-            state=_optional_str(data.get("state")) or STATE_STOPPED,
-            pid=_optional_int(data.get("pid")),
-            pgid=_optional_int(data.get("pgid")),
-            sid=_optional_int(data.get("sid")),
-            start_time_ticks=_optional_int(data.get("start_time_ticks")),
-            token=_optional_str(data.get("token")),
-            repo=_optional_str(data.get("repo")) or "",
-            git_commit=_optional_str(data.get("git_commit")),
-            worker_id=_optional_str(data.get("worker_id")),
-            log_path=_optional_str(data.get("log_path")) or "",
-            started_at=_optional_float(data.get("started_at")),
-            stopped_at=_optional_float(data.get("stopped_at")),
+            schema_version=schema_version,
+            state=_meta_string(data, "state", default=STATE_STOPPED),
+            pid=_meta_optional_int(data, "pid", minimum=1),
+            pgid=_meta_optional_int(data, "pgid", minimum=1),
+            sid=_meta_optional_int(data, "sid", minimum=0),
+            start_time_ticks=_meta_optional_int(data, "start_time_ticks", minimum=1),
+            token=_meta_optional_string(data, "token"),
+            repo=_meta_string(data, "repo", default=""),
+            git_commit=_meta_optional_string(data, "git_commit"),
+            worker_id=_meta_optional_string(data, "worker_id"),
+            log_path=_meta_string(data, "log_path", default=""),
+            started_at=_meta_optional_finite_float(data, "started_at"),
+            stopped_at=_meta_optional_finite_float(data, "stopped_at"),
         )
 
 
@@ -439,6 +447,89 @@ def worker_alive(meta: WorkerMeta) -> bool:
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
+
+
+def _required_meta_int(
+    data: dict[str, object],
+    field: str,
+    *,
+    minimum: int,
+) -> int:
+    """Return one required exact JSON integer from maintained metadata.
+
+    Raises:
+        TypeError: If the field has the wrong JSON type.
+        ValueError: If the field is missing or below its valid minimum.
+    """
+    if field not in data:
+        msg = f"worker metadata field {field!r} is missing"
+        raise ValueError(msg)
+    value = data[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"worker metadata field {field!r} must be an integer"
+        raise TypeError(msg)
+    if value < minimum:
+        msg = f"worker metadata field {field!r} must be >= {minimum}"
+        raise ValueError(msg)
+    return value
+
+
+def _meta_optional_int(
+    data: dict[str, object],
+    field: str,
+    *,
+    minimum: int,
+) -> int | None:
+    """Return an optional exact JSON integer from maintained metadata."""
+    if field not in data or data[field] is None:
+        return None
+    return _required_meta_int(data, field, minimum=minimum)
+
+
+def _meta_string(data: dict[str, object], field: str, *, default: str) -> str:
+    """Return a string field, preserving only genuine-absence compatibility.
+
+    Raises:
+        TypeError: If a present field is not a JSON string.
+    """
+    if field not in data:
+        return default
+    value = data[field]
+    if not isinstance(value, str):
+        msg = f"worker metadata field {field!r} must be a string"
+        raise TypeError(msg)
+    return value
+
+
+def _meta_optional_string(data: dict[str, object], field: str) -> str | None:
+    """Return an optional string, rejecting malformed present values."""
+    if field not in data or data[field] is None:
+        return None
+    return _meta_string(data, field, default="")
+
+
+def _meta_optional_finite_float(data: dict[str, object], field: str) -> float | None:
+    """Return an optional finite JSON number from maintained metadata.
+
+    Raises:
+        TypeError: If a present field is not a JSON number.
+        ValueError: If a present number is not finite.
+    """
+    if field not in data or data[field] is None:
+        return None
+    value = data[field]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"worker metadata field {field!r} must be a finite number"
+        raise TypeError(msg)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        msg = f"worker metadata field {field!r} must be a finite number"
+        raise ValueError(msg) from exc
+    if not math.isfinite(result):
+        msg = f"worker metadata field {field!r} must be a finite number"
+        raise ValueError(msg)
+    return result
 
 
 def _optional_int(value: object | None) -> int | None:
