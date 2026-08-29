@@ -55,7 +55,8 @@ def test_persisted_boolean_fields_require_json_booleans() -> None:
 
 def test_persisted_boolean_truthiness_is_rejected() -> None:
     """Representative non-booleans cannot become positive health authority."""
-    for bad in ("true", 0, 1, None, {}, []):
+    bad_values: tuple[object, ...] = ("true", 0, 1, None, {}, [])
+    for bad in bad_values:
         data = _data()
         data["alive"] = bad
         with pytest.raises(TypeError, match="alive"):
