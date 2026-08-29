@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Any, Final
 if TYPE_CHECKING:
     from types import TracebackType
 
+from lubko._exact_signal import open_pidfd as _open_pidfd
+from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko.state import worker_state_dir
 
 LOGGER: Final = logging.getLogger(__name__)
@@ -779,6 +781,36 @@ class EffectiveHealth:
     reason: str
 
 
+def _pinned_snapshot_process_live(snapshot: WorkerHealth) -> tuple[bool, str]:
+    """Validate one worker snapshot against one pinned kernel process.
+
+    Returns:
+        ``(live, reason)`` for the exact pinned process identity.
+    """
+    pid = snapshot.pid
+    try:
+        pidfd = _open_pidfd(pid)
+    except OSError:
+        return False, f"PID {pid} could not be pinned"
+    try:
+        current_ticks = proc_start_ticks(pid)
+        if current_ticks is None:
+            return False, f"PID {pid} is not alive"
+        if current_ticks != snapshot.start_time_ticks:
+            return False, (
+                f"PID {pid} start time {current_ticks} != expected {snapshot.start_time_ticks}"
+            )
+        if not _process_is_live(pid):
+            return False, f"PID {pid} is a zombie or dead"
+        try:
+            _pidfd_send_signal(pidfd, 0)
+        except OSError:
+            return False, f"PID {pid} disappeared during liveness validation"
+        return snapshot.alive, "ok"
+    finally:
+        os.close(pidfd)
+
+
 def interpret_worker_health(
     snapshot: WorkerHealth | None,
     *,
@@ -822,16 +854,7 @@ def interpret_worker_health(
         reason = "invalid PID in snapshot"
         live = False
     else:
-        current_ticks = proc_start_ticks(pid)
-        if current_ticks is None:
-            reason = f"PID {pid} is not alive"
-            live = False
-        elif current_ticks != snapshot.start_time_ticks:
-            reason = f"PID {pid} start time {current_ticks} != expected {snapshot.start_time_ticks}"
-            live = False
-        elif not _process_is_live(pid):
-            reason = f"PID {pid} is a zombie or dead"
-            live = False
+        live, reason = _pinned_snapshot_process_live(snapshot)
     return EffectiveHealth(snapshot=snapshot, live=live, stale=stale, reason=reason)
 
 

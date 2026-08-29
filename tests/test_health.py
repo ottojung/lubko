@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+import lubko.health as health_module
 from lubko.health import (
     WORKER_HEALTH_SCHEMA_VERSION,
     WorkerHealth,
@@ -135,6 +136,58 @@ def test_health_serialization_never_emits_non_finite_values(bad: float) -> None:
     dumped = json.dumps(_snapshot(published_at=bad).to_dict(), allow_nan=False)
     assert "NaN" not in dumped
     assert "Infinity" not in dumped
+
+
+def test_pidfd_pinned_health_rejects_disappearance_after_identity_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished pinned worker cannot borrow a reused numeric PID's liveness."""
+    pid = os.getpid()
+    ticks = proc_start_ticks(pid)
+    assert ticks is not None
+    snapshot = _snapshot(pid=pid, start_time_ticks=ticks, published_at=time.time())
+    monkeypatch.setattr(
+        health_module, "_open_pidfd", lambda _pid: os.open("/dev/null", os.O_RDONLY)
+    )
+    monkeypatch.setattr(health_module, "_process_is_live", lambda _pid: True)
+
+    def vanished(_pidfd: int, _sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(health_module, "_pidfd_send_signal", vanished)
+    effective = interpret_worker_health(snapshot)
+    assert effective.live is False
+    assert "disappeared" in effective.reason
+
+
+def test_pidfd_pinned_health_accepts_same_live_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same pinned process remains valid through final liveness acceptance."""
+    pid = os.getpid()
+    ticks = proc_start_ticks(pid)
+    assert ticks is not None
+    snapshot = _snapshot(pid=pid, start_time_ticks=ticks, published_at=time.time())
+    monkeypatch.setattr(
+        health_module, "_open_pidfd", lambda _pid: os.open("/dev/null", os.O_RDONLY)
+    )
+    monkeypatch.setattr(health_module, "_process_is_live", lambda _pid: True)
+    monkeypatch.setattr(health_module, "_pidfd_send_signal", lambda _fd, _sig: None)
+    assert interpret_worker_health(snapshot).live is True
+
+
+def test_pidfd_capability_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unavailable process pinning is ambiguous authority and therefore not live."""
+    pid = os.getpid()
+    ticks = proc_start_ticks(pid)
+    assert ticks is not None
+    snapshot = _snapshot(pid=pid, start_time_ticks=ticks, published_at=time.time())
+
+    def unavailable(_pid: int) -> int:
+        raise OSError
+
+    monkeypatch.setattr(health_module, "_open_pidfd", unavailable)
+    effective = interpret_worker_health(snapshot)
+    assert effective.live is False
+    assert "could not be pinned" in effective.reason
 
 
 def test_ordinary_finite_snapshot_keeps_current_behavior() -> None:
