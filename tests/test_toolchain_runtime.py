@@ -11,6 +11,7 @@ the pin.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -129,8 +130,14 @@ def test_nonexecutable_path_fails_closed(tmp_path: Path) -> None:
 
 
 def test_timeout_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """A uv that hangs past the bounded check is rejected, not hung."""
-    uv = _fake_uv(tmp_path, "exec sleep 10")
-    monkeypatch.setattr(toolchain, "UV_VERSION_CHECK_TIMEOUT_SECONDS", 0.3)
+    """A timed-out uv version probe is rejected without a real wall-clock wait."""
+    uv = _fake_uv(tmp_path, f'echo "uv {SUPPORTED} (fake)"')
+
+    def timeout(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command == [uv, "--version"]
+        assert kwargs["timeout"] == toolchain.UV_VERSION_CHECK_TIMEOUT_SECONDS
+        raise subprocess.TimeoutExpired(command, toolchain.UV_VERSION_CHECK_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
     with pytest.raises(UvResolutionError, match="timed out"):
         resolve_uv(uv)
