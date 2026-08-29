@@ -162,12 +162,32 @@ class SupervisorDesired:
             TypeError: If a present ``restart`` or ``migration`` value is not
                 a JSON boolean.
         """
-        schema_version = _optional_int(data.get("schema_version"))
-        generation = _optional_int(data.get("generation"))
+        schema_version = _strict_int(data.get("schema_version"))
+        generation = _strict_non_negative_int(data.get("generation"))
         commit = _optional_string(data.get("commit"))
-        if schema_version is None or generation is None or commit is None:
+        repo = "" if "repo" not in data else _optional_string(data["repo"])
+        uv_path = "" if "uv_path" not in data else _optional_string(data["uv_path"])
+        if (
+            schema_version != SCHEMA_VERSION
+            or generation is None
+            or commit is None
+            or repo is None
+            or uv_path is None
+        ):
             msg = "supervisor desired state is malformed"
             raise ValueError(msg)
+        worker_id_raw = data.get("worker_id")
+        worker_id = _optional_string(worker_id_raw)
+        if worker_id_raw is not None and worker_id is None:
+            msg = "supervisor desired state is malformed"
+            raise ValueError(msg)
+        if "requested_at" in data:
+            requested_at = _strict_finite_float(data["requested_at"])
+            if requested_at is None:
+                msg = "supervisor desired state is malformed"
+                raise ValueError(msg)
+        else:
+            requested_at = 0.0
         migration = data.get("migration", False)
         # Absence is backward-compatible false, but a present value must be a
         # real JSON boolean: anything else means the authoritative intent file
@@ -187,11 +207,11 @@ class SupervisorDesired:
                 schema_version=schema_version,
                 generation=generation,
                 commit=commit,
-                repo=str(data.get("repo") or ""),
-                uv_path=str(data.get("uv_path") or ""),
-                worker_id=_optional_string(data.get("worker_id")),
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id,
                 restart=restart,
-                requested_at=_optional_float(data.get("requested_at")) or 0.0,
+                requested_at=requested_at,
                 migration=migration,
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -243,16 +263,25 @@ class UnresolvedChild:
         Raises:
             ValueError: If a required field is missing or malformed.
         """
-        pid = _optional_int(data.get("pid"))
+        pid = _strict_non_negative_int(data.get("pid"))
         token = _optional_string(data.get("token"))
-        if pid is None or token is None:
+        ticks_raw = data.get("start_time_ticks")
+        ticks = None if ticks_raw is None else _strict_non_negative_int(ticks_raw)
+        if pid is None or token is None or (ticks_raw is not None and ticks is None):
             msg = "unresolved child hold is malformed"
             raise ValueError(msg)
+        if "spawned_at" in data:
+            spawned_at = _strict_finite_float(data["spawned_at"])
+            if spawned_at is None:
+                msg = "unresolved child hold is malformed"
+                raise ValueError(msg)
+        else:
+            spawned_at = 0.0
         return cls(
             pid=pid,
-            start_time_ticks=_optional_int(data.get("start_time_ticks")),
+            start_time_ticks=ticks,
             token=token,
-            spawned_at=_optional_float(data.get("spawned_at")) or 0.0,
+            spawned_at=spawned_at,
         )
 
 
@@ -333,9 +362,35 @@ class SpawningObligation:
             ValueError: If a required field is missing or malformed.
         """
         token = _optional_string(data.get("token"))
-        creator_pid = _optional_int(data.get("creator_pid"))
-        creator_ticks = _optional_int(data.get("creator_start_time_ticks"))
+        creator_pid = _strict_non_negative_int(data.get("creator_pid"))
+        creator_ticks = _strict_non_negative_int(data.get("creator_start_time_ticks"))
         if token is None or creator_pid is None or creator_ticks is None:
+            msg = "spawning obligation is malformed"
+            raise ValueError(msg)
+        if "commit" in data:
+            commit = _optional_string(data["commit"])
+            if commit is None:
+                msg = "spawning obligation is malformed"
+                raise ValueError(msg)
+        else:
+            commit = ""
+        pid_raw = data.get("pid")
+        pid = None if pid_raw is None else _strict_non_negative_int(pid_raw)
+        ticks_raw = data.get("start_time_ticks")
+        ticks = None if ticks_raw is None else _strict_non_negative_int(ticks_raw)
+        if (pid_raw is not None and pid is None) or (ticks_raw is not None and ticks is None):
+            msg = "spawning obligation is malformed"
+            raise ValueError(msg)
+        if "created_at" in data:
+            created_at = _strict_finite_float(data["created_at"])
+            if created_at is None:
+                msg = "spawning obligation is malformed"
+                raise ValueError(msg)
+        else:
+            created_at = 0.0
+        boot_raw = data.get("boot_id")
+        boot_id = None if boot_raw is None else _optional_string(boot_raw)
+        if boot_raw is not None and boot_id is None:
             msg = "spawning obligation is malformed"
             raise ValueError(msg)
         # Legacy obligations predate the field and were all written by the
@@ -353,13 +408,13 @@ class SpawningObligation:
             raise ValueError(msg)
         return cls(
             token=token,
-            commit=_optional_string(data.get("commit")) or "",
+            commit=commit,
             creator_pid=creator_pid,
             creator_start_time_ticks=creator_ticks,
-            pid=_optional_int(data.get("pid")),
-            start_time_ticks=_optional_int(data.get("start_time_ticks")),
-            created_at=_optional_float(data.get("created_at")) or 0.0,
-            boot_id=_optional_string(data.get("boot_id")),
+            pid=pid,
+            start_time_ticks=ticks,
+            created_at=created_at,
+            boot_id=boot_id,
             parent_death_signal=parent_death_signal,
         )
 
@@ -1776,6 +1831,20 @@ def _optional_int(value: object | None) -> int | None:
     return None
 
 
+def _strict_int(value: object | None) -> int | None:
+    """Return an exact JSON integer, or ``None`` when malformed.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        The integer, or ``None`` for booleans and non-integer values.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _strict_non_negative_int(value: object) -> int | None:
     """Return a non-negative integer generation, or ``None`` when malformed.
 
@@ -1786,9 +1855,10 @@ def _strict_non_negative_int(value: object) -> int | None:
         The non-negative integer, or ``None`` for booleans, non-integers,
         strings, and negative values.
     """
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    result = _strict_int(value)
+    if result is None or result < 0:
         return None
-    return value
+    return result
 
 
 def _strict_finite_float(value: object) -> float | None:
@@ -2068,10 +2138,10 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
     Raises:
         ValueError: If a required field is missing or malformed.
     """
-    pid = _optional_int(data.get("pid"))
-    pgid = _optional_int(data.get("pgid"))
-    sid = _optional_int(data.get("sid"))
-    ticks = _optional_int(data.get("start_time_ticks"))
+    pid = _strict_non_negative_int(data.get("pid"))
+    pgid = _strict_non_negative_int(data.get("pgid"))
+    sid = _strict_non_negative_int(data.get("sid"))
+    ticks = _strict_non_negative_int(data.get("start_time_ticks"))
     token = _optional_string(data.get("token"))
     worker_id = _optional_string(data.get("worker_id"))
     if pid is None or pgid is None or sid is None or ticks is None:
@@ -2080,6 +2150,13 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
     if token is None or worker_id is None:
         msg = "supervisor worker child identity is malformed"
         raise ValueError(msg)
+    if "spawned_at" in data:
+        spawned_at = _strict_finite_float(data["spawned_at"])
+        if spawned_at is None:
+            msg = "supervisor worker child identity is malformed"
+            raise ValueError(msg)
+    else:
+        spawned_at = 0.0
     return WorkerChild(
         pid=pid,
         pgid=pgid,
@@ -2087,7 +2164,7 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
         start_time_ticks=ticks,
         token=token,
         worker_id=worker_id,
-        spawned_at=_optional_float(data.get("spawned_at")) or 0.0,
+        spawned_at=spawned_at,
     )
 
 
