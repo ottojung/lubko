@@ -432,7 +432,11 @@ def _generation_monotonic_violations(facts: AuthorityFacts) -> list[str]:
         trusted_generation = max(trusted_generation, facts.mission_generation)
     if facts.applied_generation > trusted_generation:
         violations.append(INVARIANT_GENERATION_MONOTONIC)
-    if facts.mission_generation is not None and facts.mission_generation < facts.applied_generation:
+    if (
+        facts.mission_status == "pending"
+        and facts.mission_generation is not None
+        and facts.mission_generation < facts.applied_generation
+    ):
         violations.append(INVARIANT_GENERATION_MONOTONIC)
     return violations
 
