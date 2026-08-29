@@ -151,6 +151,71 @@ def test_invariant_generation_monotonic() -> None:
     )
 
 
+def test_invariant_generation_monotonic_pending_mission_authority() -> None:
+    """A pending supervised mission is itself a trusted generation authority.
+
+    applied_generation equal to the pending mission generation is accepted even
+    when desired is absent or older, but applied above every trusted source and
+    a stale mission below applied stay violations. Only a pending mission grants
+    this authority; a terminal mission does not.
+    """
+    # Pending mission == applied, absent/older desired (no desired.json -> 0).
+    assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(
+        _facts(
+            mission_status="pending",
+            mission_generation=5,
+            applied_generation=5,
+            desired_generation=0,
+        )
+    )
+    # Pending mission == applied, desired strictly older.
+    assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(
+        _facts(
+            mission_status="pending",
+            mission_generation=5,
+            applied_generation=5,
+            desired_generation=3,
+        )
+    )
+    # Applied above every trusted source (above desired AND above pending mission).
+    assert INVARIANT_GENERATION_MONOTONIC in check_authority_invariants(
+        _facts(
+            mission_status="pending",
+            mission_generation=5,
+            applied_generation=7,
+            desired_generation=4,
+        )
+    )
+    # Stale mission below applied remains a violation even with a higher desired.
+    assert INVARIANT_GENERATION_MONOTONIC in check_authority_invariants(
+        _facts(
+            mission_status="pending",
+            mission_generation=3,
+            applied_generation=5,
+            desired_generation=8,
+        )
+    )
+    # A non-pending (terminal) mission does NOT grant authority: applied above
+    # desired (absent) is still a violation.
+    assert INVARIANT_GENERATION_MONOTONIC in check_authority_invariants(
+        _facts(
+            mission_status="confirmed",
+            mission_generation=5,
+            applied_generation=5,
+            desired_generation=0,
+        )
+    )
+    # Applied below a pending mission (progress not yet recorded) is fine.
+    assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(
+        _facts(
+            mission_status="pending",
+            mission_generation=9,
+            applied_generation=2,
+            desired_generation=0,
+        )
+    )
+
+
 def test_invariant_malformed_never_erased() -> None:
     """Corruption without a blocking hold is flagged; with one it is not."""
     assert INVARIANT_MALFORMED_NEVER_ERASED in check_authority_invariants(
@@ -879,6 +944,55 @@ def test_publish_gate_refuses_conflicting_mission(
     monkeypatch.setattr(deployctl, "_restore_previous_prep", lambda *_, **__: None)
     with pytest.raises(deployctl.DeployCtlError, match="authority refuses a new pending mission"):
         deployctl._prepare_locked(_options(), COMMIT, supervised=True)
+
+
+def test_respawn_gate_accepts_pending_mission_after_progress_no_desired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After real mission progress with no desired.json, the respawn gate passes.
+
+    The supervisor advances ``applied_generation`` to the pending mission
+    generation once its candidate is the live worker (``_record_mission_progress``),
+    and the respawn publication path gates on ``check_authority_invariants`` over
+    the reconciled facts. That gate must not flag GENERATION_MONOTONIC for the
+    resulting durable state, so a legitimate respawn is published rather than
+    converged and reaped.
+    """
+    mission = _make_mission(deployctl.STATUS_PENDING)  # generation 5, commit COMMIT
+    deployctl._write_state(mission)
+    # No desired.json is written: desired_generation reconciles to 0.
+    state = supervise.read_state()
+    supervise.write_state(
+        replace(
+            state,
+            child=supervise.WorkerChild(
+                pid=1,
+                pgid=1,
+                sid=1,
+                start_time_ticks=1,
+                token="tok" + "a" * 20,
+                worker_id="w",
+                spawned_at=0.0,
+            ),
+            commit=COMMIT,
+            ready=True,
+            applied_generation=0,
+        )
+    )
+    monkeypatch.setattr(supervisor.SupervisorDaemon, "_child_alive", staticmethod(lambda _s: True))
+    monkeypatch.setattr(supervisor, "read_desired", lambda: None)
+    monkeypatch.setattr(supervise, "read_desired", lambda: None)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    # Drive the real supervisor mutation that records mission progress.
+    daemon._record_mission_progress(COMMIT)
+    assert supervise.read_state().applied_generation == mission.generation
+    facts = reconcile_authority_facts()
+    assert facts.mission_status == "pending"
+    assert facts.applied_generation == facts.mission_generation
+    assert facts.desired_generation == 0
+    # The exact predicate the respawn publication gate consults: it must accept
+    # applied_generation == mission_generation as valid active authority.
+    assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(facts)
 
 
 def test_publish_gate_allows_when_no_pending_mission(

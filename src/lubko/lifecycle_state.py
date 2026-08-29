@@ -406,6 +406,37 @@ class AuthorityInvariantError(RuntimeError):
         self.facts = facts
 
 
+def _generation_monotonic_violations(facts: AuthorityFacts) -> list[str]:
+    """Return generation-monotonicity violations for the reconciled ``facts``.
+
+    Generations never move backward or silently reuse authority. A pending
+    supervised mission is a valid active generation authority: its generation is
+    a trusted source alongside ``desired_generation``, so an applied generation
+    equal to the pending mission generation (even with an absent or older
+    ``desired``) is accepted rather than flagged. Applied must never exceed
+    *every* trusted generation source, and a stale mission below the applied
+    generation remains a violation.
+
+    Args:
+        facts: The reconciled authority snapshot to check.
+
+    Returns:
+        A list containing :data:`INVARIANT_GENERATION_MONOTONIC` when violated.
+    """
+    violations: list[str] = []
+    if facts.applied_generation < 0:
+        violations.append(INVARIANT_GENERATION_MONOTONIC)
+        return violations
+    trusted_generation = facts.desired_generation
+    if facts.mission_status == "pending" and facts.mission_generation is not None:
+        trusted_generation = max(trusted_generation, facts.mission_generation)
+    if facts.applied_generation > trusted_generation:
+        violations.append(INVARIANT_GENERATION_MONOTONIC)
+    if facts.mission_generation is not None and facts.mission_generation < facts.applied_generation:
+        violations.append(INVARIANT_GENERATION_MONOTONIC)
+    return violations
+
+
 def _authority_violations(facts: AuthorityFacts) -> list[str]:
     """Return the codes of every invariant violated by ``facts``.
 
@@ -423,10 +454,7 @@ def _authority_violations(facts: AuthorityFacts) -> list[str]:
         violations.extend((INVARIANT_SINGLE_CONSUMER, INVARIANT_CRASH_CONVERGES_TO_ONE_OR_ZERO))
 
     # 2: generations never move backward or silently reuse authority.
-    if facts.applied_generation < 0 or facts.applied_generation > facts.desired_generation:
-        violations.append(INVARIANT_GENERATION_MONOTONIC)
-    if facts.mission_generation is not None and facts.mission_generation < facts.applied_generation:
-        violations.append(INVARIANT_GENERATION_MONOTONIC)
+    violations.extend(_generation_monotonic_violations(facts))
 
     # 3: malformed durable authority is never implicitly erased or trusted.
     if facts.durable_malformed:
