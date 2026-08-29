@@ -1,7 +1,5 @@
 """Strict persisted boolean validation for worker health."""
 
-import json
-
 import pytest
 
 from lubko.health import WORKER_HEALTH_SCHEMA_VERSION, WorkerHealth
@@ -40,33 +38,33 @@ def _data() -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("field", BOOLEAN_FIELDS)
-def test_persisted_boolean_fields_require_json_booleans(field: str) -> None:
+def test_persisted_boolean_fields_require_json_booleans() -> None:
     """Present boolean fields accept only literal JSON booleans."""
     original = _data()
-    for value in (True, False):
-        data = dict(original)
-        data[field] = value
-        assert getattr(WorkerHealth.from_dict(data), field) is value
+    for field in BOOLEAN_FIELDS:
+        for value in (True, False):
+            data = dict(original)
+            data[field] = value
+            assert getattr(WorkerHealth.from_dict(data), field) is value
 
-    malformed = dict(original)
-    malformed[field] = "false"
-    with pytest.raises(TypeError, match=field):
-        WorkerHealth.from_dict(malformed)
+        malformed = dict(original)
+        malformed[field] = "false"
+        with pytest.raises(TypeError, match=field):
+            WorkerHealth.from_dict(malformed)
 
 
-@pytest.mark.parametrize("bad", ["true", 0, 1, None, {}, []])
-def test_persisted_boolean_truthiness_is_rejected(bad: object) -> None:
+def test_persisted_boolean_truthiness_is_rejected() -> None:
     """Representative non-booleans cannot become positive health authority."""
-    data = _data()
-    data["alive"] = bad
-    with pytest.raises(TypeError, match="alive"):
-        WorkerHealth.from_dict(data)
+    for bad in ("true", 0, 1, None, {}, []):
+        data = _data()
+        data["alive"] = bad
+        with pytest.raises(TypeError, match="alive"):
+            WorkerHealth.from_dict(data)
 
 
 def test_absent_persisted_boolean_fields_default_false() -> None:
     """Genuine absence retains the backwards-compatible false default."""
-    data = json.loads(json.dumps(_data()))
+    data = _data()
     for field in BOOLEAN_FIELDS:
         data.pop(field)
     snapshot = WorkerHealth.from_dict(data)
