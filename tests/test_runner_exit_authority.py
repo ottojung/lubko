@@ -285,3 +285,88 @@ def test_dead_claimed_runner_that_consumed_prompts_starts_fresh(tmp_path: Path) 
     res = final["runner_reservation"]
     assert isinstance(res, dict)
     assert res["state"] == "reserved"
+
+
+def test_runner_alive_uses_pinned_identity_for_final_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PID reuse after runner proof cannot make a dead runner appear live."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "runner_pid": 4242,
+        "runner_start_time": 111,
+    }
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+
+    def dead_pinned_runner(fd: int, sig: int) -> None:
+        probes.append((fd, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(agent, "pidfd_send_signal", dead_pinned_runner)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    assert not agent.runner_alive(meta)
+    assert probes == [(77, 0)]
+    assert closed == [77]
+
+
+def test_runner_alive_accepts_same_pinned_live_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner proven live through the same pidfd remains accepted."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "runner_pid": 4242,
+        "runner_start_time": 111,
+    }
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+    monkeypatch.setattr(agent, "pidfd_send_signal", lambda fd, sig: probes.append((fd, sig)))
+    monkeypatch.setattr(os, "close", closed.append)
+
+    assert agent.runner_alive(meta)
+    assert probes == [(77, 0)]
+    assert closed == [77]
+
+
+def test_prompt_does_not_reuse_runner_that_dies_during_liveness_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted work gets fresh authority when the pinned runner is gone."""
+    m = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    m.update({
+        "state": "running",
+        "active_runner": True,
+        "runner_gen": 1,
+        "runner_pid": 4242,
+        "runner_start_time": 111,
+        "runner_reservation": _claimed_reservation(),
+    })
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+    monkeypatch.setattr(
+        agent,
+        "pidfd_send_signal",
+        lambda _fd, _sig: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+    monkeypatch.setattr(os, "close", lambda _fd: None)
+
+    decision = _decide(m, prompt="work", steer=False)
+
+    assert decision["action"] == "spawn"
+    assert m["pending_prompt"] == "work"
+    assert int(m["runner_gen"]) == 2
+    reservation = m["runner_reservation"]
+    assert isinstance(reservation, dict)
+    assert reservation["state"] == "reserved"

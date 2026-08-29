@@ -869,29 +869,38 @@ def wait_group_dead(meta: Meta, timeout: float) -> bool:
 def runner_alive(meta: Meta) -> bool:
     """Return whether the recorded background runner is really our runner.
 
-    The runner PID is anchored by its start time and the per-agent
-    environment marker, exactly like the agent process itself, so a recycled
-    PID can never be mistaken for a live runner.
+    The numeric runner PID is pinned before its start-time and per-agent
+    environment marker are checked. Final liveness is then proven through the
+    same pidfd, so an exit and PID reuse after the identity checks can never
+    make an unrelated process justify the recorded runner. Platforms that
+    cannot provide the stable pin or pidfd liveness probe fail closed.
 
     Args:
         meta: Agent metadata.
 
     Returns:
-        ``True`` only when a live process matches every recorded runner
-        identity field.
+        ``True`` only when the same pinned live process matches every recorded
+        runner identity field.
     """
     pid = meta.get("runner_pid")
     if not pid:
         return False
-    if proc_start_ticks(int(pid)) != meta.get("runner_start_time"):
-        return False
-    if not env_has_marker(int(pid), meta.get("id", "")):
+    runner_pid = int(pid)
+    fd = open_pidfd(runner_pid)
+    if fd is None:
         return False
     try:
-        os.kill(int(pid), 0)
-    except OSError:
-        return False
-    return True
+        if proc_start_ticks(runner_pid) != meta.get("runner_start_time"):
+            return False
+        if not env_has_marker(runner_pid, meta.get("id", "")):
+            return False
+        try:
+            pidfd_send_signal(fd, 0)
+        except (OSError, AttributeError):
+            return False
+        return True
+    finally:
+        os.close(fd)
 
 
 def pid_alive(pid: int | None) -> bool:
