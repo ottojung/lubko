@@ -2353,26 +2353,26 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
         recovery_worker_pid: Exact PID of the recovery worker being adopted.
 
     Raises:
-        _AdoptionError: If a live mission or a different live identity is
-            recorded.
+        _AdoptionError: If rollback authority is malformed, a live mission is
+            active, or a different live identity is recorded.
     """
     path = rollback_state_path()
     if not path.is_file():
         return
     try:
         data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        remove_durable(path)
-        return
+    except (OSError, ValueError) as exc:
+        msg = "rollback state is present but malformed; repair refuses to erase authority"
+        raise _AdoptionError(msg) from exc
     if not isinstance(data, dict):
-        remove_durable(path)
-        return
+        msg = "rollback state is present but malformed; repair refuses to erase authority"
+        raise _AdoptionError(msg)
     try:
         new_meta = WorkerMeta.from_dict(data.get("new_meta") or {})
         previous_meta = WorkerMeta.from_dict(data.get("previous_meta") or {})
-    except (KeyError, TypeError, ValueError):
-        remove_durable(path)
-        return
+    except (KeyError, TypeError, ValueError) as exc:
+        msg = "rollback state is present but malformed; repair refuses to erase authority"
+        raise _AdoptionError(msg) from exc
     if (
         data.get("status") == STATE_PENDING
         and worker_alive(new_meta)
