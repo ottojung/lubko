@@ -959,13 +959,24 @@ def _runner_marker_alive(aid: str, expected_gen: int) -> bool:
         name = entry.name
         if not name.isdigit():
             continue
-        try:
-            environ = (entry / "environ").read_bytes()
-        except OSError:
+        fd = open_pidfd(int(name))
+        if fd is None:
             continue
-        fields = environ.split(b"\0")
-        if agent_marker in fields and gen_marker in fields:
+        try:
+            try:
+                environ = (entry / "environ").read_bytes()
+            except OSError:
+                continue
+            fields = environ.split(b"\0")
+            if agent_marker not in fields or gen_marker not in fields:
+                continue
+            try:
+                pidfd_send_signal(fd, 0)
+            except (OSError, AttributeError):
+                continue
             return True
+        finally:
+            os.close(fd)
     return False
 
 
