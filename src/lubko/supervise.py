@@ -263,10 +263,10 @@ class UnresolvedChild:
         Raises:
             ValueError: If a required field is missing or malformed.
         """
-        pid = _strict_int(data.get("pid"))
+        pid = _strict_non_negative_int(data.get("pid"))
         token = _optional_string(data.get("token"))
         ticks_raw = data.get("start_time_ticks")
-        ticks = None if ticks_raw is None else _strict_int(ticks_raw)
+        ticks = None if ticks_raw is None else _strict_non_negative_int(ticks_raw)
         if pid is None or token is None or (ticks_raw is not None and ticks is None):
             msg = "unresolved child hold is malformed"
             raise ValueError(msg)
@@ -362,8 +362,8 @@ class SpawningObligation:
             ValueError: If a required field is missing or malformed.
         """
         token = _optional_string(data.get("token"))
-        creator_pid = _strict_int(data.get("creator_pid"))
-        creator_ticks = _strict_int(data.get("creator_start_time_ticks"))
+        creator_pid = _strict_non_negative_int(data.get("creator_pid"))
+        creator_ticks = _strict_non_negative_int(data.get("creator_start_time_ticks"))
         if token is None or creator_pid is None or creator_ticks is None:
             msg = "spawning obligation is malformed"
             raise ValueError(msg)
@@ -375,9 +375,9 @@ class SpawningObligation:
         else:
             commit = ""
         pid_raw = data.get("pid")
-        pid = None if pid_raw is None else _strict_int(pid_raw)
+        pid = None if pid_raw is None else _strict_non_negative_int(pid_raw)
         ticks_raw = data.get("start_time_ticks")
-        ticks = None if ticks_raw is None else _strict_int(ticks_raw)
+        ticks = None if ticks_raw is None else _strict_non_negative_int(ticks_raw)
         if (pid_raw is not None and pid is None) or (ticks_raw is not None and ticks is None):
             msg = "spawning obligation is malformed"
             raise ValueError(msg)
@@ -2138,10 +2138,10 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
     Raises:
         ValueError: If a required field is missing or malformed.
     """
-    pid = _strict_int(data.get("pid"))
-    pgid = _strict_int(data.get("pgid"))
-    sid = _strict_int(data.get("sid"))
-    ticks = _strict_int(data.get("start_time_ticks"))
+    pid = _strict_non_negative_int(data.get("pid"))
+    pgid = _strict_non_negative_int(data.get("pgid"))
+    sid = _strict_non_negative_int(data.get("sid"))
+    ticks = _strict_non_negative_int(data.get("start_time_ticks"))
     token = _optional_string(data.get("token"))
     worker_id = _optional_string(data.get("worker_id"))
     if pid is None or pgid is None or sid is None or ticks is None:

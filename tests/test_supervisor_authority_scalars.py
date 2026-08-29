@@ -123,6 +123,7 @@ def test_malformed_child_scalars_preserve_ownership_hold() -> None:
     """Malformed maintained-child identity stays replacement-blocking."""
     for field, malformed in (
         ("pid", "4242"),
+        ("pid", -1),
         ("pgid", 4242.0),
         ("sid", True),
         ("start_time_ticks", "99"),
@@ -137,6 +138,7 @@ def test_malformed_unresolved_scalars_preserve_hold() -> None:
     """Malformed unresolved-child records stay durably replacement-blocking."""
     for field, malformed in (
         ("pid", "4242"),
+        ("pid", -1),
         ("start_time_ticks", 99.0),
         ("spawned_at", math.inf),
     ):
@@ -151,6 +153,7 @@ def test_malformed_spawning_scalars_preserve_hold() -> None:
     """Malformed pre-spawn records stay durably replacement-blocking."""
     for field, malformed in (
         ("creator_pid", "4000"),
+        ("creator_pid", -1),
         ("creator_start_time_ticks", 88.0),
         ("pid", True),
         ("start_time_ticks", "99"),
