@@ -1056,6 +1056,17 @@ def _owner_alive(owner: object, owner_ticks: object) -> bool:
         os.close(fd)
 
 
+def _runner_generation(value: object, *, minimum: int) -> int | None:
+    """Return a canonical persisted runner generation or ``None``.
+
+    Durable generation authority is JSON-integer only. Booleans, numeric
+    strings, floats, and values below the caller's domain minimum fail closed.
+    """
+    if type(value) is not int or value < minimum:
+        return None
+    return value
+
+
 def reservation_in_flight(meta: Meta) -> bool:
     """Return whether a reserved runner is still being brought up.
 
@@ -1077,9 +1088,12 @@ def reservation_in_flight(meta: Meta) -> bool:
     res = meta.get("runner_reservation")
     if not isinstance(res, dict) or res.get("state") != "reserved":
         return False
+    gen = _runner_generation(res.get("gen"), minimum=1)
+    if gen is None:
+        return False
     if _owner_alive(res.get("owner_pid"), res.get("owner_start_ticks")):
         return True
-    return _runner_marker_alive(meta.get("id", "") or "", int(res.get("gen") or 0))
+    return _runner_marker_alive(meta.get("id", "") or "", gen)
 
 
 def owned_by_me(meta: Meta, caller_pid: int) -> bool:
@@ -2779,6 +2793,10 @@ def _recover_stale_reservation(
         return False
     if reservation_in_flight(m):
         return False
+    current_gen = _runner_generation(m.get("runner_gen", 0), minimum=0)
+    if current_gen is None:
+        decision["action"] = "busy"
+        return True
     if res.get("state") == "claimed" and not m.get("pending_prompt"):
         # The exact runner consumed the accepted prompt before dying; there is
         # nothing to preserve and nothing to replay. Drop the dead claimed
@@ -2787,7 +2805,7 @@ def _recover_stale_reservation(
         return False
     now = time.time()
     caller_pid = os.getpid()
-    gen = int(m.get("runner_gen") or 0) + 1
+    gen = current_gen + 1
     take_mode = res.get("mode") or "new"
     accepted = bool(m.get("pending_prompt"))
     if accepted:
@@ -2903,6 +2921,37 @@ def _decide_invocation(
     _apply_locked_transition(m, decision, prompt=prompt, steer=steer, mode=mode)
 
 
+def _reserve_fresh_runner(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    mode: str,
+    now: float,
+) -> None:
+    """Reserve one fresh runner generation, failing closed on corrupt history."""
+    caller_pid = os.getpid()
+    current_gen = _runner_generation(m.get("runner_gen", 0), minimum=0)
+    if current_gen is None:
+        decision["action"] = "busy"
+        return
+    gen = current_gen + 1
+    _begin_invocation(m, prompt, now)
+    m["active_runner"] = True
+    m["runner_gen"] = gen
+    m["runner_reservation"] = {
+        "gen": gen,
+        "owner_pid": caller_pid,
+        "owner_start_ticks": proc_start_ticks(caller_pid),
+        "state": "reserved",
+        "reserved_at": now,
+        "mode": mode,
+    }
+    decision["action"] = "spawn"
+    decision["mode"] = mode
+    decision["gen"] = gen
+
+
 def _apply_locked_transition(
     m: Meta,
     decision: dict[str, object],
@@ -2982,25 +3031,14 @@ def _apply_locked_transition(
         return
 
     # Nothing is genuinely in flight and no stale reservation to recover: own
-    # this transition (fresh start) and reserve exactly one runner. A steer
-    # that reaches here (idle, finished, or a stale reservation) is exactly
-    # equivalent to an ordinary prompt, so it sets the pending prompt and
-    # becomes the single reserved invocation.
-    gen = int(m.get("runner_gen") or 0) + 1
-    _begin_invocation(m, prompt, now)
-    m["active_runner"] = True
-    m["runner_gen"] = gen
-    m["runner_reservation"] = {
-        "gen": gen,
-        "owner_pid": caller_pid,
-        "owner_start_ticks": proc_start_ticks(caller_pid),
-        "state": "reserved",
-        "reserved_at": now,
-        "mode": mode,
-    }
-    decision["action"] = "spawn"
-    decision["mode"] = mode
-    decision["gen"] = gen
+    # this transition (fresh start) and reserve exactly one runner.
+    _reserve_fresh_runner(
+        m,
+        decision,
+        prompt=prompt,
+        mode=mode,
+        now=now,
+    )
 
 
 def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
