@@ -312,6 +312,81 @@ def test_runner_convergence_signals_and_verifies_exact_identity(
     assert agent._converge_observed_runner(observed, mode) is False
 
 
+@pytest.mark.parametrize(
+    ("runner_pid", "runner_start_time"),
+    [
+        (4242.9, 42),
+        ("4242", 42),
+        (True, 42),
+        (0, 42),
+        (-1, 42),
+        (4242, "42"),
+        (4242, 42.0),
+        (4242, True),
+        (4242, -1),
+    ],
+)
+def test_runner_convergence_rejects_malformed_persisted_identity(
+    runner_pid: object,
+    runner_start_time: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed durable runner identity never becomes signalling authority."""
+    observed: agent.Meta = {
+        "id": "aaaaaaaa",
+        "runner_pid": runner_pid,
+        "runner_start_time": runner_start_time,
+    }
+
+    def reject_signal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("malformed runner identity reached signal_identity_checked")
+
+    def reject_state(*_args: object, **_kwargs: object) -> str:
+        pytest.fail("malformed runner identity reached positive-gone reasoning")
+
+    monkeypatch.setattr(agent, "signal_identity_checked", reject_signal)
+    monkeypatch.setattr(agent, "_runner_identity_state", reject_state)
+
+    assert agent._converge_observed_runner(observed, "kill") is False
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize(
+    ("runner_pid", "runner_start_time"),
+    [
+        (4242.9, 42),
+        ("4242", 42),
+        (True, 42),
+        (0, 42),
+        (4242, "42"),
+        (4242, 42.0),
+        (4242, True),
+    ],
+)
+def test_delete_convergence_rejects_malformed_persisted_runner_identity(
+    runner_pid: object,
+    runner_start_time: object,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    force: bool,
+) -> None:
+    """Delete keeps malformed present runner authority blocking."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "delete_pending": True,
+        "runner_pid": runner_pid,
+        "runner_start_time": runner_start_time,
+    }
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+
+    def reject_signal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("malformed runner identity reached signal_identity_checked")
+
+    monkeypatch.setattr(agent, "signal_identity_checked", reject_signal)
+
+    assert agent._converge_for_delete("aaaaaaaa", force=force, deadline=0.0) is False
+
+
 def test_runner_identity_state_distinguishes_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
