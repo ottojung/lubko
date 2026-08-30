@@ -4130,13 +4130,17 @@ def _converge_observed_runner(observed: Meta, mode: str) -> bool:
     Returns:
         ``True`` only when the observed runner identity is provably gone.
     """
-    pid = observed.get("runner_pid")
-    if not pid:
+    raw_pid = observed.get("runner_pid")
+    if raw_pid is None:
         # No runner was ever recorded (reserved pre-spawn window); nothing to
         # converge beyond dropping the reservation.
         return True
-    pid = int(pid)
-    ticks = observed.get("runner_start_time")
+    pid = _process_identity_int(raw_pid, minimum=1)
+    ticks = _process_identity_int(observed.get("runner_start_time"), minimum=0)
+    if pid is None or ticks is None:
+        # Present malformed durable identity is ambiguous authority, not
+        # absence and never signalling authority.
+        return False
     marker_aid = str(observed.get("id", ""))
     grace_signal = signal.SIGTERM if mode == "stop" else signal.SIGKILL
     signal_identity_checked(pid, ticks, grace_signal, marker_aid=marker_aid)
@@ -4405,6 +4409,15 @@ def _delete_converged(cur: Meta | None) -> bool:
     """
     if cur is None:
         return True
+    raw_runner_pid = cur.get("runner_pid")
+    if raw_runner_pid is not None and (
+        _process_identity_int(raw_runner_pid, minimum=1) is None
+        or _process_identity_int(cur.get("runner_start_time"), minimum=0) is None
+    ):
+        # Present malformed runner identity is unresolved durable authority.
+        # Liveness helpers intentionally return false for malformed identity,
+        # but deletion must not reinterpret that as positive convergence.
+        return False
     if _unresolved_child_state(cur) != "gone":
         # An exact unrecorded invocation was never positively proven gone
         # (still live, or evidence ambiguous): deletion must not remove
@@ -4479,10 +4492,15 @@ def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
                 # Converge the exact recorded runner identity first: pinned,
                 # start-time and marker verified at the signal point, so a
                 # recycled runner PID can never be signalled.
-                if cur.get("runner_pid"):
+                raw_runner_pid = cur.get("runner_pid")
+                if raw_runner_pid is not None:
+                    runner_pid = _process_identity_int(raw_runner_pid, minimum=1)
+                    runner_ticks = _process_identity_int(cur.get("runner_start_time"), minimum=0)
+                    if runner_pid is None or runner_ticks is None:
+                        return False
                     signal_identity_checked(
-                        int(cur["runner_pid"]),
-                        cur.get("runner_start_time"),
+                        runner_pid,
+                        runner_ticks,
                         signal.SIGKILL,
                         marker_aid=str(cur.get("id", "")),
                     )
