@@ -831,13 +831,18 @@ def derive_durable_diagnostic() -> SupervisorDiagnostic:
         The durable-state-derived diagnostic.
     """
     state = read_state()
-    recorded = read_supervisor_pid()
-    supervisor_present = recorded is not None
+    try:
+        recorded = read_supervisor_pid()
+        supervisor_present = recorded is not None
+        supervisor_alive = supervisor_running() if supervisor_present else None
+    except MalformedSupervisorIdentityError:
+        supervisor_present = True
+        supervisor_alive = False
     return SupervisorDiagnostic(
         live=False,
         source="durable-state",
         supervisor_present=supervisor_present,
-        supervisor_alive=supervisor_running() if supervisor_present else None,
+        supervisor_alive=supervisor_alive,
         mode=state.mode,
         intent=state.intent,
         commit=state.commit,
@@ -1401,7 +1406,9 @@ def _status_identity_matches(status: SupervisorStatus) -> bool:
     Returns:
         ``True`` when the identity is the current live supervisor incarnation.
     """
-    recorded = read_supervisor_pid()
+    recorded: tuple[int, int] | None = None
+    with suppress(MalformedSupervisorIdentityError):
+        recorded = read_supervisor_pid()
     if recorded is None:
         return False
     pid, ticks = recorded
@@ -1451,19 +1458,40 @@ def write_supervisor_pid(pid: int, start_time_ticks: int) -> None:
     )
 
 
+class MalformedSupervisorIdentityError(ValueError):
+    """A present supervisor identity record cannot be trusted."""
+
+
 def read_supervisor_pid() -> tuple[int, int] | None:
-    """Load the recorded daemon identity.
+    """Load the recorded daemon identity without normalizing malformed authority.
 
     Returns:
-        The ``(pid, start_time_ticks)`` pair, or ``None`` when absent.
+        The ``(pid, start_time_ticks)`` pair, or ``None`` when the identity
+        file is genuinely absent.
+
+    Raises:
+        MalformedSupervisorIdentityError: If a present identity record has an
+            unsupported schema or malformed exact process identity.
     """
-    data = _read_json(supervisor_pid_path())
-    if data is None:
+    path = supervisor_pid_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
-    pid = _optional_int(data.get("pid"))
-    ticks = _optional_int(data.get("start_time_ticks"))
-    if pid is None or ticks is None:
-        return None
+    except OSError as exc:
+        raise MalformedSupervisorIdentityError from exc
+    try:
+        decoded = json.loads(raw)
+    except ValueError as exc:
+        raise MalformedSupervisorIdentityError from exc
+    if not isinstance(decoded, dict):
+        raise MalformedSupervisorIdentityError
+    data: dict[str, object] = decoded
+    schema_version = _strict_int(data.get("schema_version"))
+    pid = _strict_non_negative_int(data.get("pid"))
+    ticks = _strict_non_negative_int(data.get("start_time_ticks"))
+    if schema_version != SCHEMA_VERSION or pid is None or pid <= 0 or ticks is None:
+        raise MalformedSupervisorIdentityError
     return pid, ticks
 
 
@@ -1780,7 +1808,10 @@ def supervisor_running() -> bool:
         ``True`` only when the recorded daemon identity matches a live process
         whose command line names the supervisor.
     """
-    recorded = read_supervisor_pid()
+    try:
+        recorded = read_supervisor_pid()
+    except MalformedSupervisorIdentityError:
+        return False
     if recorded is None:
         return False
     pid, ticks = recorded

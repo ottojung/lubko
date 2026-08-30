@@ -52,6 +52,7 @@ from lubko.durable import (
 )
 from lubko.state import state_root
 from lubko.supervise import (
+    MalformedSupervisorIdentityError,
     read_status,
     read_supervisor_pid,
     supervisor_running,
@@ -1070,7 +1071,10 @@ def verify_live_topology(
         The structured live topology proof. ``ok`` is ``False`` with a clear
         message when no supervisor is recorded or it is not live.
     """
-    recorded = read_supervisor_pid()
+    try:
+        recorded = read_supervisor_pid()
+    except MalformedSupervisorIdentityError:
+        return _unproven(contract, "supervisor identity record is malformed")
     if recorded is None:
         return _unproven(contract, "no supervisor identity is recorded")
     supervisor_pid, supervisor_start_ticks = recorded

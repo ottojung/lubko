@@ -100,6 +100,7 @@ from lubko.supervise import (
     SCHEMA_VERSION,
     ConsumerLockTimeoutError,
     LastExit,
+    MalformedSupervisorIdentityError,
     SpawningObligation,
     SupervisorStatus,
     UnresolvedChild,
@@ -2867,7 +2868,13 @@ class SupervisorDaemon:
         Raises:
             SystemExit: If another live supervisor daemon is already running.
         """
-        recorded = read_supervisor_pid()
+        try:
+            recorded = read_supervisor_pid()
+        except MalformedSupervisorIdentityError:
+            LOGGER.exception(
+                "supervisor identity record is malformed; refusing to overwrite recovery authority"
+            )
+            raise SystemExit(1) from None
         if recorded is not None and supervise.supervisor_running():
             msg = (
                 f"another lubko supervisor is already running (pid {recorded[0]}); "
