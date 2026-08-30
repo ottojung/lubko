@@ -119,8 +119,10 @@ def test_reserved_runner_blocks_removal_at_prestart_boundary(
         aid,
         state="succeeded",
         active_runner=True,
+        runner_gen=1,
         runner_reservation={
             "state": "reserved",
+            "gen": 1,
             "owner_pid": os.getpid(),
             "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
         },
