@@ -142,6 +142,123 @@ def test_authoritative_runner_accepts_exactly_one_prompt(
         proc.kill_and_reap()
 
 
+@pytest.mark.parametrize("bad_pid", [4242.9, "4242", True])
+def test_invocation_liveness_rejects_malformed_persisted_pid(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_pid: object,
+) -> None:
+    """Malformed durable PIDs cannot be normalized into invocation authority."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"state": "running", "pid": bad_pid, "start_time": 111})
+    opened: list[int] = []
+
+    def fake_open_pidfd(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", fake_open_pidfd)
+
+    assert not agent.is_alive(meta)
+    assert opened == []
+
+
+@pytest.mark.parametrize("bad_ticks", [111.0, "111", True])
+def test_invocation_liveness_rejects_malformed_persisted_start_time(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_ticks: object,
+) -> None:
+    """Malformed start ticks cannot compare equal to a real invocation identity."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"state": "running", "pid": 4242, "start_time": bad_ticks})
+    opened: list[int] = []
+
+    def fake_open_pidfd(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", fake_open_pidfd)
+
+    assert not agent.is_alive(meta)
+    assert opened == []
+
+
+def test_runner_liveness_rejects_fractional_pid_of_matching_live_process(tmp_path: Path) -> None:
+    """A fractional durable runner PID cannot truncate into a marked live runner."""
+    aid = "aaaaaaaa"
+    proc = _MarkedRunner(aid)
+    try:
+        meta = agent.idle_meta(aid, str(tmp_path), None)
+        meta["active_runner"] = True
+        meta.update(proc.identity_fields())
+        meta["runner_pid"] = proc.pid + 0.9
+
+        assert not agent.runner_alive(meta)
+    finally:
+        proc.kill_and_reap()
+
+
+@pytest.mark.parametrize("bad_pid", ["4242", True])
+def test_runner_liveness_rejects_other_malformed_persisted_pids(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_pid: object,
+) -> None:
+    """Strings and booleans cannot name persisted runner process identity."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"runner_pid": bad_pid, "runner_start_time": 111})
+    opened: list[int] = []
+
+    def fake_open_pidfd(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", fake_open_pidfd)
+
+    assert not agent.runner_alive(meta)
+    assert opened == []
+
+
+@pytest.mark.parametrize("bad_ticks", [111.0, "111", True])
+def test_runner_liveness_rejects_malformed_persisted_start_time(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_ticks: object,
+) -> None:
+    """Malformed runner ticks cannot compare equal to a real process identity."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"runner_pid": 4242, "runner_start_time": bad_ticks})
+    opened: list[int] = []
+
+    def fake_open_pidfd(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", fake_open_pidfd)
+
+    assert not agent.runner_alive(meta)
+    assert opened == []
+
+
+@pytest.mark.parametrize("bad_pid", [4242.9, "4242", True, 0])
+def test_recorded_leader_state_keeps_malformed_present_pid_ambiguous(
+    bad_pid: object,
+) -> None:
+    """Malformed persisted leader identity must never become a proven-dead PID."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"pid": bad_pid, "start_time": 111})
+
+    assert agent._recorded_leader_state(meta) == "ambiguous"
+
+
+@pytest.mark.parametrize("bad_ticks", [111.0, "111", True, -1])
+def test_recorded_leader_state_keeps_malformed_start_ticks_ambiguous(
+    bad_ticks: object,
+) -> None:
+    """Malformed persisted ticks keep stop/convergence fail closed."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"pid": 4242, "start_time": bad_ticks})
+
+    assert agent._recorded_leader_state(meta) == "ambiguous"
+
+
 def test_invocation_liveness_stays_bound_to_pinned_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
