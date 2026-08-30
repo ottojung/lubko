@@ -712,6 +712,18 @@ def _matches_invocation_group(member: int, pgid: int, aid: str, iid: str) -> boo
     return env_has_marker(member, aid) and env_has_invocation(member, iid)
 
 
+def _process_identity_int(value: object, *, minimum: int) -> int | None:
+    """Return a strict persisted JSON integer used as process identity.
+
+    Python's ``bool`  is an ``int`` subclass and ``int()`` also accepts
+    floats/strings, so durable identity fields must be validated before they
+    can name a process or establish a start-time match.
+    """
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        return None
+    return value
+
+
 def is_alive(meta: Meta) -> bool:
     """Return whether the recorded process is really our agent process.
 
@@ -728,15 +740,16 @@ def is_alive(meta: Meta) -> bool:
         ``True`` only when the same pinned live process matches every recorded
         invocation identity field.
     """
-    pid = meta.get("pid")
-    if not pid:
+    pid = _process_identity_int(meta.get("pid"), minimum=1)
+    start_time = _process_identity_int(meta.get("start_time"), minimum=0)
+    if pid is None or start_time is None:
         return False
-    invocation_pid = int(pid)
+    invocation_pid = pid
     fd = open_pidfd(invocation_pid)
     if fd is None:
         return False
     try:
-        if proc_start_ticks(invocation_pid) != meta.get("start_time"):
+        if proc_start_ticks(invocation_pid) != start_time:
             return False
         if not env_has_marker(invocation_pid, meta.get("id", "")):
             return False
@@ -763,21 +776,25 @@ def _recorded_leader_state(meta: Meta) -> str:
         cannot be inspected (unreadable procfs) — never collapsing ambiguity
         into death.
     """
-    pid = meta.get("pid")
-    if not pid:
+    raw_pid = meta.get("pid")
+    if raw_pid is None:
         return "gone"
+    pid = _process_identity_int(raw_pid, minimum=1)
+    start_time = _process_identity_int(meta.get("start_time"), minimum=0)
+    if pid is None or start_time is None:
+        return "ambiguous"
     try:
-        os.kill(int(pid), 0)
+        os.kill(pid, 0)
     except ProcessLookupError:
         return "gone"
     except OSError:
         return "ambiguous"  # exists but uninspectable
-    ticks = proc_start_ticks(int(pid))
-    if ticks is None or ticks != meta.get("start_time"):
+    ticks = proc_start_ticks(pid)
+    if ticks is None or ticks != start_time:
         # Unreadable ticks are ambiguity; readable different ticks prove the
         # slot was recycled by an unrelated occupant.
         return "ambiguous" if ticks is None else "gone"
-    state = _leader_marker_state(meta, int(pid))
+    state = _leader_marker_state(meta, pid)
     return state if state is not None else "ambiguous"
 
 
@@ -892,15 +909,16 @@ def runner_alive(meta: Meta) -> bool:
         ``True`` only when the same pinned live process matches every recorded
         runner identity field.
     """
-    pid = meta.get("runner_pid")
-    if not pid:
+    pid = _process_identity_int(meta.get("runner_pid"), minimum=1)
+    start_time = _process_identity_int(meta.get("runner_start_time"), minimum=0)
+    if pid is None or start_time is None:
         return False
-    runner_pid = int(pid)
+    runner_pid = pid
     fd = open_pidfd(runner_pid)
     if fd is None:
         return False
     try:
-        if proc_start_ticks(runner_pid) != meta.get("runner_start_time"):
+        if proc_start_ticks(runner_pid) != start_time:
             return False
         if not env_has_marker(runner_pid, meta.get("id", "")):
             return False
