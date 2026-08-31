@@ -76,3 +76,37 @@ def test_group_alive_rejects_malformed_pid_before_any_group_or_member_probe(
 
     assert agent.group_alive(meta) is True
     assert calls == []
+
+
+@pytest.mark.parametrize("mode", ["none", "missing"])
+def test_missing_agent_id_blocks_group_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """Absent/non-string agent identity cannot authorize invocation group probing."""
+    meta = dict(BASE_META)
+    if mode == "none":
+        meta["id"] = None
+    else:
+        meta.pop("id")
+    calls: list[str] = []
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+
+    def member_probe(_pgid: int, _aid: str, _iid: str) -> tuple[list[tuple[int, int]], bool]:
+        calls.append("members")
+        return [], True
+
+    def signal_member_probe(_pgid: int, _aid: str, _iid: str) -> list[tuple[int, int]]:
+        calls.append("signal-members")
+        return []
+
+    def pin_probe(_pid: int) -> None:
+        calls.append("pin")
+
+    monkeypatch.setattr(agent, "_proven_invocation_members", member_probe)
+    monkeypatch.setattr(agent, "_pinned_invocation_members", signal_member_probe)
+    monkeypatch.setattr(agent, "open_pidfd", pin_probe)
+
+    assert agent.group_alive(meta) is True
+    agent.send_signal_group(meta, 15)
+    assert calls == []

@@ -66,7 +66,7 @@ def test_abort_runner_signals_via_exact_identity_helper(
     ``killpg``, before finalizing terminal metadata.
     """
     aid = "aaaaaaaa"
-    iid = "inv-1"
+    iid = "eec0310629106a7a7e910c4f396ec98f"
     meta = _running_meta(aid, 424242, 111, iid)
     agent.write_meta(aid, meta)
 
@@ -100,7 +100,7 @@ def test_abort_runner_holds_safety_when_death_unproven(
     can start replacement work.
     """
     aid = "aaaaaaaa"
-    iid = "inv-hold"
+    iid = "966ec2c6d612be3223be131cb8141c72"
     agent.write_meta(aid, _running_meta(aid, 424242, 111, iid))
     monkeypatch.setattr(agent, "send_signal_group", lambda _m, _sig: None)
     monkeypatch.setattr(agent, "wait_group_dead", lambda _m, _t: False)
@@ -125,12 +125,12 @@ def test_abort_runner_never_terminalizes_newer_invocation(
     record.
     """
     aid = "aaaaaaaa"
-    old = _running_meta(aid, 424242, 111, "inv-old")
+    old = _running_meta(aid, 424242, 111, "6bb0eacd5381f7b7429c8f897abfd347")
     agent.write_meta(aid, old)
 
     def steal_record(_m: agent.Meta, _t: float) -> bool:
         # A newer invocation is concurrently recorded while cleanup runs.
-        newer = _running_meta(aid, 535353, 222, "inv-new")
+        newer = _running_meta(aid, 535353, 222, "fd66047cbcb50c3c0e30f6ecd9ee8205")
         newer["runner_pid"] = 777
         newer["runner_start_time"] = 888
         agent.write_meta(aid, newer)
@@ -146,7 +146,7 @@ def test_abort_runner_never_terminalizes_newer_invocation(
     assert final["state"] == "running"
     assert final.get("intent") is None
     assert final["pid"] == 535353
-    assert final["invocation_id"] == "inv-new"
+    assert final["invocation_id"] == "fd66047cbcb50c3c0e30f6ecd9ee8205"
 
 
 def test_send_signal_group_never_signals_reused_identity(
@@ -158,7 +158,7 @@ def test_send_signal_group_never_signals_reused_identity(
     time / invocation identity, neither the leader ``killpg`` nor any member
     signal may fire: fail closed instead of guessing.
     """
-    meta = _running_meta("aaaaaaaa", 424242, 111, "inv-1")
+    meta = _running_meta("aaaaaaaa", 424242, 111, "eec0310629106a7a7e910c4f396ec98f")
     pin_fd = os.open(os.devnull, os.O_RDONLY)
     monkeypatch.setattr(agent, "open_pidfd", lambda _pid: os.dup(pin_fd))
     monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 999)
@@ -179,7 +179,7 @@ def test_send_signal_group_converges_owned_descendants_after_leader_exit(
     left alone and no numeric signal fires.
     """
     aid = "aaaaaaaa"
-    iid = "inv-1"
+    iid = "eec0310629106a7a7e910c4f396ec98f"
     meta = _running_meta(aid, 424242, 111, iid)
     owned_fd, foreign_fd = 21, 22
 
@@ -215,7 +215,7 @@ def test_send_signal_group_delivers_live_leader_through_its_pin_only(
     the verified leader.
     """
     aid = "aaaaaaaa"
-    iid = "inv-live"
+    iid = "1100e7cdde305a51af927a1344d2867c"
     meta = _running_meta(aid, 424242, 111, iid)
     closed: list[int] = []
     monkeypatch.setattr(agent, "open_pidfd", lambda pid: 77 if pid == 424242 else None)
@@ -252,7 +252,7 @@ def test_send_signal_group_member_path_survives_numeric_reuse_after_proof(
     the pinned kernel process itself, never the recycled number.
     """
     aid = "aaaaaaaa"
-    iid = "inv-m"
+    iid = "1a8082ad9c106a3f4e6ded5f8d6f7dd6"
     meta = _running_meta(aid, 424242, 111, iid)
     member_fd = os.open(os.devnull, os.O_RDONLY)
     try:
@@ -311,7 +311,7 @@ def test_send_signal_group_fails_closed_without_invocation_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """No durable invocation identity means nothing is ever signalled."""
-    meta = _running_meta("aaaaaaaa", 424242, 111, "inv-z")
+    meta = _running_meta("aaaaaaaa", 424242, 111, "eed81072206f305695392344d8025ea3")
     del meta["invocation_id"]
     monkeypatch.setattr(agent, "open_pidfd", lambda _pid: None)
     monkeypatch.setattr(
@@ -411,15 +411,17 @@ def test_send_signal_group_kills_real_live_leader_and_spares_recycled_slot() -> 
     that occupant.
     """
     aid = "aaaaaaaa"
-    owner = _MarkedProcess(aid, "inv-a")
+    owner = _MarkedProcess(aid, "1f30745828e96312cceef2c6bee7b77e")
     try:
-        live = _running_meta(aid, owner.pid, agent.proc_start_ticks(owner.pid), "inv-a")
+        live = _running_meta(
+            aid, owner.pid, agent.proc_start_ticks(owner.pid), "1f30745828e96312cceef2c6bee7b77e"
+        )
         agent.send_signal_group(live, signal.SIGKILL)
         assert owner.proc.wait(timeout=5) is not None
 
-        impostor = _MarkedProcess("bbbbbbbb", "inv-b")
+        impostor = _MarkedProcess("bbbbbbbb", "bdecb37c4c10b0ab8125c1338cba9e8d")
         try:
-            stale = _running_meta(aid, impostor.pid, 1, "inv-a")
+            stale = _running_meta(aid, impostor.pid, 1, "1f30745828e96312cceef2c6bee7b77e")
             agent.send_signal_group(stale, signal.SIGKILL)
             assert impostor.proc.poll() is None, "recycled occupant must survive"
         finally:
@@ -439,7 +441,7 @@ def test_spawn_and_run_exceptional_cleanup_uses_exact_identity(
     ``(aid, pid, start, iid)`` evidence, and no bare group signal fires.
     """
     aid = "aaaaaaaa"
-    iid = "inv-x"
+    iid = "b2d47eaebc8b95c78f28b5fe82bc8adc"
 
     def boom(_proc: subprocess.Popen[bytes], _aid: str, *, is_continue: bool) -> int:
         del is_continue
@@ -493,7 +495,7 @@ def test_unrecorded_invocation_cleanup_uses_exact_identity(
 ) -> None:
     """The stop-race loser is converged through the exact-identity helper too."""
     aid = "aaaaaaaa"
-    iid = "inv-y"
+    iid = "e36fe2db7d898afe9d993a3eea15b102"
 
     monkeypatch.setattr(
         agent,
@@ -538,7 +540,7 @@ def test_spawn_and_run_exceptional_cleanup_never_touches_newer_invocation(
     the newer record.
     """
     aid = "aaaaaaaa"
-    iid = "inv-old"
+    iid = "6bb0eacd5381f7b7429c8f897abfd347"
     seed = agent.idle_meta(aid, str(tmp_path), None)
     seed["state"] = "running"
     seed["invocation_id"] = iid
@@ -551,7 +553,7 @@ def test_spawn_and_run_exceptional_cleanup_never_touches_newer_invocation(
         newer["pid"] = 535353
         newer["pgid"] = 535353
         newer["start_time"] = 222
-        newer["invocation_id"] = "inv-new"
+        newer["invocation_id"] = "fd66047cbcb50c3c0e30f6ecd9ee8205"
         agent.write_meta(aid, newer)
         return True
 
@@ -574,7 +576,9 @@ def test_spawn_and_run_exceptional_cleanup_never_touches_newer_invocation(
 
     final = agent.read_meta(aid)
     assert final is not None
-    assert final["invocation_id"] == "inv-new", "newer record must stay untouched"
+    assert final["invocation_id"] == "fd66047cbcb50c3c0e30f6ecd9ee8205", (
+        "newer record must stay untouched"
+    )
     assert final["state"] == "running"
     assert final["intent"] is None
 
@@ -590,7 +594,7 @@ def test_spawn_and_run_unprovable_live_child_records_hold_without_wedging(
     recorded instead of blocking forever or terminalizing.
     """
     aid = "aaaaaaaa"
-    iid = "inv-live"
+    iid = "1100e7cdde305a51af927a1344d2867c"
     seed = agent.idle_meta(aid, str(tmp_path), None)
     seed["state"] = "running"
     seed["invocation_id"] = iid
@@ -647,7 +651,7 @@ def test_unrecorded_invocation_live_child_keeps_blocking_hold(
     replacement work while the child lives.
     """
     aid = "aaaaaaaa"
-    iid = "inv-loser"
+    iid = "0c3fe0cc4a76075fd1768de90b6d7c4b"
     seed = agent.idle_meta(aid, str(tmp_path), None)
     seed["state"] = "running"
     seed["intent"] = "stop"
@@ -686,7 +690,7 @@ def test_unrecorded_invocation_dead_child_leaves_stop_semantics_alone(
 ) -> None:
     """A converged loser adds no metadata: stop/kill owns the lifecycle."""
     aid = "aaaaaaaa"
-    iid = "inv-dead"
+    iid = "c84d4233addc900c2d9e61f167b0de89"
     seed = agent.idle_meta(aid, str(tmp_path), None)
     seed["state"] = "running"
     seed["intent"] = "kill"
@@ -732,7 +736,7 @@ def test_unresolved_child_ambiguous_inspection_blocks_prompt(
         "pid": 424242,
         "pgid": 424242,
         "start_time": 111,
-        "invocation_id": "inv-u",
+        "invocation_id": "95894480b0564c57826c9fce0714244e",
     }
     meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped", "stop_reason": "stop"}
     meta["unresolved_invocation"] = marker
@@ -756,13 +760,32 @@ def test_unresolved_child_malformed_marker_blocks_and_persists() -> None:
     """
     cases = [
         {"start_time": 111},  # missing pid and invocation_id
-        {"pid": 0, "start_time": 111, "invocation_id": "inv-u"},
-        {"pid": -5, "start_time": 111, "invocation_id": "inv-u"},
-        {"pid": "424242", "start_time": 111, "invocation_id": "inv-u"},
-        {"pid": 424242, "pgid": 424242, "start_time": "111", "invocation_id": "inv-u"},
-        {"pid": 424242, "pgid": 424242, "start_time": None, "invocation_id": "inv-u"},
-        {"pid": 424242, "start_time": 111, "invocation_id": "inv-u"},  # missing pgid
-        {"pid": 424242, "pgid": None, "start_time": 111, "invocation_id": "inv-u"},
+        {"pid": 0, "start_time": 111, "invocation_id": "95894480b0564c57826c9fce0714244e"},
+        {"pid": -5, "start_time": 111, "invocation_id": "95894480b0564c57826c9fce0714244e"},
+        {"pid": "424242", "start_time": 111, "invocation_id": "95894480b0564c57826c9fce0714244e"},
+        {
+            "pid": 424242,
+            "pgid": 424242,
+            "start_time": "111",
+            "invocation_id": "95894480b0564c57826c9fce0714244e",
+        },
+        {
+            "pid": 424242,
+            "pgid": 424242,
+            "start_time": None,
+            "invocation_id": "95894480b0564c57826c9fce0714244e",
+        },
+        {
+            "pid": 424242,
+            "start_time": 111,
+            "invocation_id": "95894480b0564c57826c9fce0714244e",
+        },  # missing pgid
+        {
+            "pid": 424242,
+            "pgid": None,
+            "start_time": 111,
+            "invocation_id": "95894480b0564c57826c9fce0714244e",
+        },
         {"pid": 424242, "pgid": 424242, "start_time": 111},
         {"pid": 424242, "pgid": 424242, "start_time": 111, "invocation_id": ""},
     ]
@@ -782,7 +805,7 @@ def test_unresolved_child_proven_recycled_clears_block() -> None:
         "pid": 424242,
         "pgid": 424242,
         "start_time": 111,
-        "invocation_id": "inv-u",
+        "invocation_id": "95894480b0564c57826c9fce0714244e",
     }
     meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped", "stop_reason": "stop"}
     meta["unresolved_invocation"] = marker
@@ -810,7 +833,7 @@ def test_delete_honors_unresolved_child_until_exactly_proven_gone(
     signalling, and converge once the child's death is positively proven.
     """
     aid = "aaaaaaaa"
-    iid = "inv-del"
+    iid = "3dc1e2f87d5d6afdb5b05fab633b5b9c"
     seed = agent.idle_meta(aid, str(tmp_path), None)
     seed["state"] = "killed"
     seed["stop_reason"] = "kill"
@@ -887,7 +910,7 @@ def test_spawn_gate_refusal_durably_records_child_before_any_cleanup(
     concurrent force-delete can never falsely remove state while it lives.
     """
     aid = "aaaaaaaa"
-    iid = "inv-gate"
+    iid = "8b14229546b279cc30925a5e6dd0c60b"
     seed = agent.idle_meta(aid, str(tmp_path), None)
     seed["state"] = "running"
     seed["stop_reason"] = "kill"
@@ -1025,7 +1048,7 @@ def test_delete_blocked_until_marked_descendants_of_dead_leader_are_gone(
     deletion succeed.
     """
     aid = "aaaaaaaa"
-    iid = "inv-desc"
+    iid = "1a8e7515b75457a7b0ce59c9c9c091ae"
     leader, descendant_pid = _refused_leader_leaves_marked_descendant(tmp_path, aid, iid)
     try:
         monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
@@ -1063,13 +1086,13 @@ def test_delete_blocked_until_marked_descendants_of_dead_leader_are_gone(
 
 def test_unresolved_group_reuse_by_foreign_invocation_is_gone() -> None:
     """A recycled PGID hosting a foreign invocation proves the record gone."""
-    owner = _MarkedProcess("aaaaaaaa", "inv-foreign")
+    owner = _MarkedProcess("aaaaaaaa", "4c4cdac188db7bb5f96d81d8fdd21de6")
     try:
         marker = {
             "pid": 424242,  # long-dead leader slot
             "pgid": owner.pid,  # PGID recycled by a newer/foreign invocation
             "start_time": 1,
-            "invocation_id": "inv-old",
+            "invocation_id": "6bb0eacd5381f7b7429c8f897abfd347",
         }
         recycled_pgid: int = owner.pid
         meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped"}
@@ -1078,7 +1101,7 @@ def test_unresolved_group_reuse_by_foreign_invocation_is_gone() -> None:
 
         # The same group occupied by an exact-marker member of *this*
         # invocation stays live.
-        owned = _MarkedProcess("aaaaaaaa", "inv-old")
+        owned = _MarkedProcess("aaaaaaaa", "6bb0eacd5381f7b7429c8f897abfd347")
         try:
             os.setpgid(owned.pid, recycled_pgid)
         except PermissionError:
@@ -1105,7 +1128,7 @@ def _unresolved_marker_for(pgid: int) -> tuple[agent.Meta, dict[str, object]]:
         "pid": 424242,  # long-dead leader slot
         "pgid": pgid,
         "start_time": 1,
-        "invocation_id": "inv-old",
+        "invocation_id": "6bb0eacd5381f7b7429c8f897abfd347",
     }
     meta: agent.Meta = {"id": "aaaaaaaa", "state": "stopped"}
     meta["unresolved_invocation"] = marker
@@ -1116,7 +1139,7 @@ def test_unresolved_scan_proc_enumeration_failure_stays_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """/proc enumeration failure keeps the obligation ambiguous and blocking."""
-    owner = _MarkedProcess("aaaaaaaa", "inv-foreign")
+    owner = _MarkedProcess("aaaaaaaa", "4c4cdac188db7bb5f96d81d8fdd21de6")
     try:
         meta, _ = _unresolved_marker_for(owner.pid)
 
@@ -1178,7 +1201,9 @@ def test_proven_scan_fallback_eperm_is_incomplete_not_raised(
             raise failure
 
         monkeypatch.setattr(os, "kill", forbidden_kill)
-        members, complete = agent._proven_invocation_members(525252, "aaaaaaaa", "inv-x")
+        members, complete = agent._proven_invocation_members(
+            525252, "aaaaaaaa", "b2d47eaebc8b95c78f28b5fe82bc8adc"
+        )
         assert members == []
         assert complete is False
     finally:
@@ -1191,7 +1216,7 @@ def test_group_alive_and_wait_group_dead_fail_closed_on_enumeration_failure(
 ) -> None:
     """/proc ambiguity conservatively counts the exact group as still alive."""
     aid = "aaaaaaaa"
-    iid = "inv-g"
+    iid = "f546ba1bbe259b56042b67b063862d1d"
     seed = agent.idle_meta(aid, str(tmp_path), None)
     seed["pgid"] = 525252
     seed["invocation_id"] = iid
@@ -1217,7 +1242,8 @@ def test_proven_scan_incomplete_after_member_keeps_and_closes_fds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Proven members survive an incompleting scan with their pins closable."""
-    marker_env = f"LUBKO_AGENT_ID=aaaaaaaa\0{agent.INVOCATION_ID_VAR}=inv-x\0".encode()
+    iid = "b2d47eaebc8b95c78f28b5fe82bc8adc"
+    marker_env = f"LUBKO_AGENT_ID=aaaaaaaa\0{agent.INVOCATION_ID_VAR}={iid}\0".encode()
     pin_fd = os.open(os.devnull, os.O_RDONLY)
     try:
         payloads = {
@@ -1242,7 +1268,9 @@ def test_proven_scan_incomplete_after_member_keeps_and_closes_fds(
             return data
 
         monkeypatch.setattr(pathlib.Path, "read_bytes", selective_environ)
-        members, complete = agent._proven_invocation_members(525252, "aaaaaaaa", "inv-x")
+        members, complete = agent._proven_invocation_members(
+            525252, "aaaaaaaa", "b2d47eaebc8b95c78f28b5fe82bc8adc"
+        )
         assert complete is False
         assert [pid for pid, _ in members] == [525253]
         # The caller must be able to close every returned pin exactly once.
@@ -1267,7 +1295,7 @@ def test_group_alive_stays_true_when_live_leader_environ_unreadable(
     leader slot still falls through to the exact descendant scan.
     """
     aid = "aaaaaaaa"
-    iid = "inv-lead"
+    iid = "3972542cd440ece24493436a9e217dc0"
     owner = _MarkedProcess(aid, iid)
     try:
         meta = agent.idle_meta(aid, str(tmp_path), None)
