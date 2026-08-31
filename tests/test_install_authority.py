@@ -13,11 +13,12 @@ import shutil
 import subprocess
 import threading
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from lubko import cli, install, lifecycle, supervise, toolchain
+from lubko import cli, deployctl, install, lifecycle, supervise, toolchain
 from lubko.state import rollback_state_path
 
 if TYPE_CHECKING:
@@ -207,6 +208,11 @@ def test_same_commit_install_preserves_existing_desired_intent(
         migration=False,
     )
     supervise.write_desired(existing)
+    monkeypatch.setattr(
+        deployctl,
+        "read_rollback_state",
+        lambda: SimpleNamespace(generation=existing.generation - 1),
+    )
 
     code = install.main(["--repo", str(repo)])
 
@@ -215,12 +221,12 @@ def test_same_commit_install_preserves_existing_desired_intent(
     assert cli.current_commit() == head
 
 
-def test_install_does_not_settle_existing_supervised_mission(
+def test_install_fails_closed_on_untrusted_supervised_mission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Desired absence does not let install outrank separate mission authority."""
+    """Malformed mission authority is never treated as absent or stale history."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     installable_bin(monkeypatch, tmp_path)
@@ -231,9 +237,42 @@ def test_install_does_not_settle_existing_supervised_mission(
     code = install.main(["--repo", str(repo)])
 
     assert code == install.EXIT_ERROR
-    assert "mission authority exists" in capsys.readouterr().err
+    assert "untrusted supervised mission state" in capsys.readouterr().err
     assert cli.current_commit() is None
     assert supervise.read_desired_strict() is None
+
+
+def test_install_does_not_outrank_active_supervised_mission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A mission at or above desired generation remains separate authority."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    desired = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=7,
+        commit=head,
+        repo=str(repo),
+        uv_path="uv",
+        worker_id=None,
+    )
+    supervise.write_desired(desired)
+    monkeypatch.setattr(
+        deployctl,
+        "read_rollback_state",
+        lambda: SimpleNamespace(generation=desired.generation + 1),
+    )
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "active supervised deployment mission authority" in capsys.readouterr().err
+    assert cli.current_commit() is None
+    assert supervise.read_desired_strict() == desired
 
 
 def test_install_preserves_pending_migration_cli_hold(

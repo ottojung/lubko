@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from lubko import cli, supervise
+from lubko import cli, deployctl, supervise
 from lubko import lifecycle as _lifecycle
 from lubko.durable import DurabilityError
 from lubko.toolchain import UvResolutionError, resolve_uv, write_toolchain
@@ -215,13 +215,14 @@ def _install_refusal(commit: str) -> str | None:
     except supervise.DesiredIntentError as exc:
         return "refusing to install with untrusted supervisor desired state: " + str(exc)
     try:
-        mission_exists = desired is None and supervise.mission_state_exists_strict()
-    except supervise.DesiredIntentError as exc:
+        mission = deployctl.read_rollback_state()
+    except deployctl.DeployCtlError as exc:
         return "refusing to install with untrusted supervised mission state: " + str(exc)
-    if mission_exists:
+    desired_generation = desired.generation if desired is not None else 0
+    if mission is not None and mission.generation >= desired_generation:
         return (
-            "refusing to establish supervisor desired state while supervised deployment "
-            "mission authority exists"
+            "refusing to install while active supervised deployment mission authority "
+            f"exists at generation {mission.generation}"
         )
     if desired is not None and desired.migration and cli.current_commit() != commit:
         return (
