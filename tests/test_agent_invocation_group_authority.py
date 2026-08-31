@@ -9,12 +9,13 @@ import pytest
 from lubko import agent
 
 
+INVOCATION_ID = "0123456789abcdef0123456789abcdef"
 BASE_META: agent.Meta = {
     "id": "ab12",
     "pid": 4242,
     "pgid": 4242,
     "start_time": 1234,
-    "invocation_id": "inv1",
+    "invocation_id": INVOCATION_ID,
 }
 
 
@@ -45,13 +46,54 @@ def test_group_signal_rejects_malformed_numeric_authority(
     assert calls == []
 
 
-@pytest.mark.parametrize("field,value", [("id", 123), ("id", True), ("invocation_id", 123), ("invocation_id", True), ("invocation_id", "")])
+@pytest.mark.parametrize("value", [1234.0, "1234", True, -1])
+def test_group_signal_rejects_malformed_start_time_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    """Malformed persisted start time cannot authorize leader or group signalling."""
+    meta = dict(BASE_META)
+    meta["start_time"] = value
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        agent,
+        "open_pidfd",
+        lambda pid: calls.append(("pin", pid)) or None,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_pinned_invocation_members",
+        lambda pgid, _aid, _iid: calls.append(("scan", pgid)) or [],
+    )
+
+    agent.send_signal_group(meta, 15)
+
+    assert calls == []
+
+
+MALFORMED_MARKERS = [
+    ("id", 123),
+    ("id", True),
+    ("id", ""),
+    ("id", "AB12"),
+    ("id", " ab12"),
+    ("id", "zz"),
+    ("invocation_id", 123),
+    ("invocation_id", True),
+    ("invocation_id", ""),
+    ("invocation_id", "abc"),
+    ("invocation_id", "g" * 32),
+    ("invocation_id", "A" * 32),
+]
+
+
+@pytest.mark.parametrize("field,value", MALFORMED_MARKERS)
 def test_group_signal_rejects_malformed_marker_authority(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
     value: object,
 ) -> None:
-    """Present malformed marker identities are never stringified into authority."""
+    """Present malformed marker identities are never normalized into authority."""
     meta = dict(BASE_META)
     meta[field] = value
     calls: list[str] = []
@@ -94,7 +136,27 @@ def test_group_alive_preserves_absent_group_semantics() -> None:
     assert agent.group_alive(meta) is False
 
 
-@pytest.mark.parametrize("field,value", [("id", 123), ("id", True), ("invocation_id", 123), ("invocation_id", True), ("invocation_id", "")])
+@pytest.mark.parametrize("value", [1234.0, "1234", True, -1])
+def test_group_alive_fails_closed_on_malformed_start_time(
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    """Malformed start-time authority remains ambiguous and blocks convergence."""
+    meta = dict(BASE_META)
+    meta["start_time"] = value
+    scans: list[tuple[int, str, str]] = []
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(
+        agent,
+        "_proven_invocation_members",
+        lambda pgid, aid, iid: scans.append((pgid, aid, iid)) or ([], True),
+    )
+
+    assert agent.group_alive(meta) is True
+    assert scans == []
+
+
+@pytest.mark.parametrize("field,value", MALFORMED_MARKERS)
 def test_group_alive_fails_closed_on_malformed_marker_authority(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
@@ -116,13 +178,13 @@ def test_group_alive_fails_closed_on_malformed_marker_authority(
     assert scans == []
 
 
-@pytest.mark.parametrize("field,value", [("id", 123), ("id", True), ("invocation_id", 123), ("invocation_id", True), ("invocation_id", "")])
+@pytest.mark.parametrize("field,value", MALFORMED_MARKERS)
 def test_leader_marker_state_rejects_malformed_present_markers(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
     value: object,
 ) -> None:
-    """Malformed marker metadata yields ambiguity without probing a fabricated marker."""
+    """Malformed marker metadata yields ambiguity without probing fabricated authority."""
     meta = dict(BASE_META)
     meta[field] = value
     probes: list[Any] = []
@@ -150,4 +212,4 @@ def test_valid_group_authority_still_reaches_exact_member_scan(
 
     agent.send_signal_group(dict(BASE_META), 15)
 
-    assert calls == [(4242, "ab12", "inv1")]
+    assert calls == [(4242, "ab12", INVOCATION_ID)]
