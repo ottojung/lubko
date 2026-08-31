@@ -162,6 +162,77 @@ def test_gc_preserves_desired_applied_and_override_runtimes(
     assert cli.cli_commit_dir(second).is_dir()
 
 
+def test_fresh_install_establishes_supervisor_desired_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful fresh install leaves CLI and desired authority coherent."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_OK
+    assert cli.current_commit() == head
+    desired = supervise.read_desired_strict()
+    assert desired is not None
+    assert desired.commit == head
+    assert desired.generation == 1
+    assert desired.repo == str(repo)
+    assert desired.restart is False
+    assert desired.migration is False
+
+
+def test_same_commit_install_preserves_existing_desired_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idempotent install does not advance or erase same-commit authority."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    existing = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=7,
+        commit=head,
+        repo="/previous/checkout",
+        uv_path="/previous/uv",
+        worker_id="worker-existing",
+        restart=True,
+        requested_at=123.0,
+        migration=True,
+    )
+    supervise.write_desired(existing)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_OK
+    assert supervise.read_desired_strict() == existing
+    assert cli.current_commit() == head
+
+
+def test_install_fails_closed_on_untrusted_desired_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A malformed durable desired file is never treated as fresh absence."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    supervise.desired_path().parent.mkdir(parents=True, exist_ok=True)
+    supervise.desired_path().write_text("{not-json\\n", encoding="utf-8")
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "untrusted supervisor desired state" in capsys.readouterr().err
+    assert cli.current_commit() is None
+
+
 def test_install_refuses_version_change_over_desired_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

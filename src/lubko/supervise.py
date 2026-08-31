@@ -908,6 +908,10 @@ class DesiredIntentError(RuntimeError):
     """Raised when a present desired intent exists but cannot be trusted."""
 
 
+class DesiredCommitConflictError(RuntimeError):
+    """Raised when preserving desired authority forbids changing its commit."""
+
+
 def read_desired_strict() -> SupervisorDesired | None:
     """Load the desired intent in one authoritative snapshot read.
 
@@ -1278,6 +1282,87 @@ def next_generation() -> int:
     return max(applied, desired_generation, _mission_generation()) + 1
 
 
+def _write_run_intent_locked(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+    restart: bool,
+) -> int:
+    """Write one fresh run intent while the generation lock is held.
+
+    Args:
+        commit: Exact confirmed commit to run.
+        repo: Maintained checkout the commit belongs to.
+        uv_path: Resolved ``uv`` executable (recorded for coherence).
+        worker_id: Worker identifier to hand to the worker.
+        restart: Whether the intent explicitly replaces an existing process.
+
+    Returns:
+        The generation of the written intent.
+    """
+    generation = next_generation()
+    write_desired(
+        SupervisorDesired(
+            schema_version=SCHEMA_VERSION,
+            generation=generation,
+            commit=commit,
+            repo=repo,
+            uv_path=uv_path,
+            worker_id=worker_id,
+            restart=restart,
+            requested_at=time.time(),
+        )
+    )
+    return generation
+
+
+def ensure_run_intent(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+) -> int:
+    """Ensure durable desired authority names ``commit`` without restarting it.
+
+    Genuine absence gets a fresh run intent. An existing same-commit intent is
+    returned unchanged, including its generation and any restart or migration
+    obligation, so an idempotent repair cannot accidentally replay or erase a
+    lifecycle transition. A different or malformed durable intent fails closed.
+
+    Args:
+        commit: Exact commit that must be durable supervisor authority.
+        repo: Maintained checkout the commit belongs to when a new intent is needed.
+        uv_path: Resolved ``uv`` executable for a newly written intent.
+        worker_id: Worker identifier for a newly written intent.
+
+    Returns:
+        The existing or newly allocated desired generation.
+
+    Raises:
+        DesiredCommitConflictError: If a valid desired intent names another commit.
+    """
+    with generation_lock():
+        current = read_desired_strict()
+        if current is not None:
+            if current.commit != commit:
+                msg = (
+                    f"supervisor desired commit {current.commit} conflicts with "
+                    f"requested commit {commit}"
+                )
+                raise DesiredCommitConflictError(msg)
+            return current.generation
+        return _write_run_intent_locked(
+            commit,
+            repo=repo,
+            uv_path=uv_path,
+            worker_id=worker_id,
+            restart=False,
+        )
+
+
 def request_run(
     commit: str,
     *,
@@ -1301,20 +1386,13 @@ def request_run(
         The generation of the written intent.
     """
     with generation_lock():
-        generation = next_generation()
-        write_desired(
-            SupervisorDesired(
-                schema_version=SCHEMA_VERSION,
-                generation=generation,
-                commit=commit,
-                repo=repo,
-                uv_path=uv_path,
-                worker_id=worker_id,
-                restart=restart,
-                requested_at=time.time(),
-            )
+        return _write_run_intent_locked(
+            commit,
+            repo=repo,
+            uv_path=uv_path,
+            worker_id=worker_id,
+            restart=restart,
         )
-    return generation
 
 
 def request_restart(

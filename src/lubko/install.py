@@ -28,8 +28,9 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from lubko import cli
+from lubko import cli, supervise
 from lubko import lifecycle as _lifecycle
+from lubko.durable import DurabilityError
 from lubko.toolchain import UvResolutionError, resolve_uv, write_toolchain
 
 DEFAULT_GIT_TIMEOUT_SECONDS: Final = 10.0
@@ -241,6 +242,11 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
         _err(refusal)
         return EXIT_ERROR
     try:
+        supervise.read_desired_strict()
+    except supervise.DesiredIntentError as exc:
+        _err("refusing to install with untrusted supervisor desired state: " + str(exc))
+        return EXIT_ERROR
+    try:
         cli.build_cli_root(repo, commit, uv_path, cli.DEFAULT_BUILD_TIMEOUT_SECONDS)
     except cli.CliError as exc:
         _err("could not prepare the maintained CLI environment: " + str(exc))
@@ -250,6 +256,20 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
         cli.set_current(commit)
     except cli.CliError as exc:
         _err("could not activate the maintained CLI environment: " + str(exc))
+        return EXIT_ERROR
+    try:
+        supervise.ensure_run_intent(
+            commit,
+            repo=str(repo),
+            uv_path=uv_path,
+            worker_id=None,
+        )
+    except (
+        DurabilityError,
+        supervise.DesiredCommitConflictError,
+        supervise.DesiredIntentError,
+    ) as exc:
+        _err("could not establish supervisor desired state: " + str(exc))
         return EXIT_ERROR
     cli.gc_cli_roots((commit,))
     return EXIT_OK
