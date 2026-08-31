@@ -1,8 +1,8 @@
 """Fail-closed regressions for durable managed-agent invocation group authority."""
 
 import pytest
-from lubko import agent
 
+from lubko import agent
 
 INVOCATION_ID = "0123456789abcdef0123456789abcdef"
 BASE_META: agent.Meta = {
