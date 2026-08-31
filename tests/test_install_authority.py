@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Final
 import pytest
 
 from lubko import cli, install, lifecycle, supervise, toolchain
+from lubko.state import rollback_state_path
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -212,6 +213,27 @@ def test_same_commit_install_preserves_existing_desired_intent(
     assert code == install.EXIT_OK
     assert supervise.read_desired_strict() == existing
     assert cli.current_commit() == head
+
+
+def test_install_does_not_settle_existing_supervised_mission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Desired absence does not let install outrank separate mission authority."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    mission_path = rollback_state_path()
+    mission_path.parent.mkdir(parents=True, exist_ok=True)
+    mission_path.write_text("{}\n", encoding="utf-8")
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "mission authority exists" in capsys.readouterr().err
+    assert cli.current_commit() is None
+    assert supervise.read_desired_strict() is None
 
 
 def test_install_preserves_pending_migration_cli_hold(

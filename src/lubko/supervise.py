@@ -908,8 +908,8 @@ class DesiredIntentError(RuntimeError):
     """Raised when a present desired intent exists but cannot be trusted."""
 
 
-class DesiredCommitConflictError(RuntimeError):
-    """Raised when preserving desired authority forbids changing its commit."""
+class DesiredAuthorityConflictError(RuntimeError):
+    """Raised when existing lifecycle authority forbids desired-state convergence."""
 
 
 def read_desired_strict() -> SupervisorDesired | None:
@@ -1233,6 +1233,32 @@ def read_supervisor_pid() -> tuple[int, int] | None:
 # ---------------------------------------------------------------------------
 
 
+def mission_state_exists_strict() -> bool:
+    """Return whether any durable supervised-deployment mission state exists.
+
+    A mission record is lifecycle authority even when its contents are stale,
+    terminal, or malformed. Callers establishing desired state from genuine
+    absence must therefore distinguish a missing path from every present path
+    and must fail closed when the path itself cannot be inspected.
+
+    Returns:
+        ``True`` when the mission-state path exists in any form, ``False`` only
+        when it is genuinely absent.
+
+    Raises:
+        DesiredIntentError: If the mission-state path cannot be inspected.
+    """
+    path = rollback_state_path()
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        msg = f"cannot inspect supervised deployment mission state: {exc}"
+        raise DesiredIntentError(msg) from exc
+    return True
+
+
 def _mission_generation() -> int:
     """Return the durable supervised-mission generation, or 0 when absent.
 
@@ -1342,7 +1368,7 @@ def ensure_run_intent(
         The existing or newly allocated desired generation.
 
     Raises:
-        DesiredCommitConflictError: If a valid desired intent names another commit.
+        DesiredAuthorityConflictError: If existing lifecycle authority forbids convergence.
     """
     with generation_lock():
         current = read_desired_strict()
@@ -1352,8 +1378,14 @@ def ensure_run_intent(
                     f"supervisor desired commit {current.commit} conflicts with "
                     f"requested commit {commit}"
                 )
-                raise DesiredCommitConflictError(msg)
+                raise DesiredAuthorityConflictError(msg)
             return current.generation
+        if mission_state_exists_strict():
+            msg = (
+                "cannot establish supervisor desired state while supervised deployment "
+                "mission authority exists"
+            )
+            raise DesiredAuthorityConflictError(msg)
         return _write_run_intent_locked(
             commit,
             repo=repo,

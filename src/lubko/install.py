@@ -214,6 +214,15 @@ def _install_refusal(commit: str) -> str | None:
         desired = supervise.read_desired_strict()
     except supervise.DesiredIntentError as exc:
         return "refusing to install with untrusted supervisor desired state: " + str(exc)
+    try:
+        mission_exists = desired is None and supervise.mission_state_exists_strict()
+    except supervise.DesiredIntentError as exc:
+        return "refusing to install with untrusted supervised mission state: " + str(exc)
+    if mission_exists:
+        return (
+            "refusing to establish supervisor desired state while supervised deployment "
+            "mission authority exists"
+        )
     if desired is not None and desired.migration and cli.current_commit() != commit:
         return (
             "refusing to activate a pending cold-migration commit before the supervisor "
@@ -285,7 +294,7 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
         )
     except (
         DurabilityError,
-        supervise.DesiredCommitConflictError,
+        supervise.DesiredAuthorityConflictError,
         supervise.DesiredIntentError,
     ) as exc:
         _err("could not establish supervisor desired state: " + str(exc))
