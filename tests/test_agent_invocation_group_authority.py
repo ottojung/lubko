@@ -1,7 +1,5 @@
 """Fail-closed regressions for durable managed-agent invocation group authority."""
 
-from __future__ import annotations
-
 import pytest
 
 from lubko import agent
