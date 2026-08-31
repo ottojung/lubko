@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from lubko import agent
@@ -187,7 +185,7 @@ def test_leader_marker_state_rejects_malformed_present_markers(
     """Malformed marker metadata yields ambiguity without probing fabricated authority."""
     meta = dict(BASE_META)
     meta[field] = value
-    probes: list[Any] = []
+    probes: list[tuple[int, str]] = []
     monkeypatch.setattr(
         agent,
         "env_has_marker",
