@@ -14,6 +14,12 @@ BASE_META: agent.Meta = {
 }
 
 
+def _record[T, R](calls: list[T], value: T, result: R) -> R:
+    """Record a stub call argument and return its requested result."""
+    calls.append(value)
+    return result
+
+
 @pytest.mark.parametrize("field", ["pid", "pgid"])
 @pytest.mark.parametrize("value", [4242.9, "4242", True, 0, -1])
 def test_group_signal_rejects_malformed_numeric_authority(
@@ -28,12 +34,12 @@ def test_group_signal_rejects_malformed_numeric_authority(
     monkeypatch.setattr(
         agent,
         "open_pidfd",
-        lambda pid: calls.append(("pin", pid)) or None,
+        lambda pid: _record(calls, ("pin", pid), None),
     )
     monkeypatch.setattr(
         agent,
         "_pinned_invocation_members",
-        lambda pgid, _aid, _iid: calls.append(("scan", pgid)) or [],
+        lambda pgid, _aid, _iid: _record(calls, ("scan", pgid), []),
     )
 
     agent.send_signal_group(meta, 15)
@@ -53,12 +59,12 @@ def test_group_signal_rejects_malformed_start_time_authority(
     monkeypatch.setattr(
         agent,
         "open_pidfd",
-        lambda pid: calls.append(("pin", pid)) or None,
+        lambda pid: _record(calls, ("pin", pid), None),
     )
     monkeypatch.setattr(
         agent,
         "_pinned_invocation_members",
-        lambda pgid, _aid, _iid: calls.append(("scan", pgid)) or [],
+        lambda pgid, _aid, _iid: _record(calls, ("scan", pgid), []),
     )
 
     agent.send_signal_group(meta, 15)
@@ -92,11 +98,11 @@ def test_group_signal_rejects_malformed_marker_authority(
     meta = dict(BASE_META)
     meta[field] = value
     calls: list[str] = []
-    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: calls.append("pin") or None)
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: _record(calls, "pin", None))
     monkeypatch.setattr(
         agent,
         "_pinned_invocation_members",
-        lambda _pgid, _aid, _iid: calls.append("scan") or [],
+        lambda _pgid, _aid, _iid: _record(calls, "scan", []),
     )
 
     agent.send_signal_group(meta, 15)
@@ -116,7 +122,7 @@ def test_group_alive_fails_closed_on_malformed_present_pgid(
     monkeypatch.setattr(
         agent,
         "_proven_invocation_members",
-        lambda pgid, _aid, _iid: calls.append(pgid) or ([], True),
+        lambda pgid, _aid, _iid: _record(calls, pgid, ([], True)),
     )
 
     assert agent.group_alive(meta) is True
@@ -144,7 +150,7 @@ def test_group_alive_fails_closed_on_malformed_start_time(
     monkeypatch.setattr(
         agent,
         "_proven_invocation_members",
-        lambda pgid, aid, iid: scans.append((pgid, aid, iid)) or ([], True),
+        lambda pgid, aid, iid: _record(scans, (pgid, aid, iid), ([], True)),
     )
 
     assert agent.group_alive(meta) is True
@@ -166,7 +172,7 @@ def test_group_alive_fails_closed_on_malformed_marker_authority(
     monkeypatch.setattr(
         agent,
         "_proven_invocation_members",
-        lambda pgid, aid, iid: scans.append((pgid, aid, iid)) or ([], True),
+        lambda pgid, aid, iid: _record(scans, (pgid, aid, iid), ([], True)),
     )
 
     assert agent.group_alive(meta) is True
@@ -186,7 +192,7 @@ def test_leader_marker_state_rejects_malformed_present_markers(
     monkeypatch.setattr(
         agent,
         "env_has_marker",
-        lambda pid, aid: probes.append((pid, aid)) or True,
+        lambda pid, aid: _record(probes, (pid, aid), True),
     )
 
     assert agent._leader_marker_state(meta, 4242) is None
@@ -202,7 +208,7 @@ def test_valid_group_authority_still_reaches_exact_member_scan(
     monkeypatch.setattr(
         agent,
         "_pinned_invocation_members",
-        lambda pgid, aid, iid: calls.append((pgid, aid, iid)) or [],
+        lambda pgid, aid, iid: _record(calls, (pgid, aid, iid), []),
     )
 
     agent.send_signal_group(dict(BASE_META), 15)
