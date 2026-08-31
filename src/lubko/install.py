@@ -28,8 +28,9 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from lubko import cli, startup_contract
+from lubko import cli, deployctl, startup_contract, supervise
 from lubko import lifecycle as _lifecycle
+from lubko.durable import DurabilityError
 from lubko.toolchain import UvResolutionError, resolve_uv, write_toolchain
 
 DEFAULT_GIT_TIMEOUT_SECONDS: Final = 10.0
@@ -197,6 +198,40 @@ def _version_change_refusal(commit: str) -> str | None:
     )
 
 
+def _install_refusal(commit: str) -> str | None:
+    """Return why an install must not mutate maintained authority, if so.
+
+    Args:
+        commit: Exact commit the installer wants to activate.
+
+    Returns:
+        A user-facing refusal message, or ``None`` when installation may proceed.
+    """
+    refusal = _version_change_refusal(commit)
+    if refusal is not None:
+        return refusal
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError as exc:
+        return "refusing to install with untrusted supervisor desired state: " + str(exc)
+    try:
+        mission = deployctl.read_rollback_state()
+    except deployctl.DeployCtlError as exc:
+        return "refusing to install with untrusted supervised mission state: " + str(exc)
+    desired_generation = desired.generation if desired is not None else 0
+    if mission is not None and mission.generation >= desired_generation:
+        return (
+            "refusing to install while active supervised deployment mission authority "
+            f"exists at generation {mission.generation}"
+        )
+    if desired is not None and desired.migration and cli.current_commit() != commit:
+        return (
+            "refusing to activate a pending cold-migration commit before the supervisor "
+            "has proven it ready and settled the maintained CLI pointer"
+        )
+    return None
+
+
 def _activate_under_deploy_lock(repo: Path, commit: str, uv_path: str) -> int:
     """Build, activate, and garbage-collect under the deployment lock.
 
@@ -236,7 +271,7 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
     Returns:
         ``EXIT_OK`` on success, ``EXIT_ERROR`` otherwise.
     """
-    refusal = _version_change_refusal(commit)
+    refusal = _install_refusal(commit)
     if refusal is not None:
         _err(refusal)
         return EXIT_ERROR
@@ -250,6 +285,20 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
         cli.set_current(commit)
     except cli.CliError as exc:
         _err("could not activate the maintained CLI environment: " + str(exc))
+        return EXIT_ERROR
+    try:
+        supervise.ensure_run_intent(
+            commit,
+            repo=str(repo),
+            uv_path=uv_path,
+            worker_id=None,
+        )
+    except (
+        DurabilityError,
+        supervise.DesiredAuthorityConflictError,
+        supervise.DesiredIntentError,
+    ) as exc:
+        _err("could not establish supervisor desired state: " + str(exc))
         return EXIT_ERROR
     cli.gc_cli_roots((commit,))
     return EXIT_OK
@@ -276,7 +325,7 @@ def _install_repo(repo: Path, uv: str | None) -> int:
         _err(f"could not read the git commit of {repo}")
         return EXIT_ERROR
 
-    refusal = _version_change_refusal(commit)
+    refusal = _install_refusal(commit)
     if refusal is not None:
         _err(refusal)
         return EXIT_ERROR

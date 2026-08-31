@@ -12,11 +12,13 @@ import os
 import shutil
 import subprocess
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from lubko import cli, install, lifecycle, supervise, toolchain
+from lubko import cli, deployctl, install, lifecycle, supervise, toolchain
+from lubko.state import rollback_state_path
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -170,6 +172,167 @@ def test_gc_preserves_desired_applied_and_override_runtimes(
     cli.remove_cli_root(second)
     assert cli.cli_commit_dir(first).is_dir()
     assert cli.cli_commit_dir(second).is_dir()
+
+
+def test_fresh_install_establishes_supervisor_desired_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful fresh install leaves CLI and desired authority coherent."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_OK
+    assert cli.current_commit() == head
+    desired = supervise.read_desired_strict()
+    assert desired is not None
+    assert desired.commit == head
+    assert desired.generation == 1
+    assert desired.repo == str(repo)
+    assert desired.restart is False
+    assert desired.migration is False
+
+
+def test_same_commit_install_preserves_existing_desired_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idempotent install does not advance or erase same-commit authority."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    existing = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=7,
+        commit=head,
+        repo="/previous/checkout",
+        uv_path="/previous/uv",
+        worker_id="worker-existing",
+        restart=True,
+        requested_at=123.0,
+        migration=False,
+    )
+    supervise.write_desired(existing)
+    monkeypatch.setattr(
+        deployctl,
+        "read_rollback_state",
+        lambda: SimpleNamespace(generation=existing.generation - 1),
+    )
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_OK
+    assert supervise.read_desired_strict() == existing
+    assert cli.current_commit() == head
+
+
+def test_install_fails_closed_on_untrusted_supervised_mission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Malformed mission authority is never treated as absent or stale history."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    mission_path = rollback_state_path()
+    mission_path.parent.mkdir(parents=True, exist_ok=True)
+    mission_path.write_text("{}\n", encoding="utf-8")
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "untrusted supervised mission state" in capsys.readouterr().err
+    assert cli.current_commit() is None
+    assert supervise.read_desired_strict() is None
+
+
+def test_install_does_not_outrank_active_supervised_mission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A mission at or above desired generation remains separate authority."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    desired = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=7,
+        commit=head,
+        repo=str(repo),
+        uv_path="uv",
+        worker_id=None,
+    )
+    supervise.write_desired(desired)
+    monkeypatch.setattr(
+        deployctl,
+        "read_rollback_state",
+        lambda: SimpleNamespace(generation=desired.generation + 1),
+    )
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "active supervised deployment mission authority" in capsys.readouterr().err
+    assert cli.current_commit() is None
+    assert supervise.read_desired_strict() == desired
+
+
+def test_install_preserves_pending_migration_cli_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Install cannot activate a provisional migration target before readiness."""
+    repo, first = make_repo_with_pyproject(tmp_path / "repo")
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.set_current(first)
+    migration = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=7,
+        commit=head,
+        repo=str(repo),
+        uv_path="uv",
+        worker_id=None,
+        migration=True,
+    )
+    supervise.write_desired(migration)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "pending cold-migration commit" in capsys.readouterr().err
+    assert cli.current_commit() == first
+    assert supervise.read_desired_strict() == migration
+
+
+def test_install_fails_closed_on_untrusted_desired_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A malformed durable desired file is never treated as fresh absence."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    supervise.desired_path().parent.mkdir(parents=True, exist_ok=True)
+    supervise.desired_path().write_text("{not-json\\n", encoding="utf-8")
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "untrusted supervisor desired state" in capsys.readouterr().err
+    assert cli.current_commit() is None
 
 
 def test_install_refuses_version_change_over_desired_worker(

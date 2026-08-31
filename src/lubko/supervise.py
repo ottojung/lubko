@@ -51,7 +51,7 @@ from typing import TYPE_CHECKING, Final
 from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
-from lubko.state import state_root
+from lubko.state import rollback_state_path, state_root
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1156,6 +1156,10 @@ class MissionAuthorityError(RuntimeError):
     """Raised when a present supervised-mission authority exists but cannot be trusted."""
 
 
+class DesiredAuthorityConflictError(RuntimeError):
+    """Raised when existing lifecycle authority forbids desired-state convergence."""
+
+
 def read_desired_strict() -> SupervisorDesired | None:
     """Load the desired intent in one authoritative snapshot read.
 
@@ -1500,6 +1504,32 @@ def read_supervisor_pid() -> tuple[int, int] | None:
 # ---------------------------------------------------------------------------
 
 
+def mission_state_exists_strict() -> bool:
+    """Return whether any durable supervised-deployment mission state exists.
+
+    A mission record is lifecycle authority even when its contents are stale,
+    terminal, or malformed. Callers establishing desired state from genuine
+    absence must therefore distinguish a missing path from every present path
+    and must fail closed when the path itself cannot be inspected.
+
+    Returns:
+        ``True`` when the mission-state path exists in any form, ``False`` only
+        when it is genuinely absent.
+
+    Raises:
+        DesiredIntentError: If the mission-state path cannot be inspected.
+    """
+    path = rollback_state_path()
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        msg = f"cannot inspect supervised deployment mission state: {exc}"
+        raise DesiredIntentError(msg) from exc
+    return True
+
+
 def _mission_generation() -> int:
     """Return the durable supervised-mission generation, or 0 when absent.
 
@@ -1562,6 +1592,93 @@ def next_generation() -> int:
     return max(applied, desired_generation, _mission_generation()) + 1
 
 
+def _write_run_intent_locked(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+    restart: bool,
+) -> int:
+    """Write one fresh run intent while the generation lock is held.
+
+    Args:
+        commit: Exact confirmed commit to run.
+        repo: Maintained checkout the commit belongs to.
+        uv_path: Resolved ``uv`` executable (recorded for coherence).
+        worker_id: Worker identifier to hand to the worker.
+        restart: Whether the intent explicitly replaces an existing process.
+
+    Returns:
+        The generation of the written intent.
+    """
+    generation = next_generation()
+    write_desired(
+        SupervisorDesired(
+            schema_version=SCHEMA_VERSION,
+            generation=generation,
+            commit=commit,
+            repo=repo,
+            uv_path=uv_path,
+            worker_id=worker_id,
+            restart=restart,
+            requested_at=time.time(),
+        )
+    )
+    return generation
+
+
+def ensure_run_intent(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+) -> int:
+    """Ensure durable desired authority names ``commit`` without restarting it.
+
+    Genuine absence gets a fresh run intent. An existing same-commit intent is
+    returned unchanged, including its generation and any restart or migration
+    obligation, so an idempotent repair cannot accidentally replay or erase a
+    lifecycle transition. A different or malformed durable intent fails closed.
+
+    Args:
+        commit: Exact commit that must be durable supervisor authority.
+        repo: Maintained checkout the commit belongs to when a new intent is needed.
+        uv_path: Resolved ``uv`` executable for a newly written intent.
+        worker_id: Worker identifier for a newly written intent.
+
+    Returns:
+        The existing or newly allocated desired generation.
+
+    Raises:
+        DesiredAuthorityConflictError: If existing lifecycle authority forbids convergence.
+    """
+    with generation_lock():
+        current = read_desired_strict()
+        if current is not None:
+            if current.commit != commit:
+                msg = (
+                    f"supervisor desired commit {current.commit} conflicts with "
+                    f"requested commit {commit}"
+                )
+                raise DesiredAuthorityConflictError(msg)
+            return current.generation
+        if mission_state_exists_strict():
+            msg = (
+                "cannot establish supervisor desired state while supervised deployment "
+                "mission authority exists"
+            )
+            raise DesiredAuthorityConflictError(msg)
+        return _write_run_intent_locked(
+            commit,
+            repo=repo,
+            uv_path=uv_path,
+            worker_id=worker_id,
+            restart=False,
+        )
+
+
 def request_run(
     commit: str,
     *,
@@ -1585,20 +1702,13 @@ def request_run(
         The generation of the written intent.
     """
     with generation_lock():
-        generation = next_generation()
-        write_desired(
-            SupervisorDesired(
-                schema_version=SCHEMA_VERSION,
-                generation=generation,
-                commit=commit,
-                repo=repo,
-                uv_path=uv_path,
-                worker_id=worker_id,
-                restart=restart,
-                requested_at=time.time(),
-            )
+        return _write_run_intent_locked(
+            commit,
+            repo=repo,
+            uv_path=uv_path,
+            worker_id=worker_id,
+            restart=restart,
         )
-    return generation
 
 
 def request_restart(
