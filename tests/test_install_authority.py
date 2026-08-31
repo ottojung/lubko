@@ -203,7 +203,7 @@ def test_same_commit_install_preserves_existing_desired_intent(
         worker_id="worker-existing",
         restart=True,
         requested_at=123.0,
-        migration=True,
+        migration=False,
     )
     supervise.write_desired(existing)
 
@@ -212,6 +212,37 @@ def test_same_commit_install_preserves_existing_desired_intent(
     assert code == install.EXIT_OK
     assert supervise.read_desired_strict() == existing
     assert cli.current_commit() == head
+
+
+def test_install_preserves_pending_migration_cli_hold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Install cannot activate a provisional migration target before readiness."""
+    repo, first = make_repo_with_pyproject(tmp_path / "repo")
+    head = git("rev-parse", "HEAD", cwd=repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    cli.build_cli_root(repo, first, "uv", 60.0)
+    cli.set_current(first)
+    migration = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=7,
+        commit=head,
+        repo=str(repo),
+        uv_path="uv",
+        worker_id=None,
+        migration=True,
+    )
+    supervise.write_desired(migration)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    assert "pending cold-migration commit" in capsys.readouterr().err
+    assert cli.current_commit() == first
+    assert supervise.read_desired_strict() == migration
 
 
 def test_install_fails_closed_on_untrusted_desired_intent(

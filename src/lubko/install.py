@@ -198,6 +198,30 @@ def _version_change_refusal(commit: str) -> str | None:
     )
 
 
+def _install_refusal(commit: str) -> str | None:
+    """Return why an install must not mutate maintained authority, if so.
+
+    Args:
+        commit: Exact commit the installer wants to activate.
+
+    Returns:
+        A user-facing refusal message, or ``None`` when installation may proceed.
+    """
+    refusal = _version_change_refusal(commit)
+    if refusal is not None:
+        return refusal
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError as exc:
+        return "refusing to install with untrusted supervisor desired state: " + str(exc)
+    if desired is not None and desired.migration and cli.current_commit() != commit:
+        return (
+            "refusing to activate a pending cold-migration commit before the supervisor "
+            "has proven it ready and settled the maintained CLI pointer"
+        )
+    return None
+
+
 def _activate_under_deploy_lock(repo: Path, commit: str, uv_path: str) -> int:
     """Build, activate, and garbage-collect under the deployment lock.
 
@@ -237,14 +261,9 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
     Returns:
         ``EXIT_OK`` on success, ``EXIT_ERROR`` otherwise.
     """
-    refusal = _version_change_refusal(commit)
+    refusal = _install_refusal(commit)
     if refusal is not None:
         _err(refusal)
-        return EXIT_ERROR
-    try:
-        supervise.read_desired_strict()
-    except supervise.DesiredIntentError as exc:
-        _err("refusing to install with untrusted supervisor desired state: " + str(exc))
         return EXIT_ERROR
     try:
         cli.build_cli_root(repo, commit, uv_path, cli.DEFAULT_BUILD_TIMEOUT_SECONDS)
@@ -296,7 +315,7 @@ def _install_repo(repo: Path, uv: str | None) -> int:
         _err(f"could not read the git commit of {repo}")
         return EXIT_ERROR
 
-    refusal = _version_change_refusal(commit)
+    refusal = _install_refusal(commit)
     if refusal is not None:
         _err(refusal)
         return EXIT_ERROR
