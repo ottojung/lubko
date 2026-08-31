@@ -3680,13 +3680,13 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     or future statuses are retained.  Abandoned ``running`` rows are handled
     by :func:`recover_stale_jobs`.
 
-    **Phase 2 — Chunk drain + root finalization** (one transaction per batch):
-    For each GC-marked root, a bounded batch of its owned chunks (via
-    ``thread``) is deleted using ``FOR UPDATE SKIP LOCKED``, capped at
-    ``gc_batch_limit`` rows.  This keeps rows/transaction/lock duration
-    bounded even when a single root owns millions of chunks.  After bounded
-    chunk deletion, if no chunks remain for a root, the root row itself is
-    deleted.  The root only disappears after its chunks are drained, which
+    **Phase 2 — Chunk drain + root finalization** (one transaction): Exactly
+    one GC-marked root is selected and at most ``gc_batch_limit`` of its owned
+    chunks (via ``thread``) are deleted using ``FOR UPDATE SKIP LOCKED``.
+    Processing one root gives the pass a constant SQL-round-trip bound; the
+    batch limit cannot multiply into work for many roots. After bounded chunk
+    deletion, the root is deleted if no chunks remain. The root only
+    disappears after its chunks are drained, which
     preserves the documented root-first/publication-safety invariant: the
     ``gc`` flag prevents new chunks, and the root is removed once all chunks
     from the marking snapshot are gone.
@@ -3761,8 +3761,8 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    AND ((payload::jsonb)->'state'->>'gc') = 'true'\n"
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
-            "LIMIT %(limit)s\n",
-            {"server": settings.server, "limit": settings.gc_batch_limit},
+            "LIMIT 1\n",
+            {"server": settings.server},
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
         for root_id in gc_roots:
@@ -3788,22 +3788,20 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             total_chunks += cursor.rowcount
             # Delete root only if no chunks remain.
             cursor.execute(
-                "SELECT NOT EXISTS (\n"
-                "    SELECT 1\n"
-                "    FROM lubko.jobs\n"
-                "    WHERE (payload::jsonb)->>'type' = 'output_chunk'\n"
-                "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
-                "        AND lower((payload::jsonb)->>'thread') = lower(%(thread)s)\n"
-                ")\n",
-                {"server": settings.server, "thread": str(root_id)},
+                "DELETE FROM lubko.jobs AS root\n"
+                "WHERE root.id = %(job_id)s\n"
+                "    AND NOT EXISTS (\n"
+                "        SELECT 1\n"
+                "        FROM lubko.jobs AS chunk\n"
+                "        WHERE chunk.payload::jsonb->>'type' = 'output_chunk'\n"
+                "            AND "
+                + SERVER_MATCH_SQL.replace("payload", "chunk.payload")
+                + "%(server)s\n"
+                "            AND lower(chunk.payload::jsonb->>'thread') = lower(%(thread)s)\n"
+                "    )\n",
+                {"job_id": root_id, "server": settings.server, "thread": str(root_id)},
             )
-            no_chunks = cursor.fetchone()
-            if no_chunks is not None and no_chunks[0]:
-                cursor.execute(
-                    "DELETE FROM lubko.jobs\nWHERE id = %(job_id)s\n",
-                    {"job_id": root_id},
-                )
-                roots_deleted += cursor.rowcount
+            roots_deleted += cursor.rowcount
 
     # --- Phase 3: bounded orphan cleanup ---
     # Cast-free, case-normalized comparison: lower(root.id::text) = lower(thread).
@@ -4127,11 +4125,14 @@ class Supervisor:
         self._publish_all(now)
         self._finalize_completed()
         self._retry_terminalizations()
+        if not self._stopping:
+            self._claim_batch()
+        # Optional maintenance follows claiming. Even if the connection fails
+        # or its lease-safe deadline is reached during GC, pending queue work
+        # has already received its bounded opportunity in this turn.
         if now >= self._next_gc_at:
             self._run_gc()
             self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
-        if not self._stopping:
-            self._claim_batch()
 
     def _drain_captures(self, bound: int | None = None) -> None:
         """Drain every active job's capture pipes into their bounded spools.
@@ -4362,8 +4363,8 @@ class Supervisor:
     def _run_gc(self) -> None:
         """Run the transport garbage collection pass.
 
-        Three-phase staged GC: mark terminal roots, drain their chunks in
-        bounded batches, finalize root deletion, then clean orphan chunks.
+        Three-phase staged GC: mark terminal roots, drain one root's chunks in
+        a bounded batch, finalize that root when empty, then clean orphan chunks.
         Abandoned ``running`` rows go through lease recovery first.
         ``pending`` and ``running`` rows are never collected.
         """

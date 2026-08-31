@@ -403,12 +403,12 @@ explicitly refuses GC-marked roots (`WHERE ... IS DISTINCT FROM 'true'`), so
 no new `output_chunk` rows can be created for them after the mark commits.
 Unknown or future status values are retained, not collected.
 
-**Phase 2 — Chunk drain + root finalization** (one transaction per batch):
-For each GC-marked root, a bounded batch of its owned chunks (via `thread`) is
-deleted using `FOR UPDATE SKIP LOCKED`, capped at `LUBKO_GC_BATCH_LIMIT` rows.
-This keeps rows, transaction size, and lock duration bounded even when a single
-root owns millions of chunks. After bounded chunk deletion, if no chunks remain
-for a root, the root row itself is deleted. The root only disappears after its
+**Phase 2 — Chunk drain + root finalization** (one transaction): Exactly one
+GC-marked root is selected, and at most `LUBKO_GC_BATCH_LIMIT` of its owned
+chunks (via `thread`) are deleted using `FOR UPDATE SKIP LOCKED`. Processing
+one root makes the number of SQL round trips per pass constant instead of
+multiplying the batch limit by the number of selected roots. If no chunks
+remain, the root row itself is deleted. The root only disappears after its
 chunks are drained, which preserves the root-first publication-safety invariant:
 the `gc` flag prevents new chunks, and the root is removed once all chunks from
 the marking snapshot are gone.
@@ -422,7 +422,9 @@ rows are deleted in one bounded `DELETE`. This pass is safe without root-first
 ordering: the owning root is already gone, so no concurrent publication can
 create new chunks for it.
 
-All three phases run every `LUBKO_GC_INTERVAL_SECONDS` (default 60) and log
+Claiming runs before these optional phases, so a GC backlog cannot prevent a
+pending job from receiving a claim opportunity. All three phases run every
+`LUBKO_GC_INTERVAL_SECONDS` (default 60) and log
 only aggregate counts of roots marked, chunks deleted, and orphans cleaned,
 never job contents or secrets. The pass is idempotent under multiple workers
 and restarts.
