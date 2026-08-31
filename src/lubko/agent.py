@@ -63,6 +63,7 @@ HEX_DIGITS: Final = frozenset("0123456789abcdef")
 # tree, so signalling can never cross an invocation boundary even when the OS
 # recycles a process-group ID into a newer invocation of the same agent.
 INVOCATION_ID_VAR: Final = "LUBKO_INVOCATION_ID"
+INVOCATION_ID_HEX_LENGTH: Final = 32
 
 # ``SYS_pidfd_open`` uses the unified syscall number 434 on every architecture
 # with a shared generic syscall table (x86_64, aarch64, riscv64, arm32, ppc64,
@@ -615,32 +616,33 @@ def send_signal_group(meta: Meta, sig: int) -> None:
         meta: Agent metadata.
         sig: Signal to deliver.
     """
-    leader = meta.get("pid")
-    aid = str(meta.get("id", ""))
-    iid = meta.get("invocation_id")
-    pgid = meta.get("pgid") or leader
-    if not pgid or iid is None or not aid:
+    leader = _process_identity_int(meta.get("pid"), minimum=1)
+    start_time = _process_identity_int(meta.get("start_time"), minimum=0)
+    aid = _persisted_agent_id(meta.get("id"))
+    iid = _persisted_invocation_id(meta.get("invocation_id"))
+    raw_pgid = meta.get("pgid")
+    pgid = leader if raw_pgid is None else _process_identity_int(raw_pgid, minimum=1)
+    if leader is None or start_time is None or pgid is None or aid is None or iid is None:
         return
-    if leader:
-        fd = open_pidfd(int(leader))
-        if fd is not None:
-            try:
-                verified = proc_start_ticks(int(leader)) == meta.get(
-                    "start_time"
-                ) and env_has_marker(int(leader), aid)
-                if verified and iid is not None:
-                    verified = env_has_invocation(int(leader), str(iid))
-                if verified:
-                    # Deliver through the pin itself: a numeric killpg on the
-                    # recorded group could retarget after PGID reuse.
-                    with contextlib.suppress(OSError, AttributeError):
-                        pidfd_send_signal(fd, sig)
-            finally:
-                os.close(fd)
+    fd = open_pidfd(leader)
+    if fd is not None:
+        try:
+            verified = (
+                proc_start_ticks(leader) == start_time
+                and env_has_marker(leader, aid)
+                and env_has_invocation(leader, iid)
+            )
+            if verified:
+                # Deliver through the pin itself: a numeric killpg on the
+                # recorded group could retarget after PGID reuse.
+                with contextlib.suppress(OSError, AttributeError):
+                    pidfd_send_signal(fd, sig)
+        finally:
+            os.close(fd)
     # Converge surviving members of the recorded group through the exact
     # per-member pinned path — only with a durable invocation-specific
     # identity to authorize them.
-    for _member, member_fd in _pinned_invocation_members(int(pgid), aid, str(iid)):
+    for _member, member_fd in _pinned_invocation_members(pgid, aid, iid):
         try:
             with contextlib.suppress(OSError, AttributeError):
                 pidfd_send_signal(member_fd, sig)
@@ -720,6 +722,24 @@ def _process_identity_int(value: object, *, minimum: int) -> int | None:
     can name a process or establish a start-time match.
     """
     if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        return None
+    return value
+
+
+def _persisted_agent_id(value: object) -> str | None:
+    """Return an already-canonical persisted agent ID without normalizing it."""
+    if not isinstance(value, str) or normalize_agent_id(value) != value:
+        return None
+    return value
+
+
+def _persisted_invocation_id(value: object) -> str | None:
+    """Return an exact canonical UUID-hex invocation marker."""
+    if (
+        not isinstance(value, str)
+        or len(value) != INVOCATION_ID_HEX_LENGTH
+        or any(char not in HEX_DIGITS for char in value)
+    ):
         return None
     return value
 
@@ -809,10 +829,15 @@ def _leader_marker_state(meta: Meta, pid: int) -> str | None:
         ``"live"``/``"gone"`` when markers positively decide, ``None`` when
         marker inspection is ambiguous and the caller must stay conservative.
     """
-    aid = str(meta.get("id", ""))
-    iid = meta.get("invocation_id")
-    if iid is None:
+    aid = _persisted_agent_id(meta.get("id"))
+    if aid is None:
+        return None
+    iid_raw = meta.get("invocation_id")
+    if iid_raw is None:
         return "live" if env_has_marker(pid, aid) else "gone"
+    iid = _persisted_invocation_id(iid_raw)
+    if iid is None:
+        return None
     try:
         environ = Path(f"/proc/{pid}/environ").read_bytes()
     except FileNotFoundError:
@@ -827,7 +852,7 @@ def _leader_marker_state(meta: Meta, pid: int) -> str | None:
     return "live" if exact else "gone"
 
 
-def group_alive(meta: Meta) -> bool:
+def group_alive(meta: Meta) -> bool:  # ruff: ignore[too-many-return-statements]
     """Return whether any live process remains in the agent's exact invocation group.
 
     When a durable invocation ID was recorded, group membership is decided by
@@ -846,12 +871,21 @@ def group_alive(meta: Meta) -> bool:
         ``True`` when the recorded invocation still has live group members,
         or when their absence could not be positively proven.
     """
-    pgid = meta.get("pgid")
-    if not pgid:
+    raw_pgid = meta.get("pgid")
+    if raw_pgid is None:
         return False
-    iid = meta.get("invocation_id")
-    if iid is None:
-        return bool(group_has_members(int(pgid)))
+    pgid = _process_identity_int(raw_pgid, minimum=1)
+    if pgid is None:
+        return True
+    iid_raw = meta.get("invocation_id")
+    if iid_raw is None:
+        return bool(group_has_members(pgid))
+    aid = _persisted_agent_id(meta.get("id"))
+    iid = _persisted_invocation_id(iid_raw)
+    leader = _process_identity_int(meta.get("pid"), minimum=1)
+    start_time = _process_identity_int(meta.get("start_time"), minimum=0)
+    if aid is None or iid is None or leader is None or start_time is None:
+        return True
     if is_alive(meta):
         # The verified live leader implies its whole session group.
         return True
@@ -861,7 +895,7 @@ def group_alive(meta: Meta) -> bool:
         # (e.g. unreadable environ with matching start ticks) must never be
         # collapsed into a proven-dead group.
         return True
-    fds, complete = _proven_invocation_members(int(pgid), str(meta.get("id", "")), str(iid))
+    fds, complete = _proven_invocation_members(pgid, aid, iid)
     for _, fd in fds:
         os.close(fd)
     if not complete:
