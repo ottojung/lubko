@@ -85,7 +85,7 @@ MALFORMED_MARKERS = [
 ]
 
 
-@pytest.mark.parametrize("field,value", MALFORMED_MARKERS)
+@pytest.mark.parametrize(("field", "value"), MALFORMED_MARKERS)
 def test_group_signal_rejects_malformed_marker_authority(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
@@ -154,7 +154,7 @@ def test_group_alive_fails_closed_on_malformed_start_time(
     assert scans == []
 
 
-@pytest.mark.parametrize("field,value", MALFORMED_MARKERS)
+@pytest.mark.parametrize(("field", "value"), MALFORMED_MARKERS)
 def test_group_alive_fails_closed_on_malformed_marker_authority(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
@@ -176,7 +176,7 @@ def test_group_alive_fails_closed_on_malformed_marker_authority(
     assert scans == []
 
 
-@pytest.mark.parametrize("field,value", MALFORMED_MARKERS)
+@pytest.mark.parametrize(("field", "value"), MALFORMED_MARKERS)
 def test_leader_marker_state_rejects_malformed_present_markers(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
