@@ -4769,9 +4769,6 @@ class Supervisor:
         if now >= self._next_gc_at:
             self._run_gc()
             self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
-        if now >= self._next_reaper_at:
-            self._run_reaper()
-            self._next_reaper_at = time.monotonic() + self.settings.gc_interval_seconds
 
     def _drain_captures(self, bound: int | None = None) -> None:
         """Drain every active job's capture pipes into their bounded spools.
