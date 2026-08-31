@@ -15,7 +15,11 @@ BASE_META: agent.Meta = {
 
 
 def _record[T, R](calls: list[T], value: T, result: R) -> R:
-    """Record a stub call argument and return its requested result."""
+    """Record a stub call argument and return its requested result.
+
+    Returns:
+        The supplied stub result.
+    """
     calls.append(value)
     return result
 
@@ -192,7 +196,7 @@ def test_leader_marker_state_rejects_malformed_present_markers(
     monkeypatch.setattr(
         agent,
         "env_has_marker",
-        lambda pid, aid: _record(probes, (pid, aid), True),
+        lambda pid, aid: _record(probes, (pid, aid), result=True),
     )
 
     assert agent._leader_marker_state(meta, 4242) is None
