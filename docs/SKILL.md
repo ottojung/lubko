@@ -1122,7 +1122,7 @@ The maintained commands (`lubko-agent`, `lubko-worker`, `lubko-supervisor`, `lub
 lubko-install --repo /workspace/.lubko-deployment
 ```
 
-`lubko-install` writes a small stable **launcher** for each maintained command and activates the per-commit CLI environment of the given checkout, so every global command resolves to exactly the maintained commit. The global commands never become stale after a version-changing deployment: `lubko-deploy deploy` and the supervised `lubko-deploy-ctl` protocol build and activate the CLI environment for the confirmed commit themselves, switching only an atomic `current` pointer and never rewriting the launchers. `lubko-deploy-ctl status`/`checkout` also reconcile a stale pointer idempotently on each invocation, so a process crash between durable confirmation and the pointer switch cannot leave a confirmed worker with stale CLIs past the next status/checkout (and never points the CLIs at a provisional candidate). `my-lubko-agent` remains available as a transition alias for the same `lubko-agent` interface.
+`lubko-install` writes a small stable **launcher** for each maintained command, activates the per-commit CLI environment of the given checkout, and establishes the same exact commit as the supervisor's durable desired run intent. A same-commit reinstall is an idempotent repair: it preserves an existing desired generation and lifecycle flags rather than manufacturing a restart. It also preserves the cold-migration safety boundary: a provisional `migration` intent cannot move `cli/current` ahead of the supervisor's readiness proof. The global commands never become stale after a version-changing deployment: `lubko-deploy deploy` and the supervised `lubko-deploy-ctl` protocol build and activate the CLI environment for the confirmed commit themselves, switching only an atomic `current` pointer and never rewriting the launchers. `lubko-deploy-ctl status`/`checkout` also reconcile a stale pointer idempotently on each invocation, so a process crash between durable confirmation and the pointer switch cannot leave a confirmed worker with stale CLIs past the next status/checkout (and never points the CLIs at a provisional candidate). `my-lubko-agent` remains available as a transition alias for the same `lubko-agent` interface.
 
 The exact `uv` executable a successful install used is recorded in `$XDG_STATE_HOME/lubko/toolchain.json`, so `lubko-deploy deploy` keeps working even when `uv` is no longer on PATH. To reinstall when `uv` is off PATH, pass the known working path explicitly:
 
@@ -1130,11 +1130,16 @@ The exact `uv` executable a successful install used is recorded in `$XDG_STATE_H
 lubko-install --repo /workspace/.lubko-deployment --uv /absolute/path/to/uv
 ```
 
-Install from a *clean, exact-commit* deployment checkout (for example `/workspace/.lubko-deployment`), never from the dirty development checkout (`/workspace/Lubko`): deployments keep the CLIs coherent with the confirmed worker commit, and installing from a dirty dev checkout would re-point them at unconfirmed code. On a fresh system before the first maintained CLI environment exists, run the commands through a checkout's own virtualenv (for example `uv run --project /workspace/.lubko-deployment lubko-deploy deploy --bootstrap`).
+Install from a *clean, exact-commit* deployment checkout (for example `/workspace/.lubko-deployment`), never from the dirty development checkout (`/workspace/Lubko`): deployments keep the CLIs coherent with the confirmed worker commit, and installing from a dirty dev checkout would re-point them at unconfirmed code. On a fresh system before the first maintained CLI environment exists, run installation through the checkout's own virtualenv and then start the supervisor; installation itself establishes the initial durable desired commit, so no separate migration/bootstrap lifecycle command is needed:
+
+```sh
+uv run --project /workspace/.lubko-deployment lubko-install --repo /workspace/.lubko-deployment
+exec lubko-supervisor
+```
 
 ## Supervised version-changing deployments
 
-A fresh environment may establish its first maintained worker with ordinary `lubko-deploy`. Once a known-good maintained worker exists, use `lubko-deploy-ctl` for version-changing self-deployments; see [`docs/issue21-deploy-protocol.md`](issue21-deploy-protocol.md).
+After a fresh install has established the first desired commit and the supervisor owns the maintained worker, use `lubko-deploy-ctl` for version-changing self-deployments; see [`docs/issue21-deploy-protocol.md`](issue21-deploy-protocol.md).
 
 The normal supervised sequence is:
 
