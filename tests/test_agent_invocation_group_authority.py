@@ -1,7 +1,6 @@
 """Fail-closed regressions for durable managed-agent invocation group authority."""
 
 import pytest
-
 from lubko import agent
 
 
