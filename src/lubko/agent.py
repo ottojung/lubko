@@ -3594,6 +3594,17 @@ def _list_entries(args: argparse.Namespace) -> list[tuple[str, str, Meta]]:
     return entries
 
 
+def _summary_timestamp(meta: Meta, field: str, errors: list[str]) -> int | float | None:
+    """Return one finite persisted summary timestamp without coercion."""
+    raw = meta.get(field)
+    if raw is None:
+        return None
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(raw):
+        errors.append(field)
+        return None
+    return raw
+
+
 def _list_summary(
     meta: Meta,
 ) -> tuple[int | float | None, int | None, str | None, str | None, list[str]]:
@@ -3604,17 +3615,7 @@ def _list_summary(
     """
     errors: list[str] = []
 
-    created_at: int | float | None = None
-    raw_created_at = meta.get("created_at")
-    if raw_created_at is not None:
-        if (
-            not isinstance(raw_created_at, (int, float))
-            or isinstance(raw_created_at, bool)
-            or not math.isfinite(raw_created_at)
-        ):
-            errors.append("created_at")
-        else:
-            created_at = raw_created_at
+    created_at = _summary_timestamp(meta, "created_at", errors)
 
     prompt_count: int | None = None
     if "prompt_count" in meta:
@@ -3641,6 +3642,28 @@ def _list_summary(
             title = raw_title
 
     return created_at, prompt_count, cwd, title, errors
+
+
+def _status_summary(
+    meta: Meta,
+) -> tuple[
+    int | float | None,
+    int | float | None,
+    int | float | None,
+    int | None,
+    str | None,
+    str | None,
+    list[str],
+]:
+    """Validate persisted metadata shared by list and status surfaces.
+
+    Returns:
+        Canonical status summary values plus malformed field names.
+    """
+    created_at, prompt_count, cwd, title, errors = _list_summary(meta)
+    started_at = _summary_timestamp(meta, "started_at", errors)
+    finished_at = _summary_timestamp(meta, "finished_at", errors)
+    return created_at, started_at, finished_at, prompt_count, cwd, title, errors
 
 
 def _entry_json(aid: str, state: str, meta: Meta) -> Meta:
@@ -3696,7 +3719,7 @@ def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
         _out("  ".join(row[i].ljust(widths[i]) for i in range(6)))
 
 
-def cmd_status(args: argparse.Namespace) -> int:
+def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals]
     """Show detailed status of one agent.
 
     Args:
@@ -3724,23 +3747,29 @@ def cmd_status(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     log_path = agent_dir(aid) / "output.log"
+    created_at, started_at, finished_at, prompt_count, cwd, title, metadata_errors = (
+        _status_summary(meta)
+    )
+    error_fields = set(metadata_errors)
     _out(f"agent:      {aid}")
     _out(f"state:      {state}")
     _out(f"alive:      {'yes' if alive else 'no'}")
     _out(f"cpu:        {fmt_cpu(_status_cpu_seconds(meta, alive=alive))}")
-    _out(f"cwd:        {meta.get('cwd') or '-'}")
-    _out(f"created:    {fmt_time(meta.get('created_at'))}")
-    _out(f"started:    {fmt_time(meta.get('started_at'))}")
-    _out(f"finished:   {fmt_time(meta.get('finished_at'))}")
+    _out(f"cwd:        {'<invalid>' if 'cwd' in error_fields else cwd or '-'}")
+    _out(f"created:    {'<invalid>' if 'created_at' in error_fields else fmt_time(created_at)}")
+    _out(f"started:    {'<invalid>' if 'started_at' in error_fields else fmt_time(started_at)}")
+    _out(f"finished:   {'<invalid>' if 'finished_at' in error_fields else fmt_time(finished_at)}")
     exit_code = meta.get("exit_code")
     _out(f"exit code:  {exit_code if exit_code is not None else '-'}")
-    _out(f"prompts:    {meta.get('prompt_count') or 0}")
+    _out(f"prompts:    {'<invalid>' if 'prompt_count' in error_fields else prompt_count or 0}")
     steers, steer_error = _status_steer_queue(meta)
     if steer_error is not None:
         _out(f"steers:     {steer_error}")
     elif steers:
         _out(f"steers:     {len(steers)} queued: {_first_line(steers[0]['prompt'])}")
-    _out(f"title:      {meta.get('title') or '-'}")
+    _out(f"title:      {'<invalid>' if 'title' in error_fields else title or '-'}")
+    if metadata_errors:
+        _out(f"metadata:   malformed persisted summary metadata: {', '.join(metadata_errors)}")
     _out("tail(log):")
     excerpt = log_excerpt(log_path, STATUS_TAIL_LINES)
     if excerpt:
@@ -3791,7 +3820,10 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         The JSON-safe mapping.
     """
     steers, steer_error = _status_steer_queue(meta)
-    return {
+    created_at, started_at, finished_at, prompt_count, cwd, title, metadata_errors = (
+        _status_summary(meta)
+    )
+    status = {
         "id": aid,
         "state": state,
         "alive": alive,
@@ -3800,15 +3832,15 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "pid": meta.get("pid"),
         "pgid": meta.get("pgid"),
         "runner_pid": meta.get("runner_pid"),
-        "cwd": meta.get("cwd"),
-        "title": meta.get("title"),
-        "created_at": meta.get("created_at"),
-        "started_at": meta.get("started_at"),
-        "finished_at": meta.get("finished_at"),
+        "cwd": cwd,
+        "title": title,
+        "created_at": created_at,
+        "started_at": started_at,
+        "finished_at": finished_at,
         "last_activity_at": meta.get("last_activity_at"),
         "exit_code": meta.get("exit_code"),
         "exit_signal": meta.get("exit_signal"),
-        "prompts": meta.get("prompt_count"),
+        "prompts": prompt_count,
         "steers_pending": len(steers) if steers is not None else None,
         "next_steer": _first_line(steers[0]["prompt"]) if steers else None,
         "steer_metadata_error": steer_error,
@@ -3816,6 +3848,9 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "variant": meta.get("variant"),
         "log": str(agent_dir(aid) / "output.log"),
     }
+    if metadata_errors:
+        status["metadata_errors"] = metadata_errors
+    return status
 
 
 def _tail_logical_lines(path: Path, count: int) -> list[str]:
