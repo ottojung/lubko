@@ -2259,12 +2259,12 @@ def _clear_unresolved(aid: str, pid: int, start: object, iid: str) -> None:
     """
 
     def clear(m: Meta) -> None:
-        cur = m.get("unresolved_invocation")
+        cur = _persisted_unresolved_identity(m.get("unresolved_invocation"))
         if (
-            isinstance(cur, dict)
-            and cur.get("pid") == pid
-            and cur.get("start_time") == start
-            and cur.get("invocation_id") == iid
+            cur is not None
+            and cur["pid"] == pid
+            and cur["start_time"] == start
+            and cur["invocation_id"] == iid
         ):
             m["unresolved_invocation"] = None
 
@@ -2332,65 +2332,60 @@ def _unresolved_leader_state(rec: Meta) -> str | None:
     return None  # leader positively recycled by an unrelated occupant
 
 
+def _persisted_unresolved_identity(value: object) -> Meta | None:
+    """Return one canonical durable unresolved-invocation identity.
+
+    Malformed present authority must never participate in liveness or cleanup
+    through Python coercion or equality.
+    """
+    if not isinstance(value, dict):
+        return None
+    rec = cast("Meta", value)
+    if (
+        _process_identity_int(rec.get("pid"), minimum=1) is None
+        or _process_identity_int(rec.get("pgid"), minimum=1) is None
+        or _process_identity_int(rec.get("start_time"), minimum=0) is None
+        or _persisted_invocation_id(rec.get("invocation_id")) is None
+    ):
+        return None
+    return rec
+
+
 def _unresolved_child_state(m: Meta) -> str:
     """Classify the exact recorded unresolved invocation's survival evidence.
 
-    Returns ``"live"``, ``"gone"``, or ``"ambiguous"``. The obligation spans
-    the whole recorded invocation *group*, not just its leader: leader death
-    or PID recycling alone never proves it gone, because genuine descendants
-    can survive in the old process group. The record is gone only when the
-    leader is positively dead/recycled *and* a complete pinned per-invocation
-    scan finds no surviving member carrying both the agent marker and the
-    exact invocation marker (a recycled PGID hosting a foreign invocation
-    never counts). Anything uninspectable — unreadable procfs, permission
-    failures, malformed persisted state — stays ambiguous so the block never
-    fails open.
+    The obligation spans the whole recorded invocation group, not just its
+    leader: leader death or PID recycling alone never proves it gone because
+    genuine descendants can survive in the old process group. The record is
+    gone only when the leader is positively dead or recycled and a complete
+    pinned per-invocation scan finds no surviving exact-marker member. Any
+    uninspectable or malformed durable evidence remains ambiguous.
 
     Args:
         m: Agent metadata.
 
     Returns:
-        The evidence classification.
+        ``"live"``, ``"gone"``, or ``"ambiguous"`` according to exact survival evidence.
     """
-    rec = m.get("unresolved_invocation")
-    if rec is None:
+    raw = m.get("unresolved_invocation")
+    if raw is None:
         return "gone"
-
-    def valid_identity(value: object) -> bool:
-        """Whether ``value`` is a well-formed persisted identity field.
-
-        Args:
-            value: The persisted field value.
-
-        Returns:
-            ``True`` for a positive non-bool integer.
-        """
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-    well_formed = (
-        isinstance(rec, dict)
-        and valid_identity(rec.get("pid"))
-        and isinstance(rec.get("start_time"), int)
-        and not isinstance(rec.get("start_time"), bool)
-        and valid_identity(rec.get("pgid"))
-        and isinstance(rec.get("invocation_id"), str)
-        and bool(rec["invocation_id"])
-    )
-    if not well_formed:
-        return "ambiguous"  # malformed persisted state fails closed
+    rec = _persisted_unresolved_identity(raw)
+    if rec is None:
+        return "ambiguous"
     leader_state = _unresolved_leader_state(rec)
     if leader_state is not None:
         return leader_state
     aid = _persisted_agent_id(m.get("id"))
     if aid is None:
         return "ambiguous"
-    pgid: int = rec["pgid"]
-    iid: str = rec["invocation_id"]
+    pgid = cast("int", rec["pgid"])
+    iid = cast("str", rec["invocation_id"])
     members, complete = _proven_invocation_members(pgid, aid, iid)
     for _, fd in members:
         os.close(fd)
     if not complete:
-        return "ambiguous"  # uncertain membership never proves the group gone
+        return "ambiguous"
     return "live" if members else "gone"
 
 
