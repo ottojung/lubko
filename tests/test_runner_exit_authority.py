@@ -442,6 +442,34 @@ def test_dead_pinned_reservation_owner_recovers_accepted_steer(
     assert probes == [(77, 0), (77, 0), (77, 0)]
     assert closed == [77, 77, 77, 77]
 
+    # Persisted process identity must retain exact JSON integer shape before
+    # any pidfd/procfs observation can establish reservation-owner authority.
+    opened: list[int] = []
+
+    def record_open(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", record_open)
+    malformed_identities: list[tuple[object, object]] = [
+        (4242.0, 111),
+        ("4242", 111),
+        (True, 111),
+        (0, 111),
+        (-1, 111),
+        (4242, 111.0),
+        (4242, "111"),
+        (4242, True),
+        (4242, -1),
+        (4242, []),
+    ]
+    for owner_pid, owner_ticks in malformed_identities:
+        assert not agent._owner_alive(owner_pid, owner_ticks)
+    assert opened == []
+
+    reservation["owner_start_ticks"] = 111.0
+    assert not agent.reservation_in_flight(m)
+
 
 def test_reserved_runner_marker_requires_pinned_live_candidate(
     monkeypatch: pytest.MonkeyPatch,
