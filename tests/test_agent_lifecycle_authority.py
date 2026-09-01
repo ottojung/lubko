@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any, cast
 
 import pytest
 
@@ -103,3 +104,112 @@ def test_locked_transition_does_not_repair_malformed_state_into_runner_authority
 def test_missing_lifecycle_state_retains_legacy_idle_semantics() -> None:
     """Genuine field absence remains distinct from malformed presence."""
     assert derive_state({"id": "a1"}) == "idle"
+
+
+@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, 1, "yes", [1], None])
+def test_delete_tombstone_rejects_malformed_present_values(malformed: object) -> None:
+    """Only literal booleans carry durable deletion authority."""
+    assert agent._delete_pending_flag({"delete_pending": malformed}) is None
+
+
+def test_delete_tombstone_preserves_boolean_and_legacy_absence_semantics() -> None:
+    """Canonical booleans remain exact and genuine absence stays non-tombstoned."""
+    assert agent._delete_pending_flag({"delete_pending": False}) is False
+    assert agent._delete_pending_flag({"delete_pending": True}) is True
+    assert agent._delete_pending_flag({}) is False
+
+
+@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, 1, "yes", [1], None])
+def test_malformed_delete_tombstone_blocks_prompt_claim(
+    monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    """Malformed deletion metadata cannot authorize prompt execution."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "state": "running",
+        "active_runner": True,
+        "pending_prompt": "P",
+        "delete_pending": malformed,
+    }
+
+    def update(_aid: str, mutate: object) -> None:
+        assert callable(mutate)
+        mutate(meta)
+
+    monkeypatch.setattr(agent, "update_meta", update)
+    assert agent._claim_pending_prompt("aaaaaaaa", "P") is False
+    assert meta["pending_prompt"] == "P"
+    assert meta["delete_pending"] == malformed
+
+
+@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, 1, "yes", [1], None])
+def test_malformed_delete_tombstone_cannot_establish_convergence(
+    monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    """Deletion convergence requires a canonical true tombstone."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "delete_pending": malformed,
+        "active_runner": False,
+    }
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "group_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "reservation_in_flight", lambda _meta: False)
+    monkeypatch.setattr(agent, "_unresolved_child_state", lambda _meta: "gone")
+    assert agent._delete_converged(meta) is False
+
+
+def test_canonical_delete_tombstone_can_converge_when_execution_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Literal true retains ordinary deletion convergence semantics."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "delete_pending": True,
+        "active_runner": False,
+    }
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "group_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "reservation_in_flight", lambda _meta: False)
+    monkeypatch.setattr(agent, "_unresolved_child_state", lambda _meta: "gone")
+    assert agent._delete_converged(meta) is True
+
+
+@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, 1, "yes", [1], None])
+def test_delete_transitions_do_not_normalize_malformed_tombstones(
+    monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    """Begin/abort deletion preserve malformed authority for explicit repair."""
+    meta: agent.Meta = {"id": "aaaaaaaa", "delete_pending": malformed}
+
+    def update(_aid: str, mutate: object) -> None:
+        assert callable(mutate)
+        mutate(meta)
+
+    monkeypatch.setattr(agent, "update_meta", update)
+    assert agent._begin_delete("aaaaaaaa", force=True) is None
+    assert meta["delete_pending"] == malformed
+    agent._abort_delete("aaaaaaaa")
+    assert meta["delete_pending"] == malformed
+
+
+@pytest.mark.parametrize("malformed", [0, "", 1, "yes"])
+def test_malformed_delete_tombstone_blocks_invocation_tracking(malformed: object) -> None:
+    """A spawned child is unresolved, never running authority, under malformed tombstones."""
+
+    class ProcessStub:
+        pid = 4242
+
+    blocked: dict[str, bool] = {}
+    mutate = agent._record_running(cast("Any", ProcessStub()), 77, "inv-1", blocked)
+    meta: agent.Meta = {"id": "aaaaaaaa", "delete_pending": malformed}
+    mutate(meta)
+
+    assert blocked == {"stopped": True}
+    assert "pid" not in meta
+    assert meta["unresolved_invocation"] == {
+        "pid": 4242,
+        "pgid": 4242,
+        "start_time": 77,
+        "invocation_id": "inv-1",
+    }
