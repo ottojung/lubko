@@ -764,7 +764,8 @@ def is_alive(meta: Meta) -> bool:
     """
     pid = _process_identity_int(meta.get("pid"), minimum=1)
     start_time = _process_identity_int(meta.get("start_time"), minimum=0)
-    if pid is None or start_time is None:
+    aid = _persisted_agent_id(meta.get("id"))
+    if pid is None or start_time is None or aid is None:
         return False
     invocation_pid = pid
     fd = open_pidfd(invocation_pid)
@@ -773,7 +774,7 @@ def is_alive(meta: Meta) -> bool:
     try:
         if proc_start_ticks(invocation_pid) != start_time:
             return False
-        if not env_has_marker(invocation_pid, meta.get("id", "")):
+        if not env_has_marker(invocation_pid, aid):
             return False
         try:
             pidfd_send_signal(fd, 0)
@@ -947,7 +948,8 @@ def runner_alive(meta: Meta) -> bool:
     """
     pid = _process_identity_int(meta.get("runner_pid"), minimum=1)
     start_time = _process_identity_int(meta.get("runner_start_time"), minimum=0)
-    if pid is None or start_time is None:
+    aid = _persisted_agent_id(meta.get("id"))
+    if pid is None or start_time is None or aid is None:
         return False
     runner_pid = pid
     fd = open_pidfd(runner_pid)
@@ -956,7 +958,7 @@ def runner_alive(meta: Meta) -> bool:
     try:
         if proc_start_ticks(runner_pid) != start_time:
             return False
-        if not env_has_marker(runner_pid, meta.get("id", "")):
+        if not env_has_marker(runner_pid, aid):
             return False
         try:
             pidfd_send_signal(fd, 0)
