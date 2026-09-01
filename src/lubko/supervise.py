@@ -649,16 +649,6 @@ class SupervisorStatus:
                 child = _child_from_dict(child_data)
             except (TypeError, ValueError, KeyError):
                 child = None
-        exit_data = data.get("last_exit")
-        last_exit: LastExit | None = None
-        if isinstance(exit_data, dict):
-            try:
-                last_exit = LastExit(
-                    returncode=_optional_int(exit_data.get("returncode")),
-                    at=float(exit_data.get("at") or 0.0),
-                )
-            except (TypeError, ValueError):
-                last_exit = None
         return cls(
             schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
             supervisor_pid=_optional_int(data.get("supervisor_pid")) or 0,
@@ -671,7 +661,7 @@ class SupervisorStatus:
             intent=_optional_string(data.get("intent")) or INTENT_RUN,
             restart_count=_optional_int(data.get("restart_count")) or 0,
             next_attempt_at=_optional_float(data.get("next_attempt_at")),
-            last_exit=last_exit,
+            last_exit=_parse_last_exit(data),
             mission=_optional_string(data.get("mission")),
             db_ready=_optional_bool(data.get("db_ready")),
             ready=_optional_bool(data.get("ready")),
@@ -785,16 +775,6 @@ class SupervisorDiagnostic:
         Returns:
             The reconstructed diagnostic.
         """
-        exit_data = data.get("last_exit")
-        last_exit: LastExit | None = None
-        if isinstance(exit_data, dict):
-            try:
-                last_exit = LastExit(
-                    returncode=_optional_int(exit_data.get("returncode")),
-                    at=float(exit_data.get("at") or 0.0),
-                )
-            except (TypeError, ValueError):
-                last_exit = None
         return cls(
             live=bool(data.get("live")),
             source=_optional_string(data.get("source")) or "durable-state",
@@ -815,7 +795,7 @@ class SupervisorDiagnostic:
             child_present=bool(_optional_bool(data.get("child_present"))),
             unresolved_child_present=bool(_optional_bool(data.get("unresolved_child_present"))),
             spawning_present=bool(_optional_bool(data.get("spawning_present"))),
-            last_exit=last_exit,
+            last_exit=_parse_last_exit(data),
             message=_optional_string(data.get("message")),
         )
 
@@ -2215,24 +2195,31 @@ def _parse_optional_spawning(
 
 
 def _parse_last_exit(data: dict[str, object]) -> LastExit | None:
-    """Parse the optional last-exit record, tolerating shape corruption.
+    """Parse a canonical optional durable last-exit record.
 
     Args:
         data: Decoded durable state mapping.
 
     Returns:
-        The last exit, or ``None``.
+        The canonical last exit, or ``None`` when absent or malformed.
     """
     exit_data = data.get("last_exit")
-    if not isinstance(exit_data, dict):
+    if exit_data is None or not isinstance(exit_data, dict):
         return None
-    try:
-        return LastExit(
-            returncode=_optional_int(exit_data.get("returncode")),
-            at=float(exit_data.get("at") or 0.0),
-        )
-    except (TypeError, ValueError):
+
+    raw_returncode = exit_data.get("returncode")
+    returncode: int | None = None
+    if raw_returncode is not None:
+        returncode = _strict_int(raw_returncode)
+        if returncode is None:
+            return None
+
+    if "at" not in exit_data:
         return None
+    at = _strict_finite_float(exit_data["at"])
+    if at is None or at < 0:
+        return None
+    return LastExit(returncode=returncode, at=at)
 
 
 def _optional_dict(value: object | None) -> dict[str, object] | None:
