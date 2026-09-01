@@ -1561,6 +1561,25 @@ def discover_session_id(aid: str) -> str | None:
     return row[0] if row else None
 
 
+def _persisted_native_session_id(meta: Meta) -> str | None:
+    """Return canonical durable native-session continuation authority.
+
+    A persisted native session is either genuinely absent/``None`` or a
+    non-empty string. Malformed present values are ambiguous authority and
+    must fail closed rather than being normalized through truthiness.
+
+    Raises:
+        ValueError: The durable native session identity is malformed.
+    """
+    session_id = meta.get("native_session_id")
+    if session_id is None:
+        return None
+    if not isinstance(session_id, str) or not session_id:
+        message = "managed-agent native_session_id is malformed"
+        raise ValueError(message)
+    return session_id
+
+
 def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[str] | None:
     """Return the argv used to launch the underlying agent for this invocation.
 
@@ -1576,7 +1595,8 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
     variant = meta.get("variant") or DEFAULT_VARIANT
     cwd = _persisted_agent_cwd(meta)
     if is_continue:
-        session_id = meta.get("native_session_id") or discover_session_id(meta.get("id", ""))
+        recorded = _persisted_native_session_id(meta)
+        session_id = recorded or discover_session_id(meta.get("id", ""))
         if not session_id:
             return None
         return [
@@ -3043,7 +3063,7 @@ def _resolve_session_mode(m: Meta) -> str | None:
     Returns:
         ``"new"``, ``"continue"``, or ``None`` when the session is gone.
     """
-    recorded = m.get("native_session_id")
+    recorded = _persisted_native_session_id(m)
     # Always rediscover under the lock: external session availability is the
     # authority, and a stale discovery before the lock must never authorize a
     # second ``new`` session.
