@@ -1201,11 +1201,14 @@ def owned_by_me(meta: Meta, caller_pid: int) -> bool:
         owner.
     """
     res = meta.get("runner_reservation")
-    if not isinstance(res, dict) or res.get("owner_pid") != caller_pid:
+    if not isinstance(res, dict):
         return False
-    recorded = res.get("owner_start_ticks")
+    owner_pid = _process_identity_int(res.get("owner_pid"), minimum=1)
+    recorded = _process_identity_int(res.get("owner_start_ticks"), minimum=0)
+    if owner_pid != caller_pid or recorded is None:
+        return False
     current = proc_start_ticks(caller_pid)
-    return recorded is not None and current is not None and current == recorded
+    return current is not None and current == recorded
 
 
 def is_genuinely_running(meta: Meta) -> bool:
