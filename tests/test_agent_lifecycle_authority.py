@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import time
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from lubko import agent
 from lubko.agent import derive_state
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _running_meta(**overrides: object) -> dict[str, object]:
@@ -281,7 +284,7 @@ def test_stale_running_preserves_absence_and_canonical_pid_liveness(
 
 
 def test_stale_running_fails_closed_on_malformed_present_pid(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Malformed present PIDs cannot grant lifecycle or output authority."""
     meta = _running_meta()
@@ -294,3 +297,4 @@ def test_stale_running_fails_closed_on_malformed_present_pid(
         meta["pid"] = malformed
         assert agent._stale_running("a1") is True
         assert agent._can_produce_output("a1") is False
+        assert agent._wait_for_first_output("a1", tmp_path / "missing") is True
