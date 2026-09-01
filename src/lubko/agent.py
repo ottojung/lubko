@@ -1114,6 +1114,8 @@ def _next_prompt_count(meta: Meta) -> int | None:
     if type(value) is not int or value < 0:
         return None
     return value + 1
+
+
 def _active_runner_flag(meta: Meta) -> bool | None:
     """Return canonical durable runner-consumption authority.
 
