@@ -1359,14 +1359,24 @@ def _require_persisted_lifecycle_state(meta: Meta) -> str:
     return state
 
 
+def _persisted_timestamp(value: object) -> float | None:
+    """Return a canonical finite persisted timestamp without coercion."""
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        return None
+    return float(value)
+
+
 def _launch_timestamp(meta: Meta) -> float | None:
-    """Return a finite persisted launch timestamp without coercing malformed data."""
+    """Return a canonical persisted launch timestamp."""
     value = meta.get("started_at")
     if value is None:
         value = meta.get("created_at")
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
-        return None
-    return float(value)
+    return _persisted_timestamp(value)
 
 
 def derive_state(meta: Meta | None) -> str:
@@ -1395,7 +1405,8 @@ def derive_state(meta: Meta | None) -> str:
         return "unknown"
     if is_alive(meta):
         return "running"
-    return str(state) if meta.get("finished_at") else "unknown"
+    finished = _persisted_timestamp(meta.get("finished_at"))
+    return str(state) if finished is not None else "unknown"
 
 
 DISAPPEARED_NOTE: Final = "runner/model process disappeared without a captured exit status"
@@ -5158,7 +5169,7 @@ def _clean_candidates(days: int) -> list[str]:
             continue
         if derive_state(meta) not in TERMINAL_STATES:
             continue
-        finished = meta.get("finished_at")
+        finished = _persisted_timestamp(meta.get("finished_at"))
         if finished is not None and finished < cutoff:
             candidates.append(aid)
     return candidates

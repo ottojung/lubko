@@ -235,3 +235,25 @@ def test_forced_delete_rechecks_after_signalling_before_convergence(
 
     assert agent._converge_for_delete("aaaaaaaa", force=True, deadline=1.0) is True
     assert signals == [meta, meta]
+
+
+@pytest.mark.parametrize(
+    "finished_at",
+    [False, "", [], {}, -1, float("inf"), float("nan")],
+)
+def test_dead_running_state_requires_canonical_completion_timestamp(
+    monkeypatch: pytest.MonkeyPatch, finished_at: object
+) -> None:
+    """Malformed completion timestamps cannot preserve running authority."""
+    meta = _running_meta(pid=123, finished_at=finished_at)
+    monkeypatch.setattr("lubko.agent.is_alive", lambda _value: False)
+    assert derive_state(meta) == "unknown"
+
+
+def test_dead_running_state_preserves_valid_completion_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical completion timestamp preserves existing derived-state behavior."""
+    meta = _running_meta(pid=123, finished_at=1.0)
+    monkeypatch.setattr("lubko.agent.is_alive", lambda _value: False)
+    assert derive_state(meta) == "running"
