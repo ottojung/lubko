@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import time
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 from lubko import agent
 from lubko.agent import derive_state
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _running_meta(**overrides: object) -> dict[str, object]:
@@ -262,26 +265,36 @@ def test_dead_running_state_preserves_valid_completion_timestamp(
 def test_stale_running_preserves_absence_and_canonical_pid_liveness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stale-running detection distinguishes absence from exact PID liveness."""
+    """Lifecycle convergence distinguishes PID absence from exact liveness."""
     meta = _running_meta(pid=None)
+    monkeypatch.setattr(time, "time", lambda: 120.0)
     monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: True)
     monkeypatch.setattr(agent, "is_alive", lambda _meta: True)
     assert agent._stale_running("a1") is False
+    assert agent._can_produce_output("a1") is True
+    del meta["pid"]
+    assert agent._can_produce_output("a1") is True
     meta["pid"] = 123
     assert agent._stale_running("a1") is False
+    assert agent._can_produce_output("a1") is True
     monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
     assert agent._stale_running("a1") is True
+    assert agent._can_produce_output("a1") is False
 
 
 def test_stale_running_fails_closed_on_malformed_present_pid(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Malformed present PIDs cannot suppress stale-running convergence."""
+    """Malformed present PIDs cannot grant lifecycle or output authority."""
     meta = _running_meta()
     monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
     monkeypatch.setattr(agent, "is_alive", lambda _meta: True)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: True)
 
     malformed_values: tuple[object, ...] = (False, 0, 0.0, "", [], {}, "123", True)
     for malformed in malformed_values:
         meta["pid"] = malformed
         assert agent._stale_running("a1") is True
+        assert agent._can_produce_output("a1") is False
+        assert agent._wait_for_first_output("a1", tmp_path / "missing") is True

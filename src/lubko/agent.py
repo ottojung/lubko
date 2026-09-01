@@ -4354,10 +4354,11 @@ def _can_produce_output(aid: str) -> bool:
         return False
     if derive_state(meta) != "running":
         return False
-    pid = meta.get("pid")
-    if pid:
-        return is_alive(meta)
-    return runner_alive(meta)
+    if "pid" not in meta or meta["pid"] is None:
+        return runner_alive(meta)
+    if _process_identity_int(meta["pid"], minimum=1) is None:
+        return False
+    return is_alive(meta)
 
 
 def _wait_for_first_output(aid: str, log_path: Path) -> bool:
