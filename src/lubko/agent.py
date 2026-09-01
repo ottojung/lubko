@@ -3643,9 +3643,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     exit_code = meta.get("exit_code")
     _out(f"exit code:  {exit_code if exit_code is not None else '-'}")
     _out(f"prompts:    {meta.get('prompt_count') or 0}")
-    steers = meta.get("steer_queue") or []
-    if steers:
-        _out(f"steers:     {len(steers)} queued: {_first_line(steers[0].get('prompt') or '')}")
+    steers, steer_error = _status_steer_queue(meta)
+    if steer_error is not None:
+        _out(f"steers:     {steer_error}")
+    elif steers:
+        _out(f"steers:     {len(steers)} queued: {_first_line(steers[0]['prompt'])}")
     _out(f"title:      {meta.get('title') or '-'}")
     _out("tail(log):")
     excerpt = log_excerpt(log_path, STATUS_TAIL_LINES)
@@ -3673,6 +3675,17 @@ def _status_cpu_seconds(meta: Meta, *, alive: bool) -> float | None:
     return proc_cpu_seconds(meta.get("pid"))
 
 
+def _status_steer_queue(meta: Meta) -> tuple[list[Meta] | None, str | None]:
+    """Return validated steer status data without normalizing corruption."""
+    sequence = _steer_sequence(meta)
+    if sequence is None:
+        return None, "malformed persisted steer metadata"
+    queue = _steer_queue(meta, sequence=sequence)
+    if queue is None:
+        return None, "malformed persisted steer metadata"
+    return queue, None
+
+
 def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
     """Build the JSON status mapping for an agent.
 
@@ -3685,6 +3698,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
     Returns:
         The JSON-safe mapping.
     """
+    steers, steer_error = _status_steer_queue(meta)
     return {
         "id": aid,
         "state": state,
@@ -3703,12 +3717,9 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "exit_code": meta.get("exit_code"),
         "exit_signal": meta.get("exit_signal"),
         "prompts": meta.get("prompt_count"),
-        "steers_pending": len(meta.get("steer_queue") or []),
-        "next_steer": (
-            _first_line((meta.get("steer_queue") or [{}])[0].get("prompt") or "")
-            if meta.get("steer_queue")
-            else None
-        ),
+        "steers_pending": len(steers) if steers is not None else None,
+        "next_steer": _first_line(steers[0]["prompt"]) if steers else None,
+        "steer_metadata_error": steer_error,
         "model": AGENT_MODEL,
         "variant": meta.get("variant"),
         "log": str(agent_dir(aid) / "output.log"),
