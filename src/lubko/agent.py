@@ -21,6 +21,7 @@ import copy
 import ctypes
 import fcntl
 import json
+import math
 import os
 import platform
 import re
@@ -2488,16 +2489,65 @@ def _finalize_terminal(
         meta["error"] = note
 
 
-def _queue_steer(meta: Meta, prompt: str, now: float) -> None:
-    """Append a steer instruction to the agent's FIFO queue.
+class MalformedSteerMetadataError(ValueError):
+    """Persisted steer ordering metadata is not canonical."""
 
-    Args:
-        meta: Agent metadata.
-        prompt: Steer instruction.
-        now: Queue timestamp.
+
+def _steer_sequence(meta: Meta) -> int | None:
+    """Return canonical durable steer sequence authority."""
+    if "steer_seq" not in meta:
+        return 0
+    value = meta["steer_seq"]
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _valid_steer_item(item: object, *, previous: int, sequence: int) -> bool:
+    """Return whether one persisted steer item has canonical JSON shape."""
+    if type(item) is not dict:
+        return False
+    item_seq = item.get("seq")
+    prompt = item.get("prompt")
+    queued_at = item.get("queued_at")
+    return (
+        type(item_seq) is int
+        and previous < item_seq <= sequence
+        and type(prompt) is str
+        and isinstance(queued_at, (int, float))
+        and not isinstance(queued_at, bool)
+        and math.isfinite(queued_at)
+    )
+
+
+def _steer_queue(meta: Meta, *, sequence: int) -> list[Meta] | None:
+    """Return a canonical persisted FIFO steer queue, or fail closed."""
+    if "steer_queue" not in meta:
+        return []
+    value = meta["steer_queue"]
+    if type(value) is not list:
+        return None
+    previous = 0
+    for item in value:
+        if not _valid_steer_item(item, previous=previous, sequence=sequence):
+            return None
+        previous = item["seq"]
+    return value
+
+
+def _queue_steer(meta: Meta, prompt: str, now: float) -> None:
+    """Append a steer instruction only when durable queue metadata is canonical.
+
+    Raises:
+        MalformedSteerMetadataError: If persisted queue/sequence metadata is malformed.
     """
-    queue = meta.get("steer_queue") or []
-    seq = (meta.get("steer_seq") or 0) + 1
+    sequence = _steer_sequence(meta)
+    if sequence is None:
+        raise MalformedSteerMetadataError
+    queue = _steer_queue(meta, sequence=sequence)
+    if queue is None:
+        raise MalformedSteerMetadataError
+    seq = sequence + 1
     queue.append({"seq": seq, "prompt": prompt, "queued_at": now})
     meta["steer_queue"] = queue
     meta["steer_seq"] = seq
@@ -2515,10 +2565,11 @@ def _pop_into_pending(meta: Meta, now: float) -> Meta | None:
         The popped steer item, or ``None`` when the queue is empty.
     """
     next_prompt_count = _next_prompt_count(meta)
-    if next_prompt_count is None:
+    sequence = _steer_sequence(meta)
+    if next_prompt_count is None or sequence is None:
         return None
-    queue = meta.get("steer_queue") or []
-    if not queue:
+    queue = _steer_queue(meta, sequence=sequence)
+    if queue is None or not queue:
         return None
     item: Meta = queue.pop(0)
     meta["steer_queue"] = queue
