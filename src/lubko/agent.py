@@ -1645,7 +1645,7 @@ def _clear_pending(meta: Meta, prompt: str) -> None:
         meta: Agent metadata under the metadata lock.
         prompt: The exact prompt this invocation claimed.
     """
-    if meta.get("pending_prompt") == prompt:
+    if _pending_prompt(meta) == prompt:
         meta["pending_prompt"] = None
 
 
@@ -1761,8 +1761,8 @@ def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
         if meta is None or meta.get("delete_pending"):
             # Deleted (or being deleted): never start another invocation.
             return
-        prompt = meta.get("pending_prompt")
-        if not prompt:
+        prompt = _pending_prompt(meta)
+        if prompt is None:
             if _reclaim_prompt(ctx.aid):
                 continue
             # Exit boundary seam: the runner has durably relinquished
@@ -1801,8 +1801,9 @@ def _reclaim_prompt(aid: str) -> bool:
         queue = _steer_queue(m, sequence=sequence)
         if queue is None:
             raise MalformedSteerMetadataError
-        if m.get("pending_prompt") or queue:
-            if queue and not m.get("pending_prompt"):
+        pending = _pending_prompt(m)
+        if pending is not None or queue:
+            if queue and pending is None:
                 _pop_into_pending(m, time.time())
             m["active_runner"] = True
             holder["busy"] = True
@@ -2451,11 +2452,12 @@ def _drain_next(aid: str) -> str | None:
         queue = _steer_queue(m, sequence=sequence)
         if queue is None:
             raise MalformedSteerMetadataError
-        if m.get("pending_prompt"):
+        pending = _pending_prompt(m)
+        if pending is not None:
             # A new invocation was queued while this one was running; run it
             # rather than going idle, so a second runner is never needed.
             m["active_runner"] = True
-            holder["prompt"] = m["pending_prompt"]
+            holder["prompt"] = pending
             return
         if not queue:
             _set_active_runner(m, value=False)
@@ -2499,6 +2501,24 @@ def _finalize_terminal(
     meta["intent"] = None
     if note:
         meta["error"] = note
+
+
+class MalformedPendingPromptMetadataError(ValueError):
+    """Persisted pending prompt authority is not canonical."""
+
+
+def _pending_prompt(meta: Meta) -> str | None:
+    """Return canonical durable pending prompt authority, or fail closed.
+
+    Raises:
+        MalformedPendingPromptMetadataError: If present prompt authority is malformed.
+    """
+    if "pending_prompt" not in meta or meta["pending_prompt"] is None:
+        return None
+    value = meta["pending_prompt"]
+    if type(value) is not str or not value:
+        raise MalformedPendingPromptMetadataError
+    return value
 
 
 class MalformedSteerMetadataError(ValueError):
@@ -2946,6 +2966,7 @@ def _recover_stale_reservation(
     Returns:
         ``True`` when a stale reservation was recovered here.
     """
+    pending = _pending_prompt(m)
     res = m.get("runner_reservation")
     if not (isinstance(res, dict) and res.get("state") in {"reserved", "claimed"}):
         return False
@@ -2955,7 +2976,7 @@ def _recover_stale_reservation(
     if current_gen is None:
         decision["action"] = "busy"
         return True
-    if res.get("state") == "claimed" and not m.get("pending_prompt"):
+    if res.get("state") == "claimed" and pending is None:
         # The exact runner consumed the accepted prompt before dying; there is
         # nothing to preserve and nothing to replay. Drop the dead claimed
         # authority and let the caller's fresh start own the next invocation.
@@ -2965,7 +2986,7 @@ def _recover_stale_reservation(
     caller_pid = os.getpid()
     gen = current_gen + 1
     take_mode = res.get("mode") or "new"
-    accepted = bool(m.get("pending_prompt"))
+    accepted = pending is not None
     if accepted:
         if steer:
             # A --steer that discovers the same stale reservation queues the
@@ -3139,6 +3160,7 @@ def _apply_locked_transition(
         steer: Whether this is a steer rather than an ordinary prompt.
         mode: Resolved native-session mode (``new`` or ``continue``).
     """
+    pending = _pending_prompt(m)
     now = time.time()
     caller_pid = os.getpid()
     live_agent = is_alive(m)
@@ -3164,7 +3186,7 @@ def _apply_locked_transition(
             _queue_steer(m, prompt, now)
             decision["action"] = "reuse"
             decision["interrupt"] = False
-        elif m.get("pending_prompt"):
+        elif pending is not None:
             # An invocation is already accepted and awaiting this live runner;
             # a second ordinary prompt must never overwrite it.  It is
             # explicitly busy so exactly one prompt owns the runner.
@@ -4251,7 +4273,10 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
         ``True`` only when the cancellation was applied under the lock.
     """
     identity = _invocation_identity(meta)
-    expected_pending = meta.get("pending_prompt")
+    try:
+        expected_pending = _pending_prompt(meta)
+    except MalformedPendingPromptMetadataError:
+        return False
     res = meta.get("runner_reservation")
     expected_gen = res.get("gen") if isinstance(res, dict) else None
     applied = False
@@ -4260,9 +4285,13 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
         nonlocal applied
         cur_res = m.get("runner_reservation")
         cur_gen = cur_res.get("gen") if isinstance(cur_res, dict) else None
+        try:
+            current_pending = _pending_prompt(m)
+        except MalformedPendingPromptMetadataError:
+            return
         if (
             _invocation_identity(m) != identity
-            or m.get("pending_prompt") != expected_pending
+            or current_pending != expected_pending
             or cur_gen != expected_gen
         ):
             return
@@ -4391,11 +4420,11 @@ def _no_invocation_owned(meta: Meta) -> bool:
         ``True`` when no proven-live runner, in-flight reservation, or
         accepted pending prompt remains.
     """
-    return (
-        not runner_alive(meta)
-        and not reservation_in_flight(meta)
-        and not meta.get("pending_prompt")
-    )
+    try:
+        pending = _pending_prompt(meta)
+    except MalformedPendingPromptMetadataError:
+        return False
+    return not runner_alive(meta) and not reservation_in_flight(meta) and pending is None
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
