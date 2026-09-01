@@ -55,7 +55,7 @@ def test_runner_malformed_cwd_fails_before_spawn_and_aborts_cleanly(
         "id": aid,
         "cwd": "",
         "state": "idle",
-        "runner_reservation": {"state": "reserved", "gen": 1},
+        "runner_reservation": {"state": "reserved", "gen": 1, "mode": "new"},
     }
     agent.write_meta(aid, meta)
     monkeypatch.setenv("LUBKO_RUNNER_GEN", "1")

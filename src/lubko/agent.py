@@ -1102,6 +1102,22 @@ def _runner_generation(value: object, *, minimum: int) -> int | None:
     return value
 
 
+def _runner_reservation_mode(reservation: object) -> str | None:
+    """Return canonical durable runner native-session mode, or ``None``.
+
+    A runner reservation carries execution authority for exactly one of the two
+    supported native-session modes. Missing, malformed, or unsupported values
+    must fail closed rather than being defaulted through truthiness or coerced
+    to strings later in the spawn path.
+    """
+    if not isinstance(reservation, dict):
+        return None
+    mode = reservation.get("mode")
+    if type(mode) is not str or mode not in {"new", "continue"}:
+        return None
+    return mode
+
+
 def _next_prompt_count(meta: Meta) -> int | None:
     """Return the next canonical durable prompt count, or fail closed.
 
@@ -1152,7 +1168,11 @@ def reservation_in_flight(meta: Meta) -> bool:
     if runner_alive(meta):
         return True
     res = meta.get("runner_reservation")
-    if not isinstance(res, dict) or res.get("state") != "reserved":
+    if (
+        not isinstance(res, dict)
+        or res.get("state") != "reserved"
+        or _runner_reservation_mode(res) is None
+    ):
         return False
     gen = _runner_generation(res.get("gen"), minimum=1)
     if gen is None:
@@ -1236,7 +1256,11 @@ def active_runner_justified(meta: Meta) -> bool:
     # another caller, so it justifies ``active_runner``; a ``claimed``
     # reservation whose runner is no longer provably alive is stuck and must
     # never justify a persistent ``active_runner``.
-    return isinstance(res, dict) and res.get("state") == "reserved"
+    return (
+        isinstance(res, dict)
+        and res.get("state") == "reserved"
+        and _runner_reservation_mode(res) is not None
+    )
 
 
 def _set_active_runner(meta: Meta, *, value: bool) -> None:
@@ -1735,6 +1759,13 @@ def runner(aid: str, mode: str) -> None:
             # Only the exact reserved generation may run.  A missing or zero
             # generation, or a duplicate/stale replacement whose generation no
             # longer matches, bails instead of double-executing.
+            claimed["ok"] = False
+            return
+        reservation_mode = _runner_reservation_mode(res)
+        if reservation_mode is None or reservation_mode != mode:
+            # The reservation's durable native-session mode is execution
+            # authority. A malformed value, or a runner spawned for a different
+            # mode, must never claim and reinterpret it as a fresh session.
             claimed["ok"] = False
             return
         m["runner_pid"] = os.getpid()
@@ -2787,7 +2818,13 @@ def spawn_runner(aid: str, mode: str, *, gen: int | None = None) -> None:
         mode: Invocation mode (``new`` or ``continue``).
         gen: Exact reserved runner generation to carry into the runner, or
             ``None`` to fall back to metadata (used only by direct callers).
+
+    Raises:
+        ValueError: The requested runner mode is not canonical.
     """
+    if type(mode) is not str or mode not in {"new", "continue"}:
+        msg = "managed-agent runner mode is malformed"
+        raise ValueError(msg)
     script = Path(__file__).resolve()
     env = _runner_env(aid)
     if gen is not None:
@@ -2992,8 +3029,9 @@ def _recover_stale_reservation(
         return False
     if reservation_in_flight(m):
         return False
+    take_mode = _runner_reservation_mode(res)
     current_gen = _runner_generation(m.get("runner_gen", 0), minimum=0)
-    if current_gen is None:
+    if take_mode is None or current_gen is None:
         decision["action"] = "busy"
         return True
     if res.get("state") == "claimed" and pending is None:
@@ -3005,7 +3043,6 @@ def _recover_stale_reservation(
     now = time.time()
     caller_pid = os.getpid()
     gen = current_gen + 1
-    take_mode = res.get("mode") or "new"
     accepted = pending is not None
     if accepted:
         if steer:
@@ -3306,7 +3343,7 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
         _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
         return EXIT_ERROR
     if action == "spawn":
-        spawn_runner(aid, str(decision["mode"]), gen=cast("int", decision["gen"]))
+        spawn_runner(aid, cast("str", decision["mode"]), gen=cast("int", decision["gen"]))
         if decision.get("recover_busy"):
             # A stale reserved runner was recovered (the accepted pending prompt
             # is preserved and a replacement runner was started), but this
