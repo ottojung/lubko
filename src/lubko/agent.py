@@ -54,6 +54,7 @@ DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
 STOP_REASONS: Final = frozenset({"stop", "kill"})
+PERSISTED_AGENT_STATES: Final = frozenset(("idle", "running", *TERMINAL_STATES))
 PROG: Final = "lubko-agent"
 HEX_DIGITS: Final = frozenset("0123456789abcdef")
 
@@ -1314,6 +1315,32 @@ def _test_sync(step: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+class MalformedLifecycleStateError(ValueError):
+    """Persisted managed-agent lifecycle state is not canonical."""
+
+
+def _persisted_lifecycle_state(meta: Meta) -> str | None:
+    """Return canonical durable lifecycle state, preserving legacy absence as idle."""
+    if "state" not in meta:
+        return "idle"
+    value = meta["state"]
+    if type(value) is not str or value not in PERSISTED_AGENT_STATES:
+        return None
+    return value
+
+
+def _require_persisted_lifecycle_state(meta: Meta) -> str:
+    """Return canonical lifecycle state or reject malformed durable authority.
+
+    Raises:
+        MalformedLifecycleStateError: If persisted lifecycle state is malformed.
+    """
+    state = _persisted_lifecycle_state(meta)
+    if state is None:
+        raise MalformedLifecycleStateError
+    return state
+
+
 def _launch_timestamp(meta: Meta) -> float | None:
     """Return a finite persisted launch timestamp without coercing malformed data."""
     value = meta.get("started_at")
@@ -1335,9 +1362,9 @@ def derive_state(meta: Meta | None) -> str:
     """
     if not meta:
         return "unknown"
-    state = meta.get("state")
+    state = _persisted_lifecycle_state(meta)
     if state != "running":
-        return state or "idle"
+        return state if state is not None else "unknown"
     pid_value = meta.get("pid")
     if pid_value is None:
         launched = _launch_timestamp(meta)
@@ -1974,7 +2001,8 @@ def _claim_pending_prompt(aid: str, prompt: str) -> bool:
 
     def claim(m: Meta) -> None:
         if (
-            m.get("delete_pending")
+            _persisted_lifecycle_state(m) is None
+            or m.get("delete_pending")
             or m.get("intent") in STOP_REASONS
             or m.get("stop_reason") in STOP_REASONS
         ):
@@ -2521,6 +2549,8 @@ def _drain_next(aid: str) -> str | None:
     holder: dict[str, str | None] = {"prompt": None}
 
     def drain(m: Meta) -> None:
+        if _persisted_lifecycle_state(m) is None:
+            raise MalformedLifecycleStateError
         if m.get("stop_reason") in STOP_REASONS:
             _set_active_runner(m, value=False)
             return
@@ -3165,6 +3195,9 @@ def _decide_invocation(
         prompt: Instruction to run or steer.
         steer: Whether this is a steer rather than an ordinary prompt.
     """
+    if _persisted_lifecycle_state(m) is None:
+        decision["action"] = "busy"
+        return
     if _active_runner_flag(m) is None:
         decision["action"] = "busy"
         return
@@ -3244,6 +3277,7 @@ def _apply_locked_transition(
         steer: Whether this is a steer rather than an ordinary prompt.
         mode: Resolved native-session mode (``new`` or ``continue``).
     """
+    _require_persisted_lifecycle_state(m)
     pending = _pending_prompt(m)
     now = time.time()
     caller_pid = os.getpid()
