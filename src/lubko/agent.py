@@ -4159,6 +4159,16 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
     return applied
 
 
+def _persisted_runner_identity(meta: Meta) -> tuple[int, int, str] | None:
+    """Return strict recorded-runner process and marker authority."""
+    pid = _process_identity_int(meta.get("runner_pid"), minimum=1)
+    ticks = _process_identity_int(meta.get("runner_start_time"), minimum=0)
+    aid = _persisted_agent_id(meta.get("id"))
+    if pid is None or ticks is None or aid is None:
+        return None
+    return pid, ticks, aid
+
+
 def _runner_identity_state(pid: int, ticks: object, aid: str) -> str:
     """Classify the exact observed runner identity's liveness evidence.
 
@@ -4224,13 +4234,12 @@ def _converge_observed_runner(observed: Meta, mode: str) -> bool:
         # No runner was ever recorded (reserved pre-spawn window); nothing to
         # converge beyond dropping the reservation.
         return True
-    pid = _process_identity_int(raw_pid, minimum=1)
-    ticks = _process_identity_int(observed.get("runner_start_time"), minimum=0)
-    if pid is None or ticks is None:
+    identity = _persisted_runner_identity(observed)
+    if identity is None:
         # Present malformed durable identity is ambiguous authority, not
         # absence and never signalling authority.
         return False
-    marker_aid = str(observed.get("id", ""))
+    pid, ticks, marker_aid = identity
     grace_signal = signal.SIGTERM if mode == "stop" else signal.SIGKILL
     signal_identity_checked(pid, ticks, grace_signal, marker_aid=marker_aid)
 
@@ -4583,15 +4592,15 @@ def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
                 # recycled runner PID can never be signalled.
                 raw_runner_pid = cur.get("runner_pid")
                 if raw_runner_pid is not None:
-                    runner_pid = _process_identity_int(raw_runner_pid, minimum=1)
-                    runner_ticks = _process_identity_int(cur.get("runner_start_time"), minimum=0)
-                    if runner_pid is None or runner_ticks is None:
+                    identity = _persisted_runner_identity(cur)
+                    if identity is None:
                         return False
+                    runner_pid, runner_ticks, marker_aid = identity
                     signal_identity_checked(
                         runner_pid,
                         runner_ticks,
                         signal.SIGKILL,
-                        marker_aid=str(cur.get("id", "")),
+                        marker_aid=marker_aid,
                     )
                 # ...then the exact invocation process group.
                 if group_alive(cur):
