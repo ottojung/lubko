@@ -4290,9 +4290,14 @@ def _stale_running(aid: str) -> bool:
         ``True`` when the recorded process has stopped while state is running.
     """
     meta = read_meta(aid)
-    if meta is None:
+    if meta is None or meta.get("state") != "running":
         return False
-    return bool(meta.get("state") == "running" and meta.get("pid") and not is_alive(meta))
+    raw_pid = meta.get("pid")
+    if raw_pid is None:
+        return False
+    if _process_identity_int(raw_pid, minimum=1) is None:
+        return True
+    return not is_alive(meta)
 
 
 def cmd_log(args: argparse.Namespace) -> int:
