@@ -1314,6 +1314,16 @@ def _test_sync(step: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _launch_timestamp(meta: Meta) -> float | None:
+    """Return a finite persisted launch timestamp without coercing malformed data."""
+    value = meta.get("started_at")
+    if value is None:
+        value = meta.get("created_at")
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
 def derive_state(meta: Meta | None) -> str:
     """Return the live state, verifying process liveness rather than trusting metadata.
 
@@ -1328,16 +1338,19 @@ def derive_state(meta: Meta | None) -> str:
     state = meta.get("state")
     if state != "running":
         return state or "idle"
-    pid = meta.get("pid")
-    if pid and is_alive(meta):
+    pid_value = meta.get("pid")
+    if pid_value is None:
+        launched = _launch_timestamp(meta)
+        return (
+            "running"
+            if launched is not None and time.time() - launched < PID_START_WINDOW_SECONDS
+            else "unknown"
+        )
+    if _process_identity_int(pid_value, minimum=1) is None:
+        return "unknown"
+    if is_alive(meta):
         return "running"
-    if not pid:
-        # Launched but the runner has not recorded the PID yet.
-        launched = meta.get("started_at") or meta.get("created_at") or 0
-        return "running" if time.time() - launched < PID_START_WINDOW_SECONDS else "unknown"
-    if meta.get("finished_at"):
-        return str(state)  # runner finalized it
-    return "unknown"
+    return str(state) if meta.get("finished_at") else "unknown"
 
 
 DISAPPEARED_NOTE: Final = "runner/model process disappeared without a captured exit status"
@@ -1371,11 +1384,12 @@ def _reconcile_dead_invocation(m: Meta) -> None:
         return  # already terminal/reconciled; nothing to converge
     if is_genuinely_running(m):
         return
-    if not m.get("pid"):
+    pid_value = m.get("pid")
+    if pid_value is None:
         # Launched but the runner has not recorded its identity yet; give the
         # exact startup window the same grace derive_state grants it.
-        launched = m.get("started_at") or m.get("created_at") or 0
-        if time.time() - launched < PID_START_WINDOW_SECONDS:
+        launched = _launch_timestamp(m)
+        if launched is not None and time.time() - launched < PID_START_WINDOW_SECONDS:
             return
     if m.get("state") == "running":
         _finalize_terminal(m, None, None, "failed", DISAPPEARED_NOTE)
