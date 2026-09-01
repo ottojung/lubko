@@ -1127,7 +1127,8 @@ def reservation_in_flight(meta: Meta) -> bool:
         return False
     if _owner_alive(res.get("owner_pid"), res.get("owner_start_ticks")):
         return True
-    return _runner_marker_alive(meta.get("id", "") or "", gen)
+    aid = _persisted_agent_id(meta.get("id"))
+    return aid is not None and _runner_marker_alive(aid, gen)
 
 
 def owned_by_me(meta: Meta, caller_pid: int) -> bool:

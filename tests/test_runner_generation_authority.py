@@ -54,7 +54,7 @@ def test_canonical_reservation_generation_retains_marker_fallback(
     tmp_path: Path,
 ) -> None:
     """Canonical integer generations retain the marker fallback."""
-    meta = agent.idle_meta("audit", str(tmp_path), None)
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
     meta.update(
         active_runner=True,
         runner_reservation={
@@ -75,7 +75,39 @@ def test_canonical_reservation_generation_retains_marker_fallback(
     monkeypatch.setattr(agent, "_runner_marker_alive", marker_alive)
 
     assert agent.reservation_in_flight(meta)
-    assert marker_calls == [("audit", 7)]
+    assert marker_calls == [("a11d", 7)]
+
+
+@pytest.mark.parametrize("persisted_id", [123, True, "", None, "ABCDEF", "not-hex"])
+def test_malformed_persisted_agent_id_cannot_authorize_reservation_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    persisted_id: object,
+) -> None:
+    """Malformed durable agent IDs never reach reservation marker authority."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta.update(
+        id=persisted_id,
+        active_runner=True,
+        runner_reservation={
+            "state": "reserved",
+            "gen": 7,
+            "owner_pid": 1,
+            "owner_start_ticks": 1,
+        },
+    )
+    marker_calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_owner_alive", lambda _pid, _ticks: False)
+    monkeypatch.setattr(
+        agent,
+        "_runner_marker_alive",
+        lambda aid, gen: marker_calls.append((aid, gen)) or True,
+    )
+
+    assert not agent.reservation_in_flight(meta)
+    assert marker_calls == []
 
 
 @pytest.mark.parametrize("generation", [7.9, "7", True, False, -1, None])
