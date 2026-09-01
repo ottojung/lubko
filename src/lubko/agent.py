@@ -2267,9 +2267,12 @@ def _unresolved_child_state(m: Meta) -> str:
     leader_state = _unresolved_leader_state(rec)
     if leader_state is not None:
         return leader_state
+    aid = _persisted_agent_id(m.get("id"))
+    if aid is None:
+        return "ambiguous"
     pgid: int = rec["pgid"]
     iid: str = rec["invocation_id"]
-    members, complete = _proven_invocation_members(pgid, str(m.get("id", "")), iid)
+    members, complete = _proven_invocation_members(pgid, aid, iid)
     for _, fd in members:
         os.close(fd)
     if not complete:
