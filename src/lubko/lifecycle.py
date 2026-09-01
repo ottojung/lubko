@@ -2511,6 +2511,33 @@ def _spawned_by_recovery_worker(process_pid: int, recovery_worker_pid: int) -> b
     return False
 
 
+def _parse_probe_claim_state(
+    state: object,
+) -> tuple[str, str | None, int | None] | None:
+    """Parse persisted recovery-probe claim state without scalar coercion.
+
+    Returns:
+        Canonical claim fields, or ``None`` when persisted authority is malformed.
+    """
+    if not isinstance(state, dict):
+        return None
+    status = state.get("status")
+    if not isinstance(status, str):
+        return None
+
+    owner_raw = state.get("worker_id")
+    if "worker_id" in state and not isinstance(owner_raw, str):
+        return None
+    owner = owner_raw if isinstance(owner_raw, str) else None
+
+    if "process_pid" not in state:
+        return status, owner, None
+    process_pid = state["process_pid"]
+    if isinstance(process_pid, bool) or not isinstance(process_pid, int) or process_pid <= 0:
+        return None
+    return status, owner, process_pid
+
+
 def _wait_for_probe_claim(
     conn: JobsConnection,
     probe_id: UUID,
@@ -2543,27 +2570,22 @@ def _wait_for_probe_claim(
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
             cursor.execute(
-                "SELECT (payload::jsonb)->'state'->>'status', "
-                "(payload::jsonb)->'state'->>'worker_id', "
-                "(payload::jsonb)->'state'->>'process_pid' "
-                "FROM lubko.jobs WHERE id = %s",
+                "SELECT (payload::jsonb)->'state' FROM lubko.jobs WHERE id = %s",
                 (probe_id,),
             )
             row = cursor.fetchone()
         if row is None:
             return False
-        status = str(row[0])
-        owner = str(row[1]) if row[1] is not None else None
+        claim = _parse_probe_claim_state(row[0])
+        if claim is None:
+            return False
+        status, owner, process_pid = claim
         if status == STATE_RUNNING:
             if owner != expected_worker_id:
                 return False
-            if row[2] is None:
+            if process_pid is None:
                 time.sleep(LOCK_POLL_INTERVAL_SECONDS)
                 continue
-            try:
-                process_pid = int(str(row[2]))
-            except ValueError:
-                return False
             return _spawned_by_recovery_worker(process_pid, recovery_worker_pid)
         if status in {"succeeded", "failed", "cancelled"}:
             return False
