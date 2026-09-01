@@ -68,3 +68,23 @@ def test_pop_consumes_canonical_head() -> None:
     assert item == {"seq": 1, "prompt": "one", "queued_at": 1.0}
     assert meta["pending_prompt"] == "one"
     assert meta["steer_queue"] == [{"seq": 2, "prompt": "two", "queued_at": 2.0}]
+
+
+@pytest.mark.parametrize("bad", [False, "1", 1.5, -1, {}, []])
+def test_pop_rejects_malformed_sequence_without_consuming(bad: object) -> None:
+    meta: agent.Meta = {
+        "steer_queue": [{"seq": 1, "prompt": "one", "queued_at": 1.0}],
+        "steer_seq": bad,
+        "prompt_count": 0,
+    }
+    before = copy.deepcopy(meta)
+    assert agent._pop_into_pending(meta, 4.0) is None
+    assert meta == before
+
+
+@pytest.mark.parametrize("bad", [False, 0, "", {}, 1])
+def test_pop_rejects_nonlist_queue_without_consuming(bad: object) -> None:
+    meta: agent.Meta = {"steer_queue": bad, "steer_seq": 2, "prompt_count": 0}
+    before = copy.deepcopy(meta)
+    assert agent._pop_into_pending(meta, 4.0) is None
+    assert meta == before
