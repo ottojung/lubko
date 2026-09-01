@@ -2445,18 +2445,18 @@ def _drain_next(aid: str) -> str | None:
         if m.get("stop_reason") in STOP_REASONS:
             _set_active_runner(m, value=False)
             return
-        if m.get("pending_prompt"):
-            # A new invocation was queued while this one was running; run it
-            # rather than going idle, so a second runner is never needed.
-            m["active_runner"] = True
-            holder["prompt"] = m["pending_prompt"]
-            return
         sequence = _steer_sequence(m)
         if sequence is None:
             raise MalformedSteerMetadataError
         queue = _steer_queue(m, sequence=sequence)
         if queue is None:
             raise MalformedSteerMetadataError
+        if m.get("pending_prompt"):
+            # A new invocation was queued while this one was running; run it
+            # rather than going idle, so a second runner is never needed.
+            m["active_runner"] = True
+            holder["prompt"] = m["pending_prompt"]
+            return
         if not queue:
             _set_active_runner(m, value=False)
             return
