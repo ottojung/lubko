@@ -257,3 +257,31 @@ def test_dead_running_state_preserves_valid_completion_timestamp(
     meta = _running_meta(pid=123, finished_at=1.0)
     monkeypatch.setattr("lubko.agent.is_alive", lambda _value: False)
     assert derive_state(meta) == "running"
+
+
+def test_stale_running_preserves_absence_and_canonical_pid_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale-running detection distinguishes absence from exact PID liveness."""
+    meta = _running_meta(pid=None)
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: True)
+    assert agent._stale_running("a1") is False
+    meta["pid"] = 123
+    assert agent._stale_running("a1") is False
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    assert agent._stale_running("a1") is True
+
+
+def test_stale_running_fails_closed_on_malformed_present_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed present PIDs cannot suppress stale-running convergence."""
+    meta = _running_meta()
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: True)
+
+    malformed_values: tuple[object, ...] = (False, 0, 0.0, "", [], {}, "123", True)
+    for malformed in malformed_values:
+        meta["pid"] = malformed
+        assert agent._stale_running("a1") is True
