@@ -213,3 +213,25 @@ def test_malformed_delete_tombstone_blocks_invocation_tracking(malformed: object
         "start_time": 77,
         "invocation_id": "inv-1",
     }
+
+
+def test_forced_delete_rechecks_after_signalling_before_convergence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forced deletion waits for fresh convergence evidence after signalling."""
+    meta: agent.Meta = {"id": "aaaaaaaa", "delete_pending": True}
+    convergence = iter([False, True])
+    signals: list[agent.Meta] = []
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+
+    def signal(cur: agent.Meta) -> bool:
+        signals.append(cur)
+        return True
+
+    monkeypatch.setattr(agent, "_signal_delete_execution", signal)
+    monkeypatch.setattr(agent, "_delete_converged", lambda _cur: next(convergence))
+    monkeypatch.setattr(time, "time", lambda: 0.0)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    assert agent._converge_for_delete("aaaaaaaa", force=True, deadline=1.0) is True
+    assert signals == [meta, meta]

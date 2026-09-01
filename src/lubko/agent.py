@@ -4904,9 +4904,10 @@ def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
         if cur is not None:
             if _delete_pending_flag(cur) is not True:
                 return False
-            if force and not _signal_delete_execution(cur):
-                return False
-            if not _delete_converged(cur):
+            if force:
+                if not _signal_delete_execution(cur):
+                    return False
+            elif not _delete_converged(cur):
                 # Something became live between the decision and the
                 # tombstone; non-forced deletion must not kill it.
                 return False
