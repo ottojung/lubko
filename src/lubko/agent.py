@@ -1150,6 +1150,22 @@ def _active_runner_flag(meta: Meta) -> bool | None:
     return value
 
 
+def _delete_pending_flag(meta: Meta) -> bool | None:
+    """Return canonical durable deletion-tombstone authority.
+
+    Genuine field absence remains the legacy non-tombstone state. A present
+    value is lifecycle authority only when it is a literal JSON boolean;
+    malformed values remain distinguishable as ``None`` so callers can block
+    execution or deletion rather than normalizing through truthiness.
+    """
+    if "delete_pending" not in meta:
+        return False
+    value = meta.get("delete_pending")
+    if type(value) is not bool:
+        return None
+    return value
+
+
 def reservation_in_flight(meta: Meta) -> bool:
     """Return whether a reserved runner is still being brought up.
 
@@ -1798,7 +1814,7 @@ def runner(aid: str, mode: str) -> None:
     claimed = {}
 
     def claim(m: Meta) -> None:
-        if m.get("delete_pending"):
+        if _delete_pending_flag(m) is not False:
             # A concurrent delete owns the lifecycle: a runner must never
             # claim (and later recreate state) once deletion was decided.
             claimed["ok"] = False
@@ -1868,8 +1884,10 @@ def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
     """
     while True:
         meta = read_meta(ctx.aid)
-        if meta is None or meta.get("delete_pending"):
-            # Deleted (or being deleted): never start another invocation.
+        if meta is None:
+            return
+        if _delete_pending_flag(meta) is not False:
+            # Deleted, being deleted, or tombstone authority is malformed.
             return
         prompt = _pending_prompt(meta)
         if prompt is None:
@@ -2002,7 +2020,7 @@ def _claim_pending_prompt(aid: str, prompt: str) -> bool:
     def claim(m: Meta) -> None:
         if (
             _persisted_lifecycle_state(m) is None
-            or m.get("delete_pending")
+            or _delete_pending_flag(m) is not False
             or m.get("intent") in STOP_REASONS
             or m.get("stop_reason") in STOP_REASONS
         ):
@@ -2454,7 +2472,7 @@ def _record_running(
 
     def record(m: Meta) -> None:
         if (
-            m.get("delete_pending")
+            _delete_pending_flag(m) is not False
             or m.get("intent") in STOP_REASONS
             or m.get("stop_reason") in STOP_REASONS
         ):
@@ -4734,6 +4752,8 @@ def _begin_delete(aid: str, *, force: bool) -> Meta | None:
     snapshot: dict[str, Meta] = {}
 
     def fn(m: Meta) -> None:
+        if _delete_pending_flag(m) is None:
+            return
         m["delete_pending"] = True
         if force:
             m["intent"] = "kill"
@@ -4770,6 +4790,8 @@ def _delete_converged(cur: Meta | None) -> bool:
     """
     if cur is None:
         return True
+    if _delete_pending_flag(cur) is not True:
+        return False
     if _active_runner_flag(cur) is None:
         return False
     raw_runner_pid = cur.get("runner_pid")
@@ -4820,8 +4842,13 @@ def _signal_unresolved_child(meta: Meta) -> None:
 
 
 def _abort_delete(aid: str) -> None:
-    """Clear the deletion tombstone so a failed delete can be retried."""
-    update_meta(aid, lambda m: m.update(delete_pending=False))
+    """Clear only a canonical deletion tombstone after failed convergence."""
+
+    def clear(m: Meta) -> None:
+        if _delete_pending_flag(m) is True:
+            m["delete_pending"] = False
+
+    update_meta(aid, clear)
 
 
 def _remove_deleted_state(aid: str) -> bool:
@@ -4837,6 +4864,30 @@ def _remove_deleted_state(aid: str) -> bool:
     return not agent_dir(aid).exists()
 
 
+def _signal_delete_execution(cur: Meta) -> bool:
+    """Signal exact recorded execution identities during forced deletion.
+
+    Returns:
+        ``True`` when every present identity is canonical and was signalled.
+    """
+    raw_runner_pid = cur.get("runner_pid")
+    if raw_runner_pid is not None:
+        identity = _persisted_runner_identity(cur)
+        if identity is None:
+            return False
+        runner_pid, runner_ticks, marker_aid = identity
+        signal_identity_checked(
+            runner_pid,
+            runner_ticks,
+            signal.SIGKILL,
+            marker_aid=marker_aid,
+        )
+    if group_alive(cur):
+        send_signal_group(cur, signal.SIGKILL)
+    _signal_unresolved_child(cur)
+    return True
+
+
 def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
     """Converge the exact runner and invocation before state removal.
 
@@ -4850,30 +4901,12 @@ def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
     """
     while True:
         cur = read_meta(aid)
-        if cur is not None and cur.get("delete_pending"):
+        if cur is not None:
+            if _delete_pending_flag(cur) is not True:
+                return False
             if force:
-                # Converge the exact recorded runner identity first: pinned,
-                # start-time and marker verified at the signal point, so a
-                # recycled runner PID can never be signalled.
-                raw_runner_pid = cur.get("runner_pid")
-                if raw_runner_pid is not None:
-                    identity = _persisted_runner_identity(cur)
-                    if identity is None:
-                        return False
-                    runner_pid, runner_ticks, marker_aid = identity
-                    signal_identity_checked(
-                        runner_pid,
-                        runner_ticks,
-                        signal.SIGKILL,
-                        marker_aid=marker_aid,
-                    )
-                # ...then the exact invocation process group.
-                if group_alive(cur):
-                    send_signal_group(cur, signal.SIGKILL)
-                # ...and the exact unrecorded child, if any survived the
-                # spawn gate: signalled only through the same pinned,
-                # identity-exact path — never a numeric PID/PGID fallback.
-                _signal_unresolved_child(cur)
+                if not _signal_delete_execution(cur):
+                    return False
             elif not _delete_converged(cur):
                 # Something became live between the decision and the
                 # tombstone; non-forced deletion must not kill it.
@@ -4910,7 +4943,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
     if live and not args.force:
         _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
         return EXIT_ERROR
-    _begin_delete(aid, force=args.force)
+    if _begin_delete(aid, force=args.force) is None:
+        _err(f"{PROG}: agent {aid} could not establish deletion authority")
+        return EXIT_ERROR
     if not _converge_for_delete(aid, force=args.force, deadline=time.time() + KILL_WAIT_SECONDS):
         # Fail closed: convergence was not proven, so keep the retryable state.
         _abort_delete(aid)
@@ -4966,7 +5001,8 @@ def _retention_remove(aid: str, deadline: float) -> str:
         return "skipped"
     if _retention_clean_live(meta):
         return "skipped"
-    _begin_delete(aid, force=False)
+    if _begin_delete(aid, force=False) is None:
+        return "skipped"
     if not _converge_for_delete(aid, force=False, deadline=deadline):
         # Fail closed: it became live between the tombstone and convergence.
         _abort_delete(aid)
