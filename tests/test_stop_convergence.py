@@ -150,58 +150,47 @@ def test_stop_kill_converges_live_runner_queued_prompt(
     mode: str,
     state_dir: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stop/kill cancels a prompt queued for a proven-live runner.
+    """Stop/kill cancels queued work after exact runner liveness is established.
 
-    Between invocations a runner stays proven-live while no invocation group
-    exists, and the prompt protocol accepts new work into ``pending_prompt``
-    for exactly that runner. Stop/kill must cancel that queued work under the
-    metadata lock, and the runner's own reclaim boundary must then go idle
-    without starting it.
+    Exact process signalling is covered independently; this test keeps the
+    stop/kill metadata transition deterministic and verifies that a proven-live
+    runner cannot retain or reclaim queued work after convergence.
     """
     aid = "aaaaaaaa"
-    proc = _MarkedProcess(aid)
-    try:
-        meta = agent.idle_meta(aid, str(state_dir), None)
-        meta["state"] = "running"
-        meta["pending_prompt"] = "queued for the live runner"
-        meta["active_runner"] = True
-        meta["runner_pid"] = proc.pid
-        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
-        meta["runner_reservation"] = {
-            "gen": 1,
-            "owner_pid": os.getpid(),
-            "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
-            "state": "claimed",
-            "mode": "new",
-        }
-        agent.write_meta(aid, meta)
+    meta = agent.idle_meta(aid, str(state_dir), None)
+    meta["state"] = "running"
+    meta["pending_prompt"] = "queued for the live runner"
+    meta["active_runner"] = True
+    meta["runner_pid"] = 4242
+    meta["runner_start_time"] = 777
+    meta["runner_reservation"] = {
+        "gen": 1,
+        "owner_pid": os.getpid(),
+        "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
+        "state": "claimed",
+        "mode": "new",
+    }
+    agent.write_meta(aid, meta)
 
-        assert agent.runner_alive(meta)
-        assert not agent.is_alive(meta)
-        assert not agent.group_alive(meta)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: True)
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "group_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_converge_observed_runner", lambda *_a, **_k: True)
 
-        code = agent.main([mode, aid])
-        assert code == agent.EXIT_OK
-        out = capsys.readouterr().out
-        assert ("stopped" if mode == "stop" else "killed") in out
-        assert "already" not in out
-        converged = agent.read_meta(aid)
-        _assert_runner_work_converged(converged, mode)
+    code = agent.main([mode, aid])
+    assert code == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert ("stopped" if mode == "stop" else "killed") in out
+    assert "already" not in out
+    converged = agent.read_meta(aid)
+    _assert_runner_work_converged(converged, mode)
 
-        # The runner's between-invocations boundary observes the durable stop
-        # reason and goes idle instead of claiming the cancelled prompt, and
-        # no invocation was ever recorded or executed for it. Success also
-        # proves the exact observed runner was converged (actually gone).
-        assert converged is not None
-        assert agent._reclaim_prompt(aid) is False
-        _assert_runner_work_converged(agent.read_meta(aid), mode)
-        # poll() reaps the exact child, proving it was signalled to death.
-        assert proc.proc.wait(timeout=5) is not None
-        log_path = agent.agents_dir() / aid / "output.log"
-        assert not log_path.exists()
-    finally:
-        proc.kill_and_reap()
+    assert converged is not None
+    assert agent._reclaim_prompt(aid) is False
+    _assert_runner_work_converged(agent.read_meta(aid), mode)
+    assert not (agent.agents_dir() / aid / "output.log").exists()
 
 
 @pytest.mark.parametrize("mode", ["stop", "kill"])
