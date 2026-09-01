@@ -3554,7 +3554,9 @@ def _list_entries(args: argparse.Namespace) -> list[tuple[str, str, Meta]]:
     return entries
 
 
-def _list_summary(meta: Meta) -> tuple[float | None, int | None, str | None, str | None, list[str]]:
+def _list_summary(
+    meta: Meta,
+) -> tuple[int | float | None, int | None, str | None, str | None, list[str]]:
     """Validate persisted metadata used by the multi-agent list surface.
 
     Returns:
@@ -3562,7 +3564,7 @@ def _list_summary(meta: Meta) -> tuple[float | None, int | None, str | None, str
     """
     errors: list[str] = []
 
-    created_at: float | None = None
+    created_at: int | float | None = None
     raw_created_at = meta.get("created_at")
     if raw_created_at is not None:
         if (
@@ -3572,7 +3574,7 @@ def _list_summary(meta: Meta) -> tuple[float | None, int | None, str | None, str
         ):
             errors.append("created_at")
         else:
-            created_at = float(raw_created_at)
+            created_at = raw_created_at
 
     prompt_count: int | None = None
     if "prompt_count" in meta:

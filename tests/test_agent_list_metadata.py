@@ -45,6 +45,8 @@ def test_list_valid_summary_and_ordering_are_preserved(monkeypatch: pytest.Monke
         "last_activity_at": None,
         "finished_at": None,
     }
+    assert agent._entry_json(*entries[1])["created_at"] == 10
+    assert type(agent._entry_json(*entries[1])["created_at"]) is int
 
 
 def test_list_malformed_created_at_cannot_break_mixed_sorting(
