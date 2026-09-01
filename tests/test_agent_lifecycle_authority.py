@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from lubko import agent
 from lubko.agent import derive_state
 
 
@@ -53,3 +54,52 @@ def test_derive_state_fails_closed_on_malformed_launch_timestamp(
         meta["started_at"] = None
     meta[field] = malformed
     assert derive_state(meta) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [False, 0, 0.0, "", [], {}, ["corrupt"], "bogus", 1, True],
+)
+def test_derive_state_fails_closed_on_malformed_lifecycle_state(malformed: object) -> None:
+    """Malformed present lifecycle state never becomes idle/running/terminal authority."""
+    assert derive_state({"id": "a1", "state": malformed}) == "unknown"
+
+
+def _idle_transition_meta(state: object) -> dict[str, object]:
+    return {
+        "id": "a1",
+        "state": state,
+        "active_runner": False,
+        "pending_prompt": None,
+        "prompt_count": 0,
+        "runner_gen": 0,
+        "runner_reservation": None,
+        "steer_queue": [],
+        "steer_seq": 0,
+        "native_session_id": None,
+    }
+
+
+@pytest.mark.parametrize("malformed", [False, 0, "", [], {}, ["corrupt"], "bogus"])
+def test_locked_transition_does_not_repair_malformed_state_into_runner_authority(
+    monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    """Malformed lifecycle state blocks prompt acceptance without mutating durable state."""
+    meta = _idle_transition_meta(malformed)
+    before = dict(meta)
+    decision: dict[str, object] = {}
+    monkeypatch.setattr(agent, "is_alive", lambda _m: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _m: False)
+    monkeypatch.setattr(agent, "reservation_in_flight", lambda _m: False)
+
+    with pytest.raises(agent.MalformedLifecycleStateError):
+        agent._apply_locked_transition(meta, decision, prompt="P", steer=False, mode="new")
+
+    assert decision == {}
+    assert meta == before
+    assert meta["runner_reservation"] is None
+
+
+def test_missing_lifecycle_state_retains_legacy_idle_semantics() -> None:
+    """Genuine field absence remains distinct from malformed presence."""
+    assert derive_state({"id": "a1"}) == "idle"
