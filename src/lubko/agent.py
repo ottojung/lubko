@@ -1114,6 +1114,20 @@ def _next_prompt_count(meta: Meta) -> int | None:
     if type(value) is not int or value < 0:
         return None
     return value + 1
+def _active_runner_flag(meta: Meta) -> bool | None:
+    """Return canonical durable runner-consumption authority.
+
+    ``active_runner`` is persisted JSON authority, so only literal booleans are
+    usable. Historical records that genuinely omit the field predate runner
+    reservations and safely mean inactive; present malformed values remain
+    distinguishable as ``None`` and must block authority-changing operations.
+    """
+    if "active_runner" not in meta:
+        return False
+    value = meta.get("active_runner")
+    if type(value) is not bool:
+        return None
+    return value
 
 
 def reservation_in_flight(meta: Meta) -> bool:
@@ -1130,7 +1144,7 @@ def reservation_in_flight(meta: Meta) -> bool:
     Returns:
         ``True`` while a reserved runner is expected to claim the agent.
     """
-    if not meta.get("active_runner"):
+    if _active_runner_flag(meta) is not True:
         return False
     if runner_alive(meta):
         return True
@@ -1207,7 +1221,10 @@ def active_runner_justified(meta: Meta) -> bool:
     Returns:
         ``True`` when ``active_runner`` is justified.
     """
-    if not meta.get("active_runner"):
+    active_runner = _active_runner_flag(meta)
+    if active_runner is None:
+        return False
+    if not active_runner:
         return True
     if runner_alive(meta):
         return True
@@ -1317,7 +1334,10 @@ def _reconcile_dead_invocation(m: Meta) -> None:
     Args:
         m: Agent metadata under the lock.
     """
-    if not m.get("active_runner") and m.get("state") != "running":
+    active_runner = _active_runner_flag(m)
+    if active_runner is None:
+        return  # malformed durable authority requires explicit repair
+    if not active_runner and m.get("state") != "running":
         return  # already terminal/reconciled; nothing to converge
     if is_genuinely_running(m):
         return
@@ -2975,6 +2995,9 @@ def _decide_invocation(
         prompt: Instruction to run or steer.
         steer: Whether this is a steer rather than an ordinary prompt.
     """
+    if _active_runner_flag(m) is None:
+        decision["action"] = "busy"
+        return
     if _unresolved_child_state(m) != "gone":
         # An earlier unrecorded invocation could not be positively proven
         # converged (still live, or inspection ambiguous); a later
@@ -3058,7 +3081,7 @@ def _apply_locked_transition(
     # once an exiting runner has relinquished it (``active_runner`` false,
     # reservation dropped), that runner will never consume another prompt, so
     # it must not be reused even while its process is still dying.
-    live_runner = bool(m.get("active_runner")) and runner_alive(m)
+    live_runner = _active_runner_flag(m) is True and runner_alive(m)
     in_flight = reservation_in_flight(m)
 
     if live_agent:
@@ -4513,7 +4536,7 @@ def _begin_delete(aid: str, *, force: bool) -> Meta | None:
             "invocation_id": m.get("invocation_id"),
             "runner_pid": m.get("runner_pid"),
             "runner_start_time": m.get("runner_start_time"),
-            "active_runner": bool(m.get("active_runner")),
+            "active_runner": m.get("active_runner"),
             "runner_reservation": dict(res) if isinstance(res, dict) else None,
             "unresolved_invocation": dict(marker) if isinstance(marker, dict) else None,
             "delete_pending": True,
@@ -4535,6 +4558,8 @@ def _delete_converged(cur: Meta | None) -> bool:
     """
     if cur is None:
         return True
+    if _active_runner_flag(cur) is None:
+        return False
     raw_runner_pid = cur.get("runner_pid")
     if raw_runner_pid is not None and (
         _process_identity_int(raw_runner_pid, minimum=1) is None
