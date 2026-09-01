@@ -1086,14 +1086,15 @@ def _owner_alive(owner: object, owner_ticks: object) -> bool:
         ``True`` only when the same pinned live process is the exact recorded
         reservation owner.
     """
-    if not isinstance(owner, int) or isinstance(owner, bool):
+    owner_pid = _process_identity_int(owner, minimum=1)
+    start_ticks = _process_identity_int(owner_ticks, minimum=0)
+    if owner_pid is None or start_ticks is None:
         return False
-    owner_pid = int(owner)
     fd = open_pidfd(owner_pid)
     if fd is None:
         return False
     try:
-        if proc_start_ticks(owner_pid) != owner_ticks:
+        if proc_start_ticks(owner_pid) != start_ticks:
             return False
         if _is_zombie(owner_pid):
             return False
