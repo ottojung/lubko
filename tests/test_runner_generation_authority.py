@@ -100,11 +100,12 @@ def test_malformed_persisted_agent_id_cannot_authorize_reservation_marker(
 
     monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
     monkeypatch.setattr(agent, "_owner_alive", lambda _pid, _ticks: False)
-    monkeypatch.setattr(
-        agent,
-        "_runner_marker_alive",
-        lambda aid, gen: marker_calls.append((aid, gen)) or True,
-    )
+
+    def marker_alive(aid: str, gen: int) -> bool:
+        marker_calls.append((aid, gen))
+        return True
+
+    monkeypatch.setattr(agent, "_runner_marker_alive", marker_alive)
 
     assert not agent.reservation_in_flight(meta)
     assert marker_calls == []
