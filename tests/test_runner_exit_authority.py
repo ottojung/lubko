@@ -579,3 +579,52 @@ def test_dead_claimed_runner_that_consumed_prompts_starts_fresh(tmp_path: Path) 
     res = final["runner_reservation"]
     assert isinstance(res, dict)
     assert res["state"] == "reserved"
+
+
+@pytest.mark.parametrize("active_runner", ["false", "true", "garbage", 0, 1, None, [], {}])
+def test_malformed_runner_consumption_authority_blocks_prompt_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, active_runner: object
+) -> None:
+    """Malformed runner authority cannot authorize reuse or replacement."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta["active_runner"] = active_runner
+    decision: dict[str, object] = {}
+    monkeypatch.setattr(agent, "discover_session_id", lambda _aid: None)
+    agent._decide_invocation(meta, decision, prompt="new work", steer=False)
+    assert decision == {"action": "busy"}
+    assert meta["active_runner"] is active_runner
+    assert meta.get("pending_prompt") is None
+    assert meta.get("runner_reservation") is None
+
+
+def test_canonical_runner_consumption_authority_preserves_transition_semantics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Literal booleans retain inactive-spawn and active-reuse behavior."""
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: True)
+    monkeypatch.setattr(agent, "reservation_in_flight", lambda _meta: False)
+    inactive = agent.idle_meta("a11d", str(tmp_path), None)
+    inactive_decision: dict[str, object] = {}
+    agent._apply_locked_transition(inactive, inactive_decision, prompt="P", steer=False, mode="new")
+    assert inactive_decision == {"action": "spawn", "mode": "new", "gen": 1}
+    active = agent.idle_meta("a11d", str(tmp_path), None)
+    active["active_runner"] = True
+    active_decision: dict[str, object] = {}
+    agent._apply_locked_transition(active, active_decision, prompt="P", steer=False, mode="new")
+    assert active_decision == {"action": "reuse", "interrupt": False}
+
+
+def test_delete_keeps_malformed_runner_consumption_authority_blocking(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Deletion never normalizes malformed durable runner authority."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta["active_runner"] = "false"
+    agent.agent_dir("a11d").mkdir(parents=True)
+    agent.write_meta("a11d", meta)
+    snapshot = agent._begin_delete("a11d", force=False)
+    assert snapshot is not None
+    assert snapshot["active_runner"] == "false"
+    assert not agent._delete_converged(snapshot)
