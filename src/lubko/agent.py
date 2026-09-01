@@ -1535,7 +1535,7 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
     """
     model = AGENT_MODEL
     variant = meta.get("variant") or DEFAULT_VARIANT
-    cwd = meta.get("cwd") or str(Path.cwd())
+    cwd = _persisted_agent_cwd(meta)
     if is_continue:
         session_id = meta.get("native_session_id") or discover_session_id(meta.get("id", ""))
         if not session_id:
@@ -1570,6 +1570,23 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
         cwd,
         prompt,
     ]
+
+
+def _persisted_agent_cwd(meta: Meta) -> str:
+    """Return the exact durable managed-agent working directory.
+
+    Once an agent record exists, its ``cwd`` is execution authority. A
+    malformed present value must never be normalized or replaced with the
+    runner process current directory.
+
+    Raises:
+        ValueError: The durable working directory is missing or malformed.
+    """
+    cwd = meta.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        message = "managed-agent cwd is malformed"
+        raise ValueError(message)
+    return cwd
 
 
 # ---------------------------------------------------------------------------
@@ -1678,12 +1695,12 @@ def runner(aid: str, mode: str) -> None:
     directory = agent_dir(aid)
     directory.mkdir(parents=True, exist_ok=True)
     log_path = directory / "output.log"
-    cwd = meta.get("cwd") or str(Path.cwd())
     env = dict(os.environ)
     env["LUBKO_AGENT_ID"] = aid
     env["NO_COLOR"] = "1"
-    ctx = _RunnerContext(aid=aid, log_path=log_path, cwd=cwd, env=env)
     try:
+        cwd = _persisted_agent_cwd(meta)
+        ctx = _RunnerContext(aid=aid, log_path=log_path, cwd=cwd, env=env)
         _runner_loop(ctx, is_continue=mode == "continue")
     except BaseException:
         _abort_runner(aid)
