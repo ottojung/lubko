@@ -3548,33 +3548,81 @@ def _list_entries(args: argparse.Namespace) -> list[tuple[str, str, Meta]]:
         if not _matches_filters(args, state):
             continue
         entries.append((aid, state, meta))
-    entries.sort(key=lambda entry: entry[2].get("created_at") or 0, reverse=True)
+    entries.sort(key=lambda entry: _list_summary(entry[2])[0] or 0, reverse=True)
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
     return entries
 
 
+def _list_summary(
+    meta: Meta,
+) -> tuple[int | float | None, int | None, str | None, str | None, list[str]]:
+    """Validate persisted metadata used by the multi-agent list surface.
+
+    Returns:
+        Canonical summary values plus malformed field names.
+    """
+    errors: list[str] = []
+
+    created_at: int | float | None = None
+    raw_created_at = meta.get("created_at")
+    if raw_created_at is not None:
+        if (
+            not isinstance(raw_created_at, (int, float))
+            or isinstance(raw_created_at, bool)
+            or not math.isfinite(raw_created_at)
+        ):
+            errors.append("created_at")
+        else:
+            created_at = raw_created_at
+
+    prompt_count: int | None = None
+    if "prompt_count" in meta:
+        raw_prompt_count = meta["prompt_count"]
+        if type(raw_prompt_count) is not int or raw_prompt_count < 0:
+            errors.append("prompt_count")
+        else:
+            prompt_count = raw_prompt_count
+
+    cwd: str | None = None
+    raw_cwd = meta.get("cwd")
+    if raw_cwd is not None:
+        if type(raw_cwd) is not str:
+            errors.append("cwd")
+        else:
+            cwd = raw_cwd
+
+    title: str | None = None
+    raw_title = meta.get("title")
+    if raw_title is not None:
+        if type(raw_title) is not str:
+            errors.append("title")
+        else:
+            title = raw_title
+
+    return created_at, prompt_count, cwd, title, errors
+
+
 def _entry_json(aid: str, state: str, meta: Meta) -> Meta:
     """Build the JSON mapping for one agent list entry.
 
-    Args:
-        aid: Agent ID.
-        state: Agent state.
-        meta: Agent metadata.
-
     Returns:
-        The JSON-safe mapping.
+        The sanitized JSON-safe list entry.
     """
-    return {
+    created_at, prompt_count, cwd, title, errors = _list_summary(meta)
+    entry: Meta = {
         "id": aid,
         "state": state,
-        "prompts": meta.get("prompt_count"),
-        "cwd": meta.get("cwd"),
-        "title": meta.get("title"),
-        "created_at": meta.get("created_at"),
+        "prompts": prompt_count,
+        "cwd": cwd,
+        "title": title,
+        "created_at": created_at,
         "last_activity_at": meta.get("last_activity_at"),
         "finished_at": meta.get("finished_at"),
     }
+    if errors:
+        entry["metadata_errors"] = errors
+    return entry
 
 
 def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
@@ -3585,15 +3633,19 @@ def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
     """
     rows = []
     for aid, state, meta in entries:
-        cwd = _truncate(meta.get("cwd") or "", 24)
-        title = _truncate((meta.get("title") or "").replace("\n", " "), 40)
+        created_at, prompt_count, cwd, title, errors = _list_summary(meta)
+        error_fields = set(errors)
         rows.append((
             aid,
             state,
-            str(meta.get("prompt_count") or 0),
-            fmt_age(meta.get("created_at")),
-            cwd,
-            title,
+            "<invalid>" if "prompt_count" in error_fields else str(prompt_count or 0),
+            "<invalid>" if "created_at" in error_fields else fmt_age(created_at),
+            "<invalid>" if "cwd" in error_fields else _truncate(cwd or "", 24),
+            (
+                "<invalid>"
+                if "title" in error_fields
+                else _truncate((title or "").replace("\n", " "), 40)
+            ),
         ))
     widths = [max(len(row[i]) for row in rows) for i in range(6)]
     labels = ("ID", "STATE", "P", "AGE", "CWD", "TITLE")
