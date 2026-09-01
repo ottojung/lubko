@@ -2005,6 +2005,23 @@ class SupervisorDaemon:
         LOGGER.error("%s", self._message)
         return None
 
+    @staticmethod
+    def _log_worker_startup_exit(
+        proc: subprocess.Popen[bytes],
+        commit: str,
+        token: str,
+        returncode: int,
+    ) -> None:
+        """Log a high-signal diagnostic for a worker that exits during startup."""
+        LOGGER.error(
+            "maintained worker is unhealthy: worker pid=%d for commit %s failed during "
+            "startup with returncode %r; worker log: %s",
+            proc.pid,
+            commit,
+            returncode,
+            lifecycle.worker_log_path(token),
+        )
+
     def _settle_unproven_spawn(
         self,
         commit: str,
@@ -2043,8 +2060,9 @@ class SupervisorDaemon:
         Returns:
             Always ``None``: a failed spawn never yields a usable child.
         """
-        if proc.poll() is not None:
-            LOGGER.error("worker for commit %s exited before establishing its identity", commit)
+        returncode = proc.poll()
+        if returncode is not None:
+            self._log_worker_startup_exit(proc, commit, token, returncode)
             # Even an already-exited pre-publication worker may have launched
             # independent command groups under this token; recovery must
             # succeed before the durable authority is dropped.
@@ -2063,9 +2081,11 @@ class SupervisorDaemon:
                 self._release_unproven_spawn_authority(token, hold_persisted=hold_persisted)
                 return None
             observed = self._await_observable_identity(proc)
-            if observed is None and proc.poll() is not None:
+            returncode = proc.poll() if observed is None else None
+            if returncode is not None:
                 # The child exited during the hold: the exact-token groups it
                 # may have launched still owe fail-closed recovery.
+                self._log_worker_startup_exit(proc, commit, token, returncode)
                 self._release_unproven_spawn_authority(token, hold_persisted=hold_persisted)
                 return None
             if observed is not None and _identity_is_private_session(observed):

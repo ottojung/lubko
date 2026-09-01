@@ -718,6 +718,7 @@ class FakeProc:
 def test_normal_spawn_writes_obligation_before_popen_and_clears_afterwards(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Every successful or failed normal spawn keeps the protocol coherent.
 
@@ -751,6 +752,11 @@ def test_normal_spawn_writes_obligation_before_popen_and_clears_afterwards(
     assert during.commit == COMMIT
     assert during.pid is None, "the child identity cannot exist before Popen"
     assert read_state().spawning is None, "the failed spawn cleared the obligation"
+    assert "maintained worker is unhealthy" in caplog.text
+    assert "worker pid=4711" in caplog.text
+    assert f"commit {COMMIT}" in caplog.text
+    assert "failed during startup with returncode 0" in caplog.text
+    assert f"worker log: {lifecycle.worker_log_path(during.token)}" in caplog.text
 
 
 def test_failed_runtime_check_never_leaves_an_obligation(
@@ -959,6 +965,7 @@ def test_converged_unproven_spawn_recovery_failure_then_success(
 
 def test_exit_during_observation_recovery_failure_then_success(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A child exiting during identity observation owes exact group recovery."""
     obligation = _settle_obligation()
@@ -984,6 +991,11 @@ def test_exit_during_observation_recovery_failure_then_success(
     assert held.token == obligation.token
     assert read_state().child is None
     assert events == ["recover"]
+    assert "maintained worker is unhealthy" in caplog.text
+    assert "worker pid=4711" in caplog.text
+    assert f"commit {COMMIT}" in caplog.text
+    assert "failed during startup with returncode 0" in caplog.text
+    assert f"worker log: {lifecycle.worker_log_path(obligation.token)}" in caplog.text
 
     observed = _patch_recovery(monkeypatch)
     assert daemon._resolve_spawning_obligation() is True
