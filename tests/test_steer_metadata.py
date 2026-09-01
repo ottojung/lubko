@@ -88,3 +88,80 @@ def test_pop_rejects_nonlist_queue_without_consuming(bad: object) -> None:
     before = copy.deepcopy(meta)
     assert agent._pop_into_pending(meta, 4.0) is None
     assert meta == before
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("steer_queue", False),
+        ("steer_queue", ""),
+        ("steer_queue", {}),
+        ("steer_seq", False),
+        ("steer_seq", "1"),
+        ("steer_seq", 1.5),
+    ],
+)
+def test_reclaim_prompt_rejects_malformed_transition_metadata(
+    monkeypatch: pytest.MonkeyPatch, field: str, bad: object
+) -> None:
+    meta: agent.Meta = {"active_runner": True, "steer_queue": [], "steer_seq": 0}
+    meta[field] = bad
+    before = copy.deepcopy(meta)
+
+    def fake_update_meta(_aid: str, mutate: object) -> agent.Meta:
+        mutate(meta)  # type: ignore[operator]
+        return meta
+
+    monkeypatch.setattr(agent, "update_meta", fake_update_meta)
+    with pytest.raises(agent.MalformedSteerMetadataError):
+        agent._reclaim_prompt("test")
+    assert meta == before
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("steer_queue", False),
+        ("steer_queue", ""),
+        ("steer_queue", {}),
+        ("steer_seq", False),
+        ("steer_seq", "1"),
+        ("steer_seq", 1.5),
+    ],
+)
+def test_drain_next_rejects_malformed_transition_metadata(
+    monkeypatch: pytest.MonkeyPatch, field: str, bad: object
+) -> None:
+    meta: agent.Meta = {"active_runner": True, "steer_queue": [], "steer_seq": 0}
+    meta[field] = bad
+    before = copy.deepcopy(meta)
+
+    def fake_update_meta(_aid: str, mutate: object) -> agent.Meta:
+        mutate(meta)  # type: ignore[operator]
+        return meta
+
+    monkeypatch.setattr(agent, "update_meta", fake_update_meta)
+    with pytest.raises(agent.MalformedSteerMetadataError):
+        agent._drain_next("test")
+    assert meta == before
+
+
+def test_drain_next_validates_steer_metadata_before_pending_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    meta: agent.Meta = {
+        "active_runner": True,
+        "pending_prompt": "already accepted",
+        "steer_queue": False,
+        "steer_seq": 0,
+    }
+    before = copy.deepcopy(meta)
+
+    def fake_update_meta(_aid: str, mutate: object) -> agent.Meta:
+        mutate(meta)  # type: ignore[operator]
+        return meta
+
+    monkeypatch.setattr(agent, "update_meta", fake_update_meta)
+    with pytest.raises(agent.MalformedSteerMetadataError):
+        agent._drain_next("test")
+    assert meta == before

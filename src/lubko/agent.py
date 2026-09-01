@@ -1795,8 +1795,14 @@ def _reclaim_prompt(aid: str) -> bool:
         if m.get("stop_reason") in STOP_REASONS:
             _set_active_runner(m, value=False)
             return
-        if m.get("pending_prompt") or (m.get("steer_queue") or []):
-            if (m.get("steer_queue") or []) and not m.get("pending_prompt"):
+        sequence = _steer_sequence(m)
+        if sequence is None:
+            raise MalformedSteerMetadataError
+        queue = _steer_queue(m, sequence=sequence)
+        if queue is None:
+            raise MalformedSteerMetadataError
+        if m.get("pending_prompt") or queue:
+            if queue and not m.get("pending_prompt"):
                 _pop_into_pending(m, time.time())
             m["active_runner"] = True
             holder["busy"] = True
@@ -2439,13 +2445,19 @@ def _drain_next(aid: str) -> str | None:
         if m.get("stop_reason") in STOP_REASONS:
             _set_active_runner(m, value=False)
             return
+        sequence = _steer_sequence(m)
+        if sequence is None:
+            raise MalformedSteerMetadataError
+        queue = _steer_queue(m, sequence=sequence)
+        if queue is None:
+            raise MalformedSteerMetadataError
         if m.get("pending_prompt"):
             # A new invocation was queued while this one was running; run it
             # rather than going idle, so a second runner is never needed.
             m["active_runner"] = True
             holder["prompt"] = m["pending_prompt"]
             return
-        if not (m.get("steer_queue") or []):
+        if not queue:
             _set_active_runner(m, value=False)
             return
         item = _pop_into_pending(m, time.time())
