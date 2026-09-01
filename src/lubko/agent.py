@@ -197,21 +197,33 @@ def opencode_db_path() -> str:
 
 
 def read_meta(aid: str) -> Meta | None:
-    """Load an agent's metadata, tolerating absence and corruption.
+    """Load metadata only when its persisted identity is bound to ``aid``.
+
+    The directory/caller ID is the authority that selects an agent record. A
+    record whose durable ``id`` is absent, malformed, non-canonical, or names a
+    different canonical agent is corrupt and must not be reinterpreted as that
+    other agent.
 
     Args:
-        aid: Lubko agent ID.
+        aid: Canonical Lubko agent ID whose directory is being addressed.
 
     Returns:
-        The metadata mapping, or ``None`` when unavailable.
+        The bound metadata mapping, or ``None`` when unavailable or corrupt.
     """
+    if _persisted_agent_id(aid) != aid:
+        return None
     path = agent_dir(aid) / "meta.json"
     try:
         with path.open(encoding="utf-8") as fh:
-            data: Meta = json.load(fh)
-            return data
+            data: object = json.load(fh)
     except (OSError, ValueError):
         return None
+    if not isinstance(data, dict):
+        return None
+    persisted_id = _persisted_agent_id(data.get("id"))
+    if persisted_id != aid:
+        return None
+    return cast("Meta", data)
 
 
 def write_meta(aid: str, meta: Meta) -> None:
@@ -1677,6 +1689,22 @@ def _persisted_native_session_id(meta: Meta) -> str | None:
     return session_id
 
 
+def _required_persisted_agent_id(meta: Meta) -> str:
+    """Return canonical durable managed-agent identity or fail closed.
+
+    The metadata read boundary additionally binds this value to the addressed
+    agent directory, so execution paths may use it without normalization.
+
+    Raises:
+        ValueError: The durable managed-agent identity is malformed.
+    """
+    aid = _persisted_agent_id(meta.get("id"))
+    if aid is None:
+        message = "managed-agent id is malformed"
+        raise ValueError(message)
+    return aid
+
+
 def _persisted_variant(meta: Meta) -> str:
     """Return canonical durable managed-agent variant configuration.
 
@@ -1707,8 +1735,9 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
     variant = _persisted_variant(meta)
     cwd = _persisted_agent_cwd(meta)
     if is_continue:
+        aid = _required_persisted_agent_id(meta)
         recorded = _persisted_native_session_id(meta)
-        session_id = recorded or discover_session_id(meta.get("id", ""))
+        session_id = recorded or discover_session_id(aid)
         if not session_id:
             return None
         return [
@@ -1731,7 +1760,7 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
         "run",
         "--auto",
         "--title",
-        OPENCODE_TITLE_PREFIX + meta.get("id", ""),
+        OPENCODE_TITLE_PREFIX + _required_persisted_agent_id(meta),
         "--model",
         model,
         "--variant",
