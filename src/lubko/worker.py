@@ -73,6 +73,7 @@ import argparse
 import fcntl
 import json
 import logging
+import math
 import os
 import select
 import selectors
@@ -744,6 +745,7 @@ class Settings:
             ValueError: If the server identity is empty, any timing value is
                 unusable, or the supported protocol window is invalid.
         """
+        self._validate_finite_timing()
         if not self.server:
             msg = (
                 "a non-empty 'server' setting in the worker configuration file is "
@@ -755,6 +757,32 @@ class Settings:
         self._validate_output_and_gc()
         self._validate_spool()
         self._validate_protocol_range()
+
+    def _validate_finite_timing(self) -> None:
+        """Reject non-finite timing values before domain/order comparisons.
+
+        Raises:
+            ValueError: If any timing setting is NaN or infinite.
+        """
+        fields = (
+            "poll_interval_seconds",
+            "process_poll_interval_seconds",
+            "cancel_grace_seconds",
+            "lease_duration_seconds",
+            "lease_refresh_interval_seconds",
+            "lease_recovery_interval_seconds",
+            "output_publication_interval_seconds",
+            "health_publish_interval_seconds",
+            "lease_safety_margin_seconds",
+            "db_operation_timeout_seconds",
+            "gc_retention_seconds",
+            "gc_interval_seconds",
+        )
+        for field_name in fields:
+            value = getattr(self, field_name)
+            if not math.isfinite(value):
+                msg = f"{field_name} must be finite"
+                raise ValueError(msg)
 
     def _validate_protocol_range(self) -> None:
         """Fail closed if the window includes an unparseable version.
