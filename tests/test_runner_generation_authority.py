@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -212,3 +213,70 @@ def test_valid_stale_recovery_allocates_next_generation(
     reservation = meta["runner_reservation"]
     assert isinstance(reservation, dict)
     assert reservation["gen"] == 8
+
+
+def _meta(tmp_path: Path, *, owner_pid: object, owner_ticks: object) -> agent.Meta:
+    meta = agent.idle_meta("audit", str(tmp_path), None)
+    meta.update(
+        active_runner=True,
+        runner_gen=7,
+        runner_reservation={
+            "state": "reserved",
+            "gen": 7,
+            "owner_pid": owner_pid,
+            "owner_start_ticks": owner_ticks,
+            "mode": "new",
+        },
+    )
+    return meta
+
+
+def test_canonical_reservation_owner_matches_exact_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Canonical integer owner identity establishes exact self-ownership."""
+    caller = 4242
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda pid: 777 if pid == caller else None)
+    assert agent.owned_by_me(_meta(tmp_path, owner_pid=caller, owner_ticks=777), caller)
+
+
+def test_malformed_reservation_owner_never_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed durable owner identity never establishes ownership."""
+    caller = 4242
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda pid: 777 if pid == caller else None)
+    malformed = [
+        (4242.0, 777),
+        (4242, 777.0),
+        ("4242", 777),
+        (4242, "777"),
+        (True, 777),
+        (4242, True),
+        (0, 777),
+        (-1, 777),
+        (4242, -1),
+    ]
+    for owner_pid, owner_ticks in malformed:
+        assert not agent.owned_by_me(
+            _meta(tmp_path, owner_pid=owner_pid, owner_ticks=owner_ticks), caller
+        )
+
+
+def test_malformed_numeric_owner_cannot_authorize_prompt_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed numerically equal identity cannot authorize prompt reuse."""
+    caller = os.getpid()
+    ticks = 777
+    meta = _meta(tmp_path, owner_pid=float(caller), owner_ticks=float(ticks))
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda pid: ticks if pid == caller else None)
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "reservation_in_flight", lambda _meta: True)
+    decision: dict[str, object] = {}
+
+    agent._apply_locked_transition(meta, decision, prompt="new work", steer=False, mode="new")
+
+    assert decision == {"action": "busy"}
+    assert meta.get("pending_prompt") is None
