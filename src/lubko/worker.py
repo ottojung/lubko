@@ -452,6 +452,10 @@ CHUNK_OWNER_INDEX_NAME: Final = "jobs_chunk_owner_idx"
 CHUNK_ORDER_INDEX_NAME: Final = "jobs_chunk_order_idx"
 UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
 UTC_ISO_SQL: Final = f"to_jsonb({UTC_ISO_TEXT_SQL})"
+GC_FINISHED_AT_PATTERN: Final = (
+    r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
+    r"T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
+)
 LEASE_EXPIRES_AT_SQL: Final = (
     "to_jsonb(to_char("
     "now() at time zone 'utc' + make_interval(secs => %(lease_duration_seconds)s), "
@@ -4197,7 +4201,9 @@ def collect_transport(
     by :func:`recover_stale_jobs`.
 
     **Phase 2 — Chunk drain + root finalization** (one transaction): Exactly
-    one GC-marked root is selected and at most ``gc_batch_limit`` of its owned
+    one GC-marked root whose terminal status and canonical ``finished_at`` still
+    prove retention eligibility is selected, and at most ``gc_batch_limit`` of
+    its owned
     chunks (via ``thread``) are deleted using ``FOR UPDATE SKIP LOCKED``.
     Processing one root gives the pass a constant SQL-round-trip bound; the
     batch limit cannot multiply into work for many roots. After bounded chunk
@@ -4261,7 +4267,10 @@ def collect_transport(
             "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status'\n"
             "            IN ('succeeded', 'failed', 'cancelled')\n"
-            "        AND (payload::jsonb)->'state'->>'finished_at' IS NOT NULL\n"
+            "        AND jsonb_typeof((payload::jsonb)->'state'->'finished_at') = 'string'\n"
+            "        AND ((payload::jsonb)->'state'->>'finished_at')\n"
+            "            ~ %(gc_finished_at_pattern)s\n"
+            "        AND left((payload::jsonb)->'state'->>'finished_at', 4) <> '0000'\n"
             "        AND ((payload::jsonb)->'state'->>'finished_at') < gc_params.cutoff\n"
             "        AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
             "    ORDER BY ((payload::jsonb)->'state'->>'finished_at'), id\n"
@@ -4272,6 +4281,7 @@ def collect_transport(
             {
                 "server": settings.server,
                 "gc_retention_seconds": settings.gc_retention_seconds,
+                "gc_finished_at_pattern": GC_FINISHED_AT_PATTERN,
                 "limit": limit,
             },
         )
@@ -4280,15 +4290,34 @@ def collect_transport(
     # --- Phase 2: bounded chunk drain + root finalization ---
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
+            "WITH gc_params AS (\n"
+            "    SELECT to_char(\n"
+            "        now() at time zone 'utc'\n"
+            "        - make_interval(secs => %(gc_retention_seconds)s),\n"
+            '        \'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\'\n'
+            "    ) AS cutoff\n"
+            ")\n"
             "SELECT id\n"
-            "FROM lubko.jobs\n"
+            "FROM lubko.jobs, gc_params\n"
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
+            "    AND (payload::jsonb)->'state'->>'status'\n"
+            "        IN ('succeeded', 'failed', 'cancelled')\n"
+            "    AND jsonb_typeof((payload::jsonb)->'state'->'finished_at') = 'string'\n"
+            "    AND ((payload::jsonb)->'state'->>'finished_at')\n"
+            "        ~ %(gc_finished_at_pattern)s\n"
+            "    AND left((payload::jsonb)->'state'->>'finished_at', 4) <> '0000'\n"
+            "    AND ((payload::jsonb)->'state'->>'finished_at') < gc_params.cutoff\n"
             "    AND ((payload::jsonb)->'state'->>'gc') = 'true'\n"
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
             "LIMIT %(limit)s\n",
-            {"server": settings.server, "limit": limit},
+            {
+                "server": settings.server,
+                "gc_retention_seconds": settings.gc_retention_seconds,
+                "gc_finished_at_pattern": GC_FINISHED_AT_PATTERN,
+                "limit": limit,
+            },
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
         for root_id in gc_roots:
