@@ -1101,6 +1101,21 @@ def _runner_generation(value: object, *, minimum: int) -> int | None:
     return value
 
 
+def _next_prompt_count(meta: Meta) -> int | None:
+    """Return the next canonical durable prompt count, or fail closed.
+
+    Genuine absence is the legacy zero-count state. A present value must be an
+    actual non-negative JSON integer; booleans and coercible strings/floats are
+    malformed durable state and must never be normalized by an acceptance path.
+    """
+    if "prompt_count" not in meta:
+        return 1
+    value = meta["prompt_count"]
+    if type(value) is not int or value < 0:
+        return None
+    return value + 1
+
+
 def _active_runner_flag(meta: Meta) -> bool | None:
     """Return canonical durable runner-consumption authority.
 
@@ -2499,6 +2514,9 @@ def _pop_into_pending(meta: Meta, now: float) -> Meta | None:
     Returns:
         The popped steer item, or ``None`` when the queue is empty.
     """
+    next_prompt_count = _next_prompt_count(meta)
+    if next_prompt_count is None:
+        return None
     queue = meta.get("steer_queue") or []
     if not queue:
         return None
@@ -2516,7 +2534,7 @@ def _pop_into_pending(meta: Meta, now: float) -> Meta | None:
     meta["pid"] = None
     meta["pgid"] = None
     meta["start_time"] = None
-    meta["prompt_count"] = int(meta.get("prompt_count") or 0) + 1
+    meta["prompt_count"] = next_prompt_count
     return item
 
 
@@ -2903,9 +2921,13 @@ def _recover_stale_reservation(
         # No accepted prompt survived: the recovery caller's prompt is the one
         # to run and is accepted. A stale/idle --steer is equivalent to an
         # ordinary prompt here, so it simply owns the recovered invocation.
+        next_prompt_count = _next_prompt_count(m)
+        if next_prompt_count is None:
+            decision["action"] = "busy"
+            return True
         m["pending_prompt"] = prompt
         m["last_prompt"] = _truncate(prompt, 500)
-        m["prompt_count"] = int(m.get("prompt_count") or 0) + 1
+        m["prompt_count"] = next_prompt_count
     m["active_runner"] = True
     m["runner_gen"] = gen
     m["runner_reservation"] = {
@@ -3012,11 +3034,12 @@ def _reserve_fresh_runner(
     """Reserve one fresh runner generation, failing closed on corrupt history."""
     caller_pid = os.getpid()
     current_gen = _runner_generation(m.get("runner_gen", 0), minimum=0)
-    if current_gen is None:
+    next_prompt_count = _next_prompt_count(m)
+    if current_gen is None or next_prompt_count is None:
         decision["action"] = "busy"
         return
     gen = current_gen + 1
-    _begin_invocation(m, prompt, now)
+    _begin_invocation(m, prompt, now, prompt_count=next_prompt_count)
     m["active_runner"] = True
     m["runner_gen"] = gen
     m["runner_reservation"] = {
@@ -3202,7 +3225,7 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
     return _follow_attached(aid)
 
 
-def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
+def _begin_invocation(meta: Meta, prompt: str, now: float, *, prompt_count: int) -> None:
     """Mark an agent as starting a new invocation.
 
     ``active_runner`` is deliberately left untouched: whether a live runner
@@ -3213,6 +3236,7 @@ def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
         meta: Agent metadata.
         prompt: Instruction to run.
         now: Invocation timestamp.
+        prompt_count: Already validated next durable prompt count.
     """
     meta["state"] = "running"
     meta["started_at"] = now
@@ -3227,7 +3251,7 @@ def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
     meta["start_time"] = None
     meta["pending_prompt"] = prompt
     meta["last_prompt"] = _truncate(prompt, 500)
-    meta["prompt_count"] = int(meta.get("prompt_count") or 0) + 1
+    meta["prompt_count"] = prompt_count
 
 
 def cmd_list(args: argparse.Namespace) -> int:
