@@ -500,3 +500,49 @@ def test_invocation_spawn_gate_refuses_cancelled_prompt(
     result = agent.read_meta(aid)
     assert result is not None
     assert result["state"] == ("stopped" if mode == "stop" else "killed")
+
+
+@pytest.mark.parametrize("bad_id", [123, True, "", "ABC", []])
+def test_runner_convergence_rejects_malformed_persisted_agent_id(
+    bad_id: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed durable agent IDs cannot become runner marker authority."""
+    observed: agent.Meta = {
+        "id": bad_id,
+        "runner_pid": 4242,
+        "runner_start_time": 777,
+    }
+
+    def reject_signal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("malformed agent id reached runner signalling")
+
+    def reject_state(*_args: object, **_kwargs: object) -> str:
+        pytest.fail("malformed agent id reached runner identity proof")
+
+    monkeypatch.setattr(agent, "signal_identity_checked", reject_signal)
+    monkeypatch.setattr(agent, "_runner_identity_state", reject_state)
+
+    assert agent._converge_observed_runner(observed, "kill") is False
+
+
+@pytest.mark.parametrize("bad_id", [123, True, "", "ABC", []])
+def test_forced_delete_rejects_malformed_persisted_agent_id(
+    bad_id: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forced delete cannot stringify malformed durable IDs into authority."""
+    meta: agent.Meta = {
+        "id": bad_id,
+        "delete_pending": True,
+        "runner_pid": 4242,
+        "runner_start_time": 777,
+    }
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+
+    def reject_signal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("malformed agent id reached forced-delete runner signalling")
+
+    monkeypatch.setattr(agent, "signal_identity_checked", reject_signal)
+
+    assert agent._converge_for_delete("aaaaaaaa", force=True, deadline=0.0) is False
