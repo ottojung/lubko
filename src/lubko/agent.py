@@ -1580,6 +1580,21 @@ def _persisted_native_session_id(meta: Meta) -> str | None:
     return session_id
 
 
+def _persisted_variant(meta: Meta) -> str:
+    """Return canonical durable managed-agent variant configuration.
+
+    Raises:
+        ValueError: The durable variant value is malformed.
+    """
+    if "variant" not in meta:
+        return DEFAULT_VARIANT
+    variant = meta["variant"]
+    if not isinstance(variant, str) or not variant:
+        message = "managed-agent variant is malformed"
+        raise ValueError(message)
+    return variant
+
+
 def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[str] | None:
     """Return the argv used to launch the underlying agent for this invocation.
 
@@ -1592,7 +1607,7 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
         The command argv, or ``None`` when continuation is impossible.
     """
     model = AGENT_MODEL
-    variant = meta.get("variant") or DEFAULT_VARIANT
+    variant = _persisted_variant(meta)
     cwd = _persisted_agent_cwd(meta)
     if is_continue:
         recorded = _persisted_native_session_id(meta)
