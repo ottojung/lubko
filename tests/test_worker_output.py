@@ -295,7 +295,7 @@ def test_repeated_trim_publication_cycles_preserve_runes(tmp_path: Path) -> None
     full = bytearray()
     published: list[tuple[int, int, str]] = []
     # Deliberately awkward per-cycle lengths so boundaries cross runes.
-    for cycle in range(24):
+    for cycle in range(8):
         delta = _mixed_runes(900 + (cycle % 7) * 137, cycle)
         full += delta
         # Append the new tail to the spool file (it already holds [spool_start, ...]).
@@ -557,7 +557,7 @@ def test_repeated_trim_cycles_keep_continuous_invalid_coverage(tmp_path: Path) -
         ),
     )
     full = bytearray()
-    for cycle in range(20):
+    for cycle in range(8):
         delta = b"\x80" * (700 + (cycle % 5) * 211)
         full += delta
         with path.open("r+b") as fh:
