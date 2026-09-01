@@ -127,6 +127,11 @@ if TYPE_CHECKING:
     from lubko.supervise import SupervisorState
 
 LOGGER: Final = logging.getLogger(__name__)
+BOOTSTRAP_HOLD_MESSAGE: Final = (
+    "supervisor is healthy; no worker is being started intentionally because no explicit "
+    "desired commit/run intent exists; establish initial deployment authority with "
+    "lubko-deploy migrate before the next supervisor start"
+)
 
 DEFAULT_POLL_SECONDS: Final = 1.0
 DEFAULT_BACKOFF_BASE_SECONDS: Final = 2.0
@@ -579,6 +584,7 @@ class SupervisorDaemon:
         self._started_at = time.time()
         self._next_db_check_at = 0.0
         self._message: str | None = None
+        self._bootstrap_hold_logged = False
         self._ownership_fd: int | None = None
         self._start_time_ticks: int = 0
 
@@ -891,11 +897,20 @@ class SupervisorDaemon:
         try:
             mission = deployctl.read_rollback_state()
         except deployctl.DeployCtlError:
+            self._bootstrap_hold_logged = False
             self._message = "corrupt supervised-deployment state; holding without a worker"
             LOGGER.exception("corrupt supervised-deployment state; holding without a worker")
             return "hold", None
         if mission is None:
+            if desired is None:
+                self._message = BOOTSTRAP_HOLD_MESSAGE
+                if not self._bootstrap_hold_logged:
+                    LOGGER.info("%s", self._message)
+                self._bootstrap_hold_logged = True
+            else:
+                self._bootstrap_hold_logged = False
             return self._derive_without_mission(state, desired_commit)
+        self._bootstrap_hold_logged = False
         return self._derive_with_mission(mission, desired_gen, desired_commit)
 
     @staticmethod
