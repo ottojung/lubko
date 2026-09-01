@@ -988,6 +988,25 @@ def test_spawn_gate_refusal_durably_records_child_before_any_cleanup(
             proc.wait(timeout=5)
 
 
+def test_signal_unresolved_child_does_not_coerce_agent_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Malformed durable agent IDs cannot become signalling authority."""
+    monkeypatch.setattr(
+        agent,
+        "open_pidfd",
+        lambda _pid: pytest.fail("malformed agent ID reached pidfd signalling"),
+    )
+    meta: agent.Meta = {
+        "id": 123,
+        "unresolved_invocation": {
+            "pid": 424242,
+            "start_time": 1,
+            "invocation_id": "0" * agent.INVOCATION_ID_HEX_LENGTH,
+        },
+    }
+
+    agent._signal_unresolved_child(meta)
+
+
 def test_unresolved_group_reuse_by_foreign_invocation_is_gone() -> None:
     """A recycled PGID hosting a foreign invocation proves the record gone."""
     owner = _MarkedProcess("aaaaaaaa", "4c4cdac188db7bb5f96d81d8fdd21de6")

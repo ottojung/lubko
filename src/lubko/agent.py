@@ -4545,7 +4545,7 @@ def _signal_unresolved_child(meta: Meta) -> None:
         return
     send_signal_group(
         {
-            "id": str(meta.get("id", "")),
+            "id": meta.get("id"),
             "pid": rec["pid"],
             "pgid": rec["pid"],
             "start_time": rec.get("start_time"),
