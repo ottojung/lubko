@@ -2375,19 +2375,8 @@ def _parse_owned_running_group_row(
         Parsed PGID (or ``None`` for malformed/non-positive authority), parsed
         start ticks (or ``None`` when unprovable), and the job id as text.
     """
-    try:
-        parsed_pgid = int(str(pgid))
-    except ValueError:
-        pgid_i: int | None = None
-    else:
-        pgid_i = parsed_pgid if parsed_pgid > 0 else None
-
-    start_i: int | None = None
-    if start_ticks is not None:
-        try:
-            start_i = int(str(start_ticks))
-        except ValueError:
-            start_i = None
+    pgid_i = pgid if type(pgid) is int and pgid > 0 else None
+    start_i = start_ticks if type(start_ticks) is int and start_ticks > 0 else None
     return pgid_i, start_i, str(row_id)
 
 
@@ -2412,8 +2401,8 @@ def _owned_running_groups(
     groups: list[tuple[int | None, int | None, str]] = []
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT id, (payload::jsonb)->'state'->>'process_pgid',\n"
-            "       (payload::jsonb)->'state'->>'process_start_time_ticks'\n"
+            "SELECT id, (payload::jsonb)->'state'->'process_pgid',\n"
+            "       (payload::jsonb)->'state'->'process_start_time_ticks'\n"
             "FROM lubko.jobs\n"
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
