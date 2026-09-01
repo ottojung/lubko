@@ -124,6 +124,7 @@ def test_reserved_runner_blocks_removal_at_prestart_boundary(
             "state": "reserved",
             "gen": 1,
             "owner_pid": os.getpid(),
+            "mode": "new",
             "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
         },
     )

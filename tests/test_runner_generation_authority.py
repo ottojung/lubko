@@ -62,6 +62,7 @@ def test_canonical_reservation_generation_retains_marker_fallback(
             "gen": 7,
             "owner_pid": 1,
             "owner_start_ticks": 1,
+            "mode": "new",
         },
     )
     marker_calls: list[tuple[str, int]] = []
