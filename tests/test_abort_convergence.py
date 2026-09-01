@@ -1058,6 +1058,25 @@ def _unresolved_marker_for(pgid: int) -> tuple[agent.Meta, dict[str, object]]:
     return meta, marker
 
 
+@pytest.mark.parametrize(
+    "bad_id",
+    [123, True, "", "AAAAAAAA", "not-hex", None],
+)
+def test_unresolved_group_malformed_agent_id_stays_ambiguous_before_scan(
+    monkeypatch: pytest.MonkeyPatch, bad_id: object
+) -> None:
+    """Malformed parent agent identity cannot prove an unresolved group gone."""
+    meta, _ = _unresolved_marker_for(525252)
+    meta["id"] = bad_id
+    monkeypatch.setattr(agent, "_unresolved_leader_state", lambda _rec: None)
+    monkeypatch.setattr(
+        agent,
+        "_proven_invocation_members",
+        lambda *_args: pytest.fail("malformed agent id reached unresolved member scan"),
+    )
+    assert agent._unresolved_child_state(meta) == "ambiguous"
+
+
 def test_unresolved_scan_proc_enumeration_failure_stays_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
