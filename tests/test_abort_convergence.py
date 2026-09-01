@@ -699,6 +699,17 @@ def test_unrecorded_invocation_dead_child_leaves_stop_semantics_alone(
     proc = subprocess.Popen([SLEEP_BIN, "0"])
     proc.wait(timeout=5)
     monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
+
+    def converged(meta: agent.Meta, timeout: float) -> bool:
+        assert timeout == agent.ABORT_WAIT_SECONDS
+        assert meta["id"] == aid
+        assert meta["pid"] == proc.pid
+        assert meta["pgid"] == proc.pid
+        assert meta["start_time"] is None
+        assert meta["invocation_id"] == iid
+        return True
+
+    monkeypatch.setattr(agent, "wait_group_dead", converged)
     # The child intentionally exited before cleanup: post-exit ticks are
     # legitimately unobservable, and convergence must not depend on them.
     agent._kill_unrecorded_invocation(aid, proc, agent.proc_start_ticks(proc.pid), iid)

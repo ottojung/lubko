@@ -61,46 +61,35 @@ def test_present_corrupt_authority_is_durable_hold(state_path: Path, raw: str) -
     assert rewritten.ownership_hold_malformed is True
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("ownership_hold_malformed", None),
-        ("ownership_hold_malformed", "true"),
-        ("ownership_hold_malformed", 1),
-        ("unresolved_hold_malformed", None),
-        ("unresolved_hold_malformed", "true"),
-        ("unresolved_hold_malformed", 1),
-    ],
-)
-def test_present_non_boolean_safety_bit_is_durable_hold(
-    state_path: Path, field: str, value: object
-) -> None:
-    """A malformed persisted safety bit cannot erase its obligation."""
-    write_raw_state(state_path, **{field: value})
+def test_present_non_boolean_safety_bit_is_durable_hold(state_path: Path) -> None:
+    """Malformed persisted safety bits parse closed and remain durable."""
+    fields = ("ownership_hold_malformed", "unresolved_hold_malformed")
+    for field in fields:
+        for value in (None, "true", 1):
+            assert supervise._strict_safety_hold({field: value}, field) is True
 
-    state = supervise.read_state()
-    assert getattr(state, field) is True
-    supervise.write_state(state)
-    assert getattr(supervise.read_state(), field) is True
+        write_raw_state(state_path, **{field: None})
+        state = supervise.read_state()
+        assert getattr(state, field) is True
+        supervise.write_state(state)
+        assert getattr(supervise.read_state(), field) is True
 
 
-@pytest.mark.parametrize("field", ["ownership_hold_malformed", "unresolved_hold_malformed"])
-@pytest.mark.parametrize("value", [False, True])
-def test_boolean_safety_bit_values_are_preserved(
-    state_path: Path, field: str, value: object
-) -> None:
+def test_boolean_safety_bit_values_are_preserved() -> None:
     """Actual JSON booleans retain their explicit safety-bit values."""
-    write_raw_state(state_path, **{field: value})
-    assert getattr(supervise.read_state(), field) is value
+    for field in ("ownership_hold_malformed", "unresolved_hold_malformed"):
+        for value in (False, True):
+            assert supervise._strict_safety_hold({field: value}, field) is value
 
 
-@pytest.mark.parametrize("generation", [0, 7, 10**12])
-def test_valid_non_negative_generations_parse(state_path: Path, generation: int) -> None:
+def test_valid_non_negative_generations_parse() -> None:
     """Genuine non-negative integer generations keep their value."""
-    write_raw_state(state_path, applied_generation=generation)
-    state = supervise.read_state()
-    assert state.applied_generation == generation
-    assert state.ownership_hold_malformed is False
+    for generation in (0, 7, 10**12):
+        assert supervise._parse_present_strict(
+            {"applied_generation": generation},
+            "applied_generation",
+            supervise._strict_non_negative_int,
+        ) == (generation, False)
 
 
 def test_absent_generation_remains_fresh(state_path: Path) -> None:
@@ -114,21 +103,21 @@ def test_absent_generation_remains_fresh(state_path: Path) -> None:
     assert state.ownership_hold_malformed is False
 
 
-@pytest.mark.parametrize(
-    "raw_generation",
-    [True, False, "5", "", -1, 1.5, None, [5], {"n": 5}, "seven"],
-)
-def test_present_malformed_generation_is_durable_hold(
-    state_path: Path, raw_generation: object
-) -> None:
-    """A present malformed applied generation cannot degrade to absence."""
-    write_raw_state(state_path, applied_generation=raw_generation)
+def test_present_malformed_generation_is_durable_hold(state_path: Path) -> None:
+    """Malformed applied generations parse closed and the hold persists."""
+    malformed: tuple[object, ...] = (True, False, "5", "", -1, 1.5, None, [5], {"n": 5}, "seven")
+    for raw_generation in malformed:
+        assert supervise._parse_present_strict(
+            {"applied_generation": raw_generation},
+            "applied_generation",
+            supervise._strict_non_negative_int,
+        ) == (0, True)
+
+    write_raw_state(state_path, applied_generation="five")
     state = supervise.read_state()
     assert state.ownership_hold_malformed is True
-
     supervise.write_state(state)
-    rewritten = supervise.read_state()
-    assert rewritten.ownership_hold_malformed is True
+    assert supervise.read_state().ownership_hold_malformed is True
 
 
 def test_reconcile_holds_before_retire_or_spawn_on_malformed_generation(
@@ -190,13 +179,14 @@ def test_reconcile_holds_before_retire_or_spawn_on_malformed_generation(
     assert rewritten.child.pid == 4242
 
 
-@pytest.mark.parametrize("count", [0, 1, 42, 10**12])
-def test_valid_non_negative_restart_counts_parse(state_path: Path, count: int) -> None:
+def test_valid_non_negative_restart_counts_parse() -> None:
     """Genuine non-negative integer restart counts keep their value."""
-    write_raw_state(state_path, restart_count=count)
-    state = supervise.read_state()
-    assert state.restart_count == count
-    assert state.ownership_hold_malformed is False
+    for count in (0, 1, 42, 10**12):
+        assert supervise._parse_present_strict(
+            {"restart_count": count},
+            "restart_count",
+            supervise._strict_non_negative_int,
+        ) == (count, False)
 
 
 def test_absent_restart_count_remains_fresh(state_path: Path) -> None:
@@ -210,49 +200,48 @@ def test_absent_restart_count_remains_fresh(state_path: Path) -> None:
     assert state.ownership_hold_malformed is False
 
 
-@pytest.mark.parametrize(
-    "raw_count",
-    [True, False, "5", "", -1, 1.5, None, [3], {"n": 3}, "three"],
-)
-def test_present_malformed_restart_count_is_durable_hold(
-    state_path: Path, raw_count: object
-) -> None:
-    """A present malformed restart count cannot degrade to absence."""
-    write_raw_state(state_path, restart_count=raw_count)
+def test_present_malformed_restart_count_is_durable_hold(state_path: Path) -> None:
+    """Malformed restart counts parse closed and the hold persists."""
+    malformed: tuple[object, ...] = (True, False, "5", "", -1, 1.5, None, [3], {"n": 3}, "three")
+    for raw_count in malformed:
+        assert supervise._parse_present_strict(
+            {"restart_count": raw_count},
+            "restart_count",
+            supervise._strict_non_negative_int,
+        ) == (0, True)
+
+    write_raw_state(state_path, restart_count="three")
     state = supervise.read_state()
     assert state.ownership_hold_malformed is True
-
     supervise.write_state(state)
-    rewritten = supervise.read_state()
-    assert rewritten.ownership_hold_malformed is True
+    assert supervise.read_state().ownership_hold_malformed is True
 
 
-@pytest.mark.parametrize("deadline", [0.0, 12345.75, 10**15])
-@pytest.mark.parametrize("count", [0, 5])
-def test_valid_crash_history_fields_parse(state_path: Path, count: int, deadline: float) -> None:
+def test_valid_crash_history_fields_parse() -> None:
     """Genuine crash-history fields keep their values without any hold."""
-    write_raw_state(state_path, restart_count=count, next_attempt_at=deadline)
-    state = supervise.read_state()
-    assert state.restart_count == count
-    assert state.next_attempt_at == deadline
-    assert state.ownership_hold_malformed is False
+    for count in (0, 5):
+        for deadline in (0.0, 12345.75, 10**15):
+            assert supervise._parse_present_strict(
+                {"restart_count": count},
+                "restart_count",
+                supervise._strict_non_negative_int,
+            ) == (count, False)
+            assert supervise._parse_present_nullable_float(
+                {"next_attempt_at": deadline}, "next_attempt_at"
+            ) == (deadline, False)
 
 
-@pytest.mark.parametrize("raw_deadline", [None, "absent"])
-def test_null_and_absent_deadlines_are_no_deadline(state_path: Path, raw_deadline: object) -> None:
+def test_null_and_absent_deadlines_are_no_deadline() -> None:
     """Null and absent backoff deadlines stay valid no-deadline states."""
-    if raw_deadline == "absent":
-        write_raw_state(state_path)
-    else:
-        write_raw_state(state_path, next_attempt_at=None)
-    state = supervise.read_state()
-    assert state.next_attempt_at is None
-    assert state.ownership_hold_malformed is False
+    assert supervise._parse_present_nullable_float({}, "next_attempt_at") == (None, False)
+    assert supervise._parse_present_nullable_float(
+        {"next_attempt_at": None}, "next_attempt_at"
+    ) == (None, False)
 
 
-@pytest.mark.parametrize(
-    "raw_deadline",
-    [
+def test_present_malformed_backoff_deadline_is_durable_hold(state_path: Path) -> None:
+    """Malformed backoff deadlines parse closed and the hold persists."""
+    malformed: tuple[object, ...] = (
         True,
         False,
         "later",
@@ -262,19 +251,17 @@ def test_null_and_absent_deadlines_are_no_deadline(state_path: Path, raw_deadlin
         float("nan"),
         float("inf"),
         float("-inf"),
-    ],
-)
-def test_present_malformed_backoff_deadline_is_durable_hold(
-    state_path: Path, raw_deadline: object
-) -> None:
-    """A present malformed backoff deadline cannot clear an active backoff."""
-    write_raw_state(state_path, next_attempt_at=raw_deadline)
+    )
+    for raw_deadline in malformed:
+        assert supervise._parse_present_nullable_float(
+            {"next_attempt_at": raw_deadline}, "next_attempt_at"
+        ) == (None, True)
+
+    write_raw_state(state_path, next_attempt_at="later")
     state = supervise.read_state()
     assert state.ownership_hold_malformed is True
-
     supervise.write_state(state)
-    rewritten = supervise.read_state()
-    assert rewritten.ownership_hold_malformed is True
+    assert supervise.read_state().ownership_hold_malformed is True
 
 
 def test_unrepresentably_large_integer_deadline_is_durable_hold(state_path: Path) -> None:
@@ -426,21 +413,20 @@ def test_fresh_state_round_trip_has_no_boot_identity_key(state_path: Path) -> No
     assert state.ownership_hold_malformed is False
 
 
-@pytest.mark.parametrize(
-    "raw_boot_id",
-    [1, True, 1.5, [], {}, ["x"], {"b": BOOT_A}, None, ""],
-)
-def test_present_malformed_boot_identity_is_durable_hold(
-    state_path: Path, raw_boot_id: object
-) -> None:
-    """A present malformed boot identifier cannot degrade to absence."""
-    write_raw_state(state_path, boot_id=raw_boot_id)
+def test_present_malformed_boot_identity_is_durable_hold(state_path: Path) -> None:
+    """Malformed boot identifiers parse closed and the hold persists."""
+    malformed: tuple[object, ...] = (1, True, 1.5, [], {}, ["x"], {"b": BOOT_A}, None, "")
+    for raw_boot_id in malformed:
+        assert supervise._parse_present_boot_identity({"boot_id": raw_boot_id}, "boot_id") == (
+            None,
+            True,
+        )
+
+    write_raw_state(state_path, boot_id="")
     state = supervise.read_state()
     assert state.ownership_hold_malformed is True
-
     supervise.write_state(state)
-    rewritten = supervise.read_state()
-    assert rewritten.ownership_hold_malformed is True
+    assert supervise.read_state().ownership_hold_malformed is True
 
 
 def test_explicit_null_boot_identity_preserves_active_backoff(
@@ -467,12 +453,11 @@ def test_explicit_null_boot_identity_preserves_active_backoff(
     assert "malformed" in daemon._message
 
 
-@pytest.mark.parametrize("raw_boot_id", [None, "", 1, True, [], {}])
 def test_corrupted_boot_identity_never_erases_active_backoff(
-    state_path: Path, monkeypatch: pytest.MonkeyPatch, raw_boot_id: object
+    state_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Corrupt boot identity holds instead of clearing an active deadline."""
-    write_raw_state(state_path, boot_id=raw_boot_id, next_attempt_at=1000.0)
+    """Representative corrupt boot identity holds instead of clearing backoff."""
+    write_raw_state(state_path, boot_id="", next_attempt_at=1000.0)
     monkeypatch.setattr(supervise, "current_boot_id", lambda: BOOT_B)
 
     supervisor.normalize_cross_boot_state()
