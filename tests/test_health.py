@@ -143,6 +143,35 @@ def test_future_published_at_cannot_bypass_staleness() -> None:
     [
         "started_at",
         "published_at",
+        "lease_safety_margin_seconds",
+        "db_operation_deadline_seconds",
+    ],
+)
+def test_missing_required_finite_health_fields_fail_closed(field: str) -> None:
+    """Required finite health metrics cannot manufacture zero from absence."""
+    data = _snapshot().to_dict()
+    del data[field]
+    with pytest.raises(ValueError, match=field):
+        WorkerHealth.from_dict(data)
+    assert _from_dict_or_none(data) is None
+
+
+def test_missing_db_deadline_cannot_bypass_strictly_positive_domain() -> None:
+    """Missing and explicit zero database deadlines both fail closed."""
+    missing = _snapshot().to_dict()
+    del missing["db_operation_deadline_seconds"]
+    explicit_zero = _snapshot().to_dict()
+    explicit_zero["db_operation_deadline_seconds"] = 0.0
+    for data in (missing, explicit_zero):
+        with pytest.raises(ValueError, match="db_operation_deadline_seconds"):
+            WorkerHealth.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "started_at",
+        "published_at",
         "db_connected_at",
         "db_error_at",
         "db_last_activity_at",

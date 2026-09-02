@@ -26,6 +26,8 @@ def _data() -> dict[str, object]:
         "start_time_ticks": 1,
         "started_at": 1.0,
         "published_at": 1.0,
+        "lease_safety_margin_seconds": 1.0,
+        "db_operation_deadline_seconds": 1.0,
         "scan_batch_limit": 1,
         "gc_batch_limit": 1,
         "cancellation_batch_limit": 1,
