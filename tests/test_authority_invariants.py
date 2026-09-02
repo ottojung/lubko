@@ -675,6 +675,11 @@ def test_post_popen_invariant_refusal_converges_child(
         return violating if calls["n"] >= 2 else valid
 
     monkeypatch.setattr(lifecycle_state, "reconcile_authority_facts", fake_reconcile)
+    monkeypatch.setattr(
+        supervisor.SupervisorDaemon,
+        "_derive_action",
+        lambda _self, _state: ("run", COMMIT),
+    )
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
     assert daemon._spawn_worker(COMMIT) is None
     assert captured, "a real child was spawned before the refusal"

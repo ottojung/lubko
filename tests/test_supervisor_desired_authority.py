@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import pytest
 
 from lubko import deployctl, lifecycle, supervise, supervisor
-
-if TYPE_CHECKING:
-    import pytest
 
 
 def _malformed_desired() -> supervise.SupervisorDesired | None:
@@ -131,3 +128,74 @@ def test_malformed_desired_cannot_clear_cold_migration_authority(
     daemon._complete_cold_migration()
 
     assert lock_entries == []
+
+
+def _desired(commit: str, generation: int = 1) -> supervise.SupervisorDesired:
+    """Return one valid desired run intent for spawn-boundary tests."""
+    return supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=generation,
+        commit=commit,
+        repo="/workspace/Lubko",
+        uv_path="/usr/bin/uv",
+        worker_id=None,
+    )
+
+
+def test_pre_spawn_revalidation_blocks_malformed_desired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed durable intent at the last spawn gate cannot reach spawning."""
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(supervise, "read_desired_strict", _malformed_desired)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
+    monkeypatch.setattr(
+        daemon,
+        "_spawn_worker",
+        lambda _commit: pytest.fail("malformed desired authority reached _spawn_worker"),
+    )
+
+    daemon._spawn_and_publish("a" * 40)
+
+    assert daemon._message is not None
+    assert "corrupt desired supervisor state" in daemon._message
+
+
+def test_pre_spawn_revalidation_blocks_superseded_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer durable commit cannot permit a stale commit selected earlier."""
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    newer = _desired("b" * 40, generation=2)
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: newer)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
+    monkeypatch.setattr(
+        daemon,
+        "_spawn_worker",
+        lambda _commit: pytest.fail("superseded commit reached _spawn_worker"),
+    )
+
+    daemon._spawn_and_publish("a" * 40)
+
+    assert daemon._message is not None
+    assert "intent changed" in daemon._message
+
+
+def test_pre_spawn_revalidation_preserves_unchanged_desired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unchanged valid desired commit still crosses the final spawn gate."""
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    desired = _desired("a" * 40)
+    spawned: list[str] = []
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: desired)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
+    monkeypatch.setattr(
+        daemon,
+        "_spawn_worker",
+        spawned.append,
+    )
+
+    daemon._spawn_and_publish("a" * 40)
+
+    assert spawned == ["a" * 40]
