@@ -649,33 +649,70 @@ class SupervisorStatus:
 
         Returns:
             The parsed status.
+
+        Raises:
+            TypeError: If a present field has the wrong JSON scalar type.
+            ValueError: If a present field is outside its valid domain.
         """
+        if "schema_version" not in data:
+            schema_version = SCHEMA_VERSION
+        else:
+            parsed_schema_version = _strict_int(data["schema_version"])
+            if parsed_schema_version is None:
+                msg = "supervisor status is malformed"
+                raise TypeError(msg)
+            schema_version = parsed_schema_version
+
+        if "started_at" not in data:
+            started_at = 0.0
+        else:
+            raw_started_at = data["started_at"]
+            if isinstance(raw_started_at, bool) or not isinstance(raw_started_at, (int, float)):
+                msg = "supervisor status is malformed"
+                raise TypeError(msg)
+            parsed_started_at = _strict_finite_float(raw_started_at)
+            if parsed_started_at is None:
+                msg = "supervisor status is malformed"
+                raise ValueError(msg)
+            started_at = parsed_started_at
+
+        mode = _parse_diagnostic_string(data, "mode", default=MODE_IDLE)
+        intent = _parse_diagnostic_string(data, "intent", default=INTENT_RUN)
+        if mode not in {MODE_RUN, MODE_IDLE} or intent not in {INTENT_RUN, INTENT_RETIRING}:
+            msg = "supervisor status is malformed"
+            raise ValueError(msg)
+
         child_data = data.get("child")
         child: WorkerChild | None = None
-        if isinstance(child_data, dict):
-            try:
-                child = _child_from_dict(child_data)
-            except (TypeError, ValueError, KeyError):
-                child = None
+        if child_data is not None:
+            if not isinstance(child_data, dict):
+                msg = "supervisor status is malformed"
+                raise TypeError(msg)
+            child = _child_from_dict(child_data)
+
+        worker_health = _parse_status_nullable_dict(data, "worker_health")
+
         return cls(
-            schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
-            supervisor_pid=_optional_int(data.get("supervisor_pid")) or 0,
-            supervisor_start_time_ticks=_optional_int(data.get("supervisor_start_time_ticks")) or 0,
-            started_at=_optional_float(data.get("started_at")) or 0.0,
-            applied_generation=_optional_int(data.get("applied_generation")) or 0,
-            mode=_optional_string(data.get("mode")) or MODE_IDLE,
-            commit=_optional_string(data.get("commit")),
+            schema_version=schema_version,
+            supervisor_pid=_parse_diagnostic_non_negative_int(data, "supervisor_pid"),
+            supervisor_start_time_ticks=_parse_diagnostic_non_negative_int(
+                data, "supervisor_start_time_ticks"
+            ),
+            started_at=started_at,
+            applied_generation=_parse_diagnostic_non_negative_int(data, "applied_generation"),
+            mode=mode,
+            commit=_parse_diagnostic_nullable_string(data, "commit"),
             child=child,
-            intent=_optional_string(data.get("intent")) or INTENT_RUN,
-            restart_count=_optional_int(data.get("restart_count")) or 0,
-            next_attempt_at=_optional_float(data.get("next_attempt_at")),
+            intent=intent,
+            restart_count=_parse_diagnostic_non_negative_int(data, "restart_count"),
+            next_attempt_at=_parse_diagnostic_nullable_float(data, "next_attempt_at"),
             last_exit=_parse_last_exit(data),
-            mission=_optional_string(data.get("mission")),
-            db_ready=_optional_bool(data.get("db_ready")),
-            ready=_optional_bool(data.get("ready")),
-            message=_optional_string(data.get("message")),
-            worker_health=_optional_dict(data.get("worker_health")),
-            holding=bool(_optional_bool(data.get("holding"))),
+            mission=_parse_diagnostic_nullable_string(data, "mission"),
+            db_ready=_parse_diagnostic_nullable_bool(data, "db_ready"),
+            ready=_parse_diagnostic_nullable_bool(data, "ready"),
+            message=_parse_diagnostic_nullable_string(data, "message"),
+            worker_health=worker_health,
+            holding=_parse_diagnostic_bool(data, "holding"),
         )
 
 
@@ -1374,7 +1411,10 @@ def read_status() -> SupervisorStatus | None:
     data = _read_json(status_path())
     if data is None:
         return None
-    status = SupervisorStatus.from_dict(data)
+    try:
+        status = SupervisorStatus.from_dict(data)
+    except (KeyError, TypeError, ValueError):
+        return None
     if status.schema_version != SCHEMA_VERSION:
         return None
     if status.supervisor_pid == 0:
@@ -2051,6 +2091,28 @@ def _optional_bool(value: object | None) -> bool | None:
         The boolean, or ``None``.
     """
     return value if isinstance(value, bool) else None
+
+
+def _parse_status_nullable_dict(data: dict[str, object], key: str) -> dict[str, object] | None:
+    """Parse a nullable object from persisted supervisor status.
+
+    Args:
+        data: Decoded status mapping.
+        key: Field name.
+
+    Returns:
+        The object, or ``None`` for absence or explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not an object.
+    """
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if not isinstance(value, dict):
+        msg = "supervisor status is malformed"
+        raise TypeError(msg)
+    return value
 
 
 def _parse_diagnostic_bool(data: dict[str, object], key: str) -> bool:
