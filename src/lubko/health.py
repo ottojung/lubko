@@ -325,7 +325,7 @@ class WorkerHealth:
             raise ValueError(msg)
         return cls(
             schema_version=version,
-            worker_id=_coerce_str(data.get("worker_id"), "worker_id"),
+            worker_id=_required_nonempty_str(data.get("worker_id"), "worker_id"),
             worker_incarnation=_coerce_incarnation_token(
                 data.get("worker_incarnation"), "worker_incarnation"
             ),
@@ -427,6 +427,22 @@ def _required_json_int(value: object, field: str, *, minimum: int) -> int:
         msg = f"{field} must be >= {minimum}, got {value!r}"
         raise ValueError(msg)
     return value
+
+
+def _required_nonempty_str(value: object, field: str) -> str:
+    """Return a required non-empty JSON string.
+
+    Raises:
+        ValueError: If the string is absent or empty.
+    """
+    if value is None:
+        msg = f"{field} is required"
+        raise ValueError(msg)
+    result = _coerce_str(value, field)
+    if not result:
+        msg = f"{field} must not be empty"
+        raise ValueError(msg)
+    return result
 
 
 def _coerce_incarnation_token(value: object, field: str) -> str:
