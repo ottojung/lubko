@@ -97,3 +97,29 @@ def test_runner_refuses_malformed_reservation_state_before_claim(
 
     agent.runner("audit", "new")
     assert meta == before
+
+
+def test_malformed_reservation_cannot_authorize_prompt_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed reservation authority makes prompt transitions explicitly busy."""
+    meta: agent.Meta = {
+        "id": "audit",
+        "state": "idle",
+        "active_runner": True,
+        "pending_prompt": "accepted",
+        "runner_gen": 1,
+        "prompt_count": 1,
+        "steer_queue": [],
+        "steer_seq": 0,
+        "runner_reservation": {"state": [], "gen": 1, "mode": "new"},
+    }
+    before = copy.deepcopy(meta)
+    decision: dict[str, object] = {}
+    monkeypatch.setattr(agent, "is_alive", lambda _m: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _m: False)
+
+    agent._apply_locked_transition(meta, decision, prompt="new caller", steer=True, mode="new")
+
+    assert decision == {"action": "busy"}
+    assert meta == before

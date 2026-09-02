@@ -3431,7 +3431,8 @@ def _apply_locked_transition(
     # reservation dropped), that runner will never consume another prompt, so
     # it must not be reused even while its process is still dying.
     live_runner = _active_runner_flag(m) is True and runner_alive(m)
-    in_flight = reservation_in_flight(m)
+    reservation_state = _runner_reservation_state(m.get("runner_reservation"))
+    in_flight = reservation_state != "malformed" and reservation_in_flight(m)
 
     if live_agent:
         if steer:
