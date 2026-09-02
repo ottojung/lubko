@@ -29,6 +29,17 @@ if TYPE_CHECKING:
 
 COMMIT = "a" * 40
 
+
+@pytest.fixture(autouse=True)
+def valid_spawn_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep publication tests focused below the final intent-selection gate."""
+    monkeypatch.setattr(
+        supervisor.SupervisorDaemon,
+        "_derive_action",
+        lambda _self, _state: ("run", COMMIT),
+    )
+
+
 #: A fake sealed runtime root used only to build child metadata paths; it is
 #: never touched on disk by the publication protocol under test.
 FAKE_RUNTIME_ROOT = Path("/opt/lubko-fake-runtime")
