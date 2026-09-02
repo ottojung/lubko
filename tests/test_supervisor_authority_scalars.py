@@ -93,6 +93,23 @@ def test_current_and_legacy_durable_authority_round_trip() -> None:
     )
 
 
+def test_zero_supervisor_wall_clock_values_are_valid() -> None:
+    """Epoch-zero compatibility remains valid for supervisor wall-clock metadata."""
+    assert supervise.SupervisorDesired.from_dict(
+        desired_payload(requested_at=0)
+    ).requested_at == pytest.approx(0.0)
+    child, malformed = supervise._parse_optional_child({"child": child_payload(spawned_at=0)})
+    assert not malformed
+    assert child is not None
+    assert child.spawned_at == pytest.approx(0.0)
+    assert supervise.UnresolvedChild.from_dict(
+        unresolved_payload(spawned_at=0)
+    ).spawned_at == pytest.approx(0.0)
+    assert supervise.SpawningObligation.from_dict(
+        spawning_payload(created_at=0)
+    ).created_at == pytest.approx(0.0)
+
+
 def test_malformed_desired_scalars_fail_closed() -> None:
     """Desired lifecycle authority rejects coercible malformed JSON scalars."""
     malformed_fields: tuple[tuple[str, object], ...] = (
@@ -110,6 +127,7 @@ def test_malformed_desired_scalars_fail_closed() -> None:
         ("requested_at", math.inf),
         ("requested_at", -math.inf),
         ("requested_at", math.nan),
+        ("requested_at", -0.5),
     )
     for field, malformed in malformed_fields:
         with pytest.raises((TypeError, ValueError), match="malformed"):
@@ -117,6 +135,9 @@ def test_malformed_desired_scalars_fail_closed() -> None:
     assert supervise.SupervisorDesired.from_dict(
         desired_payload(requested_at=2)
     ).requested_at == pytest.approx(2.0)
+    assert supervise.SupervisorDesired.from_dict(
+        desired_payload(requested_at=0)
+    ).requested_at == pytest.approx(0.0)
 
 
 def test_malformed_child_scalars_preserve_ownership_hold() -> None:
@@ -128,6 +149,7 @@ def test_malformed_child_scalars_preserve_ownership_hold() -> None:
         ("sid", True),
         ("start_time_ticks", "99"),
         ("spawned_at", "2.5"),
+        ("spawned_at", -0.5),
     ):
         state = supervise.SupervisorState.from_dict({"child": child_payload(**{field: malformed})})
         assert state.child is None
@@ -141,6 +163,7 @@ def test_malformed_unresolved_scalars_preserve_hold() -> None:
         ("pid", -1),
         ("start_time_ticks", 99.0),
         ("spawned_at", math.inf),
+        ("spawned_at", -0.5),
     ):
         state = supervise.SupervisorState.from_dict({
             "unresolved_child": unresolved_payload(**{field: malformed})
@@ -159,6 +182,7 @@ def test_malformed_spawning_scalars_preserve_hold() -> None:
         ("start_time_ticks", "99"),
         ("commit", 123),
         ("created_at", math.nan),
+        ("created_at", -0.5),
         ("boot_id", []),
     ):
         state = supervise.SupervisorState.from_dict({
