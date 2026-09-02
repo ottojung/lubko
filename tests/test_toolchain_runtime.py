@@ -72,6 +72,30 @@ def test_recorded_supported_uv_resolves(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert resolve_uv(None) == uv
 
 
+def test_recorded_toolchain_rejects_malformed_schema_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the exact integer schema version can authorize recorded fallback."""
+    uv = _fake_uv(tmp_path, f'echo "uv {SUPPORTED} (fake)"')
+    toolchain_path().parent.mkdir(parents=True, exist_ok=True)
+
+    malformed_versions: tuple[object, ...] = (True, 1.0, "1", None, [], {}, 2)
+    for schema_version in malformed_versions:
+        record = {
+            "schema_version": schema_version,
+            "uv_path": uv,
+            "uv_version": SUPPORTED,
+        }
+        toolchain_path().write_text(json.dumps(record))
+        assert toolchain.read_toolchain() is None
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    with pytest.raises(UvResolutionError, match="no usable uv executable is recorded"):
+        resolve_uv(None)
+
+
 def test_recorded_swapped_in_place_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
