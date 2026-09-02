@@ -625,6 +625,33 @@ def test_malformed_runner_consumption_authority_blocks_prompt_mutation(
     assert meta.get("runner_reservation") is None
 
 
+@pytest.mark.parametrize("active_runner", ["false", "true", "garbage", 0, 1, None, [], {}])
+def test_malformed_runner_consumption_authority_blocks_quiescence(
+    tmp_path: Path, active_runner: object
+) -> None:
+    """Malformed runner authority cannot become proof that no work is owned."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta["active_runner"] = active_runner
+    meta["runner_reservation"] = {
+        "state": "reserved",
+        "gen": 1,
+        "owner_pid": 999999,
+        "owner_start_ticks": 1,
+        "mode": "new",
+    }
+    assert agent._active_runner_flag(meta) is None
+    assert agent.reservation_in_flight(meta)
+    assert not agent._no_invocation_owned(meta)
+
+
+def test_inactive_runner_without_owned_work_can_still_converge(tmp_path: Path) -> None:
+    """Canonical inactive authority still permits genuine quiescence."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    assert agent._active_runner_flag(meta) is False
+    assert not agent.reservation_in_flight(meta)
+    assert agent._no_invocation_owned(meta)
+
+
 def test_canonical_runner_consumption_authority_preserves_transition_semantics(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
