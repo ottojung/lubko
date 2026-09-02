@@ -535,8 +535,8 @@ class SupervisorState:
             # corrupted schedule. Enter the durable hold.
             ownership_hold_malformed = True
         monotonic_timestamps = (
-            _parse_present_nullable_float(data, "last_spawn_at"),
-            _parse_present_nullable_float(data, "next_readiness_at"),
+            _parse_present_nullable_monotonic_float(data, "last_spawn_at"),
+            _parse_present_nullable_monotonic_float(data, "next_readiness_at"),
         )
         if monotonic_timestamps[0][1] or monotonic_timestamps[1][1]:
             # Stability/readiness timing is lifecycle authority: malformed
@@ -2126,6 +2126,27 @@ def _parse_present_nullable_float(
         return None, False
     value = _strict_finite_float(raw)
     return value, value is None
+
+
+def _parse_present_nullable_monotonic_float(
+    data: dict[str, object],
+    key: str,
+) -> tuple[float | None, bool]:
+    """Parse an optional non-negative finite monotonic-clock timestamp.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Field name.
+
+    Returns:
+        A ``(value, malformed)`` pair: the parsed timestamp (``None`` for
+        genuine absence or explicit null) and whether a present non-null
+        value was malformed or outside the monotonic-clock domain.
+    """
+    value, malformed = _parse_present_nullable_float(data, key)
+    if malformed or value is None:
+        return value, malformed
+    return (value, False) if value >= 0.0 else (None, True)
 
 
 def _parse_optional_child(
