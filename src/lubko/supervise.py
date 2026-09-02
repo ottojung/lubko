@@ -534,6 +534,14 @@ class SupervisorState:
             # backoff and let reconciliation restart immediately from a
             # corrupted schedule. Enter the durable hold.
             ownership_hold_malformed = True
+        monotonic_timestamps = (
+            _parse_present_nullable_monotonic_float(data, "last_spawn_at"),
+            _parse_present_nullable_monotonic_float(data, "next_readiness_at"),
+        )
+        if monotonic_timestamps[0][1] or monotonic_timestamps[1][1]:
+            # Stability/readiness timing is lifecycle authority: malformed
+            # presence must never influence scheduling or become ordinary absence.
+            ownership_hold_malformed = True
         boot_id, boot_malformed = _parse_present_boot_identity(data, "boot_id")
         if boot_malformed:
             # Any present boot identifier must be a non-empty string: a
@@ -560,9 +568,9 @@ class SupervisorState:
             restart_count=restart_count or 0,
             next_attempt_at=next_attempt_at,
             last_exit=_parse_last_exit(data),
-            last_spawn_at=_optional_float(data.get("last_spawn_at")),
+            last_spawn_at=monotonic_timestamps[0][0],
             ready=data.get("ready", False) is True,
-            next_readiness_at=_optional_float(data.get("next_readiness_at")),
+            next_readiness_at=monotonic_timestamps[1][0],
             boot_id=boot_id,
         )
 
@@ -2278,6 +2286,27 @@ def _parse_present_nullable_float(
         return None, False
     value = _strict_finite_float(raw)
     return value, value is None
+
+
+def _parse_present_nullable_monotonic_float(
+    data: dict[str, object],
+    key: str,
+) -> tuple[float | None, bool]:
+    """Parse an optional non-negative finite monotonic-clock timestamp.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Field name.
+
+    Returns:
+        A ``(value, malformed)`` pair: the parsed timestamp (``None`` for
+        genuine absence or explicit null) and whether a present non-null
+        value was malformed or outside the monotonic-clock domain.
+    """
+    value, malformed = _parse_present_nullable_float(data, key)
+    if malformed or value is None:
+        return value, malformed
+    return (value, False) if value >= 0.0 else (None, True)
 
 
 def _parse_optional_child(
