@@ -138,13 +138,27 @@ def test_future_published_at_cannot_bypass_staleness() -> None:
     assert "future" in effective.reason
 
 
-@pytest.mark.parametrize("field", ["started_at", "published_at"])
-def test_negative_required_wall_clock_timestamps_fail_closed(field: str) -> None:
+@pytest.mark.parametrize(
+    "field",
+    [
+        "started_at",
+        "published_at",
+        "db_connected_at",
+        "db_error_at",
+        "db_last_activity_at",
+        "db_deadline_breached_at",
+        "last_cancellation_scan_at",
+        "last_recovery_at",
+        "last_gc_at",
+    ],
+)
+def test_negative_wall_clock_timestamps_fail_closed(field: str) -> None:
     """Persisted wall-clock timestamps stay inside the writer domain."""
     data = _snapshot().to_dict()
     data[field] = -1.0
     with pytest.raises(ValueError, match=field):
         WorkerHealth.from_dict(data)
+    assert _from_dict_or_none(data) is None
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
