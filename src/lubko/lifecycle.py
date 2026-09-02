@@ -529,6 +529,9 @@ def _meta_optional_finite_float(data: dict[str, object], field: str) -> float | 
     if not math.isfinite(result):
         msg = f"worker metadata field {field!r} must be a finite number"
         raise ValueError(msg)
+    if result < 0:
+        msg = f"worker metadata field {field!r} must be >= 0"
+        raise ValueError(msg)
     return result
 
 
