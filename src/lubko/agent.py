@@ -3730,6 +3730,66 @@ def _status_summary(
     return created_at, started_at, finished_at, prompt_count, cwd, title, errors
 
 
+def _status_optional_string(meta: Meta, field: str, errors: list[str]) -> str | None:
+    """Return one optional non-empty persisted status string without coercion."""
+    raw = meta.get(field)
+    if raw is None:
+        return None
+    if type(raw) is not str or not raw:
+        errors.append(field)
+        return None
+    return raw
+
+
+def _status_process_id(meta: Meta, field: str, errors: list[str]) -> int | None:
+    """Return one optional persisted process identity without coercion."""
+    raw = meta.get(field)
+    if raw is None:
+        return None
+    value = _process_identity_int(raw, minimum=1)
+    if value is None:
+        errors.append(field)
+    return value
+
+
+def _status_activity_timestamp(meta: Meta, errors: list[str]) -> int | float | None:
+    """Return the optional canonical last-activity timestamp."""
+    raw = meta.get("last_activity_at")
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, (int, float))
+        or isinstance(raw, bool)
+        or not math.isfinite(raw)
+        or raw < 0
+    ):
+        errors.append("last_activity_at")
+        return None
+    return raw
+
+
+def _status_exit_code(meta: Meta, errors: list[str]) -> int | None:
+    """Return the optional canonical subprocess return code."""
+    raw = meta.get("exit_code")
+    if raw is None:
+        return None
+    if type(raw) is not int:
+        errors.append("exit_code")
+        return None
+    return raw
+
+
+def _status_exit_signal(meta: Meta, errors: list[str]) -> int | None:
+    """Return the optional canonical positive terminating signal."""
+    raw = meta.get("exit_signal")
+    if raw is None:
+        return None
+    value = _process_identity_int(raw, minimum=1)
+    if value is None:
+        errors.append("exit_signal")
+    return value
+
+
 def _entry_json(aid: str, state: str, meta: Meta) -> Meta:
     """Build the JSON mapping for one agent list entry.
 
@@ -3814,6 +3874,7 @@ def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals
     created_at, started_at, finished_at, prompt_count, cwd, title, metadata_errors = (
         _status_summary(meta)
     )
+    exit_code = _status_exit_code(meta, metadata_errors)
     error_fields = set(metadata_errors)
     _out(f"agent:      {aid}")
     _out(f"state:      {state}")
@@ -3823,8 +3884,14 @@ def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals
     _out(f"created:    {'<invalid>' if 'created_at' in error_fields else fmt_time(created_at)}")
     _out(f"started:    {'<invalid>' if 'started_at' in error_fields else fmt_time(started_at)}")
     _out(f"finished:   {'<invalid>' if 'finished_at' in error_fields else fmt_time(finished_at)}")
-    exit_code = meta.get("exit_code")
-    _out(f"exit code:  {exit_code if exit_code is not None else '-'}")
+    exit_code_text = (
+        "<invalid>"
+        if "exit_code" in error_fields
+        else str(exit_code)
+        if exit_code is not None
+        else "-"
+    )
+    _out(f"exit code:  {exit_code_text}")
     _out(f"prompts:    {'<invalid>' if 'prompt_count' in error_fields else prompt_count or 0}")
     steers, steer_error = _status_steer_queue(meta)
     if steer_error is not None:
@@ -3892,24 +3959,24 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "state": state,
         "alive": alive,
         "cpu_seconds": _status_cpu_seconds(meta, alive=alive),
-        "native_session_id": meta.get("native_session_id"),
-        "pid": meta.get("pid"),
-        "pgid": meta.get("pgid"),
-        "runner_pid": meta.get("runner_pid"),
+        "native_session_id": _status_optional_string(meta, "native_session_id", metadata_errors),
+        "pid": _status_process_id(meta, "pid", metadata_errors),
+        "pgid": _status_process_id(meta, "pgid", metadata_errors),
+        "runner_pid": _status_process_id(meta, "runner_pid", metadata_errors),
         "cwd": cwd,
         "title": title,
         "created_at": created_at,
         "started_at": started_at,
         "finished_at": finished_at,
-        "last_activity_at": meta.get("last_activity_at"),
-        "exit_code": meta.get("exit_code"),
-        "exit_signal": meta.get("exit_signal"),
+        "last_activity_at": _status_activity_timestamp(meta, metadata_errors),
+        "exit_code": _status_exit_code(meta, metadata_errors),
+        "exit_signal": _status_exit_signal(meta, metadata_errors),
         "prompts": prompt_count,
         "steers_pending": len(steers) if steers is not None else None,
         "next_steer": _first_line(steers[0]["prompt"]) if steers else None,
         "steer_metadata_error": steer_error,
         "model": AGENT_MODEL,
-        "variant": meta.get("variant"),
+        "variant": _status_optional_string(meta, "variant", metadata_errors),
         "log": str(agent_dir(aid) / "output.log"),
     }
     if metadata_errors:
