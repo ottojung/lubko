@@ -121,3 +121,123 @@ def test_live_status_carries_holding_flag(isolated_state: Path) -> None:
     assert status.holding is True
     restored = supervise.SupervisorStatus.from_dict(status.to_dict())
     assert restored.holding is True
+
+
+def _canonical_diagnostic_mapping() -> dict[str, object]:
+    """Return one fully populated canonical diagnostic mapping."""
+    return supervise.SupervisorDiagnostic(
+        live=False,
+        source="durable-state",
+        supervisor_present=True,
+        supervisor_alive=False,
+        mode=supervise.MODE_IDLE,
+        intent=supervise.INTENT_RUN,
+        commit="a" * 40,
+        applied_generation=7,
+        restart_count=2,
+        next_attempt_at=12.5,
+        ready=False,
+        next_readiness_at=13.5,
+        holding=True,
+        ownership_hold_malformed=False,
+        unresolved_hold_malformed=False,
+        spawning_hold_malformed=False,
+        child_present=False,
+        unresolved_child_present=False,
+        spawning_present=False,
+        last_exit=supervise.LastExit(returncode=1, at=3.5),
+        message="held",
+    ).to_dict()
+
+
+def _assert_diagnostic_rejects(field: str, malformed: object) -> None:
+    """Assert one malformed present scalar is rejected.
+
+    Args:
+        field: Diagnostic field to corrupt.
+        malformed: Invalid JSON-domain value to place there.
+    """
+    data = _canonical_diagnostic_mapping()
+    data[field] = malformed
+    with pytest.raises((TypeError, ValueError), match="supervisor diagnostic is malformed"):
+        supervise.SupervisorDiagnostic.from_dict(data)
+
+
+def test_diagnostic_rejects_malformed_present_booleans() -> None:
+    """Present diagnostic boolean fields are literal JSON booleans only."""
+    cases: tuple[tuple[str, object], ...] = (
+        ("live", "false"),
+        ("supervisor_present", 1),
+        ("supervisor_alive", "true"),
+        ("ready", None),
+        ("holding", []),
+        ("ownership_hold_malformed", {}),
+        ("unresolved_hold_malformed", 0),
+        ("spawning_hold_malformed", "false"),
+        ("child_present", 1.0),
+        ("unresolved_child_present", "true"),
+        ("spawning_present", None),
+    )
+    for field, malformed in cases:
+        _assert_diagnostic_rejects(field, malformed)
+
+
+def test_diagnostic_rejects_noncanonical_numbers() -> None:
+    """Diagnostic counters and timestamps never use permissive coercion."""
+    counter_cases: tuple[tuple[str, object], ...] = (
+        ("applied_generation", "7"),
+        ("applied_generation", 7.0),
+        ("applied_generation", True),
+        ("restart_count", "2"),
+        ("restart_count", -1),
+        ("restart_count", False),
+    )
+    timestamp_values: tuple[object, ...] = ("1.5", True, float("inf"), float("nan"), [])
+    for field, malformed in counter_cases:
+        _assert_diagnostic_rejects(field, malformed)
+    for field in ("next_attempt_at", "next_readiness_at"):
+        for malformed in timestamp_values:
+            _assert_diagnostic_rejects(field, malformed)
+
+
+def test_diagnostic_rejects_malformed_present_strings() -> None:
+    """Present diagnostic strings cannot collapse to defaults or null."""
+    cases: tuple[tuple[str, object], ...] = (
+        ("source", ""),
+        ("source", 1),
+        ("mode", ""),
+        ("mode", "unknown"),
+        ("intent", ""),
+        ("intent", "unknown"),
+        ("commit", 1),
+        ("message", []),
+    )
+    for field, malformed in cases:
+        _assert_diagnostic_rejects(field, malformed)
+
+
+def test_diagnostic_defaults_apply_only_to_absent_legacy_fields() -> None:
+    """Legacy absence keeps documented defaults without accepting malformed presence."""
+    data = _canonical_diagnostic_mapping()
+    for field in (
+        "live",
+        "source",
+        "supervisor_present",
+        "mode",
+        "intent",
+        "applied_generation",
+        "restart_count",
+        "ready",
+        "holding",
+    ):
+        data.pop(field)
+    restored = supervise.SupervisorDiagnostic.from_dict(data)
+    assert restored.live is False
+    assert restored.source == "durable-state"
+    assert restored.supervisor_present is False
+    assert restored.mode == supervise.MODE_IDLE
+    assert restored.intent == supervise.INTENT_RUN
+    assert restored.applied_generation == 0
+    assert restored.restart_count == 0
+    assert restored.ready is False
+    assert restored.holding is False
