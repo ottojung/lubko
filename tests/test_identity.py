@@ -194,6 +194,19 @@ def test_metadata_requires_explicit_supported_schema() -> None:
         WorkerMeta.from_dict(data)
 
 
+def test_read_meta_fails_closed_on_unsupported_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unsupported on-disk lifecycle state cannot become usable metadata."""
+    path = tmp_path / "meta.json"
+    data = meta().to_dict()
+    data["state"] = "unknown"
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(lifecycle, "meta_path", lambda: path)
+    assert lifecycle.read_meta() is None
+
+
 def test_read_meta_fails_closed_on_malformed_identity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
