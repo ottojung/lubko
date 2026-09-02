@@ -113,3 +113,45 @@ def test_one_malformed_entry_does_not_hide_healthy_entry(
     assert bad_json["prompts"] is None
     assert bad_json["cwd"] is None
     assert bad_json["title"] is None
+
+
+@pytest.mark.parametrize("field", ["last_activity_at", "finished_at"])
+def test_list_valid_activity_and_completion_timestamps_are_preserved(field: str) -> None:
+    """Canonical list timestamps survive the persisted-metadata boundary."""
+    meta: agent.Meta = {field: 12.5}
+    entry = agent._entry_json("abc", "idle", meta)
+    assert entry[field] == pytest.approx(12.5)
+    assert "metadata_errors" not in entry
+
+
+@pytest.mark.parametrize("field", ["last_activity_at", "finished_at"])
+@pytest.mark.parametrize("value", ["1", False, float("nan"), float("inf"), -1, {}, []])
+def test_list_malformed_activity_and_completion_timestamps_are_diagnostic(
+    field: str, value: object
+) -> None:
+    """Malformed list timestamps are sanitized instead of copied verbatim."""
+    meta: agent.Meta = {field: value}
+    entry = agent._entry_json("abc", "idle", meta)
+    assert entry[field] is None
+    assert entry["metadata_errors"] == [field]
+
+
+def test_list_timestamp_validation_matches_status() -> None:
+    """List and status expose one corruption contract for shared timestamps."""
+    meta: agent.Meta = {
+        "finished_at": "not-a-time",
+        "last_activity_at": {"bad": 1},
+    }
+    entry = agent._entry_json("abc", "failed", meta)
+    status = agent._status_json("abc", meta, "failed", alive=False)
+
+    assert entry["finished_at"] is status["finished_at"] is None
+    assert entry["last_activity_at"] is status["last_activity_at"] is None
+    assert (
+        entry["metadata_errors"]
+        == status["metadata_errors"]
+        == [
+            "finished_at",
+            "last_activity_at",
+        ]
+    )

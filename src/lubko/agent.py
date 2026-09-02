@@ -3663,7 +3663,12 @@ def _summary_timestamp(meta: Meta, field: str, errors: list[str]) -> int | float
     raw = meta.get(field)
     if raw is None:
         return None
-    if not isinstance(raw, (int, float)) or isinstance(raw, bool) or not math.isfinite(raw):
+    if (
+        not isinstance(raw, (int, float))
+        or isinstance(raw, bool)
+        or not math.isfinite(raw)
+        or raw < 0
+    ):
         errors.append(field)
         return None
     return raw
@@ -3754,18 +3759,7 @@ def _status_process_id(meta: Meta, field: str, errors: list[str]) -> int | None:
 
 def _status_activity_timestamp(meta: Meta, errors: list[str]) -> int | float | None:
     """Return the optional canonical last-activity timestamp."""
-    raw = meta.get("last_activity_at")
-    if raw is None:
-        return None
-    if (
-        not isinstance(raw, (int, float))
-        or isinstance(raw, bool)
-        or not math.isfinite(raw)
-        or raw < 0
-    ):
-        errors.append("last_activity_at")
-        return None
-    return raw
+    return _summary_timestamp(meta, "last_activity_at", errors)
 
 
 def _status_exit_code(meta: Meta, errors: list[str]) -> int | None:
@@ -3797,6 +3791,8 @@ def _entry_json(aid: str, state: str, meta: Meta) -> Meta:
         The sanitized JSON-safe list entry.
     """
     created_at, prompt_count, cwd, title, errors = _list_summary(meta)
+    finished_at = _summary_timestamp(meta, "finished_at", errors)
+    last_activity_at = _summary_timestamp(meta, "last_activity_at", errors)
     entry: Meta = {
         "id": aid,
         "state": state,
@@ -3804,8 +3800,8 @@ def _entry_json(aid: str, state: str, meta: Meta) -> Meta:
         "cwd": cwd,
         "title": title,
         "created_at": created_at,
-        "last_activity_at": meta.get("last_activity_at"),
-        "finished_at": meta.get("finished_at"),
+        "last_activity_at": last_activity_at,
+        "finished_at": finished_at,
     }
     if errors:
         entry["metadata_errors"] = errors
