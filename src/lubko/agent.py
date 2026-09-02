@@ -1832,7 +1832,7 @@ def _persisted_agent_cwd(meta: Meta) -> str:
         ValueError: The durable working directory is missing or malformed.
     """
     cwd = meta.get("cwd")
-    if not isinstance(cwd, str) or not cwd:
+    if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
         message = "managed-agent cwd is malformed"
         raise ValueError(message)
     return cwd

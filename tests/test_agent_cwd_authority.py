@@ -37,7 +37,7 @@ def test_build_agent_command_preserves_valid_persisted_cwd() -> None:
     assert command[command.index("--dir") + 1] == cwd
 
 
-@pytest.mark.parametrize("cwd", ["", 0, False, None, []])
+@pytest.mark.parametrize("cwd", ["", 0, False, None, [], "relative", "./relative", "../relative"])
 def test_build_agent_command_rejects_malformed_persisted_cwd(cwd: object) -> None:
     """Reject malformed durable cwd values instead of normalizing them."""
     meta: agent.Meta = {"id": "aaaaaaaa", "cwd": cwd}
