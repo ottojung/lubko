@@ -774,29 +774,38 @@ class SupervisorDiagnostic:
 
         Returns:
             The reconstructed diagnostic.
+
+        Raises:
+            ValueError: If a present scalar has an invalid value.
         """
+        source = _parse_diagnostic_string(data, "source", default="durable-state")
+        mode = _parse_diagnostic_string(data, "mode", default=MODE_IDLE)
+        intent = _parse_diagnostic_string(data, "intent", default=INTENT_RUN)
+        if mode not in {MODE_RUN, MODE_IDLE} or intent not in {INTENT_RUN, INTENT_RETIRING}:
+            msg = "supervisor diagnostic is malformed"
+            raise ValueError(msg)
         return cls(
-            live=bool(data.get("live")),
-            source=_optional_string(data.get("source")) or "durable-state",
-            supervisor_present=bool(data.get("supervisor_present")),
-            supervisor_alive=_optional_bool(data.get("supervisor_alive")),
-            mode=_optional_string(data.get("mode")) or MODE_IDLE,
-            intent=_optional_string(data.get("intent")) or INTENT_RUN,
-            commit=_optional_string(data.get("commit")),
-            applied_generation=_optional_int(data.get("applied_generation")) or 0,
-            restart_count=_optional_int(data.get("restart_count")) or 0,
-            next_attempt_at=_optional_float(data.get("next_attempt_at")),
-            ready=bool(data.get("ready")),
-            next_readiness_at=_optional_float(data.get("next_readiness_at")),
-            holding=bool(_optional_bool(data.get("holding"))),
-            ownership_hold_malformed=bool(_optional_bool(data.get("ownership_hold_malformed"))),
-            unresolved_hold_malformed=bool(_optional_bool(data.get("unresolved_hold_malformed"))),
-            spawning_hold_malformed=bool(_optional_bool(data.get("spawning_hold_malformed"))),
-            child_present=bool(_optional_bool(data.get("child_present"))),
-            unresolved_child_present=bool(_optional_bool(data.get("unresolved_child_present"))),
-            spawning_present=bool(_optional_bool(data.get("spawning_present"))),
+            live=_parse_diagnostic_bool(data, "live"),
+            source=source,
+            supervisor_present=_parse_diagnostic_bool(data, "supervisor_present"),
+            supervisor_alive=_parse_diagnostic_nullable_bool(data, "supervisor_alive"),
+            mode=mode,
+            intent=intent,
+            commit=_parse_diagnostic_nullable_string(data, "commit"),
+            applied_generation=_parse_diagnostic_non_negative_int(data, "applied_generation"),
+            restart_count=_parse_diagnostic_non_negative_int(data, "restart_count"),
+            next_attempt_at=_parse_diagnostic_nullable_float(data, "next_attempt_at"),
+            ready=_parse_diagnostic_bool(data, "ready"),
+            next_readiness_at=_parse_diagnostic_nullable_float(data, "next_readiness_at"),
+            holding=_parse_diagnostic_bool(data, "holding"),
+            ownership_hold_malformed=_parse_diagnostic_bool(data, "ownership_hold_malformed"),
+            unresolved_hold_malformed=_parse_diagnostic_bool(data, "unresolved_hold_malformed"),
+            spawning_hold_malformed=_parse_diagnostic_bool(data, "spawning_hold_malformed"),
+            child_present=_parse_diagnostic_bool(data, "child_present"),
+            unresolved_child_present=_parse_diagnostic_bool(data, "unresolved_child_present"),
+            spawning_present=_parse_diagnostic_bool(data, "spawning_present"),
             last_exit=_parse_last_exit(data),
-            message=_optional_string(data.get("message")),
+            message=_parse_diagnostic_nullable_string(data, "message"),
         )
 
 
@@ -2034,6 +2043,157 @@ def _optional_bool(value: object | None) -> bool | None:
         The boolean, or ``None``.
     """
     return value if isinstance(value, bool) else None
+
+
+def _parse_diagnostic_bool(data: dict[str, object], key: str) -> bool:
+    """Parse a diagnostic boolean, defaulting only genuine absence to false.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The boolean value, or ``False`` when the key is absent.
+
+    Raises:
+        TypeError: If a present value is not a JSON boolean.
+    """
+    if key not in data:
+        return False
+    value = data[key]
+    if not isinstance(value, bool):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    return value
+
+
+def _parse_diagnostic_nullable_bool(data: dict[str, object], key: str) -> bool | None:
+    """Parse a nullable diagnostic boolean without truthiness coercion.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The boolean value, or ``None`` for absence or explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not a JSON boolean.
+    """
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if not isinstance(value, bool):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    return value
+
+
+def _parse_diagnostic_non_negative_int(data: dict[str, object], key: str) -> int:
+    """Parse a diagnostic counter, defaulting only genuine absence to zero.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The exact non-negative JSON integer, or zero for absence.
+
+    Raises:
+        TypeError: If a present value is not an integer or is a boolean.
+        ValueError: If a present integer is negative.
+    """
+    if key not in data:
+        return 0
+    raw = data[key]
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    if raw < 0:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return raw
+
+
+def _parse_diagnostic_nullable_float(data: dict[str, object], key: str) -> float | None:
+    """Parse a nullable finite diagnostic number without numeric coercion.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        A finite float, or ``None`` for absence or explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not a JSON number.
+        ValueError: If a present number is non-finite or unrepresentable.
+    """
+    if key not in data or data[key] is None:
+        return None
+    raw = data[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    value = _strict_finite_float(raw)
+    if value is None:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_diagnostic_string(
+    data: dict[str, object],
+    key: str,
+    *,
+    default: str,
+) -> str:
+    """Parse a required diagnostic string, defaulting only genuine absence.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+        default: Value used only when the key is absent.
+
+    Returns:
+        The non-empty string value, or ``default`` for absence.
+
+    Raises:
+        TypeError: If a present value is not a string.
+        ValueError: If a present string is empty.
+    """
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, str):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    if not value:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_diagnostic_nullable_string(data: dict[str, object], key: str) -> str | None:
+    """Parse a nullable diagnostic string without erasing malformed values.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The string value, or ``None`` for absence or explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not a string.
+    """
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if not isinstance(value, str):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    return value
 
 
 def _strict_safety_hold(data: dict[str, object], key: str) -> bool:
