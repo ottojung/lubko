@@ -1236,15 +1236,20 @@ class SupervisorDaemon:
         Args:
             commit: Exact commit the worker must run.
         """
-        action, authorized_commit = self._derive_action(read_state())
-        if action != "run" or authorized_commit != commit:
-            if action == "run":
-                self._message = (
-                    "worker intent changed before the pre-spawn boundary; "
-                    "holding for a fresh reconciliation"
-                )
-            return
-        child = self._spawn_worker(commit)
+        # Product intent writers serialize generation allocation and durable
+        # desired/mission publication through this lock. Hold it across the
+        # final strict read and the pre-Popen obligation/spawn so a newer
+        # supported intent writer cannot slip between those two boundaries.
+        with supervise.generation_lock():
+            action, authorized_commit = self._derive_action(read_state())
+            if action != "run" or authorized_commit != commit:
+                if action == "run":
+                    self._message = (
+                        "worker intent changed before the pre-spawn boundary; "
+                        "holding for a fresh reconciliation"
+                    )
+                return
+            child = self._spawn_worker(commit)
         now = time.monotonic()
         if child is None:
             state = replace(
