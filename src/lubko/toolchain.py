@@ -128,7 +128,12 @@ def read_toolchain() -> ToolchainMeta | None:
         return None
     if not isinstance(data, dict):
         return None
-    if data.get("schema_version") != TOOLCHAIN_SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != TOOLCHAIN_SCHEMA_VERSION
+    ):
         return None
     uv_path = data.get("uv_path")
     if not isinstance(uv_path, str) or not uv_path:
