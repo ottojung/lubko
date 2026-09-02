@@ -326,7 +326,9 @@ class WorkerHealth:
         return cls(
             schema_version=version,
             worker_id=_coerce_str(data.get("worker_id"), "worker_id"),
-            worker_incarnation=_coerce_str(data.get("worker_incarnation"), "worker_incarnation"),
+            worker_incarnation=_coerce_incarnation_token(
+                data.get("worker_incarnation"), "worker_incarnation"
+            ),
             pid=_required_json_int(data.get("pid"), "pid", minimum=1),
             start_time_ticks=_required_json_int(
                 data.get("start_time_ticks"), "start_time_ticks", minimum=1
@@ -425,6 +427,13 @@ def _required_json_int(value: object, field: str, *, minimum: int) -> int:
         msg = f"{field} must be >= {minimum}, got {value!r}"
         raise ValueError(msg)
     return value
+
+
+def _coerce_incarnation_token(value: object, field: str) -> str:
+    """Return a required canonical filename-safe incarnation token."""
+    token = _coerce_str(value, field)
+    validate_incarnation_token(token)
+    return token
 
 
 def _coerce_float(value: object, field: str) -> float | None:
@@ -756,6 +765,10 @@ def read_worker_health_by_incarnation(incarnation: str) -> WorkerHealth | None:
     Returns:
         The parsed snapshot, or ``None`` when absent or malformed.
     """
+    try:
+        validate_incarnation_token(incarnation)
+    except ValueError:
+        return None
     return _read_health_file(health_incarnation_path(incarnation))
 
 

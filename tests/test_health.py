@@ -523,3 +523,24 @@ def test_health_file_reader_rejects_missing_required_batch_limit(
     path = tmp_path / "health.json"
     path.write_text(json.dumps(data), encoding="utf-8")
     assert health_module._read_health_file(path) is None
+
+
+@pytest.mark.parametrize("token", ["", "bad token", "a/b", ".", "..", "bad.token"])
+def test_persisted_health_rejects_invalid_incarnation_tokens(token: str) -> None:
+    """Incarnation strings outside the artifact-safe domain are unusable health."""
+    data = _snapshot().to_dict()
+    data["worker_incarnation"] = token
+    with pytest.raises(ValueError, match="incarnation token"):
+        WorkerHealth.from_dict(data)
+
+
+def test_health_reader_rejects_invalid_incarnation_before_path_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invalid caller tokens fail closed before selecting a health artifact."""
+    monkeypatch.setattr(
+        health_module,
+        "health_incarnation_path",
+        lambda _token: pytest.fail("invalid token reached path construction"),
+    )
+    assert health_module.read_worker_health_by_incarnation("../other") is None
