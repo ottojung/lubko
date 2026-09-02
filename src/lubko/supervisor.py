@@ -671,7 +671,6 @@ class SupervisorDaemon:
         :meth:`run`.
         """
         self._message = None
-        desired = read_desired()
         state = read_state()
         if state.ownership_hold_malformed:
             # Materialize the hold so a later rewrite cannot turn authority
@@ -687,13 +686,7 @@ class SupervisorDaemon:
             LOGGER.error("%s", self._message)
             return
         action, commit = self._derive_action(state)
-        if (
-            desired is not None
-            and action == "run"
-            and commit == desired.commit
-            and desired.generation > state.applied_generation
-        ):
-            self._apply_desired(desired)
+        if action != "hold" and self._apply_newer_desired(state, commit):
             return
         if state.child is not None and not self._child_alive(state):
             child_meta = _child_to_meta(state.child, _runtime_dir(state.commit))
@@ -723,6 +716,33 @@ class SupervisorDaemon:
         self._record_mission_progress(commit)
         self._probe_readiness(now)
         self._complete_cold_migration()
+
+    def _apply_newer_desired(
+        self,
+        state: supervise.SupervisorState,
+        commit: str | None,
+    ) -> bool:
+        """Apply a newer matching desired intent, holding on malformed authority.
+
+        Returns:
+            ``True`` when reconciliation must stop because desired authority was
+            malformed or a newer desired intent was applied; otherwise ``False``.
+        """
+        try:
+            desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError:
+            self._bootstrap_hold_logged = False
+            self._message = "corrupt desired supervisor state; holding without a worker"
+            LOGGER.exception("corrupt desired supervisor state; holding without a worker")
+            return True
+        if (
+            desired is not None
+            and commit == desired.commit
+            and desired.generation > state.applied_generation
+        ):
+            self._apply_desired(desired)
+            return True
+        return False
 
     def _complete_cold_migration(self) -> None:
         """Converge CLI/deployctl authority onto a proven migrated commit.
@@ -756,7 +776,12 @@ class SupervisorDaemon:
         the next tick; the flag is cleared last, so an interrupted run is
         always resumed rather than skipped.
         """
-        desired = read_desired()
+        try:
+            desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError:
+            self._message = "corrupt desired supervisor state; cold-migration completion is held"
+            LOGGER.exception("corrupt desired supervisor state; cold-migration completion is held")
+            return
         if desired is None or not desired.migration:
             return
         try:
@@ -776,7 +801,12 @@ class SupervisorDaemon:
             desired: The migration intent observed before locking; re-read
                 and revalidated while locked.
         """
-        current_desired = read_desired()
+        try:
+            current_desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError:
+            self._message = "corrupt desired supervisor state; cold-migration completion is held"
+            LOGGER.exception("corrupt desired supervisor state; cold-migration completion is held")
+            return
         if (
             current_desired is None
             or not current_desired.migration
@@ -843,7 +873,12 @@ class SupervisorDaemon:
         Args:
             commit: The candidate commit that is now the maintained worker.
         """
-        desired = read_desired()
+        try:
+            desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError:
+            self._message = "corrupt desired supervisor state; mission progress is held"
+            LOGGER.exception("corrupt desired supervisor state; mission progress is held")
+            return
         desired_gen = desired.generation if desired is not None else 0
         try:
             mission = deployctl.read_rollback_state()
@@ -891,7 +926,13 @@ class SupervisorDaemon:
             An ``(action, commit)`` pair where ``action`` is ``run`` or
             ``hold``.
         """
-        desired = read_desired()
+        try:
+            desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError:
+            self._bootstrap_hold_logged = False
+            self._message = "corrupt desired supervisor state; holding without a worker"
+            LOGGER.exception("corrupt desired supervisor state; holding without a worker")
+            return "hold", None
         desired_gen = desired.generation if desired is not None else 0
         desired_commit = desired.commit if desired is not None else None
         try:
