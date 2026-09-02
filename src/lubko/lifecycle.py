@@ -2344,6 +2344,19 @@ class _AdoptionError(RuntimeError):
     """Raised when a recovery worker cannot be safely adopted."""
 
 
+def _required_rollback_status(data: dict[str, object]) -> str:
+    """Return a canonical persisted rollback lifecycle status.
+
+    Raises:
+        ValueError: If the status is absent or outside the canonical lifecycle states.
+    """
+    status = _meta_string(data, "status", default="")
+    if status not in {STATE_PENDING, "confirmed", "rolled_back"}:
+        msg = f"unsupported rollback status {status!r}"
+        raise ValueError(msg)
+    return status
+
+
 def _repair_rollback_state(recovery_worker_pid: int) -> None:
     """Resolve stale rollback state before adopting a recovery worker.
 
@@ -2374,13 +2387,14 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
         new_meta = WorkerMeta.from_dict(data.get("new_meta") or {})
         previous_meta = WorkerMeta.from_dict(data.get("previous_meta") or {})
         deadline = _meta_optional_finite_float(data, "deadline")
+        status = _required_rollback_status(data)
     except (KeyError, TypeError, ValueError) as exc:
         msg = "rollback state is present but malformed; repair refuses to erase authority"
         raise _AdoptionError(msg) from exc
     if deadline is None:
         msg = "rollback state is present but malformed; repair refuses to erase authority"
         raise _AdoptionError(msg)
-    if data.get("status") == STATE_PENDING and worker_alive(new_meta) and deadline > time.time():
+    if status == STATE_PENDING and worker_alive(new_meta) and deadline > time.time():
         msg = "another supervised deployment is still pending confirmation"
         raise _AdoptionError(msg)
     if worker_alive(new_meta) and new_meta.pid != recovery_worker_pid:
