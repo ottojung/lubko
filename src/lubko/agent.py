@@ -1195,8 +1195,13 @@ def reservation_in_flight(meta: Meta) -> bool:
     Returns:
         ``True`` while a reserved runner is expected to claim the agent.
     """
-    if _active_runner_flag(meta) is not True:
-        return False
+    active_runner = _active_runner_flag(meta)
+    if active_runner is not True:
+        # Malformed durable consumption authority is ambiguous, not evidence
+        # that no runner/reservation is in flight. Callers use this predicate
+        # as negative authority for stop/delete/convergence, so fail closed;
+        # canonical inactive authority remains ordinary not-in-flight.
+        return active_runner is None
     if runner_alive(meta):
         return True
     res = meta.get("runner_reservation")
