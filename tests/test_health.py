@@ -156,6 +156,21 @@ def test_missing_required_finite_health_fields_fail_closed(field: str) -> None:
     assert _from_dict_or_none(data) is None
 
 
+def test_missing_or_empty_worker_id_fails_closed(tmp_path: Path) -> None:
+    """Current-schema health requires a present non-empty worker identity."""
+    for worker_id in (None, ""):
+        data = _snapshot().to_dict()
+        if worker_id is None:
+            del data["worker_id"]
+        else:
+            data["worker_id"] = worker_id
+        with pytest.raises(ValueError, match="worker_id"):
+            WorkerHealth.from_dict(data)
+        path = tmp_path / f"health-{worker_id!r}.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        assert health_module._read_health_file(path) is None
+
+
 def test_missing_db_deadline_cannot_bypass_strictly_positive_domain() -> None:
     """Missing and explicit zero database deadlines both fail closed."""
     missing = _snapshot().to_dict()
