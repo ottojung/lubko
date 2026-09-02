@@ -100,6 +100,47 @@ def test_malformed_rollback_deadline_blocks_repair(deadline: object) -> None:
     assert rollback_state_path().read_text(encoding="utf-8") == before
 
 
+@pytest.mark.parametrize(
+    "status",
+    [_MISSING, None, False, 1, "", "unknown", [], {}],
+)
+def test_malformed_rollback_status_blocks_repair(status: object) -> None:
+    """Malformed rollback lifecycle state remains durable and blocks repair."""
+    data: dict[str, object] = {
+        "deadline": 0.0,
+        "new_meta": _stopped_meta(),
+        "previous_meta": _stopped_meta(),
+    }
+    if status is not _MISSING:
+        data["status"] = status
+    _write(data)
+    before = rollback_state_path().read_text(encoding="utf-8")
+
+    with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
+        lifecycle._repair_rollback_state(222)
+
+    assert rollback_state_path().read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    "status",
+    [lifecycle.STATE_PENDING, deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK],
+)
+def test_canonical_rollback_status_is_accepted(
+    status: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Canonical rollback lifecycle states retain their cleanup semantics."""
+    _write({
+        "status": status,
+        "deadline": 0.0,
+        "new_meta": _stopped_meta(),
+        "previous_meta": _stopped_meta(),
+    })
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _meta: False)
+    lifecycle._repair_rollback_state(222)
+    assert not rollback_state_path().exists()
+
+
 def test_valid_inert_rollback_state_is_still_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
