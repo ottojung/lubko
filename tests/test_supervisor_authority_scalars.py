@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -190,3 +191,28 @@ def test_malformed_spawning_scalars_preserve_hold() -> None:
         })
         assert state.spawning is None
         assert state.spawning_hold_malformed
+
+
+def test_malformed_supervisor_state_schema_fails_closed() -> None:
+    """Persisted state schema authority requires the exact current JSON integer."""
+    canonical = supervise.fresh_state().to_dict()
+    malformed_values: tuple[object, ...] = ("1", 1.0, True, 0, 2, None, {}, [])
+    for malformed in malformed_values:
+        payload = {**canonical, "schema_version": malformed}
+        with pytest.raises(ValueError, match="schema_version is malformed"):
+            supervise.SupervisorState.from_dict(payload)
+
+        supervise.state_path().parent.mkdir(parents=True, exist_ok=True)
+        supervise.state_path().write_text(json.dumps(payload), encoding="utf-8")
+        loaded = supervise.read_state()
+        assert loaded.ownership_hold_malformed
+        assert loaded.schema_version == supervise.SCHEMA_VERSION
+
+    supervise.state_path().unlink()
+    assert supervise.read_state() == supervise.fresh_state()
+
+
+def test_absent_in_memory_state_schema_preserves_legacy_defaults() -> None:
+    """Partial in-memory state mappings retain their documented absence compatibility."""
+    state = supervise.SupervisorState.from_dict({})
+    assert state == supervise.fresh_state()

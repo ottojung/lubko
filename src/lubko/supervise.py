@@ -507,6 +507,7 @@ class SupervisorState:
         Returns:
             The parsed state, or a fresh idle state for an empty mapping.
         """
+        _validate_state_schema(data)
         child, ownership_hold_malformed = _parse_optional_child(data)
         unresolved, unresolved_hold_malformed = _parse_optional_unresolved_child(data)
         spawning, spawning_hold_malformed = _parse_optional_spawning(data)
@@ -551,7 +552,7 @@ class SupervisorState:
             # crash-loop backoff deadline. Enter the durable hold.
             ownership_hold_malformed = True
         return cls(
-            schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
+            schema_version=SCHEMA_VERSION,
             applied_generation=generation or 0,
             mode=_optional_string(data.get("mode")) or MODE_IDLE,
             commit=_optional_string(data.get("commit")),
@@ -1347,7 +1348,7 @@ def read_state() -> SupervisorState:
         return replace(fresh_state(), ownership_hold_malformed=True)
     if not isinstance(decoded, dict):
         return replace(fresh_state(), ownership_hold_malformed=True)
-    schema_version = _optional_int(decoded.get("schema_version"))
+    schema_version = _strict_int(decoded.get("schema_version"))
     if schema_version != SCHEMA_VERSION:
         return replace(fresh_state(), ownership_hold_malformed=True)
     return SupervisorState.from_dict(decoded)
@@ -2007,6 +2008,19 @@ def _optional_int(value: object | None) -> int | None:
         except ValueError:
             return None
     return None
+
+
+def _validate_state_schema(data: dict[str, object]) -> None:
+    """Reject malformed present top-level supervisor state schema authority.
+
+    Raises:
+        ValueError: If a present schema discriminator is not the exact current JSON integer.
+    """
+    if "schema_version" not in data:
+        return
+    if _strict_int(data["schema_version"]) != SCHEMA_VERSION:
+        msg = "supervisor state schema_version is malformed"
+        raise ValueError(msg)
 
 
 def _strict_int(value: object | None) -> int | None:
