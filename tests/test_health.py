@@ -352,3 +352,76 @@ def test_fractional_pid_cannot_be_truncated_into_live_health() -> None:
     with pytest.raises(TypeError, match="pid"):
         WorkerHealth.from_dict(data)
     assert _from_dict_or_none(data) is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "active_jobs",
+        "stopping_jobs",
+        "completed_jobs",
+        "db_deadline_breach_count",
+        "capture_streams_open",
+        "spool_held_bytes",
+        "last_scan_batch_size",
+    ],
+)
+def test_persisted_worker_health_counts_reject_negative_values(field: str) -> None:
+    """Counts and sizes outside their writer domain fail closed."""
+    data = _snapshot().to_dict()
+    data[field] = -1
+    with pytest.raises(ValueError, match=field):
+        WorkerHealth.from_dict(data)
+    assert _from_dict_or_none(data) is None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "scan_batch_limit",
+        "gc_batch_limit",
+        "cancellation_batch_limit",
+        "recovery_batch_limit",
+    ],
+)
+@pytest.mark.parametrize("bad", [0, -1])
+def test_persisted_worker_health_batch_limits_must_be_positive(field: str, bad: int) -> None:
+    """Configured batch limits retain the positive runtime contract."""
+    data = _snapshot().to_dict()
+    data[field] = bad
+    with pytest.raises(ValueError, match=field):
+        WorkerHealth.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [
+        ("oldest_active_job_age_seconds", -0.1),
+        ("lease_safety_margin_seconds", -0.1),
+        ("db_operation_deadline_seconds", 0.0),
+        ("db_operation_deadline_seconds", -0.1),
+    ],
+)
+def test_persisted_worker_health_durations_enforce_runtime_domains(field: str, bad: float) -> None:
+    """Elapsed/configured durations reject semantically impossible values."""
+    data = _snapshot().to_dict()
+    data[field] = bad
+    with pytest.raises(ValueError, match=field):
+        WorkerHealth.from_dict(data)
+
+
+def test_negative_lease_safety_remaining_is_intentionally_preserved() -> None:
+    """Negative remaining safety budget still means its deadline has passed."""
+    data = _snapshot().to_dict()
+    data["min_lease_safety_remaining_seconds"] = -1.5
+    restored = WorkerHealth.from_dict(data)
+    assert restored.min_lease_safety_remaining_seconds == pytest.approx(-1.5)
+
+
+def test_health_file_reader_rejects_out_of_domain_metric(tmp_path: Path) -> None:
+    """The public persisted-health read boundary fails closed on bad domains."""
+    data = _snapshot().to_dict()
+    data["active_jobs"] = -1
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert health_module._read_health_file(path) is None
