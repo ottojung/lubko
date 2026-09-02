@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from lubko import deployctl, supervise, supervisor
+from lubko import deployctl, lifecycle, supervise, supervisor
 
 if TYPE_CHECKING:
     import pytest
@@ -123,7 +123,7 @@ def test_malformed_desired_cannot_clear_cold_migration_authority(
     lock_entries: list[bool] = []
     monkeypatch.setattr(supervise, "read_desired_strict", _malformed_desired)
     monkeypatch.setattr(
-        supervisor.lifecycle,
+        lifecycle,
         "deploy_lock",
         lambda _timeout: lock_entries.append(True),
     )
