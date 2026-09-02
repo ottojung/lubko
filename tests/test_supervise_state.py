@@ -264,6 +264,96 @@ def test_present_malformed_backoff_deadline_is_durable_hold(state_path: Path) ->
     assert supervise.read_state().ownership_hold_malformed is True
 
 
+@pytest.mark.parametrize("field", ["last_spawn_at", "next_readiness_at"])
+def test_supervisor_monotonic_timestamps_are_strict_nullable_numbers(
+    state_path: Path, field: str
+) -> None:
+    """Lifecycle monotonic timestamps accept only canonical finite JSON numbers or null."""
+    for numeric_value in (0, 1.25, 10**15):
+        parsed, malformed = supervise._parse_present_nullable_float({field: numeric_value}, field)
+        assert parsed == pytest.approx(float(numeric_value))
+        assert malformed is False
+
+    assert supervise._parse_present_nullable_float({}, field) == (None, False)
+    assert supervise._parse_present_nullable_float({field: None}, field) == (None, False)
+
+    malformed_values: tuple[object, ...] = (
+        True,
+        False,
+        "1.5",
+        "nan",
+        "inf",
+        [],
+        {},
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    )
+    for malformed_value in malformed_values:
+        assert supervise._parse_present_nullable_float({field: malformed_value}, field) == (
+            None,
+            True,
+        )
+
+    write_raw_state(state_path, **{field: "1.5"})
+    state = supervise.read_state()
+    assert getattr(state, field) is None
+    assert state.ownership_hold_malformed is True
+    supervise.write_state(state)
+    assert supervise.read_state().ownership_hold_malformed is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("last_spawn_at", "nan"), ("next_readiness_at", "inf")],
+)
+def test_reconcile_holds_before_malformed_monotonic_timing_can_drive_lifecycle(
+    state_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    """Corrupt stability/readiness timing cannot reach scheduling decisions."""
+    write_raw_state(
+        state_path,
+        mode=supervise.MODE_RUN,
+        commit=COMMIT,
+        restart_count=1,
+        child={
+            "pid": 4242,
+            "pgid": 4242,
+            "sid": 4242,
+            "start_time_ticks": 99,
+            "token": "token-4242",
+            "worker_id": "w",
+            "spawned_at": 1.0,
+        },
+        **{field: value},
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        daemon,
+        "_maybe_reset_backoff",
+        lambda _state, _now: pytest.fail("malformed stability timing reached backoff reset"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_probe_readiness",
+        lambda _now: pytest.fail("malformed readiness timing reached readiness scheduling"),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_ensure_worker",
+        lambda _commit: pytest.fail("malformed timing authority reached worker lifecycle"),
+    )
+
+    daemon.reconcile(100.0)
+
+    assert daemon._message is not None
+    assert "malformed" in daemon._message
+    assert supervise.read_state().ownership_hold_malformed is True
+
+
 def test_unrepresentably_large_integer_deadline_is_durable_hold(state_path: Path) -> None:
     """An integer beyond float range fails closed instead of raising."""
     huge = "1" + "0" * 10000
