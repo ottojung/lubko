@@ -542,13 +542,14 @@ def _required_finite_float(
         minimum_exclusive: Exclusive lower bound for a present finite number.
 
     Returns:
-        The coerced finite float (``0.0`` when absent).
+        The required finite float.
 
     Raises:
-        ValueError: If the value is present but not a finite number.
+        ValueError: If the value is absent, non-finite, or outside its allowed domain.
     """
     if value is None:
-        return 0.0
+        msg = f"{field} is required"
+        raise ValueError(msg)
     result = _coerce_float(value, field)
     if result is None or not math.isfinite(result):
         msg = f"{field} must be a finite timestamp, got {value!r}"
