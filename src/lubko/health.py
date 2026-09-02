@@ -337,8 +337,10 @@ class WorkerHealth:
             ),
             alive=_strict_bool(data, "alive"),
             db_connected=_strict_bool(data, "db_connected"),
-            db_connected_at=_optional_finite_float(data.get("db_connected_at"), "db_connected_at"),
-            db_error_at=_optional_finite_float(data.get("db_error_at"), "db_error_at"),
+            db_connected_at=_optional_finite_float(
+                data.get("db_connected_at"), "db_connected_at", minimum=0.0
+            ),
+            db_error_at=_optional_finite_float(data.get("db_error_at"), "db_error_at", minimum=0.0),
             active_jobs=_coerce_int(data.get("active_jobs"), "active_jobs", minimum=0),
             stopping_jobs=_coerce_int(data.get("stopping_jobs"), "stopping_jobs", minimum=0),
             completed_jobs=_coerce_int(data.get("completed_jobs"), "completed_jobs", minimum=0),
@@ -359,10 +361,10 @@ class WorkerHealth:
                 minimum_exclusive=0.0,
             ),
             db_last_activity_at=_optional_finite_float(
-                data.get("db_last_activity_at"), "db_last_activity_at"
+                data.get("db_last_activity_at"), "db_last_activity_at", minimum=0.0
             ),
             db_deadline_breached_at=_optional_finite_float(
-                data.get("db_deadline_breached_at"), "db_deadline_breached_at"
+                data.get("db_deadline_breached_at"), "db_deadline_breached_at", minimum=0.0
             ),
             db_deadline_breach_count=_coerce_int(
                 data.get("db_deadline_breach_count"), "db_deadline_breach_count", minimum=0
@@ -380,12 +382,12 @@ class WorkerHealth:
                 data.get("last_scan_batch_size"), "last_scan_batch_size", minimum=0
             ),
             last_cancellation_scan_at=_optional_finite_float(
-                data.get("last_cancellation_scan_at"), "last_cancellation_scan_at"
+                data.get("last_cancellation_scan_at"), "last_cancellation_scan_at", minimum=0.0
             ),
             last_recovery_at=_optional_finite_float(
-                data.get("last_recovery_at"), "last_recovery_at"
+                data.get("last_recovery_at"), "last_recovery_at", minimum=0.0
             ),
-            last_gc_at=_optional_finite_float(data.get("last_gc_at"), "last_gc_at"),
+            last_gc_at=_optional_finite_float(data.get("last_gc_at"), "last_gc_at", minimum=0.0),
             cancellation_scan_overdue=_strict_bool(data, "cancellation_scan_overdue"),
             recovery_overdue=_strict_bool(data, "recovery_overdue"),
             gc_overdue=_strict_bool(data, "gc_overdue"),
