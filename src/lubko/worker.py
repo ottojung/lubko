@@ -456,6 +456,13 @@ GC_FINISHED_AT_PATTERN: Final = (
     r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
     r"T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
 )
+CANCEL_REQUESTED_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
+CANCEL_REQUESTED_SQL: Final = (
+    "(jsonb_typeof((payload::jsonb)->'state'->'cancel_requested_at') = 'string'\n"
+    "    AND ((payload::jsonb)->'state'->>'cancel_requested_at')\n"
+    "        ~ %(cancel_requested_at_pattern)s\n"
+    "    AND left((payload::jsonb)->'state'->>'cancel_requested_at', 4) <> '0000')"
+)
 LEASE_EXPIRES_AT_SQL: Final = (
     "to_jsonb(to_char("
     "now() at time zone 'utc' + make_interval(secs => %(lease_duration_seconds)s), "
@@ -3685,7 +3692,7 @@ def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUI
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
-            "    AND (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
+            "    AND " + CANCEL_REQUESTED_SQL + "\n"
             "    AND (payload::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"
             "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"
             "LIMIT %(limit)s\n",
@@ -3693,6 +3700,7 @@ def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUI
                 "server": settings.server,
                 "worker_id": settings.worker_id,
                 "worker_incarnation": settings.worker_incarnation,
+                "cancel_requested_at_pattern": CANCEL_REQUESTED_AT_PATTERN,
                 "limit": CANCEL_DISCOVERY_LIMIT,
             },
         )
@@ -3847,7 +3855,7 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
                 "state,status",
                 (
                     "CASE\n"
-                    "    WHEN (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
+                    "    WHEN " + CANCEL_REQUESTED_SQL + "\n"
                     "        THEN to_jsonb('cancelled'::text)\n"
                     "    ELSE to_jsonb(%(status)s::text)\n"
                     "END"
@@ -3864,7 +3872,7 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
                     "'exit_code', to_jsonb(%(exit_code)s::int), "
                     "'cancellation_note', "
                     "CASE\n"
-                    "    WHEN (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
+                    "    WHEN " + CANCEL_REQUESTED_SQL + "\n"
                     "        THEN COALESCE(\n"
                     "            to_jsonb(%(cancellation_note)s::text),\n"
                     "            to_jsonb('cancelled by request'::text))\n"
@@ -3890,6 +3898,7 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
                 "stderr": result.stderr,
                 "exit_code": result.exit_code,
                 "cancellation_note": result.cancellation_note,
+                "cancel_requested_at_pattern": CANCEL_REQUESTED_AT_PATTERN,
                 "job_id": job_id,
             },
         )
