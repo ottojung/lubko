@@ -298,3 +298,99 @@ def test_stale_running_fails_closed_on_malformed_present_pid(
         assert agent._stale_running("a1") is True
         assert agent._can_produce_output("a1") is False
         assert agent._wait_for_first_output("a1", tmp_path / "missing") is True
+
+
+@pytest.mark.parametrize("value", [None, "steer", "stop", "kill"])
+def test_persisted_lifecycle_control_accepts_canonical_values(value: str | None) -> None:
+    """Canonical optional lifecycle control remains valid durable authority."""
+    assert agent._persisted_intent({"intent": value}) == (value, False)
+    assert agent._persisted_stop_reason({"stop_reason": value}) == (value, False)
+
+
+def test_persisted_lifecycle_control_preserves_genuine_absence() -> None:
+    """Missing lifecycle control remains distinct from malformed presence."""
+    assert agent._persisted_intent({}) == (None, False)
+    assert agent._persisted_stop_reason({}) == (None, False)
+
+
+@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, True, False, "bogus"])
+def test_persisted_lifecycle_control_rejects_malformed_presence(malformed: object) -> None:
+    """Only canonical strings can carry durable lifecycle-control authority."""
+    assert agent._persisted_intent({"intent": malformed}) == (None, True)
+    assert agent._persisted_stop_reason({"stop_reason": malformed}) == (None, True)
+
+
+@pytest.mark.parametrize("field", ["intent", "stop_reason"])
+@pytest.mark.parametrize("malformed", ["bogus", 1, [], {}])
+def test_malformed_lifecycle_control_blocks_pending_prompt_claim(
+    monkeypatch: pytest.MonkeyPatch, field: str, malformed: object
+) -> None:
+    """Malformed durable control cannot authorize accepted prompt execution."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "state": "running",
+        "active_runner": True,
+        "pending_prompt": "P",
+        "delete_pending": False,
+        "intent": None,
+        "stop_reason": None,
+        field: malformed,
+    }
+
+    def update(_aid: str, mutate: object) -> None:
+        assert callable(mutate)
+        mutate(meta)
+
+    monkeypatch.setattr(agent, "update_meta", update)
+    assert agent._claim_pending_prompt("aaaaaaaa", "P") is False
+    assert meta["pending_prompt"] == "P"
+    assert meta[field] == malformed
+
+
+@pytest.mark.parametrize("field", ["intent", "stop_reason"])
+@pytest.mark.parametrize("malformed", ["bogus", 1, [], {}])
+def test_malformed_lifecycle_control_blocks_new_invocation(field: str, malformed: object) -> None:
+    """Fresh invocation reservation fails closed on malformed control authority."""
+    meta = agent.idle_meta("aaaaaaaa", ".", None)
+    meta[field] = malformed
+    decision: dict[str, object] = {}
+
+    agent._decide_invocation(meta, decision, prompt="P", steer=False)
+
+    assert decision == {"action": "busy"}
+    assert meta[field] == malformed
+
+
+@pytest.mark.parametrize("field", ["intent", "stop_reason"])
+@pytest.mark.parametrize("malformed", ["bogus", 1, [], {}])
+def test_malformed_lifecycle_control_stops_runner_drain(
+    monkeypatch: pytest.MonkeyPatch, field: str, malformed: object
+) -> None:
+    """Malformed lifecycle control cannot be bypassed by queued-work drain."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "state": "succeeded",
+        "active_runner": True,
+        "intent": None,
+        "stop_reason": None,
+        "steer_queue": [],
+        "steer_seq": 0,
+        field: malformed,
+    }
+
+    def update(_aid: str, mutate: object) -> None:
+        assert callable(mutate)
+        mutate(meta)
+
+    monkeypatch.setattr(agent, "update_meta", update)
+    assert agent._drain_next("aaaaaaaa") is None
+    assert meta["active_runner"] is False
+    assert meta[field] == malformed
+
+
+def test_canonical_steer_control_does_not_create_a_stop_like_hold() -> None:
+    """Valid steer authority preserves ordinary non-stop lifecycle semantics."""
+    assert agent._stop_like_or_malformed({"intent": "steer"}) is False
+    assert agent._stop_like_or_malformed({"stop_reason": "steer"}) is False
+    assert agent._stop_like_or_malformed({"intent": "stop"}) is True
+    assert agent._stop_like_or_malformed({"stop_reason": "kill"}) is True
