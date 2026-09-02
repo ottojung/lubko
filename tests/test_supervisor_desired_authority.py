@@ -56,6 +56,46 @@ def test_reconcile_holds_before_reading_mutable_worker_state_on_malformed_desire
     assert "corrupt desired supervisor state" in daemon._message
 
 
+def test_reconcile_converges_hold_if_desired_corrupts_between_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-tick desired corruption cannot leave a selected worker running."""
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    desired = supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=1,
+        mode=supervise.MODE_RUN,
+        commit="a" * 40,
+        repo="/workspace/Lubko",
+        uv_path="/usr/bin/uv",
+        worker_id=None,
+        requested_at=1.0,
+    )
+    reads = iter((desired,))
+
+    def changing_desired() -> supervise.SupervisorDesired | None:
+        try:
+            return next(reads)
+        except StopIteration:
+            return _malformed_desired()
+
+    held: list[bool] = []
+    monkeypatch.setattr(supervise, "read_desired_strict", changing_desired)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
+    monkeypatch.setattr(
+        supervisor,
+        "read_state",
+        lambda: supervise.SupervisorState.from_dict({}),
+    )
+    monkeypatch.setattr(daemon, "_ensure_held", lambda: held.append(True))
+
+    daemon.reconcile(0.0)
+
+    assert held == [True]
+    assert daemon._message is not None
+    assert "corrupt desired supervisor state" in daemon._message
+
+
 def test_malformed_desired_cannot_advance_pending_mission_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

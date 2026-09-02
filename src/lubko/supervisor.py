@@ -734,6 +734,7 @@ class SupervisorDaemon:
             self._bootstrap_hold_logged = False
             self._message = "corrupt desired supervisor state; holding without a worker"
             LOGGER.exception("corrupt desired supervisor state; holding without a worker")
+            self._ensure_held()
             return True
         if (
             desired is not None
