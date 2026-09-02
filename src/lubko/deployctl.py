@@ -237,11 +237,15 @@ class RollbackState:
                 commit=commit,
                 previous_commit=previous_commit,
                 challenge_hash=_optional_json_string(data.get("challenge_hash")),
-                deadline=_required_finite_json_number(data["deadline"]),
+                deadline=_required_nonnegative_finite_json_number(data["deadline"]),
                 repo=_required_json_string(data["repo"]),
                 uv_path=_required_json_string(data["uv_path"]),
-                stop_grace_seconds=_required_finite_json_number(data["stop_grace_seconds"]),
-                git_timeout_seconds=_required_finite_json_number(data["git_timeout_seconds"]),
+                stop_grace_seconds=_required_positive_finite_json_number(
+                    data["stop_grace_seconds"]
+                ),
+                git_timeout_seconds=_required_positive_finite_json_number(
+                    data["git_timeout_seconds"]
+                ),
                 previous_retiring=_retiring_flag(data.get("previous_retiring", _ABSENT)),
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
@@ -346,6 +350,22 @@ def _required_finite_json_number(value: object) -> float:
         raise TypeError
     result = float(value)
     if not math.isfinite(result):
+        raise ValueError
+    return result
+
+
+def _required_nonnegative_finite_json_number(value: object) -> float:
+    """Return a finite JSON number in the non-negative domain."""
+    result = _required_finite_json_number(value)
+    if result < 0:
+        raise ValueError
+    return result
+
+
+def _required_positive_finite_json_number(value: object) -> float:
+    """Return a finite JSON number in the positive domain."""
+    result = _required_finite_json_number(value)
+    if result <= 0:
         raise ValueError
     return result
 
