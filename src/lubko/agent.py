@@ -1118,6 +1118,23 @@ def _runner_generation(value: object, *, minimum: int) -> int | None:
     return value
 
 
+def _runner_reservation_state(reservation: object) -> str:
+    """Return the strict durable runner-reservation lifecycle state.
+
+    Genuine absence is distinct from malformed present authority. Only the
+    canonical ``reserved`` and ``claimed`` strings are accepted; every other
+    present shape fails closed as ``malformed``.
+    """
+    if reservation is None:
+        return "absent"
+    if not isinstance(reservation, dict):
+        return "malformed"
+    state = reservation.get("state")
+    if type(state) is str and state in {"reserved", "claimed"}:
+        return state
+    return "malformed"
+
+
 def _runner_reservation_mode(reservation: object) -> str | None:
     """Return canonical durable runner native-session mode, or ``None``.
 
@@ -1205,12 +1222,13 @@ def reservation_in_flight(meta: Meta) -> bool:
     if runner_alive(meta):
         return True
     res = meta.get("runner_reservation")
+    reservation_state = _runner_reservation_state(res)
     if (
         not isinstance(res, dict)
-        or res.get("state") != "reserved"
+        or reservation_state != "reserved"
         or _runner_reservation_mode(res) is None
     ):
-        return False
+        return reservation_state == "malformed"
     gen = _runner_generation(res.get("gen"), minimum=1)
     if gen is None:
         return False
@@ -1297,9 +1315,7 @@ def active_runner_justified(meta: Meta) -> bool:
     # reservation whose runner is no longer provably alive is stuck and must
     # never justify a persistent ``active_runner``.
     return (
-        isinstance(res, dict)
-        and res.get("state") == "reserved"
-        and _runner_reservation_mode(res) is not None
+        _runner_reservation_state(res) == "reserved" and _runner_reservation_mode(res) is not None
     )
 
 
@@ -1916,7 +1932,7 @@ def runner(aid: str, mode: str) -> None:
             # exact reserved generation.  Fail closed.
             claimed["ok"] = False
             return
-        if res.get("state") != "reserved":
+        if _runner_reservation_state(res) != "reserved":
             # Already claimed or otherwise owned: a second runner must never
             # execute.  (A genuinely live claimed runner is the only owner.)
             claimed["ok"] = False
@@ -3204,8 +3220,12 @@ def _recover_stale_reservation(
     """
     pending = _pending_prompt(m)
     res = m.get("runner_reservation")
-    if not (isinstance(res, dict) and res.get("state") in {"reserved", "claimed"}):
-        return False
+    reservation_state = _runner_reservation_state(res)
+    if reservation_state not in {"reserved", "claimed"}:
+        malformed = reservation_state == "malformed"
+        if malformed:
+            decision["action"] = "busy"
+        return malformed
     if reservation_in_flight(m):
         return False
     take_mode = _runner_reservation_mode(res)
@@ -3213,7 +3233,7 @@ def _recover_stale_reservation(
     if take_mode is None or current_gen is None:
         decision["action"] = "busy"
         return True
-    if res.get("state") == "claimed" and pending is None:
+    if reservation_state == "claimed" and pending is None:
         # The exact runner consumed the accepted prompt before dying; there is
         # nothing to preserve and nothing to replay. Drop the dead claimed
         # authority and let the caller's fresh start own the next invocation.
@@ -3411,7 +3431,8 @@ def _apply_locked_transition(
     # reservation dropped), that runner will never consume another prompt, so
     # it must not be reused even while its process is still dying.
     live_runner = _active_runner_flag(m) is True and runner_alive(m)
-    in_flight = reservation_in_flight(m)
+    reservation_state = _runner_reservation_state(m.get("runner_reservation"))
+    in_flight = reservation_state != "malformed" and reservation_in_flight(m)
 
     if live_agent:
         if steer:
@@ -4687,12 +4708,18 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
     except MalformedPendingPromptMetadataError:
         return False
     res = meta.get("runner_reservation")
+    expected_reservation_state = _runner_reservation_state(res)
+    if expected_reservation_state == "malformed":
+        return False
     expected_gen = res.get("gen") if isinstance(res, dict) else None
     applied = False
 
     def cancel(m: Meta) -> None:
         nonlocal applied
         cur_res = m.get("runner_reservation")
+        cur_reservation_state = _runner_reservation_state(cur_res)
+        if cur_reservation_state == "malformed":
+            return
         cur_gen = cur_res.get("gen") if isinstance(cur_res, dict) else None
         try:
             current_pending = _pending_prompt(m)
@@ -4701,6 +4728,7 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
         if (
             _invocation_identity(m) != identity
             or current_pending != expected_pending
+            or cur_reservation_state != expected_reservation_state
             or cur_gen != expected_gen
         ):
             return
@@ -5042,7 +5070,7 @@ def _begin_delete(aid: str, *, force: bool) -> Meta | None:
             "runner_pid": m.get("runner_pid"),
             "runner_start_time": m.get("runner_start_time"),
             "active_runner": m.get("active_runner"),
-            "runner_reservation": dict(res) if isinstance(res, dict) else None,
+            "runner_reservation": dict(res) if isinstance(res, dict) else res,
             "unresolved_invocation": dict(marker) if isinstance(marker, dict) else None,
             "delete_pending": True,
         }
