@@ -68,6 +68,27 @@ def test_malformed_nested_worker_authority_blocks_repair(field: str) -> None:
     assert rollback_state_path().read_text(encoding="utf-8") == before
 
 
+@pytest.mark.parametrize("field", ["new_meta", "previous_meta"])
+def test_unsupported_nested_worker_state_blocks_repair(field: str) -> None:
+    """Unsupported nested worker states remain durable malformed authority."""
+    data: dict[str, object] = {
+        "status": lifecycle.STATE_PENDING,
+        "deadline": 0.0,
+        "new_meta": _stopped_meta(),
+        "previous_meta": _stopped_meta(),
+    }
+    malformed = _stopped_meta()
+    malformed["state"] = "unknown"
+    data[field] = malformed
+    _write(data)
+    before = rollback_state_path().read_text(encoding="utf-8")
+
+    with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
+        lifecycle._repair_rollback_state(222)
+
+    assert rollback_state_path().read_text(encoding="utf-8") == before
+
+
 @pytest.mark.parametrize(
     "deadline",
     [

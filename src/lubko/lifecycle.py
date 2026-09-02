@@ -199,7 +199,7 @@ class WorkerMeta:
             raise ValueError(msg)
         return cls(
             schema_version=schema_version,
-            state=_meta_string(data, "state", default=STATE_STOPPED),
+            state=_meta_worker_state(data),
             pid=_meta_optional_int(data, "pid", minimum=1),
             pgid=_meta_optional_int(data, "pgid", minimum=1),
             sid=_meta_optional_int(data, "sid", minimum=0),
@@ -499,6 +499,19 @@ def _meta_string(data: dict[str, object], field: str, *, default: str) -> str:
         msg = f"worker metadata field {field!r} must be a string"
         raise TypeError(msg)
     return value
+
+
+def _meta_worker_state(data: dict[str, object]) -> str:
+    """Return a supported persisted maintained-worker lifecycle state.
+
+    Raises:
+        ValueError: If the persisted state is outside the supported domain.
+    """
+    state = _meta_string(data, "state", default=STATE_STOPPED)
+    if state not in {STATE_RUNNING, STATE_STOPPED}:
+        msg = f"unsupported worker metadata state {state!r}"
+        raise ValueError(msg)
+    return state
 
 
 def _meta_optional_string(data: dict[str, object], field: str) -> str | None:

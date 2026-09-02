@@ -159,6 +159,22 @@ def test_metadata_rejects_malformed_present_scalars(field: str, bad_value: objec
         WorkerMeta.from_dict(data)
 
 
+@pytest.mark.parametrize("bad_state", ["", "pending", "unmanaged", "definitely-not-a-worker-state"])
+def test_metadata_rejects_unsupported_present_state(bad_state: str) -> None:
+    """Type-correct but unsupported lifecycle states remain malformed authority."""
+    data = meta().to_dict()
+    data["state"] = bad_state
+    with pytest.raises(ValueError, match=r"unsupported worker metadata state"):
+        WorkerMeta.from_dict(data)
+
+
+def test_metadata_preserves_absent_state_compatibility() -> None:
+    """Genuine legacy state absence still defaults to stopped."""
+    data = meta().to_dict()
+    del data["state"]
+    assert WorkerMeta.from_dict(data).state == lifecycle.STATE_STOPPED
+
+
 def test_metadata_accepts_non_negative_lifecycle_timestamps() -> None:
     """Zero and positive finite wall-clock timestamps remain valid metadata."""
     zero = meta(started_at=0, stopped_at=0.0)
@@ -176,6 +192,19 @@ def test_metadata_requires_explicit_supported_schema() -> None:
     del data["schema_version"]
     with pytest.raises(ValueError, match=r"schema_version.*missing"):
         WorkerMeta.from_dict(data)
+
+
+def test_read_meta_fails_closed_on_unsupported_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unsupported on-disk lifecycle state cannot become usable metadata."""
+    path = tmp_path / "meta.json"
+    data = meta().to_dict()
+    data["state"] = "unknown"
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(lifecycle, "meta_path", lambda: path)
+    assert lifecycle.read_meta() is None
 
 
 def test_read_meta_fails_closed_on_malformed_identity(
