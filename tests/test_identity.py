@@ -159,6 +159,22 @@ def test_metadata_rejects_malformed_present_scalars(field: str, bad_value: objec
         WorkerMeta.from_dict(data)
 
 
+@pytest.mark.parametrize("bad_state", ["", "pending", "unmanaged", "definitely-not-a-worker-state"])
+def test_metadata_rejects_unsupported_present_state(bad_state: str) -> None:
+    """Type-correct but unsupported lifecycle states remain malformed authority."""
+    data = meta().to_dict()
+    data["state"] = bad_state
+    with pytest.raises(ValueError, match=r"unsupported worker metadata state"):
+        WorkerMeta.from_dict(data)
+
+
+def test_metadata_preserves_absent_state_compatibility() -> None:
+    """Genuine legacy state absence still defaults to stopped."""
+    data = meta().to_dict()
+    del data["state"]
+    assert WorkerMeta.from_dict(data).state == lifecycle.STATE_STOPPED
+
+
 def test_metadata_accepts_non_negative_lifecycle_timestamps() -> None:
     """Zero and positive finite wall-clock timestamps remain valid metadata."""
     zero = meta(started_at=0, stopped_at=0.0)
