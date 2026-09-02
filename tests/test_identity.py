@@ -138,7 +138,9 @@ def test_pinned_signal_fails_closed_when_send_binding_is_unavailable(
         ("started_at", "1.0"),
         ("started_at", True),
         ("started_at", float("nan")),
+        ("started_at", -1),
         ("stopped_at", float("inf")),
+        ("stopped_at", -0.5),
         ("state", 1),
         ("token", 1),
         ("repo", 1),
@@ -157,6 +159,17 @@ def test_metadata_rejects_malformed_present_scalars(field: str, bad_value: objec
         WorkerMeta.from_dict(data)
 
 
+def test_metadata_accepts_non_negative_lifecycle_timestamps() -> None:
+    """Zero and positive finite wall-clock timestamps remain valid metadata."""
+    zero = meta(started_at=0, stopped_at=0.0)
+    assert zero.started_at == pytest.approx(0.0)
+    assert zero.stopped_at == pytest.approx(0.0)
+
+    positive = meta(started_at=1, stopped_at=2.5)
+    assert positive.started_at == pytest.approx(1.0)
+    assert positive.stopped_at == pytest.approx(2.5)
+
+
 def test_metadata_requires_explicit_supported_schema() -> None:
     """Missing schema authority is not silently upgraded to the current schema."""
     data = meta().to_dict()
@@ -173,6 +186,21 @@ def test_read_meta_fails_closed_on_malformed_identity(
     path = tmp_path / "meta.json"
     data = meta().to_dict()
     data["pid"] = "42"
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(lifecycle, "meta_path", lambda: path)
+    assert lifecycle.read_meta() is None
+
+
+@pytest.mark.parametrize("field", ["started_at", "stopped_at"])
+def test_read_meta_fails_closed_on_negative_lifecycle_timestamp(
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Negative persisted lifecycle timestamps cannot become usable metadata."""
+    path = tmp_path / "meta.json"
+    data = meta().to_dict()
+    data[field] = -1
     path.write_text(json.dumps(data))
     monkeypatch.setattr(lifecycle, "meta_path", lambda: path)
     assert lifecycle.read_meta() is None
