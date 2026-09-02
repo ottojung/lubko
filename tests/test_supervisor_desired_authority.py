@@ -64,12 +64,10 @@ def test_reconcile_converges_hold_if_desired_corrupts_between_reads(
     desired = supervise.SupervisorDesired(
         schema_version=supervise.SCHEMA_VERSION,
         generation=1,
-        mode=supervise.MODE_RUN,
         commit="a" * 40,
         repo="/workspace/Lubko",
         uv_path="/usr/bin/uv",
         worker_id=None,
-        requested_at=1.0,
     )
     reads = iter((desired,))
 
