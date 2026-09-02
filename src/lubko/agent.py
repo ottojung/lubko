@@ -1377,6 +1377,49 @@ def _require_persisted_lifecycle_state(meta: Meta) -> str:
     return state
 
 
+CONTROL_REASONS: Final = frozenset({"steer", "stop", "kill"})
+
+
+def _persisted_control_field(meta: Meta, key: str) -> tuple[str | None, bool]:
+    """Return canonical optional lifecycle control plus malformed-presence flag."""
+    if key not in meta or meta[key] is None:
+        return None, False
+    value = meta[key]
+    if type(value) is not str or value not in CONTROL_REASONS:
+        return None, True
+    return value, False
+
+
+def _persisted_intent(meta: Meta) -> tuple[str | None, bool]:
+    """Parse durable invocation intent without normalizing malformed authority.
+
+    Returns:
+        The canonical intent and whether malformed presence was observed.
+    """
+    return _persisted_control_field(meta, "intent")
+
+
+def _persisted_stop_reason(meta: Meta) -> tuple[str | None, bool]:
+    """Parse durable terminal control reason without normalizing malformed authority.
+
+    Returns:
+        The canonical reason and whether malformed presence was observed.
+    """
+    return _persisted_control_field(meta, "stop_reason")
+
+
+def _stop_like_or_malformed(meta: Meta) -> bool:
+    """Return whether lifecycle control forbids starting or draining work."""
+    intent, intent_malformed = _persisted_intent(meta)
+    stop_reason, stop_reason_malformed = _persisted_stop_reason(meta)
+    return (
+        intent_malformed
+        or stop_reason_malformed
+        or intent in STOP_REASONS
+        or stop_reason in STOP_REASONS
+    )
+
+
 def _persisted_timestamp(value: object) -> float | None:
     """Return a canonical finite persisted timestamp without coercion."""
     if (
@@ -1969,7 +2012,7 @@ def _reclaim_prompt(aid: str) -> bool:
     holder: dict[str, bool] = {"busy": False}
 
     def apply(m: Meta) -> None:
-        if m.get("stop_reason") in STOP_REASONS:
+        if _stop_like_or_malformed(m):
             _set_active_runner(m, value=False)
             return
         sequence = _steer_sequence(m)
@@ -2070,8 +2113,7 @@ def _claim_pending_prompt(aid: str, prompt: str) -> bool:
         if (
             _persisted_lifecycle_state(m) is None
             or _delete_pending_flag(m) is not False
-            or m.get("intent") in STOP_REASONS
-            or m.get("stop_reason") in STOP_REASONS
+            or _stop_like_or_malformed(m)
         ):
             return
         _clear_pending(m, prompt)
@@ -2408,7 +2450,8 @@ def _hold_unrecorded(aid: str, pid: int, start: object, iid: str) -> None:
             "start_time": start,
             "invocation_id": iid,
         }
-        if m.get("state") == "running" and m.get("intent") not in STOP_REASONS:
+        intent, intent_malformed = _persisted_intent(m)
+        if m.get("state") == "running" and not intent_malformed and intent not in STOP_REASONS:
             m["intent"] = "kill"
             m["last_activity_at"] = time.time()
 
@@ -2520,11 +2563,7 @@ def _record_running(
     """
 
     def record(m: Meta) -> None:
-        if (
-            _delete_pending_flag(m) is not False
-            or m.get("intent") in STOP_REASONS
-            or m.get("stop_reason") in STOP_REASONS
-        ):
+        if _delete_pending_flag(m) is not False or _stop_like_or_malformed(m):
             # The just-spawned child is refused tracking, but it already
             # exists in its own session: durably hand its exact identity
             # over as an unresolved obligation *in this same locked
@@ -2587,7 +2626,10 @@ def _finalize_after(rc: int) -> Callable[[Meta], None]:
         if m.get("state") != "running":
             return  # already finalized (e.g. by stop/kill/steer)
         sig = -rc if rc < 0 else None
-        intent = m.get("intent")
+        intent, intent_malformed = _persisted_intent(m)
+        _, stop_reason_malformed = _persisted_stop_reason(m)
+        if intent_malformed or stop_reason_malformed:
+            return
         m["stop_reason"] = intent
         if intent == "stop":
             state = "stopped"
@@ -2618,7 +2660,7 @@ def _drain_next(aid: str) -> str | None:
     def drain(m: Meta) -> None:
         if _persisted_lifecycle_state(m) is None:
             raise MalformedLifecycleStateError
-        if m.get("stop_reason") in STOP_REASONS:
+        if _stop_like_or_malformed(m):
             _set_active_runner(m, value=False)
             return
         sequence = _steer_sequence(m)
@@ -2673,7 +2715,9 @@ def _finalize_terminal(
     meta["exit_signal"] = exit_signal
     meta["finished_at"] = time.time()
     meta["last_activity_at"] = time.time()
-    meta["intent"] = None
+    _, intent_malformed = _persisted_intent(meta)
+    if not intent_malformed:
+        meta["intent"] = None
     if note:
         meta["error"] = note
 
@@ -3098,7 +3142,10 @@ def _interrupt_steer_if_needed(aid: str) -> None:
         aid: Lubko agent ID.
     """
     current = read_meta(aid)
-    if current is None or current.get("intent") != "steer" or not is_alive(current):
+    if current is None:
+        return
+    intent, intent_malformed = _persisted_intent(current)
+    if intent_malformed or intent != "steer" or not is_alive(current):
         return
     send_signal_group(current, signal.SIGTERM)
 
@@ -3284,7 +3331,9 @@ def _decide_invocation(
         decision["action"] = "busy"
         return
     m["unresolved_invocation"] = None
-    if m.get("intent") in STOP_REASONS:
+    intent, intent_malformed = _persisted_intent(m)
+    _, stop_reason_malformed = _persisted_stop_reason(m)
+    if intent_malformed or stop_reason_malformed or intent in STOP_REASONS:
         # A durably accepted stop/kill obligation for this invocation must
         # never be overwritten by a later prompt/steer: otherwise the dying
         # invocation is finalized as a steer and _drain_next resurrects the
