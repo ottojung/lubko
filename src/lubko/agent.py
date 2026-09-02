@@ -1475,7 +1475,7 @@ def derive_state(meta: Meta | None) -> str:
         launched = _launch_timestamp(meta)
         return (
             "running"
-            if launched is not None and time.time() - launched < PID_START_WINDOW_SECONDS
+            if launched is not None and 0 <= time.time() - launched < PID_START_WINDOW_SECONDS
             else "unknown"
         )
     if _process_identity_int(pid_value, minimum=1) is None:
@@ -1522,7 +1522,7 @@ def _reconcile_dead_invocation(m: Meta) -> None:
         # Launched but the runner has not recorded its identity yet; give the
         # exact startup window the same grace derive_state grants it.
         launched = _launch_timestamp(m)
-        if launched is not None and time.time() - launched < PID_START_WINDOW_SECONDS:
+        if launched is not None and 0 <= time.time() - launched < PID_START_WINDOW_SECONDS:
             return
     if m.get("state") == "running":
         _finalize_terminal(m, None, None, "failed", DISAPPEARED_NOTE)

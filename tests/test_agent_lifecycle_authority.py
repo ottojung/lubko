@@ -394,3 +394,34 @@ def test_canonical_steer_control_does_not_create_a_stop_like_hold() -> None:
     assert agent._stop_like_or_malformed({"stop_reason": "steer"}) is False
     assert agent._stop_like_or_malformed({"intent": "stop"}) is True
     assert agent._stop_like_or_malformed({"stop_reason": "kill"}) is True
+
+
+@pytest.mark.parametrize(
+    ("started_at", "expected"),
+    [
+        (120.0, "running"),
+        (119.0, "running"),
+        (120.0 - agent.PID_START_WINDOW_SECONDS, "unknown"),
+        (121.0, "unknown"),
+        (10_000.0, "unknown"),
+    ],
+)
+def test_derive_state_launch_grace_requires_non_future_timestamp(
+    monkeypatch: pytest.MonkeyPatch, started_at: float, expected: str
+) -> None:
+    """Only non-future launch timestamps receive the bounded no-PID grace."""
+    monkeypatch.setattr(time, "time", lambda: 120.0)
+    meta = _running_meta(pid=None)
+    meta["started_at"] = started_at
+    assert derive_state(meta) == expected
+
+
+def test_derive_state_created_at_fallback_rejects_future_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The created_at fallback rejects future timestamps as liveness evidence."""
+    monkeypatch.setattr(time, "time", lambda: 120.0)
+    meta = _running_meta(pid=None)
+    meta["started_at"] = None
+    meta["created_at"] = 10_000.0
+    assert derive_state(meta) == "unknown"
