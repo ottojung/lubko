@@ -1873,10 +1873,11 @@ def runner(aid: str, mode: str) -> None:
             # execute.  (A genuinely live claimed runner is the only owner.)
             claimed["ok"] = False
             return
-        if gen == 0 or res.get("gen") != gen:
-            # Only the exact reserved generation may run.  A missing or zero
-            # generation, or a duplicate/stale replacement whose generation no
-            # longer matches, bails instead of double-executing.
+        reservation_gen = _runner_generation(res.get("gen"), minimum=1)
+        if gen == 0 or reservation_gen is None or reservation_gen != gen:
+            # Only the exact canonical reserved generation may run. A malformed,
+            # missing, zero, or stale generation never becomes execution
+            # authority through Python cross-type equality.
             claimed["ok"] = False
             return
         reservation_mode = _runner_reservation_mode(res)
@@ -2946,13 +2947,21 @@ def spawn_runner(aid: str, mode: str, *, gen: int | None = None) -> None:
     script = Path(__file__).resolve()
     env = _runner_env(aid)
     if gen is not None:
-        env["LUBKO_RUNNER_GEN"] = str(int(gen))
+        spawn_gen = _runner_generation(gen, minimum=1)
+        if spawn_gen is None:
+            msg = "managed-agent runner generation is malformed"
+            raise ValueError(msg)
+        env["LUBKO_RUNNER_GEN"] = str(spawn_gen)
     else:
         meta = read_meta(aid)
         if meta:
             res = meta.get("runner_reservation")
-            if isinstance(res, dict) and res.get("gen"):
-                env["LUBKO_RUNNER_GEN"] = str(int(res["gen"]))
+            if isinstance(res, dict):
+                spawn_gen = _runner_generation(res.get("gen"), minimum=1)
+                if spawn_gen is None:
+                    msg = "managed-agent runner generation is malformed"
+                    raise ValueError(msg)
+                env["LUBKO_RUNNER_GEN"] = str(spawn_gen)
     subprocess.Popen(
         [sys.executable, str(script), "_runner", aid, mode],
         stdin=subprocess.DEVNULL,
