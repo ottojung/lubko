@@ -460,3 +460,66 @@ def test_health_file_reader_rejects_out_of_domain_metric(tmp_path: Path) -> None
     path = tmp_path / "health.json"
     path.write_text(json.dumps(data), encoding="utf-8")
     assert health_module._read_health_file(path) is None
+
+
+def test_canonical_worker_health_round_trips() -> None:
+    """Canonical writer output preserves every health field."""
+    snapshot = _snapshot()
+    assert WorkerHealth.from_dict(snapshot.to_dict()) == snapshot
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "scan_batch_limit",
+        "gc_batch_limit",
+        "cancellation_batch_limit",
+        "recovery_batch_limit",
+    ],
+)
+def test_required_batch_limits_reject_absence(field: str) -> None:
+    """Required positive configuration cannot disappear into an invalid zero."""
+    data = _snapshot().to_dict()
+    del data[field]
+    with pytest.raises(TypeError, match=field):
+        WorkerHealth.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "active_jobs",
+        "stopping_jobs",
+        "completed_jobs",
+        "db_deadline_breach_count",
+        "capture_streams_open",
+        "spool_held_bytes",
+        "last_scan_batch_size",
+    ],
+)
+def test_legacy_optional_counts_default_absence_to_zero(field: str) -> None:
+    """Backward-compatible count fields deliberately retain zero-on-absence semantics."""
+    data = _snapshot().to_dict()
+    del data[field]
+    parsed = WorkerHealth.from_dict(data)
+    assert getattr(parsed, field) == 0
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "scan_batch_limit",
+        "gc_batch_limit",
+        "cancellation_batch_limit",
+        "recovery_batch_limit",
+    ],
+)
+def test_health_file_reader_rejects_missing_required_batch_limit(
+    tmp_path: Path, field: str
+) -> None:
+    """Persisted health files fail closed when required configuration is truncated."""
+    data = _snapshot().to_dict()
+    del data[field]
+    path = tmp_path / "health.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert health_module._read_health_file(path) is None

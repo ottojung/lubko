@@ -341,9 +341,13 @@ class WorkerHealth:
                 data.get("db_connected_at"), "db_connected_at", minimum=0.0
             ),
             db_error_at=_optional_finite_float(data.get("db_error_at"), "db_error_at", minimum=0.0),
-            active_jobs=_coerce_int(data.get("active_jobs"), "active_jobs", minimum=0),
-            stopping_jobs=_coerce_int(data.get("stopping_jobs"), "stopping_jobs", minimum=0),
-            completed_jobs=_coerce_int(data.get("completed_jobs"), "completed_jobs", minimum=0),
+            active_jobs=_optional_json_int_zero(data.get("active_jobs"), "active_jobs", minimum=0),
+            stopping_jobs=_optional_json_int_zero(
+                data.get("stopping_jobs"), "stopping_jobs", minimum=0
+            ),
+            completed_jobs=_optional_json_int_zero(
+                data.get("completed_jobs"), "completed_jobs", minimum=0
+            ),
             oldest_active_job_age_seconds=_optional_finite_float(
                 data.get("oldest_active_job_age_seconds"),
                 "oldest_active_job_age_seconds",
@@ -366,19 +370,19 @@ class WorkerHealth:
             db_deadline_breached_at=_optional_finite_float(
                 data.get("db_deadline_breached_at"), "db_deadline_breached_at", minimum=0.0
             ),
-            db_deadline_breach_count=_coerce_int(
+            db_deadline_breach_count=_optional_json_int_zero(
                 data.get("db_deadline_breach_count"), "db_deadline_breach_count", minimum=0
             ),
-            capture_streams_open=_coerce_int(
+            capture_streams_open=_optional_json_int_zero(
                 data.get("capture_streams_open"), "capture_streams_open", minimum=0
             ),
-            spool_held_bytes=_coerce_int(
+            spool_held_bytes=_optional_json_int_zero(
                 data.get("spool_held_bytes"), "spool_held_bytes", minimum=0
             ),
-            scan_batch_limit=_coerce_int(
+            scan_batch_limit=_required_json_int(
                 data.get("scan_batch_limit"), "scan_batch_limit", minimum=1
             ),
-            last_scan_batch_size=_coerce_int(
+            last_scan_batch_size=_optional_json_int_zero(
                 data.get("last_scan_batch_size"), "last_scan_batch_size", minimum=0
             ),
             last_cancellation_scan_at=_optional_finite_float(
@@ -391,13 +395,15 @@ class WorkerHealth:
             cancellation_scan_overdue=_strict_bool(data, "cancellation_scan_overdue"),
             recovery_overdue=_strict_bool(data, "recovery_overdue"),
             gc_overdue=_strict_bool(data, "gc_overdue"),
-            gc_batch_limit=_coerce_int(data.get("gc_batch_limit"), "gc_batch_limit", minimum=1),
+            gc_batch_limit=_required_json_int(
+                data.get("gc_batch_limit"), "gc_batch_limit", minimum=1
+            ),
             gc_batch_bound_hit=_strict_bool(data, "gc_batch_bound_hit"),
-            cancellation_batch_limit=_coerce_int(
+            cancellation_batch_limit=_required_json_int(
                 data.get("cancellation_batch_limit"), "cancellation_batch_limit", minimum=1
             ),
             cancellation_batch_bound_hit=_strict_bool(data, "cancellation_batch_bound_hit"),
-            recovery_batch_limit=_coerce_int(
+            recovery_batch_limit=_required_json_int(
                 data.get("recovery_batch_limit"), "recovery_batch_limit", minimum=1
             ),
             recovery_batch_bound_hit=_strict_bool(data, "recovery_batch_bound_hit"),
@@ -442,8 +448,8 @@ def _coerce_float(value: object, field: str) -> float | None:
     return float(value)
 
 
-def _coerce_int(value: object, field: str, *, minimum: int | None = None) -> int:
-    """Require a JSON integer while preserving absent-field defaults.
+def _optional_json_int_zero(value: object, field: str, *, minimum: int | None = None) -> int:
+    """Parse a backward-compatible optional JSON integer, defaulting absence to zero.
 
     Args:
         value: Raw JSON value.
