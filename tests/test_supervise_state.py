@@ -563,3 +563,43 @@ def test_corrupted_boot_identity_never_erases_active_backoff(
     daemon.reconcile(0.0)
     assert daemon._message is not None
     assert "malformed" in daemon._message
+
+
+@pytest.mark.parametrize("token", ["", "bad token", "a/b", ".", "..", "bad.token"])
+def test_invalid_incarnation_tokens_make_persisted_worker_records_malformed(
+    state_path: Path, token: str
+) -> None:
+    """Persisted lifecycle records share the canonical incarnation-token domain."""
+    child = {
+        "pid": 42,
+        "pgid": 42,
+        "sid": 42,
+        "start_time_ticks": 7,
+        "token": token,
+        "worker_id": "worker",
+        "spawned_at": 1.0,
+    }
+    write_raw_state(state_path, child=child)
+    state = supervise.read_state()
+    assert state.child is None
+    assert state.ownership_hold_malformed is True
+
+    with pytest.raises(ValueError, match="unresolved child hold is malformed"):
+        supervise.UnresolvedChild.from_dict({
+            "pid": 42,
+            "start_time_ticks": 7,
+            "token": token,
+            "spawned_at": 1.0,
+        })
+    with pytest.raises(ValueError, match="spawning obligation is malformed"):
+        supervise.SpawningObligation.from_dict({
+            "token": token,
+            "commit": COMMIT,
+            "creator_pid": 11,
+            "creator_start_time_ticks": 12,
+            "pid": None,
+            "start_time_ticks": None,
+            "created_at": 1.0,
+            "boot_id": None,
+            "parent_death_signal": True,
+        })

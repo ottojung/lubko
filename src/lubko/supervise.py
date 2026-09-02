@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Final
 from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
+from lubko.health import validate_incarnation_token
 from lubko.state import rollback_state_path, state_root
 
 if TYPE_CHECKING:
@@ -264,7 +265,7 @@ class UnresolvedChild:
             ValueError: If a required field is missing or malformed.
         """
         pid = _strict_non_negative_int(data.get("pid"))
-        token = _optional_string(data.get("token"))
+        token = _optional_incarnation_token(data.get("token"))
         ticks_raw = data.get("start_time_ticks")
         ticks = None if ticks_raw is None else _strict_non_negative_int(ticks_raw)
         if pid is None or token is None or (ticks_raw is not None and ticks is None):
@@ -361,7 +362,7 @@ class SpawningObligation:
         Raises:
             ValueError: If a required field is missing or malformed.
         """
-        token = _optional_string(data.get("token"))
+        token = _optional_incarnation_token(data.get("token"))
         creator_pid = _strict_non_negative_int(data.get("creator_pid"))
         creator_ticks = _strict_non_negative_int(data.get("creator_start_time_ticks"))
         if token is None or creator_pid is None or creator_ticks is None:
@@ -1989,6 +1990,18 @@ def _optional_string(value: object | None) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _optional_incarnation_token(value: object | None) -> str | None:
+    """Return a canonical filename-safe incarnation token or ``None``."""
+    token = _optional_string(value)
+    if token is None:
+        return None
+    try:
+        validate_incarnation_token(token)
+    except ValueError:
+        return None
+    return token
+
+
 def _optional_int(value: object | None) -> int | None:
     """Return an integer value or ``None``.
 
@@ -2543,7 +2556,7 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
     pgid = _strict_non_negative_int(data.get("pgid"))
     sid = _strict_non_negative_int(data.get("sid"))
     ticks = _strict_non_negative_int(data.get("start_time_ticks"))
-    token = _optional_string(data.get("token"))
+    token = _optional_incarnation_token(data.get("token"))
     worker_id = _optional_string(data.get("worker_id"))
     if pid is None or pgid is None or sid is None or ticks is None:
         msg = "supervisor worker child identity is malformed"
