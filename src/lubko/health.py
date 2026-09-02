@@ -337,20 +337,24 @@ class WorkerHealth:
             db_connected=_strict_bool(data, "db_connected"),
             db_connected_at=_optional_finite_float(data.get("db_connected_at"), "db_connected_at"),
             db_error_at=_optional_finite_float(data.get("db_error_at"), "db_error_at"),
-            active_jobs=_coerce_int(data.get("active_jobs"), "active_jobs"),
-            stopping_jobs=_coerce_int(data.get("stopping_jobs"), "stopping_jobs"),
-            completed_jobs=_coerce_int(data.get("completed_jobs"), "completed_jobs"),
+            active_jobs=_coerce_int(data.get("active_jobs"), "active_jobs", minimum=0),
+            stopping_jobs=_coerce_int(data.get("stopping_jobs"), "stopping_jobs", minimum=0),
+            completed_jobs=_coerce_int(data.get("completed_jobs"), "completed_jobs", minimum=0),
             oldest_active_job_age_seconds=_optional_finite_float(
-                data.get("oldest_active_job_age_seconds"), "oldest_active_job_age_seconds"
+                data.get("oldest_active_job_age_seconds"),
+                "oldest_active_job_age_seconds",
+                minimum=0.0,
             ),
             lease_safety_margin_seconds=_required_finite_float(
-                data.get("lease_safety_margin_seconds"), "lease_safety_margin_seconds"
+                data.get("lease_safety_margin_seconds"), "lease_safety_margin_seconds", minimum=0.0
             ),
             min_lease_safety_remaining_seconds=_optional_finite_float(
                 data.get("min_lease_safety_remaining_seconds"), "min_lease_safety_remaining_seconds"
             ),
             db_operation_deadline_seconds=_required_finite_float(
-                data.get("db_operation_deadline_seconds"), "db_operation_deadline_seconds"
+                data.get("db_operation_deadline_seconds"),
+                "db_operation_deadline_seconds",
+                minimum_exclusive=0.0,
             ),
             db_last_activity_at=_optional_finite_float(
                 data.get("db_last_activity_at"), "db_last_activity_at"
@@ -359,15 +363,19 @@ class WorkerHealth:
                 data.get("db_deadline_breached_at"), "db_deadline_breached_at"
             ),
             db_deadline_breach_count=_coerce_int(
-                data.get("db_deadline_breach_count"), "db_deadline_breach_count"
+                data.get("db_deadline_breach_count"), "db_deadline_breach_count", minimum=0
             ),
             capture_streams_open=_coerce_int(
-                data.get("capture_streams_open"), "capture_streams_open"
+                data.get("capture_streams_open"), "capture_streams_open", minimum=0
             ),
-            spool_held_bytes=_coerce_int(data.get("spool_held_bytes"), "spool_held_bytes"),
-            scan_batch_limit=_coerce_int(data.get("scan_batch_limit"), "scan_batch_limit"),
+            spool_held_bytes=_coerce_int(
+                data.get("spool_held_bytes"), "spool_held_bytes", minimum=0
+            ),
+            scan_batch_limit=_coerce_int(
+                data.get("scan_batch_limit"), "scan_batch_limit", minimum=1
+            ),
             last_scan_batch_size=_coerce_int(
-                data.get("last_scan_batch_size"), "last_scan_batch_size"
+                data.get("last_scan_batch_size"), "last_scan_batch_size", minimum=0
             ),
             last_cancellation_scan_at=_optional_finite_float(
                 data.get("last_cancellation_scan_at"), "last_cancellation_scan_at"
@@ -379,14 +387,14 @@ class WorkerHealth:
             cancellation_scan_overdue=_strict_bool(data, "cancellation_scan_overdue"),
             recovery_overdue=_strict_bool(data, "recovery_overdue"),
             gc_overdue=_strict_bool(data, "gc_overdue"),
-            gc_batch_limit=_coerce_int(data.get("gc_batch_limit"), "gc_batch_limit"),
+            gc_batch_limit=_coerce_int(data.get("gc_batch_limit"), "gc_batch_limit", minimum=1),
             gc_batch_bound_hit=_strict_bool(data, "gc_batch_bound_hit"),
             cancellation_batch_limit=_coerce_int(
-                data.get("cancellation_batch_limit"), "cancellation_batch_limit"
+                data.get("cancellation_batch_limit"), "cancellation_batch_limit", minimum=1
             ),
             cancellation_batch_bound_hit=_strict_bool(data, "cancellation_batch_bound_hit"),
             recovery_batch_limit=_coerce_int(
-                data.get("recovery_batch_limit"), "recovery_batch_limit"
+                data.get("recovery_batch_limit"), "recovery_batch_limit", minimum=1
             ),
             recovery_batch_bound_hit=_strict_bool(data, "recovery_batch_bound_hit"),
             shutting_down=_strict_bool(data, "shutting_down"),
@@ -430,24 +438,29 @@ def _coerce_float(value: object, field: str) -> float | None:
     return float(value)
 
 
-def _coerce_int(value: object, field: str) -> int:
+def _coerce_int(value: object, field: str, *, minimum: int | None = None) -> int:
     """Require a JSON integer while preserving absent-field defaults.
 
     Args:
         value: Raw JSON value.
         field: Field name for error reporting.
+        minimum: Smallest allowed present integer, when constrained.
 
     Returns:
         The int (``0`` when absent).
 
     Raises:
         TypeError: If the value is present but is not a JSON integer.
+        ValueError: If a present integer is below ``minimum``.
     """
     if value is None:
         return 0
     if isinstance(value, bool) or not isinstance(value, int):
         msg = f"{field} must be an integer, got {value!r}"
         raise TypeError(msg)
+    if minimum is not None and value < minimum:
+        msg = f"{field} must be >= {minimum}, got {value!r}"
+        raise ValueError(msg)
     return value
 
 
@@ -494,12 +507,20 @@ def _strict_bool(data: dict[str, Any], field: str) -> bool:
     return value
 
 
-def _required_finite_float(value: object, field: str) -> float:
+def _required_finite_float(
+    value: object,
+    field: str,
+    *,
+    minimum: float | None = None,
+    minimum_exclusive: float | None = None,
+) -> float:
     """Coerce a required persisted timestamp, rejecting non-finite values.
 
     Args:
         value: Raw JSON value.
         field: Field name for error reporting.
+        minimum: Inclusive lower bound for a present finite number.
+        minimum_exclusive: Exclusive lower bound for a present finite number.
 
     Returns:
         The coerced finite float (``0.0`` when absent).
@@ -513,10 +534,18 @@ def _required_finite_float(value: object, field: str) -> float:
     if result is None or not math.isfinite(result):
         msg = f"{field} must be a finite timestamp, got {value!r}"
         raise ValueError(msg)
+    if minimum is not None and result < minimum:
+        msg = f"{field} must be >= {minimum}, got {value!r}"
+        raise ValueError(msg)
+    if minimum_exclusive is not None and result <= minimum_exclusive:
+        msg = f"{field} must be > {minimum_exclusive}, got {value!r}"
+        raise ValueError(msg)
     return result
 
 
-def _optional_finite_float(value: object, field: str) -> float | None:
+def _optional_finite_float(
+    value: object, field: str, *, minimum: float | None = None
+) -> float | None:
     """Coerce an optional persisted timestamp to a finite float or None.
 
     Non-finite values are rejected rather than silently accepted so
@@ -525,6 +554,7 @@ def _optional_finite_float(value: object, field: str) -> float | None:
     Args:
         value: Raw JSON value.
         field: Field name for error reporting.
+        minimum: Inclusive lower bound for a present finite number.
 
     Returns:
         The finite float, or ``None``.
@@ -535,6 +565,9 @@ def _optional_finite_float(value: object, field: str) -> float | None:
     result = _coerce_float(value, field)
     if result is not None and not math.isfinite(result):
         msg = f"timestamp must be finite, got {value!r}"
+        raise ValueError(msg)
+    if result is not None and minimum is not None and result < minimum:
+        msg = f"{field} must be >= {minimum}, got {value!r}"
         raise ValueError(msg)
     return result
 
