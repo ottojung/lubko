@@ -182,7 +182,7 @@ class SupervisorDesired:
             msg = "supervisor desired state is malformed"
             raise ValueError(msg)
         if "requested_at" in data:
-            requested_at = _strict_finite_float(data["requested_at"])
+            requested_at = _strict_non_negative_finite_float(data["requested_at"])
             if requested_at is None:
                 msg = "supervisor desired state is malformed"
                 raise ValueError(msg)
@@ -271,7 +271,7 @@ class UnresolvedChild:
             msg = "unresolved child hold is malformed"
             raise ValueError(msg)
         if "spawned_at" in data:
-            spawned_at = _strict_finite_float(data["spawned_at"])
+            spawned_at = _strict_non_negative_finite_float(data["spawned_at"])
             if spawned_at is None:
                 msg = "unresolved child hold is malformed"
                 raise ValueError(msg)
@@ -382,7 +382,7 @@ class SpawningObligation:
             msg = "spawning obligation is malformed"
             raise ValueError(msg)
         if "created_at" in data:
-            created_at = _strict_finite_float(data["created_at"])
+            created_at = _strict_non_negative_finite_float(data["created_at"])
             if created_at is None:
                 msg = "spawning obligation is malformed"
                 raise ValueError(msg)
@@ -2060,6 +2060,14 @@ def _strict_finite_float(value: object) -> float | None:
     return result
 
 
+def _strict_non_negative_finite_float(value: object) -> float | None:
+    """Return a non-negative finite JSON number, or ``None`` when malformed."""
+    result = _strict_finite_float(value)
+    if result is None or result < 0:
+        return None
+    return result
+
+
 def _optional_float(value: object | None) -> float | None:
     """Return a float value or ``None``.
 
@@ -2530,7 +2538,7 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
         msg = "supervisor worker child identity is malformed"
         raise ValueError(msg)
     if "spawned_at" in data:
-        spawned_at = _strict_finite_float(data["spawned_at"])
+        spawned_at = _strict_non_negative_finite_float(data["spawned_at"])
         if spawned_at is None:
             msg = "supervisor worker child identity is malformed"
             raise ValueError(msg)
