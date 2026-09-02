@@ -552,21 +552,23 @@ class SupervisorState:
             # written by an unknown prior boot and erase an active
             # crash-loop backoff deadline. Enter the durable hold.
             ownership_hold_malformed = True
+
         return cls(
             schema_version=SCHEMA_VERSION,
             applied_generation=generation or 0,
-            mode=_optional_string(data.get("mode")) or MODE_IDLE,
-            commit=_optional_string(data.get("commit")),
+            mode=_state_mode(data),
+            commit=_state_commit(data),
             child=child,
             unresolved_child=unresolved,
             ownership_hold_malformed=ownership_hold_malformed
+            or _state_strings_malformed(data)
             or _strict_safety_hold(data, "ownership_hold_malformed"),
             unresolved_hold_malformed=unresolved_hold_malformed
             or _strict_safety_hold(data, "unresolved_hold_malformed"),
             spawning=spawning,
             spawning_hold_malformed=spawning_hold_malformed
             or _strict_safety_hold(data, "spawning_hold_malformed"),
-            intent=_optional_string(data.get("intent")) or INTENT_RUN,
+            intent=_state_intent(data),
             restart_count=restart_count or 0,
             next_attempt_at=next_attempt_at,
             last_exit=_parse_last_exit(data),
@@ -1976,6 +1978,48 @@ def supervisor_running() -> bool:
 # ---------------------------------------------------------------------------
 # Optional value coercion
 # ---------------------------------------------------------------------------
+
+
+def _state_mode(data: dict[str, object]) -> str:
+    """Return canonical mode while leaving malformed presence to the hold."""
+    value = data.get("mode", MODE_IDLE)
+    return value if isinstance(value, str) and value in {MODE_IDLE, MODE_RUN} else MODE_IDLE
+
+
+def _state_intent(data: dict[str, object]) -> str:
+    """Return canonical intent while leaving malformed presence to the hold."""
+    value = data.get("intent", INTENT_RUN)
+    return (
+        value if isinstance(value, str) and value in {INTENT_RUN, INTENT_RETIRING} else INTENT_RUN
+    )
+
+
+def _state_commit(data: dict[str, object]) -> str | None:
+    """Preserve nullable commit semantics without coercing malformed presence.
+
+    Returns:
+        The persisted commit when it is a string, otherwise ``None``.
+    """
+    value = data.get("commit")
+    return value if isinstance(value, str) else None
+
+
+def _state_strings_malformed(data: dict[str, object]) -> bool:
+    """Check whether persisted lifecycle strings are trustworthy authority.
+
+    Returns:
+        True when any present mode, intent, or commit value is malformed.
+    """
+    mode = data.get("mode", MODE_IDLE)
+    intent = data.get("intent", INTENT_RUN)
+    commit = data.get("commit")
+    return (
+        not isinstance(mode, str)
+        or mode not in {MODE_IDLE, MODE_RUN}
+        or not isinstance(intent, str)
+        or intent not in {INTENT_RUN, INTENT_RETIRING}
+        or (commit is not None and not isinstance(commit, str))
+    )
 
 
 def _optional_string(value: object | None) -> str | None:

@@ -603,3 +603,79 @@ def test_invalid_incarnation_tokens_make_persisted_worker_records_malformed(
             "boot_id": None,
             "parent_death_signal": True,
         })
+
+
+@pytest.mark.parametrize("field", ["mode", "intent"])
+@pytest.mark.parametrize("raw", [123, True, 1.5, [], {}, None])
+def test_present_malformed_state_enum_enters_durable_hold(
+    field: str,
+    raw: object,
+) -> None:
+    """Malformed present mode/intent never becomes healthy default authority."""
+    data = supervise.fresh_state().to_dict()
+    data[field] = raw
+
+    state = supervise.SupervisorState.from_dict(data)
+
+    assert state.ownership_hold_malformed is True
+
+
+@pytest.mark.parametrize(
+    ("field", "raw"),
+    [
+        ("mode", "unsupported"),
+        ("intent", "unsupported"),
+    ],
+)
+def test_unsupported_state_enum_enters_durable_hold(field: str, raw: object) -> None:
+    """Unsupported mode/intent strings fail closed instead of becoming defaults."""
+    data = supervise.fresh_state().to_dict()
+    data[field] = raw
+
+    state = supervise.SupervisorState.from_dict(data)
+
+    assert state.ownership_hold_malformed is True
+
+
+@pytest.mark.parametrize("raw", [123, True, 1.5, [], {}])
+def test_present_malformed_commit_enters_durable_hold(raw: object) -> None:
+    """Malformed present commit cannot silently degrade to ordinary absence."""
+    data = supervise.fresh_state().to_dict()
+    data["commit"] = raw
+
+    state = supervise.SupervisorState.from_dict(data)
+
+    assert state.commit is None
+    assert state.ownership_hold_malformed is True
+
+
+def test_state_string_absence_and_commit_null_remain_compatible() -> None:
+    """Documented absence defaults and nullable commit retain healthy semantics."""
+    data = supervise.fresh_state().to_dict()
+    data.pop("mode")
+    data.pop("intent")
+    data["commit"] = None
+
+    state = supervise.SupervisorState.from_dict(data)
+
+    assert state.mode == supervise.MODE_IDLE
+    assert state.intent == supervise.INTENT_RUN
+    assert state.commit is None
+    assert state.ownership_hold_malformed is False
+
+
+def test_state_string_valid_values_round_trip() -> None:
+    """Canonical lifecycle strings remain exact and healthy."""
+    data = supervise.fresh_state().to_dict()
+    data.update(
+        mode=supervise.MODE_RUN,
+        intent=supervise.INTENT_RETIRING,
+        commit=COMMIT,
+    )
+
+    state = supervise.SupervisorState.from_dict(data)
+
+    assert state.mode == supervise.MODE_RUN
+    assert state.intent == supervise.INTENT_RETIRING
+    assert state.commit == COMMIT
+    assert state.ownership_hold_malformed is False
