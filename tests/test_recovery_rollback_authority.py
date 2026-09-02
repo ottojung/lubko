@@ -9,6 +9,8 @@ import pytest
 from lubko import deployctl, lifecycle
 from lubko.state import rollback_state_path
 
+_MISSING = object()
+
 
 def _stopped_meta() -> dict[str, object]:
     return lifecycle.WorkerMeta(
@@ -57,6 +59,38 @@ def test_malformed_nested_worker_authority_blocks_repair(field: str) -> None:
         "previous_meta": _stopped_meta(),
     }
     data[field] = {"schema_version": "1"}
+    _write(data)
+    before = rollback_state_path().read_text(encoding="utf-8")
+
+    with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
+        lifecycle._repair_rollback_state(222)
+
+    assert rollback_state_path().read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    "deadline",
+    [
+        _MISSING,
+        None,
+        False,
+        "1",
+        -1,
+        float("nan"),
+        float("inf"),
+        [],
+        {},
+    ],
+)
+def test_malformed_rollback_deadline_blocks_repair(deadline: object) -> None:
+    """Malformed rollback deadlines remain durable and block repair."""
+    data: dict[str, object] = {
+        "status": lifecycle.STATE_PENDING,
+        "new_meta": _stopped_meta(),
+        "previous_meta": _stopped_meta(),
+    }
+    if deadline is not _MISSING:
+        data["deadline"] = deadline
     _write(data)
     before = rollback_state_path().read_text(encoding="utf-8")
 

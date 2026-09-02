@@ -2373,14 +2373,14 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
     try:
         new_meta = WorkerMeta.from_dict(data.get("new_meta") or {})
         previous_meta = WorkerMeta.from_dict(data.get("previous_meta") or {})
+        deadline = _meta_optional_finite_float(data, "deadline")
     except (KeyError, TypeError, ValueError) as exc:
         msg = "rollback state is present but malformed; repair refuses to erase authority"
         raise _AdoptionError(msg) from exc
-    if (
-        data.get("status") == STATE_PENDING
-        and worker_alive(new_meta)
-        and (data.get("deadline", 0.0) > time.time())
-    ):
+    if deadline is None:
+        msg = "rollback state is present but malformed; repair refuses to erase authority"
+        raise _AdoptionError(msg)
+    if data.get("status") == STATE_PENDING and worker_alive(new_meta) and deadline > time.time():
         msg = "another supervised deployment is still pending confirmation"
         raise _AdoptionError(msg)
     if worker_alive(new_meta) and new_meta.pid != recovery_worker_pid:
