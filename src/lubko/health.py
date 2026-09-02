@@ -331,8 +331,10 @@ class WorkerHealth:
             start_time_ticks=_required_json_int(
                 data.get("start_time_ticks"), "start_time_ticks", minimum=1
             ),
-            started_at=_required_finite_float(data.get("started_at"), "started_at"),
-            published_at=_required_finite_float(data.get("published_at"), "published_at"),
+            started_at=_required_finite_float(data.get("started_at"), "started_at", minimum=0.0),
+            published_at=_required_finite_float(
+                data.get("published_at"), "published_at", minimum=0.0
+            ),
             alive=_strict_bool(data, "alive"),
             db_connected=_strict_bool(data, "db_connected"),
             db_connected_at=_optional_finite_float(data.get("db_connected_at"), "db_connected_at"),
@@ -914,6 +916,13 @@ def interpret_worker_health(
             reason="non-finite published_at in snapshot",
         )
     now = time.time()
+    if snapshot.published_at > now:
+        return EffectiveHealth(
+            snapshot=snapshot,
+            live=False,
+            stale=True,
+            reason="published_at in snapshot is in the future",
+        )
     age = now - snapshot.published_at
     pid = snapshot.pid
     reason = "ok"

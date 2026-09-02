@@ -126,6 +126,27 @@ def test_zero_staleness_cannot_be_bypassed_by_nan() -> None:
     assert effective.stale is True
 
 
+def test_future_published_at_cannot_bypass_staleness() -> None:
+    """A future-dated snapshot never becomes positive liveness authority."""
+    pid = os.getpid()
+    ticks = proc_start_ticks(pid)
+    assert ticks is not None
+    snapshot = _snapshot(pid=pid, start_time_ticks=ticks, published_at=time.time() + 60.0)
+    effective = interpret_worker_health(snapshot, max_staleness_seconds=0.0)
+    assert effective.live is False
+    assert effective.stale is True
+    assert "future" in effective.reason
+
+
+@pytest.mark.parametrize("field", ["started_at", "published_at"])
+def test_negative_required_wall_clock_timestamps_fail_closed(field: str) -> None:
+    """Persisted wall-clock timestamps stay inside the writer domain."""
+    data = _snapshot().to_dict()
+    data[field] = -1.0
+    with pytest.raises(ValueError, match=field):
+        WorkerHealth.from_dict(data)
+
+
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
 def test_health_serialization_never_emits_non_finite_values(bad: float) -> None:
     """Serialized health/status payloads stay strict-JSON-safe."""
