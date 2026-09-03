@@ -64,7 +64,14 @@ def test_gc_timestamp_authority_accepts_only_canonical_worker_shape() -> None:
     assert _canonical("2026-09-01T20:30:40.123456Z")
     assert _canonical("2099-12-31T23:59:59.000000Z")
 
+    assert _canonical("2024-02-29T00:00:00.000000Z")
+
     malformed: tuple[object, ...] = (
+        "2026-02-29T20:30:40.123456Z",
+        "2025-02-29T20:30:40.123456Z",
+        "2026-02-30T20:30:40.123456Z",
+        "2026-02-31T20:30:40.123456Z",
+        "2026-04-31T20:30:40.123456Z",
         0,
         False,
         None,
