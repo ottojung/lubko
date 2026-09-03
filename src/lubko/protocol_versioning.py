@@ -263,44 +263,37 @@ def classify_job_version(version: int, supported: ProtocolVersionRange) -> JobVe
     return JobVersionDisposition.FAIL_CLOSED
 
 
-#: The highest protocol version any running build of this code can parse and
-#: execute. A daemon running the newest build therefore knows the ceiling of
-#: every version the fleet could possibly serve.
+#: The highest protocol version this particular build can parse and execute.
+#: This is deliberately local build metadata, never proof of what every daemon
+#: in a staggered fleet can serve. In particular, an older binary cannot infer
+#: that a version above this ceiling is globally unsupported.
 _MAX_SUPPORTED_VERSION: Final = max(SUPPORTED_PROTOCOL_VERSIONS)
 
 
 def reaper_disposition(version: int, supported: ProtocolVersionRange) -> JobVersionDisposition:
-    """Decide whether the fleet-wide reaper may fail closed a pending job.
+    """Decide whether the reaper may fail closed a pending job.
 
-    A single daemon cannot see the whole fleet's window, so the reaper must be
-    conservative: it may only fail closed a pending job that *no* running daemon
-    could ever execute.
+    A single daemon cannot see the whole fleet's version capabilities, so the
+    reaper must be conservative about newer generations. A compile-time ceiling
+    such as :data:`_MAX_SUPPORTED_VERSION` only describes this binary; during a
+    staggered binary upgrade another daemon may already run a newer build.
 
-    * A version below the window's ``min`` is a retired generation: no current
-      daemon serves it, so it is safe to fail closed on any daemon.
-    * A version above the window's ``max`` is a newer generation. A daemon whose
-      own ``max`` already equals the newest version this build knows
-      (``_MAX_SUPPORTED_VERSION``) knows nothing newer can serve it, so it may
-      fail the job closed. A daemon still running an older build (``max`` below
-      the fleet ceiling) must leave the job alone: a newer daemon exists that can
-      execute it, and failing it would destroy otherwise-runnable work during a
-      staggered upgrade.
+    * A version below the window's ``min`` is treated as a retired generation
+      under the deployment contract and may be failed closed.
+    * A version above the window's ``max`` is left pending. Future-version
+      terminalization requires explicit fleet-wide authority; local build
+      knowledge is insufficient to destroy the row.
 
     Args:
         version: The pending job's protocol version.
         supported: This daemon's supported window.
 
     Returns:
-        :attr:`JobVersionDisposition.FAIL_CLOSED` only when no daemon in the
-        fleet could serve ``version``, otherwise
-        :attr:`JobVersionDisposition.CLAIMABLE`.
+        :attr:`JobVersionDisposition.FAIL_CLOSED` for retired lower versions,
+        otherwise :attr:`JobVersionDisposition.CLAIMABLE`.
     """
     if version < supported.min:
         return JobVersionDisposition.FAIL_CLOSED
-    if version > supported.max:
-        if supported.max >= _MAX_SUPPORTED_VERSION:
-            return JobVersionDisposition.FAIL_CLOSED
-        return JobVersionDisposition.CLAIMABLE
     return JobVersionDisposition.CLAIMABLE
 
 

@@ -12,11 +12,12 @@ All tests run without a database.
 import json
 import re
 from pathlib import Path
+from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 
-from lubko import worker
+from lubko import protocol_versioning, worker
 from lubko.config import load_worker_protocol_range
 from lubko.protocol import (
     OUTPUT_CHUNK_MAX_BYTES,
@@ -228,26 +229,48 @@ def test_claim_predicate_admits_the_widened_window() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_reaper_fails_closed_only_unservable_versions() -> None:
-    """The reaper never destroys a job some daemon could still execute.
-
-    A v5 job during a [4, 5] rollout is left for the [4, 5] daemons even while
-    an older [4, 4] daemon is still running, but a v6 job (above the newest
-    version any build serves) is failed closed by the newest [4, 5] daemon.
-    """
+def test_reaper_fails_closed_only_retired_versions() -> None:
+    """The reaper never destroys a job a newer binary may understand."""
     old_daemon = ProtocolVersionRange(min=4, max=4)
     new_daemon = ProtocolVersionRange(min=4, max=5)
 
-    # v4 and v5 are always claimable by a daemon that supports them.
     assert reaper_disposition(4, old_daemon) is JobVersionDisposition.CLAIMABLE
     assert reaper_disposition(5, new_daemon) is JobVersionDisposition.CLAIMABLE
-    # A v5 job is NOT reaped by an older [4, 4] daemon: a [4, 5] daemon exists.
     assert reaper_disposition(5, old_daemon) is JobVersionDisposition.CLAIMABLE
-    # A retired v3 job is failed closed on any daemon.
     assert reaper_disposition(3, old_daemon) is JobVersionDisposition.FAIL_CLOSED
-    # A future v6 job is failed closed only by the newest build ([4, 5]).
-    assert reaper_disposition(6, new_daemon) is JobVersionDisposition.FAIL_CLOSED
+    assert reaper_disposition(6, new_daemon) is JobVersionDisposition.CLAIMABLE
     assert reaper_disposition(6, old_daemon) is JobVersionDisposition.CLAIMABLE
+
+
+def test_reaper_is_conservative_across_binary_build_ceilings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local build ceiling never becomes destructive fleet authority."""
+    old_window = ProtocolVersionRange(min=4, max=4)
+    for build_ceiling, future_version in ((4, 5), (5, 6)):
+        monkeypatch.setattr(protocol_versioning, "_MAX_SUPPORTED_VERSION", build_ceiling)
+        assert reaper_disposition(future_version, old_window) is JobVersionDisposition.CLAIMABLE
+
+
+def test_worker_reaper_leaves_future_versions_for_newer_binaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker-level reaper never terminalizes locally unknown future work."""
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.transaction.return_value.__enter__.return_value = None
+    conn.cursor.return_value.__enter__.return_value = cursor
+    fail_unsupported_job = MagicMock(return_value=True)
+    monkeypatch.setattr(worker, "fail_unsupported_job", fail_unsupported_job)
+
+    old_window = ProtocolVersionRange(min=4, max=4)
+    settings = _settings(old_window)
+    for build_ceiling, future_version in ((4, 5), (5, 6)):
+        monkeypatch.setattr(protocol_versioning, "_MAX_SUPPORTED_VERSION", build_ceiling)
+        cursor.fetchall.return_value = [(UUID(int=future_version), future_version)]
+        assert worker.reap_unsupported_jobs(conn, settings, limit=10) == []
+
+    fail_unsupported_job.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
