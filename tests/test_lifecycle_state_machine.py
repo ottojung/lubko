@@ -151,9 +151,9 @@ def test_mutation_blocker_corrupt_fails_closed(monkeypatch: pytest.MonkeyPatch) 
 def _patch_sources(monkeypatch: pytest.MonkeyPatch, scenario: _Scenario) -> None:
     """Install synthetic durable sources for :func:`current_phase`."""
     if scenario.meta is None:
-        monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+        monkeypatch.setattr(lifecycle, "read_meta_strict", lambda: None)
     else:
-        monkeypatch.setattr(lifecycle, "read_meta", lambda: scenario.meta)
+        monkeypatch.setattr(lifecycle, "read_meta_strict", lambda: scenario.meta)
     monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: scenario.meta_alive)
     if scenario.mission_error:
         monkeypatch.setattr(
