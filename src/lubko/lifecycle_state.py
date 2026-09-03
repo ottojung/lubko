@@ -270,7 +270,7 @@ def reconcile_authority_facts() -> AuthorityFacts:
         mission = None
 
     try:
-        desired_intent = supervise.read_desired()
+        desired_intent = supervise.read_desired_strict()
     except Exception:  # ruff: ignore[blind-except] - unreadable desired intent fails closed
         desired_intent = None
         malformed = True

@@ -40,6 +40,7 @@ from lubko.lifecycle_state import (
     INVARIANT_SINGLE_CONSUMER,
     AuthorityFacts,
     AuthorityInvariantError,
+    LifecyclePhase,
     assert_authority_invariants,
     authorize_mission_confirm,
     authorize_mission_publish,
@@ -49,6 +50,7 @@ from lubko.lifecycle_state import (
     authorize_spawn,
     check_authority_invariants,
     current_phase,
+    phase_from_facts,
     reconcile_authority_facts,
 )
 
@@ -382,6 +384,38 @@ def test_unreadable_supervisor_state_holds_spawn_in_runtime(
     assert daemon._spawn_worker(COMMIT) is None
 
 
+def test_malformed_desired_intent_blocks_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Malformed desired authority is not normalized to genuine absence."""
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: (_ for _ in ()).throw(supervise.DesiredIntentError("malformed")),
+    )
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+
+    facts = reconcile_authority_facts()
+
+    assert facts.desired_generation == 0
+    assert facts.durable_malformed is True
+    assert phase_from_facts(facts) is LifecyclePhase.OWNERSHIP_PENDING
+    assert authorize_spawn(facts) is False
+
+
+def test_absent_desired_intent_remains_non_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Genuine desired absence retains the mission/bootstrap generation-zero semantics."""
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: None)
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
+    monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
+
+    facts = reconcile_authority_facts()
+
+    assert facts.desired_generation == 0
+    assert facts.durable_malformed is False
+
+
 def test_desired_generation_read_from_intent(monkeypatch: pytest.MonkeyPatch) -> None:
     """The actual desired generation participates in the monotonic invariant.
 
@@ -390,7 +424,7 @@ def test_desired_generation_read_from_intent(monkeypatch: pytest.MonkeyPatch) ->
     intent is flagged by GENERATION_MONOTONIC.
     """
     intent = SimpleNamespace(generation=7)
-    monkeypatch.setattr(supervise, "read_desired", lambda: intent)
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: intent)
     monkeypatch.setattr(
         supervise,
         "read_state",
