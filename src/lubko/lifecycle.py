@@ -2862,7 +2862,14 @@ def _adoption_candidate(
         msg = "cannot reach PostgreSQL; refusing to adopt the recovery worker"
         raise _AdoptionError(msg)
 
-    previous = read_meta()
+    try:
+        previous = read_meta_strict()
+    except WorkerMetadataError as exc:
+        msg = (
+            "maintained-worker metadata is present but untrustworthy; refusing to adopt a "
+            f"recovery worker until the authority is repaired: {exc}"
+        )
+        raise _AdoptionError(msg) from exc
     if previous is not None and worker_alive(previous) and previous.pid != recovery_worker_pid:
         msg = f"a live maintained worker pid {previous.pid} is already recorded; stop it first"
         raise _AdoptionError(msg)
@@ -3014,7 +3021,13 @@ def _stale_candidate_error(new_meta: WorkerMeta) -> str | None:
             f"recovery worker pid {new_meta.pid} no longer carries the exact "
             "lifecycle token it was validated with; refusing stale metadata"
         )
-    previous = read_meta()
+    try:
+        previous = read_meta_strict()
+    except WorkerMetadataError as exc:
+        return (
+            "maintained-worker metadata became untrustworthy before adoption publication; "
+            f"refusing to overwrite the authority: {exc}"
+        )
     if previous is not None and worker_alive(previous) and previous.pid != new_meta.pid:
         return (
             f"a newer live maintained worker pid {previous.pid} is already recorded; "
