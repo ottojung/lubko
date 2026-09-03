@@ -194,6 +194,8 @@ class AuthorityFacts:
         ownership_hold_malformed: A malformed ownership hold is blocking.
         unresolved_hold_malformed: A malformed unresolved-child hold is blocking.
         spawning_hold_malformed: A malformed spawning obligation is blocking.
+        identity_observation_unknown: A recorded process may still be live but its
+            exact liveness could not be determined; replacement must fail closed.
     """
 
     desired_generation: int
@@ -214,6 +216,7 @@ class AuthorityFacts:
     ownership_hold_malformed: bool
     unresolved_hold_malformed: bool
     spawning_hold_malformed: bool
+    identity_observation_unknown: bool = False
 
     def live_consumers(self) -> int:
         """Return the count of live, authorized queue consumers.
@@ -249,8 +252,8 @@ def reconcile_authority_facts() -> AuthorityFacts:
 
     malformed = False
     owned_pid: int | None = None
-    owned_commit: str | None = None
     owned_proven = False
+    identity_observation_unknown = False
     desired_generation = 0
 
     try:
@@ -260,8 +263,11 @@ def reconcile_authority_facts() -> AuthorityFacts:
         malformed = True
     if meta is not None:
         owned_pid = meta.pid
-        owned_commit = meta.git_commit
         owned_proven = lifecycle.worker_alive(meta)
+        if not owned_proven and meta.state == lifecycle.STATE_RUNNING:
+            identity_observation_unknown = meta.pid is None or not lifecycle.process_absence_proven(
+                meta.pid, meta.start_time_ticks
+            )
 
     try:
         mission = deployctl.read_rollback_state()
@@ -293,6 +299,11 @@ def reconcile_authority_facts() -> AuthorityFacts:
     child = state.child if state is not None else None
     spawning = state.spawning if state is not None else None
     unresolved = state.unresolved_child if state is not None else None
+    child_present = child is not None and supervise.child_alive(child)
+    if child is not None and not child_present:
+        identity_observation_unknown = identity_observation_unknown or not (
+            lifecycle.process_absence_proven(child.pid, child.start_time_ticks)
+        )
     current_child_identity_proven = child is not None and supervise.child_is_our_direct_child(child)
 
     return AuthorityFacts(
@@ -314,18 +325,19 @@ def reconcile_authority_facts() -> AuthorityFacts:
             else None
         ),
         owned_worker_pid=owned_pid,
-        owned_worker_commit=owned_commit,
+        owned_worker_commit=meta.git_commit if meta is not None else None,
         owned_worker_identity_proven=owned_proven,
         pre_spawn_obligation=spawning is not None,
         unresolved_child=unresolved is not None,
         candidate_ready=state.ready if state is not None else False,
         rollback_pending=mission.status == "pending" if mission is not None else False,
         durable_malformed=malformed,
-        supervisor_child_present=child is not None and supervise.child_alive(child),
+        supervisor_child_present=child_present,
         current_child_identity_proven=current_child_identity_proven,
         ownership_hold_malformed=state.ownership_hold_malformed if state is not None else False,
         unresolved_hold_malformed=state.unresolved_hold_malformed if state is not None else False,
         spawning_hold_malformed=state.spawning_hold_malformed if state is not None else False,
+        identity_observation_unknown=identity_observation_unknown,
     )
 
 
@@ -341,6 +353,7 @@ def phase_from_facts(facts: AuthorityFacts) -> LifecyclePhase:
     ordered_phases: tuple[tuple[bool, LifecyclePhase], ...] = (
         (
             facts.durable_malformed
+            or facts.identity_observation_unknown
             or facts.ownership_hold_malformed
             or facts.unresolved_hold_malformed
             or facts.spawning_hold_malformed,
@@ -547,7 +560,7 @@ def authorize_spawn(facts: AuthorityFacts) -> bool:
     Returns:
         ``True`` when a spawn may proceed.
     """
-    if facts.durable_malformed:
+    if facts.durable_malformed or facts.identity_observation_unknown:
         return False
     if facts.pre_spawn_obligation or facts.unresolved_child:
         return False

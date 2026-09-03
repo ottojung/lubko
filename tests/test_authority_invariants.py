@@ -104,6 +104,7 @@ def _facts(**overrides: Any) -> AuthorityFacts:  # ruff: ignore[any-type]
         ownership_hold_malformed=False,
         unresolved_hold_malformed=False,
         spawning_hold_malformed=False,
+        identity_observation_unknown=False,
     )
     return replace(base, **overrides)
 
@@ -349,6 +350,109 @@ def test_unreadable_supervisor_state_blocks_spawn(monkeypatch: pytest.MonkeyPatc
     facts = reconcile_authority_facts()
     assert facts.durable_malformed is True
     assert authorize_spawn(facts) is False
+
+
+def test_unknown_process_identity_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient process-identity read failure must not authorize replacement."""
+    meta = lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=123,
+        pgid=123,
+        sid=123,
+        start_time_ticks=456,
+        token=os.urandom(8).hex(),
+        repo="/r",
+        git_commit=COMMIT,
+        worker_id="w",
+        log_path="/log",
+        started_at=1.0,
+        stopped_at=None,
+    )
+    monkeypatch.setattr(lifecycle, "read_meta_strict", lambda: meta)
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _meta: False)
+    monkeypatch.setattr(lifecycle, "process_absence_proven", lambda _pid, _ticks: False)
+
+    facts = reconcile_authority_facts()
+    assert facts.identity_observation_unknown is True
+    assert phase_from_facts(facts) is LifecyclePhase.OWNERSHIP_PENDING
+    assert authorize_spawn(facts) is False
+
+
+def test_running_meta_without_pid_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Running authority without an observable PID must fail closed."""
+    meta = lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=None,
+        pgid=None,
+        sid=None,
+        start_time_ticks=None,
+        token=None,
+        repo="/r",
+        git_commit=COMMIT,
+        worker_id="w",
+        log_path="/log",
+        started_at=1.0,
+        stopped_at=None,
+    )
+    monkeypatch.setattr(lifecycle, "read_meta_strict", lambda: meta)
+
+    facts = reconcile_authority_facts()
+    assert facts.identity_observation_unknown is True
+    assert authorize_spawn(facts) is False
+
+
+def test_confirmed_dead_process_does_not_create_unknown_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive absence proof keeps the ordinary replacement path available."""
+    meta = lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=123,
+        pgid=123,
+        sid=123,
+        start_time_ticks=456,
+        token=os.urandom(8).hex(),
+        repo="/r",
+        git_commit=COMMIT,
+        worker_id="w",
+        log_path="/log",
+        started_at=1.0,
+        stopped_at=None,
+    )
+    monkeypatch.setattr(lifecycle, "read_meta_strict", lambda: meta)
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _meta: False)
+    monkeypatch.setattr(lifecycle, "process_absence_proven", lambda _pid, _ticks: True)
+
+    facts = reconcile_authority_facts()
+    assert facts.identity_observation_unknown is False
+    assert authorize_spawn(facts) is True
+
+
+def test_runtime_spawn_holds_on_unknown_process_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final supervisor spawn boundary must not reach Popen on unknown liveness."""
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: True)
+    monkeypatch.setattr(cli, "cli_entry_executable", _fake_entry)
+    monkeypatch.setattr(cli, "cli_commit_dir", _fake_commit_dir)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _t: {})
+    monkeypatch.setattr(supervisor, "read_desired", lambda: None)
+    monkeypatch.setattr(supervise, "read_desired", lambda: None)
+    monkeypatch.setattr(
+        lifecycle_state,
+        "reconcile_authority_facts",
+        lambda: _facts(identity_observation_unknown=True),
+    )
+
+    def fail_popen(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    assert daemon._spawn_worker(COMMIT) is None
 
 
 def test_unreadable_meta_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
