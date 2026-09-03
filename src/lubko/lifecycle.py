@@ -625,21 +625,54 @@ def write_meta(meta: WorkerMeta) -> None:
     write_json_durable(meta_path(), meta.to_dict())
 
 
+class WorkerMetadataError(RuntimeError):
+    """Raised when present maintained-worker metadata cannot be trusted."""
+
+
+def read_meta_strict() -> WorkerMeta | None:
+    """Load maintained-worker metadata, distinguishing absence from corruption.
+
+    Returns:
+        Parsed metadata, or ``None`` only when the artifact is genuinely absent.
+
+    Raises:
+        WorkerMetadataError: If a present metadata artifact is unreadable or malformed.
+    """
+    path = meta_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError as exc:
+        if os.path.lexists(path):
+            msg = "maintained-worker metadata is present but unreadable"
+            raise WorkerMetadataError(msg) from exc
+        return None
+    except OSError as exc:
+        msg = f"cannot read maintained-worker metadata: {exc}"
+        raise WorkerMetadataError(msg) from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        msg = "maintained-worker metadata is not valid JSON"
+        raise WorkerMetadataError(msg) from exc
+    if not isinstance(data, dict):
+        msg = "maintained-worker metadata must be a JSON object"
+        raise WorkerMetadataError(msg)
+    try:
+        return WorkerMeta.from_dict(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        msg = "maintained-worker metadata is malformed"
+        raise WorkerMetadataError(msg) from exc
+
+
 def read_meta() -> WorkerMeta | None:
     """Load worker lifecycle metadata, tolerating absence and corruption.
 
     Returns:
-        The stored metadata, or ``None`` when no metadata exists.
+        The stored metadata, or ``None`` when metadata is absent or untrustworthy.
     """
     try:
-        data = json.loads(meta_path().read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    try:
-        return WorkerMeta.from_dict(data)
-    except (KeyError, TypeError, ValueError):
+        return read_meta_strict()
+    except WorkerMetadataError:
         return None
 
 
@@ -2194,7 +2227,15 @@ def _deploy_locked(options: DeployOptions) -> int:
         DeployAbortedError: If the deployment must abort and leave the current
             worker untouched.
     """
-    previous = read_meta()
+    try:
+        previous = read_meta_strict()
+    except WorkerMetadataError as exc:
+        _err(
+            "maintained-worker metadata is present but untrustworthy "
+            f"({exc}); refusing lifecycle mutation"
+        )
+        _err("run 'lubko-deploy repair' to recover maintained-worker authority")
+        raise DeployAbortedError from exc
     state = worker_state(previous)
 
     blocker = _supervised_mutation_blocker()

@@ -406,3 +406,54 @@ def test_deployctl_wait_preserves_anchor_through_final_transient_none(
     # transient None at/after it. Both polls really happened.
     assert reads == [TRANSITIONED, None]
     assert clock.now >= dc.IDENTITY_TIMEOUT_SECONDS
+
+
+def test_bootstrap_allows_genuine_metadata_absence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Fresh bootstrap may proceed only when maintained metadata is absent."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setattr(lifecycle, "_supervised_mutation_blocker", lambda: None)
+    monkeypatch.setattr(lifecycle, "_validate_and_prepare", lambda _options: COMMIT)
+    observed: list[tuple[WorkerMeta | None, str]] = []
+
+    def complete(
+        _options: DeployOptions,
+        _commit: str,
+        previous: WorkerMeta | None,
+        state: str,
+    ) -> int:
+        observed.append((previous, state))
+        return lifecycle.EXIT_OK
+
+    monkeypatch.setattr(lifecycle, "_complete_deploy_handoff", complete)
+
+    assert lifecycle._deploy_locked(options()) == lifecycle.EXIT_OK
+    assert observed == [(None, lifecycle.STATE_UNMANAGED)]
+
+
+@pytest.mark.parametrize("contents", ["{", "[]", "{}"])
+def test_bootstrap_refuses_untrustworthy_maintained_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    contents: str,
+) -> None:
+    """Present malformed authority must block bootstrap before preparation."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    path = lifecycle.meta_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(contents)
+    prepared: list[bool] = []
+
+    def prepare(_options: DeployOptions) -> str:
+        prepared.append(True)
+        return COMMIT
+
+    monkeypatch.setattr(lifecycle, "_validate_and_prepare", prepare)
+
+    with pytest.raises(DeployAbortedError):
+        lifecycle._deploy_locked(options())
+
+    assert prepared == []
+    assert path.read_text() == contents
