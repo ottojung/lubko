@@ -4864,6 +4864,30 @@ def _no_invocation_owned(meta: Meta) -> bool:
     return not runner_alive(meta) and not reservation_in_flight(meta) and pending is None
 
 
+def _stop_like_authority_error(meta: Meta) -> str | None:
+    """Return why stop/kill cannot safely interpret execution authority.
+
+    A stop-like command may retry when canonical ownership changes concurrently,
+    but malformed durable authority is not a transient ownership change. It
+    must return a bounded failure instead of repeatedly re-reading the same
+    corrupt record and busy-spinning forever.
+
+    Args:
+        meta: Agent metadata being considered for stop/kill.
+
+    Returns:
+        A diagnostic when durable execution authority is malformed, otherwise
+        ``None``.
+    """
+    try:
+        _pending_prompt(meta)
+    except MalformedPendingPromptMetadataError:
+        return "pending prompt authority is malformed"
+    if _runner_reservation_state(meta.get("runner_reservation")) == "malformed":
+        return "runner reservation authority is malformed"
+    return None
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     """Gracefully stop a running agent.
 
@@ -4895,6 +4919,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
     while True:
         if is_alive(meta) or group_alive(meta):
             return _signal_live_invocation(aid, meta, "stop")
+        authority_error = _stop_like_authority_error(meta)
+        if authority_error is not None:
+            _err(f"{PROG}: agent {aid} cannot be stopped safely: {authority_error}")
+            return EXIT_ERROR
         if _no_invocation_owned(meta):
             _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
             return EXIT_OK
@@ -4936,6 +4964,10 @@ def cmd_kill(args: argparse.Namespace) -> int:
     while True:
         if is_alive(meta) or group_alive(meta):
             return _signal_live_invocation(aid, meta, "kill")
+        authority_error = _stop_like_authority_error(meta)
+        if authority_error is not None:
+            _err(f"{PROG}: agent {aid} cannot be killed safely: {authority_error}")
+            return EXIT_ERROR
         if _no_invocation_owned(meta):
             _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
             return EXIT_OK
