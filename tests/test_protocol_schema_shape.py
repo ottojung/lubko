@@ -170,6 +170,24 @@ def test_payload_shape_rejects_missing_strict_semantics(strict_fragment: str) ->
     assert not worker._has_current_type_shape_constraint(weakened)
 
 
+@pytest.mark.parametrize(
+    "weakened",
+    [
+        f"({STRICT_TYPE_SHAPE}) OR true",
+        f"({STRICT_TYPE_SHAPE}) OR (1 = 1)",
+        f"CASE WHEN true THEN true ELSE ({STRICT_TYPE_SHAPE}) END",
+        f"CASE WHEN 1 = 1 THEN (1 = 1) ELSE ({STRICT_TYPE_SHAPE}) END",
+    ],
+)
+def test_payload_shape_rejects_permissive_branches_with_all_markers(
+    weakened: str,
+) -> None:
+    """Extra permissive branches cannot hide behind the canonical markers."""
+    assert not worker._has_current_type_shape_constraint(weakened)
+    with pytest.raises(worker.SchemaInvariantError, match="stale or incomplete"):
+        worker.verify_protocol_schema(_as_conn(_SchemaConn(weakened)))
+
+
 def test_payload_shape_matching_tolerates_postgres_rendering_noise() -> None:
     """PostgreSQL formatting, casing, casts, and grouping do not affect matching."""
     noisy = STRICT_TYPE_SHAPE.upper().replace(" ", "\n\t")

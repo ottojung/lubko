@@ -75,6 +75,7 @@ import json
 import logging
 import math
 import os
+import re
 import select
 import selectors
 import signal
@@ -484,10 +485,26 @@ def _normalized_constraint_definition(definition: str) -> str:
 def _has_current_type_shape_constraint(definition: str) -> bool:
     """Return whether a CHECK definition proves the current payload-shape contract.
 
+    Marker presence is necessary but not sufficient: a permissive boolean branch
+    can retain every canonical fragment while making the CHECK admit arbitrary
+    rows. The canonical constraint contains neither ``OR`` operators nor a SQL
+    ``TRUE`` literal, and its control-flow skeleton has a fixed CASE/WHEN shape.
+    Reject definitions that add operators or branches before accepting markers.
+
     Returns:
-        ``True`` only when every current semantic marker is present.
+        ``True`` only when the definition is fail-closed and every current
+        semantic marker is present.
     """
     normalized = _normalized_constraint_definition(definition)
+    unquoted = re.sub(r"'(?:''|[^'])*'", "''", definition.lower())
+    if re.search(r"\bor\b", unquoted) or re.search(r"\btrue\b", unquoted):
+        return False
+    keyword_counts = tuple(
+        len(re.findall(rf"\b{keyword}\b", unquoted))
+        for keyword in ("case", "when", "then", "else", "end")
+    )
+    if keyword_counts not in {(5, 6, 6, 5, 5), (7, 8, 8, 7, 7)}:
+        return False
     return all(marker in normalized for marker in CURRENT_TYPE_SHAPE_CONSTRAINT_MARKERS)
 
 
