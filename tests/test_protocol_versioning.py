@@ -370,6 +370,22 @@ def test_migration_0005_payload_type_validation_is_total_and_fail_closed() -> No
     assert "where (payload::jsonb)->>'type' in ('command', 'output_chunk')" not in migration
 
 
+def test_earlier_transport_schema_surfaces_reject_unknown_payload_types() -> None:
+    """Fresh and routing schema definitions fail closed on the kind discriminator."""
+    root = Path(__file__).resolve().parent.parent
+    schemas = [
+        root / "migrations" / "0001_two_column_protocol.sql",
+        root / "migrations" / "0003_protocol_v4_server_routing.sql",
+    ]
+
+    for path in schemas:
+        schema = path.read_text(encoding="utf-8")
+        assert "when (payload::jsonb)->>'type' = 'command'" in schema
+        assert "when (payload::jsonb)->>'type' = 'output_chunk'" in schema
+        assert "else false" in schema
+        assert "else true" not in schema
+
+
 def test_migration_0005_command_status_validation_is_total_and_fail_closed() -> None:
     """The DB boundary admits only canonical JSON-string command statuses.
 
