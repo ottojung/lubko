@@ -13,13 +13,13 @@ if TYPE_CHECKING:
 from lubko import agent
 
 
-@pytest.mark.parametrize("generation", [7.9, "7", True, False, -1, None, [], {}])
+@pytest.mark.parametrize("generation", [7.9, "7", True, False, 0, -1, None, [], {}])
 def test_reservation_generation_must_be_canonical_integer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     generation: object,
 ) -> None:
-    """Malformed reservation generations grant no liveness authority."""
+    """Malformed reservation generations fail closed without live authority."""
     meta = agent.idle_meta("audit", str(tmp_path), None)
     meta.update(
         active_runner=True,
@@ -28,6 +28,7 @@ def test_reservation_generation_must_be_canonical_integer(
             "gen": generation,
             "owner_pid": 1,
             "owner_start_ticks": 1,
+            "mode": "new",
         },
     )
     marker_calls: list[tuple[str, int]] = []
@@ -45,7 +46,9 @@ def test_reservation_generation_must_be_canonical_integer(
     monkeypatch.setattr(agent, "_owner_alive", owner_alive)
     monkeypatch.setattr(agent, "_runner_marker_alive", marker_alive)
 
-    assert not agent.reservation_in_flight(meta)
+    assert agent.reservation_in_flight(meta)
+    assert agent.is_genuinely_running(meta)
+    assert not agent.active_runner_justified(meta)
     assert owner_calls == []
     assert marker_calls == []
 
