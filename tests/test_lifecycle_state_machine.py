@@ -446,3 +446,17 @@ def test_db_recovery_failpoint_blocks_before_db(monkeypatch: pytest.MonkeyPatch)
         ),
     ):
         supervisor.recover_owned_groups("incarnation-token")
+
+
+def test_clear_stale_supervisor_override_clears_malformed_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful activation clears an existing malformed override too."""
+    cleared: list[bool] = []
+    monkeypatch.setattr(supervise, "read_supervisor_runtime_override", lambda: None)
+    monkeypatch.setattr(
+        supervise, "clear_supervisor_runtime_override", lambda: cleared.append(True) or True
+    )
+    monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _message: None)
+    lifecycle._clear_stale_supervisor_override("c" * 40)
+    assert cleared == [True]

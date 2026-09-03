@@ -1969,9 +1969,7 @@ def _clear_stale_supervisor_override(confirmed_commit: str) -> None:
         confirmed_commit: The newly confirmed commit that ``cli/current``
             now selects (used only for the deploy log entry).
     """
-    override = supervise.read_supervisor_runtime_override()
-    if override is not None:
-        supervise.clear_supervisor_runtime_override()
+    if supervise.clear_supervisor_runtime_override():
         append_deploy_log(
             f"cleared supervisor-runtime override: commit {confirmed_commit} is now confirmed"
         )
