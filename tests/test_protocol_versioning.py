@@ -355,6 +355,33 @@ def test_migration_0005_version_validation_is_total_and_fail_closed() -> None:
     assert "->''v'')::int" not in migration
 
 
+def test_migration_0005_command_status_validation_is_total_and_fail_closed() -> None:
+    """The DB boundary admits only canonical JSON-string command statuses.
+
+    A plain ``->> status IS NOT NULL`` check would stringify arbitrary JSON and
+    admit rows that no lifecycle path can later claim, recover, or collect. The
+    migration must type-check the discriminator both during non-destructive
+    preflight and in the installed CHECK constraint, then restrict it to exactly
+    the protocol lifecycle domain.
+    """
+    migration = (
+        Path(__file__).resolve().parent.parent / "migrations" / "0005_protocol_version_window.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "(payload::jsonb)->'state'->'status'" in migration
+    assert "is not distinct from 'string'" in migration
+    assert "jsonb_typeof((payload::jsonb)->''state''->''status'')" in migration
+    assert "is not distinct from ''string''" in migration
+
+    assert "in ('pending', 'running', 'succeeded', 'failed', 'cancelled')" in migration
+    assert "in (''pending'', ''running'', ''succeeded'', ''failed'', ''cancelled'')" in migration
+
+    # The old permissive boundary accepted any JSON value that `->>` could
+    # stringify. It must not survive in the installed command constraint.
+    assert "and (((payload::jsonb)->''state''->>''status'') is not null)" not in migration
+    assert "command status is malformed/unsupported" in migration
+
+
 def test_migration_0005_retains_old_history_when_execution_floor_advances() -> None:
     """The stored-history range is broader than the daemon execution window.
 
