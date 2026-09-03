@@ -36,10 +36,10 @@ mechanism instead of a second one-off v4 hack.
    schema is unchanged and versions are compatible, an in-flight job submitted
    at the old version keeps running and every `output_chunk` it has published
    stays exactly where it is. Nothing is truncated and nothing is migrated.
-5. **A daemon fails closed on any version it cannot understand.** It claims and
-   executes only jobs whose `v` lies inside its own window. A job outside the
-   window is never run, never silently ignored, and (under the reaper below) is
-   failed with a diagnostic rather than stranded.
+5. **A daemon never executes a version it cannot understand.** It claims and
+   executes only jobs whose `v` lies inside its own window. Retired lower
+   versions may be failed closed by the reaper below; newer versions remain
+   pending unless explicit fleet-wide authority says they are unservable.
 6. **Fresh install stays simple.** A brand-new database applies the single
    baseline `0001_two_column_protocol.sql` and runs at exactly the current
    version. No window arithmetic, no extra migration, no default server. The
@@ -145,14 +145,13 @@ that cannot execute it.
   daemon's window, and `parse_payload`/`parse_chunk_payload` reject any such `v`
   with a diagnostic. A daemon therefore never executes, mutates, or collects a
   payload it does not understand.
-- **Fleet-wide reaper (recommended):** a periodic pass scans `pending`
-  `command` rows and, for any whose `v` is `classify_job_version(...) ==
-  FAIL_CLOSED` against the *deployment's* supported window, fails the job closed
-  with the diagnostic from `unsupported_version_diagnostic` instead of letting it
-  sit pending forever. This is the safety net for a job submitted at a version no
-  running daemon accepts (for example a `C+1` job that arrives after every daemon
-  has already moved to `[C+2, C+2]`). It is fail-closed, not fail-open: such a
-  job is rejected loudly, never executed by a daemon that would misinterpret it.
+- **Retired-version reaper:** a periodic pass may fail closed `pending`
+  `command` rows below the deployment's retired floor. Versions above a daemon's
+  local window are deliberately left pending: a compile-time ceiling only
+  describes that binary, and an older binary cannot prove that a newer daemon in
+  a staggered fleet does not support the row. If future-version terminalization
+  is desired, it must be backed by explicit fleet-wide authority or another
+  designed expiry mechanism rather than inferred from local build knowledge.
 
 ## What this replaces
 

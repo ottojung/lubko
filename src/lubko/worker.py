@@ -4116,15 +4116,13 @@ def fail_unsupported_job(
 
 
 def reap_unsupported_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[UUID]:
-    """Fail closed pending jobs whose protocol version no daemon can serve.
+    """Fail closed pending jobs that are safely known to be retired.
 
-    A fleet-wide safety net so a pending ``command`` job submitted at a version no
-    running daemon understands can never sit stranded forever. The reaper only
-    touches jobs whose version is unservable by the *entire* fleet, decided by
-    :func:`lubko.protocol_versioning.reaper_disposition`, so it never destroys
-    work a different daemon could still execute (for example a ``v5`` job during a
-    ``[4,5]`` staggered upgrade while older ``[4,4]`` daemons still run). The pass
-    is bounded to ``limit`` rows per turn.
+    The reaper is conservative across staggered binary upgrades. It may retire a
+    lower protocol generation according to the deployment window, but it leaves
+    versions above this daemon's window pending because this binary cannot prove
+    that a newer daemon elsewhere in the fleet does not support them. The pass is
+    bounded to ``limit`` rows per turn.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -4145,9 +4143,10 @@ def reap_unsupported_jobs(conn: JobsConnection, settings: Settings, limit: int) 
                 is JobVersionDisposition.FAIL_CLOSED
             ):
                 diagnostic = (
-                    f"protocol version {version} is unsupported by every running "
-                    f"daemon (supported window [{settings.supported_protocol_range.min}, "
-                    f"{settings.supported_protocol_range.max}]); the job is failed closed"
+                    f"protocol version {version} is below the retired floor "
+                    f"{settings.supported_protocol_range.min} for supported window "
+                    f"[{settings.supported_protocol_range.min}, "
+                    f"{settings.supported_protocol_range.max}]; the job is failed closed"
                 )
                 if fail_unsupported_job(conn, job_id, diagnostic, server=settings.server):
                     reaped.append(job_id)
