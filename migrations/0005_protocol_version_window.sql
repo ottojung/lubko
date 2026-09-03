@@ -119,20 +119,24 @@ begin
     -- false.
     select count(*) into nonconforming
     from lubko.jobs
-    where (payload::jsonb)->>'type' in ('command', 'output_chunk')
-        and not (
-            case
-                when jsonb_typeof((payload::jsonb)->'v')
+    where not (
+        case
+            when jsonb_typeof((payload::jsonb)->'type')
+                 is not distinct from 'string'
+                 and (payload::jsonb)->>'type' in ('command', 'output_chunk')
+            then (
+                case
+                    when jsonb_typeof((payload::jsonb)->'v')
                      is not distinct from 'number'
                 then ((payload::jsonb)->'v')::numeric
                          = floor(((payload::jsonb)->'v')::numeric)
                      and ((payload::jsonb)->'v')::numeric
                          between retained_min and retained_max
-                else false
-            end
-            and (
-                case
-                    when (payload::jsonb)->>'type' = 'command' then
+                    else false
+                end
+                and (
+                    case
+                        when (payload::jsonb)->>'type' = 'command' then
                         case
                             when jsonb_typeof(
                                 (payload::jsonb)->'state'->'status'
@@ -141,10 +145,13 @@ begin
                                 in ('pending', 'running', 'succeeded', 'failed', 'cancelled')
                             else false
                         end
-                    else true
-                end
+                        else true
+                    end
+                )
             )
-        );
+            else false
+        end
+    );
 
     if nonconforming > 0 then
         raise exception using
@@ -160,7 +167,9 @@ begin
 
     constraint_text := format(
         'case
-            when (payload::jsonb)->>''type'' = ''command'' then
+            when jsonb_typeof((payload::jsonb)->''type'')
+                 is not distinct from ''string''
+                 and (payload::jsonb)->>''type'' = ''command'' then
                 (case
                     when jsonb_typeof((payload::jsonb)->''v'')
                          is not distinct from ''number''
@@ -181,7 +190,9 @@ begin
                 and coalesce(jsonb_typeof((payload::jsonb)->''server''), '''')
                     = ''string''
                 and coalesce((payload::jsonb)->>''server'', '''') <> ''''
-            when (payload::jsonb)->>''type'' = ''output_chunk'' then
+            when jsonb_typeof((payload::jsonb)->''type'')
+                 is not distinct from ''string''
+                 and (payload::jsonb)->>''type'' = ''output_chunk'' then
                 (case
                     when jsonb_typeof((payload::jsonb)->''v'')
                          is not distinct from ''number''
@@ -200,7 +211,7 @@ begin
                 and (((payload::jsonb)->>''sequence'') ~ ''^[0-9]+$'')
                 and (((payload::jsonb)->>''start'') ~ ''^[0-9]+$'')
                 and (((payload::jsonb)->>''end'') ~ ''^[0-9]+$'')
-            else true
+            else false
         end',
         retained_min, retained_max, retained_min, retained_max
     );

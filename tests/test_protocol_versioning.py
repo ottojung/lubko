@@ -355,6 +355,21 @@ def test_migration_0005_version_validation_is_total_and_fail_closed() -> None:
     assert "->''v'')::int" not in migration
 
 
+def test_migration_0005_payload_type_validation_is_total_and_fail_closed() -> None:
+    """The DB boundary admits only canonical JSON-string transport kinds."""
+    migration = (
+        Path(__file__).resolve().parent.parent / "migrations" / "0005_protocol_version_window.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "jsonb_typeof((payload::jsonb)->'type')" in migration
+    assert "is not distinct from 'string'" in migration
+    assert "->>'type' in ('command', 'output_chunk')" in migration
+    assert "jsonb_typeof((payload::jsonb)->''type'')" in migration
+    assert "is not distinct from ''string''" in migration
+    assert "else false\n        end'" in migration
+    assert "where (payload::jsonb)->>'type' in ('command', 'output_chunk')" not in migration
+
+
 def test_migration_0005_command_status_validation_is_total_and_fail_closed() -> None:
     """The DB boundary admits only canonical JSON-string command statuses.
 
