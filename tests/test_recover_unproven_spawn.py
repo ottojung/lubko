@@ -664,6 +664,50 @@ def _stub_repair(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
 
 
+def test_adoption_candidate_refuses_malformed_maintained_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupt maintained authority cannot collapse to absence during adoption."""
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda *_a: True)
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: PRIVATE)
+    monkeypatch.setattr(lifecycle, "_is_lubko_worker_process", lambda _pid: True)
+    monkeypatch.setattr(lifecycle, "check_postgres", lambda *_a: True)
+
+    def malformed_meta() -> lifecycle.WorkerMeta | None:
+        msg = "maintained-worker metadata is not valid JSON"
+        raise lifecycle.WorkerMetadataError(msg)
+
+    monkeypatch.setattr(lifecycle, "read_meta_strict", malformed_meta)
+
+    with pytest.raises(lifecycle._AdoptionError, match="present but untrustworthy"):
+        lifecycle._adoption_candidate(options(), PID, COMMIT)
+
+
+def test_repair_refuses_metadata_corruption_at_final_publication_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Corruption after candidate validation blocks the authoritative write."""
+    _stub_repair(monkeypatch)
+
+    def malformed_meta() -> lifecycle.WorkerMeta | None:
+        msg = "maintained-worker metadata is malformed"
+        raise lifecycle.WorkerMetadataError(msg)
+
+    monkeypatch.setattr(lifecycle, "read_meta_strict", malformed_meta)
+    monkeypatch.setattr(
+        lifecycle,
+        "write_meta",
+        lambda _meta: pytest.fail("corrupt maintained metadata must not be overwritten"),
+    )
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "became untrustworthy before adoption publication" in captured.err
+
+
 def test_recover_success_keeps_exact_authority_until_adoption(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
