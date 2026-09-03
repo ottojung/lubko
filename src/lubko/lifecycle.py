@@ -1349,8 +1349,8 @@ def stop_worker(
     except (OSError, AttributeError):
         # The pin failed either because the exact worker already exited (the
         # numeric PID may even have been recycled since) or because the
-        # platform cannot pin PIDs at all. Distinguish by re-reading identity:
-        # a live occupant we cannot pin must never be signalled — fail closed.
+        # platform cannot pin PIDs at all. Require positive absence proof:
+        # unknown liveness must never authorize replacement — fail closed.
         return process_absence_proven(meta.pid, meta.start_time_ticks)
     try:
         return _stop_pinned(meta, grace_seconds, cancel_grace_seconds)
