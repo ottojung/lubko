@@ -2751,10 +2751,18 @@ def _cleanup_ready_markers(recovery_worker_pid: int) -> None:
         try:
             data = json.loads(path.read_text())
         except (OSError, ValueError):
-            path.unlink(missing_ok=True)
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
             continue
-        if not isinstance(data, dict) or data.get("pid") != recovery_worker_pid:
-            path.unlink(missing_ok=True)
+        marker_pid = data.get("pid") if isinstance(data, dict) else None
+        valid_marker = (
+            isinstance(marker_pid, int)
+            and not isinstance(marker_pid, bool)
+            and marker_pid == recovery_worker_pid
+        )
+        if not valid_marker:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
 
 
 def _reconcile_toolchain(uv_path: str) -> None:

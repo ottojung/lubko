@@ -23,6 +23,30 @@ NON_PRIVATE = ProcessIdentity(pid=PID, pgid=1, sid=9000, start_time_ticks=555)
 PIN_BASE = 20000
 
 
+def test_cleanup_ready_markers_tolerates_non_file_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed marker filesystem shapes cannot abort recovery cleanup."""
+    monkeypatch.setattr(lifecycle, "worker_state_dir", lambda: tmp_path)
+    (tmp_path / "ready-directory").mkdir()
+    valid = tmp_path / "ready-valid"
+    valid.write_text(json.dumps({"pid": PID}))
+    stale = tmp_path / "ready-stale"
+    stale.write_text(json.dumps({"pid": PID + 1}))
+    malformed = tmp_path / "ready-malformed"
+    malformed.write_text("not json")
+    wrong_type = tmp_path / "ready-wrong-type"
+    wrong_type.write_text(json.dumps({"pid": float(PID)}))
+
+    lifecycle._cleanup_ready_markers(PID)
+
+    assert valid.is_file()
+    assert not stale.exists()
+    assert not malformed.exists()
+    assert not wrong_type.exists()
+    assert (tmp_path / "ready-directory").is_dir()
+
+
 class NumericSignalError(AssertionError):
     """Raised when a numeric kill primitive is used instead of a pidfd."""
 
