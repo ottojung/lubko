@@ -254,7 +254,7 @@ def reconcile_authority_facts() -> AuthorityFacts:
     desired_generation = 0
 
     try:
-        meta = lifecycle.read_meta()
+        meta = lifecycle.read_meta_strict()
     except Exception:  # ruff: ignore[blind-except] - unreadable meta fails closed
         meta = None
         malformed = True

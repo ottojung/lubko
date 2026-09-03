@@ -353,7 +353,10 @@ def test_unreadable_supervisor_state_blocks_spawn(monkeypatch: pytest.MonkeyPatc
 
 def test_unreadable_meta_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unreadable worker meta fails closed: spawn is not authorized."""
-    monkeypatch.setattr(lifecycle, "read_meta", lambda: (_ for _ in ()).throw(OSError("meta gone")))
+    def read_corrupt_meta() -> None:
+        raise lifecycle.WorkerMetadataError("invalid metadata")
+
+    monkeypatch.setattr(lifecycle, "read_meta_strict", read_corrupt_meta)
     facts = reconcile_authority_facts()
     assert facts.durable_malformed is True
     assert authorize_spawn(facts) is False
@@ -391,7 +394,7 @@ def test_malformed_desired_intent_blocks_authority(monkeypatch: pytest.MonkeyPat
         "read_desired_strict",
         lambda: (_ for _ in ()).throw(supervise.DesiredIntentError("malformed")),
     )
-    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(lifecycle, "read_meta_strict", lambda: None)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
     monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
 
@@ -406,7 +409,7 @@ def test_malformed_desired_intent_blocks_authority(monkeypatch: pytest.MonkeyPat
 def test_absent_desired_intent_remains_non_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Genuine desired absence retains the mission/bootstrap generation-zero semantics."""
     monkeypatch.setattr(supervise, "read_desired_strict", lambda: None)
-    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(lifecycle, "read_meta_strict", lambda: None)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
     monkeypatch.setattr(supervise, "read_state", supervise.fresh_state)
 
@@ -439,7 +442,7 @@ def test_desired_generation_read_from_intent(monkeypatch: pytest.MonkeyPatch) ->
             ready=False,
         ),
     )
-    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(lifecycle, "read_meta_strict", lambda: None)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
 
     facts = reconcile_authority_facts()
