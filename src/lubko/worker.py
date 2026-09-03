@@ -426,19 +426,68 @@ JOBS_SCHEMA: Final = "lubko"
 JOBS_TABLE: Final = "jobs"
 JOBS_COLUMN_TYPES: Final = (("id", "uuid"), ("payload", "text"))
 TYPE_AWARE_CONSTRAINT_NAME: Final = "jobs_payload_type_shape"
-#: Whitespace-stripped fragments that only the protocol v4 (routing-aware)
-#: definition of ``jobs_payload_type_shape`` contains; a pre-cutover v3
-#: constraint of the same name lacks them and is refused at startup. Compared
-#: against ``pg_get_constraintdef`` output with all whitespace removed, so
-#: PostgreSQL normalization (extra parentheses and ``::text`` casts included)
-#: never defeats detection. The ``='4'::jsonb`` marker proves the constraint
-#: enforces the protocol version itself, not merely server presence.
-SERVER_ROUTING_CONSTRAINT_MARKERS: Final = (
-    "jsonb_typeof",
-    "->'server'",
-    "='string'",
-    "='4'::jsonb",
+#: Semantic fragments required from the current ``jobs_payload_type_shape``.
+#: ``pg_get_constraintdef`` is normalized before matching so PostgreSQL-added
+#: whitespace, ``::text`` casts, capitalization, and grouping parentheses do
+#: not affect detection. The markers are deliberately field-specific: together
+#: they prove the fail-closed payload discriminator, strict command lifecycle
+#: status, strict chunk structural typing, retained-version typing, and routing
+#: guarantees that current worker code relies on.
+CURRENT_TYPE_SHAPE_CONSTRAINT_MARKERS: Final = (
+    # Strict top-level discriminator: malformed and unknown payload kinds fail.
+    "jsonb_typeofpayload::jsonb->'type'isnotdistinctfrom'string'",
+    "payload::jsonb->>'type'='command'",
+    "payload::jsonb->>'type'='output_chunk'",
+    "elsefalse",
+    # Retained protocol versions are integral JSON numbers, not text aliases.
+    "jsonb_typeofpayload::jsonb->'v'isnotdistinctfrom'number'",
+    "payload::jsonb->'v'::numeric=floorpayload::jsonb->'v'::numeric",
+    # Command lifecycle authority is a real JSON string in the canonical set.
+    "jsonb_typeofpayload::jsonb->'state'->'status'isnotdistinctfrom'string'",
+    "'pending'",
+    "'running'",
+    "'succeeded'",
+    "'failed'",
+    "'cancelled'",
+    # Routing identity remains a required non-empty JSON string.
+    "coalescejsonb_typeofpayload::jsonb->'server',''='string'",
+    "coalescepayload::jsonb->>'server',''<>''",
+    # Output-chunk ownership/stream metadata is type-strict.
+    "coalescejsonb_typeofpayload::jsonb->'thread',''='string'",
+    "coalescejsonb_typeofpayload::jsonb->'stream',''='string'",
+    "'stdout'",
+    "'stderr'",
+    # Chunk offsets are integral, non-negative JSON numbers.
+    "jsonb_typeofpayload::jsonb->'sequence'isnotdistinctfrom'number'",
+    "payload::jsonb->'sequence'::numeric>=0",
+    "jsonb_typeofpayload::jsonb->'start'isnotdistinctfrom'number'",
+    "payload::jsonb->'start'::numeric>=0",
+    "jsonb_typeofpayload::jsonb->'end'isnotdistinctfrom'number'",
+    "payload::jsonb->'end'::numeric>=0",
 )
+
+
+def _normalized_constraint_definition(definition: str) -> str:
+    """Normalize PostgreSQL CHECK rendering for semantic marker matching.
+
+    Returns:
+        Lower-cased SQL with formatting-only casts, whitespace, and grouping
+        parentheses removed.
+    """
+    compact = "".join(definition.lower().split()).replace("::text", "")
+    return compact.replace("(", "").replace(")", "")
+
+
+def _has_current_type_shape_constraint(definition: str) -> bool:
+    """Return whether a CHECK definition proves the current payload-shape contract.
+
+    Returns:
+        ``True`` only when every current semantic marker is present.
+    """
+    normalized = _normalized_constraint_definition(definition)
+    return all(marker in normalized for marker in CURRENT_TYPE_SHAPE_CONSTRAINT_MARKERS)
+
+
 #: SQL predicate selecting rows whose top-level ``server`` is exactly the
 #: daemon's configured identity as a JSON *string*. The ``jsonb_typeof`` guard
 #: makes text-coercion aliases impossible: a row with ``server: 123`` (a JSON
@@ -4456,25 +4505,20 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
 def verify_protocol_schema(conn: JobsConnection) -> None:
     """Assert that ``lubko.jobs`` carries the canonical protocol v4 shape.
 
-    The two-column invariant alone does not make a table usable by a v4
-    worker: immutable ``output_chunk`` publication and explicit multi-server
-    routing require the type-aware ``jobs_payload_type_shape`` check
-    constraint **in its v4 form** — enforcing the required non-empty top-level
-    ``server`` field — plus the chunk ownership/ordering indexes, which
-    ``migrations/0001_two_column_protocol.sql`` declares. An existing table
-    still carrying the pre-cutover v3 constraint (same name, no ``server``
-    enforcement) is refused exactly like a missing one. The worker refuses to
-    start against any table lacking this shape so output publication can never
-    fail at runtime on a table that cannot represent immutable chunks, and no
-    daemon ever runs against a transport that does not DB-enforce server
-    routing.
+    The two-column invariant alone does not make a table usable by this worker.
+    Startup requires the current type-aware ``jobs_payload_type_shape`` contract:
+    strict payload-kind and command-status discrimination, strict output-chunk
+    structural metadata, explicit multi-server routing, and the chunk
+    ownership/ordering indexes. Older routing-aware v4 constraints are rejected
+    too: they can contain the server-routing markers while still admitting
+    malformed rows that current protocol code assumes the database excludes.
 
     Args:
         conn: Open PostgreSQL connection.
 
     Raises:
-        SchemaInvariantError: If the type-aware constraint (in its v4,
-            routing-aware form) or any required output-chunk index is missing.
+        SchemaInvariantError: If the current type-aware constraint contract or
+            any required output-chunk index is missing.
     """
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
@@ -4493,14 +4537,13 @@ def verify_protocol_schema(conn: JobsConnection) -> None:
     shape_def = constraints.get(TYPE_AWARE_CONSTRAINT_NAME)
     if shape_def is None:
         missing.append(f"check constraint {TYPE_AWARE_CONSTRAINT_NAME}")
-    elif not all(m in "".join(shape_def.split()) for m in SERVER_ROUTING_CONSTRAINT_MARKERS):
+    elif not _has_current_type_shape_constraint(shape_def):
         msg = (
-            f"lubko.jobs carries a pre-v4 {TYPE_AWARE_CONSTRAINT_NAME} check "
-            f"constraint without server-routing enforcement. Apply the "
-            f"protocol v4 cutover migration "
-            f"migrations/0003_protocol_v4_server_routing.sql while quiescent, "
-            f"then truncate lubko.jobs (the v3 -> v4 row cutover is "
-            f"destructive; no legacy row is converted). {TWO_COLUMN_INVARIANT}"
+            f"lubko.jobs carries a stale or incomplete {TYPE_AWARE_CONSTRAINT_NAME} "
+            f"check constraint that does not enforce the current fail-closed payload "
+            f"shape. Apply migrations through "
+            f"migrations/0005_protocol_version_window.sql before starting this worker. "
+            f"{TWO_COLUMN_INVARIANT}"
         )
         raise SchemaInvariantError(msg)
     missing.extend(
