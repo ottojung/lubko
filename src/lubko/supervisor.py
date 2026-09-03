@@ -1195,7 +1195,14 @@ class SupervisorDaemon:
             )
             return
         state = read_state()
-        meta = lifecycle.read_meta()
+        try:
+            meta = lifecycle.read_meta_strict()
+        except lifecycle.WorkerMetadataError as exc:
+            self._message = (
+                f"maintained-worker metadata is invalid; holding without starting a worker: {exc}"
+            )
+            LOGGER.exception("%s", self._message)
+            return
         if meta is not None and lifecycle.worker_alive(meta):
             is_our_child = (
                 state.child is not None
