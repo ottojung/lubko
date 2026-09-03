@@ -159,6 +159,47 @@ def _patch_recovery(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     return observed
 
 
+@pytest.mark.parametrize("raw_meta", ["{", "[]"])
+def test_supervisor_holds_on_invalid_maintained_worker_metadata(
+    monkeypatch: pytest.MonkeyPatch, raw_meta: str
+) -> None:
+    """Corrupt maintained-worker authority must block replacement spawn."""
+    path = lifecycle.meta_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(raw_meta)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    spawned: list[str] = []
+
+    def record_spawn(commit: str) -> None:
+        spawned.append(commit)
+
+    monkeypatch.setattr(daemon, "_spawn_and_publish", record_spawn)
+    daemon._ensure_consumer_locked(COMMIT)
+    assert spawned == []
+    assert daemon._message is not None
+    assert "holding without starting a worker" in daemon._message
+    assert path.read_text() == raw_meta
+
+
+def test_supervisor_still_spawns_when_maintained_worker_metadata_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genuine metadata absence retains normal first-establishment behavior."""
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    spawned: list[str] = []
+
+    def missing_meta() -> lifecycle.WorkerMeta | None:
+        return None
+
+    def record_spawn(commit: str) -> None:
+        spawned.append(commit)
+
+    monkeypatch.setattr(lifecycle, "read_meta_strict", missing_meta)
+    monkeypatch.setattr(daemon, "_spawn_and_publish", record_spawn)
+    daemon._ensure_consumer_locked(COMMIT)
+    assert spawned == [COMMIT]
+
+
 def test_child_published_with_spawning_then_meta_then_spawning_cleared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
