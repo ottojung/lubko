@@ -1231,7 +1231,7 @@ def reservation_in_flight(meta: Meta) -> bool:
         return reservation_state == "malformed"
     gen = _runner_generation(res.get("gen"), minimum=1)
     if gen is None:
-        return False
+        return True
     if _owner_alive(res.get("owner_pid"), res.get("owner_start_ticks")):
         return True
     aid = _persisted_agent_id(meta.get("id"))
@@ -1315,7 +1315,10 @@ def active_runner_justified(meta: Meta) -> bool:
     # reservation whose runner is no longer provably alive is stuck and must
     # never justify a persistent ``active_runner``.
     return (
-        _runner_reservation_state(res) == "reserved" and _runner_reservation_mode(res) is not None
+        isinstance(res, dict)
+        and _runner_reservation_state(res) == "reserved"
+        and _runner_reservation_mode(res) is not None
+        and _runner_generation(res.get("gen"), minimum=1) is not None
     )
 
 
