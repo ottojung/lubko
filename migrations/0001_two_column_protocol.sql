@@ -67,13 +67,14 @@ create table if not exists lubko.jobs (
                 when (payload::jsonb)->>'type' = 'output_chunk' then
                     ((payload::jsonb)->'v') = '4'::jsonb
                     and jsonb_typeof((payload::jsonb)->'value') = 'string'
-                    and (((payload::jsonb)->>'thread') is not null)
+                    and coalesce(jsonb_typeof((payload::jsonb)->'thread'), '') = 'string'
                     and coalesce(jsonb_typeof((payload::jsonb)->'server'), '') = 'string'
                     and coalesce((payload::jsonb)->>'server', '') <> ''
+                    and coalesce(jsonb_typeof((payload::jsonb)->'stream'), '') = 'string'
                     and (((payload::jsonb)->>'stream') in ('stdout', 'stderr'))
-                    and (((payload::jsonb)->>'sequence') ~ '^[0-9]+$')
-                    and (((payload::jsonb)->>'start') ~ '^[0-9]+$')
-                    and (((payload::jsonb)->>'end') ~ '^[0-9]+$')
+                    and (case when jsonb_typeof((payload::jsonb)->'sequence') is not distinct from 'number' then ((payload::jsonb)->'sequence')::numeric = floor(((payload::jsonb)->'sequence')::numeric) and ((payload::jsonb)->'sequence')::numeric >= 0 else false end)
+                    and (case when jsonb_typeof((payload::jsonb)->'start') is not distinct from 'number' then ((payload::jsonb)->'start')::numeric = floor(((payload::jsonb)->'start')::numeric) and ((payload::jsonb)->'start')::numeric >= 0 else false end)
+                    and (case when jsonb_typeof((payload::jsonb)->'end') is not distinct from 'number' then ((payload::jsonb)->'end')::numeric = floor(((payload::jsonb)->'end')::numeric) and ((payload::jsonb)->'end')::numeric >= 0 else false end)
                 else false
             end
         )
