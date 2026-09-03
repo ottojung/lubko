@@ -444,6 +444,45 @@ def worker_alive(meta: WorkerMeta) -> bool:
     return meta.token is None or process_has_token(meta.pid, meta.token)
 
 
+def process_absence_proven(pid: int, start_time_ticks: int | None) -> bool:
+    """Return whether an exact recorded process is positively proven absent.
+
+    This helper is deliberately stricter than the boolean liveness helpers used
+    for ordinary observation. At replacement-authority boundaries, an unreadable
+    ``/proc`` entry is unknown, not evidence that a worker died. Absence is
+    proven only when the PID does not exist, is zombie/dead, or exists with a
+    different start time (PID reuse).
+
+    Args:
+        pid: Recorded process ID.
+        start_time_ticks: Recorded exact process start time.
+
+    Returns:
+        ``True`` only when the recorded process identity is conclusively gone.
+    """
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    close_paren = stat.rfind(b")")
+    fields = stat[close_paren + 2 :].split() if close_paren != -1 else []
+    if len(fields) < STAT_MIN_FIELDS:
+        return False
+    if fields[STAT_STATE_FIELD_INDEX] in {b"Z", b"X"}:
+        return True
+    try:
+        observed_start = int(fields[STAT_STARTTIME_FIELD_INDEX])
+    except ValueError:
+        observed_start = None
+    return (
+        observed_start is not None
+        and start_time_ticks is not None
+        and observed_start != start_time_ticks
+    )
+
+
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
