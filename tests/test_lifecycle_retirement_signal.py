@@ -97,6 +97,12 @@ class Harness:
         monkeypatch.setattr(os, "close", close)
         monkeypatch.setattr(lifecycle, "drain_sentinel_matches", lambda _token: False)
 
+        def absence_proven(_pid: int, ticks: int | None) -> bool:
+            identity = self.identity
+            return identity is None or identity.start_time_ticks != ticks
+
+        monkeypatch.setattr(lifecycle, "process_absence_proven", absence_proven)
+
 
 def run(h: Harness) -> bool:
     """Run ``stop_worker`` with zero grace windows.
@@ -274,6 +280,7 @@ def test_pins_are_released_after_retirement(h: Harness) -> None:
     run(h)
     # one leader pin + one per signalled member (TERM), plus escalation pass
     assert h.closes >= 3
+
 
 def test_unpinnable_leader_with_unknown_absence_fails_closed(
     h: Harness,
