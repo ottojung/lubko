@@ -457,6 +457,7 @@ GC_FINISHED_AT_PATTERN: Final = (
     r"T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
 )
 CANCEL_REQUESTED_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
+LEASE_EXPIRES_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 CANCEL_REQUESTED_SQL: Final = (
     "(jsonb_typeof((payload::jsonb)->'state'->'cancel_requested_at') = 'string'\n"
     "    AND ((payload::jsonb)->'state'->>'cancel_requested_at')\n"
@@ -3780,7 +3781,10 @@ def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, st
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
             "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status' = 'running'\n"
-            "        AND (payload::jsonb)->'state'->>'lease_expires_at' IS NOT NULL\n"
+            "        AND jsonb_typeof((payload::jsonb)->'state'->'lease_expires_at') = 'string'\n"
+            "        AND ((payload::jsonb)->'state'->>'lease_expires_at') "
+            "            ~ %(lease_expires_at_pattern)s\n"
+            "        AND left((payload::jsonb)->'state'->>'lease_expires_at', 4) <> '0000'\n"
             "        AND ((payload::jsonb)->'state'->>'lease_expires_at') < "
             + UTC_ISO_TEXT_SQL
             + "\n"
@@ -3793,7 +3797,11 @@ def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, st
             "FROM stale\n"
             "WHERE job.id = stale.id\n"
             "RETURNING job.id, job.payload\n",
-            {"server": server, "limit": LEASE_RECOVERY_LIMIT},
+            {
+                "server": server,
+                "limit": LEASE_RECOVERY_LIMIT,
+                "lease_expires_at_pattern": LEASE_EXPIRES_AT_PATTERN,
+            },
         )
         rows = cursor.fetchall()
     return [(row[0], str(row[1])) for row in rows]
