@@ -65,6 +65,19 @@
 -- The numeric comparison is performed with ::numeric (safe for every JSON
 -- number) and the type test uses `is not distinct from 'number'` so missing
 -- keys and JSON null are treated as decisively NOT a number.
+--
+-- COMMAND STATUS VALIDATION
+--
+-- A command row is lifecycle state, so its status discriminator must also be
+-- total and fail-closed at the database boundary.  `->>` alone is not a type
+-- check: PostgreSQL stringifies booleans, numbers, arrays, and objects.  The
+-- command status gate therefore first requires a JSON string and only then
+-- admits one of the five protocol lifecycle states.  This prevents malformed
+-- direct writes from becoming permanently stranded rows that are neither
+-- claimable (`pending`), recoverable (`running`), nor terminal-GC eligible.
+-- As with protocol versions, migration preflight refuses to tighten the
+-- constraint while malformed historical command status exists; it never
+-- rewrites or deletes such authority.
 
 do $$
 declare
@@ -117,14 +130,29 @@ begin
                          between retained_min and retained_max
                 else false
             end
+            and (
+                case
+                    when (payload::jsonb)->>'type' = 'command' then
+                        case
+                            when jsonb_typeof(
+                                (payload::jsonb)->'state'->'status'
+                            ) is not distinct from 'string'
+                            then (payload::jsonb)->'state'->>'status'
+                                in ('pending', 'running', 'succeeded', 'failed', 'cancelled')
+                            else false
+                        end
+                    else true
+                end
+            )
         );
 
     if nonconforming > 0 then
         raise exception using
             message = format(
                 'lubko.jobs still holds %s command/output_chunk payload(s) whose '
-                'protocol version is outside the retained range [%s, %s]. Fix the '
-                'malformed/future row or widen RETAINED_MAX before applying; the '
+                'protocol version is outside the retained range [%s, %s] or whose '
+                'command status is malformed/unsupported. Fix the malformed/future '
+                'row or widen RETAINED_MAX when appropriate before applying; the '
                 'constraint is unchanged.',
                 nonconforming, retained_min, retained_max
             );
@@ -143,7 +171,13 @@ begin
                  end)
                 and coalesce(jsonb_typeof((payload::jsonb)->''request''), '''')
                     = ''object''
-                and (((payload::jsonb)->''state''->>''status'') is not null)
+                and (case
+                    when jsonb_typeof((payload::jsonb)->''state''->''status'')
+                         is not distinct from ''string''
+                    then ((payload::jsonb)->''state''->>''status'')
+                         in (''pending'', ''running'', ''succeeded'', ''failed'', ''cancelled'')
+                    else false
+                 end)
                 and coalesce(jsonb_typeof((payload::jsonb)->''server''), '''')
                     = ''string''
                 and coalesce((payload::jsonb)->>''server'', '''') <> ''''
