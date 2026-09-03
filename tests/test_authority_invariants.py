@@ -354,7 +354,8 @@ def test_unreadable_supervisor_state_blocks_spawn(monkeypatch: pytest.MonkeyPatc
 def test_unreadable_meta_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unreadable worker meta fails closed: spawn is not authorized."""
     def read_corrupt_meta() -> None:
-        raise lifecycle.WorkerMetadataError("invalid metadata")
+        message = "invalid metadata"
+        raise lifecycle.WorkerMetadataError(message)
 
     monkeypatch.setattr(lifecycle, "read_meta_strict", read_corrupt_meta)
     facts = reconcile_authority_facts()
