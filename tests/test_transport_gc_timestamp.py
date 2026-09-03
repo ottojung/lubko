@@ -103,4 +103,9 @@ def test_gc_revalidates_timestamp_authority_before_phase_two_deletion() -> None:
         assert params["gc_finished_at_pattern"] == GC_FINISHED_AT_PATTERN
 
     assert "IN ('succeeded', 'failed', 'cancelled')" in drain_query
-    assert "((payload::jsonb)->'state'->>'gc') = 'true'" in drain_query
+    assert "(payload::jsonb)->'state'->'gc' = 'true'::jsonb" in drain_query
+    assert "(payload::jsonb)->'state'->'gc' IS NULL" in mark_query
+    assert "(payload::jsonb)->'state'->'gc' = 'null'::jsonb" in mark_query
+    assert "(payload::jsonb)->'state'->'gc' = 'false'::jsonb" in mark_query
+    assert "->>'gc'" not in mark_query
+    assert "->>'gc'" not in drain_query
