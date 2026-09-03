@@ -149,16 +149,19 @@ def test_newer_mission_survives_and_owns_authority_over_stale_migration(
     assert desired.migration is False
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    ["{broken", "0", "true", "[]", "{}", '"unsupported"'],
+)
 def test_malformed_mission_holds_cold_migration_completion(
-    isolated: Path, monkeypatch: pytest.MonkeyPatch
+    isolated: Path, monkeypatch: pytest.MonkeyPatch, malformed: str
 ) -> None:
-    """Malformed mission authority is preserved and blocks migration settlement."""
+    """Malformed mission authority is preserved and repeatedly blocks settlement."""
     del isolated
     migration_intent(6, NEW)
     ready_state(6, NEW)
     path = rollback_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    malformed = "{broken"
     path.write_text(malformed, encoding="utf-8")
     cli_calls: list[str] = []
     monkeypatch.setattr(
@@ -168,16 +171,16 @@ def test_malformed_mission_holds_cold_migration_completion(
     )
 
     daemon = SupervisorDaemon(Settings())
-    daemon._complete_cold_migration()
-
-    assert path.read_text(encoding="utf-8") == malformed
-    desired = supervise.read_desired_strict()
-    assert desired is not None
-    assert desired.migration is True
-    assert cli_calls == []
-    assert daemon._message == (
-        "corrupt supervised deployment state; cold-migration completion is held"
-    )
+    for _ in range(2):
+        daemon._complete_cold_migration()
+        assert path.read_text(encoding="utf-8") == malformed
+        desired = supervise.read_desired_strict()
+        assert desired is not None
+        assert desired.migration is True
+        assert cli_calls == []
+        assert daemon._message == (
+            "corrupt supervised deployment state; cold-migration completion is held"
+        )
 
 
 def test_in_flight_migration_holds_cli_reconciliation(isolated: Path) -> None:
