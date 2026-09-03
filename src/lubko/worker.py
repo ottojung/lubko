@@ -453,8 +453,13 @@ CHUNK_ORDER_INDEX_NAME: Final = "jobs_chunk_order_idx"
 UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
 UTC_ISO_SQL: Final = f"to_jsonb({UTC_ISO_TEXT_SQL})"
 GC_FINISHED_AT_PATTERN: Final = (
-    r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
-    r"T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
+    r"^(?:"
+    r"(?:[0-9]{4}-(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01]))"
+    r"|(?:[0-9]{4}-(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30))"
+    r"|(?:[0-9]{4}-02-(?:0[1-9]|1[0-9]|2[0-8]))"
+    r"|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])"
+    r"|(?:[02468][048]|[13579][26])00)-02-29)"
+    r")T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
 )
 CANCEL_REQUESTED_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 LEASE_EXPIRES_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
