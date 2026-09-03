@@ -159,6 +159,9 @@ def test_stale_routing_shape_is_rejected() -> None:
         "jsonb_typeof(((payload)::jsonb -> 'sequence'::text))",
         "jsonb_typeof(((payload)::jsonb -> 'start'::text))",
         "jsonb_typeof(((payload)::jsonb -> 'end'::text))",
+        "floor((((payload)::jsonb -> 'sequence'::text))::numeric)",
+        "floor((((payload)::jsonb -> 'start'::text))::numeric)",
+        "floor((((payload)::jsonb -> 'end'::text))::numeric)",
     ],
 )
 def test_payload_shape_rejects_missing_strict_semantics(strict_fragment: str) -> None:

@@ -459,10 +459,13 @@ CURRENT_TYPE_SHAPE_CONSTRAINT_MARKERS: Final = (
     "'stderr'",
     # Chunk offsets are integral, non-negative JSON numbers.
     "jsonb_typeofpayload::jsonb->'sequence'isnotdistinctfrom'number'",
+    "payload::jsonb->'sequence'::numeric=floorpayload::jsonb->'sequence'::numeric",
     "payload::jsonb->'sequence'::numeric>=0",
     "jsonb_typeofpayload::jsonb->'start'isnotdistinctfrom'number'",
+    "payload::jsonb->'start'::numeric=floorpayload::jsonb->'start'::numeric",
     "payload::jsonb->'start'::numeric>=0",
     "jsonb_typeofpayload::jsonb->'end'isnotdistinctfrom'number'",
+    "payload::jsonb->'end'::numeric=floorpayload::jsonb->'end'::numeric",
     "payload::jsonb->'end'::numeric>=0",
 )
 
