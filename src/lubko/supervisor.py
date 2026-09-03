@@ -792,7 +792,9 @@ class SupervisorDaemon:
             LOGGER.warning("cold-migration completion deferred: deployment lock is held")
             self._message = "cold-migration completion deferred; deployment in progress"
 
-    def _complete_cold_migration_locked(self, desired: supervise.SupervisorDesired) -> None:
+    def _complete_cold_migration_locked(  # ruff: ignore[too-many-return-statements]
+        self, desired: supervise.SupervisorDesired
+    ) -> None:
         """Perform cold-migration convergence while holding the deployment lock.
 
         All authority inputs are re-read inside the critical section so the
@@ -818,7 +820,11 @@ class SupervisorDaemon:
         try:
             mission = deployctl.read_rollback_state()
         except deployctl.DeployCtlError:
-            mission = None
+            self._message = "corrupt supervised deployment state; cold-migration completion is held"
+            LOGGER.exception(
+                "corrupt supervised deployment state; cold-migration completion is held"
+            )
+            return
         if mission is not None and mission.generation > desired.generation:
             # A strictly newer supervised-deployment mission supersedes the
             # migration; its own confirmation path owns authority now and its
