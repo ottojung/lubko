@@ -3212,7 +3212,7 @@ def _wait_for_any_claim(
     return False
 
 
-def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool:
+def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool | None:
     """Return whether any worker is currently consuming the queue.
 
     A probe job is inserted and must not be claimed by any worker: a claim
@@ -3230,16 +3230,16 @@ def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool:
     try:
         database = load_database_config()
     except (OSError, ValueError):
-        return False
+        return None
     try:
         conn = psycopg.connect(database.conninfo(), row_factory=tuple_row)
     except (psycopg.Error, OSError):
-        return False
+        return None
     conn.autocommit = True
     try:
         probe_id = _insert_probe_job(conn, cwd)
         if probe_id is None:
-            return False
+            return None
         try:
             return _wait_for_any_claim(conn, probe_id, timeout_seconds)
         finally:
@@ -3285,8 +3285,11 @@ def _recover_preflight(options: DeployOptions) -> str:
     if not check_postgres(options.postgres_timeout_seconds):
         msg = "cannot reach PostgreSQL; refusing to start a recovery worker"
         raise _AdoptionError(msg)
-    if _queue_has_consumer(
-        str(options.repo), min(options.probe_timeout_seconds, DEFAULT_RECOVER_PREFLIGHT_SECONDS)
+    if (
+        _queue_has_consumer(
+            str(options.repo), min(options.probe_timeout_seconds, DEFAULT_RECOVER_PREFLIGHT_SECONDS)
+        )
+        is not False
     ):
         msg = (
             "a worker is already consuming the queue; adopt the existing worker with "
