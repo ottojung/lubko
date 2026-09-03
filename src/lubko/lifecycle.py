@@ -1351,7 +1351,7 @@ def stop_worker(
         # numeric PID may even have been recycled since) or because the
         # platform cannot pin PIDs at all. Distinguish by re-reading identity:
         # a live occupant we cannot pin must never be signalled — fail closed.
-        return process_identity(meta.pid) is None
+        return process_absence_proven(meta.pid, meta.start_time_ticks)
     try:
         return _stop_pinned(meta, grace_seconds, cancel_grace_seconds)
     finally:

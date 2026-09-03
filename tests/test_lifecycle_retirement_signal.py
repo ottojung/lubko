@@ -274,3 +274,37 @@ def test_pins_are_released_after_retirement(h: Harness) -> None:
     run(h)
     # one leader pin + one per signalled member (TERM), plus escalation pass
     assert h.closes >= 3
+
+def test_unpinnable_leader_with_unknown_absence_fails_closed(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown process liveness after pidfd failure must not count as retirement."""
+    h.unpinnable = {LIVE.pid}
+    calls: list[tuple[int, int | None]] = []
+
+    def absence(pid: int, ticks: int | None) -> bool:
+        calls.append((pid, ticks))
+        return False
+
+    monkeypatch.setattr(lifecycle, "process_absence_proven", absence)
+
+    assert run(h) is False
+    assert calls == [(LIVE.pid, LIVE.start_time_ticks)]
+    assert h.sends == []
+
+
+def test_unpinnable_leader_with_proven_absence_succeeds(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Conclusive absence or PID reuse after pidfd failure counts as retirement."""
+    h.unpinnable = {LIVE.pid}
+    monkeypatch.setattr(
+        lifecycle,
+        "process_absence_proven",
+        lambda pid, ticks: (pid, ticks) == (LIVE.pid, LIVE.start_time_ticks),
+    )
+
+    assert run(h) is True
+    assert h.sends == []
