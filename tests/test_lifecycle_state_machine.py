@@ -453,10 +453,13 @@ def test_clear_stale_supervisor_override_clears_malformed_authority(
 ) -> None:
     """Successful activation clears an existing malformed override too."""
     cleared: list[bool] = []
+
+    def clear_override() -> bool:
+        cleared.append(True)
+        return True
+
     monkeypatch.setattr(supervise, "read_supervisor_runtime_override", lambda: None)
-    monkeypatch.setattr(
-        supervise, "clear_supervisor_runtime_override", lambda: cleared.append(True) or True
-    )
+    monkeypatch.setattr(supervise, "clear_supervisor_runtime_override", clear_override)
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _message: None)
     lifecycle._clear_stale_supervisor_override("c" * 40)
     assert cleared == [True]
