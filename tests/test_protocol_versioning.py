@@ -386,6 +386,39 @@ def test_earlier_transport_schema_surfaces_reject_unknown_payload_types() -> Non
         assert "else true" not in schema
 
 
+def test_chunk_schema_fields_are_type_strict_at_the_database_boundary() -> None:
+    """Chunk ownership and offsets never gain authority through text coercion."""
+    root = Path(__file__).resolve().parent.parent
+    schemas = [
+        root / "migrations" / "0001_two_column_protocol.sql",
+        root / "migrations" / "0003_protocol_v4_server_routing.sql",
+        root / "migrations" / "0005_protocol_version_window.sql",
+    ]
+
+    for path in schemas:
+        schema = path.read_text(encoding="utf-8")
+        assert (
+            "jsonb_typeof((payload::jsonb)->'thread')" in schema
+            or "jsonb_typeof((payload::jsonb)->''thread'')" in schema
+        )
+        assert (
+            "jsonb_typeof((payload::jsonb)->'stream')" in schema
+            or "jsonb_typeof((payload::jsonb)->''stream'')" in schema
+        )
+        for field in ("sequence", "start", "end"):
+            plain = f"jsonb_typeof((payload::jsonb)->'{field}')"
+            quoted = f"jsonb_typeof((payload::jsonb)->''{field}'')"
+            assert plain in schema or quoted in schema
+            assert "floor(" in schema
+            assert "::numeric >= 0" in schema
+
+    migration = schemas[-1].read_text(encoding="utf-8")
+    assert "else true" not in migration
+    assert "output_chunk structural metadata is malformed/unsupported" in migration
+    for field in ("sequence", "start", "end"):
+        assert f"->>''{field}'') ~ ''^[0-9]+$''" not in migration
+
+
 def test_migration_0005_command_status_validation_is_total_and_fail_closed() -> None:
     """The DB boundary admits only canonical JSON-string command statuses.
 
