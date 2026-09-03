@@ -41,7 +41,7 @@ constraint jobs_payload_type_shape      check (
             and (((payload::jsonb)->>'sequence') ~ '^[0-9]+$')
             and (((payload::jsonb)->>'start') ~ '^[0-9]+$')
             and (((payload::jsonb)->>'end') ~ '^[0-9]+$')
-        else true
+        else false
     end
 )
 ```
