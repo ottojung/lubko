@@ -65,6 +65,7 @@ import ctypes
 import functools
 import json
 import logging
+import math
 import os
 import secrets
 import signal
@@ -235,6 +236,23 @@ class Settings:
         Raises:
             ValueError: If any value is unusable.
         """
+        timing_settings = (
+            ("poll_interval_seconds", self.poll_interval_seconds),
+            ("backoff_base_seconds", self.backoff_base_seconds),
+            ("backoff_max_seconds", self.backoff_max_seconds),
+            ("stable_window_seconds", self.stable_window_seconds),
+            ("stop_grace_seconds", self.stop_grace_seconds),
+            ("identity_timeout_seconds", self.identity_timeout_seconds),
+            ("postgres_timeout_seconds", self.postgres_timeout_seconds),
+            ("lock_timeout_seconds", self.lock_timeout_seconds),
+            ("probe_timeout_seconds", self.probe_timeout_seconds),
+            ("readiness_interval_seconds", self.readiness_interval_seconds),
+        )
+        for name, value in timing_settings:
+            if not math.isfinite(value):
+                msg = f"{name} must be finite"
+                raise ValueError(msg)
+
         if self.poll_interval_seconds <= 0:
             msg = "LUBKO_SUPERVISOR_POLL_SECONDS must be positive"
             raise ValueError(msg)
@@ -249,6 +267,9 @@ class Settings:
             raise ValueError(msg)
         if self.identity_timeout_seconds <= 0:
             msg = "LUBKO_SUPERVISOR_IDENTITY_TIMEOUT_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.postgres_timeout_seconds <= 0 or self.lock_timeout_seconds <= 0:
+            msg = "LUBKO_SUPERVISOR database timeout settings must be positive"
             raise ValueError(msg)
         if self.probe_timeout_seconds <= 0 or self.readiness_interval_seconds <= 0:
             msg = "LUBKO_SUPERVISOR readiness probe settings must be positive"
