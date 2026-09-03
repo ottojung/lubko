@@ -69,6 +69,9 @@ CASE
 END)
 """
 
+STRICT_TYPE_SHAPE_EXPRESSION = STRICT_TYPE_SHAPE.strip()[len("CHECK (") : -1]
+
+
 STALE_ROUTING_SHAPE = """
 CHECK (
 CASE
@@ -177,6 +180,9 @@ def test_payload_shape_rejects_missing_strict_semantics(strict_fragment: str) ->
         f"({STRICT_TYPE_SHAPE}) OR (1 = 1)",
         f"CASE WHEN true THEN true ELSE ({STRICT_TYPE_SHAPE}) END",
         f"CASE WHEN 1 = 1 THEN (1 = 1) ELSE ({STRICT_TYPE_SHAPE}) END",
+        f"CHECK (NULLIF(({STRICT_TYPE_SHAPE_EXPRESSION}), false))",
+        f"CHECK (({STRICT_TYPE_SHAPE_EXPRESSION}) = NULL)",
+        f"CHECK (NOT ({STRICT_TYPE_SHAPE_EXPRESSION}))",
     ],
 )
 def test_payload_shape_rejects_permissive_branches_with_all_markers(

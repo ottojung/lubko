@@ -497,7 +497,9 @@ def _has_current_type_shape_constraint(definition: str) -> bool:
     """
     normalized = _normalized_constraint_definition(definition)
     unquoted = re.sub(r"'(?:''|[^'])*'", "''", definition.lower())
-    if re.search(r"\bor\b", unquoted) or re.search(r"\btrue\b", unquoted):
+    if not normalized.startswith("checkcase") or not normalized.endswith("end"):
+        return False
+    if re.search(r"\b(?:or|true|null|nullif)\b", unquoted):
         return False
     keyword_counts = tuple(
         len(re.findall(rf"\b{keyword}\b", unquoted))
