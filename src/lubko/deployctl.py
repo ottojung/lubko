@@ -494,9 +494,11 @@ def _mission_candidate_alive(state: RollbackState) -> bool:
     Returns:
         ``True`` when the candidate consumer is currently live.
     """
-    if supervise.supervisor_running():
-        return _supervised_mission_active(state)
-    return worker_alive(state.new_meta)
+    if state.supervisor_owned is False:
+        return worker_alive(state.new_meta)
+    if not supervise.supervisor_running():
+        return False
+    return _supervised_mission_active(state)
 
 
 def _supervised_mission_authoritative(state: RollbackState) -> bool:
@@ -530,11 +532,13 @@ def _pending_mission_rollback_due(state: RollbackState) -> bool:
     Returns:
         ``True`` when the mission must roll back now.
     """
-    if supervise.supervisor_running():
-        if not _supervised_mission_authoritative(state):
-            return True
-        return time.time() >= state.deadline and not _supervised_mission_active(state)
-    return time.time() >= state.deadline or not worker_alive(state.new_meta)
+    if state.supervisor_owned is False:
+        return time.time() >= state.deadline or not worker_alive(state.new_meta)
+    if not supervise.supervisor_running():
+        return True
+    if not _supervised_mission_authoritative(state):
+        return True
+    return time.time() >= state.deadline and not _supervised_mission_active(state)
 
 
 def settle_desired(commit: str, repo: str, uv_path: str) -> int:
@@ -1504,7 +1508,9 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             continue
         if state is None or state.status in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
             return
-        if supervise.supervisor_running():
+        if state.supervisor_owned is False:
+            should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
+        elif supervise.supervisor_running():
             # While the supervisor is present, candidate liveness is a separate
             # observation: only roll back after the deadline AND the exact child
             # is no longer proven live.  A stale state.json child must not count
@@ -1512,7 +1518,7 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
                 state
             )
-        elif state.supervisor_owned is not False:
+        else:
             # Pending supervised missions and missions with unknown lifecycle
             # authority must never enter the legacy direct rollback/worker
             # lifecycle.  If the supervisor is temporarily absent, fail closed
@@ -1520,8 +1526,6 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             # the next supervisor incarnation.  ``None`` (unknown authority)
             # fails closed identically to ``True``.
             should_rollback = False
-        else:
-            should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
         if should_rollback:
             try:
                 with deploy_lock(lock_timeout_seconds):

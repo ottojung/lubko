@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import lubko.deployctl as dc
-from lubko import cli, lifecycle, supervise
+from lubko import cli, lifecycle, lifecycle_state, supervise
 
 COMMIT = "2" * 40
 PREVIOUS_COMMIT = "1" * 40
@@ -217,9 +218,11 @@ def test_legacy_authority_does_not_sample_supervisor_liveness_between_phases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Ambient liveness changes cannot transfer an explicit legacy mission."""
-    state = _pending_state(supervisor_owned=False)
+    state = replace(_pending_state(supervisor_owned=False), deadline=10**20)
     liveness = iter([False, True])
     monkeypatch.setattr(supervise, "supervisor_running", lambda: next(liveness))
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(lifecycle_state, "authorize_mission_confirm", lambda _facts: True)
     monkeypatch.setattr(cli, "build_cli_root", lambda *_args: None)
     monkeypatch.setattr(dc, "write_meta", lambda _meta: None)
     monkeypatch.setattr(dc, "_write_state", lambda _state: None)
@@ -227,6 +230,7 @@ def test_legacy_authority_does_not_sample_supervisor_liveness_between_phases(
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
     monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
 
+    dc._authorize_confirmation(state)
     dc._prepare_confirmation_candidate(state, _options())
     terminal = dc._finalize_confirmation(state)
 
