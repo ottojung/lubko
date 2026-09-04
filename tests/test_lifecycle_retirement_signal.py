@@ -320,6 +320,18 @@ def test_pinned_leader_with_unknown_identity_fails_closed(
     assert h.sends == []
 
 
+def test_pinned_leader_with_proven_absence_succeeds(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive absence proof after a successful pin permits retirement."""
+    h.identity = None
+    monkeypatch.setattr(lifecycle, "process_absence_proven", lambda _pid, _ticks: True)
+
+    assert run(h) is True
+    assert h.sends == []
+
+
 def test_unpinnable_leader_with_proven_absence_succeeds(
     h: Harness,
     monkeypatch: pytest.MonkeyPatch,
