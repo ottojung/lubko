@@ -560,7 +560,9 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
     lifecycle_state.failpoint(lifecycle_state.FAILPOINT_MISSION_CONFIRM)
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         raise DeployCtlError("the external supervisor did not apply the requested target")
-    if not supervise.wait_until_ready(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+    if not supervise.wait_until_ready(
+        generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS, commit=commit
+    ):
         raise DeployCtlError(
             "the external supervisor did not prove the requested worker queue-ready"
         )
@@ -609,7 +611,9 @@ def _wait_for_supervisor_mission(
     ):
         msg = "the external supervisor did not apply the pending supervised mission"
         raise DeployCtlError(msg)
-    if not supervise.wait_until_ready(state.generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
+    if not supervise.wait_until_ready(
+        state.generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS, commit=state.commit
+    ):
         msg = "the external supervisor did not prove the candidate consumes the queue"
         raise DeployCtlError(msg)
     live = replace(state, deadline=time.time() + confirm_window_seconds)

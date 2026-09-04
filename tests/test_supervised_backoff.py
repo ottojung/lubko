@@ -322,6 +322,32 @@ def test_wait_until_ready_polls_through_transient_child_none(
     assert observations == []
 
 
+def test_wait_until_ready_rejects_superseding_different_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer ready generation for another commit cannot satisfy the wait."""
+    observation = replace(
+        _supervisor_status(child=None, ready=True),
+        applied_generation=GENERATION + 1,
+        commit=OTHER_COMMIT,
+    )
+    monkeypatch.setattr(supervise, "read_status", lambda: observation)
+    assert supervise.wait_until_ready(GENERATION, timeout_seconds=10.0, commit=NEW_COMMIT) is False
+
+
+def test_wait_until_ready_accepts_newer_same_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer generation remains valid when it proves the same exact commit ready."""
+    observation = replace(
+        _supervisor_status(child=None, ready=True),
+        applied_generation=GENERATION + 1,
+        commit=NEW_COMMIT,
+    )
+    monkeypatch.setattr(supervise, "read_status", lambda: observation)
+    assert supervise.wait_until_ready(GENERATION, timeout_seconds=10.0, commit=NEW_COMMIT) is True
+
+
 def test_wait_until_ready_times_out_without_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

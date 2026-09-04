@@ -1803,30 +1803,34 @@ def wait_for_generation(generation: int, timeout_seconds: float) -> bool:
     return False
 
 
-def wait_until_ready(generation: int, timeout_seconds: float) -> bool:
+def wait_until_ready(generation: int, timeout_seconds: float, *, commit: str | None = None) -> bool:
     """Wait until the daemon proves its worker consumes the queue.
 
     Readiness is the daemon's own proof that the exact worker child it spawned
     reached the queue-consumer boundary, so waiting here means the replacement
     is genuinely consuming ``lubko.jobs``, not merely alive or PostgreSQL
-    reachable.
+    reachable. When ``commit`` is supplied, a generation at or beyond the
+    requested generation may satisfy the wait only while it still targets that
+    exact commit. A newer generation for another commit supersedes the request
+    and therefore fails closed immediately.
 
     Args:
         generation: Requested generation.
         timeout_seconds: Maximum seconds to wait.
+        commit: Optional exact commit that must still own the applied generation.
 
     Returns:
         ``True`` when the daemon applied the generation and its worker is
-        queue-ready.
+        queue-ready for the requested commit.
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         status = read_status()
-        # A ``child=None`` observation is the daemon's ordinary bounded
-        # restart-backoff state for the same applied generation, not a
-        # terminal failure: keep polling until readiness or this timeout.
-        if status is not None and status.applied_generation >= generation and status.ready:
-            return True
+        if status is not None and status.applied_generation >= generation:
+            if commit is not None and status.commit != commit:
+                return False
+            if status.ready:
+                return True
         time.sleep(REQUEST_POLL_SECONDS)
     return False
 
