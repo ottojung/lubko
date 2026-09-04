@@ -13,16 +13,9 @@ The supported startup definition is::
     tini-static -- lubko-supervisor
 
 Tini is the container init: it launches the supervisor as its direct child and
-reaps zombies / forwards signals.  Tini does **not** restart the supervisor
-when it exits — that restart authority is the container or service restart
-policy (for example a container ``restart: always`` or a systemd
-``Restart=always``).  The versioned contract therefore encodes that external
-restart policy as well as the exact ``tini-static -- lubko-supervisor`` command.
-The repository-owned deployment seam proves the configured authority as far as
-it can: the generated launcher is installed/validated by install/bootstrap, the
-recorded contract must equal :data:`CURRENT_CONTRACT` exactly, and an optional
-environment seam (``LUBKO_SUPERVISOR_RESTART_POLICY``) lets an orchestrator
-inject the live policy for a fail-closed check.
+reaps zombies / forwards signals. The outer host/container environment is trusted
+to restart Lubko appropriately; that external setup is intentionally outside this
+contract and is neither declared nor inspected by Lubko.
 
 The live proof walks the exact process tree and rejects unsupported topologies
 such as ``tini-static -- sleep infinity``: the supervisor must be a live
@@ -83,13 +76,6 @@ STARTUP_DEFINITION_NAME: Final = "lubko-startup-definition.json"
 #: Schema version of the startup definition artifact.
 STARTUP_DEFINITION_SCHEMA_VERSION: Final = 1
 
-#: Environment variable through which an orchestrator may inject the live
-#: restart policy for a fail-closed deployment-seam check.
-RESTART_POLICY_ENV: Final = "LUBKO_SUPERVISOR_RESTART_POLICY"
-
-#: Canonical required restart policy (container ``restart: always`` /
-#: systemd ``Restart=always``).
-DEFAULT_RESTART_POLICY: Final = "always"
 
 #: Required permission mode for the contract's state directories: private to
 #: the owner, no group or world access.
@@ -136,8 +122,7 @@ class StartupContract:
 
     The contract is the repository-owned definition of how the container must
     start the supervisor.  It names the exact ``tini-static -- lubko-supervisor``
-    command, the external restart authority (the container/service restart
-    policy — Tini only reaps and forwards signals), and the state directories
+    command and the state directories
     the deployment must mount with the required permissions.  A version change
     or any semantic difference from :data:`CURRENT_CONTRACT` fails closed: an
     installation that recorded an obsolete or divergent contract is never
@@ -150,8 +135,6 @@ class StartupContract:
     supervisor_markers: tuple[str, ...]
     supervisor_command: tuple[str, ...]
     worker_relationship: str
-    restart_policy: str
-    restart_authority: str
     required_state_dirs: tuple[str, ...]
     required_config_files: tuple[str, ...]
 
@@ -168,8 +151,6 @@ class StartupContract:
             "supervisor_markers": list(self.supervisor_markers),
             "supervisor_command": list(self.supervisor_command),
             "worker_relationship": self.worker_relationship,
-            "restart_policy": self.restart_policy,
-            "restart_authority": self.restart_authority,
             "required_state_dirs": list(self.required_state_dirs),
             "required_config_files": list(self.required_config_files),
         }
@@ -206,15 +187,7 @@ class StartupContract:
             data.get("required_config_files"), "required_config_files"
         )
         worker_relationship = data.get("worker_relationship")
-        restart_policy = data.get("restart_policy")
-        restart_authority = data.get("restart_authority")
         if not isinstance(worker_relationship, str):
-            msg = "startup contract is malformed"
-            raise TypeError(msg)
-        if not isinstance(restart_policy, str):
-            msg = "startup contract is malformed"
-            raise TypeError(msg)
-        if not isinstance(restart_authority, str):
             msg = "startup contract is malformed"
             raise TypeError(msg)
         return cls(
@@ -224,8 +197,6 @@ class StartupContract:
             supervisor_markers=supervisor_markers,
             supervisor_command=supervisor_command,
             worker_relationship=worker_relationship,
-            restart_policy=restart_policy,
-            restart_authority=restart_authority,
             required_state_dirs=required_state_dirs,
             required_config_files=required_config_files,
         )
@@ -239,11 +210,6 @@ CURRENT_CONTRACT: Final = StartupContract(
     supervisor_markers=DEFAULT_SUPERVISOR_MARKERS,
     supervisor_command=("lubko-supervisor",),
     worker_relationship="direct-child",
-    restart_policy=DEFAULT_RESTART_POLICY,
-    restart_authority=(
-        "container restart policy (restart=always) or systemd Restart=always; "
-        "tini-static is init/reaper/signal-forwarder only"
-    ),
     required_state_dirs=("supervisor", "worker", "deploy"),
     required_config_files=DEFAULT_CONFIG_FILES,
 )
@@ -300,22 +266,6 @@ class TopologyProof:
     worker_pid: int | None
     worker_is_direct_child: bool
     worker_identity_matches: bool
-    message: str
-
-
-@dataclass(frozen=True, slots=True)
-class RestartAuthorityProof:
-    """Proof of the external restart authority recorded by the contract.
-
-    Tini does not restart the supervisor; the container/service restart policy
-    does.  The contract records the required policy, and an orchestrator may
-    inject the live policy through :data:`RESTART_POLICY_ENV` for a fail-closed
-    seam check.
-    """
-
-    ok: bool
-    policy: str
-    source: str
     message: str
 
 
@@ -672,8 +622,8 @@ def generate_startup_definition() -> dict[str, object]:
 
     The definition is the authoritative, versioned description of how the
     supported deployment must start the supervisor: the exact
-    ``tini-static -- lubko-supervisor`` command, the external restart policy,
-    the required state mounts, and the private config path expectations. It is
+    ``tini-static -- lubko-supervisor`` command, required state mounts, and the
+    private config path expectations. It is
     consumed by the supported install/bootstrap/deploy path and validated exactly
     by the maintained verifier — unlike a prose instruction, it controls startup.
 
@@ -683,8 +633,6 @@ def generate_startup_definition() -> dict[str, object]:
     return {
         "schema_version": STARTUP_DEFINITION_SCHEMA_VERSION,
         "command": list(canonical_startup_command()),
-        "restart_policy": DEFAULT_RESTART_POLICY,
-        "restart_authority": CURRENT_CONTRACT.restart_authority,
         "required_state_dirs": list(CURRENT_CONTRACT.required_state_dirs),
         "required_config_files": list(CURRENT_CONTRACT.required_config_files),
     }
@@ -763,8 +711,8 @@ def install_and_validate_startup_definition(bin_home: Path) -> str | None:
     deployment while the repository-owned startup definition or its state mounts
     are missing or have drifted. The deployment remains container-agnostic: it
     installs the authoritative definition this repo owns, but cannot mutate the
-    outer container manager, so the restart authority itself is proven separately
-    by the verifier against injected deployment-seam evidence.
+    outer container manager. Outer host/service-manager behavior is trusted and
+    intentionally outside this verifier.
 
     Args:
         bin_home: Directory containing the launcher scripts.
@@ -791,64 +739,6 @@ def install_and_validate_startup_definition(bin_home: Path) -> str | None:
     if not paths.ok:
         return f"required startup state directories are not satisfied: {paths.message}"
     return None
-
-
-def prove_restart_authority(
-    contract: StartupContract,
-    *,
-    configured_policy: str | None = None,
-) -> RestartAuthorityProof:
-    """Prove the external restart authority recorded by the contract.
-
-    Tini reaps and forwards signals but does not restart the supervisor; the
-    container/service restart policy is the restart authority.  The contract of
-    record alone is **not** activation proof: this repo cannot observe or mutate
-    the outer container/service restart policy, so a present contract that merely
-    says ``restart_policy == "always"`` must never satisfy the proof.  Concrete,
-    configured restart-authority evidence from the supported deployment seam is
-    required.  The optional :data:`RESTART_POLICY_ENV` (or an explicit
-    ``configured_policy`` from the deployment seam) is that evidence; when it is
-    absent the proof fails closed rather than reporting the supported topology as
-    active.
-
-    Args:
-        contract: The recorded (or current) contract.
-        configured_policy: Override for the live policy (used by tests and the
-            deployment seam); defaults to :data:`RESTART_POLICY_ENV`.
-
-    Returns:
-        The restart-authority proof.
-    """
-    live = (
-        configured_policy if configured_policy is not None else os.environ.get(RESTART_POLICY_ENV)
-    )
-    if live is None:
-        return RestartAuthorityProof(
-            ok=False,
-            policy=contract.restart_policy,
-            source="no-evidence",
-            message=(
-                "no configured/activated restart-policy evidence is available; the "
-                "contract of record alone is not startup-activation proof (supply "
-                f"{RESTART_POLICY_ENV} from the deployment seam)"
-            ),
-        )
-    if live != contract.restart_policy:
-        return RestartAuthorityProof(
-            ok=False,
-            policy=live,
-            source=f"deployment-seam:{RESTART_POLICY_ENV}",
-            message=(
-                f"configured restart policy {live!r} differs from the contract "
-                f"policy {contract.restart_policy!r}"
-            ),
-        )
-    return RestartAuthorityProof(
-        ok=True,
-        policy=live,
-        source=f"deployment-seam:{RESTART_POLICY_ENV}",
-        message="configured restart policy matches the contract",
-    )
 
 
 def _read_proc_stat(pid: int) -> bytes | None:
@@ -1177,7 +1067,7 @@ def _topology_message(proof: TopologyProof) -> str:
             proof.uses_sleep_placeholder,
             (
                 "unsupported placeholder topology: Tini launched 'sleep infinity' instead of "
-                "lubko-supervisor; the worker has no supervisor restart authority"
+                "lubko-supervisor; the worker has no supported supervisor"
             ),
         ),
         (
