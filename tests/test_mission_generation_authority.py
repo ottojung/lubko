@@ -58,7 +58,6 @@ def _mission(
         status=status,
         commit=commit,
         previous_commit=OLD,
-        challenge_hash=None,
         deadline=0.0,
         repo="/workspace/repo",
         uv_path="uv",
