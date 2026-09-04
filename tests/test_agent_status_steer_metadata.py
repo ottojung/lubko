@@ -58,3 +58,12 @@ def test_status_json_fails_closed_on_malformed_steer_sequence() -> None:
     assert status["steers_pending"] is None
     assert status["next_steer"] is None
     assert status["steer_metadata_error"] == "malformed persisted steer metadata"
+
+
+def test_status_json_exposes_active_hard_preemption() -> None:
+    """Status distinguishes queued steering from an actively superseded invocation."""
+    status = _status({"intent": "steer", "steer_seq": 1, "steer_queue": []})
+    assert status["steer_preempting"] is True
+
+    idle = _status({"intent": None, "steer_seq": 0, "steer_queue": []})
+    assert idle["steer_preempting"] is False
