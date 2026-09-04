@@ -8,15 +8,14 @@ from typing import cast
 
 import pytest
 
-import lubko.cli as cli
 import lubko.deployctl as dc
-import lubko.supervise as supervise
+from lubko import cli, supervise
 
 COMMIT = "2" * 40
 PREVIOUS_COMMIT = "1" * 40
 
 
-def _pending_state(supervisor_owned: bool | None) -> dc.RollbackState:
+def _pending_state(*, supervisor_owned: bool | None) -> dc.RollbackState:
     """Return a minimal pending mission for confirmation finalization tests."""
     return cast(
         "dc.RollbackState",
@@ -46,13 +45,13 @@ def _options() -> dc.Options:
     )
 
 
-@pytest.mark.parametrize("supervisor_owned", [True, None])
-def test_supervised_confirmation_requires_live_supervisor_at_terminalization(
+def _assert_supervisor_authority_requires_liveness(
     monkeypatch: pytest.MonkeyPatch,
+    *,
     supervisor_owned: bool | None,
 ) -> None:
-    """Supervised or unknown ownership cannot degrade to legacy confirmation."""
-    state = _pending_state(supervisor_owned)
+    """Assert durable supervisor authority cannot degrade to legacy confirmation."""
+    state = _pending_state(supervisor_owned=supervisor_owned)
     writes: list[object] = []
     pointer_updates: list[str] = []
     monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
@@ -67,11 +66,25 @@ def test_supervised_confirmation_requires_live_supervisor_at_terminalization(
     assert pointer_updates == []
 
 
+def test_supervisor_owned_confirmation_requires_live_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Supervisor-owned confirmation cannot degrade to legacy confirmation."""
+    _assert_supervisor_authority_requires_liveness(monkeypatch, supervisor_owned=True)
+
+
+def test_unknown_confirmation_ownership_requires_live_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown confirmation ownership fails closed without a supervisor."""
+    _assert_supervisor_authority_requires_liveness(monkeypatch, supervisor_owned=None)
+
+
 def test_explicit_legacy_confirmation_can_terminalize_without_supervisor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit legacy ownership retains direct no-supervisor confirmation."""
-    state = _pending_state(False)
+    state = _pending_state(supervisor_owned=False)
     writes: list[dc.RollbackState] = []
     pointer_updates: list[str] = []
     monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
@@ -91,7 +104,7 @@ def test_confirmation_fails_closed_if_supervisor_disappears_after_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A live preparation observation cannot authorize later legacy fallback."""
-    state = _pending_state(True)
+    state = _pending_state(supervisor_owned=True)
     liveness = iter([True, False])
     settled: list[tuple[str, str, str]] = []
     writes: list[object] = []
