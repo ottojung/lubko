@@ -1440,6 +1440,11 @@ def _rollback_locked(state: RollbackState) -> bool:
             else:
                 finalized = True
         return finalized
+    if state.supervisor_owned is not False:
+        append_deploy_log(
+            "supervised rollback lost supervisor authority before settlement; holding pending mission"
+        )
+        return False
     if not _retire_candidate_locked(state):
         return False
     return _restore_previous_locked(state)
