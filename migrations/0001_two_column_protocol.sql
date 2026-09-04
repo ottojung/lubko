@@ -1,8 +1,10 @@
--- Lubko transport queue baseline.
+-- Frozen Lubko PostgreSQL transport contract.
 --
--- PostgreSQL owns only the frozen transport metadata. The payload is opaque
--- text to PostgreSQL; all JSON shape, protocol version, routing, lifecycle,
--- and compatibility semantics are enforced by Lubko application code.
+-- PostgreSQL is deliberately unaware of the application payload format. The
+-- catalog contract is fixed: one schema, one two-column queue table, the UUID
+-- primary-key/default, payload NOT NULL, and the already-established worker
+-- access grants. Protocol evolution happens only in application code and in the
+-- opaque payload text; normal Lubko upgrades must not alter PostgreSQL metadata.
 
 create schema if not exists lubko;
 
@@ -11,8 +13,9 @@ create table if not exists lubko.jobs (
     payload text not null
 );
 
--- lubko_worker is the stable transport credential. This access arrangement is
--- frozen infrastructure rather than an application-protocol boundary.
+-- `lubko_worker` is existing frozen access infrastructure. This baseline does
+-- not create users or credentials. When the role already exists, make the
+-- stable table privileges idempotently explicit.
 do $$
 begin
     if to_regrole('lubko_worker') is not null then

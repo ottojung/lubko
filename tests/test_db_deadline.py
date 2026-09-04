@@ -329,7 +329,6 @@ def test_connect_selects_the_production_deadline_connection(
         DatabaseConfig(host="h", port=1, dbname="d", user="u", password=str(uuid4())),
     )
     monkeypatch.setattr(worker, "verify_jobs_table_invariant", lambda _conn: None)
-    monkeypatch.setattr(worker, "verify_protocol_schema", lambda _conn: None)
     # Bind the recording double into the module globals without tripping the
     # lazy ``__getattr__`` loader: setattr would resolve the real driver-bound
     # class just to check for its existence.

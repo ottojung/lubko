@@ -123,55 +123,46 @@ If the Lubko deployment architecture is later changed to weaken this isolation �
 
 # Supabase job transport
 
-Lubko jobs live in one PostgreSQL table, **`lubko.jobs`**, which has **exactly two columns forever**:
+Lubko jobs live in one PostgreSQL table, **`lubko.jobs`**, whose PostgreSQL
+metadata is frozen:
 
 ```sql
 id      uuid primary key default gen_random_uuid()
 payload text not null
 ```
 
-`payload` is one string containing a JSON object (protocol v4, documented in `docs/protocol.md`). Every evolving job/request/result/state/cancellation/process-identity/output field lives inside it:
+`payload` is opaque text to PostgreSQL. The database does not validate JSON,
+protocol versions, server routing, command/output kinds, lifecycle fields, or
+output-chunk structure, and it has no payload-aware secondary indexes. All of
+those semantics belong to Lubko application code.
+
+Never add a third column and never require PostgreSQL metadata/catalog changes
+for a Lubko protocol upgrade. Do not add or evolve payload CHECK constraints,
+payload expression indexes, per-server database roles, RLS, policies, triggers,
+functions, views, sequences, or other protocol-supporting catalog objects.
+Existing `lubko_worker` access is frozen infrastructure rather than an evolving
+protocol mechanism.
+
+The current application protocol is versioned inside `payload` and documented in
+`docs/protocol.md`. A typical command contains:
 
 ```text
-payload.v                  protocol version (currently 4)
-payload.server             required non-empty string naming the execution server that owns and runs the row
-payload.type               job kind: "command" or "output_chunk"
+payload.v                  application protocol version
+payload.server             required non-empty execution-server identity
+payload.type               "command" or "output_chunk"
 payload.request.cwd        working directory
-payload.request.process    argv array (required; executed directly, never through a shell)
+payload.request.process    argv array
 payload.state.status       pending | running | succeeded | failed | cancelled
-payload.state.created_at / updated_at / started_at / finished_at
-payload.state.worker_id
-payload.state.worker_incarnation
-payload.state.lease_expires_at / recovered_at
-payload.state.process_pid / process_pgid
-payload.state.cancel_requested_at
-payload.output.<stream>.tail / start / end / previous   bounded live output window
-payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
+...                        other application-managed lifecycle/output fields
 ```
 
-Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware but deliberately generic: `command` rows need a `request` object, `state.status`, and a required non-empty top-level `server` string at protocol version 4, while `output_chunk` rows need explicit `thread` ownership, value/offset shape, and the same server field. The payload parser (`protocol.py`) additionally enforces that `request.process` is required — a non-empty array of non-empty strings — and that the legacy `request.command` / `request.args` keys are rejected; the server routing requirement itself IS encoded in SQL.
+SQL may cast `payload::jsonb` transiently for application predicates and atomic
+updates, but those casts do not make JSON shape part of PostgreSQL metadata.
+Server isolation is enforced by exact application-level server predicates on
+claims, updates, cancellation, finalization, recovery, and GC.
 
-Immutable historical output lives in separate `output_chunk` rows in the same two-column table, explicitly owned by a root job via `payload.thread`. Root live output tails are bounded rolling windows of the newest up to 4000 raw bytes per stream (decoded to at most 4000 characters), never shortened by archival rotation. Chunk insertion and the root `previous` pointer update are transactional, and the publication transaction first retains the root `command` row with a row-level lock so a root deleted concurrently leaves no new chunk rows.
-
-The worker atomically claims pending `command` rows whose `payload.server` exactly equals the daemon's configured server identity (the non-empty `server` setting of its restricted worker configuration file), using PostgreSQL row locking and a JSON compare-and-swap, including `FOR UPDATE SKIP LOCKED`; jobs addressed to other servers stay pending untouched. Running jobs carry a lease (`payload.state.lease_expires_at`) refreshed by the owning worker's heartbeat; on crash/restart an expired lease is recovered by marking the abandoned job `failed` with a `payload.result.recovery_note` rather than re-executing it. A live job is never stolen, and recovery never lets two workers execute the same job concurrently. Timing is configurable (`LUBKO_LEASE_DURATION_SECONDS`, `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`, `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS`); see the README.
-
-One worker is a single nonblocking supervisor and runs arbitrarily many jobs concurrently; there is no application-level concurrency limit, so submitting several independent jobs lets them genuinely run at the same time.
-
-Protocol version upgrades are breaking and destructive. The v3 → v4 cutover
-**discards old transport contents rather than migrating them**: every existing
-root `command` row and its `output_chunk` history in `lubko.jobs` is purged,
-and no v3 row is transformed or preserved. There is no protocol-data drain or migration,
-and no compatibility path — v4 rejects all v3 payloads, which lack the required
-non-empty top-level `server` field. Operationally, quiesce the
-live queue by stopping new submissions, let any in-flight work become durably
-terminal, `truncate lubko.jobs` while quiescent (truncating before applying is
-required; applying against nonconforming rows fails fast with an explicit
-diagnostic), apply `migrations/0003_protocol_v4_server_routing.sql`, start each
-daemon with its configured server identity, and prove a fresh v4
-round trip. The end state is an empty `lubko.jobs` with no v3 or historical
-content left behind.
-
----
+Protocol evolution—including changes to top-level `v`—must remain compatible with
+this fixed database contract. See `docs/protocol_upgrades.md`.
 
 # Creating and polling a Supabase job
 
