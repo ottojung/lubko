@@ -1116,37 +1116,42 @@ def _abort_mission(gated: GatedWorker | None, state: RollbackState) -> None:
     cli.remove_cli_root(state.commit)
 
 
-def _complete_handoff(
+def _complete_supervisor_owned_handoff(
     options: Options,
     state: RollbackState,
     gated: GatedWorker | None,
 ) -> RollbackState:
-    """Cross the destructive handoff for a prepared pending mission.
-
-    With a live external supervisor the handoff is purely durable: the pending
-    mission is published so the daemon (the single process-lifecycle
-    authority) retires the previous worker and starts the candidate from its
-    sealed runtime as a direct child, and deployctl waits for the daemon to
-    prove candidate readiness. Without a supervisor (one-time bootstrap /
-    emergency path only) the legacy gate release runs.
-
-    Args:
-        options: Deployment options.
-        state: Prepared pending mission.
-        gated: The gated candidate (legacy path), or ``None`` when supervised.
+    """Publish and await a handoff prepared for supervisor ownership.
 
     Returns:
-        The live pending rollback state.
-
-    Raises:
-        DeployCtlError: If the handoff cannot complete; rollback is attempted.
+        The live pending rollback state after supervisor convergence.
     """
+    if gated is not None:
+        _abort_gated_candidate(gated)
+        raise DeployCtlError("supervisor-owned handoff cannot carry a legacy gated candidate")
+    publish_mission(state, options.lock_timeout_seconds)
+    return _wait_for_supervisor_mission(state, options.confirm_window_seconds)
+
+
+def _complete_legacy_handoff(
+    options: Options,
+    state: RollbackState,
+    gated: GatedWorker | None,
+) -> RollbackState:
+    """Complete an explicitly legacy gated handoff without mixing authorities.
+
+    Returns:
+        The live pending rollback state after the gated candidate is released.
+    """
+    if gated is None:
+        raise DeployCtlError("legacy handoff requires its prepared gated candidate")
     if supervise.supervisor_running():
-        publish_mission(state, options.lock_timeout_seconds)
-        return _wait_for_supervisor_mission(state, options.confirm_window_seconds)
-    if gated is None:  # pragma: no cover - impossible without a supervisor
-        msg = "cannot hand off a supervisor-owned mission without a supervisor"
-        raise DeployCtlError(msg)
+        _abort_gated_candidate(gated)
+        if not _rollback_locked(state):
+            raise DeployCtlError(
+                "legacy handoff lost authority to a live supervisor and rollback remains pending"
+            )
+        raise DeployCtlError("legacy handoff aborted because a supervisor became authoritative")
     retiring = replace(state, previous_retiring=True)
     _write_state(retiring)
     try:
@@ -1162,6 +1167,38 @@ def _complete_handoff(
         _abort_gated_candidate(gated)
         _rollback_locked(retiring)
         raise
+
+
+def _complete_handoff(
+    options: Options,
+    state: RollbackState,
+    gated: GatedWorker | None,
+) -> RollbackState:
+    """Cross the destructive handoff under the preparation's durable authority.
+
+    ``state.supervisor_owned`` freezes the ownership mode chosen during
+    preparation. A later supervisor liveness observation may affect whether a
+    legacy handoff is still safe, but it must never silently reclassify the
+    prepared mission or mix supervisor-owned and gated legacy artifacts.
+
+    Args:
+        options: Deployment options.
+        state: Prepared pending mission with explicit durable ownership.
+        gated: The gated candidate (legacy path), or ``None`` when supervised.
+
+    Returns:
+        The live pending rollback state.
+
+    Raises:
+        DeployCtlError: If the handoff cannot complete safely.
+    """
+    if state.supervisor_owned is True:
+        return _complete_supervisor_owned_handoff(options, state, gated)
+    if state.supervisor_owned is False:
+        return _complete_legacy_handoff(options, state, gated)
+    if gated is not None:
+        _abort_gated_candidate(gated)
+    raise DeployCtlError("cannot hand off a deployment with unknown supervisor ownership")
 
 
 def _restart_previous(state: RollbackState) -> WorkerMeta | None:
