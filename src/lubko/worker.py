@@ -3942,12 +3942,24 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str, *, server: 
 
 
 _REAP_UNSUPPORTED_TEMPLATE: Final = """\
-SELECT id, ((payload::jsonb)->'v')::int AS version
+SELECT id, (payload::jsonb)->>'v' AS version,
+       jsonb_typeof((payload::jsonb)->'v') AS version_type
 FROM lubko.jobs
 WHERE (payload::jsonb)->>'type' = 'command'
     AND jsonb_typeof((payload::jsonb)->'server') = 'string'
     AND (payload::jsonb)->>'server' = %(server)s
     AND (payload::jsonb)->'state'->>'status' = 'pending'
+    AND CASE
+        WHEN jsonb_typeof((payload::jsonb)->'v') = 'number'
+             AND (payload::jsonb)->>'v' ~ '^-?[0-9]+$'
+        THEN left((payload::jsonb)->>'v', 1) = '-'
+             OR length((payload::jsonb)->>'v') < length(%(protocol_version)s::text)
+             OR (
+                 length((payload::jsonb)->>'v') = length(%(protocol_version)s::text)
+                 AND (payload::jsonb)->>'v' < %(protocol_version)s::text
+             )
+        ELSE true
+    END
 ORDER BY (payload::jsonb)->'state'->>'created_at', id
 LIMIT %(limit)s
 FOR UPDATE SKIP LOCKED
@@ -4034,18 +4046,37 @@ def reap_unsupported_jobs(conn: JobsConnection, settings: Settings, limit: int) 
         The identifiers of the jobs failed closed this pass.
     """
     reaped: list[UUID] = []
+    params = {
+        "server": settings.server,
+        "limit": limit,
+        "protocol_version": CURRENT_PROTOCOL_VERSION,
+    }
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
-        cursor.execute(_REAP_UNSUPPORTED_TEMPLATE, {"server": settings.server, "limit": limit})
-        for job_id, version in cursor.fetchall():
-            if version is None:
-                continue
-            if reaper_disposition(int(version)) is JobVersionDisposition.FAIL_CLOSED:
+        cursor.execute(_REAP_UNSUPPORTED_TEMPLATE, params)
+        for job_id, version, version_type in cursor.fetchall():
+            parsed_version: int | None = None
+            if version_type == "number" and version is not None:
+                try:
+                    parsed_version = int(str(version))
+                except ValueError:
+                    parsed_version = None
+            if parsed_version is not None:
+                if reaper_disposition(parsed_version) is not JobVersionDisposition.FAIL_CLOSED:
+                    # Defensive only: the SQL deliberately excludes current and
+                    # future integer versions before LIMIT, so they cannot starve
+                    # safely terminalizable rows from the bounded batch.
+                    continue
                 diagnostic = (
                     f"protocol version {version} is below the retired current version "
                     f"{CURRENT_PROTOCOL_VERSION}; the job is failed closed"
                 )
-                if fail_unsupported_job(conn, job_id, diagnostic, server=settings.server):
-                    reaped.append(job_id)
+            else:
+                diagnostic = (
+                    "payload 'v' must be an integer protocol version; "
+                    "the malformed pending job is failed closed"
+                )
+            if fail_unsupported_job(conn, job_id, diagnostic, server=settings.server):
+                reaped.append(job_id)
     return reaped
 
 
@@ -4594,8 +4625,13 @@ class Supervisor:
         if not self._stopping:
             self._claim_batch()
         # Optional maintenance follows claiming. Even if the connection fails
-        # or its lease-safe deadline is reached during GC, pending queue work
-        # has already received its bounded opportunity in this turn.
+        # or its lease-safe deadline is reached during a maintenance pass,
+        # pending current-version work has already received its bounded
+        # opportunity in this turn. Retired/malformed protocol work is reaped on
+        # the recovery cadence; the pass itself is bounded by LEASE_RECOVERY_LIMIT.
+        if now >= self._next_reaper_at:
+            self._run_reaper()
+            self._next_reaper_at = time.monotonic() + self.settings.lease_recovery_interval_seconds
         if now >= self._next_gc_at:
             self._run_gc()
             self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds

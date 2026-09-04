@@ -66,6 +66,16 @@ def reaper_disposition(version: int) -> JobVersionDisposition:
 
 
 def claim_version_predicate() -> tuple[str, dict[str, int]]:
-    """Return the SQL predicate restricting claims to the current protocol."""
-    fragment = "AND ((payload::jsonb)->>'v')::int = %(protocol_version)s\n"
+    """Return a non-throwing SQL predicate for the exact current protocol.
+
+    The row-controlled version text is never cast to an integer: PostgreSQL is
+    only a transport here, and a malformed application payload must not turn one
+    claim scan into a global SQL error that stops the worker. Exact integer-v4
+    text is selected; malformed/retired versions are handled by the bounded
+    application reaper instead.
+    """
+    fragment = (
+        "AND jsonb_typeof((payload::jsonb)->'v') = 'number'\n"
+        "AND (payload::jsonb)->>'v' = %(protocol_version)s::text\n"
+    )
     return fragment, {"protocol_version": CURRENT_PROTOCOL_VERSION}
