@@ -3229,11 +3229,21 @@ def _wait_for_steer_group_convergence(aid: str, observed: Meta) -> bool:
         intent, intent_malformed = _persisted_intent(current)
         if intent_malformed:
             return False
-        if intent != "steer":
+        if intent not in {"steer", "stop", "kill"}:
             return True
         if not group_alive(observed):
             return True
-        if _interrupt_steer_if_needed(aid):
+        if intent == "steer":
+            converged = _interrupt_steer_if_needed(aid)
+        else:
+            first_signal = signal.SIGKILL if intent == "kill" else signal.SIGTERM
+            send_signal_group(observed, first_signal)
+            first_wait = KILL_WAIT_SECONDS if intent == "kill" else STOP_WAIT_SECONDS
+            converged = wait_group_dead(observed, first_wait)
+            if not converged and intent == "stop":
+                send_signal_group(observed, signal.SIGKILL)
+                converged = wait_group_dead(observed, KILL_WAIT_SECONDS)
+        if converged:
             return not group_alive(observed)
         time.sleep(STEER_POLL_SECONDS)
 
@@ -5183,10 +5193,8 @@ def _signal_live_invocation(aid: str, meta: Meta, mode: str) -> int:
                 (-signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
                 f"stopped agent {aid} (force-killed group members)",
             )
-        _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
         _err(f"{PROG}: agent {aid} did not stop within {STOP_WAIT_SECONDS:.0f}s; use 'kill'")
         return EXIT_ERROR
-    _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
     _err(f"{PROG}: agent {aid} could not be killed")
     return EXIT_ERROR
 
