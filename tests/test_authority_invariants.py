@@ -309,6 +309,13 @@ def test_authorize_decisions() -> None:
         authorize_recovery(_facts(unresolved_child=True, owned_worker_identity_proven=True))
         is False
     )
+    assert authorize_recovery(_facts(unresolved_child=True, supervisor_child_present=True)) is False
+    assert authorize_recovery(_facts(unresolved_child=True, pre_spawn_obligation=True)) is False
+    assert (
+        authorize_recovery(_facts(unresolved_child=True, identity_observation_unknown=True))
+        is False
+    )
+    assert authorize_recovery(_facts(unresolved_child=True, durable_malformed=True)) is False
     assert authorize_recovery(_facts()) is False
 
     assert authorize_retirement(_facts(current_child_identity_proven=True)) is True
@@ -832,7 +839,7 @@ def test_recovery_gate_refuses_conflicting_authority(
     monkeypatch.setattr(
         lifecycle_state,
         "reconcile_authority_facts",
-        lambda: _facts(unresolved_child=True, owned_worker_identity_proven=True),
+        lambda: _facts(unresolved_child=True, supervisor_child_present=True),
     )
     state = supervise.read_state()
     supervise.write_state(
@@ -845,16 +852,23 @@ def test_recovery_gate_refuses_conflicting_authority(
     )
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
     converged: list[bool] = []
+    recovered: list[str] = []
 
     def spy_converge(_h: object) -> bool:
         converged.append(True)
         return False
 
+    def spy_recover(token: str) -> bool:
+        recovered.append(token)
+        return True
+
     monkeypatch.setattr(daemon, "_converge_unresolved", spy_converge)
+    monkeypatch.setattr(daemon, "_recover_spawn_owned_groups", spy_recover)
     assert daemon._resolve_unresolved_child() is False
     assert converged == [], (
         "convergence must not run when the authority refuses recovery (conflicting consumer)"
     )
+    assert recovered == [], "group recovery must not run beside a competing live consumer"
 
 
 def test_recovery_gate_allows_when_authority_permitted(
