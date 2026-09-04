@@ -12,6 +12,7 @@ import pytest
 
 import lubko.deployctl as dc
 from lubko import lifecycle, supervise
+from lubko import supervisor as supervisor_mod
 
 COMMIT = "2" * 40
 PREVIOUS_COMMIT = "1" * 40
@@ -186,3 +187,33 @@ def test_stable_legacy_handoff_keeps_its_prepared_gate(
     assert math.isclose(live.deadline, 53.0)
     assert released == [9]
     assert writes == [replace(state, previous_retiring=True), live]
+
+
+def test_supervisor_never_adopts_explicit_legacy_pending_mission() -> None:
+    """A durable legacy mission cannot become supervisor authority at startup."""
+    daemon = supervisor_mod.SupervisorDaemon(supervisor_mod.Settings())
+    mission = _state(supervisor_owned=False)
+
+    assert daemon._derive_with_mission(mission, 0, None) == ("hold", None)
+    assert daemon._message == (
+        "pending deployment mission is not supervisor-owned; holding without a worker"
+    )
+
+
+def test_supervisor_fails_closed_on_unknown_pending_mission_ownership() -> None:
+    """Unknown durable ownership cannot be inferred as supervisor authority."""
+    daemon = supervisor_mod.SupervisorDaemon(supervisor_mod.Settings())
+    mission = _state(supervisor_owned=None)
+
+    assert daemon._derive_with_mission(mission, 0, None) == ("hold", None)
+
+
+def test_newer_desired_intent_can_supersede_legacy_pending_mission() -> None:
+    """A strictly newer explicit desired generation still owns reconciliation."""
+    daemon = supervisor_mod.SupervisorDaemon(supervisor_mod.Settings())
+    mission = _state(supervisor_owned=False)
+
+    assert daemon._derive_with_mission(mission, 2, PREVIOUS_COMMIT) == (
+        "run",
+        PREVIOUS_COMMIT,
+    )

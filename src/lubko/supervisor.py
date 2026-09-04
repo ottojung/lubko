@@ -1029,6 +1029,14 @@ class SupervisorDaemon:
         if mission.generation < desired_gen:
             if desired_commit is not None:
                 action, commit = "run", desired_commit
+        elif mission.status == deployctl.STATUS_PENDING and mission.supervisor_owned is not True:
+            self._message = (
+                "pending deployment mission is not supervisor-owned; holding without a worker"
+            )
+            LOGGER.warning(
+                "pending mission at generation %d is not supervisor-owned; holding",
+                mission.generation,
+            )
         elif mission.generation > desired_gen:
             if mission.status == deployctl.STATUS_PENDING:
                 action, commit = "run", mission.commit
