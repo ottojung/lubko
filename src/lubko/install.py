@@ -348,9 +348,7 @@ def _install_repo(repo: Path, uv: str | None) -> int:
     _out(
         f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION}, launcher, "
         f"and startup definition installed; the container must run "
-        f"'{startup_contract.STARTUP_LAUNCHER_NAME}' (tini-static -- lubko-supervisor) and "
-        f"the deployment seam must supply {startup_contract.RESTART_POLICY_ENV} so restart "
-        f"authority is proven"
+        f"'{startup_contract.STARTUP_LAUNCHER_NAME}' (tini-static -- lubko-supervisor)"
     )
     return EXIT_OK
 

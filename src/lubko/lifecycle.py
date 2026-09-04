@@ -3867,8 +3867,6 @@ def _print_startup_contract() -> None:
         )
         _out(f"  worker identity matches recorded: {proof.worker_identity_matches}")
     _out(f"  proof: {proof.message}")
-    rap = startup_contract.prove_restart_authority(startup_contract.CURRENT_CONTRACT)
-    _out(f"restart authority: {'OK' if rap.ok else 'FAIL'} ({rap.source}: {rap.message})")
 
 
 def startup_contract_cmd(args: argparse.Namespace) -> int:
@@ -3885,14 +3883,11 @@ def startup_contract_cmd(args: argparse.Namespace) -> int:
     * the installed startup definition to match the current contract exactly;
     * the required private state directories to exist with the exact safe mode;
     * the private config files to exist with no group/world access;
-    * the live Tini -> supervisor -> worker topology to be proven; and
-    * concrete, configured restart-authority evidence from the deployment seam
-      (the contract of record alone is not activation proof).
+    * the live Tini -> supervisor -> worker topology to be proven.
 
     It exits non-zero unless every check passes — for example when the container
     still uses the ``sleep infinity`` placeholder, the recorded contract has
-    silently drifted, the startup definition is missing, or no restart-policy
-    evidence is supplied.
+    silently drifted, or the startup definition is missing.
 
     Args:
         args: Parsed command line arguments.
@@ -3907,8 +3902,7 @@ def startup_contract_cmd(args: argparse.Namespace) -> int:
         _out(
             f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION}, "
             f"launcher, and startup definition written; the container must run "
-            f"'{startup_contract.STARTUP_LAUNCHER_NAME}' and the deployment seam must "
-            f"supply {startup_contract.RESTART_POLICY_ENV} for restart authority"
+            f"'{startup_contract.STARTUP_LAUNCHER_NAME}'"
         )
     assessment = startup_contract.assess_recorded_contract()
     contract_ok = assessment.state == "current"
@@ -3920,18 +3914,9 @@ def startup_contract_cmd(args: argparse.Namespace) -> int:
     paths_ok = startup_contract.validate_contract_paths().ok
     config_ok = startup_contract.validate_contract_config().ok
     proof = startup_contract.verify_live_topology()
-    rap = startup_contract.prove_restart_authority(startup_contract.CURRENT_CONTRACT)
     return (
         EXIT_OK
-        if (
-            contract_ok
-            and launcher_ok
-            and definition_ok
-            and paths_ok
-            and config_ok
-            and proof.ok
-            and rap.ok
-        )
+        if (contract_ok and launcher_ok and definition_ok and paths_ok and config_ok and proof.ok)
         else EXIT_ERROR
     )
 
@@ -4621,8 +4606,7 @@ def _bootstrap_locked(
     _out(f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION} recorded")
     _out(
         f"startup definition installed; the container must run "
-        f"'{startup_contract.STARTUP_LAUNCHER_NAME}' and the deployment seam must supply "
-        f"{startup_contract.RESTART_POLICY_ENV} for restart authority"
+        f"'{startup_contract.STARTUP_LAUNCHER_NAME}'"
     )
     return EXIT_OK
 

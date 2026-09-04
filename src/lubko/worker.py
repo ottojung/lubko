@@ -662,6 +662,7 @@ class _HealthAggregates:
     active_jobs: int
     stopping_jobs: int
     oldest_active_job_age_seconds: float | None
+    oldest_active_job_id: str | None
     min_lease_safety_remaining_seconds: float | None
     capture_streams_open: int
     spool_held_bytes: int
@@ -6112,6 +6113,7 @@ class Supervisor:
             stopping_jobs=agg.stopping_jobs,
             completed_jobs=getattr(self, "_completed_count", 0),
             oldest_active_job_age_seconds=agg.oldest_active_job_age_seconds,
+            oldest_active_job_id=agg.oldest_active_job_id,
             lease_safety_margin_seconds=self.settings.lease_safety_margin_seconds,
             min_lease_safety_remaining_seconds=agg.min_lease_safety_remaining_seconds,
             db_operation_deadline_seconds=self.settings.db_operation_timeout_seconds,
@@ -6149,16 +6151,26 @@ class Supervisor:
         active_jobs = self.active
         stopping = 0
         oldest_age: float | None = None
+        oldest_job_id: str | None = None
         min_lease_safety_remaining: float | None = None
         capture_open = 0
         spool_held = 0
-        for job in active_jobs.values():
+        for job_id, job in active_jobs.items():
             if job.term_sent or job.kill_sent or job.stop_started is not None:
                 stopping += 1
             if job.claimed_at > 0.0:
                 age = now_mono - job.claimed_at
-                if oldest_age is None or age > oldest_age:
+                candidate_id = str(job_id)
+                if (
+                    oldest_age is None
+                    or age > oldest_age
+                    or (
+                        age == oldest_age
+                        and (oldest_job_id is None or candidate_id < oldest_job_id)
+                    )
+                ):
                     oldest_age = age
+                    oldest_job_id = candidate_id
             if job.last_heartbeat_at > 0.0:
                 # Safety remaining, not full-lease remaining: subtract the
                 # configured safety margin so a negative value means the
@@ -6183,6 +6195,7 @@ class Supervisor:
             active_jobs=len(active_jobs),
             stopping_jobs=stopping,
             oldest_active_job_age_seconds=oldest_age,
+            oldest_active_job_id=oldest_job_id,
             min_lease_safety_remaining_seconds=min_lease_safety_remaining,
             capture_streams_open=capture_open,
             spool_held_bytes=spool_held,
