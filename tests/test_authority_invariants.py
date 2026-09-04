@@ -735,9 +735,7 @@ def _make_meta(commit: str, *, pid: int = 1) -> lifecycle.WorkerMeta:
     )
 
 
-def _make_mission(
-    status: str, *, commit: str = COMMIT, challenge_hash: str | None = None
-) -> deployctl.RollbackState:
+def _make_mission(status: str, *, commit: str = COMMIT) -> deployctl.RollbackState:
     """Build a minimal valid rollback mission in ``status``.
 
     Returns:
@@ -749,7 +747,6 @@ def _make_mission(
         status=status,
         commit=commit,
         previous_commit="0" * 40,
-        challenge_hash=challenge_hash,
         deadline=time.time() + 60.0,
         repo="/r",
         uv_path="uv",
@@ -1000,17 +997,11 @@ def test_confirm_gate_refuses_malformed_authority(
         lambda: (_ for _ in ()).throw(deployctl.DeployCtlError("malformed")),
     )
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
-    challenge = deployctl._generate_challenge()
-    monkeypatch.setattr(
-        deployctl,
-        "_read_state",
-        lambda: replace(mission, challenge_hash=deployctl._challenge_digest(challenge)),
-    )
     monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
     monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
     with pytest.raises(deployctl.DeployCtlError, match="authority refuses confirmation"):
         deployctl._confirm_locked(
-            {"type": "confirm", "commit": mission.commit, "challenge": challenge[::-1]},
+            {"type": "confirm", "commit": mission.commit},
             _options(),
         )
     # Fail closed: the malformed mission was NOT rolled back or mutated.
@@ -1022,12 +1013,7 @@ def test_confirm_gate_refuses_malformed_authority(
 def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None:
     """_confirm_locked proceeds when the authority permits the transition."""
     mission = _make_mission(deployctl.STATUS_PENDING)
-    challenge = deployctl._generate_challenge()
-    monkeypatch.setattr(
-        deployctl,
-        "_read_state",
-        lambda: replace(mission, challenge_hash=deployctl._challenge_digest(challenge)),
-    )
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
@@ -1038,7 +1024,7 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None
     written: list[deployctl.RollbackState] = []
     monkeypatch.setattr(deployctl, "_write_state", written.append)
     response = deployctl._confirm_locked(
-        {"type": "confirm", "commit": mission.commit, "challenge": challenge[::-1]},
+        {"type": "confirm", "commit": mission.commit},
         _options(),
     )
     assert response["confirmed"] is True
