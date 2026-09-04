@@ -774,6 +774,37 @@ def test_failed_runtime_check_never_leaves_an_obligation(
     assert read_state().spawning is None
 
 
+def test_unavailable_pdeathsig_never_crosses_popen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsupported parent-death guard holds before any spawn authority exists."""
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(cli, "cli_entry_executable", lambda _commit, _name: "/bin/true")
+    monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: tmp_path)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
+
+    def unsupported() -> bool:
+        calls.append("probe")
+        return False
+
+    monkeypatch.setattr(supervisor, "_pdeathsig_supported", unsupported)
+    monkeypatch.setattr(
+        "lubko.supervisor.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("unguarded spawn crossed Popen"),
+    )
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+
+    assert daemon._spawn_worker(COMMIT) is None
+    assert calls == ["probe"]
+    assert read_state().spawning is None
+    assert daemon._message is not None
+    assert "parent-death protection is unavailable" in daemon._message
+
+
 def test_child_side_pdeathsig_failure_never_execs_worker_code(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

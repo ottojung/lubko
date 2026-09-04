@@ -1838,6 +1838,15 @@ class SupervisorDaemon:
         # fail-closed authority that forbids any successor supervisor from
         # starting a second maintained consumer beside a possibly-live first
         # spawn.
+        pdeathsig_supported = _pdeathsig_supported()
+        if not pdeathsig_supported:
+            self._message = (
+                "parent-death protection is unavailable; holding without starting a worker"
+            )
+            LOGGER.error(
+                "PR_SET_PDEATHSIG is unavailable; refusing to start an unguarded maintained worker"
+            )
+            return None
         creator_ticks = proc_start_ticks(os.getpid()) or 0
         obligation = SpawningObligation(
             token=token,
@@ -1858,7 +1867,7 @@ class SupervisorDaemon:
             )
             return None
         write_state(replace(read_state(), spawning=obligation))
-        preexec = functools.partial(_child_preexec, os.getpid()) if _pdeathsig_supported() else None
+        preexec = functools.partial(_child_preexec, os.getpid())
         try:
             proc = subprocess.Popen(
                 [str(executable)],
