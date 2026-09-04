@@ -255,7 +255,7 @@ def test_recovery_batch_bound_hit_reflected_in_health() -> None:
 
 
 def test_schema_exposes_only_one_bounded_job_identity() -> None:
-    """The v3 schema adds one root UUID while remaining strictly bounded."""
+    """The additive v1 envelope exposes one root UUID while remaining bounded."""
     fields = set(WorkerHealth.__dataclass_fields__)
     assert "oldest_active_job_id" in fields
     assert "current_job_id" not in fields
@@ -271,4 +271,4 @@ def test_schema_exposes_only_one_bounded_job_identity() -> None:
         "last_gc_at",
     ):
         assert expected in fields
-    assert WORKER_HEALTH_SCHEMA_VERSION == 3
+    assert WORKER_HEALTH_SCHEMA_VERSION == 1
