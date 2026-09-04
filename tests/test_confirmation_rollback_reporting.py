@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
+import lubko.cli
 import lubko.deployctl as dc
-import lubko.lifecycle_state as lifecycle_state
+import lubko.supervise
+from lubko import lifecycle_state
+
+cli = lubko.cli
+supervise = lubko.supervise
 
 COMMIT = "2" * 40
 OTHER_COMMIT = "3" * 40
 
 
-def _pending_state() -> SimpleNamespace:
+def _pending_state() -> dc.RollbackState:
     """Return the minimal pending mission shape used by confirmation helpers."""
-    return SimpleNamespace(status=dc.STATUS_PENDING, commit=COMMIT)
+    return cast(
+        "dc.RollbackState",
+        SimpleNamespace(
+            status=dc.STATUS_PENDING, commit=COMMIT, repo="/workspace/Lubko", uv_path="uv"
+        ),
+    )
 
 
 def test_expired_confirmation_reports_successful_rollback(
@@ -70,7 +82,7 @@ def test_candidate_failure_reports_pending_when_rollback_does_not_terminalize(
     monkeypatch.setattr(dc, "_rollback_locked", lambda _state: False)
 
     with pytest.raises(dc.DeployCtlError, match="remains pending"):
-        dc._authorize_confirmation(state)  # type: ignore[arg-type]
+        dc._authorize_confirmation(state)
 
     assert state.status == dc.STATUS_PENDING
 
@@ -86,6 +98,38 @@ def test_authority_failure_reports_pending_when_rollback_does_not_terminalize(
     monkeypatch.setattr(dc, "_rollback_locked", lambda _state: False)
 
     with pytest.raises(dc.DeployCtlError, match="remains pending"):
-        dc._authorize_confirmation(state)  # type: ignore[arg-type]
+        dc._authorize_confirmation(state)
+
+    assert state.status == dc.STATUS_PENDING
+
+
+def test_cli_preparation_failure_reports_pending_when_rollback_does_not_terminalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI preparation failure must not falsely claim terminal rollback."""
+    state = _pending_state()
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(
+        cli,
+        "build_cli_root",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(cli.CliError("build failed")),
+    )
+    monkeypatch.setattr(dc, "_rollback_locked", lambda _state: False)
+
+    with pytest.raises(dc.DeployCtlError, match="remains pending"):
+        dc._prepare_confirmation_candidate(
+            state,
+            dc.Options(
+                repo=Path("/workspace/Lubko"),
+                uv_path="uv",
+                confirm_window_seconds=1.0,
+                stop_grace_seconds=1.0,
+                postgres_timeout_seconds=1.0,
+                lock_timeout_seconds=1.0,
+                validation_timeout_seconds=1.0,
+                git_timeout_seconds=1.0,
+                cli_timeout_seconds=1.0,
+            ),
+        )
 
     assert state.status == dc.STATUS_PENDING
