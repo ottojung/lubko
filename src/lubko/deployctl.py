@@ -2069,6 +2069,22 @@ def _confirmation_response(state: RollbackState) -> dict[str, object]:
     return {"type": "confirm", "ok": True, "commit": state.commit, "confirmed": True}
 
 
+def _confirmation_rollback_error(state: RollbackState, failure: str) -> str:
+    """Return a truthful confirmation failure after requesting rollback.
+
+    Args:
+        state: Pending mission whose rollback was requested.
+        failure: Human-readable reason confirmation cannot proceed.
+
+    Returns:
+        A terminal rollback diagnostic only when rollback actually completed;
+        otherwise an explicit fail-closed pending diagnostic.
+    """
+    if _rollback_locked(state):
+        return f"{failure}; deployment was rolled back"
+    return f"{failure}; deployment remains pending because rollback could not yet be completed"
+
+
 def _confirmation_state(request: dict[str, object]) -> RollbackState:
     """Load, recover, and validate the mission targeted by confirmation.
 
@@ -2092,26 +2108,31 @@ def _confirmation_state(request: dict[str, object]) -> RollbackState:
     if state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
     if _pending_mission_rollback_due(state):
-        _rollback_locked(state)
-        raise DeployCtlError("confirmation window lapsed; deployment was rolled back")
+        raise DeployCtlError(_confirmation_rollback_error(state, "confirmation window lapsed"))
     if request.get("commit") != state.commit:
-        _rollback_locked(state)
-        raise DeployCtlError("confirmation commit does not match the proposed commit; rolled back")
+        raise DeployCtlError(
+            _confirmation_rollback_error(
+                state, "confirmation commit does not match the proposed commit"
+            )
+        )
     return state
 
 
 def _authorize_confirmation(state: RollbackState) -> None:
     """Recheck candidate liveness and lifecycle authority before confirmation."""
     if _pending_mission_rollback_due(state):
-        _rollback_locked(state)
-        raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
+        raise DeployCtlError(
+            _confirmation_rollback_error(state, "candidate failed before confirmation")
+        )
     if not lifecycle_state.authorize_mission_confirm(
         _mission_authority_facts(state.status, candidate_ready=True)
     ):
-        _rollback_locked(state)
         raise DeployCtlError(
-            "lifecycle authority refuses confirmation (candidate not proven ready or "
-            "durable authority malformed); deployment was rolled back"
+            _confirmation_rollback_error(
+                state,
+                "lifecycle authority refuses confirmation (candidate not proven ready or "
+                "durable authority malformed)",
+            )
         )
 
 
@@ -2133,8 +2154,9 @@ def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> N
             Path(state.repo), state.commit, state.uv_path, options.cli_timeout_seconds
         )
     except cli.CliError as exc:
-        _rollback_locked(state)
-        msg = f"confirmed CLI environment could not be prepared; deployment was rolled back: {exc}"
+        msg = _confirmation_rollback_error(
+            state, f"confirmed CLI environment could not be prepared: {exc}"
+        )
         raise DeployCtlError(msg) from exc
     write_meta(state.new_meta)
 
