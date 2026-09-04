@@ -375,7 +375,6 @@ def _pending_mission() -> deployctl.RollbackState:
         status=deployctl.STATUS_PENDING,
         commit="c" * 40,
         previous_commit="d" * 40,
-        challenge_hash=None,
         deadline=1e9,
         repo="/r",
         uv_path="/uv",
