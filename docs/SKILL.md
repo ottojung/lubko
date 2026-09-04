@@ -514,7 +514,9 @@ A freshly created agent has no underlying native session yet. The **first** `pro
 lubko-agent prompt --id a13f09c2 --steer 'Stop this approach and use the parser-level fix instead.'
 ```
 
-While the agent is running, `--steer` interrupts/redirects the current invocation according to the steer model, then follows the resulting invocation.
+While the agent is running, `--steer` is **hard preemption**. The steer is durably accepted first, the exact currently owned native invocation and its owned process tree are terminated immediately rather than waiting for the current tool/model turn to finish, and the same logical managed agent continues under the steer only after the superseded invocation is proven converged. Lubko uses bounded termination with escalation; it never authorizes the continuation merely because the old leader process exited while an owned descendant may still be running.
+
+Hard preemption is not rollback. Files already written, output already emitted, external requests already sent, and other side effects that happened before termination may remain. The continued agent must inspect the real repository/system state and reconcile it. `status --json` exposes `steer_preempting`, and text status reports when the old invocation is still being hard-preempted.
 
 If the agent is **not currently running** (idle, finished, stopped, or never-started), `prompt --id <ID> --steer 'task'` is exactly equivalent to `prompt --id <ID> 'task'`. `--steer` is harmless and redundant on an idle/finished/not-yet-started agent; it is never rejected merely because there is nothing currently running to interrupt. This lets caller code always request "make the latest instruction take precedence" without first branching on whether the agent happens to be busy.
 
