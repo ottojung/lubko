@@ -541,9 +541,10 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
     """Request one exact supervisor target and await queue readiness.
 
     The external orchestrator owns transaction sequencing. This host-side
-    primitive is intentionally idempotent in effect: retries may allocate a new
-    supervisor generation, but they request the same exact commit and return only
-    after that generation is applied and queue-ready.
+    primitive is intentionally idempotent in effect. If the current desired
+    intent already names the exact commit, settlement preserves that generation
+    (including any restart or migration obligation) and waits for it to become
+    queue-ready. Otherwise it publishes a fresh generation for the exact commit.
 
     Returns:
         The applied supervisor generation.
@@ -551,12 +552,23 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
     Raises:
         DeployCtlError: If the supervisor cannot apply or prove the target.
     """
-    generation = supervise.request_run(
-        commit,
-        repo=repo,
-        uv_path=uv_path,
-        worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-    )
+    worker_id = os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError as exc:
+        raise DeployCtlError("the supervisor desired intent is not trustworthy") from exc
+    if desired is not None and desired.commit == commit:
+        # Preserve an already-published same-commit lifecycle obligation. In
+        # particular, confirmation must not erase a concurrent restart or
+        # migration by publishing a newer ordinary settlement generation.
+        generation = desired.generation
+    else:
+        generation = supervise.request_run(
+            commit,
+            repo=repo,
+            uv_path=uv_path,
+            worker_id=worker_id,
+        )
     lifecycle_state.failpoint(lifecycle_state.FAILPOINT_MISSION_CONFIRM)
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         raise DeployCtlError("the external supervisor did not apply the requested target")
@@ -1296,13 +1308,49 @@ def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
 
 
 def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
-    """Durably archive a queue-ready confirmed target.
+    """Durably archive only a still-current queue-ready supervisor target.
+
+    Terminalization is serialized with desired-generation writers. A restart,
+    migration, or other newer desired generation that wins before this lock is
+    acquired invalidates the older readiness proof even when it names the same
+    commit. The mission remains pending so the newer obligation can converge.
 
     Returns:
         The terminal confirmed state.
+
+    Raises:
+        DeployCtlError: If the queue-readiness proof was superseded or cannot
+            be bound to the current durable supervisor generation.
     """
-    terminal = replace(state, status=STATUS_CONFIRMED)
-    _write_state(terminal)
+    with supervise.generation_lock():
+        try:
+            desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError as exc:
+            raise DeployCtlError(
+                "cannot confirm while supervisor desired authority is unreadable"
+            ) from exc
+        status = supervise.read_status()
+        if desired is None or status is None:
+            raise DeployCtlError(
+                "the supervisor readiness proof was superseded before confirmation; "
+                "deployment remains pending"
+            )
+        if desired.commit != state.commit or status.commit != state.commit:
+            raise DeployCtlError(
+                "the supervisor readiness proof was superseded before confirmation; "
+                "deployment remains pending"
+            )
+        if (
+            status.applied_generation != desired.generation
+            or status.ready is not True
+            or status.holding
+        ):
+            raise DeployCtlError(
+                "the supervisor readiness proof was superseded before confirmation; "
+                "deployment remains pending"
+            )
+        terminal = replace(state, status=STATUS_CONFIRMED)
+        _write_state(terminal)
     try:
         cli.set_current(state.commit)
     except cli.CliError as exc:
