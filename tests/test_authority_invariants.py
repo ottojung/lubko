@@ -1171,6 +1171,76 @@ def test_rollback_gate_keeps_pending_when_final_readiness_is_superseded(
     assert logged == ["supervised rollback readiness was superseded before terminalization"]
 
 
+def test_supervised_rollback_does_not_fall_back_to_legacy_without_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supervised mission stays pending if the supervisor disappears at dispatch."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    retire = MagicMock(return_value=True)
+    restore = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_retire_candidate_locked", retire)
+    monkeypatch.setattr(deployctl, "_restore_previous_locked", restore)
+    logged: list[str] = []
+    monkeypatch.setattr(deployctl, "append_deploy_log", logged.append)
+
+    assert deployctl._rollback_locked(mission) is False
+    retire.assert_not_called()
+    restore.assert_not_called()
+    assert logged == [
+        "supervised rollback lost supervisor authority before settlement; holding pending mission"
+    ]
+
+
+def test_watchdog_supervised_rollback_race_stays_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Supervisor loss after watchdog decision cannot dispatch legacy recovery."""
+    mission = replace(_make_mission(deployctl.STATUS_PENDING), deadline=time.time() - 1.0)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
+    observations = iter((True, False))
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: next(observations))
+    monkeypatch.setattr(deployctl, "_supervised_mission_active", lambda _state: False)
+    monkeypatch.setattr(deployctl, "deploy_lock", lambda _timeout: nullcontext())
+    retire = MagicMock(return_value=True)
+    restore = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_retire_candidate_locked", retire)
+    monkeypatch.setattr(deployctl, "_restore_previous_locked", restore)
+
+    class WatchdogTestCompleteError(RuntimeError):
+        pass
+
+    def stop_after_first_iteration(_seconds: float) -> None:
+        raise WatchdogTestCompleteError
+
+    monkeypatch.setattr(time, "sleep", stop_after_first_iteration)
+
+    with pytest.raises(WatchdogTestCompleteError):
+        deployctl._watchdog_main(1.0)
+
+    retire.assert_not_called()
+    restore.assert_not_called()
+
+
+def test_legacy_rollback_still_uses_direct_restore_without_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit legacy/bootstrap authority keeps the direct rollback path."""
+    mission = replace(_make_mission(deployctl.STATUS_PENDING), supervisor_owned=False)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    retire = MagicMock(return_value=True)
+    restore = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_retire_candidate_locked", retire)
+    monkeypatch.setattr(deployctl, "_restore_previous_locked", restore)
+
+    assert deployctl._rollback_locked(mission) is True
+    retire.assert_called_once_with(mission)
+    restore.assert_called_once_with(mission)
+
+
 def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None:
     """_rollback_locked proceeds when the authority permits the transition."""
     mission = _make_mission(deployctl.STATUS_PENDING)
