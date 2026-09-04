@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -159,6 +159,22 @@ def _set_lease_timing(sup: Supervisor, duration: float, margin: float) -> None:
     )
 
 
+def test_oldest_active_job_identity_is_deterministic() -> None:
+    """The bounded job identity is the oldest active root, then lowest UUID."""
+    sup = _bare_supervisor()
+    older_high = UUID("00000000-0000-0000-0000-000000000002")
+    older_low = UUID("00000000-0000-0000-0000-000000000001")
+    newer = UUID("00000000-0000-0000-0000-000000000003")
+    sup.active = {
+        older_high: _fake_active(900.0, claimed_at=800.0),
+        older_low: _fake_active(900.0, claimed_at=800.0),
+        newer: _fake_active(900.0, claimed_at=900.0),
+    }
+    agg = sup._collect_health_aggregates(now_mono=1000.0)
+    assert agg.oldest_active_job_age_seconds == pytest.approx(200.0)
+    assert agg.oldest_active_job_id == str(older_low)
+
+
 def test_lease_safety_remaining_subtracts_margin_and_passes_negative() -> None:
     """min_lease_safety_remaining subtracts the margin; negative = passed."""
     sup = _bare_supervisor()
@@ -238,10 +254,10 @@ def test_recovery_batch_bound_hit_reflected_in_health() -> None:
     assert sup._build_health().recovery_batch_limit == LEASE_RECOVERY_LIMIT
 
 
-def test_schema_has_no_job_identity_and_includes_new_signals() -> None:
-    """The v2 schema is bounded and free of per-job identifiers."""
+def test_schema_exposes_only_one_bounded_job_identity() -> None:
+    """The v3 schema adds one root UUID while remaining strictly bounded."""
     fields = set(WorkerHealth.__dataclass_fields__)
-    assert "oldest_active_job_id" not in fields
+    assert "oldest_active_job_id" in fields
     assert "current_job_id" not in fields
     for expected in (
         "db_deadline_breached_at",
@@ -255,4 +271,4 @@ def test_schema_has_no_job_identity_and_includes_new_signals() -> None:
         "last_gc_at",
     ):
         assert expected in fields
-    assert WORKER_HEALTH_SCHEMA_VERSION == 2
+    assert WORKER_HEALTH_SCHEMA_VERSION == 3

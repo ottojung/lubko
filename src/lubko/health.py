@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
+from uuid import UUID
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -50,12 +51,12 @@ WORKER_LOG_MAX_BYTES: Final = 2 * 1024 * 1024  # 2 MiB per file
 WORKER_LOG_BACKUP_COUNT: Final = 3
 
 #: Current on-disk schema version for the per-incarnation worker health
-#: snapshot.  Version 1 exposed a singular ``current_job_id`` that could only
-#: ever describe one of potentially many concurrently active jobs and therefore
-#: misrepresented a busy worker as idle-or-single-job.  Version 2 replaces it
-#: with concurrency-aware aggregates and bounded operational counters.  Old
-#: snapshots are never treated as current (they fail closed in the reader).
-WORKER_HEALTH_SCHEMA_VERSION: Final = 2
+#: snapshot. Version 1 exposed a misleading singular ``current_job_id``. Version
+#: 2 replaced it with concurrency-aware aggregates. Version 3 restores exactly
+#: one bounded identity: the oldest active root UUID, deterministically tie-broken
+#: by UUID string, while retaining all aggregate metrics. Old snapshots fail
+#: closed in the reader.
+WORKER_HEALTH_SCHEMA_VERSION: Final = 3
 
 LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
 
@@ -255,6 +256,9 @@ class WorkerHealth:
     #: pressure/saturation signal), from the actual returned recovered count.
     recovery_batch_bound_hit: bool
     shutting_down: bool
+    #: Root UUID of the oldest active job, tie-broken lexicographically, or ``None``.
+    #: This is the only per-job identity exposed by health.
+    oldest_active_job_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the snapshot for atomic storage.
@@ -303,6 +307,7 @@ class WorkerHealth:
             "recovery_batch_limit": self.recovery_batch_limit,
             "recovery_batch_bound_hit": self.recovery_batch_bound_hit,
             "shutting_down": self.shutting_down,
+            "oldest_active_job_id": self.oldest_active_job_id,
         }
 
     @classmethod
@@ -410,6 +415,9 @@ class WorkerHealth:
             ),
             recovery_batch_bound_hit=_strict_bool(data, "recovery_batch_bound_hit"),
             shutting_down=_strict_bool(data, "shutting_down"),
+            oldest_active_job_id=_optional_uuid_str(
+                data.get("oldest_active_job_id"), "oldest_active_job_id"
+            ),
         )
 
 
@@ -427,6 +435,22 @@ def _required_json_int(value: object, field: str, *, minimum: int) -> int:
         msg = f"{field} must be >= {minimum}, got {value!r}"
         raise ValueError(msg)
     return value
+
+
+def _optional_uuid_str(value: object, field: str) -> str | None:
+    """Return a canonical optional UUID string.
+
+    Raises:
+        ValueError: If a present value is not a valid UUID.
+    """
+    if value is None:
+        return None
+    text = _required_nonempty_str(value, field)
+    try:
+        return str(UUID(text))
+    except ValueError as exc:
+        msg = f"{field} must be a UUID, got {value!r}"
+        raise ValueError(msg) from exc
 
 
 def _required_nonempty_str(value: object, field: str) -> str:

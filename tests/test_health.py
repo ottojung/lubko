@@ -329,12 +329,21 @@ def test_concurrency_aware_aggregates_are_bounded() -> None:
     assert restored.recovery_batch_bound_hit is True
 
 
-def test_no_job_identity_is_published() -> None:
-    """The health schema never carries a per-job identifier."""
-    payload = _snapshot().to_dict()
-    assert "oldest_active_job_id" not in payload
+def test_health_publishes_only_one_bounded_job_identity() -> None:
+    """Health exposes one root UUID without per-job payload/list data."""
+    job_id = "00000000-0000-0000-0000-000000000123"
+    payload = _snapshot(oldest_active_job_id=job_id).to_dict()
+    assert payload["oldest_active_job_id"] == job_id
     assert "current_job_id" not in payload
-    assert "worker_id" in payload  # bounded process identity, not a job id
+    assert WorkerHealth.from_dict(payload).oldest_active_job_id == job_id
+
+
+def test_health_rejects_malformed_bounded_job_identity() -> None:
+    """The single published job identity remains a strict UUID scalar."""
+    payload = _snapshot().to_dict()
+    payload["oldest_active_job_id"] = "not-a-uuid"
+    with pytest.raises(ValueError, match="oldest_active_job_id"):
+        WorkerHealth.from_dict(payload)
 
 
 @pytest.mark.parametrize(
