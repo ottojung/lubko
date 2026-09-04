@@ -330,8 +330,6 @@ def test_connect_selects_the_production_deadline_connection(
     )
     monkeypatch.setattr(worker, "verify_jobs_table_invariant", lambda _conn: None)
     monkeypatch.setattr(worker, "verify_protocol_schema", lambda _conn: None)
-    monkeypatch.setattr(worker, "verify_server_isolation", lambda _conn: None)
-    monkeypatch.setattr(worker, "verify_server_identity", lambda _conn, _server: None)
     # Bind the recording double into the module globals without tripping the
     # lazy ``__getattr__`` loader: setattr would resolve the real driver-bound
     # class just to check for its existence.
