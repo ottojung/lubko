@@ -235,3 +235,65 @@ def test_recovery_queues_new_steer_behind_accepted_fifo(
         "second accepted steer",
         "third steer",
     ]
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected_signals", "expected_timeouts"),
+    [
+        ("stop", [signal.SIGTERM], [agent.STOP_WAIT_SECONDS]),
+        ("kill", [signal.SIGKILL], [agent.KILL_WAIT_SECONDS]),
+    ],
+)
+def test_stop_like_intent_converges_exact_group_after_leader_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    intent: str,
+    expected_signals: list[int],
+    expected_timeouts: list[float],
+) -> None:
+    """Stop/kill cannot terminalize merely because the invocation leader exited."""
+    current = _steering_meta()
+    current["intent"] = intent
+    observed = dict(current)
+    group_states = iter((True, False))
+    signals: list[int] = []
+    timeouts: list[float] = []
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: current)
+    monkeypatch.setattr(agent, "group_alive", lambda _meta: next(group_states))
+    monkeypatch.setattr(
+        agent,
+        "send_signal_group",
+        lambda _meta, sig: signals.append(sig),
+    )
+
+    def wait_dead(_meta: agent.Meta, timeout: float) -> bool:
+        timeouts.append(timeout)
+        return True
+
+    monkeypatch.setattr(agent, "wait_group_dead", wait_dead)
+
+    assert agent._wait_for_steer_group_convergence(current["id"], observed) is True
+    assert signals == expected_signals
+    assert timeouts == expected_timeouts
+
+
+def test_stop_after_leader_exit_escalates_before_allowing_terminalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A surviving exact descendant forces TERM-to-KILL convergence for stop."""
+    current = _steering_meta()
+    current["intent"] = "stop"
+    observed = dict(current)
+    group_states = iter((True, False))
+    waits = iter((False, True))
+    signals: list[int] = []
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: current)
+    monkeypatch.setattr(agent, "group_alive", lambda _meta: next(group_states))
+    monkeypatch.setattr(
+        agent,
+        "send_signal_group",
+        lambda _meta, sig: signals.append(sig),
+    )
+    monkeypatch.setattr(agent, "wait_group_dead", lambda _meta, _timeout: next(waits))
+
+    assert agent._wait_for_steer_group_convergence(current["id"], observed) is True
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
