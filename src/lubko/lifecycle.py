@@ -1255,6 +1255,23 @@ def _signal_exact_group(pgid: int, sig: int, token: str | None) -> bool:
     return attempted
 
 
+def _worker_retirement_state(meta: WorkerMeta) -> bool | None:
+    """Return exact-worker retirement state for authority decisions.
+
+    ``True`` means the recorded worker is positively gone or its PID was reused,
+    ``False`` means the exact recorded worker is still live, and ``None`` means
+    liveness is unreadable and therefore cannot authorize replacement.
+    """
+    if meta.pid is None:
+        return True
+    identity = process_identity(meta.pid)
+    if identity is None:
+        if process_absence_proven(meta.pid, meta.start_time_ticks):
+            return True
+        return None
+    return not identity_matches(meta, identity)
+
+
 def _worker_process_alive(meta: WorkerMeta) -> bool:
     """Return whether the exact recorded worker process instance is still alive.
 
@@ -1421,13 +1438,24 @@ def _stop_pinned(
     #    group member fails its re-proof rather than absorbing the SIGKILL.
     if time.monotonic() < kill_floor:
         time.sleep(kill_floor - time.monotonic())
-    if not _worker_process_alive(meta):
+    retirement = _worker_retirement_state(meta)
+    if retirement is True:
         return True
     _signal_exact_group(identity.pgid, signal.SIGKILL, meta.token)
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline and _worker_process_alive(meta):
+    return _wait_for_retirement(meta, time.monotonic() + grace_seconds)
+
+
+def _wait_for_retirement(meta: WorkerMeta, deadline: float) -> bool:
+    """Wait for positive exact-worker retirement proof until ``deadline``.
+
+    Returns:
+        ``True`` only when retirement is positively proven.
+    """
+    while time.monotonic() < deadline:
+        if _worker_retirement_state(meta) is True:
+            return True
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
-    return not _worker_process_alive(meta)
+    return _worker_retirement_state(meta) is True
 
 
 def _wait_for_drain(meta: WorkerMeta, wait_deadline: float) -> bool:
@@ -1448,12 +1476,14 @@ def _wait_for_drain(meta: WorkerMeta, wait_deadline: float) -> bool:
         ``True`` when the worker reached a safe-to-reap boundary.
     """
     while time.monotonic() < wait_deadline:
-        if not _worker_process_alive(meta):
+        if _worker_retirement_state(meta) is True:
             return True
         if meta.token is not None and drain_sentinel_matches(meta.token):
-            while time.monotonic() < wait_deadline and _worker_process_alive(meta):
+            while time.monotonic() < wait_deadline:
+                if _worker_retirement_state(meta) is True:
+                    return True
                 time.sleep(LOCK_POLL_INTERVAL_SECONDS)
-            return not _worker_process_alive(meta)
+            return False
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
     return False
 
