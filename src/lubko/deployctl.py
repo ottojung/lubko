@@ -1428,9 +1428,18 @@ def _rollback_locked(state: RollbackState) -> bool:
             settle_desired(state.previous_commit, state.repo, state.uv_path)
         except DeployCtlError:
             append_deploy_log("supervised rollback could not settle the previous commit")
-            return False
-        _finalize_supervised_rollback(state)
-        return True
+            finalized = False
+        else:
+            try:
+                _finalize_supervised_rollback(state)
+            except DeployCtlError:
+                append_deploy_log(
+                    "supervised rollback readiness was superseded before terminalization"
+                )
+                finalized = False
+            else:
+                finalized = True
+        return finalized
     if not _retire_candidate_locked(state):
         return False
     return _restore_previous_locked(state)

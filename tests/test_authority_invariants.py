@@ -1150,6 +1150,27 @@ def test_rollback_gate_refuses_malformed_authority(
     assert deployctl._read_state() is mission
 
 
+def test_rollback_gate_keeps_pending_when_final_readiness_is_superseded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost final readiness race leaves rollback pending for a later retry."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: mission.generation + 1)
+
+    def refuse(_state: deployctl.RollbackState) -> deployctl.RollbackState:
+        msg = "readiness superseded"
+        raise deployctl.DeployCtlError(msg)
+
+    monkeypatch.setattr(deployctl, "_finalize_supervised_rollback", refuse)
+    logged: list[str] = []
+    monkeypatch.setattr(deployctl, "append_deploy_log", logged.append)
+
+    assert deployctl._rollback_locked(mission) is False
+    assert logged == ["supervised rollback readiness was superseded before terminalization"]
+
+
 def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None:
     """_rollback_locked proceeds when the authority permits the transition."""
     mission = _make_mission(deployctl.STATUS_PENDING)
