@@ -66,7 +66,9 @@ def test_claim_decision_is_exactly_current_version() -> None:
     assert classify_job_version(5) is JobVersionDisposition.FAIL_CLOSED
     fragment, params = claim_version_predicate()
     assert "BETWEEN" not in fragment
-    assert "= %(protocol_version)s" in fragment
+    assert "::int" not in fragment
+    assert "jsonb_typeof" in fragment
+    assert "= %(protocol_version)s::text" in fragment
     assert params == {"protocol_version": 4}
 
 
@@ -129,7 +131,7 @@ def test_worker_reaper_leaves_future_versions_for_newer_binaries(
     cursor = MagicMock()
     conn.transaction.return_value.__enter__.return_value = None
     conn.cursor.return_value.__enter__.return_value = cursor
-    cursor.fetchall.return_value = [(UUID(int=5), 5)]
+    cursor.fetchall.return_value = [(UUID(int=5), "5", "number")]
     fail_unsupported_job = MagicMock(return_value=True)
     monkeypatch.setattr(worker, "fail_unsupported_job", fail_unsupported_job)
     assert worker.reap_unsupported_jobs(conn, _settings(), limit=10) == []
@@ -147,3 +149,40 @@ def test_chunk_emission_preserves_root_version(tmp_path: Path) -> None:
     )
     assert chunks
     assert all(json.loads(payload)["v"] == 4 for _chunk_id, payload in chunks)
+
+
+def test_worker_reaper_targets_retired_and_malformed_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bounded pass fails safe rows without letting current/future work starve them."""
+    conn = MagicMock()
+    cursor = MagicMock()
+    conn.transaction.return_value.__enter__.return_value = None
+    conn.cursor.return_value.__enter__.return_value = cursor
+    cursor.fetchall.return_value = [
+        (UUID(int=3), "3", "number"),
+        (UUID(int=30), "3.0", "number"),
+        (UUID(int=31), "bad", "string"),
+        (UUID(int=32), None, None),
+        # Defensive future row: SQL should exclude it, and Python still refuses
+        # to terminalize it if a test double or future query change returns it.
+        (UUID(int=5), "5", "number"),
+    ]
+    failed: list[UUID] = []
+
+    def fail(_conn: object, job_id: UUID, _diagnostic: str, *, server: str) -> bool:
+        assert server == "test-server"
+        failed.append(job_id)
+        return True
+
+    monkeypatch.setattr(worker, "fail_unsupported_job", fail)
+
+    reaped = worker.reap_unsupported_jobs(conn, _settings(), limit=10)
+
+    assert reaped == [UUID(int=3), UUID(int=30), UUID(int=31), UUID(int=32)]
+    assert failed == reaped
+    query, params = cursor.execute.call_args.args
+    assert "CASE" in query
+    assert "ORDER BY" in query
+    assert "LIMIT %(limit)s" in query
+    assert params["protocol_version"] == CURRENT_PROTOCOL_VERSION
