@@ -2199,7 +2199,9 @@ def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> N
         write_meta(state.new_meta)
         return
     if not supervise.supervisor_running():
-        msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
+        msg = _confirmation_rollback_error(
+            state, "cannot confirm a supervisor-owned deployment without a live supervisor"
+        )
         raise DeployCtlError(msg)
     settle_desired(state.commit, state.repo, state.uv_path)
 
