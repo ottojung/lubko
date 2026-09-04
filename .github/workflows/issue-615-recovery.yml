@@ -24,21 +24,26 @@ jobs:
           from pathlib import Path
 
           path = Path("src/lubko/deployctl.py")
-          text = path.read_text(encoding="utf-8")
-          old = '''    if supervise.supervisor_running():
-              return _finalize_supervised_confirmation(state)
-          terminal = replace(state, status=STATUS_CONFIRMED)
-          '''
-          new = '''    if supervise.supervisor_running():
-              return _finalize_supervised_confirmation(state)
-          if state.supervisor_owned is not False:
-              msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
-              raise DeployCtlError(msg)
-          terminal = replace(state, status=STATUS_CONFIRMED)
-          '''
-          if old not in text:
-              raise SystemExit("expected confirmation terminalization block not found")
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          lines = path.read_text(encoding="utf-8").splitlines()
+          needle = [
+              "    if supervise.supervisor_running():",
+              "        return _finalize_supervised_confirmation(state)",
+              "    terminal = replace(state, status=STATUS_CONFIRMED)",
+          ]
+          replacement = [
+              "    if supervise.supervisor_running():",
+              "        return _finalize_supervised_confirmation(state)",
+              "    if state.supervisor_owned is not False:",
+              '        msg = "cannot confirm a supervisor-owned deployment without a live supervisor"',
+              "        raise DeployCtlError(msg)",
+              "    terminal = replace(state, status=STATUS_CONFIRMED)",
+          ]
+          matches = [index for index in range(len(lines)) if lines[index:index + 3] == needle]
+          if len(matches) != 1:
+              raise SystemExit(f"expected one confirmation terminalization block, found {len(matches)}")
+          index = matches[0]
+          lines[index:index + 3] = replacement
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
       - name: Verify project checks
         run: |
