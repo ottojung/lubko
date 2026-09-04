@@ -10,8 +10,10 @@ and an expired deadline without a live candidate, fail closed.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -186,12 +188,32 @@ def settlement(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         Mapping of settled commit to settlement count.
     """
     recorded: dict[str, int] = {}
+    settled: dict[str, str | int] = {"commit": NEW_COMMIT, "generation": GENERATION}
 
     def record(commit: str, _repo: str, _uv_path: str) -> int:
+        generation = GENERATION + 10
         recorded[commit] = recorded.get(commit, 0) + 1
-        return GENERATION + 10
+        settled["commit"] = commit
+        settled["generation"] = generation
+        return generation
 
     monkeypatch.setattr(dc, "settle_desired", record)
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=settled["commit"], generation=settled["generation"]),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=settled["generation"],
+            commit=settled["commit"],
+            ready=True,
+            holding=False,
+        ),
+    )
     return recorded
 
 

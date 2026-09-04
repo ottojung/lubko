@@ -1289,13 +1289,47 @@ def _restore_previous_locked(state: RollbackState) -> bool:
 
 
 def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
-    """Durably archive a queue-ready rollback target.
+    """Durably archive only a still-current queue-ready rollback target.
+
+    Terminalization is serialized with desired-generation writers. A restart,
+    migration, or other newer desired generation that wins before this lock is
+    acquired invalidates the older readiness proof even when it names the same
+    previous commit. The mission remains pending so the newer obligation can
+    converge.
 
     Returns:
         The terminal rolled-back state.
+
+    Raises:
+        DeployCtlError: If the queue-readiness proof was superseded or cannot
+            be bound to the current durable supervisor generation.
     """
-    terminal = replace(state, status=STATUS_ROLLED_BACK)
-    _write_state(terminal)
+    with supervise.generation_lock():
+        try:
+            desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError as exc:
+            raise DeployCtlError(
+                "cannot roll back while supervisor desired authority is unreadable"
+            ) from exc
+        status = supervise.read_status()
+        if desired is None or status is None:
+            raise DeployCtlError(
+                "the supervisor readiness proof was superseded before rollback; "
+                "deployment remains pending"
+            )
+        if (
+            desired.commit != state.previous_commit
+            or status.commit != state.previous_commit
+            or status.applied_generation != desired.generation
+            or status.ready is not True
+            or status.holding
+        ):
+            raise DeployCtlError(
+                "the supervisor readiness proof was superseded before rollback; "
+                "deployment remains pending"
+            )
+        terminal = replace(state, status=STATUS_ROLLED_BACK)
+        _write_state(terminal)
     cli.remove_cli_root(state.commit)
     if cli.reconcile_pointer(state.previous_commit):
         append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
