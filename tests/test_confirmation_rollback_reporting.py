@@ -25,7 +25,11 @@ def _pending_state() -> dc.RollbackState:
     return cast(
         "dc.RollbackState",
         SimpleNamespace(
-            status=dc.STATUS_PENDING, commit=COMMIT, repo="/workspace/Lubko", uv_path="uv"
+            status=dc.STATUS_PENDING,
+            commit=COMMIT,
+            repo="/workspace/Lubko",
+            uv_path="uv",
+            supervisor_owned=False,
         ),
     )
 

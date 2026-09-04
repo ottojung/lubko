@@ -494,9 +494,11 @@ def _mission_candidate_alive(state: RollbackState) -> bool:
     Returns:
         ``True`` when the candidate consumer is currently live.
     """
-    if supervise.supervisor_running():
-        return _supervised_mission_active(state)
-    return worker_alive(state.new_meta)
+    if state.supervisor_owned is False:
+        return worker_alive(state.new_meta)
+    if not supervise.supervisor_running():
+        return False
+    return _supervised_mission_active(state)
 
 
 def _supervised_mission_authoritative(state: RollbackState) -> bool:
@@ -530,11 +532,13 @@ def _pending_mission_rollback_due(state: RollbackState) -> bool:
     Returns:
         ``True`` when the mission must roll back now.
     """
-    if supervise.supervisor_running():
-        if not _supervised_mission_authoritative(state):
-            return True
-        return time.time() >= state.deadline and not _supervised_mission_active(state)
-    return time.time() >= state.deadline or not worker_alive(state.new_meta)
+    if state.supervisor_owned is False:
+        return time.time() >= state.deadline or not worker_alive(state.new_meta)
+    if not supervise.supervisor_running():
+        return True
+    if not _supervised_mission_authoritative(state):
+        return True
+    return time.time() >= state.deadline and not _supervised_mission_active(state)
 
 
 def settle_desired(commit: str, repo: str, uv_path: str) -> int:
@@ -1460,31 +1464,29 @@ def _rollback_locked(state: RollbackState) -> bool:
     if not lifecycle_state.authorize_mission_rollback(_mission_authority_facts(state.status)):
         append_deploy_log("lifecycle authority refuses rollback of the pending mission; holding")
         return False
-    if supervise.supervisor_running():
-        try:
-            settle_desired(state.previous_commit, state.repo, state.uv_path)
-        except DeployCtlError:
-            append_deploy_log("supervised rollback could not settle the previous commit")
-            finalized = False
-        else:
-            try:
-                _finalize_supervised_rollback(state)
-            except DeployCtlError:
-                append_deploy_log(
-                    "supervised rollback readiness was superseded before terminalization"
-                )
-                finalized = False
-            else:
-                finalized = True
-        return finalized
-    if state.supervisor_owned is not False:
+    if state.supervisor_owned is False:
+        if not _retire_candidate_locked(state):
+            return False
+        return _restore_previous_locked(state)
+    if not supervise.supervisor_running():
         append_deploy_log(
             "supervised rollback lost supervisor authority before settlement; holding pending mission"
         )
         return False
-    if not _retire_candidate_locked(state):
-        return False
-    return _restore_previous_locked(state)
+    try:
+        settle_desired(state.previous_commit, state.repo, state.uv_path)
+    except DeployCtlError:
+        append_deploy_log("supervised rollback could not settle the previous commit")
+        finalized = False
+    else:
+        try:
+            _finalize_supervised_rollback(state)
+        except DeployCtlError:
+            append_deploy_log("supervised rollback readiness was superseded before terminalization")
+            finalized = False
+        else:
+            finalized = True
+    return finalized
 
 
 def _watchdog_main(lock_timeout_seconds: float) -> None:
@@ -1506,7 +1508,9 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             continue
         if state is None or state.status in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
             return
-        if supervise.supervisor_running():
+        if state.supervisor_owned is False:
+            should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
+        elif supervise.supervisor_running():
             # While the supervisor is present, candidate liveness is a separate
             # observation: only roll back after the deadline AND the exact child
             # is no longer proven live.  A stale state.json child must not count
@@ -1514,7 +1518,7 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
                 state
             )
-        elif state.supervisor_owned is not False:
+        else:
             # Pending supervised missions and missions with unknown lifecycle
             # authority must never enter the legacy direct rollback/worker
             # lifecycle.  If the supervisor is temporarily absent, fail closed
@@ -1522,8 +1526,6 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
             # the next supervisor incarnation.  ``None`` (unknown authority)
             # fails closed identically to ``True``.
             should_rollback = False
-        else:
-            should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
         if should_rollback:
             try:
                 with deploy_lock(lock_timeout_seconds):
@@ -2188,19 +2190,24 @@ def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> N
     Raises:
         DeployCtlError: If the legacy CLI environment cannot be prepared.
     """
-    if supervise.supervisor_running():
-        settle_desired(state.commit, state.repo, state.uv_path)
+    if state.supervisor_owned is False:
+        try:
+            cli.build_cli_root(
+                Path(state.repo), state.commit, state.uv_path, options.cli_timeout_seconds
+            )
+        except cli.CliError as exc:
+            msg = _confirmation_rollback_error(
+                state, f"confirmed CLI environment could not be prepared: {exc}"
+            )
+            raise DeployCtlError(msg) from exc
+        write_meta(state.new_meta)
         return
-    try:
-        cli.build_cli_root(
-            Path(state.repo), state.commit, state.uv_path, options.cli_timeout_seconds
-        )
-    except cli.CliError as exc:
+    if not supervise.supervisor_running():
         msg = _confirmation_rollback_error(
-            state, f"confirmed CLI environment could not be prepared: {exc}"
+            state, "cannot confirm a supervisor-owned deployment without a live supervisor"
         )
-        raise DeployCtlError(msg) from exc
-    write_meta(state.new_meta)
+        raise DeployCtlError(msg)
+    settle_desired(state.commit, state.repo, state.uv_path)
 
 
 def _finalize_confirmation(state: RollbackState) -> RollbackState:
@@ -2212,11 +2219,11 @@ def _finalize_confirmation(state: RollbackState) -> RollbackState:
     Returns:
         Terminal confirmed mission state.
     """
-    if supervise.supervisor_running():
-        return _finalize_supervised_confirmation(state)
     if state.supervisor_owned is not False:
-        msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
-        raise DeployCtlError(msg)
+        if not supervise.supervisor_running():
+            msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
+            raise DeployCtlError(msg)
+        return _finalize_supervised_confirmation(state)
     terminal = replace(state, status=STATUS_CONFIRMED)
     _write_state(terminal)
     try:

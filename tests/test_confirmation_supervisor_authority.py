@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import lubko.deployctl as dc
-from lubko import cli, lifecycle, supervise
+from lubko import cli, lifecycle, lifecycle_state, supervise
 
 COMMIT = "2" * 40
 PREVIOUS_COMMIT = "1" * 40
@@ -150,3 +151,88 @@ def test_confirmation_fails_closed_if_supervisor_disappears_after_preparation(
     assert state.status == dc.STATUS_PENDING
     assert writes == []
     assert pointer_updates == []
+
+
+def test_explicit_legacy_confirmation_ignores_live_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable legacy authority selects direct confirmation despite a supervisor."""
+    state = _pending_state(supervisor_owned=False)
+    built: list[str] = []
+    metadata: list[object] = []
+    writes: list[dc.RollbackState] = []
+
+    monkeypatch.setattr(dc, "_confirmation_state", lambda _request: state)
+    monkeypatch.setattr(dc, "_authorize_confirmation", lambda _state: None)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        dc,
+        "settle_desired",
+        lambda *_args: pytest.fail("legacy confirmation must not settle supervisor desired state"),
+    )
+    monkeypatch.setattr(
+        cli, "build_cli_root", lambda _repo, commit, _uv, _timeout: built.append(commit)
+    )
+    monkeypatch.setattr(dc, "write_meta", metadata.append)
+    monkeypatch.setattr(dc, "_write_state", writes.append)
+    monkeypatch.setattr(cli, "set_current", lambda _commit: None)
+    monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
+
+    dc._confirm_locked({"type": "confirm", "commit": COMMIT}, _options())
+
+    assert built == [COMMIT]
+    assert metadata == [state.new_meta]
+    assert writes[-1].status == dc.STATUS_CONFIRMED
+
+
+def test_explicit_legacy_rollback_ignores_live_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable legacy authority restores recorded workers despite a supervisor."""
+    state = _pending_state(supervisor_owned=False)
+    steps: list[str] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        dc,
+        "settle_desired",
+        lambda *_args: pytest.fail("legacy rollback must not settle supervisor desired state"),
+    )
+
+    def retire(_state: dc.RollbackState) -> bool:
+        steps.append("retire")
+        return True
+
+    def restore(_state: dc.RollbackState) -> bool:
+        steps.append("restore")
+        return True
+
+    monkeypatch.setattr(dc, "_retire_candidate_locked", retire)
+    monkeypatch.setattr(dc, "_restore_previous_locked", restore)
+
+    assert dc._rollback_locked(state) is True
+    assert steps == ["retire", "restore"]
+
+
+def test_legacy_authority_does_not_sample_supervisor_liveness_between_phases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient liveness changes cannot transfer an explicit legacy mission."""
+    state = replace(_pending_state(supervisor_owned=False), deadline=10**20)
+    liveness = iter([False, True])
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: next(liveness))
+    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
+    monkeypatch.setattr(lifecycle_state, "authorize_mission_confirm", lambda _facts: True)
+    monkeypatch.setattr(cli, "build_cli_root", lambda *_args: None)
+    monkeypatch.setattr(dc, "write_meta", lambda _meta: None)
+    monkeypatch.setattr(dc, "_write_state", lambda _state: None)
+    monkeypatch.setattr(cli, "set_current", lambda _commit: None)
+    monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
+
+    dc._authorize_confirmation(state)
+    dc._prepare_confirmation_candidate(state, _options())
+    terminal = dc._finalize_confirmation(state)
+
+    assert terminal.status == dc.STATUS_CONFIRMED
+    assert list(liveness) == [False, True]
