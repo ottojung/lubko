@@ -3,30 +3,52 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from typing import cast
 
 import pytest
 
 import lubko.deployctl as dc
-from lubko import cli, supervise
+from lubko import cli, lifecycle, supervise
 
 COMMIT = "2" * 40
 PREVIOUS_COMMIT = "1" * 40
 
 
+def _meta(commit: str, pid: int) -> lifecycle.WorkerMeta:
+    """Return a minimal valid worker authority record."""
+    return lifecycle.WorkerMeta(
+        schema_version=lifecycle.SCHEMA_VERSION,
+        state=lifecycle.STATE_RUNNING,
+        pid=pid,
+        pgid=pid,
+        sid=pid,
+        start_time_ticks=pid,
+        token=f"token-{pid}",
+        repo="/workspace/Lubko",
+        git_commit=commit,
+        worker_id="w",
+        log_path="",
+        started_at=1.0,
+        stopped_at=None,
+    )
+
+
 def _pending_state(*, supervisor_owned: bool | None) -> dc.RollbackState:
-    """Return a minimal pending mission for confirmation finalization tests."""
-    return cast(
-        "dc.RollbackState",
-        SimpleNamespace(
-            status=dc.STATUS_PENDING,
-            commit=COMMIT,
-            previous_commit=PREVIOUS_COMMIT,
-            repo="/workspace/Lubko",
-            uv_path="uv",
-            supervisor_owned=supervisor_owned,
-        ),
+    """Return a valid pending mission for confirmation finalization tests."""
+    return dc.RollbackState(
+        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=1,
+        status=dc.STATUS_PENDING,
+        commit=COMMIT,
+        previous_commit=PREVIOUS_COMMIT,
+        deadline=10.0,
+        repo="/workspace/Lubko",
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=1.0,
+        previous_retiring=False,
+        previous_meta=_meta(PREVIOUS_COMMIT, 100),
+        new_meta=_meta(COMMIT, 200),
+        supervisor_owned=supervisor_owned,
     )
 
 
