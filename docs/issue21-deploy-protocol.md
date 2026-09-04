@@ -67,33 +67,17 @@ refused because a queue job is executed by a live worker. See the README
 
 A manual (non-queue) invocation retains the synchronous safe path: preparation is immediately followed by the destructive handoff under the deployment lock.
 
-## Confirmation handshake
+## Exact-commit confirmation
 
-The orchestrator must confirm the exact proposed commit twice. Both requests travel through the replacement worker, so the handshake itself is the end-to-end proof that the candidate can consume `lubko.jobs` and return responses.
-
-First request:
+The orchestrator confirms the exact proposed commit once. The request travels through the replacement worker, so successful confirmation is itself end-to-end evidence that the candidate can consume `lubko.jobs` and return a response.
 
 ```json
 {"type":"confirm","commit":"<exact proposed commit>"}
 ```
 
-The controller returns a fresh random challenge and stores only its digest. The
-challenge is exactly 7 characters of lowercase hexadecimal text (canonical form
-`^[0-9a-f]{7}$`, for example `3fa91c0`); any other value is malformed.
+While holding the deployment lock, the controller rechecks the pending mission, exact commit, deadline, lifecycle authority, and candidate readiness. With the external supervisor active it publishes the exact candidate commit as desired, waits until that generation is applied and queue-ready, then persists terminal `confirmed` state. The operation is idempotent for an already-confirmed matching commit.
 
-Second request:
-
-```json
-{
-  "type":"confirm",
-  "commit":"<exact proposed commit>",
-  "challenge":"<the first 7-character hex challenge reversed>"
-}
-```
-
-The controller rechecks the deadline and candidate process identity while holding the deployment lock. Only after the response is valid does it write the candidate as maintained-worker metadata and persist terminal `confirmed` state.
-
-A wrong commit, a wrong-length or non-hex challenge response, a challenge supplied before any first-stage state exists, candidate failure, or timeout triggers rollback rather than leaving the candidate accepted ambiguously. An omitted `challenge` field is not a failure: it is treated as another first-stage confirmation request that issues or refreshes a fresh 7-character hex challenge and leaves the deployment pending confirmation.
+A wrong commit, candidate failure, expired deadline, malformed durable authority, or inability to prove the exact candidate queue-ready fails closed and may trigger rollback rather than accepting ambiguous state. There is no challenge field or second confirmation stage; transaction sequencing belongs to the external orchestrator.
 
 ## Global CLI coherence
 
@@ -105,9 +89,8 @@ supervised protocol keeps that pointer coherent with the *confirmed* worker:
 
 - the candidate environment is built during checkout, while the CLIs still
   resolve to the previous confirmed commit;
-- the second confirmation durably records `confirmed` state and candidate
-  metadata first, and only then atomically switches the `current` symlink to
-  the candidate commit;
+- confirmation durably records `confirmed` state and candidate metadata first,
+  and only then atomically switches the `current` symlink to the candidate commit;
 - any rollback path removes the candidate environment and never moves the
   `current` symlink, so the prior confirmed CLI version is preserved by
   construction.
@@ -151,7 +134,7 @@ If restoration cannot complete, the state remains pending and the watchdog retri
 {"type":"status"}
 ```
 
-Status reports one of the externally relevant states: idle, awaiting the first confirmation, or awaiting the reversed challenge. Reading status also enforces an already-expired/dead candidate by attempting rollback under the deployment lock.
+Status reports the externally relevant state as either idle or awaiting exact-commit confirmation. Reading status also enforces an already-expired/dead candidate by attempting rollback under the deployment lock.
 
 ## External supervisor integration
 
@@ -169,9 +152,9 @@ generation space, and only the newest generation may choose a worker commit:
   supervisor is active;
 - a pending mission at the desired generation only runs when it selects the
   same commit, otherwise the contradiction holds;
-- terminal `confirmed`/`rolled_back` status alone never selects a commit: the
-  settlement (confirmation or rollback convergence) writes a strictly newer
-  desired intent, which is what the supervisor applies;
+- terminal `confirmed`/`rolled_back` status alone never selects a commit: confirmation
+  or rollback requests one exact target through the supervisor, which publishes and
+  applies a newer desired generation while the controller holds the deployment lock;
 - after a container restart during a `pending` mission (controller and
   watchdog gone), the supervisor reconstructs the pending candidate directly
   from the durable mission record, so the queue is never left with no consumer

@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Final
 from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
+from lubko.health import validate_incarnation_token
 from lubko.state import rollback_state_path, state_root
 
 if TYPE_CHECKING:
@@ -162,12 +163,32 @@ class SupervisorDesired:
             TypeError: If a present ``restart`` or ``migration`` value is not
                 a JSON boolean.
         """
-        schema_version = _optional_int(data.get("schema_version"))
-        generation = _optional_int(data.get("generation"))
+        schema_version = _strict_int(data.get("schema_version"))
+        generation = _strict_non_negative_int(data.get("generation"))
         commit = _optional_string(data.get("commit"))
-        if schema_version is None or generation is None or commit is None:
+        repo = "" if "repo" not in data else _optional_string(data["repo"])
+        uv_path = "" if "uv_path" not in data else _optional_string(data["uv_path"])
+        if (
+            schema_version != SCHEMA_VERSION
+            or generation is None
+            or commit is None
+            or repo is None
+            or uv_path is None
+        ):
             msg = "supervisor desired state is malformed"
             raise ValueError(msg)
+        worker_id_raw = data.get("worker_id")
+        worker_id = _optional_string(worker_id_raw)
+        if worker_id_raw is not None and worker_id is None:
+            msg = "supervisor desired state is malformed"
+            raise ValueError(msg)
+        if "requested_at" in data:
+            requested_at = _strict_non_negative_finite_float(data["requested_at"])
+            if requested_at is None:
+                msg = "supervisor desired state is malformed"
+                raise ValueError(msg)
+        else:
+            requested_at = 0.0
         migration = data.get("migration", False)
         # Absence is backward-compatible false, but a present value must be a
         # real JSON boolean: anything else means the authoritative intent file
@@ -187,11 +208,11 @@ class SupervisorDesired:
                 schema_version=schema_version,
                 generation=generation,
                 commit=commit,
-                repo=str(data.get("repo") or ""),
-                uv_path=str(data.get("uv_path") or ""),
-                worker_id=_optional_string(data.get("worker_id")),
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id,
                 restart=restart,
-                requested_at=_optional_float(data.get("requested_at")) or 0.0,
+                requested_at=requested_at,
                 migration=migration,
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -243,16 +264,25 @@ class UnresolvedChild:
         Raises:
             ValueError: If a required field is missing or malformed.
         """
-        pid = _optional_int(data.get("pid"))
-        token = _optional_string(data.get("token"))
-        if pid is None or token is None:
+        pid = _strict_non_negative_int(data.get("pid"))
+        token = _optional_incarnation_token(data.get("token"))
+        ticks_raw = data.get("start_time_ticks")
+        ticks = None if ticks_raw is None else _strict_non_negative_int(ticks_raw)
+        if pid is None or token is None or (ticks_raw is not None and ticks is None):
             msg = "unresolved child hold is malformed"
             raise ValueError(msg)
+        if "spawned_at" in data:
+            spawned_at = _strict_non_negative_finite_float(data["spawned_at"])
+            if spawned_at is None:
+                msg = "unresolved child hold is malformed"
+                raise ValueError(msg)
+        else:
+            spawned_at = 0.0
         return cls(
             pid=pid,
-            start_time_ticks=_optional_int(data.get("start_time_ticks")),
+            start_time_ticks=ticks,
             token=token,
-            spawned_at=_optional_float(data.get("spawned_at")) or 0.0,
+            spawned_at=spawned_at,
         )
 
 
@@ -332,10 +362,36 @@ class SpawningObligation:
         Raises:
             ValueError: If a required field is missing or malformed.
         """
-        token = _optional_string(data.get("token"))
-        creator_pid = _optional_int(data.get("creator_pid"))
-        creator_ticks = _optional_int(data.get("creator_start_time_ticks"))
+        token = _optional_incarnation_token(data.get("token"))
+        creator_pid = _strict_non_negative_int(data.get("creator_pid"))
+        creator_ticks = _strict_non_negative_int(data.get("creator_start_time_ticks"))
         if token is None or creator_pid is None or creator_ticks is None:
+            msg = "spawning obligation is malformed"
+            raise ValueError(msg)
+        if "commit" in data:
+            commit = _optional_string(data["commit"])
+            if commit is None:
+                msg = "spawning obligation is malformed"
+                raise ValueError(msg)
+        else:
+            commit = ""
+        pid_raw = data.get("pid")
+        pid = None if pid_raw is None else _strict_non_negative_int(pid_raw)
+        ticks_raw = data.get("start_time_ticks")
+        ticks = None if ticks_raw is None else _strict_non_negative_int(ticks_raw)
+        if (pid_raw is not None and pid is None) or (ticks_raw is not None and ticks is None):
+            msg = "spawning obligation is malformed"
+            raise ValueError(msg)
+        if "created_at" in data:
+            created_at = _strict_non_negative_finite_float(data["created_at"])
+            if created_at is None:
+                msg = "spawning obligation is malformed"
+                raise ValueError(msg)
+        else:
+            created_at = 0.0
+        boot_raw = data.get("boot_id")
+        boot_id = None if boot_raw is None else _optional_string(boot_raw)
+        if boot_raw is not None and boot_id is None:
             msg = "spawning obligation is malformed"
             raise ValueError(msg)
         # Legacy obligations predate the field and were all written by the
@@ -353,13 +409,13 @@ class SpawningObligation:
             raise ValueError(msg)
         return cls(
             token=token,
-            commit=_optional_string(data.get("commit")) or "",
+            commit=commit,
             creator_pid=creator_pid,
             creator_start_time_ticks=creator_ticks,
-            pid=_optional_int(data.get("pid")),
-            start_time_ticks=_optional_int(data.get("start_time_ticks")),
-            created_at=_optional_float(data.get("created_at")) or 0.0,
-            boot_id=_optional_string(data.get("boot_id")),
+            pid=pid,
+            start_time_ticks=ticks,
+            created_at=created_at,
+            boot_id=boot_id,
             parent_death_signal=parent_death_signal,
         )
 
@@ -452,6 +508,7 @@ class SupervisorState:
         Returns:
             The parsed state, or a fresh idle state for an empty mapping.
         """
+        _validate_state_schema(data)
         child, ownership_hold_malformed = _parse_optional_child(data)
         unresolved, unresolved_hold_malformed = _parse_optional_unresolved_child(data)
         spawning, spawning_hold_malformed = _parse_optional_spawning(data)
@@ -479,6 +536,14 @@ class SupervisorState:
             # backoff and let reconciliation restart immediately from a
             # corrupted schedule. Enter the durable hold.
             ownership_hold_malformed = True
+        monotonic_timestamps = (
+            _parse_present_nullable_monotonic_float(data, "last_spawn_at"),
+            _parse_present_nullable_monotonic_float(data, "next_readiness_at"),
+        )
+        if monotonic_timestamps[0][1] or monotonic_timestamps[1][1]:
+            # Stability/readiness timing is lifecycle authority: malformed
+            # presence must never influence scheduling or become ordinary absence.
+            ownership_hold_malformed = True
         boot_id, boot_malformed = _parse_present_boot_identity(data, "boot_id")
         if boot_malformed:
             # Any present boot identifier must be a non-empty string: a
@@ -487,27 +552,29 @@ class SupervisorState:
             # written by an unknown prior boot and erase an active
             # crash-loop backoff deadline. Enter the durable hold.
             ownership_hold_malformed = True
+
         return cls(
-            schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
+            schema_version=SCHEMA_VERSION,
             applied_generation=generation or 0,
-            mode=_optional_string(data.get("mode")) or MODE_IDLE,
-            commit=_optional_string(data.get("commit")),
+            mode=_state_mode(data),
+            commit=_state_commit(data),
             child=child,
             unresolved_child=unresolved,
             ownership_hold_malformed=ownership_hold_malformed
+            or _state_strings_malformed(data)
             or _strict_safety_hold(data, "ownership_hold_malformed"),
             unresolved_hold_malformed=unresolved_hold_malformed
             or _strict_safety_hold(data, "unresolved_hold_malformed"),
             spawning=spawning,
             spawning_hold_malformed=spawning_hold_malformed
             or _strict_safety_hold(data, "spawning_hold_malformed"),
-            intent=_optional_string(data.get("intent")) or INTENT_RUN,
+            intent=_state_intent(data),
             restart_count=restart_count or 0,
             next_attempt_at=next_attempt_at,
             last_exit=_parse_last_exit(data),
-            last_spawn_at=_optional_float(data.get("last_spawn_at")),
+            last_spawn_at=monotonic_timestamps[0][0],
             ready=data.get("ready", False) is True,
-            next_readiness_at=_optional_float(data.get("next_readiness_at")),
+            next_readiness_at=monotonic_timestamps[1][0],
             boot_id=boot_id,
         )
 
@@ -539,6 +606,11 @@ class SupervisorStatus:
     ready: bool | None
     message: str | None
     worker_health: dict[str, object] | None
+    #: Whether the supervisor is intentionally not running a confirmed worker
+    #: it owns (a durable hold, backoff, pending migration/retire, or an
+    #: unresolved/spawning obligation).  Distinct from ``ready``: a held
+    #: supervisor is alive but deliberately not serving a worker.
+    holding: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -569,6 +641,7 @@ class SupervisorStatus:
             "ready": self.ready,
             "message": self.message,
             "worker_health": self.worker_health,
+            "holding": self.holding,
         }
 
     @classmethod
@@ -580,43 +653,252 @@ class SupervisorStatus:
 
         Returns:
             The parsed status.
+
+        Raises:
+            TypeError: If a present field has the wrong JSON scalar type.
+            ValueError: If a present field is outside its valid domain.
         """
+        if "schema_version" not in data:
+            schema_version = SCHEMA_VERSION
+        else:
+            parsed_schema_version = _strict_int(data["schema_version"])
+            if parsed_schema_version is None:
+                msg = "supervisor status is malformed"
+                raise TypeError(msg)
+            schema_version = parsed_schema_version
+
+        if "started_at" not in data:
+            started_at = 0.0
+        else:
+            raw_started_at = data["started_at"]
+            if isinstance(raw_started_at, bool) or not isinstance(raw_started_at, (int, float)):
+                msg = "supervisor status is malformed"
+                raise TypeError(msg)
+            parsed_started_at = _strict_finite_float(raw_started_at)
+            if parsed_started_at is None:
+                msg = "supervisor status is malformed"
+                raise ValueError(msg)
+            started_at = parsed_started_at
+
+        mode = _parse_diagnostic_string(data, "mode", default=MODE_IDLE)
+        intent = _parse_diagnostic_string(data, "intent", default=INTENT_RUN)
+        if mode not in {MODE_RUN, MODE_IDLE} or intent not in {INTENT_RUN, INTENT_RETIRING}:
+            msg = "supervisor status is malformed"
+            raise ValueError(msg)
+
         child_data = data.get("child")
         child: WorkerChild | None = None
-        if isinstance(child_data, dict):
-            try:
-                child = _child_from_dict(child_data)
-            except (TypeError, ValueError, KeyError):
-                child = None
-        exit_data = data.get("last_exit")
-        last_exit: LastExit | None = None
-        if isinstance(exit_data, dict):
-            try:
-                last_exit = LastExit(
-                    returncode=_optional_int(exit_data.get("returncode")),
-                    at=float(exit_data.get("at") or 0.0),
-                )
-            except (TypeError, ValueError):
-                last_exit = None
+        if child_data is not None:
+            if not isinstance(child_data, dict):
+                msg = "supervisor status is malformed"
+                raise TypeError(msg)
+            child = _child_from_dict(child_data)
+
+        worker_health = _parse_status_nullable_dict(data, "worker_health")
+
         return cls(
-            schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
-            supervisor_pid=_optional_int(data.get("supervisor_pid")) or 0,
-            supervisor_start_time_ticks=_optional_int(data.get("supervisor_start_time_ticks")) or 0,
-            started_at=_optional_float(data.get("started_at")) or 0.0,
-            applied_generation=_optional_int(data.get("applied_generation")) or 0,
-            mode=_optional_string(data.get("mode")) or MODE_IDLE,
-            commit=_optional_string(data.get("commit")),
+            schema_version=schema_version,
+            supervisor_pid=_parse_diagnostic_non_negative_int(data, "supervisor_pid"),
+            supervisor_start_time_ticks=_parse_diagnostic_non_negative_int(
+                data, "supervisor_start_time_ticks"
+            ),
+            started_at=started_at,
+            applied_generation=_parse_diagnostic_non_negative_int(data, "applied_generation"),
+            mode=mode,
+            commit=_parse_diagnostic_nullable_string(data, "commit"),
             child=child,
-            intent=_optional_string(data.get("intent")) or INTENT_RUN,
-            restart_count=_optional_int(data.get("restart_count")) or 0,
-            next_attempt_at=_optional_float(data.get("next_attempt_at")),
-            last_exit=last_exit,
-            mission=_optional_string(data.get("mission")),
-            db_ready=_optional_bool(data.get("db_ready")),
-            ready=_optional_bool(data.get("ready")),
-            message=_optional_string(data.get("message")),
-            worker_health=_optional_dict(data.get("worker_health")),
+            intent=intent,
+            restart_count=_parse_diagnostic_non_negative_int(data, "restart_count"),
+            next_attempt_at=_parse_diagnostic_nullable_float(data, "next_attempt_at"),
+            last_exit=_parse_last_exit(data),
+            mission=_parse_diagnostic_nullable_string(data, "mission"),
+            db_ready=_parse_diagnostic_nullable_bool(data, "db_ready"),
+            ready=_parse_diagnostic_nullable_bool(data, "ready"),
+            message=_parse_diagnostic_nullable_string(data, "message"),
+            worker_health=worker_health,
+            holding=_parse_diagnostic_bool(data, "holding"),
         )
+
+
+def is_holding(state: SupervisorState) -> bool:
+    """Return whether the supervisor is intentionally not serving a worker.
+
+    A held supervisor is alive but deliberately not running a confirmed worker
+    it owns: a durable replacement-blocking hold (any ``*_hold_malformed``
+    flag, an unresolved/spawning obligation), a non-run intent (migration or
+    retire), or simply the idle/retiring mode without an owned child.
+
+    Args:
+        state: The durable supervisor state.
+
+    Returns:
+        ``True`` when the supervisor is holding rather than actively serving.
+    """
+    if state.ownership_hold_malformed or state.unresolved_hold_malformed:
+        return True
+    if state.spawning_hold_malformed:
+        return True
+    if state.unresolved_child is not None or state.spawning is not None:
+        return True
+    if state.intent != INTENT_RUN:
+        return True
+    return state.mode != MODE_RUN or state.child is None
+
+
+@dataclass(frozen=True, slots=True)
+class SupervisorDiagnostic:
+    """Non-live diagnostic derived solely from durable supervisor state.
+
+    This is explicitly **not** a live health snapshot.  It is produced only when
+    the supervisor process is dead, replaced, or otherwise cannot publish a
+    live :class:`SupervisorStatus`, so operators never mistake stale durable
+    records for a running supervisor.  ``live`` is always ``False`` and
+    ``source`` names the durable origin that was read.
+
+    Field semantics mirror the durable state authority (``state.json``) plus
+    the recorded supervisor identity file; no live process observation is
+    trusted here beyond what the durable records already prove.
+    """
+
+    live: bool
+    source: str
+    supervisor_present: bool
+    supervisor_alive: bool | None
+    mode: str
+    intent: str
+    commit: str | None
+    applied_generation: int
+    restart_count: int
+    next_attempt_at: float | None
+    ready: bool
+    next_readiness_at: float | None
+    holding: bool
+    ownership_hold_malformed: bool
+    unresolved_hold_malformed: bool
+    spawning_hold_malformed: bool
+    child_present: bool
+    unresolved_child_present: bool
+    spawning_present: bool
+    last_exit: LastExit | None
+    message: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the durable diagnostic for operators.
+
+        Returns:
+            A JSON-serializable mapping marked non-live.
+        """
+        return {
+            "live": self.live,
+            "source": self.source,
+            "supervisor_present": self.supervisor_present,
+            "supervisor_alive": self.supervisor_alive,
+            "mode": self.mode,
+            "intent": self.intent,
+            "commit": self.commit,
+            "applied_generation": self.applied_generation,
+            "restart_count": self.restart_count,
+            "next_attempt_at": self.next_attempt_at,
+            "ready": self.ready,
+            "next_readiness_at": self.next_readiness_at,
+            "holding": self.holding,
+            "ownership_hold_malformed": self.ownership_hold_malformed,
+            "unresolved_hold_malformed": self.unresolved_hold_malformed,
+            "spawning_hold_malformed": self.spawning_hold_malformed,
+            "child_present": self.child_present,
+            "unresolved_child_present": self.unresolved_child_present,
+            "spawning_present": self.spawning_present,
+            "last_exit": None
+            if self.last_exit is None
+            else {"returncode": self.last_exit.returncode, "at": self.last_exit.at},
+            "message": self.message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> SupervisorDiagnostic:
+        """Rebuild a durable diagnostic from a stored mapping.
+
+        Args:
+            data: Mapping produced by :meth:`to_dict`.
+
+        Returns:
+            The reconstructed diagnostic.
+
+        Raises:
+            ValueError: If a present scalar has an invalid value.
+        """
+        source = _parse_diagnostic_string(data, "source", default="durable-state")
+        mode = _parse_diagnostic_string(data, "mode", default=MODE_IDLE)
+        intent = _parse_diagnostic_string(data, "intent", default=INTENT_RUN)
+        if mode not in {MODE_RUN, MODE_IDLE} or intent not in {INTENT_RUN, INTENT_RETIRING}:
+            msg = "supervisor diagnostic is malformed"
+            raise ValueError(msg)
+        return cls(
+            live=_parse_diagnostic_bool(data, "live"),
+            source=source,
+            supervisor_present=_parse_diagnostic_bool(data, "supervisor_present"),
+            supervisor_alive=_parse_diagnostic_nullable_bool(data, "supervisor_alive"),
+            mode=mode,
+            intent=intent,
+            commit=_parse_diagnostic_nullable_string(data, "commit"),
+            applied_generation=_parse_diagnostic_non_negative_int(data, "applied_generation"),
+            restart_count=_parse_diagnostic_non_negative_int(data, "restart_count"),
+            next_attempt_at=_parse_diagnostic_nullable_float(data, "next_attempt_at"),
+            ready=_parse_diagnostic_bool(data, "ready"),
+            next_readiness_at=_parse_diagnostic_nullable_float(data, "next_readiness_at"),
+            holding=_parse_diagnostic_bool(data, "holding"),
+            ownership_hold_malformed=_parse_diagnostic_bool(data, "ownership_hold_malformed"),
+            unresolved_hold_malformed=_parse_diagnostic_bool(data, "unresolved_hold_malformed"),
+            spawning_hold_malformed=_parse_diagnostic_bool(data, "spawning_hold_malformed"),
+            child_present=_parse_diagnostic_bool(data, "child_present"),
+            unresolved_child_present=_parse_diagnostic_bool(data, "unresolved_child_present"),
+            spawning_present=_parse_diagnostic_bool(data, "spawning_present"),
+            last_exit=_parse_last_exit(data),
+            message=_parse_diagnostic_nullable_string(data, "message"),
+        )
+
+
+def derive_durable_diagnostic() -> SupervisorDiagnostic:
+    """Build a non-live diagnostic from the durable supervisor records.
+
+    Reads ``state.json`` and the recorded supervisor identity, never a live
+    process snapshot.  The result is explicitly marked ``live=False`` so it can
+    never be confused with a running supervisor's health.
+
+    Returns:
+        The durable-state-derived diagnostic.
+    """
+    state = read_state()
+    try:
+        recorded = read_supervisor_pid()
+        supervisor_present = recorded is not None
+        supervisor_alive = supervisor_running() if supervisor_present else None
+    except MalformedSupervisorIdentityError:
+        supervisor_present = True
+        supervisor_alive = False
+    return SupervisorDiagnostic(
+        live=False,
+        source="durable-state",
+        supervisor_present=supervisor_present,
+        supervisor_alive=supervisor_alive,
+        mode=state.mode,
+        intent=state.intent,
+        commit=state.commit,
+        applied_generation=state.applied_generation,
+        restart_count=state.restart_count,
+        next_attempt_at=state.next_attempt_at,
+        ready=state.ready,
+        next_readiness_at=state.next_readiness_at,
+        holding=is_holding(state),
+        ownership_hold_malformed=state.ownership_hold_malformed,
+        unresolved_hold_malformed=state.unresolved_hold_malformed,
+        spawning_hold_malformed=state.spawning_hold_malformed,
+        child_present=state.child is not None,
+        unresolved_child_present=state.unresolved_child is not None,
+        spawning_present=state.spawning is not None,
+        last_exit=state.last_exit,
+        message=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -908,6 +1190,10 @@ class DesiredIntentError(RuntimeError):
     """Raised when a present desired intent exists but cannot be trusted."""
 
 
+class MissionAuthorityError(RuntimeError):
+    """Raised when a present supervised-mission authority exists but cannot be trusted."""
+
+
 class DesiredAuthorityConflictError(RuntimeError):
     """Raised when existing lifecycle authority forbids desired-state convergence."""
 
@@ -1065,7 +1351,7 @@ def read_state() -> SupervisorState:
         return replace(fresh_state(), ownership_hold_malformed=True)
     if not isinstance(decoded, dict):
         return replace(fresh_state(), ownership_hold_malformed=True)
-    schema_version = _optional_int(decoded.get("schema_version"))
+    schema_version = _strict_int(decoded.get("schema_version"))
     if schema_version != SCHEMA_VERSION:
         return replace(fresh_state(), ownership_hold_malformed=True)
     return SupervisorState.from_dict(decoded)
@@ -1129,7 +1415,10 @@ def read_status() -> SupervisorStatus | None:
     data = _read_json(status_path())
     if data is None:
         return None
-    status = SupervisorStatus.from_dict(data)
+    try:
+        status = SupervisorStatus.from_dict(data)
+    except (KeyError, TypeError, ValueError):
+        return None
     if status.schema_version != SCHEMA_VERSION:
         return None
     if status.supervisor_pid == 0:
@@ -1162,7 +1451,9 @@ def _status_identity_matches(status: SupervisorStatus) -> bool:
     Returns:
         ``True`` when the identity is the current live supervisor incarnation.
     """
-    recorded = read_supervisor_pid()
+    recorded: tuple[int, int] | None = None
+    with suppress(MalformedSupervisorIdentityError):
+        recorded = read_supervisor_pid()
     if recorded is None:
         return False
     pid, ticks = recorded
@@ -1212,19 +1503,40 @@ def write_supervisor_pid(pid: int, start_time_ticks: int) -> None:
     )
 
 
+class MalformedSupervisorIdentityError(ValueError):
+    """A present supervisor identity record cannot be trusted."""
+
+
 def read_supervisor_pid() -> tuple[int, int] | None:
-    """Load the recorded daemon identity.
+    """Load the recorded daemon identity without normalizing malformed authority.
 
     Returns:
-        The ``(pid, start_time_ticks)`` pair, or ``None`` when absent.
+        The ``(pid, start_time_ticks)`` pair, or ``None`` when the identity
+        file is genuinely absent.
+
+    Raises:
+        MalformedSupervisorIdentityError: If a present identity record has an
+            unsupported schema or malformed exact process identity.
     """
-    data = _read_json(supervisor_pid_path())
-    if data is None:
+    path = supervisor_pid_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
-    pid = _optional_int(data.get("pid"))
-    ticks = _optional_int(data.get("start_time_ticks"))
-    if pid is None or ticks is None:
-        return None
+    except OSError as exc:
+        raise MalformedSupervisorIdentityError from exc
+    try:
+        decoded = json.loads(raw)
+    except ValueError as exc:
+        raise MalformedSupervisorIdentityError from exc
+    if not isinstance(decoded, dict):
+        raise MalformedSupervisorIdentityError
+    data: dict[str, object] = decoded
+    schema_version = _strict_int(data.get("schema_version"))
+    pid = _strict_non_negative_int(data.get("pid"))
+    ticks = _strict_non_negative_int(data.get("start_time_ticks"))
+    if schema_version != SCHEMA_VERSION or pid is None or pid <= 0 or ticks is None:
+        raise MalformedSupervisorIdentityError
     return pid, ticks
 
 
@@ -1262,29 +1574,42 @@ def mission_state_exists_strict() -> bool:
 def _mission_generation() -> int:
     """Return the durable supervised-mission generation, or 0 when absent.
 
-    The mission is deployctl-owned and lives under the worker state; only the
-    ``generation`` field is observed here so generation allocation can never
-    be outranked by an open mission without forming an import cycle with
-    :mod:`lubko.deployctl`. A corrupt, absent, or legacy mission contributes
-    0.
+    The mission is deployctl-owned and lives under the worker state. Generation
+    allocation must observe any open mission so a newer intent can never be
+    outranked by an older one, but the authoritative read is the canonical
+    mission parser in :mod:`lubko.deployctl`; a local import keeps the shared
+    absence-vs-corruption rule in exactly one place without forming a load-time
+    cycle with that module.
+
+    The rule is shared with :func:`read_desired_strict` and
+    :func:`lubko.deployctl.read_rollback_state`:
+
+    * genuine absence (no mission file exists) contributes ``0``;
+    * a present mission authority that is unreadable, invalid JSON, not a
+      supported object, or missing/non-positive its ``generation`` is corrupt
+      and blocks allocation rather than silently degrading to ``0``.
+
+    Blocking on corruption preserves the "never outranked by an open mission"
+    invariant: a newer allocation must never reuse or undercut a mission
+    generation that may already be live.
 
     Returns:
-        The mission's generation, or ``0`` when none is usable.
+        The mission's generation, or ``0`` when no mission authority exists.
+
+    Raises:
+        MissionAuthorityError: If a present mission authority cannot be trusted.
     """
+    from lubko import (  # ruff: ignore[import-outside-top-level] - avoids the deployctl<->supervise import cycle
+        deployctl,
+    )
+
     try:
-        data = json.loads(rollback_state_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        mission = deployctl.read_rollback_state()
+    except deployctl.DeployCtlError as exc:
+        raise MissionAuthorityError(str(exc)) from exc
+    if mission is None:
         return 0
-    if isinstance(data, dict):
-        value = data.get("generation")
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            try:
-                return int(value)
-            except ValueError:
-                pass
-    return 0
+    return mission.generation
 
 
 def next_generation() -> int:
@@ -1478,30 +1803,34 @@ def wait_for_generation(generation: int, timeout_seconds: float) -> bool:
     return False
 
 
-def wait_until_ready(generation: int, timeout_seconds: float) -> bool:
+def wait_until_ready(generation: int, timeout_seconds: float, *, commit: str | None = None) -> bool:
     """Wait until the daemon proves its worker consumes the queue.
 
     Readiness is the daemon's own proof that the exact worker child it spawned
     reached the queue-consumer boundary, so waiting here means the replacement
     is genuinely consuming ``lubko.jobs``, not merely alive or PostgreSQL
-    reachable.
+    reachable. When ``commit`` is supplied, a generation at or beyond the
+    requested generation may satisfy the wait only while it still targets that
+    exact commit. A newer generation for another commit supersedes the request
+    and therefore fails closed immediately.
 
     Args:
         generation: Requested generation.
         timeout_seconds: Maximum seconds to wait.
+        commit: Optional exact commit that must still own the applied generation.
 
     Returns:
         ``True`` when the daemon applied the generation and its worker is
-        queue-ready.
+        queue-ready for the requested commit.
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         status = read_status()
-        # A ``child=None`` observation is the daemon's ordinary bounded
-        # restart-backoff state for the same applied generation, not a
-        # terminal failure: keep polling until readiness or this timeout.
-        if status is not None and status.applied_generation >= generation and status.ready:
-            return True
+        if status is not None and status.applied_generation >= generation:
+            if commit is not None and status.commit != commit:
+                return False
+            if status.ready:
+                return True
         time.sleep(REQUEST_POLL_SECONDS)
     return False
 
@@ -1576,6 +1905,37 @@ def child_alive(child: WorkerChild) -> bool:
     return proc_start_ticks(child.pid) == child.start_time_ticks
 
 
+def child_is_our_direct_child(child: WorkerChild) -> bool:
+    """Return whether the recorded child is our live direct child.
+
+    Combines the liveness check of :func:`child_alive` with an exact parent
+    proof: the recorded child must be live *and* its parent PID must be this
+    process, so a child reparented to PID 1 after a supervisor restart is
+    never mistaken for our own.  This is the exact identity proof the
+    retirement authority requires before any signal is delivered.
+
+    Args:
+        child: Exact child identity recorded by the supervisor.
+
+    Returns:
+        ``True`` only when the live process is provably our direct child.
+    """
+    if not child_alive(child):
+        return False
+    try:
+        status = (Path("/proc") / str(child.pid) / "status").read_bytes()
+    except (OSError, AttributeError, ValueError):
+        return False
+    for raw in status.splitlines():
+        if raw.startswith(b"PPid:"):
+            try:
+                ppid = int(raw.split()[1])
+            except (ValueError, IndexError):
+                return False
+            return ppid == os.getpid()
+    return False
+
+
 def _read_cmdline(pid: int) -> str:
     """Read the joined command line of a live process.
 
@@ -1603,7 +1963,10 @@ def supervisor_running() -> bool:
         ``True`` only when the recorded daemon identity matches a live process
         whose command line names the supervisor.
     """
-    recorded = read_supervisor_pid()
+    try:
+        recorded = read_supervisor_pid()
+    except MalformedSupervisorIdentityError:
+        return False
     if recorded is None:
         return False
     pid, ticks = recorded
@@ -1621,6 +1984,48 @@ def supervisor_running() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _state_mode(data: dict[str, object]) -> str:
+    """Return canonical mode while leaving malformed presence to the hold."""
+    value = data.get("mode", MODE_IDLE)
+    return value if isinstance(value, str) and value in {MODE_IDLE, MODE_RUN} else MODE_IDLE
+
+
+def _state_intent(data: dict[str, object]) -> str:
+    """Return canonical intent while leaving malformed presence to the hold."""
+    value = data.get("intent", INTENT_RUN)
+    return (
+        value if isinstance(value, str) and value in {INTENT_RUN, INTENT_RETIRING} else INTENT_RUN
+    )
+
+
+def _state_commit(data: dict[str, object]) -> str | None:
+    """Preserve nullable commit semantics without coercing malformed presence.
+
+    Returns:
+        The persisted commit when it is a string, otherwise ``None``.
+    """
+    value = data.get("commit")
+    return value if isinstance(value, str) else None
+
+
+def _state_strings_malformed(data: dict[str, object]) -> bool:
+    """Check whether persisted lifecycle strings are trustworthy authority.
+
+    Returns:
+        True when any present mode, intent, or commit value is malformed.
+    """
+    mode = data.get("mode", MODE_IDLE)
+    intent = data.get("intent", INTENT_RUN)
+    commit = data.get("commit")
+    return (
+        not isinstance(mode, str)
+        or mode not in {MODE_IDLE, MODE_RUN}
+        or not isinstance(intent, str)
+        or intent not in {INTENT_RUN, INTENT_RETIRING}
+        or (commit is not None and not isinstance(commit, str))
+    )
+
+
 def _optional_string(value: object | None) -> str | None:
     """Return a string value or ``None``.
 
@@ -1631,6 +2036,18 @@ def _optional_string(value: object | None) -> str | None:
         The string, or ``None``.
     """
     return value if isinstance(value, str) else None
+
+
+def _optional_incarnation_token(value: object | None) -> str | None:
+    """Return a canonical filename-safe incarnation token or ``None``."""
+    token = _optional_string(value)
+    if token is None:
+        return None
+    try:
+        validate_incarnation_token(token)
+    except ValueError:
+        return None
+    return token
 
 
 def _optional_int(value: object | None) -> int | None:
@@ -1654,6 +2071,33 @@ def _optional_int(value: object | None) -> int | None:
     return None
 
 
+def _validate_state_schema(data: dict[str, object]) -> None:
+    """Reject malformed present top-level supervisor state schema authority.
+
+    Raises:
+        ValueError: If a present schema discriminator is not the exact current JSON integer.
+    """
+    if "schema_version" not in data:
+        return
+    if _strict_int(data["schema_version"]) != SCHEMA_VERSION:
+        msg = "supervisor state schema_version is malformed"
+        raise ValueError(msg)
+
+
+def _strict_int(value: object | None) -> int | None:
+    """Return an exact JSON integer, or ``None`` when malformed.
+
+    Args:
+        value: JSON value to inspect.
+
+    Returns:
+        The integer, or ``None`` for booleans and non-integer values.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
 def _strict_non_negative_int(value: object) -> int | None:
     """Return a non-negative integer generation, or ``None`` when malformed.
 
@@ -1664,9 +2108,10 @@ def _strict_non_negative_int(value: object) -> int | None:
         The non-negative integer, or ``None`` for booleans, non-integers,
         strings, and negative values.
     """
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    result = _strict_int(value)
+    if result is None or result < 0:
         return None
-    return value
+    return result
 
 
 def _strict_finite_float(value: object) -> float | None:
@@ -1686,6 +2131,14 @@ def _strict_finite_float(value: object) -> float | None:
     except OverflowError:
         return None
     if not math.isfinite(result):
+        return None
+    return result
+
+
+def _strict_non_negative_finite_float(value: object) -> float | None:
+    """Return a non-negative finite JSON number, or ``None`` when malformed."""
+    result = _strict_finite_float(value)
+    if result is None or result < 0:
         return None
     return result
 
@@ -1721,6 +2174,179 @@ def _optional_bool(value: object | None) -> bool | None:
         The boolean, or ``None``.
     """
     return value if isinstance(value, bool) else None
+
+
+def _parse_status_nullable_dict(data: dict[str, object], key: str) -> dict[str, object] | None:
+    """Parse a nullable object from persisted supervisor status.
+
+    Args:
+        data: Decoded status mapping.
+        key: Field name.
+
+    Returns:
+        The object, or ``None`` for absence or explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not an object.
+    """
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if not isinstance(value, dict):
+        msg = "supervisor status is malformed"
+        raise TypeError(msg)
+    return value
+
+
+def _parse_diagnostic_bool(data: dict[str, object], key: str) -> bool:
+    """Parse a diagnostic boolean, defaulting only genuine absence to false.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The boolean value, or ``False`` when the key is absent.
+
+    Raises:
+        TypeError: If a present value is not a JSON boolean.
+    """
+    if key not in data:
+        return False
+    value = data[key]
+    if not isinstance(value, bool):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    return value
+
+
+def _parse_diagnostic_nullable_bool(data: dict[str, object], key: str) -> bool | None:
+    """Parse a nullable diagnostic boolean without truthiness coercion.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The boolean value, or ``None`` for absence or explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not a JSON boolean.
+    """
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if not isinstance(value, bool):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    return value
+
+
+def _parse_diagnostic_non_negative_int(data: dict[str, object], key: str) -> int:
+    """Parse a diagnostic counter, defaulting only genuine absence to zero.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The exact non-negative JSON integer, or zero for absence.
+
+    Raises:
+        TypeError: If a present value is not an integer or is a boolean.
+        ValueError: If a present integer is negative.
+    """
+    if key not in data:
+        return 0
+    raw = data[key]
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    if raw < 0:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return raw
+
+
+def _parse_diagnostic_nullable_float(data: dict[str, object], key: str) -> float | None:
+    """Parse a nullable finite diagnostic number without numeric coercion.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        A finite float, or ``None`` for absence or explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not a JSON number.
+        ValueError: If a present number is non-finite or unrepresentable.
+    """
+    if key not in data or data[key] is None:
+        return None
+    raw = data[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    value = _strict_finite_float(raw)
+    if value is None:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_diagnostic_string(
+    data: dict[str, object],
+    key: str,
+    *,
+    default: str,
+) -> str:
+    """Parse a required diagnostic string, defaulting only genuine absence.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+        default: Value used only when the key is absent.
+
+    Returns:
+        The non-empty string value, or ``default`` for absence.
+
+    Raises:
+        TypeError: If a present value is not a string.
+        ValueError: If a present string is empty.
+    """
+    if key not in data:
+        return default
+    value = data[key]
+    if not isinstance(value, str):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    if not value:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_diagnostic_nullable_string(data: dict[str, object], key: str) -> str | None:
+    """Parse a nullable diagnostic string without erasing malformed values.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The string value, or ``None`` for absence or explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not a string.
+    """
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if not isinstance(value, str):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    return value
 
 
 def _strict_safety_hold(data: dict[str, object], key: str) -> bool:
@@ -1807,6 +2433,27 @@ def _parse_present_nullable_float(
     return value, value is None
 
 
+def _parse_present_nullable_monotonic_float(
+    data: dict[str, object],
+    key: str,
+) -> tuple[float | None, bool]:
+    """Parse an optional non-negative finite monotonic-clock timestamp.
+
+    Args:
+        data: Decoded durable state mapping.
+        key: Field name.
+
+    Returns:
+        A ``(value, malformed)`` pair: the parsed timestamp (``None`` for
+        genuine absence or explicit null) and whether a present non-null
+        value was malformed or outside the monotonic-clock domain.
+    """
+    value, malformed = _parse_present_nullable_float(data, key)
+    if malformed or value is None:
+        return value, malformed
+    return (value, False) if value >= 0.0 else (None, True)
+
+
 def _parse_optional_child(
     data: dict[str, object],
 ) -> tuple[WorkerChild | None, bool]:
@@ -1882,24 +2529,31 @@ def _parse_optional_spawning(
 
 
 def _parse_last_exit(data: dict[str, object]) -> LastExit | None:
-    """Parse the optional last-exit record, tolerating shape corruption.
+    """Parse a canonical optional durable last-exit record.
 
     Args:
         data: Decoded durable state mapping.
 
     Returns:
-        The last exit, or ``None``.
+        The canonical last exit, or ``None`` when absent or malformed.
     """
     exit_data = data.get("last_exit")
-    if not isinstance(exit_data, dict):
+    if exit_data is None or not isinstance(exit_data, dict):
         return None
-    try:
-        return LastExit(
-            returncode=_optional_int(exit_data.get("returncode")),
-            at=float(exit_data.get("at") or 0.0),
-        )
-    except (TypeError, ValueError):
+
+    raw_returncode = exit_data.get("returncode")
+    returncode: int | None = None
+    if raw_returncode is not None:
+        returncode = _strict_int(raw_returncode)
+        if returncode is None:
+            return None
+
+    if "at" not in exit_data:
         return None
+    at = _strict_finite_float(exit_data["at"])
+    if at is None or at < 0:
+        return None
+    return LastExit(returncode=returncode, at=at)
 
 
 def _optional_dict(value: object | None) -> dict[str, object] | None:
@@ -1946,11 +2600,11 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
     Raises:
         ValueError: If a required field is missing or malformed.
     """
-    pid = _optional_int(data.get("pid"))
-    pgid = _optional_int(data.get("pgid"))
-    sid = _optional_int(data.get("sid"))
-    ticks = _optional_int(data.get("start_time_ticks"))
-    token = _optional_string(data.get("token"))
+    pid = _strict_non_negative_int(data.get("pid"))
+    pgid = _strict_non_negative_int(data.get("pgid"))
+    sid = _strict_non_negative_int(data.get("sid"))
+    ticks = _strict_non_negative_int(data.get("start_time_ticks"))
+    token = _optional_incarnation_token(data.get("token"))
     worker_id = _optional_string(data.get("worker_id"))
     if pid is None or pgid is None or sid is None or ticks is None:
         msg = "supervisor worker child identity is malformed"
@@ -1958,6 +2612,13 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
     if token is None or worker_id is None:
         msg = "supervisor worker child identity is malformed"
         raise ValueError(msg)
+    if "spawned_at" in data:
+        spawned_at = _strict_non_negative_finite_float(data["spawned_at"])
+        if spawned_at is None:
+            msg = "supervisor worker child identity is malformed"
+            raise ValueError(msg)
+    else:
+        spawned_at = 0.0
     return WorkerChild(
         pid=pid,
         pgid=pgid,
@@ -1965,7 +2626,7 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
         start_time_ticks=ticks,
         token=token,
         worker_id=worker_id,
-        spawned_at=_optional_float(data.get("spawned_at")) or 0.0,
+        spawned_at=spawned_at,
     )
 
 

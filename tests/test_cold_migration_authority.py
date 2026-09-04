@@ -18,6 +18,7 @@ import pytest
 
 from lubko import cli, lifecycle, supervise
 from lubko import deployctl as dc
+from lubko.state import rollback_state_path
 from lubko.supervisor import Settings, SupervisorDaemon
 
 if TYPE_CHECKING:
@@ -55,7 +56,6 @@ def mission(generation: int, status: str, commit: str) -> dc.RollbackState:
         status=status,
         commit=commit,
         previous_commit=OLD,
-        challenge_hash=None,
         deadline=0.0,
         repo="/workspace/repo",
         uv_path="uv",
@@ -146,6 +146,40 @@ def test_newer_mission_survives_and_owns_authority_over_stale_migration(
     desired = supervise.read_desired()
     assert desired is not None
     assert desired.migration is False
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["{broken", "0", "true", "[]", "{}", '"unsupported"'],
+)
+def test_malformed_mission_holds_cold_migration_completion(
+    isolated: Path, monkeypatch: pytest.MonkeyPatch, malformed: str
+) -> None:
+    """Malformed mission authority is preserved and repeatedly blocks settlement."""
+    del isolated
+    migration_intent(6, NEW)
+    ready_state(6, NEW)
+    path = rollback_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(malformed, encoding="utf-8")
+    cli_calls: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "build_cli_root",
+        lambda *_args, **_kwargs: cli_calls.append("build"),
+    )
+
+    daemon = SupervisorDaemon(Settings())
+    for _ in range(2):
+        daemon._complete_cold_migration()
+        assert path.read_text(encoding="utf-8") == malformed
+        desired = supervise.read_desired_strict()
+        assert desired is not None
+        assert desired.migration is True
+        assert cli_calls == []
+        assert daemon._message == (
+            "corrupt supervised deployment state; cold-migration completion is held"
+        )
 
 
 def test_in_flight_migration_holds_cli_reconciliation(isolated: Path) -> None:

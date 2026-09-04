@@ -2,144 +2,60 @@
 
 Status: authoritative for protocol v4.
 
-## The two-column invariant
+## Frozen PostgreSQL transport contract
 
-The Lubko transport table `lubko.jobs` has **exactly two columns forever**:
+The PostgreSQL catalog is permanent transport infrastructure, not part of the
+evolving application protocol. `lubko.jobs` has exactly two columns forever:
 
-| Column    | Type         | Constraint                          | Meaning                                    |
-| --------- | ------------ | ----------------------------------- | ------------------------------------------ |
-| `id`      | `uuid`       | primary key, `default gen_random_uuid()` | unique random identifier              |
-| `payload` | `text`       | `not null`, must hold a JSON object | one string containing a JSON object |
+| Column    | Type   | Structural contract |
+| --------- | ------ | ------------------- |
+| `id`      | `uuid` | primary key, `default gen_random_uuid()` |
+| `payload` | `text` | `not null`; otherwise opaque to PostgreSQL |
 
-All evolving job/request/result/state/cancellation/process-identity/output
-data lives inside the `payload` JSON object. **Never add a third column.**
-Schema evolution happens inside `payload`; incompatible changes bump the
-protocol version (`v`).
+PostgreSQL does **not** require `payload` to be JSON and does not validate or
+index any payload field. It knows nothing about protocol versions, command or
+output kinds, server routing, lifecycle status, request shape, chunk ownership,
+streams, sequences, or offsets. Those are application-level invariants enforced
+by Lubko's parser and by the exact predicates/CAS operations used by workers and
+orchestrators.
 
-The payload column is opaque text at rest. SQL casts `payload::jsonb` only
-transiently — for predicates and for atomic `jsonb_set` updates — and every
-write stores `::text` back. Constraints are **type-aware**:
+Normal Lubko upgrades must not add, remove, or modify PostgreSQL columns,
+payload CHECK constraints, payload expression indexes, roles or role memberships,
+grants/revokes beyond the frozen access arrangement, RLS settings, policies,
+triggers, routines, views, sequences, or other protocol-supporting catalog
+objects.
 
-```sql
-constraint jobs_payload_is_json_object check (jsonb_typeof(payload::jsonb) = 'object')
-constraint jobs_payload_has_version     check ((payload::jsonb) ? 'v')
-constraint jobs_payload_type_shape      check (
-    case
-        when (payload::jsonb)->>'type' = 'command' then
-            ((payload::jsonb)->'v') = '4'::jsonb
-            and jsonb_typeof((payload::jsonb)->'request') = 'object'
-            and (((payload::jsonb)->'state'->>'status') is not null)
-            and coalesce(jsonb_typeof((payload::jsonb)->'server'), '') = 'string'
-            and coalesce((payload::jsonb)->>'server', '') <> ''
-        when (payload::jsonb)->>'type' = 'output_chunk' then
-            ((payload::jsonb)->'v') = '4'::jsonb
-            and jsonb_typeof((payload::jsonb)->'value') = 'string'
-            and (((payload::jsonb)->>'thread') is not null)
-            and coalesce(jsonb_typeof((payload::jsonb)->'server'), '') = 'string'
-            and coalesce((payload::jsonb)->>'server', '') <> ''
-            and (((payload::jsonb)->>'stream') in ('stdout', 'stderr'))
-            and (((payload::jsonb)->>'sequence') ~ '^[0-9]+$')
-            and (((payload::jsonb)->>'start') ~ '^[0-9]+$')
-            and (((payload::jsonb)->>'end') ~ '^[0-9]+$')
-        else true
-    end
-)
-```
-
-The SQL constraint is deliberately generic; it does not encode `request.process`
-or the legacy-field prohibition. Those rules are enforced by the payload parser
-(`src/lubko/protocol.py`): a v4 `command` request must carry a process array,
-and carrying the legacy `command`/`args` keys is rejected. The required
-non-empty top-level `server` field, however, is enforced by both the parser and
-the SQL constraint: there is **no implicit or default server**. Because the v3
-to v4 breaking change is content-only, the physical two-column table does not
-change between versions.
-
-`command` rows carry a runnable lifecycle; immutable `output_chunk` rows carry
-explicit ownership and offset shape. Chunk rows never carry fake command
-lifecycle state. Claim and lease-recovery queries operate only on
-`type = 'command'` rows.
-
-## Startup schema verification
-
-The v4 worker verifies more than the two-column invariant before starting. It
-also requires the type-aware `jobs_payload_type_shape` constraint and the chunk
-ownership/ordering indexes to be present, because immutable `output_chunk`
-publication is impossible without them. Any table lacking this canonical
-protocol v4 shape is refused at startup with a clear diagnostic pointing at
-the idempotent baseline `migrations/0001_two_column_protocol.sql`. This keeps
-output publication from failing at runtime on a table that cannot represent
-immutable chunks.
-
-## Physical schema
+The canonical fresh-install definition is therefore only:
 
 ```sql
-create table lubko.jobs (
+create schema if not exists lubko;
+
+create table if not exists lubko.jobs (
     id uuid primary key default gen_random_uuid(),
     payload text not null
-        constraint jobs_payload_is_json_object check (jsonb_typeof(payload::jsonb) = 'object')
-        constraint jobs_payload_has_version check ((payload::jsonb) ? 'v')
-        constraint jobs_payload_type_shape check (...)
 );
-
-create index jobs_queue_idx
-    on lubko.jobs (
-        ((payload::jsonb)->>'server'),
-        ((payload::jsonb)->'state'->>'status'),
-        ((payload::jsonb)->'state'->>'created_at')
-    )
-    where ((payload::jsonb)->>'type') = 'command';
-
-create index jobs_chunk_owner_idx
-    on lubko.jobs (((payload::jsonb)->>'thread'))
-    where ((payload::jsonb)->>'type') = 'output_chunk';
-
-create index jobs_chunk_order_idx
-    on lubko.jobs (((payload::jsonb)->>'thread'), (((payload::jsonb)->'sequence')::bigint))
-    where ((payload::jsonb)->>'type') = 'output_chunk';
 ```
 
-## Worker role access (part of the binding)
+The existing `lubko_worker` role/access grants are frozen infrastructure. Lubko
+does not introduce per-server database principals. Every execution server uses
+the application-level `server` field and exact server predicates described below.
 
-`lubko_worker` is the stable role the worker connects as (see the README
-database configuration) and must hold the privileges it needs to claim, cancel,
-poll, publish output (including inserting immutable `output_chunk` rows),
-finalize jobs, and collect transport garbage:
+### Startup verification
 
-```sql
-grant usage on schema lubko to lubko_worker;
-grant select, insert, update, delete on table lubko.jobs to lubko_worker;
-```
+The worker verifies the two-column structural table contract before consuming
+work. It deliberately does **not** verify payload CHECK constraints, payload
+indexes, RLS/policies/functions/triggers, or protocol-version metadata, because
+those objects are not part of the supported database contract.
 
-The baseline migration `migrations/0001_two_column_protocol.sql` applies these
-`GRANT`s (guarded by `to_regrole` so a fresh environment without the role does
-not fail). `GRANT` is idempotent, so re-applying the baseline repairs the
-access contract.
+### Payload versioning
 
-## Versioning
+`payload.v` is an application-level integer protocol version. PostgreSQL does not
+constrain it. Supported execution windows and compatibility rules live entirely
+in application code; see `docs/protocol_upgrades.md`.
 
-- `payload.v` is a required integer protocol version.
-- Version `4` is the current binding. Within a version, fields may be added
-  additively. Breaking changes (renaming or removing fields, changing types or
-  semantics) require a new version and a new worker generation.
-- **The v3 → v4 cutover is destructive.** Version `3` is unsupported: v4
-  parsers, builders, and workers accept only payloads carrying a required
-  non-empty top-level `server` string field, which v3 rows lack; there is **no
-  compatibility path and no data migration**. The two-column transport schema
-  itself does not change between versions — only the payload-shape constraint
-  and the routing-aware queue index do — so the cutover replaces the constraint
-  via `migrations/0003_protocol_v4_server_routing.sql`. A valid procedure is:
-  quiesce new submissions, let any in-flight work become durably terminal,
-  `truncate lubko.jobs` while quiescent (the row cutover is destructive: every
-  old root `command` row and its `output_chunk` history is discarded, and there
-  is no default server), apply the migration (drop + recreate + validate the
-  constraint and rebuild the queue index), then start the daemon with its
-  configured server identity and prove a fresh v4 round trip. Applying the
-  migration against a table that still holds nonconforming rows fails fast with
-  an explicit diagnostic instead of leaving the transport half-upgraded;
-  truncating first is what makes validation trivially succeed.
-- A v4 worker rejects any payload whose version it does not understand; the job
-  is failed with a diagnostic instead of being stuck in the queue.
+Compatible or breaking payload evolution must never require PostgreSQL metadata
+changes. Old terminal history may retain older application versions because the
+database stores it as opaque text.
 
 ## Server routing
 
@@ -494,7 +410,18 @@ and an unbounded in-memory registry of active jobs. There is **no
 application-level concurrency limit** and no thread or connection per job; each
 job process runs as its own OS process/session/process group, executed directly
 from its `request.process` argv (never through a shell), and the daemon
-observes it with `Popen.poll()`-style checks. The supervisor loop services
+observes it with `Popen.poll()`-style checks. This is a deliberate,
+durable decision (see `docs/adr/0001-no-application-concurrency-cap.md`): each
+job's local capture spool and live tail are bounded, and the machine-readable
+health snapshot is a fixed-size aggregate with no per-job entries, but a
+long-running job can still accumulate arbitrarily many immutable history chunks
+until termination, and aggregate output, spool, and active-row database work
+(including lease heartbeat, which refreshes every active root in one statement)
+still scale with the number of concurrently active jobs. The application therefore
+uses one shared DB connection, set-based operations, operation deadlines, and
+bounded claim/cancellation/recovery/GC scans where they exist, and leaves the hard
+ceiling on *execution* concurrency to the surrounding container/host/OS rather than
+acting as a scheduler. The supervisor loop services
 running jobs (observe exits, escalate cancellations, publish output, finalize),
 refreshes leases, runs recovery, and claims a bounded batch of new pending
 jobs each turn, so an endless pending queue can never starve heartbeats,
@@ -551,35 +478,16 @@ never lets it steal a live job.
 
 ## Fresh-install schema
 
-A fresh (purged) database applies the single canonical baseline
-`migrations/0001_two_column_protocol.sql`, which creates the type-aware
-two-column `lubko.jobs` table, its indexes, the worker role grants, and the
-invariant comment. The baseline is idempotent and safe to apply more than
-once. There is no older schema, no staging table, and no rollback path: the
-two-column table is the only supported binding, and the worker refuses to
-start against any other shape. After the table exists, submit jobs in protocol
-v4 JSON form, addressed to a specific server (there is no default):
+Apply `migrations/0001_two_column_protocol.sql` once to establish the frozen
+transport infrastructure. It creates only the `lubko` schema, the two-column
+`lubko.jobs` table, and the existing worker access grants when that role is
+already provisioned.
 
-```sql
-insert into lubko.jobs (payload)
-values ('{"v":4,"type":"command","server":"alpha-server","request":{"cwd":"...","process":["git","status"]},"state":{"status":"pending"}}');
-```
+After bootstrap, **there are no PostgreSQL schema/protocol migrations as part of
+normal Lubko upgrades**. Submitters and workers may evolve the opaque payload
+format through application versioning without changing database metadata.
 
-The job runs only on the daemon whose configured server identity (the
-non-empty `server` setting of its restricted worker configuration file) is
-`alpha-server`; jobs addressed to other servers stay pending untouched.
-
-Upgrading an existing transport from v3 is a destructive cutover that replaces
-the payload-shape constraint via
-`migrations/0003_protocol_v4_server_routing.sql`: v4 rejects every v3 payload,
-because v3 rows carry no required top-level `server` routing identity. Run it
-against the live queue: quiesce new submissions, let any in-flight v3 work
-become durably terminal, `truncate lubko.jobs` while quiescent (discarding
-every old root `command` row and `output_chunk` history — truncating before
-applying is **required**; applying against nonconforming rows fails fast with
-an explicit diagnostic), apply the migration, start each daemon with its
-configured server identity, and prove a fresh v4 round trip.
-Old v3 contents are discarded; there is no protocol-data drain/migration path,
-and no v3 row is transformed or preserved. Only the payload protocol version
-and the shape constraint change; the physical schema stays the canonical
-two-column table.
+Existing deployments that still carry historical payload CHECK constraints or
+payload expression indexes must be normalized to this frozen contract as a
+separate, explicit deployment operation. This repository change does not modify
+the live database.

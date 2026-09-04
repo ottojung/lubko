@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final
@@ -46,7 +45,14 @@ def git(*args: str, cwd: Path) -> str:
         Trimmed standard output.
     """
     proc = subprocess.run(
-        [GIT_BIN, *args],
+        [
+            GIT_BIN,
+            "-c",
+            "user.name=lubko-test",
+            "-c",
+            "user.email=lubko-test@example.com",
+            *args,
+        ],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -55,27 +61,60 @@ def git(*args: str, cwd: Path) -> str:
     return proc.stdout.strip()
 
 
-def make_repo_with_pyproject(path: Path) -> tuple[Path, str]:
-    """Create a two-commit git repo plus a HEAD commit adding pyproject.toml.
+def _build_repo_with_pyproject(path: Path) -> tuple[Path, str]:
+    """Build the immutable repository template used by installer tests.
 
     Returns:
-        The repository path and the first (pre-HEAD) commit hash.
+        The repository path and first commit hash.
     """
     path.mkdir(parents=True)
     git("init", "-q", cwd=path)
-    git("config", "user.name", "lubko-test", cwd=path)
-    git("config", "user.email", "lubko-test@example.com", cwd=path)
     (path / "marker.txt").write_text("A\n", encoding="utf-8")
     git("add", "marker.txt", cwd=path)
     git("commit", "-q", "-m", "first", cwd=path)
     first = git("rev-parse", "HEAD", cwd=path)
     (path / "marker.txt").write_text("B\n", encoding="utf-8")
-    git("add", "marker.txt", cwd=path)
-    git("commit", "-q", "-m", "second", cwd=path)
     (path / "pyproject.toml").write_text('[project]\nname = "lubko"\n', encoding="utf-8")
-    git("add", "pyproject.toml", cwd=path)
-    git("commit", "-q", "-m", "pyproject", cwd=path)
+    git("add", "marker.txt", "pyproject.toml", cwd=path)
+    git("commit", "-q", "-m", "second", cwd=path)
     return path, first
+
+
+_REPO_TEMPLATE: list[tuple[Path, str]] = []
+
+
+@pytest.fixture(scope="session", autouse=True)
+def repository_template(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Create the immutable two-commit repository only once per test session."""
+    _REPO_TEMPLATE.append(
+        _build_repo_with_pyproject(tmp_path_factory.mktemp("install-repo") / "repo")
+    )
+    yield
+    _REPO_TEMPLATE.clear()
+
+
+def make_repo_with_pyproject(path: Path) -> tuple[Path, str]:
+    """Clone the immutable repository fixture with filesystem copies only.
+
+    Returns:
+        The copied repository path and first commit hash.
+    """
+    assert len(_REPO_TEMPLATE) == 1
+    template, first = _REPO_TEMPLATE[0]
+    shutil.copytree(template, path)
+    return path, first
+
+
+def head_commit(path: Path) -> str:
+    """Read HEAD directly from the fresh test repository's loose ref.
+
+    Returns:
+        The current commit hash.
+    """
+    head = (path / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    if not head.startswith("ref: "):
+        return head
+    return (path / ".git" / head.removeprefix("ref: ")).read_text(encoding="utf-8").strip()
 
 
 @pytest.fixture(autouse=True)
@@ -93,7 +132,7 @@ def installable_bin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     uv_dir = tmp_path / "uv-dir"
     uv_dir.mkdir()
     uv = uv_dir / "uv"
-    uv.write_text("#!/bin/sh\nexit 0\n")
+    uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     uv.chmod(0o755)
     bin_dir = tmp_path / "bin"
     cli.install_launchers(bin_dir)
@@ -122,7 +161,7 @@ def test_gc_preserves_desired_applied_and_override_runtimes(
 ) -> None:
     """GC and explicit removal never delete supervisor-authoritative runtimes."""
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
-    second = git("rev-parse", "HEAD", cwd=repo)
+    second = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     for commit in (first, second):
         cli.build_cli_root(repo, commit, "uv", 60.0)
@@ -170,7 +209,7 @@ def test_fresh_install_establishes_supervisor_desired_commit(
 ) -> None:
     """A successful fresh install leaves CLI and desired authority coherent."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
-    head = git("rev-parse", "HEAD", cwd=repo)
+    head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     installable_bin(monkeypatch, tmp_path)
 
@@ -193,7 +232,7 @@ def test_same_commit_install_preserves_existing_desired_intent(
 ) -> None:
     """An idempotent install does not advance or erase same-commit authority."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
-    head = git("rev-parse", "HEAD", cwd=repo)
+    head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     installable_bin(monkeypatch, tmp_path)
     existing = supervise.SupervisorDesired(
@@ -249,7 +288,7 @@ def test_install_does_not_outrank_active_supervised_mission(
 ) -> None:
     """A mission at or above desired generation remains separate authority."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
-    head = git("rev-parse", "HEAD", cwd=repo)
+    head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     installable_bin(monkeypatch, tmp_path)
     desired = supervise.SupervisorDesired(
@@ -282,7 +321,7 @@ def test_install_preserves_pending_migration_cli_hold(
 ) -> None:
     """Install cannot activate a provisional migration target before readiness."""
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
-    head = git("rev-parse", "HEAD", cwd=repo)
+    head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     installable_bin(monkeypatch, tmp_path)
     cli.build_cli_root(repo, first, "uv", 60.0)
@@ -351,7 +390,7 @@ def test_same_commit_install_keeps_worker_runtime_startable(
 ) -> None:
     """After refusal the supervisor can still recover its maintained runtime."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
-    head = git("rev-parse", "HEAD", cwd=repo)
+    head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     installable_bin(monkeypatch, tmp_path)
     cli.build_cli_root(repo, head, "uv", 60.0)
@@ -372,7 +411,7 @@ def test_same_commit_install_succeeds_and_gcs_stale_roots(
 ) -> None:
     """A same-commit fresh install succeeds and GC keeps only authority roots."""
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
-    head = git("rev-parse", "HEAD", cwd=repo)
+    head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     installable_bin(monkeypatch, tmp_path)
     cli.build_cli_root(repo, first, "uv", 60.0)
@@ -396,7 +435,7 @@ def test_install_refuses_version_change_over_override(
 ) -> None:
     """A bootstrap override naming another commit blocks version-changing installs."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
-    head = git("rev-parse", "HEAD", cwd=repo)
+    head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     bin_dir = installable_bin(monkeypatch, tmp_path)
     override = "d" * 40
@@ -448,31 +487,20 @@ def test_install_fails_closed_when_deploy_lock_is_busy(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A held deployment lock makes the installer refuse without mutating CLIs."""
+    """A deployment-lock timeout makes the installer refuse without mutating CLIs."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     bin_dir = installable_bin(monkeypatch, tmp_path)
-    monkeypatch.setattr(lifecycle, "DEFAULT_LOCK_TIMEOUT_SECONDS", 0.2)
 
-    release = threading.Event()
+    @contextmanager
+    def busy_lock(timeout_seconds: float) -> Iterator[None]:
+        if timeout_seconds >= 0.0:
+            raise lifecycle.LockTimeoutError
+        yield
 
-    def hold_lock() -> None:
-        with lifecycle.deploy_lock(10.0):
-            release.wait(timeout=30)
+    monkeypatch.setattr(lifecycle, "deploy_lock", busy_lock)
 
-    holder = threading.Thread(target=hold_lock)
-    holder.start()
-    try:
-        while True:
-            try:
-                with lifecycle.deploy_lock(0.05):
-                    continue
-            except lifecycle.LockTimeoutError:
-                break
-        code = install.main(["--repo", str(repo)])
-    finally:
-        release.set()
-        holder.join()
+    code = install.main(["--repo", str(repo)])
 
     assert code == install.EXIT_ERROR
     assert "deployment lock" in capsys.readouterr().err

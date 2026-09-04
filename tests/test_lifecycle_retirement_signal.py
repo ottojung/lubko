@@ -97,6 +97,12 @@ class Harness:
         monkeypatch.setattr(os, "close", close)
         monkeypatch.setattr(lifecycle, "drain_sentinel_matches", lambda _token: False)
 
+        def absence_proven(_pid: int, ticks: int | None) -> bool:
+            identity = self.identity
+            return identity is None or identity.start_time_ticks != ticks
+
+        monkeypatch.setattr(lifecycle, "process_absence_proven", absence_proven)
+
 
 def run(h: Harness) -> bool:
     """Run ``stop_worker`` with zero grace windows.
@@ -196,6 +202,11 @@ def test_wedged_exact_worker_receives_sigkill_escalation(
         return None if any(sig == signal.SIGKILL for _, sig in h.sends) else LIVE
 
     monkeypatch.setattr(lifecycle, "process_identity", gone_after_kill)
+    monkeypatch.setattr(
+        lifecycle,
+        "process_absence_proven",
+        lambda _pid, _ticks: any(sig == signal.SIGKILL for _, sig in h.sends),
+    )
 
     assert run(h) is True
     assert h.sends == [(LIVE.pid, signal.SIGTERM), (LIVE.pid, signal.SIGKILL)]
@@ -231,6 +242,11 @@ def test_exact_worker_that_exits_after_term_retires_with_drain_only(
         return None if any(sig == signal.SIGTERM for _, sig in h.sends) else LIVE
 
     monkeypatch.setattr(lifecycle, "process_identity", gone_after_term)
+    monkeypatch.setattr(
+        lifecycle,
+        "process_absence_proven",
+        lambda _pid, _ticks: any(sig == signal.SIGTERM for _, sig in h.sends),
+    )
 
     assert run(h) is True
     assert h.sends == [(LIVE.pid, signal.SIGTERM)]
@@ -274,3 +290,107 @@ def test_pins_are_released_after_retirement(h: Harness) -> None:
     run(h)
     # one leader pin + one per signalled member (TERM), plus escalation pass
     assert h.closes >= 3
+
+
+def test_unpinnable_leader_with_unknown_absence_fails_closed(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown process liveness after pidfd failure must not count as retirement."""
+    h.unpinnable = {LIVE.pid}
+    calls: list[tuple[int, int | None]] = []
+
+    def absence(pid: int, ticks: int | None) -> bool:
+        calls.append((pid, ticks))
+        return False
+
+    monkeypatch.setattr(lifecycle, "process_absence_proven", absence)
+
+    assert run(h) is False
+    assert calls == [(LIVE.pid, LIVE.start_time_ticks)]
+    assert h.sends == []
+
+
+def test_pinned_leader_with_unknown_identity_fails_closed(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful pidfd pin does not turn an unreadable identity into absence."""
+    h.identity = None
+    calls: list[tuple[int, int | None]] = []
+
+    def absence(pid: int, ticks: int | None) -> bool:
+        calls.append((pid, ticks))
+        return False
+
+    monkeypatch.setattr(lifecycle, "process_absence_proven", absence)
+
+    assert run(h) is False
+    assert calls == [(LIVE.pid, LIVE.start_time_ticks)]
+    assert h.sends == []
+
+
+def test_pinned_leader_with_proven_absence_succeeds(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive absence proof after a successful pin permits retirement."""
+    h.identity = None
+    monkeypatch.setattr(lifecycle, "process_absence_proven", lambda _pid, _ticks: True)
+
+    assert run(h) is True
+    assert h.sends == []
+
+
+def test_unpinnable_leader_with_proven_absence_succeeds(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Conclusive absence or PID reuse after pidfd failure counts as retirement."""
+    h.unpinnable = {LIVE.pid}
+    monkeypatch.setattr(
+        lifecycle,
+        "process_absence_proven",
+        lambda pid, ticks: (pid, ticks) == (LIVE.pid, LIVE.start_time_ticks),
+    )
+
+    assert run(h) is True
+    assert h.sends == []
+
+
+def test_unreadable_retirement_liveness_never_authorizes_handoff(
+    h: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreadable identity after signalling stays unknown through escalation."""
+    h.members = [LIVE.pid]
+    h.pgrps = {LIVE.pid: LIVE.pgid}
+    h.tokened = {LIVE.pid: True}
+
+    def unreadable_after_term(_pid: int) -> ProcessIdentity | None:
+        return None if any(sig == signal.SIGTERM for _, sig in h.sends) else LIVE
+
+    monkeypatch.setattr(lifecycle, "process_identity", unreadable_after_term)
+    monkeypatch.setattr(lifecycle, "process_absence_proven", lambda _pid, _ticks: False)
+
+    assert run(h) is False
+    assert h.sends == [(LIVE.pid, signal.SIGTERM), (LIVE.pid, signal.SIGKILL)]
+
+
+@pytest.mark.parametrize(
+    "observed",
+    [
+        ProcessIdentity(
+            pid=LIVE.pid, pgid=LIVE.pgid + 1, sid=LIVE.sid, start_time_ticks=LIVE.start_time_ticks
+        ),
+        ProcessIdentity(
+            pid=LIVE.pid, pgid=LIVE.pgid, sid=LIVE.sid + 1, start_time_ticks=LIVE.start_time_ticks
+        ),
+    ],
+)
+def test_same_incarnation_identity_disagreement_fails_closed(
+    observed: ProcessIdentity, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PGID/SID disagreement cannot prove a still-present PID incarnation retired."""
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: observed)
+
+    assert lifecycle._worker_retirement_state(meta()) is None

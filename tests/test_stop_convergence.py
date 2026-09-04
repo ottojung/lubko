@@ -150,58 +150,47 @@ def test_stop_kill_converges_live_runner_queued_prompt(
     mode: str,
     state_dir: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Stop/kill cancels a prompt queued for a proven-live runner.
+    """Stop/kill cancels queued work after exact runner liveness is established.
 
-    Between invocations a runner stays proven-live while no invocation group
-    exists, and the prompt protocol accepts new work into ``pending_prompt``
-    for exactly that runner. Stop/kill must cancel that queued work under the
-    metadata lock, and the runner's own reclaim boundary must then go idle
-    without starting it.
+    Exact process signalling is covered independently; this test keeps the
+    stop/kill metadata transition deterministic and verifies that a proven-live
+    runner cannot retain or reclaim queued work after convergence.
     """
     aid = "aaaaaaaa"
-    proc = _MarkedProcess(aid)
-    try:
-        meta = agent.idle_meta(aid, str(state_dir), None)
-        meta["state"] = "running"
-        meta["pending_prompt"] = "queued for the live runner"
-        meta["active_runner"] = True
-        meta["runner_pid"] = proc.pid
-        meta["runner_start_time"] = agent.proc_start_ticks(proc.pid)
-        meta["runner_reservation"] = {
-            "gen": 1,
-            "owner_pid": os.getpid(),
-            "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
-            "state": "claimed",
-            "mode": "new",
-        }
-        agent.write_meta(aid, meta)
+    meta = agent.idle_meta(aid, str(state_dir), None)
+    meta["state"] = "running"
+    meta["pending_prompt"] = "queued for the live runner"
+    meta["active_runner"] = True
+    meta["runner_pid"] = 4242
+    meta["runner_start_time"] = 777
+    meta["runner_reservation"] = {
+        "gen": 1,
+        "owner_pid": os.getpid(),
+        "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
+        "state": "claimed",
+        "mode": "new",
+    }
+    agent.write_meta(aid, meta)
 
-        assert agent.runner_alive(meta)
-        assert not agent.is_alive(meta)
-        assert not agent.group_alive(meta)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: True)
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "group_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_converge_observed_runner", lambda *_a, **_k: True)
 
-        code = agent.main([mode, aid])
-        assert code == agent.EXIT_OK
-        out = capsys.readouterr().out
-        assert ("stopped" if mode == "stop" else "killed") in out
-        assert "already" not in out
-        converged = agent.read_meta(aid)
-        _assert_runner_work_converged(converged, mode)
+    code = agent.main([mode, aid])
+    assert code == agent.EXIT_OK
+    out = capsys.readouterr().out
+    assert ("stopped" if mode == "stop" else "killed") in out
+    assert "already" not in out
+    converged = agent.read_meta(aid)
+    _assert_runner_work_converged(converged, mode)
 
-        # The runner's between-invocations boundary observes the durable stop
-        # reason and goes idle instead of claiming the cancelled prompt, and
-        # no invocation was ever recorded or executed for it. Success also
-        # proves the exact observed runner was converged (actually gone).
-        assert converged is not None
-        assert agent._reclaim_prompt(aid) is False
-        _assert_runner_work_converged(agent.read_meta(aid), mode)
-        # poll() reaps the exact child, proving it was signalled to death.
-        assert proc.proc.wait(timeout=5) is not None
-        log_path = agent.agents_dir() / aid / "output.log"
-        assert not log_path.exists()
-    finally:
-        proc.kill_and_reap()
+    assert converged is not None
+    assert agent._reclaim_prompt(aid) is False
+    _assert_runner_work_converged(agent.read_meta(aid), mode)
+    assert not (agent.agents_dir() / aid / "output.log").exists()
 
 
 @pytest.mark.parametrize("mode", ["stop", "kill"])
@@ -310,6 +299,81 @@ def test_runner_convergence_signals_and_verifies_exact_identity(
     signals.clear()
     monkeypatch.setattr(agent, "_runner_identity_state", lambda *_a: "unprovable")
     assert agent._converge_observed_runner(observed, mode) is False
+
+
+@pytest.mark.parametrize(
+    ("runner_pid", "runner_start_time"),
+    [
+        (4242.9, 42),
+        ("4242", 42),
+        (True, 42),
+        (0, 42),
+        (-1, 42),
+        (4242, "42"),
+        (4242, 42.0),
+        (4242, True),
+        (4242, -1),
+    ],
+)
+def test_runner_convergence_rejects_malformed_persisted_identity(
+    runner_pid: object,
+    runner_start_time: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed durable runner identity never becomes signalling authority."""
+    observed: agent.Meta = {
+        "id": "aaaaaaaa",
+        "runner_pid": runner_pid,
+        "runner_start_time": runner_start_time,
+    }
+
+    def reject_signal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("malformed runner identity reached signal_identity_checked")
+
+    def reject_state(*_args: object, **_kwargs: object) -> str:
+        pytest.fail("malformed runner identity reached positive-gone reasoning")
+
+    monkeypatch.setattr(agent, "signal_identity_checked", reject_signal)
+    monkeypatch.setattr(agent, "_runner_identity_state", reject_state)
+
+    assert agent._converge_observed_runner(observed, "kill") is False
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize(
+    ("runner_pid", "runner_start_time"),
+    [
+        (4242.9, 42),
+        ("4242", 42),
+        (True, 42),
+        (0, 42),
+        (4242, "42"),
+        (4242, 42.0),
+        (4242, True),
+    ],
+)
+def test_delete_convergence_rejects_malformed_persisted_runner_identity(
+    runner_pid: object,
+    runner_start_time: object,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    force: bool,
+) -> None:
+    """Delete keeps malformed present runner authority blocking."""
+    meta: agent.Meta = {
+        "id": "aaaaaaaa",
+        "delete_pending": True,
+        "runner_pid": runner_pid,
+        "runner_start_time": runner_start_time,
+    }
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+
+    def reject_signal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("malformed runner identity reached signal_identity_checked")
+
+    monkeypatch.setattr(agent, "signal_identity_checked", reject_signal)
+
+    assert agent._converge_for_delete("aaaaaaaa", force=force, deadline=0.0) is False
 
 
 def test_runner_identity_state_distinguishes_evidence(
@@ -425,3 +489,49 @@ def test_invocation_spawn_gate_refuses_cancelled_prompt(
     result = agent.read_meta(aid)
     assert result is not None
     assert result["state"] == ("stopped" if mode == "stop" else "killed")
+
+
+@pytest.mark.parametrize("bad_id", [123, True, "", "ABC", []])
+def test_runner_convergence_rejects_malformed_persisted_agent_id(
+    bad_id: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed durable agent IDs cannot become runner marker authority."""
+    observed: agent.Meta = {
+        "id": bad_id,
+        "runner_pid": 4242,
+        "runner_start_time": 777,
+    }
+
+    def reject_signal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("malformed agent id reached runner signalling")
+
+    def reject_state(*_args: object, **_kwargs: object) -> str:
+        pytest.fail("malformed agent id reached runner identity proof")
+
+    monkeypatch.setattr(agent, "signal_identity_checked", reject_signal)
+    monkeypatch.setattr(agent, "_runner_identity_state", reject_state)
+
+    assert agent._converge_observed_runner(observed, "kill") is False
+
+
+@pytest.mark.parametrize("bad_id", [123, True, "", "ABC", []])
+def test_forced_delete_rejects_malformed_persisted_agent_id(
+    bad_id: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forced delete cannot stringify malformed durable IDs into authority."""
+    meta: agent.Meta = {
+        "id": bad_id,
+        "delete_pending": True,
+        "runner_pid": 4242,
+        "runner_start_time": 777,
+    }
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+
+    def reject_signal(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("malformed agent id reached forced-delete runner signalling")
+
+    monkeypatch.setattr(agent, "signal_identity_checked", reject_signal)
+
+    assert agent._converge_for_delete("aaaaaaaa", force=True, deadline=0.0) is False

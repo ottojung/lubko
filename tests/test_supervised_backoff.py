@@ -10,13 +10,22 @@ and an expired deadline without a live candidate, fail closed.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from lubko import cli, lifecycle, supervise
-from lubko import deployctl as dc
+import lubko.cli
+import lubko.deployctl
+import lubko.lifecycle
+import lubko.supervise
+
+cli = lubko.cli
+dc = lubko.deployctl
+lifecycle = lubko.lifecycle
+supervise = lubko.supervise
 
 OLD_COMMIT = "1" * 40
 NEW_COMMIT = "2" * 40
@@ -140,7 +149,6 @@ def mission(monkeypatch: pytest.MonkeyPatch) -> dc.RollbackState:
         status=dc.STATUS_PENDING,
         commit=NEW_COMMIT,
         previous_commit=OLD_COMMIT,
-        challenge_hash=None,
         deadline=time.time() + 3600.0,
         repo="/workspace/Lubko",
         uv_path="uv",
@@ -180,12 +188,32 @@ def settlement(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         Mapping of settled commit to settlement count.
     """
     recorded: dict[str, int] = {}
+    settled: dict[str, str | int] = {"commit": NEW_COMMIT, "generation": GENERATION}
 
     def record(commit: str, _repo: str, _uv_path: str) -> int:
+        generation = GENERATION + 10
         recorded[commit] = recorded.get(commit, 0) + 1
-        return GENERATION + 10
+        settled["commit"] = commit
+        settled["generation"] = generation
+        return generation
 
     monkeypatch.setattr(dc, "settle_desired", record)
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=settled["commit"], generation=settled["generation"]),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=settled["generation"],
+            commit=settled["commit"],
+            ready=True,
+            holding=False,
+        ),
+    )
     return recorded
 
 
@@ -205,47 +233,6 @@ def status_env(mission: dc.RollbackState, monkeypatch: pytest.MonkeyPatch) -> No
     del mission
     monkeypatch.setattr(dc, "read_meta", lambda: None)
     monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
-
-
-def test_confirm_pre_challenge_survives_restart_backoff(
-    mission: dc.RollbackState,
-    live_supervisor: list[supervise.SupervisorState],
-    settlement: dict[str, int],
-    cli_stubs: None,
-) -> None:
-    """A ``child=None`` backoff snapshot must not roll back a challenge issue."""
-    del cli_stubs, live_supervisor, mission
-    response = dc._confirm_locked({"type": "confirm", "commit": NEW_COMMIT}, _options())
-
-    assert response["ok"] is True
-    assert settlement == {}
-    current = dc._read_state()
-    assert current is not None
-    assert current.status == dc.STATUS_PENDING
-    assert current.challenge_hash is not None
-
-
-def test_confirm_post_challenge_survives_restart_backoff(
-    mission: dc.RollbackState,
-    live_supervisor: list[supervise.SupervisorState],
-    settlement: dict[str, int],
-    cli_stubs: None,
-) -> None:
-    """A correctly answered challenge confirms despite a transient gap."""
-    del cli_stubs, live_supervisor
-    challenge = dc._generate_challenge()
-    dc._write_state(replace(mission, challenge_hash=dc._challenge_digest(challenge)))
-
-    response = dc._confirm_locked(
-        {"type": "confirm", "commit": NEW_COMMIT, "challenge": challenge[::-1]},
-        _options(),
-    )
-
-    assert response == {"type": "confirm", "ok": True, "commit": NEW_COMMIT, "confirmed": True}
-    assert settlement == {NEW_COMMIT: 1}
-    current = dc._read_state()
-    assert current is not None
-    assert current.status == dc.STATUS_CONFIRMED
 
 
 def test_status_survives_restart_backoff(
@@ -357,6 +344,32 @@ def test_wait_until_ready_polls_through_transient_child_none(
     assert observations == []
 
 
+def test_wait_until_ready_rejects_superseding_different_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer ready generation for another commit cannot satisfy the wait."""
+    observation = replace(
+        _supervisor_status(child=None, ready=True),
+        applied_generation=GENERATION + 1,
+        commit=OTHER_COMMIT,
+    )
+    monkeypatch.setattr(supervise, "read_status", lambda: observation)
+    assert supervise.wait_until_ready(GENERATION, timeout_seconds=10.0, commit=NEW_COMMIT) is False
+
+
+def test_wait_until_ready_accepts_newer_same_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer generation remains valid when it proves the same exact commit ready."""
+    observation = replace(
+        _supervisor_status(child=None, ready=True),
+        applied_generation=GENERATION + 1,
+        commit=NEW_COMMIT,
+    )
+    monkeypatch.setattr(supervise, "read_status", lambda: observation)
+    assert supervise.wait_until_ready(GENERATION, timeout_seconds=10.0, commit=NEW_COMMIT) is True
+
+
 def test_wait_until_ready_times_out_without_readiness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -378,3 +391,16 @@ def test_wait_until_ready_times_out_without_readiness(
     )
 
     assert supervise.wait_until_ready(GENERATION, timeout_seconds=2.0) is False
+
+
+def _desired(generation: int, commit: str) -> supervise.SupervisorDesired:
+    """Return one exact desired supervisor intent."""
+    return supervise.SupervisorDesired(
+        schema_version=supervise.SCHEMA_VERSION,
+        generation=generation,
+        commit=commit,
+        repo="/workspace/Lubko",
+        uv_path="uv",
+        worker_id="test-worker",
+        requested_at=1.0,
+    )

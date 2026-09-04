@@ -1,11 +1,13 @@
 """Process-identity matching and worker signalling invariants."""
 
+import json
 import os
 import signal
+from pathlib import Path
 
 import pytest
 
-from lubko import worker
+from lubko import lifecycle, worker
 from lubko.lifecycle import SCHEMA_VERSION, ProcessIdentity, WorkerMeta, identity_matches
 
 LIVE = ProcessIdentity(pid=42, pgid=42, sid=7, start_time_ticks=1234)
@@ -118,3 +120,116 @@ def test_pinned_signal_fails_closed_when_send_binding_is_unavailable(
     assert not PIN_AND_SIGNAL(12345, signal.SIGTERM, 77)
     assert broad == []
     assert closed == [92]
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("schema_version", "1"),
+        ("schema_version", 1.0),
+        ("schema_version", True),
+        ("schema_version", 2),
+        ("pid", "42"),
+        ("pid", 42.0),
+        ("pid", True),
+        ("pgid", "42"),
+        ("sid", "7"),
+        ("start_time_ticks", "1234"),
+        ("started_at", "1.0"),
+        ("started_at", True),
+        ("started_at", float("nan")),
+        ("started_at", -1),
+        ("stopped_at", float("inf")),
+        ("stopped_at", -0.5),
+        ("state", 1),
+        ("token", 1),
+        ("repo", 1),
+        ("git_commit", 1),
+        ("worker_id", 1),
+        ("log_path", 1),
+    ],
+)
+def test_metadata_rejects_malformed_present_scalars(field: str, bad_value: object) -> None:
+    """Present malformed scalars never become maintained-worker authority."""
+    data = meta().to_dict()
+    data[field] = bad_value
+    with pytest.raises(
+        (TypeError, ValueError), match=r"worker metadata|unsupported worker metadata"
+    ):
+        WorkerMeta.from_dict(data)
+
+
+@pytest.mark.parametrize("bad_state", ["", "pending", "unmanaged", "definitely-not-a-worker-state"])
+def test_metadata_rejects_unsupported_present_state(bad_state: str) -> None:
+    """Type-correct but unsupported lifecycle states remain malformed authority."""
+    data = meta().to_dict()
+    data["state"] = bad_state
+    with pytest.raises(ValueError, match=r"unsupported worker metadata state"):
+        WorkerMeta.from_dict(data)
+
+
+def test_metadata_preserves_absent_state_compatibility() -> None:
+    """Genuine legacy state absence still defaults to stopped."""
+    data = meta().to_dict()
+    del data["state"]
+    assert WorkerMeta.from_dict(data).state == lifecycle.STATE_STOPPED
+
+
+def test_metadata_accepts_non_negative_lifecycle_timestamps() -> None:
+    """Zero and positive finite wall-clock timestamps remain valid metadata."""
+    zero = meta(started_at=0, stopped_at=0.0)
+    assert zero.started_at == pytest.approx(0.0)
+    assert zero.stopped_at == pytest.approx(0.0)
+
+    positive = meta(started_at=1, stopped_at=2.5)
+    assert positive.started_at == pytest.approx(1.0)
+    assert positive.stopped_at == pytest.approx(2.5)
+
+
+def test_metadata_requires_explicit_supported_schema() -> None:
+    """Missing schema authority is not silently upgraded to the current schema."""
+    data = meta().to_dict()
+    del data["schema_version"]
+    with pytest.raises(ValueError, match=r"schema_version.*missing"):
+        WorkerMeta.from_dict(data)
+
+
+def test_read_meta_fails_closed_on_unsupported_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unsupported on-disk lifecycle state cannot become usable metadata."""
+    path = tmp_path / "meta.json"
+    data = meta().to_dict()
+    data["state"] = "unknown"
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(lifecycle, "meta_path", lambda: path)
+    assert lifecycle.read_meta() is None
+
+
+def test_read_meta_fails_closed_on_malformed_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Malformed on-disk identity cannot become usable lifecycle metadata."""
+    path = tmp_path / "meta.json"
+    data = meta().to_dict()
+    data["pid"] = "42"
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(lifecycle, "meta_path", lambda: path)
+    assert lifecycle.read_meta() is None
+
+
+@pytest.mark.parametrize("field", ["started_at", "stopped_at"])
+def test_read_meta_fails_closed_on_negative_lifecycle_timestamp(
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Negative persisted lifecycle timestamps cannot become usable metadata."""
+    path = tmp_path / "meta.json"
+    data = meta().to_dict()
+    data[field] = -1
+    path.write_text(json.dumps(data))
+    monkeypatch.setattr(lifecycle, "meta_path", lambda: path)
+    assert lifecycle.read_meta() is None

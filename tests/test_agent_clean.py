@@ -119,9 +119,12 @@ def test_reserved_runner_blocks_removal_at_prestart_boundary(
         aid,
         state="succeeded",
         active_runner=True,
+        runner_gen=1,
         runner_reservation={
             "state": "reserved",
+            "gen": 1,
             "owner_pid": os.getpid(),
+            "mode": "new",
             "owner_start_ticks": agent.proc_start_ticks(os.getpid()),
         },
     )
@@ -135,3 +138,19 @@ def test_reserved_runner_blocks_removal_at_prestart_boundary(
     assert meta is not None
     assert not meta.get("delete_pending")
     assert "removed agent aa" not in out
+
+
+def test_retention_candidates_fail_closed_on_malformed_completion_timestamps() -> None:
+    """Malformed completion timestamps never crash cleanup or authorize removal."""
+    write_meta("aa", finished_at=0.0)
+    for aid, value in {
+        "ab": False,
+        "ac": "old",
+        "ad": {},
+        "ae": -1,
+        "af": float("inf"),
+        "a0": float("nan"),
+    }.items():
+        write_meta(aid, finished_at=value)
+
+    assert agent._clean_candidates(14) == ["aa"]

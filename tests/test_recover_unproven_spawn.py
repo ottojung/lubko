@@ -23,6 +23,30 @@ NON_PRIVATE = ProcessIdentity(pid=PID, pgid=1, sid=9000, start_time_ticks=555)
 PIN_BASE = 20000
 
 
+def test_cleanup_ready_markers_tolerates_non_file_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed marker filesystem shapes cannot abort recovery cleanup."""
+    monkeypatch.setattr(lifecycle, "worker_state_dir", lambda: tmp_path)
+    (tmp_path / "ready-directory").mkdir()
+    valid = tmp_path / "ready-valid"
+    valid.write_text(json.dumps({"pid": PID}))
+    stale = tmp_path / "ready-stale"
+    stale.write_text(json.dumps({"pid": PID + 1}))
+    malformed = tmp_path / "ready-malformed"
+    malformed.write_text("not json")
+    wrong_type = tmp_path / "ready-wrong-type"
+    wrong_type.write_text(json.dumps({"pid": float(PID)}))
+
+    lifecycle._cleanup_ready_markers(PID)
+
+    assert valid.is_file()
+    assert not stale.exists()
+    assert not malformed.exists()
+    assert not wrong_type.exists()
+    assert (tmp_path / "ready-directory").is_dir()
+
+
 class NumericSignalError(AssertionError):
     """Raised when a numeric kill primitive is used instead of a pidfd."""
 
@@ -638,6 +662,50 @@ def _stub_repair(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(lifecycle, "_reconcile_toolchain", lambda _uv: None)
     monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", lambda *_a: True)
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
+
+
+def test_adoption_candidate_refuses_malformed_maintained_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrupt maintained authority cannot collapse to absence during adoption."""
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda *_a: True)
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: PRIVATE)
+    monkeypatch.setattr(lifecycle, "_is_lubko_worker_process", lambda _pid: True)
+    monkeypatch.setattr(lifecycle, "check_postgres", lambda *_a: True)
+
+    def malformed_meta() -> lifecycle.WorkerMeta | None:
+        msg = "maintained-worker metadata is not valid JSON"
+        raise lifecycle.WorkerMetadataError(msg)
+
+    monkeypatch.setattr(lifecycle, "read_meta_strict", malformed_meta)
+
+    with pytest.raises(lifecycle._AdoptionError, match="present but untrustworthy"):
+        lifecycle._adoption_candidate(options(), PID, COMMIT)
+
+
+def test_repair_refuses_metadata_corruption_at_final_publication_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Corruption after candidate validation blocks the authoritative write."""
+    _stub_repair(monkeypatch)
+
+    def malformed_meta() -> lifecycle.WorkerMeta | None:
+        msg = "maintained-worker metadata is malformed"
+        raise lifecycle.WorkerMetadataError(msg)
+
+    monkeypatch.setattr(lifecycle, "read_meta_strict", malformed_meta)
+    monkeypatch.setattr(
+        lifecycle,
+        "write_meta",
+        lambda _meta: pytest.fail("corrupt maintained metadata must not be overwritten"),
+    )
+
+    code = lifecycle._repair_locked(options(), PID)
+    captured = capsys.readouterr()
+
+    assert code == lifecycle.EXIT_ERROR
+    assert "became untrustworthy before adoption publication" in captured.err
 
 
 def test_recover_success_keeps_exact_authority_until_adoption(

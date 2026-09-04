@@ -1,11 +1,12 @@
 """Poll PostgreSQL for jobs, execute them concurrently, and supervise them safely.
 
 The transport table ``lubko.jobs`` keeps exactly two columns forever: ``id``
-(unique random) and ``payload`` (one string containing a JSON object). All
-job/request/result/state/cancellation/process-identity/lease/output data lives
-inside ``payload`` using the versioned binding in :mod:`lubko.protocol` (see
-``docs/protocol.md``). The worker refuses to start against a table that
-violates the two-column invariant.
+(unique random) and ``payload`` (opaque text). PostgreSQL deliberately knows
+nothing about the application payload format; all job/request/result/state/
+cancellation/process-identity/lease/output semantics live in application code
+using the versioned binding in :mod:`lubko.protocol` (see ``docs/protocol.md``).
+The worker refuses to start against a table that violates the two-column
+structural invariant.
 
 The daemon is a single nonblocking supervisor. It holds one PostgreSQL
 connection and an in-memory registry of active jobs; each job runs as its own
@@ -73,6 +74,7 @@ import argparse
 import fcntl
 import json
 import logging
+import math
 import os
 import select
 import selectors
@@ -96,8 +98,12 @@ from lubko._exact_signal import open_pidfd as _shared_open_pidfd
 from lubko._exact_signal import pidfd_send_signal as _shared_pidfd_send_signal
 from lubko._exact_signal import process_pgrp as _shared_process_pgrp
 from lubko._start_gate import GATE_RELEASE_BYTE
-from lubko.config import load_database_config, load_worker_server
+from lubko.config import (
+    load_database_config,
+    load_worker_server,
+)
 from lubko.health import (
+    WORKER_HEALTH_SCHEMA_VERSION,
     WorkerHealth,
     configure_worker_logging,
     install_worker_exception_hooks,
@@ -112,9 +118,16 @@ from lubko.protocol import (
     OUTPUT_TAIL_MAX_BYTES,
     TWO_COLUMN_INVARIANT,
     ProtocolError,
+    _utf8_byte_length,
     build_output_chunk_payload,
     build_output_window_payload,
     parse_payload,
+)
+from lubko.protocol_versioning import (
+    CURRENT_PROTOCOL_VERSION,
+    JobVersionDisposition,
+    claim_version_predicate,
+    reaper_disposition,
 )
 from lubko.state import state_root
 
@@ -410,20 +423,6 @@ EXECUTION_ERROR_EXIT_CODE: Final = 127
 JOBS_SCHEMA: Final = "lubko"
 JOBS_TABLE: Final = "jobs"
 JOBS_COLUMN_TYPES: Final = (("id", "uuid"), ("payload", "text"))
-TYPE_AWARE_CONSTRAINT_NAME: Final = "jobs_payload_type_shape"
-#: Whitespace-stripped fragments that only the protocol v4 (routing-aware)
-#: definition of ``jobs_payload_type_shape`` contains; a pre-cutover v3
-#: constraint of the same name lacks them and is refused at startup. Compared
-#: against ``pg_get_constraintdef`` output with all whitespace removed, so
-#: PostgreSQL normalization (extra parentheses and ``::text`` casts included)
-#: never defeats detection. The ``='4'::jsonb`` marker proves the constraint
-#: enforces the protocol version itself, not merely server presence.
-SERVER_ROUTING_CONSTRAINT_MARKERS: Final = (
-    "jsonb_typeof",
-    "->'server'",
-    "='string'",
-    "='4'::jsonb",
-)
 #: SQL predicate selecting rows whose top-level ``server`` is exactly the
 #: daemon's configured identity as a JSON *string*. The ``jsonb_typeof`` guard
 #: makes text-coercion aliases impossible: a row with ``server: 123`` (a JSON
@@ -433,10 +432,25 @@ SERVER_ROUTING_CONSTRAINT_MARKERS: Final = (
 SERVER_MATCH_SQL: Final = (
     "jsonb_typeof((payload::jsonb)->'server') = 'string'\n    AND (payload::jsonb)->>'server' = "
 )
-CHUNK_OWNER_INDEX_NAME: Final = "jobs_chunk_owner_idx"
-CHUNK_ORDER_INDEX_NAME: Final = "jobs_chunk_order_idx"
 UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
 UTC_ISO_SQL: Final = f"to_jsonb({UTC_ISO_TEXT_SQL})"
+GC_FINISHED_AT_PATTERN: Final = (
+    r"^(?:"
+    r"(?:[0-9]{4}-(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01]))"
+    r"|(?:[0-9]{4}-(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30))"
+    r"|(?:[0-9]{4}-02-(?:0[1-9]|1[0-9]|2[0-8]))"
+    r"|(?:(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])"
+    r"|(?:[02468][048]|[13579][26])00)-02-29)"
+    r")T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
+)
+CANCEL_REQUESTED_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
+LEASE_EXPIRES_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
+CANCEL_REQUESTED_SQL: Final = (
+    "(jsonb_typeof((payload::jsonb)->'state'->'cancel_requested_at') = 'string'\n"
+    "    AND ((payload::jsonb)->'state'->>'cancel_requested_at')\n"
+    "        ~ %(cancel_requested_at_pattern)s\n"
+    "    AND left((payload::jsonb)->'state'->>'cancel_requested_at', 4) <> '0000')"
+)
 LEASE_EXPIRES_AT_SQL: Final = (
     "to_jsonb(to_char("
     "now() at time zone 'utc' + make_interval(secs => %(lease_duration_seconds)s), "
@@ -598,6 +612,11 @@ class ActiveJob:
     pgid: int
     started_mono: float
     claimed_at: float
+    #: Protocol version of the root command payload that owns this job. Every
+    #: immutable output_chunk this worker publishes for the job is stamped with
+    #: this same version, so chunk history can never drift to a different
+    #: protocol generation than its root.
+    version: int
     stdout: OutputStream = field(init=False)
     stderr: OutputStream = field(init=False)
     completed: bool = False
@@ -634,6 +653,22 @@ class ActiveJob:
     # (leader exited, PGID possibly recycled) ONLY by exact (pid, ticks) match
     # against this ledger; anything else fails closed and is never signalled.
     owned_members: dict[int, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _HealthAggregates:
+    """Bounded per-job aggregates for one health snapshot."""
+
+    active_jobs: int
+    stopping_jobs: int
+    oldest_active_job_age_seconds: float | None
+    oldest_active_job_id: str | None
+    min_lease_safety_remaining_seconds: float | None
+    capture_streams_open: int
+    spool_held_bytes: int
+    cancellation_scan_overdue: bool
+    recovery_overdue: bool
+    gc_overdue: bool
 
 
 @dataclass(slots=True)
@@ -700,9 +735,10 @@ class Settings:
         """Validate lease timing so a live worker's lease never expires idle.
 
         Raises:
-            ValueError: If the server identity is empty or any timing value
-                is unusable.
+            ValueError: If the server identity is empty, any timing value is
+                unusable.
         """
+        self._validate_finite_timing()
         if not self.server:
             msg = (
                 "a non-empty 'server' setting in the worker configuration file is "
@@ -713,6 +749,32 @@ class Settings:
         self._validate_lease_timing()
         self._validate_output_and_gc()
         self._validate_spool()
+
+    def _validate_finite_timing(self) -> None:
+        """Reject non-finite timing values before domain/order comparisons.
+
+        Raises:
+            ValueError: If any timing setting is NaN or infinite.
+        """
+        fields = (
+            "poll_interval_seconds",
+            "process_poll_interval_seconds",
+            "cancel_grace_seconds",
+            "lease_duration_seconds",
+            "lease_refresh_interval_seconds",
+            "lease_recovery_interval_seconds",
+            "output_publication_interval_seconds",
+            "health_publish_interval_seconds",
+            "lease_safety_margin_seconds",
+            "db_operation_timeout_seconds",
+            "gc_retention_seconds",
+            "gc_interval_seconds",
+        )
+        for field_name in fields:
+            value = getattr(self, field_name)
+            if not math.isfinite(value):
+                msg = f"{field_name} must be finite"
+                raise ValueError(msg)
 
     def _validate_lease_timing(self) -> None:
         """Validate lease-related settings are consistent.
@@ -809,9 +871,8 @@ class Settings:
     def from_environment(cls, *, server: str) -> Settings:
         """Load worker settings from environment variables.
 
-        The execution-server identity is never environmental: it must be
-        supplied explicitly, loaded from the restricted worker configuration
-        file by the entry point.
+        The execution-server identity is never environmental: it is supplied
+        explicitly from the restricted worker configuration file.
 
         Args:
             server: Non-empty execution-server identity from the config file.
@@ -955,18 +1016,6 @@ def truncate_output(data: bytes, limit: int) -> str:
             index += 1
         result = result[:body_offset] + result[index:]
     return result
-
-
-def read_output(path: Path) -> bytes:
-    """Read all bytes captured so far into an output file.
-
-    Args:
-        path: Capture file for the stream.
-
-    Returns:
-        The captured bytes.
-    """
-    return path.read_bytes()
 
 
 def stream_size(path: Path) -> int:
@@ -1321,22 +1370,236 @@ def pg_safe_decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace").replace("\x00", "\ufffd")
 
 
-def decode_range(path: Path, start: int, end: int) -> str:
-    """Decode the bytes in ``[start, end)`` as PostgreSQL-safe UTF-8 text.
+_UTF8_CONTINUATION_MIN: Final = 0x80
+_UTF8_CONTINUATION_MAX: Final = 0xBF
+_UTF8_TWO_BYTE_MIN: Final = 0xC2
+_UTF8_TWO_BYTE_MAX: Final = 0xDF
+_UTF8_THREE_BYTE_MIN: Final = 0xE0
+_UTF8_THREE_BYTE_MAX: Final = 0xEF
+_UTF8_FOUR_BYTE_MIN: Final = 0xF0
+_UTF8_FOUR_BYTE_MAX: Final = 0xF4
+_UTF8_MIN_CODE_POINT_LEN: Final = 2
+_UTF8_MAX_CODE_POINT_LEN: Final = 4
+_UNICODE_MAX_CODE_POINT: Final = 0x10FFFF
+_UTF16_SURROGATE_MIN: Final = 0xD800
+_UTF16_SURROGATE_MAX: Final = 0xDFFF
+_CODE_POINT_MIN_VALUE: Final[dict[int, int]] = {2: 0x80, 3: 0x800, 4: 0x10000}
 
-    The canonical conversion uses :func:`pg_safe_decode`: invalid UTF-8 byte
-    sequences become U+FFFD and NUL (U+0000) is replaced with U+FFFD so the
-    result is always safe for PostgreSQL ``text`` / ``jsonb``.
+
+def _is_utf8_continuation_byte(byte: int) -> bool:
+    """Return ``True`` when ``byte`` continues a multi-byte UTF-8 sequence."""
+    return _UTF8_CONTINUATION_MIN <= byte <= _UTF8_CONTINUATION_MAX
+
+
+def _code_point_length(lead: int) -> int:
+    """Return the byte length (2/3/4) of a structurally valid multi-byte lead.
+
+    ASCII (``< 0x80``) and invalid lead bytes (including the overlong ``0xC0``/
+    ``0xC1`` heads and the ``0xF5..0xFF`` range) return ``0``; the caller then
+    leaves the raw boundary unchanged so ``pg_safe_decode`` defines the behavior.
+    """
+    if _UTF8_TWO_BYTE_MIN <= lead <= _UTF8_TWO_BYTE_MAX:
+        return 2
+    if _UTF8_THREE_BYTE_MIN <= lead <= _UTF8_THREE_BYTE_MAX:
+        return 3
+    if _UTF8_FOUR_BYTE_MIN <= lead <= _UTF8_FOUR_BYTE_MAX:
+        return 4
+    return 0
+
+
+def _code_point_scalar(lead: int, cont: bytes, length: int) -> int | None:
+    """Decode the Unicode scalar of a structurally-shaped code point, or ``None``.
+
+    The lead/continuation byte shapes are assumed already checked by the caller;
+    this only rejects *overlong* encodings (whose scalar could be written in fewer
+    bytes) by returning ``None`` when the decoded value is below the minimum for
+    ``length``. Callers additionally reject surrogates and values above U+10FFFF so
+    that semantically invalid sequences are not treated as valid code points for
+    boundary movement.
 
     Args:
-        path: Capture file for the stream.
-        start: Inclusive byte offset.
-        end: Exclusive byte offset.
+        lead: The lead byte.
+        cont: The ``length - 1`` continuation bytes.
+        length: The code-point byte length (2, 3 or 4).
 
     Returns:
-        The decoded text.
+        The decoded scalar, or ``None`` when the encoding is overlong.
     """
-    return pg_safe_decode(read_range(path, start, end))
+    lead_mask = (1 << (7 - length)) - 1
+    cp = lead & lead_mask
+    for byte in cont:
+        cp = (cp << 6) | (byte & 0x3F)
+    if cp < _CODE_POINT_MIN_VALUE[length]:
+        return None
+    return cp
+
+
+def _valid_code_point_at(data: bytes, start: int, length: int) -> bool:
+    """Return ``True`` if ``data[start:start + length]`` is a valid code point.
+
+    A valid code point has a structurally correct lead byte whose declared length
+    matches ``length``, whose continuation bytes are all continuation bytes, and
+    whose decoded scalar is a legal Unicode value (not overlong, not a UTF-16
+    surrogate, not above U+10FFFF). Semantically invalid sequences such as
+    ``E0 80 80`` (overlong), ``ED A0 80`` (surrogate), ``F0 80 80 80`` (overlong)
+    and ``F4 90 80 80`` (> U+10FFFF) are rejected so they stay on the raw boundary
+    and ``pg_safe_decode`` defines their deterministic replacement. The check
+    inspects only ``length`` bytes, never scanning further.
+    """
+    if length < _UTF8_MIN_CODE_POINT_LEN or length > _UTF8_MAX_CODE_POINT_LEN:
+        return False
+    if start < 0 or start + length > len(data):
+        return False
+    if _code_point_length(data[start]) != length:
+        return False
+    cont = data[start + 1 : start + length]
+    if not all(_is_utf8_continuation_byte(byte) for byte in cont):
+        return False
+    cp = _code_point_scalar(data[start], cont, length)
+    if cp is None or cp > _UNICODE_MAX_CODE_POINT:
+        return False
+    return not (_UTF16_SURROGATE_MIN <= cp <= _UTF16_SURROGATE_MAX)
+
+
+def align_code_point_start(data: bytes, candidate: int) -> int:
+    """Return the smallest code-point boundary at or after ``candidate``.
+
+    The live-tail head only moves when ``candidate`` is strictly inside a
+    structurally valid 2/3/4-byte code point: the head snaps forward to that
+    code point's end (the next boundary) so the newest tail never begins
+    mid-rune. Because a code point is at most four bytes, the lead lies within
+    three bytes before ``candidate``; only those few bytes are inspected and a
+    continuation run with no valid lead nearby is left untouched. The head moves
+    at most three bytes forward, so the window stays within its byte bound, and
+    genuinely invalid bytes are left to ``pg_safe_decode``.
+
+    Args:
+        data: Raw bytes of the capture file.
+        candidate: Requested head offset, clamped into ``[0, len(data)]``.
+
+    Returns:
+        The aligned head offset (a code-point boundary or the bounds of ``data``).
+    """
+    n = len(data)
+    if candidate <= 0:
+        return 0
+    if candidate >= n:
+        return n
+    for lead_back in (1, 2, 3):
+        lead = candidate - lead_back
+        if lead < 0:
+            break
+        length = _code_point_length(data[lead])
+        if length == 0 or lead_back >= length:
+            continue
+        if _valid_code_point_at(data, lead, length):
+            return lead + length
+    return candidate
+
+
+def align_code_point_end(data: bytes, candidate: int) -> int:
+    """Return the largest code-point boundary at or before ``candidate``.
+
+    An archive chunk end only moves when ``candidate`` is strictly inside a
+    structurally valid 2/3/4-byte code point: the end snaps back to that code
+    point's start so the immutable chunk never splits a rune and only ever holds
+    complete code points. Only the few bytes around ``candidate`` are inspected;
+    a continuation run with no valid lead within three bytes is left untouched and
+    decoded deterministically by ``pg_safe_decode``. The chunk stays within its
+    byte bound because the end only moves backward (toward older bytes).
+
+    Args:
+        data: Raw bytes of the capture file.
+        candidate: Requested end offset, clamped into ``[0, len(data)]``.
+
+    Returns:
+        The aligned end offset (a code-point boundary or the bounds of ``data``).
+    """
+    n = len(data)
+    if candidate <= 0:
+        return 0
+    if candidate >= n:
+        return n
+    for lead_back in (1, 2, 3):
+        lead = candidate - lead_back
+        if lead < 0:
+            break
+        length = _code_point_length(data[lead])
+        if length == 0 or lead_back >= length:
+            continue
+        if _valid_code_point_at(data, lead, length):
+            return lead
+    return candidate
+
+
+def _bounded_suffix(raw: bytes, limit: int) -> tuple[int, str]:
+    """Keep the newest ``raw`` bytes whose decoded text fits a UTF-8 byte limit.
+
+    The newest tail of ``raw`` is retained: the returned ``keep`` offset is the
+    smallest code-point boundary at which ``pg_safe_decode(raw[keep:])`` encodes
+    to at most ``limit`` UTF-8 bytes. Offsets stay on raw byte boundaries, so the
+    returned text is exactly the decode of its ``[keep, len(raw))`` range and the
+    canonical invalid-byte replacement policy is unchanged; only the represented
+    byte interval is shortened (from the oldest end) when sanitizing invalid
+    bytes would otherwise expand the encoded payload past the protocol's ceiling.
+
+    Args:
+        raw: The candidate raw byte window (already code-point aligned at the start).
+        limit: Maximum UTF-8 byte length of the returned decoded text.
+
+    Returns:
+        A ``(keep, text)`` pair where ``text`` is the bounded decoded suffix.
+    """
+    full = pg_safe_decode(raw)
+    if _utf8_byte_length(full) <= limit:
+        return 0, full
+    boundaries = [k for k in range(len(raw) + 1) if align_code_point_end(raw, k) == k]
+    lo, hi = 0, len(boundaries) - 1
+    keep = len(raw)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        k = boundaries[mid]
+        if _utf8_byte_length(pg_safe_decode(raw[k:])) <= limit:
+            keep = k
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return keep, pg_safe_decode(raw[keep:])
+
+
+def _bounded_prefix(raw: bytes, limit: int) -> tuple[int, str]:
+    """Keep the oldest ``raw`` bytes whose decoded text fits a UTF-8 byte limit.
+
+    The oldest prefix of ``raw`` is retained: the returned ``end`` offset is the
+    largest code-point boundary at which ``pg_safe_decode(raw[:end])`` encodes to
+    at most ``limit`` UTF-8 bytes, and ``end`` is always at least one byte so the
+    represented range makes forward progress. Offsets stay on raw byte boundaries,
+    so the returned text is exactly the decode of its ``[0, end)`` range and the
+    canonical invalid-byte replacement policy is unchanged; only the represented
+    byte interval is shortened (from the newest end) when sanitizing invalid
+    bytes would otherwise expand the encoded payload past the protocol's ceiling.
+
+    Args:
+        raw: The candidate raw byte window (already code-point aligned at both ends).
+        limit: Maximum UTF-8 byte length of the returned decoded text.
+
+    Returns:
+        An ``(end, text)`` pair where ``text`` is the bounded decoded prefix.
+    """
+    if not raw:
+        return 0, ""
+    boundaries = [k for k in range(1, len(raw) + 1) if align_code_point_end(raw, k) == k]
+    lo, hi = 0, len(boundaries) - 1
+    end = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        k = boundaries[mid]
+        if _utf8_byte_length(pg_safe_decode(raw[:k])) <= limit:
+            end = k
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return end, pg_safe_decode(raw[:end])
 
 
 def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[str, int, int]:
@@ -1344,9 +1607,13 @@ def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[st
 
     Byte offsets are used for the window bounds and decoding is UTF-8 with
     replacement, so offsets are deterministic even when a window starts inside
-    a multi-byte sequence. ``base`` is the logical offset of the first physical
+    a multi-byte sequence. The window head is aligned forward to the next
+    code-point boundary so a multi-byte rune is never split across the live-tail
+    boundary: the returned text is exactly the decode of its ``[start, end)``
+    byte range, with no partial rune replaced by U+FFFD, while the window stays
+    within ``max_chars``. ``base`` is the logical offset of the first physical
     byte in the file (``OutputStream.spool_start``); the returned ``start`` and
-    ``end`` are logical offsets and the physical read is translated by ``base``.
+    ``end`` are logical offsets.
 
     Args:
         path: Capture file for the stream.
@@ -1359,7 +1626,17 @@ def output_window_text(path: Path, max_chars: int, *, base: int = 0) -> tuple[st
     size = stream_size(path) + base
     window = min(size, max_chars)
     start = size - window
-    return decode_range(path, start - base, size - base), start, size
+    physical_head = start - base
+    # Read only the bounded tail plus the at most three prefix bytes needed to
+    # classify a code-point crossing; the whole spool is never materialized.
+    read_from = max(0, physical_head - 3)
+    tail = read_range(path, read_from, size - base)
+    local_candidate = physical_head - read_from
+    aligned_local = align_code_point_start(tail, local_candidate)
+    aligned_physical = read_from + aligned_local
+    raw_window = tail[aligned_local:]
+    keep, text = _bounded_suffix(raw_window, max_chars)
+    return text, aligned_physical + keep + base, size
 
 
 def archive_target(size: int) -> int:
@@ -1602,7 +1879,13 @@ def _plan_streams(
                 stream.path, OUTPUT_TAIL_MAX_BYTES, base=stream.spool_start
             )
             chunks, archived_upto, last_chunk, sequence = _plan_chunks(
-                job.id, name, stream, tail_end, server
+                job.id,
+                name,
+                stream,
+                tail_end,
+                server,
+                version=job.version,
+                tail_start=tail_start,
             )
         except OSError as exc:
             # Never silently omit a stream: a stat/read/disappearance failure on
@@ -1631,12 +1914,15 @@ def _plan_streams(
     return plans
 
 
-def _plan_chunks(
+def _plan_chunks(  # ruff: ignore[too-many-arguments] -- the chunk identity/offset/version fields are each required; bundling them hides intent
     job_id: UUID,
     name: str,
     stream: OutputStream,
     tail_end: int,
     server: str,
+    *,
+    version: int,
+    tail_start: int = 0,
 ) -> tuple[tuple[tuple[UUID, str], ...], int, UUID | None, int]:
     """Compute the immutable chunks to archive for one stream.
 
@@ -1646,6 +1932,19 @@ def _plan_chunks(
         stream: The stream's current publication state.
         tail_end: Current byte size of the stream (end of the live tail).
         server: The daemon's configured server identity stamped onto chunks.
+        version: Protocol version of the owning root job; every emitted chunk is
+            stamped with this same version so chunk history cannot drift to a
+            different protocol generation.
+        tail_start: Logical offset where the live tail begins. Archiving must
+            reach at least this offset so the immutable chunks and the live tail
+            cover every raw byte of the stream with no gap: byte offsets strictly
+            before ``tail_start`` are historical and belong in chunks, while the
+            tail owns ``[tail_start, tail_end)``. ``archive_target`` overlaps the
+            tail by ``ARCHIVE_MARGIN_CHARS`` (intentional, offset-disambiguated),
+            but invalid UTF-8 expands to U+FFFD on decode and can push the tail
+            head forward past that margin; when it does, archiving must extend to
+            ``tail_start`` itself rather than stopping short and leaving an
+            uncovered, and ultimately trimmed-away, gap.
 
     Returns:
         The planned ``(chunks, archived_upto, last_chunk, sequence)`` tuple.
@@ -1655,14 +1954,39 @@ def _plan_chunks(
     last_chunk = stream.last_chunk
     sequence = stream.sequence
     target = archive_target(tail_end)
+    # Emit full-size chunks toward the margin target. Each aligned end moves
+    # backward by at most three bytes, so every full chunk makes guaranteed
+    # forward progress and the loop terminates; the leftover partial window is
+    # intentionally left in the live-tail overlap (it is archived by a later
+    # publication once it forms a full chunk).
     while target - archived_upto >= OUTPUT_CHUNK_MAX_BYTES:
         chunk_start = archived_upto
-        chunk_end = chunk_start + OUTPUT_CHUNK_MAX_BYTES
-        value = decode_range(
-            stream.path,
-            chunk_start - stream.spool_start,
-            chunk_end - stream.spool_start,
+        candidate = chunk_start + OUTPUT_CHUNK_MAX_BYTES - stream.spool_start
+        # Classify the boundary with a bounded neighborhood read: a few bytes before
+        # the candidate (for the lead) and up to three after it (the longest a
+        # 4-byte rune can extend), so the whole spool is never materialized.
+        n_from = max(0, candidate - 3)
+        neighborhood = read_range(stream.path, n_from, candidate + 4)
+        # End the chunk on a complete code point so its decoded value is exactly
+        # the decode of its byte range and never collides mid-rune with the
+        # adjacent chunk or the live tail. The alignment moves the end backward by
+        # at most three bytes, so the chunk stays within OUTPUT_CHUNK_MAX_BYTES.
+        chunk_end = (
+            n_from + align_code_point_end(neighborhood, candidate - n_from) + stream.spool_start
         )
+        # Decode only the bounded chunk bytes for the immutable value.
+        chunk_bytes = read_range(
+            stream.path, chunk_start - stream.spool_start, chunk_end - stream.spool_start
+        )
+        value = pg_safe_decode(chunk_bytes)
+        # Invalid bytes sanitize to the three-byte U+FFFD, so the decoded value
+        # can encode to more UTF-8 bytes than the raw range holds. Shrink the
+        # represented interval from the newest end to the oldest boundary that
+        # fits the protocol byte ceiling, keeping offsets and replacement
+        # semantics intact and preserving forward progress.
+        if _utf8_byte_length(value) > OUTPUT_CHUNK_MAX_BYTES:
+            end, value = _bounded_prefix(chunk_bytes, OUTPUT_CHUNK_MAX_BYTES)
+            chunk_end = chunk_start + end
         chunk_id = uuid4()
         chunk_payload = json.dumps(
             build_output_chunk_payload(
@@ -1674,12 +1998,56 @@ def _plan_chunks(
                 end=chunk_end,
                 value=value,
                 previous=last_chunk,
+                version=version,
             )
         )
         chunks.append((chunk_id, chunk_payload))
         last_chunk = chunk_id
         sequence += 1
         archived_upto = chunk_end
+    # Invalid UTF-8 expands to U+FFFD on decode and can push the live-tail head
+    # (``tail_start``) forward past the margin ``target``. ``tail_start`` is
+    # recomputed as a code-point boundary by ``output_window_text``, so when it
+    # exceeds ``target`` the historical prefix up to ``tail_start`` must still be
+    # archived; otherwise those raw bytes are never covered and a later trim
+    # drops them as an uncovered gap between the chunks and the live tail.
+    if tail_start > target:
+        while archived_upto < tail_start:
+            chunk_start = archived_upto
+            candidate = tail_start - stream.spool_start
+            # ``tail_start`` is itself a code-point boundary, so the aligned end
+            # never snaps backward past the chunk start; this loop therefore
+            # always makes forward progress and terminates.
+            n_from = max(0, candidate - 3)
+            neighborhood = read_range(stream.path, n_from, candidate + 4)
+            chunk_end = (
+                n_from + align_code_point_end(neighborhood, candidate - n_from) + stream.spool_start
+            )
+            chunk_bytes = read_range(
+                stream.path, chunk_start - stream.spool_start, chunk_end - stream.spool_start
+            )
+            value = pg_safe_decode(chunk_bytes)
+            if _utf8_byte_length(value) > OUTPUT_CHUNK_MAX_BYTES:
+                end, value = _bounded_prefix(chunk_bytes, OUTPUT_CHUNK_MAX_BYTES)
+                chunk_end = chunk_start + end
+            chunk_id = uuid4()
+            chunk_payload = json.dumps(
+                build_output_chunk_payload(
+                    server=server,
+                    thread=job_id,
+                    stream=name,
+                    sequence=sequence,
+                    start=chunk_start,
+                    end=chunk_end,
+                    value=value,
+                    previous=last_chunk,
+                    version=version,
+                )
+            )
+            chunks.append((chunk_id, chunk_payload))
+            last_chunk = chunk_id
+            sequence += 1
+            archived_upto = chunk_end
     return tuple(chunks), archived_upto, last_chunk, sequence
 
 
@@ -1740,79 +2108,6 @@ def _output_update_params(
 # ---------------------------------------------------------------------------
 # Process helpers
 # ---------------------------------------------------------------------------
-
-
-_CLAIM_JOBS_TEMPLATE: Final = """\
-WITH next AS (
-    SELECT id
-    FROM lubko.jobs
-    WHERE (payload::jsonb)->>'type' = 'command'
-        AND (payload::jsonb)->'state'->>'status' = 'pending'
-    ORDER BY (payload::jsonb)->'state'->>'created_at', id
-    FOR UPDATE SKIP LOCKED
-    LIMIT %(limit)s
-)
-UPDATE lubko.jobs AS job
-SET payload = __SET_CHAIN__::text
-FROM next
-WHERE job.id = next.id
-RETURNING job.id, job.payload
-"""
-
-_RECOVER_STALE_JOBS_TEMPLATE: Final = """\
-WITH stale AS (
-    SELECT id
-    FROM lubko.jobs
-    WHERE (payload::jsonb)->>'type' = 'command'
-        AND (payload::jsonb)->'state'->>'status' = 'running'
-        AND (payload::jsonb)->'state'->>'lease_expires_at' IS NOT NULL
-        AND ((payload::jsonb)->'state'->>'lease_expires_at') < __ISO_NOW__
-    ORDER BY id
-    FOR UPDATE SKIP LOCKED
-    LIMIT %(limit)s
-)
-UPDATE lubko.jobs AS job
-SET payload = __SET_CHAIN__::text
-FROM stale
-WHERE job.id = stale.id
-RETURNING job.id, job.payload
-"""
-
-
-def _claim_jobs_sql(set_chain: str) -> str:
-    """Compose the bounded claiming ``UPDATE`` statement.
-
-    The SQL is assembled from internal constant literals and the prebuilt
-    ``jsonb_set`` chain; the chain is slotted into the template with a string
-    replacement (never by concatenating a query fragment into a ``SELECT``-bearing
-    string) so no external input reaches the query and the template stays a safe
-    constant. The only runtime inputs are bound parameters.
-
-    Args:
-        set_chain: The prebuilt ``jsonb_set`` chain for the claim state.
-
-    Returns:
-        The full claiming statement text.
-    """
-    return _CLAIM_JOBS_TEMPLATE.replace("__SET_CHAIN__", set_chain)
-
-
-def _recover_stale_jobs_sql(set_chain: str) -> str:
-    """Compose the bounded lease-recovery ``UPDATE`` statement.
-
-    As with :func:`_claim_jobs_sql`, the statement is built only from the
-    internal template and the prebuilt chain; the only runtime inputs are bound
-    parameters.
-
-    Args:
-        set_chain: The prebuilt ``jsonb_set`` chain for the failed state.
-
-    Returns:
-        The full recovery statement text.
-    """
-    return _RECOVER_STALE_JOBS_TEMPLATE.replace("__SET_CHAIN__", set_chain).replace(
-        "__ISO_NOW__", UTC_ISO_TEXT_SQL
-    )
 
 
 def _streams_at_eof(job: ActiveJob) -> bool:
@@ -2030,27 +2325,50 @@ def drain_sentinel_matches(incarnation: str) -> bool:
         return False
 
 
+def _parse_owned_running_group_row(
+    row_id: object,
+    pgid: object,
+    start_ticks: object | None,
+) -> tuple[int | None, int | None, str]:
+    """Parse one selected owned-command identity without dropping corruption.
+
+    A malformed or non-positive *present* PGID becomes ``None`` so the caller
+    can retain the job as an explicit blocking obligation instead of silently
+    treating it as absent. Start ticks preserve the existing fail-closed rule:
+    malformed values become ``None`` and therefore can never authorize a signal.
+
+    Returns:
+        Parsed PGID (or ``None`` for malformed/non-positive authority), parsed
+        start ticks (or ``None`` when unprovable), and the job id as text.
+    """
+    pgid_i = pgid if type(pgid) is int and pgid > 0 else None
+    start_i = start_ticks if type(start_ticks) is int and start_ticks > 0 else None
+    return pgid_i, start_i, str(row_id)
+
+
 def _owned_running_groups(
     conn: JobsConnection,
     incarnation: str,
-) -> list[tuple[int, int | None, str]]:
-    """Return the exact identity of owned commands for one incarnation.
+) -> list[tuple[int | None, int | None, str]]:
+    """Return persisted owned-command identities for one incarnation.
 
     Args:
         conn: Open PostgreSQL connection.
         incarnation: The worker incarnation (lifecycle token) to match.
 
     Returns:
-        Triples of the exact process group id, the persisted command start-time
-        ticks (``None`` when the legacy row never recorded ticks), and the job
-        row id (as text, usable as the ``LUBKO_JOB_ID`` marker) for every
-        running command owned by the incarnation.
+        Triples of the process group id, persisted command start-time ticks,
+        and job row id for every selected owned running command. A ``None``
+        group id means the durable ``process_pgid`` was present (the query
+        excludes genuine absence) but malformed or non-positive, and therefore
+        remains an explicit blocking recovery obligation. ``None`` start ticks
+        likewise mean missing or malformed exact-start identity.
     """
-    groups: list[tuple[int, int | None, str]] = []
+    groups: list[tuple[int | None, int | None, str]] = []
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT id, (payload::jsonb)->'state'->>'process_pgid',\n"
-            "       (payload::jsonb)->'state'->>'process_start_time_ticks'\n"
+            "SELECT id, (payload::jsonb)->'state'->'process_pgid',\n"
+            "       (payload::jsonb)->'state'->'process_start_time_ticks'\n"
             "FROM lubko.jobs\n"
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
@@ -2064,17 +2382,7 @@ def _owned_running_groups(
             start_ticks = row[2]
             if pgid is None:
                 continue
-            try:
-                pgid_i = int(str(pgid))
-            except ValueError:
-                continue
-            start_i: int | None = None
-            if start_ticks is not None:
-                try:
-                    start_i = int(str(start_ticks))
-                except ValueError:
-                    start_i = None
-            groups.append((pgid_i, start_i, str(row_id)))
+            groups.append(_parse_owned_running_group_row(row_id, pgid, start_ticks))
     return groups
 
 
@@ -2477,14 +2785,17 @@ class ReclaimedGroups:
         unresolved: Exact process-group ids that have live members but whose
             exact identity could not be proven (missing/malformed/unreadable/
             mismatched persisted start-time ticks). They are never signalled,
-            but remain a durable blocking obligation exactly like ``surviving``:
-            the orchestrator must hold and retry rather than clear authority or
-            start a replacement.
+            but remain a durable blocking obligation exactly like ``surviving``.
+        malformed: Job ids whose durable ``process_pgid`` was present but could
+            not be parsed as a positive process-group id. They cannot be safely
+            inspected or signalled and therefore remain explicit blocking
+            recovery obligations until durable authority is repaired.
     """
 
     reaped: list[int]
     surviving: list[int]
     unresolved: list[int]
+    malformed: list[str]
 
 
 def _terminate_one_group(
@@ -2587,11 +2898,15 @@ def recover_owned_job_groups(
     """
     groups = _owned_running_groups(conn, incarnation)
     if not groups:
-        return ReclaimedGroups(reaped=[], surviving=[], unresolved=[])
+        return ReclaimedGroups(reaped=[], surviving=[], unresolved=[], malformed=[])
     reaped: list[int] = []
     surviving: list[int] = []
     unresolved: list[int] = []
+    malformed: list[str] = []
     for pgid, start_ticks, marker in groups:
+        if pgid is None:
+            malformed.append(marker)
+            continue
         decision = _group_reclaim_decision(pgid, start_ticks)
         if decision is GroupReclaimDecision.GONE:
             continue
@@ -2602,7 +2917,12 @@ def recover_owned_job_groups(
                 surviving.append(pgid)
         else:
             unresolved.append(pgid)
-    return ReclaimedGroups(reaped=reaped, surviving=surviving, unresolved=unresolved)
+    return ReclaimedGroups(
+        reaped=reaped,
+        surviving=surviving,
+        unresolved=unresolved,
+        malformed=malformed,
+    )
 
 
 def _wait_for_session(pid: int) -> int:
@@ -3038,7 +3358,12 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
     execute the same root job. Only ``command`` rows whose top-level
     ``server`` exactly equals the daemon's configured server identity are
     claimed; jobs addressed to other servers stay pending, and immutable
-    ``output_chunk`` rows are never claim candidates.
+    ``output_chunk`` rows are never claim candidates. The claim is further gated
+    to rows whose protocol ``v`` lies inside the daemon's supported version
+    window (see :mod:`lubko.protocol_versioning`), so a daemon never locks a job
+    it cannot parse or execute and a mixed-version fleet can run a
+    non-destructive, staggered upgrade while older in-flight jobs keep running
+    on daemons that still advertise the older version.
 
     The claim records the worker's incarnation and grants each job a lease by
     writing ``state.lease_expires_at``; the owning worker refreshes those
@@ -3075,13 +3400,17 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
             ("state,updated_at", UTC_ISO_SQL),
         ],
     )
+    version_fragment, version_params = claim_version_predicate()
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "WITH next AS (\n"
             "    SELECT id\n"
             "    FROM lubko.jobs\n"
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
-            "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
+            + version_fragment
+            + "        AND "
+            + SERVER_MATCH_SQL
+            + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status' = 'pending'\n"
             "    ORDER BY (payload::jsonb)->'state'->>'created_at', id\n"
             "    FOR UPDATE SKIP LOCKED\n"
@@ -3098,6 +3427,7 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
                 "worker_incarnation": settings.worker_incarnation,
                 "lease_duration_seconds": settings.lease_duration_seconds,
                 "limit": limit,
+                **version_params,
             },
         )
         rows = cursor.fetchall()
@@ -3321,7 +3651,7 @@ def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUI
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "    AND (payload::jsonb)->'state'->>'status' = 'running'\n"
-            "    AND (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
+            "    AND " + CANCEL_REQUESTED_SQL + "\n"
             "    AND (payload::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"
             "    AND (payload::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"
             "LIMIT %(limit)s\n",
@@ -3329,6 +3659,7 @@ def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUI
                 "server": settings.server,
                 "worker_id": settings.worker_id,
                 "worker_incarnation": settings.worker_incarnation,
+                "cancel_requested_at_pattern": CANCEL_REQUESTED_AT_PATTERN,
                 "limit": CANCEL_DISCOVERY_LIMIT,
             },
         )
@@ -3408,7 +3739,10 @@ def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, st
             "    WHERE (payload::jsonb)->>'type' = 'command'\n"
             "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status' = 'running'\n"
-            "        AND (payload::jsonb)->'state'->>'lease_expires_at' IS NOT NULL\n"
+            "        AND jsonb_typeof((payload::jsonb)->'state'->'lease_expires_at') = 'string'\n"
+            "        AND ((payload::jsonb)->'state'->>'lease_expires_at') "
+            "            ~ %(lease_expires_at_pattern)s\n"
+            "        AND left((payload::jsonb)->'state'->>'lease_expires_at', 4) <> '0000'\n"
             "        AND ((payload::jsonb)->'state'->>'lease_expires_at') < "
             + UTC_ISO_TEXT_SQL
             + "\n"
@@ -3421,7 +3755,11 @@ def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, st
             "FROM stale\n"
             "WHERE job.id = stale.id\n"
             "RETURNING job.id, job.payload\n",
-            {"server": server, "limit": LEASE_RECOVERY_LIMIT},
+            {
+                "server": server,
+                "limit": LEASE_RECOVERY_LIMIT,
+                "lease_expires_at_pattern": LEASE_EXPIRES_AT_PATTERN,
+            },
         )
         rows = cursor.fetchall()
     return [(row[0], str(row[1])) for row in rows]
@@ -3483,7 +3821,7 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
                 "state,status",
                 (
                     "CASE\n"
-                    "    WHEN (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
+                    "    WHEN " + CANCEL_REQUESTED_SQL + "\n"
                     "        THEN to_jsonb('cancelled'::text)\n"
                     "    ELSE to_jsonb(%(status)s::text)\n"
                     "END"
@@ -3500,7 +3838,7 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
                     "'exit_code', to_jsonb(%(exit_code)s::int), "
                     "'cancellation_note', "
                     "CASE\n"
-                    "    WHEN (payload::jsonb)->'state'->>'cancel_requested_at' IS NOT NULL\n"
+                    "    WHEN " + CANCEL_REQUESTED_SQL + "\n"
                     "        THEN COALESCE(\n"
                     "            to_jsonb(%(cancellation_note)s::text),\n"
                     "            to_jsonb('cancelled by request'::text))\n"
@@ -3526,6 +3864,7 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
                 "stderr": result.stderr,
                 "exit_code": result.exit_code,
                 "cancellation_note": result.cancellation_note,
+                "cancel_requested_at_pattern": CANCEL_REQUESTED_AT_PATTERN,
                 "job_id": job_id,
             },
         )
@@ -3602,6 +3941,145 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str, *, server: 
     return True
 
 
+_REAP_UNSUPPORTED_TEMPLATE: Final = """\
+SELECT id, (payload::jsonb)->>'v' AS version,
+       jsonb_typeof((payload::jsonb)->'v') AS version_type
+FROM lubko.jobs
+WHERE (payload::jsonb)->>'type' = 'command'
+    AND jsonb_typeof((payload::jsonb)->'server') = 'string'
+    AND (payload::jsonb)->>'server' = %(server)s
+    AND (payload::jsonb)->'state'->>'status' = 'pending'
+    AND CASE
+        WHEN jsonb_typeof((payload::jsonb)->'v') = 'number'
+             AND (payload::jsonb)->>'v' ~ '^-?[0-9]+$'
+        THEN left((payload::jsonb)->>'v', 1) = '-'
+             OR length((payload::jsonb)->>'v') < length(%(protocol_version)s::text)
+             OR (
+                 length((payload::jsonb)->>'v') = length(%(protocol_version)s::text)
+                 AND (payload::jsonb)->>'v' < %(protocol_version)s::text
+             )
+        ELSE true
+    END
+ORDER BY (payload::jsonb)->'state'->>'created_at', id
+LIMIT %(limit)s
+FOR UPDATE SKIP LOCKED
+"""
+
+
+def fail_unsupported_job(
+    conn: JobsConnection, job_id: UUID, diagnostic: str, *, server: str
+) -> bool:
+    """Fail a pending job closed because its protocol version is unservable.
+
+    Mirrors :func:`_quarantine_job` in bypassing the normal finalization CAS
+    (which only matches ``running`` rows) so a never-claimed pending job can be
+    durably terminalized. The write is scoped to the daemon's server and to
+    non-terminal rows, so it can never finalize another server's row or a row
+    already terminal.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        job_id: Identifier of the job to fail closed.
+        diagnostic: Human-readable reason (no NUL bytes).
+        server: The daemon's configured server identity guarding the update.
+
+    Returns:
+        ``True`` when the row was terminalized or was already safe; ``False`` when
+        the write failed and must be retried.
+
+    Raises:
+        psycopg.Error: When the error is a connectivity issue.
+    """
+    safe_diagnostic = diagnostic.replace("\x00", "\ufffd")
+    try:
+        with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+            cursor.execute(
+                "UPDATE lubko.jobs\n"
+                "SET payload = (\n"
+                "  jsonb_set(\n"
+                "    jsonb_set(\n"
+                "      jsonb_set(\n"
+                "        jsonb_set(payload::jsonb, '{state,status}', to_jsonb('failed'::text)),\n"
+                "        '{state,finished_at}', " + UTC_ISO_SQL + "\n"
+                "      ),\n"
+                "      '{state,updated_at}', " + UTC_ISO_SQL + "\n"
+                "    ),\n"
+                "    '{state,unsupported_protocol_version_reason}', to_jsonb(%(reason)s::text)\n"
+                "  )\n"
+                ")::text\n"
+                "WHERE id = %(job_id)s\n"
+                "  AND (payload::jsonb)->>'type' = 'command'\n"
+                "  AND " + SERVER_MATCH_SQL + "%(server)s\n"
+                "  AND (payload::jsonb)->'state'->>'status'\n"
+                "      NOT IN ('succeeded','failed','cancelled')\n"
+                "RETURNING id\n",
+                {"job_id": job_id, "reason": safe_diagnostic, "server": server},
+            )
+            cursor.fetchone()
+    except psycopg.Error as exc:
+        if _is_connectivity_error_check(exc, conn):
+            raise
+        LOGGER.exception(
+            "unsupported-version terminalization for job %s failed (SQLSTATE %s)",
+            job_id,
+            exc.sqlstate or "N/A",
+        )
+        return False
+    return True
+
+
+def reap_unsupported_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[UUID]:
+    """Fail closed pending jobs that are safely known to be retired.
+
+    The reaper is conservative across staggered binary upgrades. It may retire a
+    lower protocol generation according to the deployment window, but it leaves
+    versions above this daemon's window pending because this binary cannot prove
+    that a newer daemon elsewhere in the fleet does not support them. The pass is
+    bounded to ``limit`` rows per turn.
+
+    Args:
+        conn: Open PostgreSQL connection.
+        settings: Worker runtime settings (server identity and supported window).
+        limit: Maximum number of candidate rows to scan and potentially reap.
+
+    Returns:
+        The identifiers of the jobs failed closed this pass.
+    """
+    reaped: list[UUID] = []
+    params = {
+        "server": settings.server,
+        "limit": limit,
+        "protocol_version": CURRENT_PROTOCOL_VERSION,
+    }
+    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(_REAP_UNSUPPORTED_TEMPLATE, params)
+        for job_id, version, version_type in cursor.fetchall():
+            parsed_version: int | None = None
+            if version_type == "number" and version is not None:
+                try:
+                    parsed_version = int(str(version))
+                except ValueError:
+                    parsed_version = None
+            if parsed_version is not None:
+                if reaper_disposition(parsed_version) is not JobVersionDisposition.FAIL_CLOSED:
+                    # Defensive only: the SQL deliberately excludes current and
+                    # future integer versions before LIMIT, so they cannot starve
+                    # safely terminalizable rows from the bounded batch.
+                    continue
+                diagnostic = (
+                    f"protocol version {version} is below the retired current version "
+                    f"{CURRENT_PROTOCOL_VERSION}; the job is failed closed"
+                )
+            else:
+                diagnostic = (
+                    "payload 'v' must be an integer protocol version; "
+                    "the malformed pending job is failed closed"
+                )
+            if fail_unsupported_job(conn, job_id, diagnostic, server=settings.server):
+                reaped.append(job_id)
+    return reaped
+
+
 def delete_job_and_chunks(conn: JobsConnection, job_id: UUID, *, server: str) -> None:
     """Delete a root job and every output chunk explicitly owned by it.
 
@@ -3663,7 +4141,38 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID, *, server: str) ->
         )
 
 
-def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UUID], int, int]:
+def _gc_phase_bound_hit(
+    marked: int, gc_roots: int, chunk_counts: list[int], orphans: int, limit: int
+) -> bool:
+    """Return whether any GC phase saturated its per-phase batch bound.
+
+    Each GC phase selects/deletes through an independent ``LIMIT``.  A bound is
+    hit only when one phase's own capped selection reached ``limit`` (a
+    saturation-pressure signal).  This is deliberately *not* the summed row
+    count: the phases are independently capped, so their total can equal or
+    exceed ``limit`` even when no single phase was saturated, which would be a
+    false-positive saturation signal.
+
+    Args:
+        marked: Phase-1 marked-root count.
+        gc_roots: Phase-2 selected GC-root count.
+        chunk_counts: Per-root phase-2 chunk-deletion counts.
+        orphans: Phase-3 orphan-deletion count.
+        limit: The configured ``gc_batch_limit``.
+
+    Returns:
+        ``True`` when at least one phase reached its bound (saturated).
+    """
+    if limit <= 0:
+        return False
+    if marked >= limit or gc_roots >= limit or orphans >= limit:
+        return True
+    return any(count >= limit for count in chunk_counts)
+
+
+def collect_transport(
+    conn: JobsConnection, settings: Settings
+) -> tuple[list[UUID], int, int, bool]:
     """Collect terminal command rows, their owned chunks, and orphan chunks.
 
     Three bounded phases run in separate transactions, each with ``FOR UPDATE
@@ -3681,7 +4190,9 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     by :func:`recover_stale_jobs`.
 
     **Phase 2 — Chunk drain + root finalization** (one transaction): Exactly
-    one GC-marked root is selected and at most ``gc_batch_limit`` of its owned
+    one GC-marked root whose terminal status and canonical ``finished_at`` still
+    prove retention eligibility is selected, and at most ``gc_batch_limit`` of
+    its owned
     chunks (via ``thread``) are deleted using ``FOR UPDATE SKIP LOCKED``.
     Processing one root gives the pass a constant SQL-round-trip bound; the
     batch limit cannot multiply into work for many roots. After bounded chunk
@@ -3702,17 +4213,27 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     the owning root is already gone, so no concurrent publication can create
     new chunks for it.
 
+    The returned ``gc_batch_bound_hit`` flag is the accurate saturation
+    signal: it is ``True`` only when an actual bounded selection/deletion
+    reached its per-phase ``LIMIT`` (a pressure/saturation condition).  It is
+    intentionally *not* derived from the aggregate row counts, because the
+    phases are independently capped and their sum can reach or exceed the
+    limit even when no single phase was saturated.
+
     Args:
         conn: Open PostgreSQL connection.
         settings: Worker runtime settings.
 
     Returns:
-        A ``(roots_marked, chunks_deleted, orphans_deleted)`` triple.
+        A ``(roots_marked, chunks_deleted, orphans_deleted, gc_batch_bound_hit)``
+        tuple.
     """
+    limit = settings.gc_batch_limit
     roots_marked: list[UUID] = []
     roots_deleted = 0
     total_chunks = 0
     total_orphans = 0
+    per_root_chunk_counts: list[int] = []
 
     # --- Phase 1: mark terminal roots as GC ---
     # The retention cutoff is pre-computed in a CTE so the main query string
@@ -3735,9 +4256,16 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
             "        AND (payload::jsonb)->'state'->>'status'\n"
             "            IN ('succeeded', 'failed', 'cancelled')\n"
-            "        AND (payload::jsonb)->'state'->>'finished_at' IS NOT NULL\n"
+            "        AND jsonb_typeof((payload::jsonb)->'state'->'finished_at') = 'string'\n"
+            "        AND ((payload::jsonb)->'state'->>'finished_at')\n"
+            "            ~ %(gc_finished_at_pattern)s\n"
+            "        AND left((payload::jsonb)->'state'->>'finished_at', 4) <> '0000'\n"
             "        AND ((payload::jsonb)->'state'->>'finished_at') < gc_params.cutoff\n"
-            "        AND ((payload::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"
+            "        AND (\n"
+            "            (payload::jsonb)->'state'->'gc' IS NULL\n"
+            "            OR (payload::jsonb)->'state'->'gc' = 'null'::jsonb\n"
+            "            OR (payload::jsonb)->'state'->'gc' = 'false'::jsonb\n"
+            "        )\n"
             "    ORDER BY ((payload::jsonb)->'state'->>'finished_at'), id\n"
             "    FOR UPDATE SKIP LOCKED\n"
             "    LIMIT %(limit)s\n"
@@ -3746,7 +4274,8 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             {
                 "server": settings.server,
                 "gc_retention_seconds": settings.gc_retention_seconds,
-                "limit": settings.gc_batch_limit,
+                "gc_finished_at_pattern": GC_FINISHED_AT_PATTERN,
+                "limit": limit,
             },
         )
         roots_marked = [row[0] for row in cursor.fetchall()]
@@ -3754,15 +4283,34 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
     # --- Phase 2: bounded chunk drain + root finalization ---
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
+            "WITH gc_params AS (\n"
+            "    SELECT to_char(\n"
+            "        now() at time zone 'utc'\n"
+            "        - make_interval(secs => %(gc_retention_seconds)s),\n"
+            '        \'YYYY-MM-DD"T"HH24:MI:SS.US"Z"\'\n'
+            "    ) AS cutoff\n"
+            ")\n"
             "SELECT id\n"
-            "FROM lubko.jobs\n"
+            "FROM lubko.jobs, gc_params\n"
             "WHERE (payload::jsonb)->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "    AND ((payload::jsonb)->'state'->>'gc') = 'true'\n"
+            "    AND (payload::jsonb)->'state'->>'status'\n"
+            "        IN ('succeeded', 'failed', 'cancelled')\n"
+            "    AND jsonb_typeof((payload::jsonb)->'state'->'finished_at') = 'string'\n"
+            "    AND ((payload::jsonb)->'state'->>'finished_at')\n"
+            "        ~ %(gc_finished_at_pattern)s\n"
+            "    AND left((payload::jsonb)->'state'->>'finished_at', 4) <> '0000'\n"
+            "    AND ((payload::jsonb)->'state'->>'finished_at') < gc_params.cutoff\n"
+            "    AND (payload::jsonb)->'state'->'gc' = 'true'::jsonb\n"
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
-            "LIMIT 1\n",
-            {"server": settings.server},
+            "LIMIT %(limit)s\n",
+            {
+                "server": settings.server,
+                "gc_retention_seconds": settings.gc_retention_seconds,
+                "gc_finished_at_pattern": GC_FINISHED_AT_PATTERN,
+                "limit": limit,
+            },
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
         for root_id in gc_roots:
@@ -3782,10 +4330,11 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
                 {
                     "server": settings.server,
                     "thread": str(root_id),
-                    "limit": settings.gc_batch_limit,
+                    "limit": limit,
                 },
             )
             total_chunks += cursor.rowcount
+            per_root_chunk_counts.append(cursor.rowcount)
             # Delete root only if no chunks remain.
             cursor.execute(
                 "DELETE FROM lubko.jobs AS root\n"
@@ -3825,7 +4374,7 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
-            {"server": settings.server, "limit": settings.gc_batch_limit},
+            {"server": settings.server, "limit": limit},
         )
         orphan_ids = [row[0] for row in cursor.fetchall()]
         if orphan_ids:
@@ -3835,18 +4384,21 @@ def collect_transport(conn: JobsConnection, settings: Settings) -> tuple[list[UU
             )
             total_orphans += len(orphan_ids)
 
+    batch_bound_hit = _gc_phase_bound_hit(
+        len(roots_marked), len(gc_roots), per_root_chunk_counts, len(orphan_ids), limit
+    )
     if roots_deleted:
         LOGGER.info("gc deleted %d root(s)", roots_deleted)
-    return roots_marked, total_chunks, total_orphans
+    return roots_marked, total_chunks, total_orphans, batch_bound_hit
 
 
 def verify_jobs_table_invariant(conn: JobsConnection) -> None:
     """Assert that ``lubko.jobs`` keeps exactly the two protocol columns.
 
     The transport table must have exactly two columns forever: ``id`` (unique
-    random ``uuid``) and ``payload`` (one string containing a JSON object,
-    stored as ``text``). The worker refuses to run against a table that
-    drifted, enforcing the invariant documented in ``docs/protocol.md``.
+    random ``uuid``) and ``payload`` (opaque ``text``). PostgreSQL must not
+    interpret the payload format. The worker refuses to run against a table
+    whose structural contract drifted, enforcing ``docs/protocol.md``.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -3875,76 +4427,6 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
             f"lubko.jobs violates the two-column transport invariant: "
             f"expected columns {expected} but found {found}. "
             f"{TWO_COLUMN_INVARIANT}"
-        )
-        raise SchemaInvariantError(msg)
-
-
-def verify_protocol_schema(conn: JobsConnection) -> None:
-    """Assert that ``lubko.jobs`` carries the canonical protocol v4 shape.
-
-    The two-column invariant alone does not make a table usable by a v4
-    worker: immutable ``output_chunk`` publication and explicit multi-server
-    routing require the type-aware ``jobs_payload_type_shape`` check
-    constraint **in its v4 form** — enforcing the required non-empty top-level
-    ``server`` field — plus the chunk ownership/ordering indexes, which
-    ``migrations/0001_two_column_protocol.sql`` declares. An existing table
-    still carrying the pre-cutover v3 constraint (same name, no ``server``
-    enforcement) is refused exactly like a missing one. The worker refuses to
-    start against any table lacking this shape so output publication can never
-    fail at runtime on a table that cannot represent immutable chunks, and no
-    daemon ever runs against a transport that does not DB-enforce server
-    routing.
-
-    Args:
-        conn: Open PostgreSQL connection.
-
-    Raises:
-        SchemaInvariantError: If the type-aware constraint (in its v4,
-            routing-aware form) or any required output-chunk index is missing.
-    """
-    with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
-        cursor.execute(
-            "SELECT conname, pg_get_constraintdef(oid)\n"
-            "FROM pg_constraint\n"
-            "WHERE conrelid = to_regclass(%s) AND contype = 'c'\n",
-            (f"{JOBS_SCHEMA}.{JOBS_TABLE}",),
-        )
-        constraints = {str(row[0]): str(row[1]) for row in cursor.fetchall()}
-        cursor.execute(
-            "SELECT indexname\nFROM pg_indexes\nWHERE schemaname = %s AND tablename = %s\n",
-            (JOBS_SCHEMA, JOBS_TABLE),
-        )
-        indexes = {str(row[0]) for row in cursor.fetchall()}
-    missing: list[str] = []
-    shape_def = constraints.get(TYPE_AWARE_CONSTRAINT_NAME)
-    if shape_def is None:
-        missing.append(f"check constraint {TYPE_AWARE_CONSTRAINT_NAME}")
-    elif not all(m in "".join(shape_def.split()) for m in SERVER_ROUTING_CONSTRAINT_MARKERS):
-        msg = (
-            f"lubko.jobs carries a pre-v4 {TYPE_AWARE_CONSTRAINT_NAME} check "
-            f"constraint without server-routing enforcement. Apply the "
-            f"protocol v4 cutover migration "
-            f"migrations/0003_protocol_v4_server_routing.sql while quiescent, "
-            f"then truncate lubko.jobs (the v3 -> v4 row cutover is "
-            f"destructive; no legacy row is converted). {TWO_COLUMN_INVARIANT}"
-        )
-        raise SchemaInvariantError(msg)
-    missing.extend(
-        f"index {name}"
-        for name in (CHUNK_OWNER_INDEX_NAME, CHUNK_ORDER_INDEX_NAME)
-        if name not in indexes
-    )
-    if missing:
-        detail = ", ".join(missing)
-        msg = (
-            f"lubko.jobs lacks the canonical output-chunk schema shape "
-            f"required for immutable output publication and server routing: "
-            f"missing {detail}. Apply the canonical, idempotent baseline "
-            f"migration migrations/0001_two_column_protocol.sql (fresh "
-            f"installs) or the protocol v4 cutover migration "
-            f"migrations/0003_protocol_v4_server_routing.sql (existing v3 "
-            f"tables; then truncate lubko.jobs while quiescent — the row "
-            f"cutover is destructive). {TWO_COLUMN_INVARIANT}"
         )
         raise SchemaInvariantError(msg)
 
@@ -3985,6 +4467,7 @@ class Supervisor:
         self._next_cancel_scan_at = 0.0
         self._next_reconnect_at = 0.0
         self._next_gc_at = 0.0
+        self._next_reaper_at = 0.0
         self._started_at = time.time()
         self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
         self._db_connected_at: float | None = None
@@ -3992,6 +4475,17 @@ class Supervisor:
         self._last_completed_job_id: str | None = None
         self._last_completed_at: float | None = None
         self._last_completed_status: str | None = None
+        self._completed_count = 0
+        self._last_claim_batch = 0
+        self._last_db_activity_at: float | None = None
+        self._db_deadline_breached_at: float | None = None
+        self._db_deadline_breach_count = 0
+        self._last_cancellation_scan_at: float | None = None
+        self._last_recovery_at: float | None = None
+        self._last_gc_at: float | None = None
+        self._gc_batch_bound_hit = False
+        self._cancellation_batch_bound_hit = False
+        self._recovery_batch_bound_hit = False
         self._next_health_publish_at = 0.0
         self._health_force = True
 
@@ -4031,9 +4525,11 @@ class Supervisor:
                 self._tick(time.monotonic())
             except DbOperationDeadlineError:
                 # A hung established operation breached its hard client
-                # deadline mid-turn. Enter outage handling and enforce lease
-                # safety immediately rather than sleeping a turn so an owned
-                # group can never outlive its database lease.
+                # deadline mid-turn. Record the breach explicitly (distinct
+                # from mere DB activity recency), then enter outage handling
+                # and enforce lease safety immediately rather than sleeping a
+                # turn so an owned group can never outlive its database lease.
+                self._record_db_deadline_breach()
                 self._enter_outage()
                 self._enforce_lease_safety()
             except psycopg.Error as exc:
@@ -4107,6 +4603,7 @@ class Supervisor:
         Args:
             now: Monotonic time at the start of the turn.
         """
+        self._last_db_activity_at = time.time()
         if now >= self._next_recovery_at:
             self._run_recovery()
             self._next_recovery_at = (
@@ -4128,8 +4625,13 @@ class Supervisor:
         if not self._stopping:
             self._claim_batch()
         # Optional maintenance follows claiming. Even if the connection fails
-        # or its lease-safe deadline is reached during GC, pending queue work
-        # has already received its bounded opportunity in this turn.
+        # or its lease-safe deadline is reached during a maintenance pass,
+        # pending current-version work has already received its bounded
+        # opportunity in this turn. Retired/malformed protocol work is reaped on
+        # the recovery cadence; the pass itself is bounded by LEASE_RECOVERY_LIMIT.
+        if now >= self._next_reaper_at:
+            self._run_reaper()
+            self._next_reaper_at = time.monotonic() + self.settings.lease_recovery_interval_seconds
         if now >= self._next_gc_at:
             self._run_gc()
             self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
@@ -4339,6 +4841,7 @@ class Supervisor:
                 self._next_recovery_at = 0.0
                 self._next_lease_refresh_at = 0.0
                 self._next_gc_at = 0.0
+                self._next_reaper_at = 0.0
             else:
                 self._next_reconnect_at = time.monotonic() + max(
                     self.settings.poll_interval_seconds, 0.5
@@ -4349,7 +4852,9 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
+        self._last_recovery_at = time.time()
         recovered = recover_stale_jobs(conn, self.settings.server)
+        self._recovery_batch_bound_hit = len(recovered) >= LEASE_RECOVERY_LIMIT
         for job_id, _payload in recovered:
             LOGGER.warning(
                 "recovered stale job %s: lease expired; marked failed rather than re-executed",
@@ -4359,6 +4864,17 @@ class Supervisor:
             if job is not None:
                 job.row_lost = True
                 request_stop(job, STOP_REASON_ROW_LOST)
+
+    def _run_reaper(self) -> None:
+        """Fail closed pending jobs at a protocol version no daemon can serve."""
+        conn = self.conn
+        if conn is None:
+            return
+        reaped = reap_unsupported_jobs(conn, self.settings, LEASE_RECOVERY_LIMIT)
+        if reaped:
+            LOGGER.warning(
+                "reaped %d pending job(s) at an unsupported protocol version", len(reaped)
+            )
 
     def _run_gc(self) -> None:
         """Run the transport garbage collection pass.
@@ -4371,13 +4887,16 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
-        roots, chunks, orphans = collect_transport(conn, self.settings)
+        self._last_gc_at = time.time()
+        roots, chunks, orphans, bound_hit = collect_transport(conn, self.settings)
+        self._gc_batch_bound_hit = bound_hit
         if roots or chunks or orphans:
             LOGGER.info(
-                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)",
+                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)%s",
                 len(roots),
                 chunks,
                 orphans,
+                "; batch bound hit (saturated)" if bound_hit else "",
             )
 
     def _heartbeat_root_ids(self) -> set[UUID]:
@@ -4468,7 +4987,10 @@ class Supervisor:
         conn = self.conn
         if conn is None:
             return
-        for job_id in discover_cancellations(conn, self.settings):
+        self._last_cancellation_scan_at = time.time()
+        found = discover_cancellations(conn, self.settings)
+        self._cancellation_batch_bound_hit = len(found) >= CANCEL_DISCOVERY_LIMIT
+        for job_id in found:
             job = self.active.get(job_id)
             if job is not None and not job.cancel_requested:
                 LOGGER.info("cancelling job %s by request", job_id)
@@ -5198,6 +5720,7 @@ class Supervisor:
         self._last_completed_job_id = str(job.id)
         self._last_completed_at = time.time()
         self._last_completed_status = final_status
+        self._completed_count = getattr(self, "_completed_count", 0) + 1
         cleanup_job(job)
         self._publish_health_force()
         return True
@@ -5220,6 +5743,7 @@ class Supervisor:
             return
         claim_mono = time.monotonic()
         claimed = claim_jobs(conn, self.settings, self.settings.claim_batch_limit)
+        self._last_claim_batch = len(claimed)
         for claimed_job in claimed:
             self._start_job(claimed_job, claim_mono)
 
@@ -5324,6 +5848,7 @@ class Supervisor:
             job_spec,
             gated,
             claim_mono=claim_mono,
+            version=payload.version,
         )
         if job is None:
             # The gated start was aborted and finalized; close the capture fds
@@ -5444,7 +5969,7 @@ class Supervisor:
         )
         return "unable to record exact process identity; job not started", 0
 
-    def _activate_gated_job(
+    def _activate_gated_job(  # ruff: ignore[too-many-arguments] -- each field is required by the activation contract
         self,
         conn: JobsConnection,
         job_id: UUID,
@@ -5452,6 +5977,7 @@ class Supervisor:
         gated: GatedSpawn,
         *,
         claim_mono: float,
+        version: int,
     ) -> ActiveJob | None:
         """Persist the exact identity, release the gate, and build the active job.
 
@@ -5467,6 +5993,8 @@ class Supervisor:
             job_spec: The claimed job specification.
             gated: Handles and exact identity of the gated start to activate.
             claim_mono: Monotonic claim instant carried onto the active job.
+            version: Protocol version of the root command payload; stored on the
+                active job so every emitted output chunk is stamped with it.
 
         Returns:
             The :class:`ActiveJob` for normal supervision, or ``None`` when the
@@ -5494,6 +6022,7 @@ class Supervisor:
                     pgid=gated.pgid,
                     started_mono=time.monotonic(),
                     claimed_at=claim_mono,
+                    version=version,
                     start_ticks=start_ticks,
                     owned_members={gated.proc.pid: start_ticks},
                 )
@@ -5591,6 +6120,9 @@ class Supervisor:
     def _build_health(self, *, alive: bool = True, shutting_down: bool = False) -> WorkerHealth:
         """Build a health snapshot from the current supervisor state.
 
+        The snapshot is concurrency-aware: it reports job counts and bounded
+        per-job aggregates rather than a single misleading ``current_job_id``.
+
         Args:
             alive: Whether the worker is alive.
             shutting_down: Whether the worker is shutting down.
@@ -5598,31 +6130,126 @@ class Supervisor:
         Returns:
             A fresh health snapshot.
         """
-        current_job_id: str | None = None
-        current_job_started_at: float | None = None
-        if self.active:
-            first_job = next(iter(self.active.values()))
-            current_job_id = str(first_job.id)
-            current_job_started_at = first_job.claimed_at
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        agg = self._collect_health_aggregates(now_mono)
         return WorkerHealth(
-            schema_version=1,
+            schema_version=WORKER_HEALTH_SCHEMA_VERSION,
             worker_id=self.settings.worker_id,
             worker_incarnation=self.settings.worker_incarnation,
             pid=os.getpid(),
             start_time_ticks=self._start_time_ticks,
             started_at=self._started_at,
-            published_at=time.time(),
+            published_at=now_wall,
             alive=alive,
             db_connected=self.conn is not None,
             db_connected_at=self._db_connected_at,
             db_error_at=self._db_error_at,
-            current_job_id=current_job_id,
-            current_job_started_at=current_job_started_at,
-            last_completed_job_id=self._last_completed_job_id,
-            last_completed_at=self._last_completed_at,
-            last_completed_status=self._last_completed_status,
+            active_jobs=agg.active_jobs,
+            stopping_jobs=agg.stopping_jobs,
+            completed_jobs=getattr(self, "_completed_count", 0),
+            oldest_active_job_age_seconds=agg.oldest_active_job_age_seconds,
+            oldest_active_job_id=agg.oldest_active_job_id,
+            lease_safety_margin_seconds=self.settings.lease_safety_margin_seconds,
+            min_lease_safety_remaining_seconds=agg.min_lease_safety_remaining_seconds,
+            db_operation_deadline_seconds=self.settings.db_operation_timeout_seconds,
+            db_last_activity_at=getattr(self, "_last_db_activity_at", None),
+            db_deadline_breached_at=getattr(self, "_db_deadline_breached_at", None),
+            db_deadline_breach_count=getattr(self, "_db_deadline_breach_count", 0),
+            capture_streams_open=agg.capture_streams_open,
+            spool_held_bytes=agg.spool_held_bytes,
+            scan_batch_limit=self.settings.claim_batch_limit,
+            last_scan_batch_size=getattr(self, "_last_claim_batch", 0),
+            last_cancellation_scan_at=getattr(self, "_last_cancellation_scan_at", None),
+            last_recovery_at=getattr(self, "_last_recovery_at", None),
+            last_gc_at=getattr(self, "_last_gc_at", None),
+            cancellation_scan_overdue=agg.cancellation_scan_overdue,
+            recovery_overdue=agg.recovery_overdue,
+            gc_overdue=agg.gc_overdue,
+            gc_batch_limit=self.settings.gc_batch_limit,
+            gc_batch_bound_hit=getattr(self, "_gc_batch_bound_hit", False),
+            cancellation_batch_limit=CANCEL_DISCOVERY_LIMIT,
+            cancellation_batch_bound_hit=getattr(self, "_cancellation_batch_bound_hit", False),
+            recovery_batch_limit=LEASE_RECOVERY_LIMIT,
+            recovery_batch_bound_hit=getattr(self, "_recovery_batch_bound_hit", False),
             shutting_down=shutting_down,
         )
+
+    def _collect_health_aggregates(self, now_mono: float) -> _HealthAggregates:
+        """Aggregate bounded concurrency/capture metrics from active jobs.
+
+        Args:
+            now_mono: Current monotonic time for age/lease computation.
+
+        Returns:
+            The bounded per-job aggregates for the health snapshot.
+        """
+        active_jobs = self.active
+        stopping = 0
+        oldest_age: float | None = None
+        oldest_job_id: str | None = None
+        min_lease_safety_remaining: float | None = None
+        capture_open = 0
+        spool_held = 0
+        for job_id, job in active_jobs.items():
+            if job.term_sent or job.kill_sent or job.stop_started is not None:
+                stopping += 1
+            if job.claimed_at > 0.0:
+                age = now_mono - job.claimed_at
+                candidate_id = str(job_id)
+                if (
+                    oldest_age is None
+                    or age > oldest_age
+                    or (
+                        age == oldest_age
+                        and (oldest_job_id is None or candidate_id < oldest_job_id)
+                    )
+                ):
+                    oldest_age = age
+                    oldest_job_id = candidate_id
+            if job.last_heartbeat_at > 0.0:
+                # Safety remaining, not full-lease remaining: subtract the
+                # configured safety margin so a negative value means the
+                # lease-safety deadline (expiry minus margin) has passed.
+                remaining = (
+                    job.last_heartbeat_at
+                    + self.settings.lease_duration_seconds
+                    - self.settings.lease_safety_margin_seconds
+                    - now_mono
+                )
+                if min_lease_safety_remaining is None or remaining < min_lease_safety_remaining:
+                    min_lease_safety_remaining = remaining
+            for name in OUTPUT_STREAMS:
+                stream = getattr(job, name)
+                if stream.fd is not None and not stream.eof:
+                    capture_open += 1
+                with suppress(OSError):
+                    size = stream.path.stat().st_size
+                    if size > 0:
+                        spool_held += size
+        return _HealthAggregates(
+            active_jobs=len(active_jobs),
+            stopping_jobs=stopping,
+            oldest_active_job_age_seconds=oldest_age,
+            oldest_active_job_id=oldest_job_id,
+            min_lease_safety_remaining_seconds=min_lease_safety_remaining,
+            capture_streams_open=capture_open,
+            spool_held_bytes=spool_held,
+            cancellation_scan_overdue=now_mono > getattr(self, "_next_cancel_scan_at", 0.0),
+            recovery_overdue=now_mono > getattr(self, "_next_recovery_at", 0.0),
+            gc_overdue=now_mono > getattr(self, "_next_gc_at", 0.0),
+        )
+
+    def _record_db_deadline_breach(self) -> None:
+        """Record that a hard client database deadline was breached.
+
+        Called from the actual deadline-failure path so the bounded health
+        signal ``db_deadline_breached_at``/``db_deadline_breach_count`` answers
+        whether a database operation recently exceeded its deadline, which
+        ``db_last_activity_at`` alone cannot prove.
+        """
+        self._db_deadline_breached_at = time.time()
+        self._db_deadline_breach_count = getattr(self, "_db_deadline_breach_count", 0) + 1
 
     def _publish_health(self, *, force: bool = False) -> None:
         """Write an atomic health snapshot, throttled unless forced.
@@ -5674,10 +6301,10 @@ class Supervisor:
             return
         try:
             verify_jobs_table_invariant(conn)
-            verify_protocol_schema(conn)
         except SchemaInvariantError:
             LOGGER.exception(
-                "refusing to run against a table that is not a migrated protocol v4 schema"
+                "refusing to run against a database that violates the frozen "
+                "PostgreSQL transport contract"
             )
             with suppress(Exception):
                 conn.close()
@@ -5713,13 +6340,56 @@ class Supervisor:
         self._next_reconnect_at = 0.0
         self._publish_health_force()
 
+    def _discard_db_connection(self) -> None:
+        """Discard the database connection so it is never reused or misreported.
+
+        Closes the connection (ignoring any error) and clears the handle. After
+        this, the final health snapshot reports ``db_connected=False`` and no
+        later remote finalization is attempted on a known-unusable connection.
+        """
+        if self.conn is not None:
+            with suppress(Exception):
+                self.conn.close()
+        self.conn = None
+
     def _shutdown(self) -> None:
         """Gracefully terminate, reap, and finalize every tracked process group.
 
-        Stops claiming, requests termination of every active group, reaps the
-        children, escalates to ``SIGKILL`` after the bounded grace period where
-        necessary, finalizes the affected jobs when PostgreSQL is available, and
-        removes the temporary capture files.
+        Local ownership convergence (reaping and, where provable, killing every
+        exact process group) and local cleanup (removing every capture file)
+        plus the final local health snapshot are **unconditional**: a remote
+        database deadline breach (:class:`DbOperationDeadlineError`) or a
+        connectivity loss during finalization must never prevent them. Remote DB
+        terminalization is best-effort and fail-closed — its deadline/connectivity
+        failures are caught at their narrow boundary, discard the connection, and
+        stop further remote attempts, while the affected rows stay safely
+        recoverable. The exact drain sentinel is written only after a *clean*
+        local drain, so a failed drain never produces a false sentinel. Any other
+        (deterministic/schema/programming) fault propagates naturally: Python runs
+        the ``finally`` cleanup and final health publication first, then re-raises.
+        """
+        try:
+            self._shutdown_finalize()
+        finally:
+            # Unconditional local convergence cleanup: remove every capture file
+            # regardless of any remote terminalization outcome.
+            self._cleanup_all_files()
+            # Discard the connection so the final health snapshot never falsely
+            # reports db_connected=True after a deadline breach or connectivity
+            # loss, and no further remote step can use a known-unusable handle.
+            self._discard_db_connection()
+            health = self._build_health(alive=False, shutting_down=True)
+            try:
+                write_worker_health(health)
+            except OSError:
+                LOGGER.debug("failed to write shutdown health snapshot", exc_info=True)
+
+    def _shutdown_finalize(self) -> None:
+        """Stop, drain, and remote-finalize every tracked group.
+
+        See :meth:`_shutdown` for the invariant: this helper performs the
+        remote-touching work, and any non-best-effort exception it lets escape
+        is handled by the caller's ``finally`` boundary.
         """
         LOGGER.info("shutting down: terminating %d active job(s)", len(self.active))
         install_operation_deadline(
@@ -5730,10 +6400,9 @@ class Supervisor:
                 request_stop(job, STOP_REASON_SHUTDOWN)
         if not self._drain_active_groups():
             # Positive post-SIGKILL proof failed for at least one exact active
-            # group. This is NOT a clean drain: never emit the sentinel, never
-            # terminalize/untrack those jobs (their running rows keep the exact
-            # persisted identity recoverable by emergency recovery), and fail
-            # loudly in the log so the outer authority holds instead of reaping.
+            # group. This is NOT a clean drain: never emit the sentinel, and
+            # retain those jobs (their running rows keep the exact persisted
+            # identity recoverable by emergency recovery).
             surviving = [job.pgid for job in self.active.values() if _owned_group_alive(job)]
             LOGGER.error(
                 "shutdown cannot prove groups %s member-free; withholding the "
@@ -5743,21 +6412,14 @@ class Supervisor:
             )
             self._finalize_all_for_shutdown(retain_groups=surviving)
         else:
+            # Clean local drain: the worker proved every owned group is gone, so
+            # the sentinel may be written exactly once. Remote finalization below
+            # is best-effort.
             try:
                 write_drain_sentinel(self.settings.worker_incarnation)
             except OSError:
                 LOGGER.debug("could not write drain sentinel", exc_info=True)
             self._finalize_all_for_shutdown()
-        self._cleanup_all_files()
-        if self.conn is not None:
-            with suppress(Exception):
-                self.conn.close()
-            self.conn = None
-        health = self._build_health(alive=False, shutting_down=True)
-        try:
-            write_worker_health(health)
-        except OSError:
-            LOGGER.debug("failed to write shutdown health snapshot", exc_info=True)
 
     def _drain_active_groups(self) -> bool:
         """Wait for every active process group to exit, escalating to SIGKILL.
@@ -5830,19 +6492,21 @@ class Supervisor:
     def _finalize_all_for_shutdown(self, *, retain_groups: list[int] | None = None) -> None:
         """Finalize every tracked job when PostgreSQL is available.
 
-        Connectivity errors are re-raised so the caller can handle outage
-        before continuing shutdown.  Deterministic per-job errors are logged
-        and the job is quarantined, preserving lease/row safety. Jobs whose
-        exact group could not be proven member-free (``retain_groups``) are
-        retained in the active set and their rows stay recoverable: they are
-        never terminalized or untracked here.
+        This is the only step that touches the remote database during shutdown,
+        so it is the only step that can fail with a database operation deadline
+        breach (:class:`DbOperationDeadlineError`) or a connectivity loss. Both
+        are best-effort and fail-closed here: the connection is discarded (so no
+        later job attempts a remote finalization on a known-unusable handle) and
+        the loop stops, leaving every not-yet-finalized job's row safely
+        recoverable. Deterministic per-job errors are logged and the job is
+        quarantined, preserving lease/row safety. Jobs whose exact group could
+        not be proven member-free (``retain_groups``) are retained in the active
+        set and their rows stay recoverable: they are never terminalized or
+        untracked here.
 
         Args:
             retain_groups: Exact group ids that failed post-SIGKILL proof;
                 their jobs are retained instead of finalized.
-
-        Raises:
-            psycopg.Error: When the error is a connectivity issue.
         """
         if self.conn is None:
             return
@@ -5860,9 +6524,30 @@ class Supervisor:
             # disk or silently discarding.
             try:
                 self.finalize_completed_job_bounded(job)
+            except DbOperationDeadlineError:
+                # The hard client deadline breached while terminalizing this
+                # job's remote rows. This is a best-effort remote step: the row
+                # stays recoverable and the connection is now unusable, so stop
+                # attempting further remote finalizations and let shutdown
+                # proceed with its unconditional local cleanup.
+                LOGGER.exception(
+                    "shutdown finalization hit the database operation deadline for job %s",
+                    job.id,
+                )
+                self._discard_db_connection()
+                return
             except psycopg.Error as exc:
                 if self._is_connectivity_error(exc):
-                    raise
+                    # Connectivity loss during shutdown finalization is
+                    # best-effort: the row stays recoverable and the connection
+                    # is unusable, so stop further remote attempts and let
+                    # shutdown finish locally.
+                    LOGGER.exception(
+                        "shutdown finalization lost database connectivity for job %s",
+                        job.id,
+                    )
+                    self._discard_db_connection()
+                    return
                 # Deterministic per-job error already quarantined inside the
                 # bounded finalizer.
                 LOGGER.exception("deterministic failure finalizing job %s", job.id)

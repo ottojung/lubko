@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from typing import Any, Final
 from uuid import UUID
 
+from lubko.protocol_versioning import unsupported_version_diagnostic
+
 PROTOCOL_VERSION: Final = 4
 
 
@@ -63,14 +65,15 @@ KNOWN_STATUSES: Final = frozenset({
 
 CHUNK_STREAMS: Final = ("stdout", "stderr")
 
-#: Strict maximum size (in raw bytes) of a root live output tail window.
-#: UTF-8 decoding of at most this many bytes yields at most this many
-#: characters, so the decoded ``tail`` text is bounded by the same number.
+#: Strict maximum size (in UTF-8 encoded bytes) of a root live output tail
+#: window. The bound is enforced on the encoded bytes of the decoded ``tail``
+#: text, never on its codepoint count, so a multibyte rune is counted as the
+#: bytes it occupies on disk.
 OUTPUT_TAIL_MAX_BYTES: Final = 4000
 
-#: Strict maximum size (in raw bytes) of one immutable output chunk value.
-#: UTF-8 decoding of at most this many bytes yields at most this many
-#: characters, so the decoded ``value`` text is bounded by the same number.
+#: Strict maximum size (in UTF-8 encoded bytes) of one immutable output chunk
+#: value. The bound is enforced on the encoded bytes of the decoded ``value``
+#: text, never on its codepoint count.
 OUTPUT_CHUNK_MAX_BYTES: Final = 2000
 
 TWO_COLUMN_INVARIANT: Final = (
@@ -80,6 +83,17 @@ TWO_COLUMN_INVARIANT: Final = (
     "process-identity/output data lives inside that JSON payload. Never add a "
     "third column."
 )
+
+
+def _utf8_byte_length(text: str) -> int:
+    """Return the number of UTF-8 encoded bytes ``text`` occupies.
+
+    The protocol's byte-named bounds (``OUTPUT_TAIL_MAX_BYTES``,
+    ``OUTPUT_CHUNK_MAX_BYTES``) constrain the on-disk UTF-8 payload size, so
+    callers must measure encoded bytes rather than the decoded codepoint count
+    returned by ``len``; a single decoded character can span up to four bytes.
+    """
+    return len(text.encode("utf-8"))
 
 
 class ProtocolError(ValueError):
@@ -192,33 +206,69 @@ def parse_server(value: object) -> str:
     return value
 
 
-def build_payload(*, server: str, cwd: str, process: list[str]) -> dict[str, Any]:
-    """Build a protocol v4 ``command`` job payload ready for submission.
+def _validate_cwd(cwd: object) -> str:
+    """Validate a request working directory as a non-empty absolute path.
+
+    The protocol documents ``cwd`` as an absolute working directory passed
+    directly to ``Popen``. Relative paths are rejected here rather than
+    resolved, so a daemon never enters a caller-relative directory.
+
+    Args:
+        cwd: The raw ``request.cwd`` value.
+
+    Returns:
+        The validated absolute working directory.
+
+    Raises:
+        ProtocolError: If the value is missing, not a string, empty, or not an
+            absolute POSIX path beginning with ``/``.
+    """
+    if not isinstance(cwd, str) or not cwd:
+        msg = "request.cwd must be a non-empty string"
+        raise ProtocolError(msg)
+    if not cwd.startswith("/"):
+        msg = "request.cwd must be an absolute POSIX path beginning with '/'"
+        raise ProtocolError(msg)
+    return cwd
+
+
+def build_payload(
+    *, server: str, cwd: str, process: list[str], version: object = PROTOCOL_VERSION
+) -> dict[str, Any]:
+    """Build a protocol ``command`` job payload ready for submission.
 
     ``server`` is required and names the execution server that must claim and
     run the job; there is no implicit or default server. ``process`` is the
     sole executable field: a required list of non-empty strings executed
-    directly as argv, never through a shell.
+    directly as argv, never through a shell. ``version`` defaults to the current
+    application protocol version.
 
     Args:
         server: Non-empty identity of the target execution server.
-        cwd: Absolute working directory for the job.
+        cwd: Absolute working directory for the job; passed directly to the
+            worker's ``Popen`` and therefore required to be a non-empty absolute
+            POSIX path beginning with ``/``.
         process: Non-empty list of non-empty argv strings to execute directly.
+        version: Application protocol version for the submission.
 
     Returns:
         The versioned payload dict.
 
     Raises:
-        ProtocolError: If the request violates the binding.
+        ProtocolError: If the request or version violates the binding.
     """
-    validated_server = parse_server(server)
-    request: dict[str, object] = {"cwd": cwd}
-    request["process"] = list(_parse_process(process))
-    if not cwd:
-        msg = "request.cwd must be a non-empty string"
+    if not isinstance(version, int) or isinstance(version, bool):
+        msg = "payload version must be a positive integer"
         raise ProtocolError(msg)
+    if version < 1:
+        msg = "payload version must be a positive integer"
+        raise ProtocolError(msg)
+    validated_server = parse_server(server)
+    validated_cwd = _validate_cwd(cwd)
+    request: dict[str, object] = {"cwd": validated_cwd}
+    request["process"] = list(_parse_process(process))
     return {
-        "v": PROTOCOL_VERSION,
+        "v": version,
         "type": JOB_TYPE_COMMAND,
         "server": validated_server,
         "request": request,
@@ -244,10 +294,13 @@ def build_output_window_payload(
     Raises:
         ProtocolError: If the window violates the size bound.
     """
-    if len(tail) > OUTPUT_TAIL_MAX_BYTES:
-        msg = f"output tail must be at most {OUTPUT_TAIL_MAX_BYTES} characters"
+    if _utf8_byte_length(tail) > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"output tail must be at most {OUTPUT_TAIL_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
+    if end - start > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"output window span must be at most {OUTPUT_TAIL_MAX_BYTES} raw bytes"
+        raise ProtocolError(msg)
     window: dict[str, Any] = {
         "tail": tail,
         "start": start,
@@ -270,6 +323,7 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments] -- every fie
     end: int,
     value: str,
     previous: UUID | None,
+    version: object = PROTOCOL_VERSION,
 ) -> dict[str, Any]:
     """Build an immutable ``output_chunk`` payload mapping.
 
@@ -282,6 +336,8 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments] -- every fie
         end: Byte offset where the chunk ends.
         value: Immutable decoded output text of the chunk.
         previous: UUID of the previous chunk in the chain, or ``None``.
+        version: Application protocol version for the chunk; it must match the
+            owning root job's version.
 
     Returns:
         The chunk payload mapping.
@@ -291,15 +347,24 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments] -- every fie
     """
     _validate_stream(stream)
     validated_server = parse_server(server)
+    if not isinstance(version, int) or isinstance(version, bool):
+        msg = "payload version must be a positive integer"
+        raise ProtocolError(msg)
+    if version < 1:
+        msg = "payload version must be a positive integer"
+        raise ProtocolError(msg)
     if sequence < 0:
         msg = "output_chunk.sequence must be a non-negative integer"
         raise ProtocolError(msg)
-    if len(value) > OUTPUT_CHUNK_MAX_BYTES:
-        msg = f"output_chunk.value must be at most {OUTPUT_CHUNK_MAX_BYTES} characters"
+    if _utf8_byte_length(value) > OUTPUT_CHUNK_MAX_BYTES:
+        msg = f"output_chunk.value must be at most {OUTPUT_CHUNK_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
+    if end - start > OUTPUT_CHUNK_MAX_BYTES:
+        msg = f"output_chunk span must be at most {OUTPUT_CHUNK_MAX_BYTES} raw bytes"
+        raise ProtocolError(msg)
     chunk: dict[str, Any] = {
-        "v": PROTOCOL_VERSION,
+        "v": version,
         "type": JOB_TYPE_OUTPUT_CHUNK,
         "server": validated_server,
         "thread": str(thread),
@@ -369,10 +434,7 @@ def _parse_request(raw_request: object) -> JobRequest:
             "are not accepted in v4"
         )
         raise ProtocolError(msg)
-    cwd = raw_request.get("cwd")
-    if not isinstance(cwd, str) or not cwd:
-        msg = "request.cwd must be a non-empty string"
-        raise ProtocolError(msg)
+    cwd = _validate_cwd(raw_request.get("cwd"))
     return JobRequest(cwd=cwd, process=_parse_process(raw_request.get("process")))
 
 
@@ -437,8 +499,8 @@ def _parse_window(raw: object) -> OutputWindow:
         msg = "output window must be an object"
         raise ProtocolError(msg)
     tail = raw.get("tail")
-    if not isinstance(tail, str) or len(tail) > OUTPUT_TAIL_MAX_BYTES:
-        msg = f"output window tail must be a string of at most {OUTPUT_TAIL_MAX_BYTES} characters"
+    if not isinstance(tail, str) or _utf8_byte_length(tail) > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"output window tail must be a string of at most {OUTPUT_TAIL_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     start = raw.get("start")
     end = raw.get("end")
@@ -449,6 +511,9 @@ def _parse_window(raw: object) -> OutputWindow:
         msg = "output window end must be an integer"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
+    if end - start > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"output window span must be at most {OUTPUT_TAIL_MAX_BYTES} raw bytes"
+        raise ProtocolError(msg)
     previous = _parse_uuid(raw.get("previous"))
     return OutputWindow(tail=tail, start=start, end=end, previous=previous)
 
@@ -494,11 +559,11 @@ def _parse_result(raw: object) -> ResultView | None:
         raise ProtocolError(msg)
     stdout = raw.get("stdout")
     stderr = raw.get("stderr")
-    if not isinstance(stdout, str) or len(stdout) > OUTPUT_TAIL_MAX_BYTES:
-        msg = f"result.stdout must be a string of at most {OUTPUT_TAIL_MAX_BYTES} characters"
+    if not isinstance(stdout, str) or _utf8_byte_length(stdout) > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"result.stdout must be a string of at most {OUTPUT_TAIL_MAX_BYTES} bytes"
         raise ProtocolError(msg)
-    if not isinstance(stderr, str) or len(stderr) > OUTPUT_TAIL_MAX_BYTES:
-        msg = f"result.stderr must be a string of at most {OUTPUT_TAIL_MAX_BYTES} characters"
+    if not isinstance(stderr, str) or _utf8_byte_length(stderr) > OUTPUT_TAIL_MAX_BYTES:
+        msg = f"result.stderr must be a string of at most {OUTPUT_TAIL_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     exit_code = raw.get("exit_code")
     if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
@@ -549,6 +614,9 @@ def _decode_payload(data: object) -> dict[str, Any]:
 def _parse_version_and_type(data: dict[str, Any]) -> tuple[int, str]:
     """Validate the version and type fields of a payload.
 
+    The ``v`` field must name the exact protocol version this build supports.
+    Unsupported versions fail closed in application code.
+
     Args:
         data: The decoded payload mapping.
 
@@ -556,12 +624,15 @@ def _parse_version_and_type(data: dict[str, Any]) -> tuple[int, str]:
         The ``(version, type)`` pair.
 
     Raises:
-        ProtocolError: If the version or type is invalid.
+        ProtocolError: If the version or type is invalid or unsupported.
     """
     version = data.get("v")
-    if version != PROTOCOL_VERSION:
-        msg = f"unsupported protocol version: {version!r} (expected {PROTOCOL_VERSION})"
+    if not isinstance(version, int) or isinstance(version, bool):
+        msg = "payload 'v' must be an integer protocol version"
         raise ProtocolError(msg)
+    diagnostic = unsupported_version_diagnostic(int(version))
+    if diagnostic is not None:
+        raise ProtocolError(diagnostic)
     job_type = data.get("type")
     if job_type not in KNOWN_JOB_TYPES:
         msg = f"unknown job type: {job_type!r}"
@@ -574,7 +645,8 @@ def parse_payload(data: object) -> JobPayload:
 
     The stored ``payload`` column is opaque text; a raw JSON string is decoded
     before validation. ``output_chunk`` rows are rejected here; use
-    :func:`parse_chunk_payload` for those.
+    :func:`parse_chunk_payload` for those. The payload's ``v`` must lie inside
+    this build supports, failing closed on any unsupported version.
 
     Args:
         data: The JSON object stored in the ``payload`` column, either as a
@@ -639,9 +711,12 @@ def parse_chunk_payload(data: object) -> OutputChunk:
         msg = "output_chunk.end must be an integer"
         raise ProtocolError(msg)
     _validate_offsets(start, end)
+    if end - start > OUTPUT_CHUNK_MAX_BYTES:
+        msg = f"output_chunk span must be at most {OUTPUT_CHUNK_MAX_BYTES} raw bytes"
+        raise ProtocolError(msg)
     value = decoded.get("value")
-    if not isinstance(value, str) or len(value) > OUTPUT_CHUNK_MAX_BYTES:
-        msg = f"output_chunk.value must be a string of at most {OUTPUT_CHUNK_MAX_BYTES} characters"
+    if not isinstance(value, str) or _utf8_byte_length(value) > OUTPUT_CHUNK_MAX_BYTES:
+        msg = f"output_chunk.value must be a string of at most {OUTPUT_CHUNK_MAX_BYTES} bytes"
         raise ProtocolError(msg)
     previous = _parse_uuid(decoded.get("previous"))
     return OutputChunk(

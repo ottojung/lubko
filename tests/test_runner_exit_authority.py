@@ -15,14 +15,12 @@ import os
 import shutil
 import signal
 import subprocess
-from typing import TYPE_CHECKING, Final
+from pathlib import Path
+from typing import Final
 
 import pytest
 
 from lubko import agent
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 SLEEP_BIN: Final = shutil.which("sleep") or "/bin/sleep"
 
@@ -144,55 +142,216 @@ def test_authoritative_runner_accepts_exactly_one_prompt(
         proc.kill_and_reap()
 
 
-def test_exit_boundary_forces_fresh_generation_for_late_work(
-    tmp_path: Path,
+@pytest.mark.parametrize("bad_pid", [4242.9, "4242", True])
+def test_invocation_liveness_rejects_malformed_persisted_pid(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_pid: object,
 ) -> None:
-    """Work arriving after the reclaim boundary gains fresh execution authority.
+    """Malformed durable PIDs cannot be normalized into invocation authority."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"state": "running", "pid": bad_pid, "start_time": 111})
+    opened: list[int] = []
 
-    The reclaim boundary durably drops ``active_runner`` and the reservation
-    while the runner process is demonstrably still alive; the very next locked
-    transition must reserve a replacement generation rather than reuse the
-    exiting runner.
-    """
+    def fake_open_pidfd(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", fake_open_pidfd)
+
+    assert not agent.is_alive(meta)
+    assert opened == []
+
+
+@pytest.mark.parametrize("bad_ticks", [111.0, "111", True])
+def test_invocation_liveness_rejects_malformed_persisted_start_time(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_ticks: object,
+) -> None:
+    """Malformed start ticks cannot compare equal to a real invocation identity."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"state": "running", "pid": 4242, "start_time": bad_ticks})
+    opened: list[int] = []
+
+    def fake_open_pidfd(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", fake_open_pidfd)
+
+    assert not agent.is_alive(meta)
+    assert opened == []
+
+
+def test_runner_liveness_rejects_fractional_pid_of_matching_live_process(tmp_path: Path) -> None:
+    """A fractional durable runner PID cannot truncate into a marked live runner."""
     aid = "aaaaaaaa"
     proc = _MarkedRunner(aid)
     try:
         meta = agent.idle_meta(aid, str(tmp_path), None)
-        meta["state"] = "running"
         meta["active_runner"] = True
-        meta["runner_gen"] = 1
         meta.update(proc.identity_fields())
-        meta["runner_reservation"] = _claimed_reservation()
-        agent.write_meta(aid, meta)
-        stored = agent.read_meta(aid)
-        assert stored is not None
-        assert agent.runner_alive(stored)
+        meta["runner_pid"] = proc.pid + 0.9
 
-        # The runner's own exit boundary relinquishes consumption authority.
-        assert agent._reclaim_prompt(aid) is False
-        after = agent.read_meta(aid)
-        assert after is not None
-        assert after["active_runner"] is False
-        assert after["runner_reservation"] is None
-        # This is precisely the vulnerable window: authority is gone but the
-        # exact runner process still probes as alive.
-        assert proc.proc.poll() is None
-        assert agent.runner_alive(after)
-
-        decision: dict[str, object] = {}
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(agent, "_begin_invocation", lambda *_a, **_k: None)
-            agent.update_meta(aid, lambda m: _decide_into(m, decision, "late", steer=False))
-        final = agent.read_meta(aid)
-        assert decision["action"] == "spawn"
-        assert final is not None
-        assert int(final["runner_gen"]) == 2
-        res = final["runner_reservation"]
-        assert isinstance(res, dict)
-        assert res["state"] == "reserved"
-        assert final["active_runner"] is True
+        assert not agent.runner_alive(meta)
     finally:
         proc.kill_and_reap()
+
+
+@pytest.mark.parametrize("bad_pid", ["4242", True])
+def test_runner_liveness_rejects_other_malformed_persisted_pids(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_pid: object,
+) -> None:
+    """Strings and booleans cannot name persisted runner process identity."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"runner_pid": bad_pid, "runner_start_time": 111})
+    opened: list[int] = []
+
+    def fake_open_pidfd(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", fake_open_pidfd)
+
+    assert not agent.runner_alive(meta)
+    assert opened == []
+
+
+@pytest.mark.parametrize("bad_ticks", [111.0, "111", True])
+def test_runner_liveness_rejects_malformed_persisted_start_time(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_ticks: object,
+) -> None:
+    """Malformed runner ticks cannot compare equal to a real process identity."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"runner_pid": 4242, "runner_start_time": bad_ticks})
+    opened: list[int] = []
+
+    def fake_open_pidfd(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", fake_open_pidfd)
+
+    assert not agent.runner_alive(meta)
+    assert opened == []
+
+
+@pytest.mark.parametrize("bad_pid", [4242.9, "4242", True, 0])
+def test_recorded_leader_state_keeps_malformed_present_pid_ambiguous(
+    bad_pid: object,
+) -> None:
+    """Malformed persisted leader identity must never become a proven-dead PID."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"pid": bad_pid, "start_time": 111})
+
+    assert agent._recorded_leader_state(meta) == "ambiguous"
+
+
+@pytest.mark.parametrize("bad_ticks", [111.0, "111", True, -1])
+def test_recorded_leader_state_keeps_malformed_start_ticks_ambiguous(
+    bad_ticks: object,
+) -> None:
+    """Malformed persisted ticks keep stop/convergence fail closed."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"pid": 4242, "start_time": bad_ticks})
+
+    assert agent._recorded_leader_state(meta) == "ambiguous"
+
+
+def test_invocation_liveness_stays_bound_to_pinned_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invocation liveness is accepted only through the pinned process."""
+    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    meta.update({"state": "running", "pid": 4242, "start_time": 111})
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+    monkeypatch.setattr(agent, "pidfd_send_signal", lambda fd, sig: probes.append((fd, sig)))
+    monkeypatch.setattr(os, "close", closed.append)
+
+    assert agent.is_alive(meta)
+    assert probes == [(77, 0)]
+    assert closed == [77]
+
+
+def test_dead_pinned_invocation_cannot_authorize_prompt_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished invocation makes ordinary prompts and steers start fresh."""
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+
+    def dead_pinned_invocation(fd: int, sig: int) -> None:
+        probes.append((fd, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(agent, "pidfd_send_signal", dead_pinned_invocation)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    for steer in (False, True):
+        meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+        meta.update({"state": "running", "pid": 4242, "start_time": 111})
+
+        decision = _decide(meta, prompt="work", steer=steer)
+
+        assert decision["action"] == "spawn"
+        assert meta["pending_prompt"] == "work"
+        assert meta["active_runner"] is True
+        reservation = meta["runner_reservation"]
+        assert isinstance(reservation, dict)
+        assert reservation["state"] == "reserved"
+
+    assert probes == [(77, 0), (77, 0)]
+    assert closed == [77, 77]
+
+
+def test_runner_disappearing_during_identity_proof_gets_fresh_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PID reuse during runner proof cannot authorize stale prompt reuse."""
+    m = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    m.update({
+        "state": "running",
+        "active_runner": True,
+        "runner_gen": 1,
+        "runner_pid": 4242,
+        "runner_start_time": 111,
+        "runner_reservation": _claimed_reservation(),
+    })
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "env_has_marker", lambda _pid, _aid: True)
+
+    def dead_pinned_runner(fd: int, sig: int) -> None:
+        probes.append((fd, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(agent, "pidfd_send_signal", dead_pinned_runner)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    decision = _decide(m, prompt="work", steer=False)
+
+    assert probes
+    assert all(probe == (77, 0) for probe in probes)
+    assert closed == [77] * len(probes)
+    assert decision["action"] == "spawn"
+    assert m["pending_prompt"] == "work"
+    assert int(m["runner_gen"]) == 2
+    reservation = m["runner_reservation"]
+    assert isinstance(reservation, dict)
+    assert reservation["state"] == "reserved"
 
 
 def _dead_claimed_meta(aid: str, tmp_path: Path) -> agent.Meta:
@@ -223,6 +382,169 @@ def _dead_claimed_meta(aid: str, tmp_path: Path) -> agent.Meta:
     meta["runner_reservation"] = _claimed_reservation()
     agent.write_meta(aid, meta)
     return meta
+
+
+def test_dead_pinned_reservation_owner_recovers_accepted_steer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished reservation owner cannot authorize queued work reuse."""
+    m = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    m.update({
+        "state": "running",
+        "active_runner": True,
+        "runner_gen": 1,
+        "runner_reservation": {
+            "gen": 1,
+            "owner_pid": 4242,
+            "owner_start_ticks": 111,
+            "state": "reserved",
+            "mode": "new",
+        },
+        "pending_prompt": "original",
+    })
+    probes: list[tuple[int, int]] = []
+    closed: list[int] = []
+
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 111)
+    monkeypatch.setattr(agent, "_is_zombie", lambda _pid: False)
+    monkeypatch.setattr(agent, "_runner_marker_alive", lambda _aid, _gen: False)
+
+    def dead_owner(fd: int, sig: int) -> None:
+        probes.append((fd, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(agent, "pidfd_send_signal", dead_owner)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    decision: dict[str, object] = {}
+    agent._apply_locked_transition(m, decision, prompt="steer", steer=True, mode="new")
+
+    assert probes == [(77, 0), (77, 0)]
+    assert closed == [77, 77]
+    assert decision["action"] == "spawn"
+    assert decision.get("steer_accepted") is True
+    assert m["pending_prompt"] == "original"
+    assert int(m["runner_gen"]) == 2
+    reservation = m["runner_reservation"]
+    assert isinstance(reservation, dict)
+    assert reservation["state"] == "reserved"
+    assert reservation["gen"] == 2
+    assert m["steer_queue"][0]["prompt"] == "steer"
+
+    # The same helper accepts a genuinely live pinned owner and rejects a
+    # start-time-mismatched (reused) numeric PID without probing it as live.
+    monkeypatch.setattr(agent, "pidfd_send_signal", lambda fd, sig: probes.append((fd, sig)))
+    assert agent._owner_alive(4242, 111)
+    assert not agent._owner_alive(4242, 999)
+    assert probes == [(77, 0), (77, 0), (77, 0)]
+    assert closed == [77, 77, 77, 77]
+
+    # Persisted process identity must retain exact JSON integer shape before
+    # any pidfd/procfs observation can establish reservation-owner authority.
+    opened: list[int] = []
+
+    def record_open(pid: int) -> int:
+        opened.append(pid)
+        return 77
+
+    monkeypatch.setattr(agent, "open_pidfd", record_open)
+    malformed_identities: list[tuple[object, object]] = [
+        (4242.0, 111),
+        ("4242", 111),
+        (True, 111),
+        (0, 111),
+        (-1, 111),
+        (4242, 111.0),
+        (4242, "111"),
+        (4242, True),
+        (4242, -1),
+        (4242, []),
+    ]
+    for owner_pid, owner_ticks in malformed_identities:
+        assert not agent._owner_alive(owner_pid, owner_ticks)
+    assert opened == []
+
+    reservation["owner_start_ticks"] = 111.0
+    assert not agent.reservation_in_flight(m)
+
+
+def test_reserved_runner_marker_requires_pinned_live_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generation marker authorizes reuse only while its pinned process lives."""
+    state = {"alive": True, "vanish_on_read": True}
+    closed: list[int] = []
+
+    proc_root = Path("/proc")
+    candidate = Path("/proc/4242")
+    environ_path = candidate / "environ"
+
+    monkeypatch.setattr(Path, "is_dir", lambda self: self == proc_root)
+    monkeypatch.setattr(
+        Path,
+        "iterdir",
+        lambda self: iter([candidate]) if self == proc_root else iter(()),
+    )
+
+    def read_markers(path: Path) -> bytes:
+        """Return exact markers and optionally model exit immediately after read."""
+        if path != environ_path:
+            return b""
+        if state["vanish_on_read"]:
+            state["alive"] = False
+        return b"LUBKO_AGENT_ID=aaaaaaaa\0LUBKO_RUNNER_GEN=1\0"
+
+    monkeypatch.setattr(Path, "read_bytes", read_markers)
+
+    def probe_pinned(_fd: int, _sig: int) -> None:
+        if not state["alive"]:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(agent, "open_pidfd", lambda _pid: 77)
+    monkeypatch.setattr(agent, "pidfd_send_signal", probe_pinned)
+    monkeypatch.setattr(os, "close", closed.append)
+
+    assert not agent._runner_marker_alive("aaaaaaaa", 1)
+    assert closed == [77]
+
+    state.update({"alive": True, "vanish_on_read": False})
+    assert agent._runner_marker_alive("aaaaaaaa", 1)
+    assert not agent._runner_marker_alive("bbbbbbbb", 1)
+
+    m = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+    m.update({
+        "state": "running",
+        "active_runner": True,
+        "runner_gen": 1,
+        "runner_reservation": {
+            "gen": 1,
+            "owner_pid": 4242,
+            "owner_start_ticks": 111,
+            "state": "reserved",
+            "mode": "new",
+        },
+        "pending_prompt": "original",
+    })
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_owner_alive", lambda _pid, _ticks: False)
+    monkeypatch.setattr(agent, "owned_by_me", lambda _meta, _pid: False)
+    state.update({"alive": True, "vanish_on_read": True})
+
+    decision: dict[str, object] = {}
+    agent._apply_locked_transition(m, decision, prompt="steer", steer=True, mode="new")
+
+    assert decision["action"] == "spawn"
+    assert decision.get("steer_accepted") is True
+    assert m["pending_prompt"] == "original"
+    assert m["steer_queue"][0]["prompt"] == "steer"
+    reservation = m["runner_reservation"]
+    assert isinstance(reservation, dict)
+    assert reservation["gen"] == 2
+    assert reservation["state"] == "reserved"
 
 
 def test_dead_claimed_runner_preserves_accepted_prompt_exactly_once(
@@ -285,3 +607,79 @@ def test_dead_claimed_runner_that_consumed_prompts_starts_fresh(tmp_path: Path) 
     res = final["runner_reservation"]
     assert isinstance(res, dict)
     assert res["state"] == "reserved"
+
+
+@pytest.mark.parametrize("active_runner", ["false", "true", "garbage", 0, 1, None, [], {}])
+def test_malformed_runner_consumption_authority_blocks_prompt_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, active_runner: object
+) -> None:
+    """Malformed runner authority cannot authorize reuse or replacement."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta["active_runner"] = active_runner
+    decision: dict[str, object] = {}
+    monkeypatch.setattr(agent, "discover_session_id", lambda _aid: None)
+    agent._decide_invocation(meta, decision, prompt="new work", steer=False)
+    assert decision == {"action": "busy"}
+    assert meta["active_runner"] is active_runner
+    assert meta.get("pending_prompt") is None
+    assert meta.get("runner_reservation") is None
+
+
+@pytest.mark.parametrize("active_runner", ["false", "true", "garbage", 0, 1, None, [], {}])
+def test_malformed_runner_consumption_authority_blocks_quiescence(
+    tmp_path: Path, active_runner: object
+) -> None:
+    """Malformed runner authority cannot become proof that no work is owned."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta["active_runner"] = active_runner
+    meta["runner_reservation"] = {
+        "state": "reserved",
+        "gen": 1,
+        "owner_pid": 999999,
+        "owner_start_ticks": 1,
+        "mode": "new",
+    }
+    assert agent._active_runner_flag(meta) is None
+    assert agent.reservation_in_flight(meta)
+    assert not agent._no_invocation_owned(meta)
+
+
+def test_inactive_runner_without_owned_work_can_still_converge(tmp_path: Path) -> None:
+    """Canonical inactive authority still permits genuine quiescence."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    assert agent._active_runner_flag(meta) is False
+    assert not agent.reservation_in_flight(meta)
+    assert agent._no_invocation_owned(meta)
+
+
+def test_canonical_runner_consumption_authority_preserves_transition_semantics(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Literal booleans retain inactive-spawn and active-reuse behavior."""
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: True)
+    monkeypatch.setattr(agent, "reservation_in_flight", lambda _meta: False)
+    inactive = agent.idle_meta("a11d", str(tmp_path), None)
+    inactive_decision: dict[str, object] = {}
+    agent._apply_locked_transition(inactive, inactive_decision, prompt="P", steer=False, mode="new")
+    assert inactive_decision == {"action": "spawn", "mode": "new", "gen": 1}
+    active = agent.idle_meta("a11d", str(tmp_path), None)
+    active["active_runner"] = True
+    active_decision: dict[str, object] = {}
+    agent._apply_locked_transition(active, active_decision, prompt="P", steer=False, mode="new")
+    assert active_decision == {"action": "reuse", "interrupt": False}
+
+
+def test_delete_keeps_malformed_runner_consumption_authority_blocking(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Deletion never normalizes malformed durable runner authority."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta["active_runner"] = "false"
+    agent.agent_dir("a11d").mkdir(parents=True)
+    agent.write_meta("a11d", meta)
+    snapshot = agent._begin_delete("a11d", force=False)
+    assert snapshot is not None
+    assert snapshot["active_runner"] == "false"
+    assert not agent._delete_converged(snapshot)

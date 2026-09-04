@@ -21,6 +21,7 @@ import copy
 import ctypes
 import fcntl
 import json
+import math
 import os
 import platform
 import re
@@ -53,6 +54,7 @@ DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
 STOP_REASONS: Final = frozenset({"stop", "kill"})
+PERSISTED_AGENT_STATES: Final = frozenset(("idle", "running", *TERMINAL_STATES))
 PROG: Final = "lubko-agent"
 HEX_DIGITS: Final = frozenset("0123456789abcdef")
 
@@ -63,6 +65,7 @@ HEX_DIGITS: Final = frozenset("0123456789abcdef")
 # tree, so signalling can never cross an invocation boundary even when the OS
 # recycles a process-group ID into a newer invocation of the same agent.
 INVOCATION_ID_VAR: Final = "LUBKO_INVOCATION_ID"
+INVOCATION_ID_HEX_LENGTH: Final = 32
 
 # ``SYS_pidfd_open`` uses the unified syscall number 434 on every architecture
 # with a shared generic syscall table (x86_64, aarch64, riscv64, arm32, ppc64,
@@ -97,6 +100,7 @@ SECONDS_PER_DAY: Final = 86400
 PID_START_WINDOW_SECONDS: Final = 60
 SESSION_DISCOVER_TIMEOUT_SECONDS: Final = 60
 SESSION_DISCOVER_POLL_SECONDS: Final = 1
+STEER_POLL_SECONDS: Final = 0.2
 STOP_WAIT_SECONDS: Final = 10.0
 KILL_WAIT_SECONDS: Final = 5.0
 ABORT_WAIT_SECONDS: Final = 5.0
@@ -194,21 +198,33 @@ def opencode_db_path() -> str:
 
 
 def read_meta(aid: str) -> Meta | None:
-    """Load an agent's metadata, tolerating absence and corruption.
+    """Load metadata only when its persisted identity is bound to ``aid``.
+
+    The directory/caller ID is the authority that selects an agent record. A
+    record whose durable ``id`` is absent, malformed, non-canonical, or names a
+    different canonical agent is corrupt and must not be reinterpreted as that
+    other agent.
 
     Args:
-        aid: Lubko agent ID.
+        aid: Canonical Lubko agent ID whose directory is being addressed.
 
     Returns:
-        The metadata mapping, or ``None`` when unavailable.
+        The bound metadata mapping, or ``None`` when unavailable or corrupt.
     """
+    if _persisted_agent_id(aid) != aid:
+        return None
     path = agent_dir(aid) / "meta.json"
     try:
         with path.open(encoding="utf-8") as fh:
-            data: Meta = json.load(fh)
-            return data
+            data: object = json.load(fh)
     except (OSError, ValueError):
         return None
+    if not isinstance(data, dict):
+        return None
+    persisted_id = _persisted_agent_id(data.get("id"))
+    if persisted_id != aid:
+        return None
+    return cast("Meta", data)
 
 
 def write_meta(aid: str, meta: Meta) -> None:
@@ -615,32 +631,33 @@ def send_signal_group(meta: Meta, sig: int) -> None:
         meta: Agent metadata.
         sig: Signal to deliver.
     """
-    leader = meta.get("pid")
-    aid = str(meta.get("id", ""))
-    iid = meta.get("invocation_id")
-    pgid = meta.get("pgid") or leader
-    if not pgid or iid is None or not aid:
+    leader = _process_identity_int(meta.get("pid"), minimum=1)
+    start_time = _process_identity_int(meta.get("start_time"), minimum=0)
+    aid = _persisted_agent_id(meta.get("id"))
+    iid = _persisted_invocation_id(meta.get("invocation_id"))
+    raw_pgid = meta.get("pgid")
+    pgid = leader if raw_pgid is None else _process_identity_int(raw_pgid, minimum=1)
+    if leader is None or start_time is None or pgid is None or aid is None or iid is None:
         return
-    if leader:
-        fd = open_pidfd(int(leader))
-        if fd is not None:
-            try:
-                verified = proc_start_ticks(int(leader)) == meta.get(
-                    "start_time"
-                ) and env_has_marker(int(leader), aid)
-                if verified and iid is not None:
-                    verified = env_has_invocation(int(leader), str(iid))
-                if verified:
-                    # Deliver through the pin itself: a numeric killpg on the
-                    # recorded group could retarget after PGID reuse.
-                    with contextlib.suppress(OSError, AttributeError):
-                        pidfd_send_signal(fd, sig)
-            finally:
-                os.close(fd)
+    fd = open_pidfd(leader)
+    if fd is not None:
+        try:
+            verified = (
+                proc_start_ticks(leader) == start_time
+                and env_has_marker(leader, aid)
+                and env_has_invocation(leader, iid)
+            )
+            if verified:
+                # Deliver through the pin itself: a numeric killpg on the
+                # recorded group could retarget after PGID reuse.
+                with contextlib.suppress(OSError, AttributeError):
+                    pidfd_send_signal(fd, sig)
+        finally:
+            os.close(fd)
     # Converge surviving members of the recorded group through the exact
     # per-member pinned path — only with a durable invocation-specific
     # identity to authorize them.
-    for _member, member_fd in _pinned_invocation_members(int(pgid), aid, str(iid)):
+    for _member, member_fd in _pinned_invocation_members(pgid, aid, iid):
         try:
             with contextlib.suppress(OSError, AttributeError):
                 pidfd_send_signal(member_fd, sig)
@@ -712,31 +729,73 @@ def _matches_invocation_group(member: int, pgid: int, aid: str, iid: str) -> boo
     return env_has_marker(member, aid) and env_has_invocation(member, iid)
 
 
+def _process_identity_int(value: object, *, minimum: int) -> int | None:
+    """Return a strict persisted JSON integer used as process identity.
+
+    Python's ``bool`  is an ``int`` subclass and ``int()`` also accepts
+    floats/strings, so durable identity fields must be validated before they
+    can name a process or establish a start-time match.
+    """
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        return None
+    return value
+
+
+def _persisted_agent_id(value: object) -> str | None:
+    """Return an already-canonical persisted agent ID without normalizing it."""
+    if not isinstance(value, str) or normalize_agent_id(value) != value:
+        return None
+    return value
+
+
+def _persisted_invocation_id(value: object) -> str | None:
+    """Return an exact canonical UUID-hex invocation marker."""
+    if (
+        not isinstance(value, str)
+        or len(value) != INVOCATION_ID_HEX_LENGTH
+        or any(char not in HEX_DIGITS for char in value)
+    ):
+        return None
+    return value
+
+
 def is_alive(meta: Meta) -> bool:
     """Return whether the recorded process is really our agent process.
 
-    A PID alone is not trusted: the process start time (ticks) and a
-    per-agent environment marker must both match, so a reused or recycled
-    PID can never be mistaken for our agent.
+    The numeric invocation PID is pinned before its start-time and per-agent
+    environment marker are checked. Final liveness is then proven through the
+    same pidfd, so exit and PID reuse after the identity checks cannot make an
+    unrelated process justify the recorded invocation. Platforms that cannot
+    provide the stable pin or pidfd liveness probe fail closed.
 
     Args:
         meta: Agent metadata.
 
     Returns:
-        ``True`` only when a live process matches every recorded identity.
+        ``True`` only when the same pinned live process matches every recorded
+        invocation identity field.
     """
-    pid = meta.get("pid")
-    if not pid:
+    pid = _process_identity_int(meta.get("pid"), minimum=1)
+    start_time = _process_identity_int(meta.get("start_time"), minimum=0)
+    aid = _persisted_agent_id(meta.get("id"))
+    if pid is None or start_time is None or aid is None:
         return False
-    if proc_start_ticks(pid) != meta.get("start_time"):
-        return False
-    if not env_has_marker(pid, meta.get("id", "")):
+    invocation_pid = pid
+    fd = open_pidfd(invocation_pid)
+    if fd is None:
         return False
     try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+        if proc_start_ticks(invocation_pid) != start_time:
+            return False
+        if not env_has_marker(invocation_pid, aid):
+            return False
+        try:
+            pidfd_send_signal(fd, 0)
+        except (OSError, AttributeError):
+            return False
+        return True
+    finally:
+        os.close(fd)
 
 
 def _recorded_leader_state(meta: Meta) -> str:
@@ -753,21 +812,25 @@ def _recorded_leader_state(meta: Meta) -> str:
         cannot be inspected (unreadable procfs) — never collapsing ambiguity
         into death.
     """
-    pid = meta.get("pid")
-    if not pid:
+    raw_pid = meta.get("pid")
+    if raw_pid is None:
         return "gone"
+    pid = _process_identity_int(raw_pid, minimum=1)
+    start_time = _process_identity_int(meta.get("start_time"), minimum=0)
+    if pid is None or start_time is None:
+        return "ambiguous"
     try:
-        os.kill(int(pid), 0)
+        os.kill(pid, 0)
     except ProcessLookupError:
         return "gone"
     except OSError:
         return "ambiguous"  # exists but uninspectable
-    ticks = proc_start_ticks(int(pid))
-    if ticks is None or ticks != meta.get("start_time"):
+    ticks = proc_start_ticks(pid)
+    if ticks is None or ticks != start_time:
         # Unreadable ticks are ambiguity; readable different ticks prove the
         # slot was recycled by an unrelated occupant.
         return "ambiguous" if ticks is None else "gone"
-    state = _leader_marker_state(meta, int(pid))
+    state = _leader_marker_state(meta, pid)
     return state if state is not None else "ambiguous"
 
 
@@ -782,10 +845,15 @@ def _leader_marker_state(meta: Meta, pid: int) -> str | None:
         ``"live"``/``"gone"`` when markers positively decide, ``None`` when
         marker inspection is ambiguous and the caller must stay conservative.
     """
-    aid = str(meta.get("id", ""))
-    iid = meta.get("invocation_id")
-    if iid is None:
+    aid = _persisted_agent_id(meta.get("id"))
+    if aid is None:
+        return None
+    iid_raw = meta.get("invocation_id")
+    if iid_raw is None:
         return "live" if env_has_marker(pid, aid) else "gone"
+    iid = _persisted_invocation_id(iid_raw)
+    if iid is None:
+        return None
     try:
         environ = Path(f"/proc/{pid}/environ").read_bytes()
     except FileNotFoundError:
@@ -800,7 +868,7 @@ def _leader_marker_state(meta: Meta, pid: int) -> str | None:
     return "live" if exact else "gone"
 
 
-def group_alive(meta: Meta) -> bool:
+def group_alive(meta: Meta) -> bool:  # ruff: ignore[too-many-return-statements]
     """Return whether any live process remains in the agent's exact invocation group.
 
     When a durable invocation ID was recorded, group membership is decided by
@@ -819,12 +887,21 @@ def group_alive(meta: Meta) -> bool:
         ``True`` when the recorded invocation still has live group members,
         or when their absence could not be positively proven.
     """
-    pgid = meta.get("pgid")
-    if not pgid:
+    raw_pgid = meta.get("pgid")
+    if raw_pgid is None:
         return False
-    iid = meta.get("invocation_id")
-    if iid is None:
-        return bool(group_has_members(int(pgid)))
+    pgid = _process_identity_int(raw_pgid, minimum=1)
+    if pgid is None:
+        return True
+    iid_raw = meta.get("invocation_id")
+    if iid_raw is None:
+        return bool(group_has_members(pgid))
+    aid = _persisted_agent_id(meta.get("id"))
+    iid = _persisted_invocation_id(iid_raw)
+    leader = _process_identity_int(meta.get("pid"), minimum=1)
+    start_time = _process_identity_int(meta.get("start_time"), minimum=0)
+    if aid is None or iid is None or leader is None or start_time is None:
+        return True
     if is_alive(meta):
         # The verified live leader implies its whole session group.
         return True
@@ -834,7 +911,7 @@ def group_alive(meta: Meta) -> bool:
         # (e.g. unreadable environ with matching start ticks) must never be
         # collapsed into a proven-dead group.
         return True
-    fds, complete = _proven_invocation_members(int(pgid), str(meta.get("id", "")), str(iid))
+    fds, complete = _proven_invocation_members(pgid, aid, iid)
     for _, fd in fds:
         os.close(fd)
     if not complete:
@@ -869,29 +946,40 @@ def wait_group_dead(meta: Meta, timeout: float) -> bool:
 def runner_alive(meta: Meta) -> bool:
     """Return whether the recorded background runner is really our runner.
 
-    The runner PID is anchored by its start time and the per-agent
-    environment marker, exactly like the agent process itself, so a recycled
-    PID can never be mistaken for a live runner.
+    The numeric runner PID is pinned before its start-time and per-agent
+    environment marker are checked. Final liveness is then proven through the
+    same pidfd, so an exit and PID reuse after the identity checks can never
+    make an unrelated process justify the recorded runner. Platforms that
+    cannot provide the stable pin or pidfd liveness probe fail closed.
 
     Args:
         meta: Agent metadata.
 
     Returns:
-        ``True`` only when a live process matches every recorded runner
-        identity field.
+        ``True`` only when the same pinned live process matches every recorded
+        runner identity field.
     """
-    pid = meta.get("runner_pid")
-    if not pid:
+    pid = _process_identity_int(meta.get("runner_pid"), minimum=1)
+    start_time = _process_identity_int(meta.get("runner_start_time"), minimum=0)
+    aid = _persisted_agent_id(meta.get("id"))
+    if pid is None or start_time is None or aid is None:
         return False
-    if proc_start_ticks(int(pid)) != meta.get("runner_start_time"):
-        return False
-    if not env_has_marker(int(pid), meta.get("id", "")):
+    runner_pid = pid
+    fd = open_pidfd(runner_pid)
+    if fd is None:
         return False
     try:
-        os.kill(int(pid), 0)
-    except OSError:
-        return False
-    return True
+        if proc_start_ticks(runner_pid) != start_time:
+            return False
+        if not env_has_marker(runner_pid, aid):
+            return False
+        try:
+            pidfd_send_signal(fd, 0)
+        except (OSError, AttributeError):
+            return False
+        return True
+    finally:
+        os.close(fd)
 
 
 def pid_alive(pid: int | None) -> bool:
@@ -940,13 +1028,24 @@ def _runner_marker_alive(aid: str, expected_gen: int) -> bool:
         name = entry.name
         if not name.isdigit():
             continue
-        try:
-            environ = (entry / "environ").read_bytes()
-        except OSError:
+        fd = open_pidfd(int(name))
+        if fd is None:
             continue
-        fields = environ.split(b"\0")
-        if agent_marker in fields and gen_marker in fields:
+        try:
+            try:
+                environ = (entry / "environ").read_bytes()
+            except OSError:
+                continue
+            fields = environ.split(b"\0")
+            if agent_marker not in fields or gen_marker not in fields:
+                continue
+            try:
+                pidfd_send_signal(fd, 0)
+            except (OSError, AttributeError):
+                continue
             return True
+        finally:
+            os.close(fd)
     return False
 
 
@@ -975,26 +1074,129 @@ def _is_zombie(pid: int) -> bool:
 def _owner_alive(owner: object, owner_ticks: object) -> bool:
     """Return whether ``owner`` is still the exact live reservation owner.
 
-    A PID alone is not trusted: the process must be live (not a zombie), its
-    start time (ticks) must be readable, and it must match the recorded owner
-    identity.  Unavailable ticks or a zombie owner fail closed, so a reused PID
-    or a defunct owner can never justify the reservation.
+    The recorded PID is pinned before its start-time proof and final liveness
+    acceptance. This prevents an owner that exits during validation, or a later
+    process that reuses its numeric PID, from justifying the reservation.
+    Unavailable pidfd/procfs evidence and zombie owners fail closed.
 
     Args:
         owner: Recorded owner process ID, or ``None``.
         owner_ticks: Recorded owner start time in clock ticks, or ``None``.
 
     Returns:
-        ``True`` only when the live process is the exact recorded owner.
+        ``True`` only when the same pinned live process is the exact recorded
+        reservation owner.
     """
-    if not isinstance(owner, int) or not pid_alive(owner):
+    owner_pid = _process_identity_int(owner, minimum=1)
+    start_ticks = _process_identity_int(owner_ticks, minimum=0)
+    if owner_pid is None or start_ticks is None:
         return False
-    if _is_zombie(owner):
+    fd = open_pidfd(owner_pid)
+    if fd is None:
         return False
-    current = proc_start_ticks(owner)
-    if current is None:
+    try:
+        if proc_start_ticks(owner_pid) != start_ticks:
+            return False
+        if _is_zombie(owner_pid):
+            return False
+        try:
+            pidfd_send_signal(fd, 0)
+        except (OSError, AttributeError):
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+def _runner_generation(value: object, *, minimum: int) -> int | None:
+    """Return a canonical persisted runner generation or ``None``.
+
+    Durable generation authority is JSON-integer only. Booleans, numeric
+    strings, floats, and values below the caller's domain minimum fail closed.
+    """
+    if type(value) is not int or value < minimum:
+        return None
+    return value
+
+
+def _runner_reservation_state(reservation: object) -> str:
+    """Return the strict durable runner-reservation lifecycle state.
+
+    Genuine absence is distinct from malformed present authority. Only the
+    canonical ``reserved`` and ``claimed`` strings are accepted; every other
+    present shape fails closed as ``malformed``.
+    """
+    if reservation is None:
+        return "absent"
+    if not isinstance(reservation, dict):
+        return "malformed"
+    state = reservation.get("state")
+    if type(state) is str and state in {"reserved", "claimed"}:
+        return state
+    return "malformed"
+
+
+def _runner_reservation_mode(reservation: object) -> str | None:
+    """Return canonical durable runner native-session mode, or ``None``.
+
+    A runner reservation carries execution authority for exactly one of the two
+    supported native-session modes. Missing, malformed, or unsupported values
+    must fail closed rather than being defaulted through truthiness or coerced
+    to strings later in the spawn path.
+    """
+    if not isinstance(reservation, dict):
+        return None
+    mode = reservation.get("mode")
+    if type(mode) is not str or mode not in {"new", "continue"}:
+        return None
+    return mode
+
+
+def _next_prompt_count(meta: Meta) -> int | None:
+    """Return the next canonical durable prompt count, or fail closed.
+
+    Genuine absence is the legacy zero-count state. A present value must be an
+    actual non-negative JSON integer; booleans and coercible strings/floats are
+    malformed durable state and must never be normalized by an acceptance path.
+    """
+    if "prompt_count" not in meta:
+        return 1
+    value = meta["prompt_count"]
+    if type(value) is not int or value < 0:
+        return None
+    return value + 1
+
+
+def _active_runner_flag(meta: Meta) -> bool | None:
+    """Return canonical durable runner-consumption authority.
+
+    ``active_runner`` is persisted JSON authority, so only literal booleans are
+    usable. Historical records that genuinely omit the field predate runner
+    reservations and safely mean inactive; present malformed values remain
+    distinguishable as ``None`` and must block authority-changing operations.
+    """
+    if "active_runner" not in meta:
         return False
-    return current == owner_ticks
+    value = meta.get("active_runner")
+    if type(value) is not bool:
+        return None
+    return value
+
+
+def _delete_pending_flag(meta: Meta) -> bool | None:
+    """Return canonical durable deletion-tombstone authority.
+
+    Genuine field absence remains the legacy non-tombstone state. A present
+    value is lifecycle authority only when it is a literal JSON boolean;
+    malformed values remain distinguishable as ``None`` so callers can block
+    execution or deletion rather than normalizing through truthiness.
+    """
+    if "delete_pending" not in meta:
+        return False
+    value = meta.get("delete_pending")
+    if type(value) is not bool:
+        return None
+    return value
 
 
 def reservation_in_flight(meta: Meta) -> bool:
@@ -1011,16 +1213,30 @@ def reservation_in_flight(meta: Meta) -> bool:
     Returns:
         ``True`` while a reserved runner is expected to claim the agent.
     """
-    if not meta.get("active_runner"):
-        return False
+    active_runner = _active_runner_flag(meta)
+    if active_runner is not True:
+        # Malformed durable consumption authority is ambiguous, not evidence
+        # that no runner/reservation is in flight. Callers use this predicate
+        # as negative authority for stop/delete/convergence, so fail closed;
+        # canonical inactive authority remains ordinary not-in-flight.
+        return active_runner is None
     if runner_alive(meta):
         return True
     res = meta.get("runner_reservation")
-    if not isinstance(res, dict) or res.get("state") != "reserved":
-        return False
+    reservation_state = _runner_reservation_state(res)
+    if (
+        not isinstance(res, dict)
+        or reservation_state != "reserved"
+        or _runner_reservation_mode(res) is None
+    ):
+        return reservation_state == "malformed"
+    gen = _runner_generation(res.get("gen"), minimum=1)
+    if gen is None:
+        return True
     if _owner_alive(res.get("owner_pid"), res.get("owner_start_ticks")):
         return True
-    return _runner_marker_alive(meta.get("id", "") or "", int(res.get("gen") or 0))
+    aid = _persisted_agent_id(meta.get("id"))
+    return aid is not None and _runner_marker_alive(aid, gen)
 
 
 def owned_by_me(meta: Meta, caller_pid: int) -> bool:
@@ -1041,11 +1257,14 @@ def owned_by_me(meta: Meta, caller_pid: int) -> bool:
         owner.
     """
     res = meta.get("runner_reservation")
-    if not isinstance(res, dict) or res.get("owner_pid") != caller_pid:
+    if not isinstance(res, dict):
         return False
-    recorded = res.get("owner_start_ticks")
+    owner_pid = _process_identity_int(res.get("owner_pid"), minimum=1)
+    recorded = _process_identity_int(res.get("owner_start_ticks"), minimum=0)
+    if owner_pid != caller_pid or recorded is None:
+        return False
     current = proc_start_ticks(caller_pid)
-    return recorded is not None and current is not None and current == recorded
+    return current is not None and current == recorded
 
 
 def is_genuinely_running(meta: Meta) -> bool:
@@ -1084,7 +1303,10 @@ def active_runner_justified(meta: Meta) -> bool:
     Returns:
         ``True`` when ``active_runner`` is justified.
     """
-    if not meta.get("active_runner"):
+    active_runner = _active_runner_flag(meta)
+    if active_runner is None:
+        return False
+    if not active_runner:
         return True
     if runner_alive(meta):
         return True
@@ -1093,7 +1315,12 @@ def active_runner_justified(meta: Meta) -> bool:
     # another caller, so it justifies ``active_runner``; a ``claimed``
     # reservation whose runner is no longer provably alive is stuck and must
     # never justify a persistent ``active_runner``.
-    return isinstance(res, dict) and res.get("state") == "reserved"
+    return (
+        isinstance(res, dict)
+        and _runner_reservation_state(res) == "reserved"
+        and _runner_reservation_mode(res) is not None
+        and _runner_generation(res.get("gen"), minimum=1) is not None
+    )
 
 
 def _set_active_runner(meta: Meta, *, value: bool) -> None:
@@ -1144,6 +1371,95 @@ def _test_sync(step: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+class MalformedLifecycleStateError(ValueError):
+    """Persisted managed-agent lifecycle state is not canonical."""
+
+
+def _persisted_lifecycle_state(meta: Meta) -> str | None:
+    """Return canonical durable lifecycle state, preserving legacy absence as idle."""
+    if "state" not in meta:
+        return "idle"
+    value = meta["state"]
+    if type(value) is not str or value not in PERSISTED_AGENT_STATES:
+        return None
+    return value
+
+
+def _require_persisted_lifecycle_state(meta: Meta) -> str:
+    """Return canonical lifecycle state or reject malformed durable authority.
+
+    Raises:
+        MalformedLifecycleStateError: If persisted lifecycle state is malformed.
+    """
+    state = _persisted_lifecycle_state(meta)
+    if state is None:
+        raise MalformedLifecycleStateError
+    return state
+
+
+CONTROL_REASONS: Final = frozenset({"steer", "stop", "kill"})
+
+
+def _persisted_control_field(meta: Meta, key: str) -> tuple[str | None, bool]:
+    """Return canonical optional lifecycle control plus malformed-presence flag."""
+    if key not in meta or meta[key] is None:
+        return None, False
+    value = meta[key]
+    if type(value) is not str or value not in CONTROL_REASONS:
+        return None, True
+    return value, False
+
+
+def _persisted_intent(meta: Meta) -> tuple[str | None, bool]:
+    """Parse durable invocation intent without normalizing malformed authority.
+
+    Returns:
+        The canonical intent and whether malformed presence was observed.
+    """
+    return _persisted_control_field(meta, "intent")
+
+
+def _persisted_stop_reason(meta: Meta) -> tuple[str | None, bool]:
+    """Parse durable terminal control reason without normalizing malformed authority.
+
+    Returns:
+        The canonical reason and whether malformed presence was observed.
+    """
+    return _persisted_control_field(meta, "stop_reason")
+
+
+def _stop_like_or_malformed(meta: Meta) -> bool:
+    """Return whether lifecycle control forbids starting or draining work."""
+    intent, intent_malformed = _persisted_intent(meta)
+    stop_reason, stop_reason_malformed = _persisted_stop_reason(meta)
+    return (
+        intent_malformed
+        or stop_reason_malformed
+        or intent in STOP_REASONS
+        or stop_reason in STOP_REASONS
+    )
+
+
+def _persisted_timestamp(value: object) -> float | None:
+    """Return a canonical finite persisted timestamp without coercion."""
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        return None
+    return float(value)
+
+
+def _launch_timestamp(meta: Meta) -> float | None:
+    """Return a canonical persisted launch timestamp."""
+    value = meta.get("started_at")
+    if value is None:
+        value = meta.get("created_at")
+    return _persisted_timestamp(value)
+
+
 def derive_state(meta: Meta | None) -> str:
     """Return the live state, verifying process liveness rather than trusting metadata.
 
@@ -1155,19 +1471,23 @@ def derive_state(meta: Meta | None) -> str:
     """
     if not meta:
         return "unknown"
-    state = meta.get("state")
+    state = _persisted_lifecycle_state(meta)
     if state != "running":
-        return state or "idle"
-    pid = meta.get("pid")
-    if pid and is_alive(meta):
+        return state if state is not None else "unknown"
+    pid_value = meta.get("pid")
+    if pid_value is None:
+        launched = _launch_timestamp(meta)
+        return (
+            "running"
+            if launched is not None and 0 <= time.time() - launched < PID_START_WINDOW_SECONDS
+            else "unknown"
+        )
+    if _process_identity_int(pid_value, minimum=1) is None:
+        return "unknown"
+    if is_alive(meta):
         return "running"
-    if not pid:
-        # Launched but the runner has not recorded the PID yet.
-        launched = meta.get("started_at") or meta.get("created_at") or 0
-        return "running" if time.time() - launched < PID_START_WINDOW_SECONDS else "unknown"
-    if meta.get("finished_at"):
-        return str(state)  # runner finalized it
-    return "unknown"
+    finished = _persisted_timestamp(meta.get("finished_at"))
+    return str(state) if finished is not None else "unknown"
 
 
 DISAPPEARED_NOTE: Final = "runner/model process disappeared without a captured exit status"
@@ -1194,15 +1514,19 @@ def _reconcile_dead_invocation(m: Meta) -> None:
     Args:
         m: Agent metadata under the lock.
     """
-    if not m.get("active_runner") and m.get("state") != "running":
+    active_runner = _active_runner_flag(m)
+    if active_runner is None:
+        return  # malformed durable authority requires explicit repair
+    if not active_runner and m.get("state") != "running":
         return  # already terminal/reconciled; nothing to converge
     if is_genuinely_running(m):
         return
-    if not m.get("pid"):
+    pid_value = m.get("pid")
+    if pid_value is None:
         # Launched but the runner has not recorded its identity yet; give the
         # exact startup window the same grace derive_state grants it.
-        launched = m.get("started_at") or m.get("created_at") or 0
-        if time.time() - launched < PID_START_WINDOW_SECONDS:
+        launched = _launch_timestamp(m)
+        if launched is not None and 0 <= time.time() - launched < PID_START_WINDOW_SECONDS:
             return
     if m.get("state") == "running":
         _finalize_terminal(m, None, None, "failed", DISAPPEARED_NOTE)
@@ -1415,6 +1739,56 @@ def discover_session_id(aid: str) -> str | None:
     return row[0] if row else None
 
 
+def _persisted_native_session_id(meta: Meta) -> str | None:
+    """Return canonical durable native-session continuation authority.
+
+    A persisted native session is either genuinely absent/``None`` or a
+    non-empty string. Malformed present values are ambiguous authority and
+    must fail closed rather than being normalized through truthiness.
+
+    Raises:
+        ValueError: The durable native session identity is malformed.
+    """
+    session_id = meta.get("native_session_id")
+    if session_id is None:
+        return None
+    if not isinstance(session_id, str) or not session_id:
+        message = "managed-agent native_session_id is malformed"
+        raise ValueError(message)
+    return session_id
+
+
+def _required_persisted_agent_id(meta: Meta) -> str:
+    """Return canonical durable managed-agent identity or fail closed.
+
+    The metadata read boundary additionally binds this value to the addressed
+    agent directory, so execution paths may use it without normalization.
+
+    Raises:
+        ValueError: The durable managed-agent identity is malformed.
+    """
+    aid = _persisted_agent_id(meta.get("id"))
+    if aid is None:
+        message = "managed-agent id is malformed"
+        raise ValueError(message)
+    return aid
+
+
+def _persisted_variant(meta: Meta) -> str:
+    """Return canonical durable managed-agent variant configuration.
+
+    Raises:
+        ValueError: The durable variant value is malformed.
+    """
+    if "variant" not in meta:
+        return DEFAULT_VARIANT
+    variant = meta["variant"]
+    if not isinstance(variant, str) or not variant:
+        message = "managed-agent variant is malformed"
+        raise ValueError(message)
+    return variant
+
+
 def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[str] | None:
     """Return the argv used to launch the underlying agent for this invocation.
 
@@ -1427,10 +1801,12 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
         The command argv, or ``None`` when continuation is impossible.
     """
     model = AGENT_MODEL
-    variant = meta.get("variant") or DEFAULT_VARIANT
-    cwd = meta.get("cwd") or str(Path.cwd())
+    variant = _persisted_variant(meta)
+    cwd = _persisted_agent_cwd(meta)
     if is_continue:
-        session_id = meta.get("native_session_id") or discover_session_id(meta.get("id", ""))
+        aid = _required_persisted_agent_id(meta)
+        recorded = _persisted_native_session_id(meta)
+        session_id = recorded or discover_session_id(aid)
         if not session_id:
             return None
         return [
@@ -1453,7 +1829,7 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
         "run",
         "--auto",
         "--title",
-        OPENCODE_TITLE_PREFIX + meta.get("id", ""),
+        OPENCODE_TITLE_PREFIX + _required_persisted_agent_id(meta),
         "--model",
         model,
         "--variant",
@@ -1463,6 +1839,23 @@ def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[s
         cwd,
         prompt,
     ]
+
+
+def _persisted_agent_cwd(meta: Meta) -> str:
+    """Return the exact durable managed-agent working directory.
+
+    Once an agent record exists, its ``cwd`` is execution authority. A
+    malformed present value must never be normalized or replaced with the
+    runner process current directory.
+
+    Raises:
+        ValueError: The durable working directory is missing or malformed.
+    """
+    cwd = meta.get("cwd")
+    if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
+        message = "managed-agent cwd is malformed"
+        raise ValueError(message)
+    return cwd
 
 
 # ---------------------------------------------------------------------------
@@ -1482,7 +1875,7 @@ def _clear_pending(meta: Meta, prompt: str) -> None:
         meta: Agent metadata under the metadata lock.
         prompt: The exact prompt this invocation claimed.
     """
-    if meta.get("pending_prompt") == prompt:
+    if _pending_prompt(meta) == prompt:
         meta["pending_prompt"] = None
 
 
@@ -1532,7 +1925,7 @@ def runner(aid: str, mode: str) -> None:
     claimed = {}
 
     def claim(m: Meta) -> None:
-        if m.get("delete_pending"):
+        if _delete_pending_flag(m) is not False:
             # A concurrent delete owns the lifecycle: a runner must never
             # claim (and later recreate state) once deletion was decided.
             claimed["ok"] = False
@@ -1543,15 +1936,23 @@ def runner(aid: str, mode: str) -> None:
             # exact reserved generation.  Fail closed.
             claimed["ok"] = False
             return
-        if res.get("state") != "reserved":
+        if _runner_reservation_state(res) != "reserved":
             # Already claimed or otherwise owned: a second runner must never
             # execute.  (A genuinely live claimed runner is the only owner.)
             claimed["ok"] = False
             return
-        if gen == 0 or res.get("gen") != gen:
-            # Only the exact reserved generation may run.  A missing or zero
-            # generation, or a duplicate/stale replacement whose generation no
-            # longer matches, bails instead of double-executing.
+        reservation_gen = _runner_generation(res.get("gen"), minimum=1)
+        if gen == 0 or reservation_gen is None or reservation_gen != gen:
+            # Only the exact canonical reserved generation may run. A malformed,
+            # missing, zero, or stale generation never becomes execution
+            # authority through Python cross-type equality.
+            claimed["ok"] = False
+            return
+        reservation_mode = _runner_reservation_mode(res)
+        if reservation_mode is None or reservation_mode != mode:
+            # The reservation's durable native-session mode is execution
+            # authority. A malformed value, or a runner spawned for a different
+            # mode, must never claim and reinterpret it as a fresh session.
             claimed["ok"] = False
             return
         m["runner_pid"] = os.getpid()
@@ -1571,12 +1972,12 @@ def runner(aid: str, mode: str) -> None:
     directory = agent_dir(aid)
     directory.mkdir(parents=True, exist_ok=True)
     log_path = directory / "output.log"
-    cwd = meta.get("cwd") or str(Path.cwd())
     env = dict(os.environ)
     env["LUBKO_AGENT_ID"] = aid
     env["NO_COLOR"] = "1"
-    ctx = _RunnerContext(aid=aid, log_path=log_path, cwd=cwd, env=env)
     try:
+        cwd = _persisted_agent_cwd(meta)
+        ctx = _RunnerContext(aid=aid, log_path=log_path, cwd=cwd, env=env)
         _runner_loop(ctx, is_continue=mode == "continue")
     except BaseException:
         _abort_runner(aid)
@@ -1595,11 +1996,13 @@ def _runner_loop(ctx: _RunnerContext, *, is_continue: bool) -> None:
     """
     while True:
         meta = read_meta(ctx.aid)
-        if meta is None or meta.get("delete_pending"):
-            # Deleted (or being deleted): never start another invocation.
+        if meta is None:
             return
-        prompt = meta.get("pending_prompt")
-        if not prompt:
+        if _delete_pending_flag(meta) is not False:
+            # Deleted, being deleted, or tombstone authority is malformed.
+            return
+        prompt = _pending_prompt(meta)
+        if prompt is None:
             if _reclaim_prompt(ctx.aid):
                 continue
             # Exit boundary seam: the runner has durably relinquished
@@ -1629,11 +2032,18 @@ def _reclaim_prompt(aid: str) -> bool:
     holder: dict[str, bool] = {"busy": False}
 
     def apply(m: Meta) -> None:
-        if m.get("stop_reason") in STOP_REASONS:
+        if _stop_like_or_malformed(m):
             _set_active_runner(m, value=False)
             return
-        if m.get("pending_prompt") or (m.get("steer_queue") or []):
-            if (m.get("steer_queue") or []) and not m.get("pending_prompt"):
+        sequence = _steer_sequence(m)
+        if sequence is None:
+            raise MalformedSteerMetadataError
+        queue = _steer_queue(m, sequence=sequence)
+        if queue is None:
+            raise MalformedSteerMetadataError
+        pending = _pending_prompt(m)
+        if pending is not None or queue:
+            if queue and pending is None:
                 _pop_into_pending(m, time.time())
             m["active_runner"] = True
             holder["busy"] = True
@@ -1721,9 +2131,9 @@ def _claim_pending_prompt(aid: str, prompt: str) -> bool:
 
     def claim(m: Meta) -> None:
         if (
-            m.get("delete_pending")
-            or m.get("intent") in STOP_REASONS
-            or m.get("stop_reason") in STOP_REASONS
+            _persisted_lifecycle_state(m) is None
+            or _delete_pending_flag(m) is not False
+            or _stop_like_or_malformed(m)
         ):
             return
         _clear_pending(m, prompt)
@@ -1844,6 +2254,15 @@ def _spawn_and_run(
                 _finalize_abort() if converged else _hold_abort(),
             )
             raise
+        observed = {
+            "id": aid,
+            "pid": proc.pid,
+            "pgid": proc.pid,
+            "start_time": start,
+            "invocation_id": iid,
+        }
+        if not _wait_for_steer_group_convergence(aid, observed):
+            return None
         update_meta(aid, _finalize_after(rc))
 
     return rc
@@ -1923,7 +2342,12 @@ def _wait_for_invocation_exit(
     *,
     is_continue: bool,
 ) -> int:
-    """Discover the native session if needed, then wait for the invocation.
+    """Discover the native session and enforce durable steer preemption while waiting.
+
+    The runner never blocks indefinitely inside one opaque ``proc.wait()``. It
+    periodically re-reads durable lifecycle intent so a steer remains effective
+    even if the submitting CLI dies immediately after the metadata transaction
+    and before it can signal the native invocation itself.
 
     Args:
         proc: The spawned invocation process.
@@ -1933,15 +2357,23 @@ def _wait_for_invocation_exit(
     Returns:
         The invocation's return code.
     """
-    if not is_continue:
-        deadline = time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
-        while time.time() < deadline and proc.poll() is None:
+    discovery_deadline = None if is_continue else time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
+    next_discovery = 0.0
+    while True:
+        now = time.time()
+        if discovery_deadline is not None and now < discovery_deadline and now >= next_discovery:
             sid = discover_session_id(aid)
             if sid:
                 update_meta(aid, _set_native_session(sid))
-                break
-            time.sleep(SESSION_DISCOVER_POLL_SECONDS)
-    return proc.wait()
+                discovery_deadline = None
+            else:
+                next_discovery = now + SESSION_DISCOVER_POLL_SECONDS
+        try:
+            return proc.wait(timeout=STEER_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            # The durable intent is the authority. This makes steer recovery
+            # independent of the lifetime of the CLI process that accepted it.
+            _interrupt_steer_if_needed(aid)
 
 
 def _kill_spawned_invocation(aid: str, pid: int, start: object, iid: str) -> None:
@@ -2020,12 +2452,12 @@ def _clear_unresolved(aid: str, pid: int, start: object, iid: str) -> None:
     """
 
     def clear(m: Meta) -> None:
-        cur = m.get("unresolved_invocation")
+        cur = _persisted_unresolved_identity(m.get("unresolved_invocation"))
         if (
-            isinstance(cur, dict)
-            and cur.get("pid") == pid
-            and cur.get("start_time") == start
-            and cur.get("invocation_id") == iid
+            cur is not None
+            and cur["pid"] == pid
+            and cur["start_time"] == start
+            and cur["invocation_id"] == iid
         ):
             m["unresolved_invocation"] = None
 
@@ -2060,7 +2492,8 @@ def _hold_unrecorded(aid: str, pid: int, start: object, iid: str) -> None:
             "start_time": start,
             "invocation_id": iid,
         }
-        if m.get("state") == "running" and m.get("intent") not in STOP_REASONS:
+        intent, intent_malformed = _persisted_intent(m)
+        if m.get("state") == "running" and not intent_malformed and intent not in STOP_REASONS:
             m["intent"] = "kill"
             m["last_activity_at"] = time.time()
 
@@ -2093,62 +2526,60 @@ def _unresolved_leader_state(rec: Meta) -> str | None:
     return None  # leader positively recycled by an unrelated occupant
 
 
+def _persisted_unresolved_identity(value: object) -> Meta | None:
+    """Return one canonical durable unresolved-invocation identity.
+
+    Malformed present authority must never participate in liveness or cleanup
+    through Python coercion or equality.
+    """
+    if not isinstance(value, dict):
+        return None
+    rec = cast("Meta", value)
+    if (
+        _process_identity_int(rec.get("pid"), minimum=1) is None
+        or _process_identity_int(rec.get("pgid"), minimum=1) is None
+        or _process_identity_int(rec.get("start_time"), minimum=0) is None
+        or _persisted_invocation_id(rec.get("invocation_id")) is None
+    ):
+        return None
+    return rec
+
+
 def _unresolved_child_state(m: Meta) -> str:
     """Classify the exact recorded unresolved invocation's survival evidence.
 
-    Returns ``"live"``, ``"gone"``, or ``"ambiguous"``. The obligation spans
-    the whole recorded invocation *group*, not just its leader: leader death
-    or PID recycling alone never proves it gone, because genuine descendants
-    can survive in the old process group. The record is gone only when the
-    leader is positively dead/recycled *and* a complete pinned per-invocation
-    scan finds no surviving member carrying both the agent marker and the
-    exact invocation marker (a recycled PGID hosting a foreign invocation
-    never counts). Anything uninspectable — unreadable procfs, permission
-    failures, malformed persisted state — stays ambiguous so the block never
-    fails open.
+    The obligation spans the whole recorded invocation group, not just its
+    leader: leader death or PID recycling alone never proves it gone because
+    genuine descendants can survive in the old process group. The record is
+    gone only when the leader is positively dead or recycled and a complete
+    pinned per-invocation scan finds no surviving exact-marker member. Any
+    uninspectable or malformed durable evidence remains ambiguous.
 
     Args:
         m: Agent metadata.
 
     Returns:
-        The evidence classification.
+        ``"live"``, ``"gone"``, or ``"ambiguous"`` according to exact survival evidence.
     """
-    rec = m.get("unresolved_invocation")
-    if rec is None:
+    raw = m.get("unresolved_invocation")
+    if raw is None:
         return "gone"
-
-    def valid_identity(value: object) -> bool:
-        """Whether ``value`` is a well-formed persisted identity field.
-
-        Args:
-            value: The persisted field value.
-
-        Returns:
-            ``True`` for a positive non-bool integer.
-        """
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-    well_formed = (
-        isinstance(rec, dict)
-        and valid_identity(rec.get("pid"))
-        and isinstance(rec.get("start_time"), int)
-        and not isinstance(rec.get("start_time"), bool)
-        and valid_identity(rec.get("pgid"))
-        and isinstance(rec.get("invocation_id"), str)
-        and bool(rec["invocation_id"])
-    )
-    if not well_formed:
-        return "ambiguous"  # malformed persisted state fails closed
+    rec = _persisted_unresolved_identity(raw)
+    if rec is None:
+        return "ambiguous"
     leader_state = _unresolved_leader_state(rec)
     if leader_state is not None:
         return leader_state
-    pgid: int = rec["pgid"]
-    iid: str = rec["invocation_id"]
-    members, complete = _proven_invocation_members(pgid, str(m.get("id", "")), iid)
+    aid = _persisted_agent_id(m.get("id"))
+    if aid is None:
+        return "ambiguous"
+    pgid = cast("int", rec["pgid"])
+    iid = cast("str", rec["invocation_id"])
+    members, complete = _proven_invocation_members(pgid, aid, iid)
     for _, fd in members:
         os.close(fd)
     if not complete:
-        return "ambiguous"  # uncertain membership never proves the group gone
+        return "ambiguous"
     return "live" if members else "gone"
 
 
@@ -2174,11 +2605,7 @@ def _record_running(
     """
 
     def record(m: Meta) -> None:
-        if (
-            m.get("delete_pending")
-            or m.get("intent") in STOP_REASONS
-            or m.get("stop_reason") in STOP_REASONS
-        ):
+        if _delete_pending_flag(m) is not False or _stop_like_or_malformed(m):
             # The just-spawned child is refused tracking, but it already
             # exists in its own session: durably hand its exact identity
             # over as an unresolved obligation *in this same locked
@@ -2241,7 +2668,10 @@ def _finalize_after(rc: int) -> Callable[[Meta], None]:
         if m.get("state") != "running":
             return  # already finalized (e.g. by stop/kill/steer)
         sig = -rc if rc < 0 else None
-        intent = m.get("intent")
+        intent, intent_malformed = _persisted_intent(m)
+        _, stop_reason_malformed = _persisted_stop_reason(m)
+        if intent_malformed or stop_reason_malformed:
+            return
         m["stop_reason"] = intent
         if intent == "stop":
             state = "stopped"
@@ -2270,16 +2700,25 @@ def _drain_next(aid: str) -> str | None:
     holder: dict[str, str | None] = {"prompt": None}
 
     def drain(m: Meta) -> None:
-        if m.get("stop_reason") in STOP_REASONS:
+        if _persisted_lifecycle_state(m) is None:
+            raise MalformedLifecycleStateError
+        if _stop_like_or_malformed(m):
             _set_active_runner(m, value=False)
             return
-        if m.get("pending_prompt"):
+        sequence = _steer_sequence(m)
+        if sequence is None:
+            raise MalformedSteerMetadataError
+        queue = _steer_queue(m, sequence=sequence)
+        if queue is None:
+            raise MalformedSteerMetadataError
+        pending = _pending_prompt(m)
+        if pending is not None:
             # A new invocation was queued while this one was running; run it
             # rather than going idle, so a second runner is never needed.
             m["active_runner"] = True
-            holder["prompt"] = m["pending_prompt"]
+            holder["prompt"] = pending
             return
-        if not (m.get("steer_queue") or []):
+        if not queue:
             _set_active_runner(m, value=False)
             return
         item = _pop_into_pending(m, time.time())
@@ -2318,21 +2757,90 @@ def _finalize_terminal(
     meta["exit_signal"] = exit_signal
     meta["finished_at"] = time.time()
     meta["last_activity_at"] = time.time()
-    meta["intent"] = None
+    _, intent_malformed = _persisted_intent(meta)
+    if not intent_malformed:
+        meta["intent"] = None
     if note:
         meta["error"] = note
 
 
-def _queue_steer(meta: Meta, prompt: str, now: float) -> None:
-    """Append a steer instruction to the agent's FIFO queue.
+class MalformedPendingPromptMetadataError(ValueError):
+    """Persisted pending prompt authority is not canonical."""
 
-    Args:
-        meta: Agent metadata.
-        prompt: Steer instruction.
-        now: Queue timestamp.
+
+def _pending_prompt(meta: Meta) -> str | None:
+    """Return canonical durable pending prompt authority, or fail closed.
+
+    Raises:
+        MalformedPendingPromptMetadataError: If present prompt authority is malformed.
     """
-    queue = meta.get("steer_queue") or []
-    seq = (meta.get("steer_seq") or 0) + 1
+    if "pending_prompt" not in meta or meta["pending_prompt"] is None:
+        return None
+    value = meta["pending_prompt"]
+    if type(value) is not str or not value:
+        raise MalformedPendingPromptMetadataError
+    return value
+
+
+class MalformedSteerMetadataError(ValueError):
+    """Persisted steer ordering metadata is not canonical."""
+
+
+def _steer_sequence(meta: Meta) -> int | None:
+    """Return canonical durable steer sequence authority."""
+    if "steer_seq" not in meta:
+        return 0
+    value = meta["steer_seq"]
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _valid_steer_item(item: object, *, previous: int, sequence: int) -> bool:
+    """Return whether one persisted steer item has canonical JSON shape."""
+    if type(item) is not dict:
+        return False
+    item_seq = item.get("seq")
+    prompt = item.get("prompt")
+    queued_at = item.get("queued_at")
+    return (
+        type(item_seq) is int
+        and previous < item_seq <= sequence
+        and type(prompt) is str
+        and isinstance(queued_at, (int, float))
+        and not isinstance(queued_at, bool)
+        and math.isfinite(queued_at)
+    )
+
+
+def _steer_queue(meta: Meta, *, sequence: int) -> list[Meta] | None:
+    """Return a canonical persisted FIFO steer queue, or fail closed."""
+    if "steer_queue" not in meta:
+        return []
+    value = meta["steer_queue"]
+    if type(value) is not list:
+        return None
+    previous = 0
+    for item in value:
+        if not _valid_steer_item(item, previous=previous, sequence=sequence):
+            return None
+        previous = item["seq"]
+    return value
+
+
+def _queue_steer(meta: Meta, prompt: str, now: float) -> None:
+    """Append a steer instruction only when durable queue metadata is canonical.
+
+    Raises:
+        MalformedSteerMetadataError: If persisted queue/sequence metadata is malformed.
+    """
+    sequence = _steer_sequence(meta)
+    if sequence is None:
+        raise MalformedSteerMetadataError
+    queue = _steer_queue(meta, sequence=sequence)
+    if queue is None:
+        raise MalformedSteerMetadataError
+    seq = sequence + 1
     queue.append({"seq": seq, "prompt": prompt, "queued_at": now})
     meta["steer_queue"] = queue
     meta["steer_seq"] = seq
@@ -2349,8 +2857,12 @@ def _pop_into_pending(meta: Meta, now: float) -> Meta | None:
     Returns:
         The popped steer item, or ``None`` when the queue is empty.
     """
-    queue = meta.get("steer_queue") or []
-    if not queue:
+    next_prompt_count = _next_prompt_count(meta)
+    sequence = _steer_sequence(meta)
+    if next_prompt_count is None or sequence is None:
+        return None
+    queue = _steer_queue(meta, sequence=sequence)
+    if queue is None or not queue:
         return None
     item: Meta = queue.pop(0)
     meta["steer_queue"] = queue
@@ -2366,7 +2878,7 @@ def _pop_into_pending(meta: Meta, now: float) -> Meta | None:
     meta["pid"] = None
     meta["pgid"] = None
     meta["start_time"] = None
-    meta["prompt_count"] = int(meta.get("prompt_count") or 0) + 1
+    meta["prompt_count"] = next_prompt_count
     return item
 
 
@@ -2516,17 +3028,31 @@ def spawn_runner(aid: str, mode: str, *, gen: int | None = None) -> None:
         mode: Invocation mode (``new`` or ``continue``).
         gen: Exact reserved runner generation to carry into the runner, or
             ``None`` to fall back to metadata (used only by direct callers).
+
+    Raises:
+        ValueError: The requested runner mode is not canonical.
     """
+    if type(mode) is not str or mode not in {"new", "continue"}:
+        msg = "managed-agent runner mode is malformed"
+        raise ValueError(msg)
     script = Path(__file__).resolve()
     env = _runner_env(aid)
     if gen is not None:
-        env["LUBKO_RUNNER_GEN"] = str(int(gen))
+        spawn_gen = _runner_generation(gen, minimum=1)
+        if spawn_gen is None:
+            msg = "managed-agent runner generation is malformed"
+            raise ValueError(msg)
+        env["LUBKO_RUNNER_GEN"] = str(spawn_gen)
     else:
         meta = read_meta(aid)
         if meta:
             res = meta.get("runner_reservation")
-            if isinstance(res, dict) and res.get("gen"):
-                env["LUBKO_RUNNER_GEN"] = str(int(res["gen"]))
+            if isinstance(res, dict):
+                spawn_gen = _runner_generation(res.get("gen"), minimum=1)
+                if spawn_gen is None:
+                    msg = "managed-agent runner generation is malformed"
+                    raise ValueError(msg)
+                env["LUBKO_RUNNER_GEN"] = str(spawn_gen)
     subprocess.Popen(
         [sys.executable, str(script), "_runner", aid, mode],
         stdin=subprocess.DEVNULL,
@@ -2646,21 +3172,137 @@ def _follow_attached(aid: str) -> int:
     return exit_code_for(read_meta(aid))
 
 
-def _interrupt_steer_if_needed(aid: str) -> None:
-    """Send SIGTERM to a live agent that is mid-steer, if applicable.
+def _interrupt_steer_if_needed(aid: str) -> bool:
+    """Hard-preempt and converge the exact invocation superseded by a steer.
 
-    A reuse decision that interrupted the running invocation only matters when
-    the runner is still executing the agent under a ``steer`` intent; an agent
-    that has already finished or never entered the steer intent needs no
-    signal.
+    Steering is a control operation, not a polite queued follow-up. Once the
+    durable ``steer`` intent is present, terminate the exact owned invocation
+    immediately, wait only a bounded grace period, then escalate to ``SIGKILL``.
+    The function succeeds only when the whole exact invocation group is proven
+    gone; leader exit alone is never sufficient authority for continuation.
 
     Args:
         aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when no steer is currently targeting a live invocation, or when
+        the targeted exact invocation group has been positively converged.
     """
     current = read_meta(aid)
-    if current is None or current.get("intent") != "steer" or not is_alive(current):
-        return
+    if current is None:
+        return True
+    intent, intent_malformed = _persisted_intent(current)
+    if intent_malformed:
+        return False
+    if intent != "steer":
+        return True
+    if not group_alive(current):
+        return True
     send_signal_group(current, signal.SIGTERM)
+    if wait_group_dead(current, STOP_WAIT_SECONDS):
+        return True
+    send_signal_group(current, signal.SIGKILL)
+    return wait_group_dead(current, KILL_WAIT_SECONDS)
+
+
+def _wait_for_steer_group_convergence(aid: str, observed: Meta) -> bool:
+    """Prevent a steer continuation until the superseded exact group is gone.
+
+    ``proc.wait()`` proves only that the native invocation leader exited. A tool
+    or descendant from that same invocation may still be executing. If this was
+    a steer, retain the runner as the sole execution authority and keep retrying
+    exact bounded preemption until the old group is positively empty. This is
+    fail-closed: ambiguous ownership never authorizes the next invocation.
+
+    Args:
+        aid: Lubko agent ID.
+        observed: Exact invocation identity captured by the runner.
+
+    Returns:
+        ``True`` when continuation is safe, ``False`` when durable metadata is
+        unavailable or malformed and the runner must stop.
+    """
+    while True:
+        current = read_meta(aid)
+        if current is None:
+            return False
+        intent, intent_malformed = _persisted_intent(current)
+        if intent_malformed:
+            return False
+        if intent not in {"steer", "stop", "kill"}:
+            return True
+        if not group_alive(observed):
+            return True
+        if intent == "steer":
+            converged = _interrupt_steer_if_needed(aid)
+        else:
+            first_signal = signal.SIGKILL if intent == "kill" else signal.SIGTERM
+            send_signal_group(observed, first_signal)
+            first_wait = KILL_WAIT_SECONDS if intent == "kill" else STOP_WAIT_SECONDS
+            converged = wait_group_dead(observed, first_wait)
+            if not converged and intent == "stop":
+                send_signal_group(observed, signal.SIGKILL)
+                converged = wait_group_dead(observed, KILL_WAIT_SECONDS)
+        if converged:
+            return not group_alive(observed)
+        time.sleep(STEER_POLL_SECONDS)
+
+
+def _promote_steer_after_claimed_runner_death(m: Meta, decision: dict[str, object]) -> str | None:
+    """Recover the oldest accepted steer left behind by a dead claimed runner.
+
+    Returns:
+        The promoted pending prompt, ``None`` when no accepted steer remains, or
+        ``None`` with ``decision["action"] == "busy"`` for malformed state.
+    """
+    sequence = _steer_sequence(m)
+    if sequence is None:
+        decision["action"] = "busy"
+        return None
+    queue = _steer_queue(m, sequence=sequence)
+    if queue is None:
+        decision["action"] = "busy"
+        return None
+    if not queue:
+        _set_active_runner(m, value=False)
+        return None
+    if _pop_into_pending(m, time.time()) is None:
+        decision["action"] = "busy"
+        return None
+    pending = _pending_prompt(m)
+    if pending is None:
+        decision["action"] = "busy"
+    return pending
+
+
+def _accept_stale_recovery_caller(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    steer: bool,
+    pending: str | None,
+) -> bool:
+    """Accept or reject the caller without overwriting older recovered work.
+
+    Returns:
+        ``True`` when recovery may reserve a replacement runner.
+    """
+    if pending is not None:
+        if steer:
+            _queue_steer(m, prompt, time.time())
+            decision["steer_accepted"] = True
+        else:
+            decision["recover_busy"] = True
+        return True
+    next_prompt_count = _next_prompt_count(m)
+    if next_prompt_count is None:
+        decision["action"] = "busy"
+        return False
+    m["pending_prompt"] = prompt
+    m["last_prompt"] = _truncate(prompt, 500)
+    m["prompt_count"] = next_prompt_count
+    return True
 
 
 def _recover_stale_reservation(
@@ -2680,10 +3322,11 @@ def _recover_stale_reservation(
     fresh generation so the stale old generation is invalidated, and starts
     exactly one replacement runner.
 
-    A claimed runner that already consumed its prompt (no ``pending_prompt``
-    survives) is not recovered here: the stale claimed authority is dropped and
-    the caller falls through to an ordinary fresh start, so the consumed prompt
-    is never replayed.
+    A claimed runner that already consumed its ordinary prompt is not replayed.
+    If durable FIFO steers still survive, however, the oldest accepted steer is
+    promoted and recovered before any newer caller may reserve work. Only when
+    neither ``pending_prompt`` nor queued steer work survives is the stale claimed
+    authority dropped and the caller allowed to fall through to a fresh start.
 
     The already-accepted pending prompt is preserved and never overwritten. When
     an accepted prompt exists:
@@ -2715,43 +3358,32 @@ def _recover_stale_reservation(
     Returns:
         ``True`` when a stale reservation was recovered here.
     """
+    pending = _pending_prompt(m)
     res = m.get("runner_reservation")
-    if not (isinstance(res, dict) and res.get("state") in {"reserved", "claimed"}):
-        return False
+    reservation_state = _runner_reservation_state(res)
+    if reservation_state not in {"reserved", "claimed"}:
+        malformed = reservation_state == "malformed"
+        if malformed:
+            decision["action"] = "busy"
+        return malformed
     if reservation_in_flight(m):
         return False
-    if res.get("state") == "claimed" and not m.get("pending_prompt"):
-        # The exact runner consumed the accepted prompt before dying; there is
-        # nothing to preserve and nothing to replay. Drop the dead claimed
-        # authority and let the caller's fresh start own the next invocation.
-        _set_active_runner(m, value=False)
-        return False
+    take_mode = _runner_reservation_mode(res)
+    current_gen = _runner_generation(m.get("runner_gen", 0), minimum=0)
+    if take_mode is None or current_gen is None:
+        decision["action"] = "busy"
+        return True
+    if reservation_state == "claimed" and pending is None:
+        # The dead runner may have consumed its ordinary prompt but still own
+        # accepted FIFO steers. Recover that control work before newer callers.
+        pending = _promote_steer_after_claimed_runner_death(m, decision)
+        if pending is None:
+            return decision.get("action") == "busy"
     now = time.time()
     caller_pid = os.getpid()
-    gen = int(m.get("runner_gen") or 0) + 1
-    take_mode = res.get("mode") or "new"
-    accepted = bool(m.get("pending_prompt"))
-    if accepted:
-        if steer:
-            # A --steer that discovers the same stale reservation queues the
-            # steer deterministically behind the recovered invocation using the
-            # existing steer semantics, is durably accepted (success), and lets
-            # exactly one replacement runner execute the original prompt. The
-            # accepted pending prompt is never overwritten.
-            _queue_steer(m, prompt, now)
-            decision["steer_accepted"] = True
-        else:
-            # An ordinary recovery caller must not overwrite the accepted prompt;
-            # its own prompt is explicitly rejected (busy) while recovery of the
-            # original prompt proceeds via the spawned replacement runner.
-            decision["recover_busy"] = True
-    else:
-        # No accepted prompt survived: the recovery caller's prompt is the one
-        # to run and is accepted. A stale/idle --steer is equivalent to an
-        # ordinary prompt here, so it simply owns the recovered invocation.
-        m["pending_prompt"] = prompt
-        m["last_prompt"] = _truncate(prompt, 500)
-        m["prompt_count"] = int(m.get("prompt_count") or 0) + 1
+    gen = current_gen + 1
+    if not _accept_stale_recovery_caller(m, decision, prompt=prompt, steer=steer, pending=pending):
+        return True
     m["active_runner"] = True
     m["runner_gen"] = gen
     m["runner_reservation"] = {
@@ -2783,7 +3415,7 @@ def _resolve_session_mode(m: Meta) -> str | None:
     Returns:
         ``"new"``, ``"continue"``, or ``None`` when the session is gone.
     """
-    recorded = m.get("native_session_id")
+    recorded = _persisted_native_session_id(m)
     # Always rediscover under the lock: external session availability is the
     # authority, and a stale discovery before the lock must never authorize a
     # second ``new`` session.
@@ -2821,6 +3453,12 @@ def _decide_invocation(
         prompt: Instruction to run or steer.
         steer: Whether this is a steer rather than an ordinary prompt.
     """
+    if _persisted_lifecycle_state(m) is None:
+        decision["action"] = "busy"
+        return
+    if _active_runner_flag(m) is None:
+        decision["action"] = "busy"
+        return
     if _unresolved_child_state(m) != "gone":
         # An earlier unrecorded invocation could not be positively proven
         # converged (still live, or inspection ambiguous); a later
@@ -2829,7 +3467,9 @@ def _decide_invocation(
         decision["action"] = "busy"
         return
     m["unresolved_invocation"] = None
-    if m.get("intent") in STOP_REASONS:
+    intent, intent_malformed = _persisted_intent(m)
+    _, stop_reason_malformed = _persisted_stop_reason(m)
+    if intent_malformed or stop_reason_malformed or intent in STOP_REASONS:
         # A durably accepted stop/kill obligation for this invocation must
         # never be overwritten by a later prompt/steer: otherwise the dying
         # invocation is finalized as a steer and _drain_next resurrects the
@@ -2842,6 +3482,38 @@ def _decide_invocation(
         decision["action"] = "error_session_gone"
         return
     _apply_locked_transition(m, decision, prompt=prompt, steer=steer, mode=mode)
+
+
+def _reserve_fresh_runner(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    mode: str,
+    now: float,
+) -> None:
+    """Reserve one fresh runner generation, failing closed on corrupt history."""
+    caller_pid = os.getpid()
+    current_gen = _runner_generation(m.get("runner_gen", 0), minimum=0)
+    next_prompt_count = _next_prompt_count(m)
+    if current_gen is None or next_prompt_count is None:
+        decision["action"] = "busy"
+        return
+    gen = current_gen + 1
+    _begin_invocation(m, prompt, now, prompt_count=next_prompt_count)
+    m["active_runner"] = True
+    m["runner_gen"] = gen
+    m["runner_reservation"] = {
+        "gen": gen,
+        "owner_pid": caller_pid,
+        "owner_start_ticks": proc_start_ticks(caller_pid),
+        "state": "reserved",
+        "reserved_at": now,
+        "mode": mode,
+    }
+    decision["action"] = "spawn"
+    decision["mode"] = mode
+    decision["gen"] = gen
 
 
 def _apply_locked_transition(
@@ -2865,6 +3537,8 @@ def _apply_locked_transition(
         steer: Whether this is a steer rather than an ordinary prompt.
         mode: Resolved native-session mode (``new`` or ``continue``).
     """
+    _require_persisted_lifecycle_state(m)
+    pending = _pending_prompt(m)
     now = time.time()
     caller_pid = os.getpid()
     live_agent = is_alive(m)
@@ -2872,8 +3546,9 @@ def _apply_locked_transition(
     # once an exiting runner has relinquished it (``active_runner`` false,
     # reservation dropped), that runner will never consume another prompt, so
     # it must not be reused even while its process is still dying.
-    live_runner = bool(m.get("active_runner")) and runner_alive(m)
-    in_flight = reservation_in_flight(m)
+    live_runner = _active_runner_flag(m) is True and runner_alive(m)
+    reservation_state = _runner_reservation_state(m.get("runner_reservation"))
+    in_flight = reservation_state != "malformed" and reservation_in_flight(m)
 
     if live_agent:
         if steer:
@@ -2890,7 +3565,7 @@ def _apply_locked_transition(
             _queue_steer(m, prompt, now)
             decision["action"] = "reuse"
             decision["interrupt"] = False
-        elif m.get("pending_prompt"):
+        elif pending is not None:
             # An invocation is already accepted and awaiting this live runner;
             # a second ordinary prompt must never overwrite it.  It is
             # explicitly busy so exactly one prompt owns the runner.
@@ -2923,25 +3598,14 @@ def _apply_locked_transition(
         return
 
     # Nothing is genuinely in flight and no stale reservation to recover: own
-    # this transition (fresh start) and reserve exactly one runner. A steer
-    # that reaches here (idle, finished, or a stale reservation) is exactly
-    # equivalent to an ordinary prompt, so it sets the pending prompt and
-    # becomes the single reserved invocation.
-    gen = int(m.get("runner_gen") or 0) + 1
-    _begin_invocation(m, prompt, now)
-    m["active_runner"] = True
-    m["runner_gen"] = gen
-    m["runner_reservation"] = {
-        "gen": gen,
-        "owner_pid": caller_pid,
-        "owner_start_ticks": proc_start_ticks(caller_pid),
-        "state": "reserved",
-        "reserved_at": now,
-        "mode": mode,
-    }
-    decision["action"] = "spawn"
-    decision["mode"] = mode
-    decision["gen"] = gen
+    # this transition (fresh start) and reserve exactly one runner.
+    _reserve_fresh_runner(
+        m,
+        decision,
+        prompt=prompt,
+        mode=mode,
+        now=now,
+    )
 
 
 def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
@@ -3001,7 +3665,7 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
         _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
         return EXIT_ERROR
     if action == "spawn":
-        spawn_runner(aid, str(decision["mode"]), gen=cast("int", decision["gen"]))
+        spawn_runner(aid, cast("str", decision["mode"]), gen=cast("int", decision["gen"]))
         if decision.get("recover_busy"):
             # A stale reserved runner was recovered (the accepted pending prompt
             # is preserved and a replacement runner was started), but this
@@ -3010,8 +3674,22 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
             _err(f"{PROG}: agent {aid} is recovering a reserved prompt; this prompt was rejected")
             return EXIT_ERROR
     elif action == "reuse" and decision.get("interrupt"):
-        _interrupt_steer_if_needed(aid)
+        if not _interrupt_steer_if_needed(aid):
+            _err(
+                f"{PROG}: steer for agent {aid} was durably accepted, but exact "
+                "preemption has not converged; continuation remains blocked"
+            )
+            return EXIT_ERROR
 
+    return _finish_prompt_dispatch(args, aid)
+
+
+def _finish_prompt_dispatch(args: argparse.Namespace, aid: str) -> int:
+    """Finish attached/detached prompt transport after execution ownership is set.
+
+    Returns:
+        The prompt transport exit code.
+    """
     if args.detach:
         if args.json:
             _out(json.dumps({"id": aid, "state": "running", "detached": True}))
@@ -3025,7 +3703,7 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
     return _follow_attached(aid)
 
 
-def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
+def _begin_invocation(meta: Meta, prompt: str, now: float, *, prompt_count: int) -> None:
     """Mark an agent as starting a new invocation.
 
     ``active_runner`` is deliberately left untouched: whether a live runner
@@ -3036,6 +3714,7 @@ def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
         meta: Agent metadata.
         prompt: Instruction to run.
         now: Invocation timestamp.
+        prompt_count: Already validated next durable prompt count.
     """
     meta["state"] = "running"
     meta["started_at"] = now
@@ -3050,7 +3729,7 @@ def _begin_invocation(meta: Meta, prompt: str, now: float) -> None:
     meta["start_time"] = None
     meta["pending_prompt"] = prompt
     meta["last_prompt"] = _truncate(prompt, 500)
-    meta["prompt_count"] = int(meta.get("prompt_count") or 0) + 1
+    meta["prompt_count"] = prompt_count
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -3124,33 +3803,160 @@ def _list_entries(args: argparse.Namespace) -> list[tuple[str, str, Meta]]:
         if not _matches_filters(args, state):
             continue
         entries.append((aid, state, meta))
-    entries.sort(key=lambda entry: entry[2].get("created_at") or 0, reverse=True)
+    entries.sort(key=lambda entry: _list_summary(entry[2])[0] or 0, reverse=True)
     if args.limit and args.limit > 0:
         entries = entries[: args.limit]
     return entries
 
 
+def _summary_timestamp(meta: Meta, field: str, errors: list[str]) -> int | float | None:
+    """Return one finite persisted summary timestamp without coercion."""
+    raw = meta.get(field)
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, (int, float))
+        or isinstance(raw, bool)
+        or not math.isfinite(raw)
+        or raw < 0
+    ):
+        errors.append(field)
+        return None
+    return raw
+
+
+def _list_summary(
+    meta: Meta,
+) -> tuple[int | float | None, int | None, str | None, str | None, list[str]]:
+    """Validate persisted metadata used by the multi-agent list surface.
+
+    Returns:
+        Canonical summary values plus malformed field names.
+    """
+    errors: list[str] = []
+
+    created_at = _summary_timestamp(meta, "created_at", errors)
+
+    prompt_count: int | None = None
+    if "prompt_count" in meta:
+        raw_prompt_count = meta["prompt_count"]
+        if type(raw_prompt_count) is not int or raw_prompt_count < 0:
+            errors.append("prompt_count")
+        else:
+            prompt_count = raw_prompt_count
+
+    cwd: str | None = None
+    raw_cwd = meta.get("cwd")
+    if raw_cwd is not None:
+        if type(raw_cwd) is not str:
+            errors.append("cwd")
+        else:
+            cwd = raw_cwd
+
+    title: str | None = None
+    raw_title = meta.get("title")
+    if raw_title is not None:
+        if type(raw_title) is not str:
+            errors.append("title")
+        else:
+            title = raw_title
+
+    return created_at, prompt_count, cwd, title, errors
+
+
+def _status_summary(
+    meta: Meta,
+) -> tuple[
+    int | float | None,
+    int | float | None,
+    int | float | None,
+    int | None,
+    str | None,
+    str | None,
+    list[str],
+]:
+    """Validate persisted metadata shared by list and status surfaces.
+
+    Returns:
+        Canonical status summary values plus malformed field names.
+    """
+    created_at, prompt_count, cwd, title, errors = _list_summary(meta)
+    started_at = _summary_timestamp(meta, "started_at", errors)
+    finished_at = _summary_timestamp(meta, "finished_at", errors)
+    return created_at, started_at, finished_at, prompt_count, cwd, title, errors
+
+
+def _status_optional_string(meta: Meta, field: str, errors: list[str]) -> str | None:
+    """Return one optional non-empty persisted status string without coercion."""
+    raw = meta.get(field)
+    if raw is None:
+        return None
+    if type(raw) is not str or not raw:
+        errors.append(field)
+        return None
+    return raw
+
+
+def _status_process_id(meta: Meta, field: str, errors: list[str]) -> int | None:
+    """Return one optional persisted process identity without coercion."""
+    raw = meta.get(field)
+    if raw is None:
+        return None
+    value = _process_identity_int(raw, minimum=1)
+    if value is None:
+        errors.append(field)
+    return value
+
+
+def _status_activity_timestamp(meta: Meta, errors: list[str]) -> int | float | None:
+    """Return the optional canonical last-activity timestamp."""
+    return _summary_timestamp(meta, "last_activity_at", errors)
+
+
+def _status_exit_code(meta: Meta, errors: list[str]) -> int | None:
+    """Return the optional canonical subprocess return code."""
+    raw = meta.get("exit_code")
+    if raw is None:
+        return None
+    if type(raw) is not int:
+        errors.append("exit_code")
+        return None
+    return raw
+
+
+def _status_exit_signal(meta: Meta, errors: list[str]) -> int | None:
+    """Return the optional canonical positive terminating signal."""
+    raw = meta.get("exit_signal")
+    if raw is None:
+        return None
+    value = _process_identity_int(raw, minimum=1)
+    if value is None:
+        errors.append("exit_signal")
+    return value
+
+
 def _entry_json(aid: str, state: str, meta: Meta) -> Meta:
     """Build the JSON mapping for one agent list entry.
 
-    Args:
-        aid: Agent ID.
-        state: Agent state.
-        meta: Agent metadata.
-
     Returns:
-        The JSON-safe mapping.
+        The sanitized JSON-safe list entry.
     """
-    return {
+    created_at, prompt_count, cwd, title, errors = _list_summary(meta)
+    finished_at = _summary_timestamp(meta, "finished_at", errors)
+    last_activity_at = _summary_timestamp(meta, "last_activity_at", errors)
+    entry: Meta = {
         "id": aid,
         "state": state,
-        "prompts": meta.get("prompt_count"),
-        "cwd": meta.get("cwd"),
-        "title": meta.get("title"),
-        "created_at": meta.get("created_at"),
-        "last_activity_at": meta.get("last_activity_at"),
-        "finished_at": meta.get("finished_at"),
+        "prompts": prompt_count,
+        "cwd": cwd,
+        "title": title,
+        "created_at": created_at,
+        "last_activity_at": last_activity_at,
+        "finished_at": finished_at,
     }
+    if errors:
+        entry["metadata_errors"] = errors
+    return entry
 
 
 def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
@@ -3161,15 +3967,19 @@ def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
     """
     rows = []
     for aid, state, meta in entries:
-        cwd = _truncate(meta.get("cwd") or "", 24)
-        title = _truncate((meta.get("title") or "").replace("\n", " "), 40)
+        created_at, prompt_count, cwd, title, errors = _list_summary(meta)
+        error_fields = set(errors)
         rows.append((
             aid,
             state,
-            str(meta.get("prompt_count") or 0),
-            fmt_age(meta.get("created_at")),
-            cwd,
-            title,
+            "<invalid>" if "prompt_count" in error_fields else str(prompt_count or 0),
+            "<invalid>" if "created_at" in error_fields else fmt_age(created_at),
+            "<invalid>" if "cwd" in error_fields else _truncate(cwd or "", 24),
+            (
+                "<invalid>"
+                if "title" in error_fields
+                else _truncate((title or "").replace("\n", " "), 40)
+            ),
         ))
     widths = [max(len(row[i]) for row in rows) for i in range(6)]
     labels = ("ID", "STATE", "P", "AGE", "CWD", "TITLE")
@@ -3180,7 +3990,7 @@ def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
         _out("  ".join(row[i].ljust(widths[i]) for i in range(6)))
 
 
-def cmd_status(args: argparse.Namespace) -> int:
+def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals]
     """Show detailed status of one agent.
 
     Args:
@@ -3208,21 +4018,41 @@ def cmd_status(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     log_path = agent_dir(aid) / "output.log"
+    created_at, started_at, finished_at, prompt_count, cwd, title, metadata_errors = (
+        _status_summary(meta)
+    )
+    exit_code = _status_exit_code(meta, metadata_errors)
+    error_fields = set(metadata_errors)
     _out(f"agent:      {aid}")
     _out(f"state:      {state}")
     _out(f"alive:      {'yes' if alive else 'no'}")
     _out(f"cpu:        {fmt_cpu(_status_cpu_seconds(meta, alive=alive))}")
-    _out(f"cwd:        {meta.get('cwd') or '-'}")
-    _out(f"created:    {fmt_time(meta.get('created_at'))}")
-    _out(f"started:    {fmt_time(meta.get('started_at'))}")
-    _out(f"finished:   {fmt_time(meta.get('finished_at'))}")
-    exit_code = meta.get("exit_code")
-    _out(f"exit code:  {exit_code if exit_code is not None else '-'}")
-    _out(f"prompts:    {meta.get('prompt_count') or 0}")
-    steers = meta.get("steer_queue") or []
-    if steers:
-        _out(f"steers:     {len(steers)} queued: {_first_line(steers[0].get('prompt') or '')}")
-    _out(f"title:      {meta.get('title') or '-'}")
+    _out(f"cwd:        {'<invalid>' if 'cwd' in error_fields else cwd or '-'}")
+    _out(f"created:    {'<invalid>' if 'created_at' in error_fields else fmt_time(created_at)}")
+    _out(f"started:    {'<invalid>' if 'started_at' in error_fields else fmt_time(started_at)}")
+    _out(f"finished:   {'<invalid>' if 'finished_at' in error_fields else fmt_time(finished_at)}")
+    exit_code_text = (
+        "<invalid>"
+        if "exit_code" in error_fields
+        else str(exit_code)
+        if exit_code is not None
+        else "-"
+    )
+    _out(f"exit code:  {exit_code_text}")
+    _out(f"prompts:    {'<invalid>' if 'prompt_count' in error_fields else prompt_count or 0}")
+    steers, steer_error = _status_steer_queue(meta)
+    if steer_error is not None:
+        _out(f"steers:     {steer_error}")
+    elif steers:
+        _out(f"steers:     {len(steers)} queued: {_first_line(steers[0]['prompt'])}")
+    intent, intent_malformed = _persisted_intent(meta)
+    if intent_malformed:
+        _out("steer:      malformed persisted lifecycle intent")
+    elif intent == "steer":
+        _out("steer:      hard-preempting current invocation")
+    _out(f"title:      {'<invalid>' if 'title' in error_fields else title or '-'}")
+    if metadata_errors:
+        _out(f"metadata:   malformed persisted summary metadata: {', '.join(metadata_errors)}")
     _out("tail(log):")
     excerpt = log_excerpt(log_path, STATUS_TAIL_LINES)
     if excerpt:
@@ -3249,6 +4079,17 @@ def _status_cpu_seconds(meta: Meta, *, alive: bool) -> float | None:
     return proc_cpu_seconds(meta.get("pid"))
 
 
+def _status_steer_queue(meta: Meta) -> tuple[list[Meta] | None, str | None]:
+    """Return validated steer status data without normalizing corruption."""
+    sequence = _steer_sequence(meta)
+    if sequence is None:
+        return None, "malformed persisted steer metadata"
+    queue = _steer_queue(meta, sequence=sequence)
+    if queue is None:
+        return None, "malformed persisted steer metadata"
+    return queue, None
+
+
 def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
     """Build the JSON status mapping for an agent.
 
@@ -3261,34 +4102,40 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
     Returns:
         The JSON-safe mapping.
     """
-    return {
+    steers, steer_error = _status_steer_queue(meta)
+    intent, intent_malformed = _persisted_intent(meta)
+    created_at, started_at, finished_at, prompt_count, cwd, title, metadata_errors = (
+        _status_summary(meta)
+    )
+    status = {
         "id": aid,
         "state": state,
         "alive": alive,
         "cpu_seconds": _status_cpu_seconds(meta, alive=alive),
-        "native_session_id": meta.get("native_session_id"),
-        "pid": meta.get("pid"),
-        "pgid": meta.get("pgid"),
-        "runner_pid": meta.get("runner_pid"),
-        "cwd": meta.get("cwd"),
-        "title": meta.get("title"),
-        "created_at": meta.get("created_at"),
-        "started_at": meta.get("started_at"),
-        "finished_at": meta.get("finished_at"),
-        "last_activity_at": meta.get("last_activity_at"),
-        "exit_code": meta.get("exit_code"),
-        "exit_signal": meta.get("exit_signal"),
-        "prompts": meta.get("prompt_count"),
-        "steers_pending": len(meta.get("steer_queue") or []),
-        "next_steer": (
-            _first_line((meta.get("steer_queue") or [{}])[0].get("prompt") or "")
-            if meta.get("steer_queue")
-            else None
-        ),
+        "native_session_id": _status_optional_string(meta, "native_session_id", metadata_errors),
+        "pid": _status_process_id(meta, "pid", metadata_errors),
+        "pgid": _status_process_id(meta, "pgid", metadata_errors),
+        "runner_pid": _status_process_id(meta, "runner_pid", metadata_errors),
+        "cwd": cwd,
+        "title": title,
+        "created_at": created_at,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "last_activity_at": _status_activity_timestamp(meta, metadata_errors),
+        "exit_code": _status_exit_code(meta, metadata_errors),
+        "exit_signal": _status_exit_signal(meta, metadata_errors),
+        "prompts": prompt_count,
+        "steers_pending": len(steers) if steers is not None else None,
+        "next_steer": _first_line(steers[0]["prompt"]) if steers else None,
+        "steer_preempting": None if intent_malformed else intent == "steer",
+        "steer_metadata_error": steer_error,
         "model": AGENT_MODEL,
-        "variant": meta.get("variant"),
+        "variant": _status_optional_string(meta, "variant", metadata_errors),
         "log": str(agent_dir(aid) / "output.log"),
     }
+    if metadata_errors:
+        status["metadata_errors"] = metadata_errors
+    return status
 
 
 def _tail_logical_lines(path: Path, count: int) -> list[str]:
@@ -3792,9 +4639,14 @@ def _stale_running(aid: str) -> bool:
         ``True`` when the recorded process has stopped while state is running.
     """
     meta = read_meta(aid)
-    if meta is None:
+    if meta is None or meta.get("state") != "running":
         return False
-    return bool(meta.get("state") == "running" and meta.get("pid") and not is_alive(meta))
+    raw_pid = meta.get("pid")
+    if raw_pid is None:
+        return False
+    if _process_identity_int(raw_pid, minimum=1) is None:
+        return True
+    return not is_alive(meta)
 
 
 def cmd_log(args: argparse.Namespace) -> int:
@@ -3851,10 +4703,11 @@ def _can_produce_output(aid: str) -> bool:
         return False
     if derive_state(meta) != "running":
         return False
-    pid = meta.get("pid")
-    if pid:
-        return is_alive(meta)
-    return runner_alive(meta)
+    if "pid" not in meta or meta["pid"] is None:
+        return runner_alive(meta)
+    if _process_identity_int(meta["pid"], minimum=1) is None:
+        return False
+    return is_alive(meta)
 
 
 def _wait_for_first_output(aid: str, log_path: Path) -> bool:
@@ -3987,18 +4840,32 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
         ``True`` only when the cancellation was applied under the lock.
     """
     identity = _invocation_identity(meta)
-    expected_pending = meta.get("pending_prompt")
+    try:
+        expected_pending = _pending_prompt(meta)
+    except MalformedPendingPromptMetadataError:
+        return False
     res = meta.get("runner_reservation")
+    expected_reservation_state = _runner_reservation_state(res)
+    if expected_reservation_state == "malformed":
+        return False
     expected_gen = res.get("gen") if isinstance(res, dict) else None
     applied = False
 
     def cancel(m: Meta) -> None:
         nonlocal applied
         cur_res = m.get("runner_reservation")
+        cur_reservation_state = _runner_reservation_state(cur_res)
+        if cur_reservation_state == "malformed":
+            return
         cur_gen = cur_res.get("gen") if isinstance(cur_res, dict) else None
+        try:
+            current_pending = _pending_prompt(m)
+        except MalformedPendingPromptMetadataError:
+            return
         if (
             _invocation_identity(m) != identity
-            or m.get("pending_prompt") != expected_pending
+            or current_pending != expected_pending
+            or cur_reservation_state != expected_reservation_state
             or cur_gen != expected_gen
         ):
             return
@@ -4009,6 +4876,16 @@ def _cancel_runner_work(aid: str, intent: str, meta: Meta) -> bool:
 
     update_meta(aid, cancel)
     return applied
+
+
+def _persisted_runner_identity(meta: Meta) -> tuple[int, int, str] | None:
+    """Return strict recorded-runner process and marker authority."""
+    pid = _process_identity_int(meta.get("runner_pid"), minimum=1)
+    ticks = _process_identity_int(meta.get("runner_start_time"), minimum=0)
+    aid = _persisted_agent_id(meta.get("id"))
+    if pid is None or ticks is None or aid is None:
+        return None
+    return pid, ticks, aid
 
 
 def _runner_identity_state(pid: int, ticks: object, aid: str) -> str:
@@ -4071,14 +4948,17 @@ def _converge_observed_runner(observed: Meta, mode: str) -> bool:
     Returns:
         ``True`` only when the observed runner identity is provably gone.
     """
-    pid = observed.get("runner_pid")
-    if not pid:
+    raw_pid = observed.get("runner_pid")
+    if raw_pid is None:
         # No runner was ever recorded (reserved pre-spawn window); nothing to
         # converge beyond dropping the reservation.
         return True
-    pid = int(pid)
-    ticks = observed.get("runner_start_time")
-    marker_aid = str(observed.get("id", ""))
+    identity = _persisted_runner_identity(observed)
+    if identity is None:
+        # Present malformed durable identity is ambiguous authority, not
+        # absence and never signalling authority.
+        return False
+    pid, ticks, marker_aid = identity
     grace_signal = signal.SIGTERM if mode == "stop" else signal.SIGKILL
     signal_identity_checked(pid, ticks, grace_signal, marker_aid=marker_aid)
 
@@ -4114,11 +4994,35 @@ def _no_invocation_owned(meta: Meta) -> bool:
         ``True`` when no proven-live runner, in-flight reservation, or
         accepted pending prompt remains.
     """
-    return (
-        not runner_alive(meta)
-        and not reservation_in_flight(meta)
-        and not meta.get("pending_prompt")
-    )
+    try:
+        pending = _pending_prompt(meta)
+    except MalformedPendingPromptMetadataError:
+        return False
+    return not runner_alive(meta) and not reservation_in_flight(meta) and pending is None
+
+
+def _stop_like_authority_error(meta: Meta) -> str | None:
+    """Return why stop/kill cannot safely interpret execution authority.
+
+    A stop-like command may retry when canonical ownership changes concurrently,
+    but malformed durable authority is not a transient ownership change. It
+    must return a bounded failure instead of repeatedly re-reading the same
+    corrupt record and busy-spinning forever.
+
+    Args:
+        meta: Agent metadata being considered for stop/kill.
+
+    Returns:
+        A diagnostic when durable execution authority is malformed, otherwise
+        ``None``.
+    """
+    try:
+        _pending_prompt(meta)
+    except MalformedPendingPromptMetadataError:
+        return "pending prompt authority is malformed"
+    if _runner_reservation_state(meta.get("runner_reservation")) == "malformed":
+        return "runner reservation authority is malformed"
+    return None
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -4152,6 +5056,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
     while True:
         if is_alive(meta) or group_alive(meta):
             return _signal_live_invocation(aid, meta, "stop")
+        authority_error = _stop_like_authority_error(meta)
+        if authority_error is not None:
+            _err(f"{PROG}: agent {aid} cannot be stopped safely: {authority_error}")
+            return EXIT_ERROR
         if _no_invocation_owned(meta):
             _out(f"{PROG}: agent {aid} is already stopped (state {derive_state(meta)})")
             return EXIT_OK
@@ -4193,6 +5101,10 @@ def cmd_kill(args: argparse.Namespace) -> int:
     while True:
         if is_alive(meta) or group_alive(meta):
             return _signal_live_invocation(aid, meta, "kill")
+        authority_error = _stop_like_authority_error(meta)
+        if authority_error is not None:
+            _err(f"{PROG}: agent {aid} cannot be killed safely: {authority_error}")
+            return EXIT_ERROR
         if _no_invocation_owned(meta):
             _out(f"{PROG}: agent {aid} is already dead (state {derive_state(meta)})")
             return EXIT_OK
@@ -4281,10 +5193,8 @@ def _signal_live_invocation(aid: str, meta: Meta, mode: str) -> int:
                 (-signal.SIGKILL, signal.SIGKILL, "stopped", "stop"),
                 f"stopped agent {aid} (force-killed group members)",
             )
-        _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
         _err(f"{PROG}: agent {aid} did not stop within {STOP_WAIT_SECONDS:.0f}s; use 'kill'")
         return EXIT_ERROR
-    _update_meta_if_same_invocation(aid, identity, lambda m: m.update(intent=None))
     _err(f"{PROG}: agent {aid} could not be killed")
     return EXIT_ERROR
 
@@ -4310,6 +5220,8 @@ def _begin_delete(aid: str, *, force: bool) -> Meta | None:
     snapshot: dict[str, Meta] = {}
 
     def fn(m: Meta) -> None:
+        if _delete_pending_flag(m) is None:
+            return
         m["delete_pending"] = True
         if force:
             m["intent"] = "kill"
@@ -4324,8 +5236,8 @@ def _begin_delete(aid: str, *, force: bool) -> Meta | None:
             "invocation_id": m.get("invocation_id"),
             "runner_pid": m.get("runner_pid"),
             "runner_start_time": m.get("runner_start_time"),
-            "active_runner": bool(m.get("active_runner")),
-            "runner_reservation": dict(res) if isinstance(res, dict) else None,
+            "active_runner": m.get("active_runner"),
+            "runner_reservation": dict(res) if isinstance(res, dict) else res,
             "unresolved_invocation": dict(marker) if isinstance(marker, dict) else None,
             "delete_pending": True,
         }
@@ -4346,6 +5258,19 @@ def _delete_converged(cur: Meta | None) -> bool:
     """
     if cur is None:
         return True
+    if _delete_pending_flag(cur) is not True:
+        return False
+    if _active_runner_flag(cur) is None:
+        return False
+    raw_runner_pid = cur.get("runner_pid")
+    if raw_runner_pid is not None and (
+        _process_identity_int(raw_runner_pid, minimum=1) is None
+        or _process_identity_int(cur.get("runner_start_time"), minimum=0) is None
+    ):
+        # Present malformed runner identity is unresolved durable authority.
+        # Liveness helpers intentionally return false for malformed identity,
+        # but deletion must not reinterpret that as positive convergence.
+        return False
     if _unresolved_child_state(cur) != "gone":
         # An exact unrecorded invocation was never positively proven gone
         # (still live, or evidence ambiguous): deletion must not remove
@@ -4374,7 +5299,7 @@ def _signal_unresolved_child(meta: Meta) -> None:
         return
     send_signal_group(
         {
-            "id": str(meta.get("id", "")),
+            "id": meta.get("id"),
             "pid": rec["pid"],
             "pgid": rec["pid"],
             "start_time": rec.get("start_time"),
@@ -4385,8 +5310,13 @@ def _signal_unresolved_child(meta: Meta) -> None:
 
 
 def _abort_delete(aid: str) -> None:
-    """Clear the deletion tombstone so a failed delete can be retried."""
-    update_meta(aid, lambda m: m.update(delete_pending=False))
+    """Clear only a canonical deletion tombstone after failed convergence."""
+
+    def clear(m: Meta) -> None:
+        if _delete_pending_flag(m) is True:
+            m["delete_pending"] = False
+
+    update_meta(aid, clear)
 
 
 def _remove_deleted_state(aid: str) -> bool:
@@ -4402,6 +5332,30 @@ def _remove_deleted_state(aid: str) -> bool:
     return not agent_dir(aid).exists()
 
 
+def _signal_delete_execution(cur: Meta) -> bool:
+    """Signal exact recorded execution identities during forced deletion.
+
+    Returns:
+        ``True`` when every present identity is canonical and was signalled.
+    """
+    raw_runner_pid = cur.get("runner_pid")
+    if raw_runner_pid is not None:
+        identity = _persisted_runner_identity(cur)
+        if identity is None:
+            return False
+        runner_pid, runner_ticks, marker_aid = identity
+        signal_identity_checked(
+            runner_pid,
+            runner_ticks,
+            signal.SIGKILL,
+            marker_aid=marker_aid,
+        )
+    if group_alive(cur):
+        send_signal_group(cur, signal.SIGKILL)
+    _signal_unresolved_child(cur)
+    return True
+
+
 def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
     """Converge the exact runner and invocation before state removal.
 
@@ -4415,25 +5369,12 @@ def _converge_for_delete(aid: str, *, force: bool, deadline: float) -> bool:
     """
     while True:
         cur = read_meta(aid)
-        if cur is not None and cur.get("delete_pending"):
+        if cur is not None:
+            if _delete_pending_flag(cur) is not True:
+                return False
             if force:
-                # Converge the exact recorded runner identity first: pinned,
-                # start-time and marker verified at the signal point, so a
-                # recycled runner PID can never be signalled.
-                if cur.get("runner_pid"):
-                    signal_identity_checked(
-                        int(cur["runner_pid"]),
-                        cur.get("runner_start_time"),
-                        signal.SIGKILL,
-                        marker_aid=str(cur.get("id", "")),
-                    )
-                # ...then the exact invocation process group.
-                if group_alive(cur):
-                    send_signal_group(cur, signal.SIGKILL)
-                # ...and the exact unrecorded child, if any survived the
-                # spawn gate: signalled only through the same pinned,
-                # identity-exact path — never a numeric PID/PGID fallback.
-                _signal_unresolved_child(cur)
+                if not _signal_delete_execution(cur):
+                    return False
             elif not _delete_converged(cur):
                 # Something became live between the decision and the
                 # tombstone; non-forced deletion must not kill it.
@@ -4470,7 +5411,9 @@ def cmd_delete(args: argparse.Namespace) -> int:
     if live and not args.force:
         _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
         return EXIT_ERROR
-    _begin_delete(aid, force=args.force)
+    if _begin_delete(aid, force=args.force) is None:
+        _err(f"{PROG}: agent {aid} could not establish deletion authority")
+        return EXIT_ERROR
     if not _converge_for_delete(aid, force=args.force, deadline=time.time() + KILL_WAIT_SECONDS):
         # Fail closed: convergence was not proven, so keep the retryable state.
         _abort_delete(aid)
@@ -4526,7 +5469,8 @@ def _retention_remove(aid: str, deadline: float) -> str:
         return "skipped"
     if _retention_clean_live(meta):
         return "skipped"
-    _begin_delete(aid, force=False)
+    if _begin_delete(aid, force=False) is None:
+        return "skipped"
     if not _converge_for_delete(aid, force=False, deadline=deadline):
         # Fail closed: it became live between the tombstone and convergence.
         _abort_delete(aid)
@@ -4617,7 +5561,7 @@ def _clean_candidates(days: int) -> list[str]:
             continue
         if derive_state(meta) not in TERMINAL_STATES:
             continue
-        finished = meta.get("finished_at")
+        finished = _persisted_timestamp(meta.get("finished_at"))
         if finished is not None and finished < cutoff:
             candidates.append(aid)
     return candidates

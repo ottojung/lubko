@@ -1,0 +1,285 @@
+"""Managed-agent runner generation authority invariants."""
+
+from __future__ import annotations
+
+import os
+from typing import TYPE_CHECKING
+
+import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+from lubko import agent
+
+
+@pytest.mark.parametrize("generation", [7.9, "7", True, False, 0, -1, None, [], {}])
+def test_reservation_generation_must_be_canonical_integer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    generation: object,
+) -> None:
+    """Malformed reservation generations fail closed without live authority."""
+    meta = agent.idle_meta("audit", str(tmp_path), None)
+    meta.update(
+        active_runner=True,
+        runner_reservation={
+            "state": "reserved",
+            "gen": generation,
+            "owner_pid": 1,
+            "owner_start_ticks": 1,
+            "mode": "new",
+        },
+    )
+    marker_calls: list[tuple[str, int]] = []
+    owner_calls: list[tuple[object, object]] = []
+
+    def owner_alive(pid: object, ticks: object) -> bool:
+        owner_calls.append((pid, ticks))
+        return True
+
+    def marker_alive(aid: str, gen: int) -> bool:
+        marker_calls.append((aid, gen))
+        return True
+
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_owner_alive", owner_alive)
+    monkeypatch.setattr(agent, "_runner_marker_alive", marker_alive)
+
+    assert agent.reservation_in_flight(meta)
+    assert agent.is_genuinely_running(meta)
+    assert not agent.active_runner_justified(meta)
+    assert owner_calls == []
+    assert marker_calls == []
+
+
+def test_canonical_reservation_generation_retains_marker_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Canonical integer generations retain the marker fallback."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta.update(
+        active_runner=True,
+        runner_reservation={
+            "state": "reserved",
+            "gen": 7,
+            "owner_pid": 1,
+            "owner_start_ticks": 1,
+            "mode": "new",
+        },
+    )
+    marker_calls: list[tuple[str, int]] = []
+
+    def marker_alive(aid: str, gen: int) -> bool:
+        marker_calls.append((aid, gen))
+        return True
+
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_owner_alive", lambda _pid, _ticks: False)
+    monkeypatch.setattr(agent, "_runner_marker_alive", marker_alive)
+
+    assert agent.reservation_in_flight(meta)
+    assert marker_calls == [("a11d", 7)]
+
+
+@pytest.mark.parametrize("persisted_id", [123, True, "", None, "ABCDEF", "not-hex"])
+def test_malformed_persisted_agent_id_cannot_authorize_reservation_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    persisted_id: object,
+) -> None:
+    """Malformed durable agent IDs never reach reservation marker authority."""
+    meta = agent.idle_meta("a11d", str(tmp_path), None)
+    meta.update(
+        id=persisted_id,
+        active_runner=True,
+        runner_reservation={
+            "state": "reserved",
+            "gen": 7,
+            "owner_pid": 1,
+            "owner_start_ticks": 1,
+        },
+    )
+    marker_calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_owner_alive", lambda _pid, _ticks: False)
+
+    def marker_alive(aid: str, gen: int) -> bool:
+        marker_calls.append((aid, gen))
+        return True
+
+    monkeypatch.setattr(agent, "_runner_marker_alive", marker_alive)
+
+    assert not agent.reservation_in_flight(meta)
+    assert marker_calls == []
+
+
+@pytest.mark.parametrize("generation", [7.9, "7", True, False, -1, None])
+def test_malformed_runner_generation_blocks_allocation(
+    tmp_path: Path,
+    generation: object,
+) -> None:
+    """Malformed persisted runner history cannot allocate a new generation."""
+    meta = agent.idle_meta("audit", str(tmp_path), None)
+    meta["runner_gen"] = generation
+    decision: dict[str, object] = {}
+
+    agent._apply_locked_transition(
+        meta,
+        decision,
+        prompt="work",
+        steer=False,
+        mode="new",
+    )
+
+    assert decision == {"action": "busy"}
+    assert meta["runner_gen"] is generation
+    assert meta["runner_reservation"] is None
+
+
+@pytest.mark.parametrize("generation", [7.9, "7", True, False, -1, None])
+def test_malformed_runner_generation_blocks_stale_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    generation: object,
+) -> None:
+    """Malformed persisted runner history cannot allocate during stale recovery."""
+    meta = agent.idle_meta("audit", str(tmp_path), None)
+    meta.update(
+        active_runner=True,
+        runner_gen=generation,
+        runner_reservation={
+            "state": "reserved",
+            "gen": 7,
+            "owner_pid": 1,
+            "owner_start_ticks": 1,
+            "mode": "new",
+        },
+        pending_prompt="original",
+    )
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_owner_alive", lambda _pid, _ticks: False)
+    monkeypatch.setattr(agent, "_runner_marker_alive", lambda _aid, _gen: False)
+    decision: dict[str, object] = {}
+
+    agent._apply_locked_transition(
+        meta,
+        decision,
+        prompt="late",
+        steer=False,
+        mode="new",
+    )
+
+    assert decision == {"action": "busy"}
+    assert meta["runner_gen"] is generation
+    reservation = meta["runner_reservation"]
+    assert isinstance(reservation, dict)
+    assert reservation["gen"] == 7
+
+
+def test_valid_stale_recovery_allocates_next_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Valid stale recovery remains monotonic."""
+    meta = agent.idle_meta("audit", str(tmp_path), None)
+    meta.update(
+        active_runner=True,
+        runner_gen=7,
+        runner_reservation={
+            "state": "reserved",
+            "gen": 7,
+            "owner_pid": 1,
+            "owner_start_ticks": 1,
+            "mode": "new",
+        },
+        pending_prompt="original",
+    )
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "_owner_alive", lambda _pid, _ticks: False)
+    monkeypatch.setattr(agent, "_runner_marker_alive", lambda _aid, _gen: False)
+    decision: dict[str, object] = {}
+
+    agent._apply_locked_transition(
+        meta,
+        decision,
+        prompt="late",
+        steer=False,
+        mode="new",
+    )
+
+    assert decision["action"] == "spawn"
+    assert decision["gen"] == 8
+    assert meta["runner_gen"] == 8
+    reservation = meta["runner_reservation"]
+    assert isinstance(reservation, dict)
+    assert reservation["gen"] == 8
+
+
+def _meta(tmp_path: Path, *, owner_pid: object, owner_ticks: object) -> agent.Meta:
+    meta = agent.idle_meta("audit", str(tmp_path), None)
+    meta.update(
+        active_runner=True,
+        runner_gen=7,
+        runner_reservation={
+            "state": "reserved",
+            "gen": 7,
+            "owner_pid": owner_pid,
+            "owner_start_ticks": owner_ticks,
+            "mode": "new",
+        },
+    )
+    return meta
+
+
+def test_canonical_reservation_owner_matches_exact_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Canonical integer owner identity establishes exact self-ownership."""
+    caller = 4242
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda pid: 777 if pid == caller else None)
+    assert agent.owned_by_me(_meta(tmp_path, owner_pid=caller, owner_ticks=777), caller)
+
+
+def test_malformed_reservation_owner_never_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed durable owner identity never establishes ownership."""
+    caller = 4242
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda pid: 777 if pid == caller else None)
+    malformed = [
+        (4242.0, 777),
+        (4242, 777.0),
+        ("4242", 777),
+        (4242, "777"),
+        (True, 777),
+        (4242, True),
+        (0, 777),
+        (-1, 777),
+        (4242, -1),
+    ]
+    for owner_pid, owner_ticks in malformed:
+        assert not agent.owned_by_me(
+            _meta(tmp_path, owner_pid=owner_pid, owner_ticks=owner_ticks), caller
+        )
+
+
+def test_malformed_numeric_owner_cannot_authorize_prompt_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed numerically equal identity cannot authorize prompt reuse."""
+    caller = os.getpid()
+    ticks = 777
+    meta = _meta(tmp_path, owner_pid=float(caller), owner_ticks=float(ticks))
+    monkeypatch.setattr(agent, "proc_start_ticks", lambda pid: ticks if pid == caller else None)
+    monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
+    monkeypatch.setattr(agent, "reservation_in_flight", lambda _meta: True)
+    decision: dict[str, object] = {}
+
+    agent._apply_locked_transition(meta, decision, prompt="new work", steer=False, mode="new")
+
+    assert decision == {"action": "busy"}
+    assert meta.get("pending_prompt") is None

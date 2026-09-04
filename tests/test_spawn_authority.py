@@ -129,14 +129,20 @@ def test_obligation_roundtrip_is_exact() -> None:
     assert restored == obligation
 
 
-@pytest.mark.parametrize("raw", [7, "nope", {"token": 5}, {"commit": COMMIT}])
 def test_present_malformed_obligation_is_durable_hold(
-    raw: object,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A corrupt obligation survives its own corruption and blocks spawns."""
+    """All malformed shapes parse closed; one durable shape blocks spawns."""
+    malformed: tuple[object, ...] = (7, "nope", {"token": 5}, {"commit": COMMIT})
+    for raw in malformed:
+        state = supervise.SupervisorState.from_dict({
+            "schema_version": supervise.SCHEMA_VERSION,
+            "spawning": raw,
+        })
+        assert state.spawning_hold_malformed is True
+
     supervise.state_path().write_text(
-        json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": raw}),
+        json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": "nope"}),
         encoding="utf-8",
     )
     state = supervise.read_state()
@@ -155,40 +161,34 @@ def test_present_malformed_obligation_is_durable_hold(
     assert "malformed" in daemon._message
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
+def test_parent_death_signal_field_parses_strictly() -> None:
+    """An absent field stays legacy-True; explicit booleans round-trip."""
+    cases: tuple[tuple[dict[str, object], bool], ...] = (
         ({}, True),
         ({"parent_death_signal": True}, True),
         ({"parent_death_signal": False}, False),
-    ],
-)
-def test_parent_death_signal_field_parses_strictly(
-    *,
-    raw: dict[str, object],
-    expected: bool,
-) -> None:
-    """An absent field stays legacy-True; explicit booleans round-trip."""
-    base = _obligation(pid=4242, ticks=777)
-    data = base.to_dict()
-    for key, value in raw.items():
-        data[key] = value
-    restored = SpawningObligation.from_dict(data)
-    assert restored.parent_death_signal is expected
-    assert restored.pid == 4242
+    )
+    for raw, expected in cases:
+        data = _obligation(pid=4242, ticks=777).to_dict()
+        data.update(raw)
+        restored = SpawningObligation.from_dict(data)
+        assert restored.parent_death_signal is expected
+        assert restored.pid == 4242
 
 
-@pytest.mark.parametrize("value", [None, "true", 1, 0.0, [True], {"pds": True}])
 def test_present_malformed_parent_death_signal_is_durable_hold(
-    value: object,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A present non-boolean flag fails closed instead of claiming a kernel guarantee."""
-    data = _obligation(pid=4242, ticks=777).to_dict()
-    data["parent_death_signal"] = value
-    with pytest.raises(ValueError, match="malformed"):
-        SpawningObligation.from_dict(data)
+    """All non-booleans parse closed; representative corruption stays durable."""
+    malformed: tuple[object, ...] = (None, "true", 1, 0.0, [True], {"pds": True})
+    for value in malformed:
+        data = _obligation(pid=4242, ticks=777).to_dict()
+        data["parent_death_signal"] = value
+        with pytest.raises(ValueError, match="malformed"):
+            SpawningObligation.from_dict(data)
 
+    data = _obligation(pid=4242, ticks=777).to_dict()
+    data["parent_death_signal"] = "true"
     supervise.state_path().write_text(
         json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": data}),
         encoding="utf-8",
@@ -209,24 +209,24 @@ def test_present_malformed_parent_death_signal_is_durable_hold(
     assert "malformed" in daemon._message
 
 
-@pytest.mark.parametrize("value", [None, "false", 0, [False]])
 def test_malformed_pid_less_obligation_never_auto_resolves(
-    value: object,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Malformed flags cannot turn a pid-less obligation auto-resolvable."""
+    """All malformed flags parse closed; durable corruption never auto-resolves."""
+    malformed: tuple[object, ...] = (None, "false", 0, [False])
+    for value in malformed:
+        data = _obligation(pid=None, ticks=None).to_dict()
+        data["parent_death_signal"] = value
+        with pytest.raises(ValueError, match="malformed"):
+            SpawningObligation.from_dict(data)
+
     data = _obligation(pid=None, ticks=None).to_dict()
-    # The on-disk shape is exactly what an operator repair or a buggy writer
-    # could leave behind: the flag key present but not a real boolean.
-    data["parent_death_signal"] = value
-    with pytest.raises(ValueError, match="malformed"):
-        SpawningObligation.from_dict(data)
+    data["parent_death_signal"] = "false"
     supervise.state_path().write_text(
         json.dumps({"schema_version": supervise.SCHEMA_VERSION, "spawning": data}),
         encoding="utf-8",
     )
     observed = _patch_recovery(monkeypatch)
-
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
 
     assert not daemon._resolve_spawning_obligation()
@@ -366,41 +366,41 @@ def test_previous_boot_obligation_resolves_without_evidence() -> None:
 
 
 def test_live_first_spawn_blocks_every_new_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Crash after Popen with a live first spawn: a second spawn is forbidden.
+    """A proven-live first spawn blocks every replacement until proven gone."""
+    pid = 4242
+    ticks = 777
+    obligation = _obligation(pid=pid, ticks=ticks)
+    _write_state_with_spawning(obligation)
+    monkeypatch.setattr(
+        supervisor, "proc_start_ticks", lambda candidate: ticks if candidate == pid else None
+    )
 
-    The obligation carries the exact identity (PID plus start-time ticks) of
-    a genuinely live process — the dangerous boundary state a successor
-    supervisor reads after the spawning daemon died. No spawn may be
-    authorized until that exact instance is positively gone.
-    """
-    proc = _blocking_child()
-    try:
-        ticks = proc_start_ticks(proc.pid)
-        assert ticks is not None
-        _write_state_with_spawning(_obligation(pid=proc.pid, ticks=ticks))
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings(stop_grace_seconds=0.05))
+    monkeypatch.setattr(
+        daemon,
+        "_converge_unresolved",
+        lambda _hold: False,
+    )
+    monkeypatch.setattr(
+        daemon,
+        "_spawn_worker",
+        lambda _commit: pytest.fail("a possibly-live first spawn authorized a second"),
+    )
+    daemon._ensure_worker(COMMIT)
 
-        daemon = supervisor.SupervisorDaemon(supervisor.Settings(stop_grace_seconds=0.05))
-        monkeypatch.setattr(
-            daemon,
-            "_spawn_worker",
-            lambda _commit: pytest.fail("a possibly-live first spawn authorized a second"),
-        )
-        daemon._ensure_worker(COMMIT)
+    assert daemon._message is not None
+    assert "still live" in daemon._message
+    state = read_state()
+    assert state.child is None, "no replacement worker was started"
+    assert state.spawning == obligation, "the blocking obligation survived"
+    assert state.unresolved_child is not None
+    assert state.unresolved_child.pid == pid
+    assert state.unresolved_child.start_time_ticks == ticks
 
-        assert daemon._message is not None
-        assert "still live" in daemon._message
-        assert read_state().child is None, "no replacement worker was started"
-        assert read_state().spawning is not None, "the blocking obligation survived"
-
-        # The first spawn's fate is now positively resolved (killed and
-        # reaped): only then does the gate open again.
-        proc.kill()
-        proc.wait()
-
-        assert daemon._resolve_spawning_obligation() is True
-        assert read_state().spawning is None
-    finally:
-        proc.poll()
+    monkeypatch.setattr(supervisor, "proc_start_ticks", lambda _candidate: None)
+    _patch_recovery(monkeypatch)
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
 
 
 def test_recycled_identity_never_extends_the_obligation(
@@ -408,17 +408,20 @@ def test_recycled_identity_never_extends_the_obligation(
 ) -> None:
     """A PID whose start ticks differ from the record proves the instance gone."""
     _patch_recovery(monkeypatch)
-    proc = _blocking_child()
-    try:
-        _write_state_with_spawning(_obligation(pid=proc.pid, ticks=1))
+    pid = 4242
+    recorded_ticks = 1
+    replacement_ticks = 2
+    _write_state_with_spawning(_obligation(pid=pid, ticks=recorded_ticks))
+    monkeypatch.setattr(
+        supervisor,
+        "proc_start_ticks",
+        lambda candidate: replacement_ticks if candidate == pid else None,
+    )
 
-        daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
 
-        assert daemon._resolve_spawning_obligation() is True
-        assert read_state().spawning is None
-    finally:
-        proc.kill()
-        proc.wait()
+    assert daemon._resolve_spawning_obligation() is True
+    assert read_state().spawning is None
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +721,7 @@ class FakeProc:
 def test_normal_spawn_writes_obligation_before_popen_and_clears_afterwards(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Every successful or failed normal spawn keeps the protocol coherent.
 
@@ -751,6 +755,11 @@ def test_normal_spawn_writes_obligation_before_popen_and_clears_afterwards(
     assert during.commit == COMMIT
     assert during.pid is None, "the child identity cannot exist before Popen"
     assert read_state().spawning is None, "the failed spawn cleared the obligation"
+    assert "maintained worker is unhealthy" in caplog.text
+    assert "worker pid=4711" in caplog.text
+    assert f"commit {COMMIT}" in caplog.text
+    assert "failed during startup with returncode 0" in caplog.text
+    assert f"worker log: {lifecycle.worker_log_path(during.token)}" in caplog.text
 
 
 def test_failed_runtime_check_never_leaves_an_obligation(
@@ -763,6 +772,37 @@ def test_failed_runtime_check_never_leaves_an_obligation(
 
     assert daemon._spawn_worker(COMMIT) is None
     assert read_state().spawning is None
+
+
+def test_unavailable_pdeathsig_never_crosses_popen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsupported parent-death guard holds before any spawn authority exists."""
+    calls: list[str] = []
+
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
+    monkeypatch.setattr(cli, "cli_entry_executable", lambda _commit, _name: "/bin/true")
+    monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: tmp_path)
+    monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
+
+    def unsupported() -> bool:
+        calls.append("probe")
+        return False
+
+    monkeypatch.setattr(supervisor, "_pdeathsig_supported", unsupported)
+    monkeypatch.setattr(
+        "lubko.supervisor.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("unguarded spawn crossed Popen"),
+    )
+
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+
+    assert daemon._spawn_worker(COMMIT) is None
+    assert calls == ["probe"]
+    assert read_state().spawning is None
+    assert daemon._message is not None
+    assert "parent-death protection is unavailable" in daemon._message
 
 
 def test_child_side_pdeathsig_failure_never_execs_worker_code(
@@ -959,6 +999,7 @@ def test_converged_unproven_spawn_recovery_failure_then_success(
 
 def test_exit_during_observation_recovery_failure_then_success(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A child exiting during identity observation owes exact group recovery."""
     obligation = _settle_obligation()
@@ -984,6 +1025,11 @@ def test_exit_during_observation_recovery_failure_then_success(
     assert held.token == obligation.token
     assert read_state().child is None
     assert events == ["recover"]
+    assert "maintained worker is unhealthy" in caplog.text
+    assert "worker pid=4711" in caplog.text
+    assert f"commit {COMMIT}" in caplog.text
+    assert "failed during startup with returncode 0" in caplog.text
+    assert f"worker log: {lifecycle.worker_log_path(obligation.token)}" in caplog.text
 
     observed = _patch_recovery(monkeypatch)
     assert daemon._resolve_spawning_obligation() is True

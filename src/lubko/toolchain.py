@@ -1,20 +1,10 @@
 """Resolution and persistence of the maintained ``uv`` executable.
 
-``lubko-install`` records the exact ``uv`` executable it successfully used to
-install the maintained commands into a small versioned JSON metadata file under
-the per-user Lubko state tree (``$XDG_STATE_HOME/lubko/toolchain.json``, default
-``~/.local/state/lubko/toolchain.json``). Later, ``lubko-deploy`` keeps working
-even when ``uv`` is no longer on PATH by falling back to that recorded
-executable.
-
-Resolution follows a strict, deterministic precedence:
-
-1. an explicit ``--uv`` argument, validated and never silently replaced;
-2. ``uv`` found on the current PATH;
-3. the ``uv`` executable recorded in Lubko state, validated to still exist and
-   be executable.
-
-When nothing is usable, resolution fails with a clear, actionable error.
+Runtime resolution deliberately does not make one external ``uv`` patch release
+part of Lubko's production protocol. CI pins its validation toolchain exactly and
+``uv.lock`` is consumed frozen; runtime deployment only requires an executable
+``uv`` path. The last successfully resolved path is persisted as a fallback when
+``uv`` is not on ``PATH``.
 """
 
 from __future__ import annotations
@@ -63,20 +53,8 @@ def toolchain_path() -> Path:
 
 
 def write_toolchain(uv_path: str) -> None:
-    """Crash-durably persist the resolved ``uv`` executable.
-
-    ``toolchain.json`` is recovery authority for later installs/deploys: it is
-    the fallback ``uv`` used when none is on PATH, so the write must be
-    confirmed durable.
-
-    Args:
-        uv_path: Absolute path of the ``uv`` executable used.
-
-    Note:
-        Fails closed: the write raises :class:`DurabilityError` from
-        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
-        durable, so callers must not advance a dependent action.
-    """
+    """Crash-durably persist one usable ``uv`` executable path."""
+    validate_uv_candidate(uv_path)
     meta = ToolchainMeta(schema_version=TOOLCHAIN_SCHEMA_VERSION, uv_path=uv_path)
     write_json_durable(toolchain_path(), meta.to_dict())
 
@@ -97,7 +75,12 @@ def read_toolchain() -> ToolchainMeta | None:
         return None
     if not isinstance(data, dict):
         return None
-    if data.get("schema_version") != TOOLCHAIN_SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != TOOLCHAIN_SCHEMA_VERSION
+    ):
         return None
     uv_path = data.get("uv_path")
     if not isinstance(uv_path, str) or not uv_path:
@@ -117,12 +100,26 @@ def is_executable(path: str) -> bool:
     return Path(path).is_file() and os.access(path, os.X_OK)
 
 
+def validate_uv_candidate(uv_path: str) -> None:
+    """Require ``uv_path`` to name an existing executable regular file.
+
+    Runtime compatibility is exercised by the actual frozen ``uv`` commands;
+    Lubko intentionally does not reject an executable because its patch version
+    differs from CI's build-tool pin.
+
+    Raises:
+        UvResolutionError: If the candidate is not an executable regular file.
+    """
+    if not is_executable(uv_path):
+        msg = f"uv executable not found or not executable: {uv_path!r}"
+        raise UvResolutionError(msg)
+
+
 def resolve_uv(explicit: str | None) -> str:
     """Resolve the ``uv`` executable following the maintained precedence.
 
-    The strict precedence is: explicit ``--uv``, then ``uv`` on PATH, then the
-    recorded Lubko toolchain executable. An explicit value that is not usable
-    is never silently replaced.
+    Each candidate must be an executable regular file. An explicit unusable
+    value is never silently replaced.
 
     Args:
         explicit: Explicit ``uv`` value from ``--uv``, or ``None``.
@@ -134,33 +131,19 @@ def resolve_uv(explicit: str | None) -> str:
         UvResolutionError: If no usable ``uv`` executable can be resolved.
     """
     if explicit is not None:
-        return _resolve_explicit(explicit)
-    on_path = shutil.which("uv")
-    if on_path is not None:
-        return on_path
-    recorded = read_toolchain()
-    if recorded is not None and is_executable(recorded.uv_path):
-        return recorded.uv_path
-    raise UvResolutionError(_unresolvable_message(recorded))
-
-
-def _resolve_explicit(explicit: str) -> str:
-    """Resolve and validate an explicitly requested ``uv`` executable.
-
-    Args:
-        explicit: The ``--uv`` value.
-
-    Returns:
-        The resolved absolute path.
-
-    Raises:
-        UvResolutionError: If the explicit value is not usable.
-    """
-    path = shutil.which(explicit) or explicit
-    if is_executable(path):
-        return path
-    msg = f"explicit uv executable not found or not executable: {explicit!r}"
-    raise UvResolutionError(msg)
+        candidate = shutil.which(explicit) or explicit
+    else:
+        on_path = shutil.which("uv")
+        if on_path is not None:
+            candidate = on_path
+        else:
+            recorded = read_toolchain()
+            if recorded is not None and is_executable(recorded.uv_path):
+                candidate = recorded.uv_path
+            else:
+                raise UvResolutionError(_unresolvable_message(recorded))
+    validate_uv_candidate(candidate)
+    return candidate
 
 
 def _unresolvable_message(recorded: ToolchainMeta | None) -> str:

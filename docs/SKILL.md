@@ -123,55 +123,46 @@ If the Lubko deployment architecture is later changed to weaken this isolation �
 
 # Supabase job transport
 
-Lubko jobs live in one PostgreSQL table, **`lubko.jobs`**, which has **exactly two columns forever**:
+Lubko jobs live in one PostgreSQL table, **`lubko.jobs`**, whose PostgreSQL
+metadata is frozen:
 
 ```sql
 id      uuid primary key default gen_random_uuid()
 payload text not null
 ```
 
-`payload` is one string containing a JSON object (protocol v4, documented in `docs/protocol.md`). Every evolving job/request/result/state/cancellation/process-identity/output field lives inside it:
+`payload` is opaque text to PostgreSQL. The database does not validate JSON,
+protocol versions, server routing, command/output kinds, lifecycle fields, or
+output-chunk structure, and it has no payload-aware secondary indexes. All of
+those semantics belong to Lubko application code.
+
+Never add a third column and never require PostgreSQL metadata/catalog changes
+for a Lubko protocol upgrade. Do not add or evolve payload CHECK constraints,
+payload expression indexes, per-server database roles, RLS, policies, triggers,
+functions, views, sequences, or other protocol-supporting catalog objects.
+Existing `lubko_worker` access is frozen infrastructure rather than an evolving
+protocol mechanism.
+
+The current application protocol is versioned inside `payload` and documented in
+`docs/protocol.md`. A typical command contains:
 
 ```text
-payload.v                  protocol version (currently 4)
-payload.server             required non-empty string naming the execution server that owns and runs the row
-payload.type               job kind: "command" or "output_chunk"
+payload.v                  application protocol version
+payload.server             required non-empty execution-server identity
+payload.type               "command" or "output_chunk"
 payload.request.cwd        working directory
-payload.request.process    argv array (required; executed directly, never through a shell)
+payload.request.process    argv array
 payload.state.status       pending | running | succeeded | failed | cancelled
-payload.state.created_at / updated_at / started_at / finished_at
-payload.state.worker_id
-payload.state.worker_incarnation
-payload.state.lease_expires_at / recovered_at
-payload.state.process_pid / process_pgid
-payload.state.cancel_requested_at
-payload.output.<stream>.tail / start / end / previous   bounded live output window
-payload.result.stdout / stderr / exit_code / cancellation_note / recovery_note
+...                        other application-managed lifecycle/output fields
 ```
 
-Never add a third column to `lubko.jobs`; evolve the protocol inside `payload` instead. SQL casts `payload::jsonb` only transiently for predicates and atomic updates, and stores `::text` back. Constraints are type-aware but deliberately generic: `command` rows need a `request` object, `state.status`, and a required non-empty top-level `server` string at protocol version 4, while `output_chunk` rows need explicit `thread` ownership, value/offset shape, and the same server field. The payload parser (`protocol.py`) additionally enforces that `request.process` is required — a non-empty array of non-empty strings — and that the legacy `request.command` / `request.args` keys are rejected; the server routing requirement itself IS encoded in SQL.
+SQL may cast `payload::jsonb` transiently for application predicates and atomic
+updates, but those casts do not make JSON shape part of PostgreSQL metadata.
+Server isolation is enforced by exact application-level server predicates on
+claims, updates, cancellation, finalization, recovery, and GC.
 
-Immutable historical output lives in separate `output_chunk` rows in the same two-column table, explicitly owned by a root job via `payload.thread`. Root live output tails are bounded rolling windows of the newest up to 4000 raw bytes per stream (decoded to at most 4000 characters), never shortened by archival rotation. Chunk insertion and the root `previous` pointer update are transactional, and the publication transaction first retains the root `command` row with a row-level lock so a root deleted concurrently leaves no new chunk rows.
-
-The worker atomically claims pending `command` rows whose `payload.server` exactly equals the daemon's configured server identity (the non-empty `server` setting of its restricted worker configuration file), using PostgreSQL row locking and a JSON compare-and-swap, including `FOR UPDATE SKIP LOCKED`; jobs addressed to other servers stay pending untouched. Running jobs carry a lease (`payload.state.lease_expires_at`) refreshed by the owning worker's heartbeat; on crash/restart an expired lease is recovered by marking the abandoned job `failed` with a `payload.result.recovery_note` rather than re-executing it. A live job is never stolen, and recovery never lets two workers execute the same job concurrently. Timing is configurable (`LUBKO_LEASE_DURATION_SECONDS`, `LUBKO_LEASE_REFRESH_INTERVAL_SECONDS`, `LUBKO_LEASE_RECOVERY_INTERVAL_SECONDS`); see the README.
-
-One worker is a single nonblocking supervisor and runs arbitrarily many jobs concurrently; there is no application-level concurrency limit, so submitting several independent jobs lets them genuinely run at the same time.
-
-Protocol version upgrades are breaking and destructive. The v3 → v4 cutover
-**discards old transport contents rather than migrating them**: every existing
-root `command` row and its `output_chunk` history in `lubko.jobs` is purged,
-and no v3 row is transformed or preserved. There is no protocol-data drain or migration,
-and no compatibility path — v4 rejects all v3 payloads, which lack the required
-non-empty top-level `server` field. Operationally, quiesce the
-live queue by stopping new submissions, let any in-flight work become durably
-terminal, `truncate lubko.jobs` while quiescent (truncating before applying is
-required; applying against nonconforming rows fails fast with an explicit
-diagnostic), apply `migrations/0003_protocol_v4_server_routing.sql`, start each
-daemon with its configured server identity, and prove a fresh v4
-round trip. The end state is an empty `lubko.jobs` with no v3 or historical
-content left behind.
-
----
+Protocol evolution—including changes to top-level `v`—must remain compatible with
+this fixed database contract. See `docs/protocol_upgrades.md`.
 
 # Creating and polling a Supabase job
 
@@ -523,7 +514,9 @@ A freshly created agent has no underlying native session yet. The **first** `pro
 lubko-agent prompt --id a13f09c2 --steer 'Stop this approach and use the parser-level fix instead.'
 ```
 
-While the agent is running, `--steer` interrupts/redirects the current invocation according to the steer model, then follows the resulting invocation.
+While the agent is running, `--steer` is **hard preemption**. The steer is durably accepted first, the exact currently owned native invocation and its owned process tree are terminated immediately rather than waiting for the current tool/model turn to finish, and the same logical managed agent continues under the steer only after the superseded invocation is proven converged. Lubko uses bounded termination with escalation; it never authorizes the continuation merely because the old leader process exited while an owned descendant may still be running.
+
+Hard preemption is not rollback. Files already written, output already emitted, external requests already sent, and other side effects that happened before termination may remain. The continued agent must inspect the real repository/system state and reconcile it. `status --json` exposes `steer_preempting`, and text status reports when the old invocation is still being hard-preempted.
 
 If the agent is **not currently running** (idle, finished, stopped, or never-started), `prompt --id <ID> --steer 'task'` is exactly equivalent to `prompt --id <ID> 'task'`. `--steer` is harmless and redundant on an idle/finished/not-yet-started agent; it is never rejected merely because there is nothing currently running to interrupt. This lets caller code always request "make the latest instruction take precedence" without first branching on whether the agent happens to be busy.
 
@@ -1104,6 +1097,33 @@ Deployment behavior:
 
 Per-user lifecycle state and logs live under `$XDG_STATE_HOME/lubko` (default `~/.local/state/lubko`), with `worker/meta.json`, `worker/worker.log`, `worker/deploy.log`, a `worker/.deploy.lock` serializing concurrent deployments, `supervisor/` holding the external supervisor's durable desired/state/status files, and `toolchain.json` recording the maintained `uv` executable.
 
+`lubko-supervisor --status` emits one of two clearly distinct machine-readable
+surfaces. When the supervisor process is alive and its exact identity verifies,
+it emits a live `SupervisorStatus` (`live: true`) carrying the confirmed child,
+intent, crash-loop `restart_count`/`next_attempt_at` backoff, queue `ready`/
+`db_ready` readiness, and a derived `holding` flag. When the supervisor is
+dead, replaced, or PID-reused — so no live status survives — it emits a
+`SupervisorDiagnostic` (`live: false`, `source: "durable-state"`) derived
+solely from the durable `state.json` and the recorded identity file. The
+diagnostic never pretends to be current health: it reports holding/backoff/
+readiness from durable authority only, and is safe to read after a crash
+without mistaking stale records for a running supervisor.
+
+The worker itself publishes a bounded, concurrency-aware health snapshot
+(`health/health-{incarnation}.json`, symlinked as `worker/health.json`) that
+exposes job aggregates (`active_jobs`/`stopping_jobs`/`completed_jobs`/oldest
+active age — never a job id), lease-safety margin and remaining budget,
+capture/spool pressure (`capture_streams_open`/`spool_held_bytes`), claim-batch
+pressure (`scan_batch_limit`/`last_scan_batch_size`), cancellation/recovery/GC
+scan recency and overdue signals (`last_cancellation_scan_at`/
+`last_recovery_at`/`last_gc_at`/`cancellation_scan_overdue`/`recovery_overdue`/
+`gc_overdue`), an explicit GC batch-saturation flag `gc_batch_bound_hit`
+derived inside the GC pass from the actual per-phase capped selections (not
+summed row counts), and a hard database-deadline breach signal
+(`db_deadline_breached_at`/`db_deadline_breach_count`) that proves a database
+operation actually exceeded its deadline — never a single job id, command
+text, or secret.
+
 ## Bootstrap and the unmanaged legacy worker
 
 Before the first managed deployment the running worker is an unmanaged legacy daemon with no recorded identity. `lubko-deploy status` reports `unmanaged`, and `deploy` refuses to claim it can stop it by identity. The one-time migration is a single manual stop of the legacy worker followed by:
@@ -1147,12 +1167,10 @@ The normal supervised sequence is:
 checkout exact commit
     -> provisional candidate + armed rollback watchdog
 confirm exact commit
-    -> 7-character hex challenge
-confirm exact commit + reversed challenge
-    -> terminal confirmation
+    -> exact candidate is queue-ready + terminal confirmation
 ```
 
-Both confirmation requests must traverse the replacement worker. Do not consider a deployment stable merely because checkout returned successfully or the candidate process exists. Until the second confirmation succeeds, the watchdog may restore the previous exact maintained commit automatically.
+The confirmation request must traverse the replacement worker. Do not consider a deployment stable merely because checkout returned successfully or the candidate process exists. Until exact-commit confirmation succeeds, the watchdog may restore the previous exact maintained commit automatically. The host controller no longer runs a challenge/response handshake; the external orchestrator owns transaction sequencing and confirmation is one idempotent exact-commit primitive.
 
 When checkout is submitted through the queue itself, the worker injects the exact root job UUID into the command environment (`LUBKO_JOB_ID`) so the controller recognizes its own queue row without any `process_pgid` race, then forks a detached handoff helper: the queue job returns its response and reaches durable `succeeded` before the old worker is stopped, so the control job is never killed by the old worker's own shutdown. A helper error or helper death makes the job exit non-zero and be durably recorded `failed` — never falsely `succeeded`. No ordinary job is ever exempted from shutdown cleanup.
 

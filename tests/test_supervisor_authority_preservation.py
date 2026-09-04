@@ -377,6 +377,7 @@ def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
     locked_methods = {
         "_ensure_consumer_locked",
         "_spawn_worker",
+        "_publish_spawned_child",
         "_settle_unproven_spawn",
         "_recover_unpublished_spawn",
         "_release_unproven_spawn_authority",
@@ -384,6 +385,9 @@ def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
         "_persist_unobservable_hold",
         "_record_shared_group_hold",
         "_resolve_spawning_obligation",
+        "_finish_publication",
+        "_persist_missing_obligation_hold",
+        "_spawn_and_publish",
         "_resolve_pidless_spawn",
         "_resolve_identified_spawn",
         "_resolve_unresolved_child",

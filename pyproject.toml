@@ -5,7 +5,7 @@ description = "Execute queued development jobs directly inside the Lubko contain
 readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-requires-python = ">=3.12"
+requires-python = "==3.12.*"
 dependencies = [
     "psycopg[binary]>=3.2,<4",
 ]
@@ -107,6 +107,10 @@ convention = "google"
 ]
 "src/lubko/cli.py" = [
     "start-process-with-partial-path",
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
+"src/lubko/toolchain.py" = [
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]

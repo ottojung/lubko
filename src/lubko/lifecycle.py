@@ -25,6 +25,7 @@ import argparse
 import fcntl
 import json
 import logging
+import math
 import os
 import secrets
 import signal
@@ -36,15 +37,18 @@ import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, protocol, supervise, toolchain
+from lubko import cli, lifecycle_state, protocol, startup_contract, supervise, toolchain
 from lubko._exact_signal import open_pidfd as _open_exact_pidfd
 from lubko._exact_signal import pidfd_send_signal, process_pgrp
-from lubko.config import load_database_config, load_worker_server
+from lubko.config import (
+    load_database_config,
+    load_worker_server,
+)
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
@@ -183,21 +187,28 @@ class WorkerMeta:
 
         Returns:
             The reconstructed metadata.
+
+        Raises:
+            ValueError: If required metadata is missing or outside its valid domain.
         """
+        schema_version = _required_meta_int(data, "schema_version", minimum=1)
+        if schema_version != SCHEMA_VERSION:
+            msg = f"unsupported worker metadata schema version {schema_version}"
+            raise ValueError(msg)
         return cls(
-            schema_version=_optional_int(data.get("schema_version")) or SCHEMA_VERSION,
-            state=_optional_str(data.get("state")) or STATE_STOPPED,
-            pid=_optional_int(data.get("pid")),
-            pgid=_optional_int(data.get("pgid")),
-            sid=_optional_int(data.get("sid")),
-            start_time_ticks=_optional_int(data.get("start_time_ticks")),
-            token=_optional_str(data.get("token")),
-            repo=_optional_str(data.get("repo")) or "",
-            git_commit=_optional_str(data.get("git_commit")),
-            worker_id=_optional_str(data.get("worker_id")),
-            log_path=_optional_str(data.get("log_path")) or "",
-            started_at=_optional_float(data.get("started_at")),
-            stopped_at=_optional_float(data.get("stopped_at")),
+            schema_version=schema_version,
+            state=_meta_worker_state(data),
+            pid=_meta_optional_int(data, "pid", minimum=1),
+            pgid=_meta_optional_int(data, "pgid", minimum=1),
+            sid=_meta_optional_int(data, "sid", minimum=0),
+            start_time_ticks=_meta_optional_int(data, "start_time_ticks", minimum=1),
+            token=_meta_optional_string(data, "token"),
+            repo=_meta_string(data, "repo", default=""),
+            git_commit=_meta_optional_string(data, "git_commit"),
+            worker_id=_meta_optional_string(data, "worker_id"),
+            log_path=_meta_string(data, "log_path", default=""),
+            started_at=_meta_optional_finite_float(data, "started_at"),
+            stopped_at=_meta_optional_finite_float(data, "stopped_at"),
         )
 
 
@@ -431,9 +442,147 @@ def worker_alive(meta: WorkerMeta) -> bool:
     return meta.token is None or process_has_token(meta.pid, meta.token)
 
 
+def process_absence_proven(pid: int, start_time_ticks: int | None) -> bool:
+    """Return whether an exact recorded process is positively proven absent.
+
+    This helper is deliberately stricter than the boolean liveness helpers used
+    for ordinary observation. At replacement-authority boundaries, an unreadable
+    ``/proc`` entry is unknown, not evidence that a worker died. Absence is
+    proven only when the PID does not exist, is zombie/dead, or exists with a
+    different start time (PID reuse).
+
+    Args:
+        pid: Recorded process ID.
+        start_time_ticks: Recorded exact process start time.
+
+    Returns:
+        ``True`` only when the recorded process identity is conclusively gone.
+    """
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    close_paren = stat.rfind(b")")
+    fields = stat[close_paren + 2 :].split() if close_paren != -1 else []
+    if len(fields) < STAT_MIN_FIELDS:
+        return False
+    if fields[STAT_STATE_FIELD_INDEX] in {b"Z", b"X"}:
+        return True
+    try:
+        observed_start = int(fields[STAT_STARTTIME_FIELD_INDEX])
+    except ValueError:
+        observed_start = None
+    return (
+        observed_start is not None
+        and start_time_ticks is not None
+        and observed_start != start_time_ticks
+    )
+
+
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
+
+
+def _required_meta_int(
+    data: dict[str, object],
+    field: str,
+    *,
+    minimum: int,
+) -> int:
+    """Return one required exact JSON integer from maintained metadata.
+
+    Raises:
+        TypeError: If the field has the wrong JSON type.
+        ValueError: If the field is missing or below its valid minimum.
+    """
+    if field not in data:
+        msg = f"worker metadata field {field!r} is missing"
+        raise ValueError(msg)
+    value = data[field]
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"worker metadata field {field!r} must be an integer"
+        raise TypeError(msg)
+    if value < minimum:
+        msg = f"worker metadata field {field!r} must be >= {minimum}"
+        raise ValueError(msg)
+    return value
+
+
+def _meta_optional_int(
+    data: dict[str, object],
+    field: str,
+    *,
+    minimum: int,
+) -> int | None:
+    """Return an optional exact JSON integer from maintained metadata."""
+    if field not in data or data[field] is None:
+        return None
+    return _required_meta_int(data, field, minimum=minimum)
+
+
+def _meta_string(data: dict[str, object], field: str, *, default: str) -> str:
+    """Return a string field, preserving only genuine-absence compatibility.
+
+    Raises:
+        TypeError: If a present field is not a JSON string.
+    """
+    if field not in data:
+        return default
+    value = data[field]
+    if not isinstance(value, str):
+        msg = f"worker metadata field {field!r} must be a string"
+        raise TypeError(msg)
+    return value
+
+
+def _meta_worker_state(data: dict[str, object]) -> str:
+    """Return a supported persisted maintained-worker lifecycle state.
+
+    Raises:
+        ValueError: If the persisted state is outside the supported domain.
+    """
+    state = _meta_string(data, "state", default=STATE_STOPPED)
+    if state not in {STATE_RUNNING, STATE_STOPPED}:
+        msg = f"unsupported worker metadata state {state!r}"
+        raise ValueError(msg)
+    return state
+
+
+def _meta_optional_string(data: dict[str, object], field: str) -> str | None:
+    """Return an optional string, rejecting malformed present values."""
+    if field not in data or data[field] is None:
+        return None
+    return _meta_string(data, field, default="")
+
+
+def _meta_optional_finite_float(data: dict[str, object], field: str) -> float | None:
+    """Return an optional finite JSON number from maintained metadata.
+
+    Raises:
+        TypeError: If a present field is not a JSON number.
+        ValueError: If a present number is not finite.
+    """
+    if field not in data or data[field] is None:
+        return None
+    value = data[field]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        msg = f"worker metadata field {field!r} must be a finite number"
+        raise TypeError(msg)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        msg = f"worker metadata field {field!r} must be a finite number"
+        raise ValueError(msg) from exc
+    if not math.isfinite(result):
+        msg = f"worker metadata field {field!r} must be a finite number"
+        raise ValueError(msg)
+    if result < 0:
+        msg = f"worker metadata field {field!r} must be >= 0"
+        raise ValueError(msg)
+    return result
 
 
 def _optional_int(value: object | None) -> int | None:
@@ -509,24 +658,58 @@ def write_meta(meta: WorkerMeta) -> None:
         :func:`lubko.durable.write_json_durable` when it cannot be confirmed
         durable, so callers must not advance a dependent action.
     """
+    lifecycle_state.failpoint(lifecycle_state.FAILPOINT_METADATA_PUBLICATION)
     write_json_durable(meta_path(), meta.to_dict())
+
+
+class WorkerMetadataError(RuntimeError):
+    """Raised when present maintained-worker metadata cannot be trusted."""
+
+
+def read_meta_strict() -> WorkerMeta | None:
+    """Load maintained-worker metadata, distinguishing absence from corruption.
+
+    Returns:
+        Parsed metadata, or ``None`` only when the artifact is genuinely absent.
+
+    Raises:
+        WorkerMetadataError: If a present metadata artifact is unreadable or malformed.
+    """
+    path = meta_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError as exc:
+        if os.path.lexists(path):
+            msg = "maintained-worker metadata is present but unreadable"
+            raise WorkerMetadataError(msg) from exc
+        return None
+    except OSError as exc:
+        msg = f"cannot read maintained-worker metadata: {exc}"
+        raise WorkerMetadataError(msg) from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        msg = "maintained-worker metadata is not valid JSON"
+        raise WorkerMetadataError(msg) from exc
+    if not isinstance(data, dict):
+        msg = "maintained-worker metadata must be a JSON object"
+        raise WorkerMetadataError(msg)
+    try:
+        return WorkerMeta.from_dict(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        msg = "maintained-worker metadata is malformed"
+        raise WorkerMetadataError(msg) from exc
 
 
 def read_meta() -> WorkerMeta | None:
     """Load worker lifecycle metadata, tolerating absence and corruption.
 
     Returns:
-        The stored metadata, or ``None`` when no metadata exists.
+        The stored metadata, or ``None`` when metadata is absent or untrustworthy.
     """
     try:
-        data = json.loads(meta_path().read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    try:
-        return WorkerMeta.from_dict(data)
-    except (KeyError, TypeError, ValueError):
+        return read_meta_strict()
+    except WorkerMetadataError:
         return None
 
 
@@ -795,6 +978,7 @@ def spawn_worker(
         The started worker process.
     """
     del log_path
+    lifecycle_state.failpoint("popen")
     return subprocess.Popen(
         _worker_command(uv_path),
         cwd=repo,
@@ -1069,6 +1253,27 @@ def _signal_exact_group(pgid: int, sig: int, token: str | None) -> bool:
     return attempted
 
 
+def _worker_retirement_state(meta: WorkerMeta) -> bool | None:
+    """Return exact-worker retirement state for authority decisions.
+
+    ``True`` means the recorded worker is positively gone or its PID was reused,
+    ``False`` means the exact recorded worker is still live, and ``None`` means
+    liveness is unreadable and therefore cannot authorize replacement.
+    """
+    if meta.pid is None:
+        return True
+    identity = process_identity(meta.pid)
+    if identity is None:
+        if process_absence_proven(meta.pid, meta.start_time_ticks):
+            return True
+        return None
+    if identity_matches(meta, identity):
+        return False
+    if meta.start_time_ticks is not None and identity.start_time_ticks != meta.start_time_ticks:
+        return True
+    return None
+
+
 def _worker_process_alive(meta: WorkerMeta) -> bool:
     """Return whether the exact recorded worker process instance is still alive.
 
@@ -1157,14 +1362,15 @@ def stop_worker(
     """
     if meta.pid is None:
         return True
+    lifecycle_state.failpoint("process_retirement")
     try:
         pin = _open_exact_pidfd(meta.pid)
     except (OSError, AttributeError):
         # The pin failed either because the exact worker already exited (the
         # numeric PID may even have been recycled since) or because the
-        # platform cannot pin PIDs at all. Distinguish by re-reading identity:
-        # a live occupant we cannot pin must never be signalled — fail closed.
-        return process_identity(meta.pid) is None
+        # platform cannot pin PIDs at all. Require positive absence proof:
+        # unknown liveness must never authorize replacement — fail closed.
+        return process_absence_proven(meta.pid, meta.start_time_ticks)
     try:
         return _stop_pinned(meta, grace_seconds, cancel_grace_seconds)
     finally:
@@ -1194,10 +1400,19 @@ def _stop_pinned(
     if meta.pid is None:
         return True
     identity = process_identity(meta.pid)
-    if identity is None or not identity_matches(meta, identity):
-        # The exact worker process is gone or its identity changed (a recycled
-        # PID can never be mis-signalled). Nothing to stop; retirement succeeds.
-        return True
+    retirement_proven: bool | None = None
+    if identity is None:
+        # The pidfd proves that some process was pinned, but a failed identity
+        # read is still ambiguous. Require positive absence proof before
+        # handing replacement authority to another worker.
+        retirement_proven = process_absence_proven(meta.pid, meta.start_time_ticks)
+    elif not identity_matches(meta, identity):
+        # A different start time proves PID reuse; the recorded worker is gone
+        # and the replacement occupant is never signalled.
+        retirement_proven = True
+    if retirement_proven is not None:
+        return retirement_proven
+    identity = cast("ProcessIdentity", identity)
     # Signal authorization requires the exact lifecycle token: an unowned live
     # process — a wrong token or none at all — is never signalled and
     # retirement is never claimed, so the caller holds rather than handing off
@@ -1225,13 +1440,24 @@ def _stop_pinned(
     #    group member fails its re-proof rather than absorbing the SIGKILL.
     if time.monotonic() < kill_floor:
         time.sleep(kill_floor - time.monotonic())
-    if not _worker_process_alive(meta):
+    retirement = _worker_retirement_state(meta)
+    if retirement is True:
         return True
     _signal_exact_group(identity.pgid, signal.SIGKILL, meta.token)
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline and _worker_process_alive(meta):
+    return _wait_for_retirement(meta, time.monotonic() + grace_seconds)
+
+
+def _wait_for_retirement(meta: WorkerMeta, deadline: float) -> bool:
+    """Wait for positive exact-worker retirement proof until ``deadline``.
+
+    Returns:
+        ``True`` only when retirement is positively proven.
+    """
+    while time.monotonic() < deadline:
+        if _worker_retirement_state(meta) is True:
+            return True
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
-    return not _worker_process_alive(meta)
+    return _worker_retirement_state(meta) is True
 
 
 def _wait_for_drain(meta: WorkerMeta, wait_deadline: float) -> bool:
@@ -1252,12 +1478,14 @@ def _wait_for_drain(meta: WorkerMeta, wait_deadline: float) -> bool:
         ``True`` when the worker reached a safe-to-reap boundary.
     """
     while time.monotonic() < wait_deadline:
-        if not _worker_process_alive(meta):
+        if _worker_retirement_state(meta) is True:
             return True
         if meta.token is not None and drain_sentinel_matches(meta.token):
-            while time.monotonic() < wait_deadline and _worker_process_alive(meta):
+            while time.monotonic() < wait_deadline:
+                if _worker_retirement_state(meta) is True:
+                    return True
                 time.sleep(LOCK_POLL_INTERVAL_SECONDS)
-            return not _worker_process_alive(meta)
+            return False
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
     return False
 
@@ -1821,9 +2049,7 @@ def _clear_stale_supervisor_override(confirmed_commit: str) -> None:
         confirmed_commit: The newly confirmed commit that ``cli/current``
             now selects (used only for the deploy log entry).
     """
-    override = supervise.read_supervisor_runtime_override()
-    if override is not None:
-        supervise.clear_supervisor_runtime_override()
+    if supervise.clear_supervisor_runtime_override():
         append_deploy_log(
             f"cleared supervisor-runtime override: commit {confirmed_commit} is now confirmed"
         )
@@ -2020,36 +2246,16 @@ def _supervised_mutation_blocker() -> str | None:
     must invoke this under the deployment lock so no guard-to-mutation TOCTOU
     window remains.
 
+    The decision is delegated to :func:`lubko.lifecycle_state.mutation_blocker_reason`,
+    the single authority-state model, so the refusal logic cannot diverge from
+    the documented invariants.
+
     Returns:
         ``None`` when mutation may proceed, otherwise a human-readable refusal
         reason.
 
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
-        deployctl,
-    )
-
-    try:
-        mission = deployctl.read_rollback_state()
-    except deployctl.DeployCtlError as exc:
-        return (
-            f"supervised deployment state is unreadable or corrupt ({exc}); refusing to mutate "
-            "lifecycle state; inspect with 'lubko-deploy-ctl status'"
-        )
-    if mission is None:
-        return None
-    if mission.status == deployctl.STATUS_PENDING:
-        return (
-            f"a supervised checkout of commit {mission.commit} (generation {mission.generation}) "
-            "is still pending confirmation; lifecycle mutation is blocked until it is resolved "
-            "with 'lubko-deploy-ctl confirm' or 'lubko-deploy-ctl rollback'"
-        )
-    if mission.status not in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}:
-        return (
-            f"supervised deployment state has unknown status {mission.status!r}; refusing to "
-            "mutate lifecycle state"
-        )
-    return None
+    return lifecycle_state.mutation_blocker_reason()
 
 
 def _refuse_version_changing_deploy(previous: WorkerMeta | None, commit: str) -> bool:
@@ -2061,6 +2267,11 @@ def _refuse_version_changing_deploy(previous: WorkerMeta | None, commit: str) ->
     clean first installation (no metadata) and a same-commit invocation are
     allowed.
 
+    The decision is delegated to
+    :func:`lubko.lifecycle_state.refuses_version_change`, the single authority
+    model, so the recorded-version rule cannot diverge from the documented
+    invariants.
+
     Args:
         previous: Previously recorded worker metadata, or ``None``.
         commit: Exact validated target commit.
@@ -2068,7 +2279,8 @@ def _refuse_version_changing_deploy(previous: WorkerMeta | None, commit: str) ->
     Returns:
         ``True`` when the deploy must be refused.
     """
-    return previous is not None and previous.git_commit != commit
+    previous_commit = previous.git_commit if previous is not None else None
+    return lifecycle_state.refuses_version_change(previous, commit, git_commit=previous_commit)
 
 
 def _deploy_locked(options: DeployOptions) -> int:
@@ -2093,7 +2305,15 @@ def _deploy_locked(options: DeployOptions) -> int:
         DeployAbortedError: If the deployment must abort and leave the current
             worker untouched.
     """
-    previous = read_meta()
+    try:
+        previous = read_meta_strict()
+    except WorkerMetadataError as exc:
+        _err(
+            "maintained-worker metadata is present but untrustworthy "
+            f"({exc}); refusing lifecycle mutation"
+        )
+        _err("run 'lubko-deploy repair' to recover maintained-worker authority")
+        raise DeployAbortedError from exc
     state = worker_state(previous)
 
     blocker = _supervised_mutation_blocker()
@@ -2256,6 +2476,19 @@ class _AdoptionError(RuntimeError):
     """Raised when a recovery worker cannot be safely adopted."""
 
 
+def _required_rollback_status(data: dict[str, object]) -> str:
+    """Return a canonical persisted rollback lifecycle status.
+
+    Raises:
+        ValueError: If the status is absent or outside the canonical lifecycle states.
+    """
+    status = _meta_string(data, "status", default="")
+    if status not in {STATE_PENDING, "confirmed", "rolled_back"}:
+        msg = f"unsupported rollback status {status!r}"
+        raise ValueError(msg)
+    return status
+
+
 def _repair_rollback_state(recovery_worker_pid: int) -> None:
     """Resolve stale rollback state before adopting a recovery worker.
 
@@ -2268,31 +2501,32 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
         recovery_worker_pid: Exact PID of the recovery worker being adopted.
 
     Raises:
-        _AdoptionError: If a live mission or a different live identity is
-            recorded.
+        _AdoptionError: If rollback authority is malformed, a live mission is
+            active, or a different live identity is recorded.
     """
     path = rollback_state_path()
     if not path.is_file():
         return
     try:
         data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        remove_durable(path)
-        return
+    except (OSError, ValueError) as exc:
+        msg = "rollback state is present but malformed; repair refuses to erase authority"
+        raise _AdoptionError(msg) from exc
     if not isinstance(data, dict):
-        remove_durable(path)
-        return
+        msg = "rollback state is present but malformed; repair refuses to erase authority"
+        raise _AdoptionError(msg)
     try:
         new_meta = WorkerMeta.from_dict(data.get("new_meta") or {})
         previous_meta = WorkerMeta.from_dict(data.get("previous_meta") or {})
-    except (KeyError, TypeError, ValueError):
-        remove_durable(path)
-        return
-    if (
-        data.get("status") == STATE_PENDING
-        and worker_alive(new_meta)
-        and (data.get("deadline", 0.0) > time.time())
-    ):
+        deadline = _meta_optional_finite_float(data, "deadline")
+        status = _required_rollback_status(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        msg = "rollback state is present but malformed; repair refuses to erase authority"
+        raise _AdoptionError(msg) from exc
+    if deadline is None:
+        msg = "rollback state is present but malformed; repair refuses to erase authority"
+        raise _AdoptionError(msg)
+    if status == STATE_PENDING and worker_alive(new_meta) and deadline > time.time():
         msg = "another supervised deployment is still pending confirmation"
         raise _AdoptionError(msg)
     if worker_alive(new_meta) and new_meta.pid != recovery_worker_pid:
@@ -2416,6 +2650,33 @@ def _spawned_by_recovery_worker(process_pid: int, recovery_worker_pid: int) -> b
     return False
 
 
+def _parse_probe_claim_state(
+    state: object,
+) -> tuple[str, str | None, int | None] | None:
+    """Parse persisted recovery-probe claim state without scalar coercion.
+
+    Returns:
+        Canonical claim fields, or ``None`` when persisted authority is malformed.
+    """
+    if not isinstance(state, dict):
+        return None
+    status = state.get("status")
+    if not isinstance(status, str):
+        return None
+
+    owner_raw = state.get("worker_id")
+    if "worker_id" in state and not isinstance(owner_raw, str):
+        return None
+    owner = owner_raw if isinstance(owner_raw, str) else None
+
+    if "process_pid" not in state:
+        return status, owner, None
+    process_pid = state["process_pid"]
+    if isinstance(process_pid, bool) or not isinstance(process_pid, int) or process_pid <= 0:
+        return None
+    return status, owner, process_pid
+
+
 def _wait_for_probe_claim(
     conn: JobsConnection,
     probe_id: UUID,
@@ -2448,27 +2709,22 @@ def _wait_for_probe_claim(
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
             cursor.execute(
-                "SELECT (payload::jsonb)->'state'->>'status', "
-                "(payload::jsonb)->'state'->>'worker_id', "
-                "(payload::jsonb)->'state'->>'process_pid' "
-                "FROM lubko.jobs WHERE id = %s",
+                "SELECT (payload::jsonb)->'state' FROM lubko.jobs WHERE id = %s",
                 (probe_id,),
             )
             row = cursor.fetchone()
         if row is None:
             return False
-        status = str(row[0])
-        owner = str(row[1]) if row[1] is not None else None
+        claim = _parse_probe_claim_state(row[0])
+        if claim is None:
+            return False
+        status, owner, process_pid = claim
         if status == STATE_RUNNING:
             if owner != expected_worker_id:
                 return False
-            if row[2] is None:
+            if process_pid is None:
                 time.sleep(LOCK_POLL_INTERVAL_SECONDS)
                 continue
-            try:
-                process_pid = int(str(row[2]))
-            except ValueError:
-                return False
             return _spawned_by_recovery_worker(process_pid, recovery_worker_pid)
         if status in {"succeeded", "failed", "cancelled"}:
             return False
@@ -2604,10 +2860,18 @@ def _cleanup_ready_markers(recovery_worker_pid: int) -> None:
         try:
             data = json.loads(path.read_text())
         except (OSError, ValueError):
-            path.unlink(missing_ok=True)
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
             continue
-        if not isinstance(data, dict) or data.get("pid") != recovery_worker_pid:
-            path.unlink(missing_ok=True)
+        marker_pid = data.get("pid") if isinstance(data, dict) else None
+        valid_marker = (
+            isinstance(marker_pid, int)
+            and not isinstance(marker_pid, bool)
+            and marker_pid == recovery_worker_pid
+        )
+        if not valid_marker:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
 
 
 def _reconcile_toolchain(uv_path: str) -> None:
@@ -2666,7 +2930,14 @@ def _adoption_candidate(
         msg = "cannot reach PostgreSQL; refusing to adopt the recovery worker"
         raise _AdoptionError(msg)
 
-    previous = read_meta()
+    try:
+        previous = read_meta_strict()
+    except WorkerMetadataError as exc:
+        msg = (
+            "maintained-worker metadata is present but untrustworthy; refusing to adopt a "
+            f"recovery worker until the authority is repaired: {exc}"
+        )
+        raise _AdoptionError(msg) from exc
     if previous is not None and worker_alive(previous) and previous.pid != recovery_worker_pid:
         msg = f"a live maintained worker pid {previous.pid} is already recorded; stop it first"
         raise _AdoptionError(msg)
@@ -2818,7 +3089,13 @@ def _stale_candidate_error(new_meta: WorkerMeta) -> str | None:
             f"recovery worker pid {new_meta.pid} no longer carries the exact "
             "lifecycle token it was validated with; refusing stale metadata"
         )
-    previous = read_meta()
+    try:
+        previous = read_meta_strict()
+    except WorkerMetadataError as exc:
+        return (
+            "maintained-worker metadata became untrustworthy before adoption publication; "
+            f"refusing to overwrite the authority: {exc}"
+        )
     if previous is not None and worker_alive(previous) and previous.pid != new_meta.pid:
         return (
             f"a newer live maintained worker pid {previous.pid} is already recorded; "
@@ -3003,7 +3280,7 @@ def _wait_for_any_claim(
     return False
 
 
-def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool:
+def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool | None:
     """Return whether any worker is currently consuming the queue.
 
     A probe job is inserted and must not be claimed by any worker: a claim
@@ -3021,16 +3298,16 @@ def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool:
     try:
         database = load_database_config()
     except (OSError, ValueError):
-        return False
+        return None
     try:
         conn = psycopg.connect(database.conninfo(), row_factory=tuple_row)
     except (psycopg.Error, OSError):
-        return False
+        return None
     conn.autocommit = True
     try:
         probe_id = _insert_probe_job(conn, cwd)
         if probe_id is None:
-            return False
+            return None
         try:
             return _wait_for_any_claim(conn, probe_id, timeout_seconds)
         finally:
@@ -3076,8 +3353,11 @@ def _recover_preflight(options: DeployOptions) -> str:
     if not check_postgres(options.postgres_timeout_seconds):
         msg = "cannot reach PostgreSQL; refusing to start a recovery worker"
         raise _AdoptionError(msg)
-    if _queue_has_consumer(
-        str(options.repo), min(options.probe_timeout_seconds, DEFAULT_RECOVER_PREFLIGHT_SECONDS)
+    if (
+        _queue_has_consumer(
+            str(options.repo), min(options.probe_timeout_seconds, DEFAULT_RECOVER_PREFLIGHT_SECONDS)
+        )
+        is not False
     ):
         msg = (
             "a worker is already consuming the queue; adopt the existing worker with "
@@ -3514,9 +3794,11 @@ def status_cmd() -> int:
         _out(UNMANAGED_WORKER_MESSAGE)
         _out("after stopping the legacy worker manually once, run: lubko-deploy deploy --bootstrap")
         _print_supervisor_status()
+        _print_startup_contract()
         return EXIT_OK
     if meta is None:
         _print_supervisor_status()
+        _print_startup_contract()
         return EXIT_OK
     _out(f"pid: {meta.pid}")
     _out(f"pgid: {meta.pgid}")
@@ -3538,7 +3820,105 @@ def status_cmd() -> int:
                 f"worker commit {meta.git_commit}; run lubko-deploy-ctl status to reconcile"
             )
     _print_supervisor_status()
+    _print_startup_contract()
     return EXIT_OK
+
+
+def _print_startup_contract() -> None:
+    """Report the versioned startup contract and its live topology proof.
+
+    The contract is the authoritative, repository-owned definition of how the
+    container must start the supervisor; the proof demonstrates the live
+    process topology actually matches it, rather than merely inferring worker
+    liveness from queue state.
+    """
+    assessment = startup_contract.assess_recorded_contract()
+    if assessment.state == "current" and assessment.contract is not None:
+        _out(f"startup contract: current (version {assessment.contract.schema_version})")
+    elif assessment.state == "missing":
+        _out("startup contract: MISSING (run 'lubko-install' or 'lubko-deploy bootstrap')")
+    elif assessment.state == "corrupt":
+        _out(f"startup contract: CORRUPT ({assessment.message})")
+    else:
+        _out(f"startup contract: MISMATCH ({assessment.message})")
+    launcher_ok = startup_contract.validate_startup_launcher(_resolve_bin_home())
+    launcher_state = "installed" if launcher_ok else "MISSING"
+    _out(f"startup launcher ({startup_contract.STARTUP_LAUNCHER_NAME}): {launcher_state}")
+    definition = startup_contract.validate_startup_definition()
+    _out(f"startup definition: {'OK' if definition.ok else 'FAIL'} ({definition.message})")
+    paths = startup_contract.validate_contract_paths()
+    _out(f"startup state paths: {'OK' if paths.ok else 'FAIL'} ({paths.message})")
+    config_paths = startup_contract.validate_contract_config()
+    _out(f"private config paths: {'OK' if config_paths.ok else 'FAIL'} ({config_paths.message})")
+    proof = startup_contract.verify_live_topology()
+    _out(f"startup topology: {'OK' if proof.ok else 'FAIL'}")
+    _out(f"  init (pid {proof.init_pid}): {proof.init_cmdline or 'unknown'}")
+    _out(f"  init is supported tini: {proof.init_is_tini}")
+    if proof.supervisor_pid:
+        _out(f"  supervisor (pid {proof.supervisor_pid}): {proof.supervisor_cmdline or 'unknown'}")
+    _out(f"  supervisor under tini: {proof.supervisor_under_init}")
+    _out(f"  supervisor is lubko-supervisor: {proof.supervisor_is_contract_binary}")
+    _out(f"  supervisor identity matches recorded: {proof.supervisor_identity_matches}")
+    _out(f"  uses sleep-infinity placeholder: {proof.uses_sleep_placeholder}")
+    if proof.worker_pid is not None:
+        _out(
+            f"  worker (pid {proof.worker_pid}) direct child of supervisor: "
+            f"{proof.worker_is_direct_child}"
+        )
+        _out(f"  worker identity matches recorded: {proof.worker_identity_matches}")
+    _out(f"  proof: {proof.message}")
+
+
+def startup_contract_cmd(args: argparse.Namespace) -> int:
+    """Verify, and optionally publish, the live supervisor startup contract.
+
+    The command requires every supported-deployment boundary to hold before it
+    reports the startup contract active, and it fails closed on any missing
+    piece. Concretely it requires:
+
+    * the recorded contract to exactly equal the code's current contract
+      (missing/malformed/unsupported/mismatch all fail closed);
+    * the repository-owned startup launcher to be installed and match the versioned
+      source;
+    * the installed startup definition to match the current contract exactly;
+    * the required private state directories to exist with the exact safe mode;
+    * the private config files to exist with no group/world access;
+    * the live Tini -> supervisor -> worker topology to be proven.
+
+    It exits non-zero unless every check passes — for example when the container
+    still uses the ``sleep infinity`` placeholder, the recorded contract has
+    silently drifted, or the startup definition is missing.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        A process exit code.
+    """
+    if getattr(args, "write", False):
+        startup_contract.write_contract()
+        startup_contract.write_startup_launcher(_resolve_bin_home())
+        startup_contract.write_startup_definition()
+        _out(
+            f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION}, "
+            f"launcher, and startup definition written; the container must run "
+            f"'{startup_contract.STARTUP_LAUNCHER_NAME}'"
+        )
+    assessment = startup_contract.assess_recorded_contract()
+    contract_ok = assessment.state == "current"
+    if not contract_ok:
+        _out(f"startup contract: {assessment.state.upper()} ({assessment.message})")
+    _print_startup_contract()
+    launcher_ok = startup_contract.validate_startup_launcher(_resolve_bin_home())
+    definition_ok = startup_contract.validate_startup_definition().ok
+    paths_ok = startup_contract.validate_contract_paths().ok
+    config_ok = startup_contract.validate_contract_config().ok
+    proof = startup_contract.verify_live_topology()
+    return (
+        EXIT_OK
+        if (contract_ok and launcher_ok and definition_ok and paths_ok and config_ok and proof.ok)
+        else EXIT_ERROR
+    )
 
 
 def restart_cmd(_args: argparse.Namespace) -> int:
@@ -4031,6 +4411,15 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
         mission = deployctl.read_rollback_state()
     except deployctl.DeployCtlError:
         mission = None
+    if mission is None:
+        # The supervised-deployment authority is absent or already corrupt: this
+        # migration intentionally supersedes it, so remove any present file
+        # before allocating a generation. Allocation then observes genuine
+        # absence rather than failing closed on authority we are about to
+        # replace, and no malformed authority is silently deleted outside an
+        # explicit recovery path.
+        remove_durable(rollback_state_path())
+        append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
     with supervise.generation_lock():
         generation = supervise.next_generation()
         # The migration flag travels inside this one atomically written
@@ -4052,16 +4441,18 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
                 migration=True,
             )
         )
-    if mission is None:
-        remove_durable(rollback_state_path())
-        append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
-    elif mission.status == deployctl.STATUS_PENDING and mission.generation < generation:
+    if (
+        mission is not None
+        and mission.status == deployctl.STATUS_PENDING
+        and mission.generation < generation
+    ):
         deployctl.archive_mission(mission, deployctl.STATUS_ROLLED_BACK)
         append_deploy_log(
             f"migration archived stale pending mission generation {mission.generation}"
         )
     elif (
-        mission.status in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}
+        mission is not None
+        and mission.status in {deployctl.STATUS_CONFIRMED, deployctl.STATUS_ROLLED_BACK}
         and mission.generation < generation
     ):
         # A strictly newer cold-migration intent supersedes older terminal
@@ -4190,6 +4581,12 @@ def _bootstrap_locked(
         _err("refusing to continue without a verified launcher")
         return EXIT_ERROR
 
+    _out("bootstrap: installing versioned startup launcher ...")
+    if (err := startup_contract.install_and_validate_startup_definition(bin_home)) is not None:
+        _err(err)
+        _err("refusing to continue without a verified startup definition")
+        return EXIT_ERROR
+
     _out(f"bootstrap: publishing supervisor-runtime override for {commit} ...")
     supervise.write_supervisor_runtime_override(commit)
 
@@ -4205,6 +4602,12 @@ def _bootstrap_locked(
     _out("  1. restart the container/environment to load the new supervisor code")
     _out("  2. the new supervisor will restore the confirmed worker from desired state")
     _out("  3. run 'lubko-deploy deploy <target>' to confirm the target and advance cli/current")
+    startup_contract.write_contract()
+    _out(f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION} recorded")
+    _out(
+        f"startup definition installed; the container must run "
+        f"'{startup_contract.STARTUP_LAUNCHER_NAME}'"
+    )
     return EXIT_OK
 
 
@@ -4392,6 +4795,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("status", help="show worker lifecycle state")
+
+    contract_parser = subparsers.add_parser(
+        "startup-contract",
+        help="prove the live supervisor startup topology (tini -> supervisor -> worker)",
+    )
+    contract_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="publish the current versioned startup contract artifact before proving the topology",
+    )
 
     deploy_parser = subparsers.add_parser(
         "deploy",
@@ -4649,6 +5062,7 @@ def main(argv: list[str] | None = None) -> int:
         "restart": restart_cmd,
         "migrate": migrate_cmd,
         "bootstrap": bootstrap_cmd,
+        "startup-contract": startup_contract_cmd,
         "repair": repair_cmd,
         "recover": recover_cmd,
         "log": lambda namespace: log_cmd(namespace.lines),

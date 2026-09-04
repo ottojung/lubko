@@ -114,3 +114,67 @@ def test_malformed_previous_retiring_never_reuses_live_worker(
 
     with pytest.raises(dc.DeployCtlError):
         dc._read_state()
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed"),
+    [
+        ("schema_version", "2"),
+        ("schema_version", 2.0),
+        ("schema_version", True),
+        ("status", [dc.STATUS_PENDING]),
+        ("status", "unknown"),
+        ("commit", 123),
+        ("commit", "b" * 39),
+        ("previous_commit", [COMMIT]),
+        ("repo", ["/workspace/repo"]),
+        ("uv_path", 123),
+        ("deadline", "1.0"),
+        ("deadline", True),
+        ("deadline", float("nan")),
+        ("deadline", -1),
+        ("stop_grace_seconds", "1.0"),
+        ("stop_grace_seconds", float("inf")),
+        ("stop_grace_seconds", 0),
+        ("stop_grace_seconds", -1),
+        ("git_timeout_seconds", False),
+        ("git_timeout_seconds", "5.0"),
+        ("git_timeout_seconds", 0),
+        ("git_timeout_seconds", -1),
+        ("supervisor_owned", "true"),
+    ],
+)
+def test_present_malformed_authority_scalar_fails_closed(field: str, malformed: object) -> None:
+    """Present authority fields keep their exact JSON type and shape."""
+    with pytest.raises(dc.DeployCtlError):
+        dc.RollbackState.from_dict(rollback_payload(**{field: malformed}))
+
+
+@pytest.mark.parametrize("field", ["deadline", "stop_grace_seconds", "git_timeout_seconds"])
+@pytest.mark.parametrize("value", [1, 1.25])
+def test_finite_json_numbers_remain_accepted(field: str, value: float) -> None:
+    """Finite positive JSON integers and floats remain valid for durable numeric fields."""
+    parsed = dc.RollbackState.from_dict(rollback_payload(**{field: value}))
+    assert getattr(parsed, field) == pytest.approx(value)
+
+
+def test_zero_deadline_remains_valid() -> None:
+    """The epoch deadline remains valid for already-expired durable missions."""
+    parsed = dc.RollbackState.from_dict(rollback_payload(deadline=0))
+    assert parsed.deadline == pytest.approx(0.0)
+
+
+def test_out_of_domain_timing_fails_closed_through_state_reader(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The durable state reader rejects semantically invalid timing authority."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    path = rollback_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(rollback_payload(stop_grace_seconds=0)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(dc.DeployCtlError):
+        dc._read_state()

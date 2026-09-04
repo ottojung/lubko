@@ -56,7 +56,7 @@ def _verified_identity(
     monkeypatch: pytest.MonkeyPatch,
     *,
     aid: str = "ab12",
-    iid: str = "inv1",
+    iid: str = "25e6c9b6be0fb773433c28fb74db32a0",
 ) -> None:
     """Make every identity proof pass for the fake pinned process."""
     monkeypatch.setattr(agent, "proc_start_ticks", lambda _pid: 1234)
@@ -69,7 +69,7 @@ _META: agent.Meta = {
     "pid": 4242,
     "pgid": 4242,
     "start_time": 1234,
-    "invocation_id": "inv1",
+    "invocation_id": "25e6c9b6be0fb773433c28fb74db32a0",
 }
 
 
