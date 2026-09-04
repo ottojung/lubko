@@ -202,6 +202,11 @@ def test_wedged_exact_worker_receives_sigkill_escalation(
         return None if any(sig == signal.SIGKILL for _, sig in h.sends) else LIVE
 
     monkeypatch.setattr(lifecycle, "process_identity", gone_after_kill)
+    monkeypatch.setattr(
+        lifecycle,
+        "process_absence_proven",
+        lambda _pid, _ticks: any(sig == signal.SIGKILL for _, sig in h.sends),
+    )
 
     assert run(h) is True
     assert h.sends == [(LIVE.pid, signal.SIGTERM), (LIVE.pid, signal.SIGKILL)]
@@ -237,6 +242,11 @@ def test_exact_worker_that_exits_after_term_retires_with_drain_only(
         return None if any(sig == signal.SIGTERM for _, sig in h.sends) else LIVE
 
     monkeypatch.setattr(lifecycle, "process_identity", gone_after_term)
+    monkeypatch.setattr(
+        lifecycle,
+        "process_absence_proven",
+        lambda _pid, _ticks: any(sig == signal.SIGTERM for _, sig in h.sends),
+    )
 
     assert run(h) is True
     assert h.sends == [(LIVE.pid, signal.SIGTERM)]
@@ -346,3 +356,21 @@ def test_unpinnable_leader_with_proven_absence_succeeds(
 
     assert run(h) is True
     assert h.sends == []
+
+
+def test_unreadable_retirement_liveness_never_authorizes_handoff(
+    h: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreadable identity after signalling stays unknown through escalation."""
+    h.members = [LIVE.pid]
+    h.pgrps = {LIVE.pid: LIVE.pgid}
+    h.tokened = {LIVE.pid: True}
+
+    def unreadable_after_term(_pid: int) -> ProcessIdentity | None:
+        return None if any(sig == signal.SIGTERM for _, sig in h.sends) else LIVE
+
+    monkeypatch.setattr(lifecycle, "process_identity", unreadable_after_term)
+    monkeypatch.setattr(lifecycle, "process_absence_proven", lambda _pid, _ticks: False)
+
+    assert run(h) is False
+    assert h.sends == [(LIVE.pid, signal.SIGTERM), (LIVE.pid, signal.SIGKILL)]
