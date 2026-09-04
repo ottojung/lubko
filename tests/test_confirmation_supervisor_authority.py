@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -95,11 +96,15 @@ def test_supervisor_owned_confirmation_requires_live_supervisor(
     _assert_supervisor_authority_requires_liveness(monkeypatch, supervisor_owned=True)
 
 
-def test_unknown_confirmation_ownership_requires_live_supervisor(
+def test_unknown_confirmation_ownership_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unknown confirmation ownership fails closed without a supervisor."""
-    _assert_supervisor_authority_requires_liveness(monkeypatch, supervisor_owned=None)
+    """Unknown confirmation ownership is never inferred from liveness."""
+    state = _pending_state(supervisor_owned=None)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+
+    with pytest.raises(dc.DeployCtlError, match="unknown supervisor ownership"):
+        dc._finalize_confirmation(state)
 
 
 def test_explicit_legacy_confirmation_can_terminalize_without_supervisor(
@@ -109,7 +114,9 @@ def test_explicit_legacy_confirmation_can_terminalize_without_supervisor(
     state = _pending_state(supervisor_owned=False)
     writes: list[dc.RollbackState] = []
     pointer_updates: list[str] = []
-    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    closed: list[int] = []
+    monkeypatch.setattr(supervise, "acquire_supervisor_lock", lambda: 41)
+    monkeypatch.setattr(os, "close", closed.append)
     monkeypatch.setattr(dc, "_write_state", writes.append)
     monkeypatch.setattr(cli, "set_current", pointer_updates.append)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
@@ -120,6 +127,7 @@ def test_explicit_legacy_confirmation_can_terminalize_without_supervisor(
     assert terminal.status == dc.STATUS_CONFIRMED
     assert writes == [terminal]
     assert pointer_updates == [COMMIT]
+    assert closed == [41]
 
 
 def test_confirmation_fails_closed_if_supervisor_disappears_after_preparation(
@@ -150,3 +158,104 @@ def test_confirmation_fails_closed_if_supervisor_disappears_after_preparation(
     assert state.status == dc.STATUS_PENDING
     assert writes == []
     assert pointer_updates == []
+
+
+def test_legacy_confirmation_rolls_back_if_supervisor_appears_before_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live supervisor cannot adopt a legacy candidate during confirmation."""
+    state = _pending_state(supervisor_owned=False)
+    settled: list[tuple[str, str, str]] = []
+    rolled_back: list[dc.RollbackState] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        dc,
+        "settle_desired",
+        lambda commit, repo, uv_path: settled.append((commit, repo, uv_path)),
+    )
+
+    def rollback(s: dc.RollbackState) -> bool:
+        rolled_back.append(s)
+        return True
+
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    with pytest.raises(dc.DeployCtlError, match="deployment was rolled back"):
+        dc._prepare_confirmation_candidate(state, _options())
+
+    assert settled == []
+    assert rolled_back == [state]
+
+
+def test_legacy_confirmation_rolls_back_if_supervisor_owns_terminalization_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late supervisor wins atomically over prepared legacy confirmation."""
+    state = _pending_state(supervisor_owned=False)
+    rolled_back: list[dc.RollbackState] = []
+    writes: list[object] = []
+    pointer_updates: list[str] = []
+
+    def lock_contended() -> int:
+        raise BlockingIOError
+
+    def rollback(s: dc.RollbackState) -> bool:
+        rolled_back.append(s)
+        return True
+
+    monkeypatch.setattr(supervise, "acquire_supervisor_lock", lock_contended)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+    monkeypatch.setattr(dc, "_write_state", writes.append)
+    monkeypatch.setattr(cli, "set_current", pointer_updates.append)
+
+    with pytest.raises(dc.DeployCtlError, match="deployment was rolled back"):
+        dc._finalize_confirmation(state)
+
+    assert rolled_back == [state]
+    assert writes == []
+    assert pointer_updates == []
+
+
+def test_legacy_confirmation_lock_failure_without_live_supervisor_stays_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambiguous ownership-lock failure never authorizes direct confirmation."""
+    state = _pending_state(supervisor_owned=False)
+    rolled_back: list[dc.RollbackState] = []
+
+    def lock_failed() -> int:
+        message = "lock unavailable"
+        raise OSError(message)
+
+    def rollback(s: dc.RollbackState) -> bool:
+        rolled_back.append(s)
+        return True
+
+    monkeypatch.setattr(supervise, "acquire_supervisor_lock", lock_failed)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
+    monkeypatch.setattr(dc, "_rollback_locked", rollback)
+
+    with pytest.raises(dc.DeployCtlError, match="absence cannot be proven"):
+        dc._finalize_confirmation(state)
+
+    assert rolled_back == []
+
+
+def test_unknown_confirmation_ownership_is_not_inferred_from_live_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown ownership fails closed before any supervisor settlement is published."""
+    state = _pending_state(supervisor_owned=None)
+    settled: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        dc,
+        "settle_desired",
+        lambda commit, repo, uv_path: settled.append((commit, repo, uv_path)),
+    )
+
+    with pytest.raises(dc.DeployCtlError, match="unknown supervisor ownership"):
+        dc._prepare_confirmation_candidate(state, _options())
+
+    assert settled == []

@@ -2179,18 +2179,29 @@ def _authorize_confirmation(state: RollbackState) -> None:
 
 
 def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> None:
-    """Prepare the exact candidate for terminal confirmation.
+    """Prepare the exact candidate under the mission's durable ownership mode.
 
     Args:
         state: Pending mission being confirmed.
         options: Runtime options for legacy CLI preparation.
 
     Raises:
-        DeployCtlError: If the legacy CLI environment cannot be prepared.
+        DeployCtlError: If confirmation authority or candidate preparation is unsafe.
     """
-    if supervise.supervisor_running():
+    if state.supervisor_owned is True:
+        if not supervise.supervisor_running():
+            raise DeployCtlError(
+                "cannot confirm a supervisor-owned deployment without a live supervisor"
+            )
         settle_desired(state.commit, state.repo, state.uv_path)
         return
+    if state.supervisor_owned is None:
+        raise DeployCtlError("cannot confirm a deployment with unknown supervisor ownership")
+    if supervise.supervisor_running():
+        msg = _confirmation_rollback_error(
+            state, "legacy deployment lost authority to a live supervisor before confirmation"
+        )
+        raise DeployCtlError(msg)
     try:
         cli.build_cli_root(
             Path(state.repo), state.commit, state.uv_path, options.cli_timeout_seconds
@@ -2203,29 +2214,69 @@ def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> N
     write_meta(state.new_meta)
 
 
+def _finalize_legacy_confirmation(state: RollbackState) -> RollbackState:
+    """Linearize legacy confirmation against supervisor process ownership.
+
+    The daemon holds ``.supervisor.lock`` for its whole lifetime. Taking that
+    same lock non-blockingly proves that no supervisor owns process lifecycle
+    now and prevents one from starting until the terminal legacy state is
+    durable. Failure to acquire the lock is ambiguous until exact daemon
+    liveness is checked, so it either converges a proven live-supervisor race
+    through rollback or leaves the mission pending.
+
+    Returns:
+        Terminal confirmed legacy mission state.
+
+    Raises:
+        DeployCtlError: If supervisor absence cannot be proven.
+    """
+    try:
+        ownership_fd = supervise.acquire_supervisor_lock()
+    except OSError as exc:
+        if supervise.supervisor_running():
+            msg = _confirmation_rollback_error(
+                state,
+                "legacy deployment lost authority to a live supervisor before terminalization",
+            )
+            raise DeployCtlError(msg) from exc
+        raise DeployCtlError(
+            "cannot confirm a legacy deployment because supervisor absence cannot be proven"
+        ) from exc
+    try:
+        terminal = replace(state, status=STATUS_CONFIRMED)
+        _write_state(terminal)
+        try:
+            cli.set_current(terminal.commit)
+        except cli.CliError as exc:
+            append_deploy_log(f"supervised deployment confirmed but CLI activation failed: {exc}")
+        cli.gc_cli_roots((terminal.commit, terminal.previous_commit))
+        append_deploy_log(f"supervised deployment confirmed commit {terminal.commit}")
+        return terminal
+    finally:
+        os.close(ownership_fd)
+
+
 def _finalize_confirmation(state: RollbackState) -> RollbackState:
-    """Persist terminal confirmation and maintain the CLI pointer.
+    """Persist terminal confirmation under the mission's durable ownership mode.
 
     Args:
         state: Pending mission whose candidate is prepared.
 
     Returns:
         Terminal confirmed mission state.
+
+    Raises:
+        DeployCtlError: If ownership changed or cannot be proven at terminalization.
     """
-    if supervise.supervisor_running():
+    if state.supervisor_owned is True:
+        if not supervise.supervisor_running():
+            raise DeployCtlError(
+                "cannot confirm a supervisor-owned deployment without a live supervisor"
+            )
         return _finalize_supervised_confirmation(state)
-    if state.supervisor_owned is not False:
-        msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
-        raise DeployCtlError(msg)
-    terminal = replace(state, status=STATUS_CONFIRMED)
-    _write_state(terminal)
-    try:
-        cli.set_current(terminal.commit)
-    except cli.CliError as exc:
-        append_deploy_log(f"supervised deployment confirmed but CLI activation failed: {exc}")
-    cli.gc_cli_roots((terminal.commit, terminal.previous_commit))
-    append_deploy_log(f"supervised deployment confirmed commit {terminal.commit}")
-    return terminal
+    if state.supervisor_owned is None:
+        raise DeployCtlError("cannot confirm a deployment with unknown supervisor ownership")
+    return _finalize_legacy_confirmation(state)
 
 
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
