@@ -19,10 +19,12 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1017,7 +1019,23 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
-    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
+    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: mission.generation)
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=mission.generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=mission.generation,
+            commit=mission.commit,
+            ready=True,
+            holding=False,
+        ),
+    )
     monkeypatch.setattr(cli, "set_current", lambda _c: None)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _c: None)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
@@ -1029,6 +1047,90 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None
     )
     assert response["confirmed"] is True
     assert written[-1].status == deployctl.STATUS_CONFIRMED
+
+
+def test_confirmation_holds_for_superseding_unready_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Terminal confirmation requires readiness for the current desired generation."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    newer_generation = mission.generation + 1
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=newer_generation, restart=True),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=mission.generation,
+            commit=mission.commit,
+            ready=True,
+            holding=False,
+        ),
+    )
+    written = MagicMock()
+    monkeypatch.setattr(deployctl, "_write_state", written)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._finalize_supervised_confirmation(mission)
+
+    written.assert_not_called()
+
+
+def test_confirmation_holds_while_current_generation_is_holding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current generation in a replacement hold is not a readiness proof."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    generation = mission.generation + 1
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=generation, restart=True),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=generation,
+            commit=mission.commit,
+            ready=False,
+            holding=True,
+        ),
+    )
+    written = MagicMock()
+    monkeypatch.setattr(deployctl, "_write_state", written)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._finalize_supervised_confirmation(mission)
+
+    written.assert_not_called()
+
+
+def test_settlement_preserves_existing_same_commit_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Settlement cannot erase an already-published same-commit replacement intent."""
+    generation = 71
+    desired = SimpleNamespace(commit=COMMIT, generation=generation, restart=True)
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: desired)
+    request_run = MagicMock()
+    monkeypatch.setattr(supervise, "request_run", request_run)
+    monkeypatch.setattr(
+        supervise, "wait_for_generation", lambda current, _timeout: current == generation
+    )
+    monkeypatch.setattr(
+        supervise,
+        "wait_until_ready",
+        lambda current, _timeout, *, commit=None: current == generation and commit == COMMIT,
+    )
+
+    assert deployctl.settle_desired(COMMIT, "/repo", "/uv") == generation
+    request_run.assert_not_called()
 
 
 def test_rollback_gate_refuses_malformed_authority(
