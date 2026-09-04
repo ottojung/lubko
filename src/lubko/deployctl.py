@@ -2177,6 +2177,9 @@ def _finalize_confirmation(state: RollbackState) -> RollbackState:
     """
     if supervise.supervisor_running():
         return _finalize_supervised_confirmation(state)
+    if state.supervisor_owned is not False:
+        msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
+        raise DeployCtlError(msg)
     terminal = replace(state, status=STATUS_CONFIRMED)
     _write_state(terminal)
     try:
