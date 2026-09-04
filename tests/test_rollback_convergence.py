@@ -119,7 +119,6 @@ def pending_state(*, previous_retiring: bool = False) -> dc.RollbackState:
         status=dc.STATUS_PENDING,
         commit=new,
         previous_commit=old,
-        challenge_hash=None,
         deadline=time.time() + 60,
         repo="/workspace/Lubko",
         uv_path="uv",

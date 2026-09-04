@@ -141,7 +141,6 @@ def test_malformed_previous_retiring_never_reuses_live_worker(
         ("git_timeout_seconds", "5.0"),
         ("git_timeout_seconds", 0),
         ("git_timeout_seconds", -1),
-        ("challenge_hash", []),
         ("supervisor_owned", "true"),
     ],
 )

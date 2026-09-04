@@ -1167,12 +1167,10 @@ The normal supervised sequence is:
 checkout exact commit
     -> provisional candidate + armed rollback watchdog
 confirm exact commit
-    -> 7-character hex challenge
-confirm exact commit + reversed challenge
-    -> terminal confirmation
+    -> exact candidate is queue-ready + terminal confirmation
 ```
 
-Both confirmation requests must traverse the replacement worker. Do not consider a deployment stable merely because checkout returned successfully or the candidate process exists. Until the second confirmation succeeds, the watchdog may restore the previous exact maintained commit automatically.
+The confirmation request must traverse the replacement worker. Do not consider a deployment stable merely because checkout returned successfully or the candidate process exists. Until exact-commit confirmation succeeds, the watchdog may restore the previous exact maintained commit automatically. The host controller no longer runs a challenge/response handshake; the external orchestrator owns transaction sequencing and confirmation is one idempotent exact-commit primitive.
 
 When checkout is submitted through the queue itself, the worker injects the exact root job UUID into the command environment (`LUBKO_JOB_ID`) so the controller recognizes its own queue row without any `process_pgid` race, then forks a detached handoff helper: the queue job returns its response and reaches durable `succeeded` before the old worker is stopped, so the control job is never killed by the old worker's own shutdown. A helper error or helper death makes the job exit non-zero and be durably recorded `failed` — never falsely `succeeded`. No ordinary job is ever exempted from shutdown cleanup.
 

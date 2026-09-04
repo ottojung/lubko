@@ -1609,7 +1609,7 @@ def _mission_generation() -> int:
         raise MissionAuthorityError(str(exc)) from exc
     if mission is None:
         return 0
-    return max(mission.generation, mission.settlement_generation or 0)
+    return mission.generation
 
 
 def next_generation() -> int:
