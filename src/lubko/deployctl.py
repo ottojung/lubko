@@ -1,24 +1,15 @@
-"""Crash-safe supervised self-deployment for Lubko.
+"""Crash-safe supervised self-deployment primitives for Lubko.
 
-``lubko-deploy-ctl`` is the stable control plane used for version-changing
-self-deployments. A checkout is provisional until two requests traverse the
-replacement worker: first an exact-commit confirmation that returns a fresh
-7-character lowercase hexadecimal challenge, then a second exact-commit
-confirmation containing that challenge reversed. Until both complete, a forked
-watchdog retains the known-good process image and restores the previous commit
-automatically on timeout or candidate failure.
-
-The global command line tools are kept coherent with the confirmed commit:
-the candidate CLI environment is built during the provisional phase, and the
-``current`` pointer is switched only after durable ``confirmed`` state exists,
-so rollback can never strand the global CLIs on candidate code. See
-:mod:`lubko.cli`.
+The host side exposes a small set of exact, idempotent deployment primitives.
+The external orchestrator owns transaction sequencing; host state retains only
+what is required to preserve exact-commit authority, readiness, rollback, and
+fail-closed recovery across crashes. Confirmation is a single exact-commit
+operation rather than a multi-step challenge handshake.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import math
@@ -78,8 +69,6 @@ SUPPORTED_ROLLBACK_SCHEMA_VERSIONS: Final = frozenset({2})
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
-SETTLEMENT_CONFIRM: Final = "confirm"
-SETTLEMENT_ROLLBACK: Final = "rollback"
 DEFAULT_CONFIRM_WINDOW_SECONDS: Final = 120.0
 DEFAULT_STOP_GRACE_SECONDS: Final = 5.0
 DEFAULT_POSTGRES_TIMEOUT_SECONDS: Final = 5.0
@@ -92,7 +81,6 @@ IDENTITY_POLL_SECONDS: Final = 0.02
 POST_RELEASE_STABILITY_SECONDS: Final = 0.25
 WATCHDOG_POLL_SECONDS: Final = 0.5
 COMMIT_RE: Final = re.compile(r"[0-9a-f]{40}")
-CHALLENGE_RE: Final = re.compile(r"[0-9a-f]{7}")
 HANDOFF_POLL_SECONDS: Final = 0.1
 HANDOFF_RESPONSE_MAX_BYTES: Final = 1048576
 HELPER_ERROR_MAX_CHARS: Final = 8000
@@ -141,7 +129,6 @@ class RollbackState:
     status: str
     commit: str
     previous_commit: str
-    challenge_hash: str | None
     deadline: float
     repo: str
     uv_path: str
@@ -151,9 +138,6 @@ class RollbackState:
     previous_meta: WorkerMeta
     new_meta: WorkerMeta
     supervisor_owned: bool | None = None
-    settlement_transition: str | None = None
-    settlement_generation: int | None = None
-    settlement_commit: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize durable rollback state.
@@ -167,7 +151,6 @@ class RollbackState:
             "status": self.status,
             "commit": self.commit,
             "previous_commit": self.previous_commit,
-            "challenge_hash": self.challenge_hash,
             "deadline": self.deadline,
             "repo": self.repo,
             "uv_path": self.uv_path,
@@ -178,17 +161,6 @@ class RollbackState:
             "new_meta": self.new_meta.to_dict(),
             "supervisor_owned": self.supervisor_owned,
         }
-        settlement = (
-            self.settlement_transition,
-            self.settlement_generation,
-            self.settlement_commit,
-        )
-        if any(value is not None for value in settlement):
-            result.update(
-                settlement_transition=self.settlement_transition,
-                settlement_generation=self.settlement_generation,
-                settlement_commit=self.settlement_commit,
-            )
         return result
 
     @classmethod
@@ -221,9 +193,6 @@ class RollbackState:
             ):
                 raise ValueError
             generation = raw_generation
-            settlement_transition, settlement_generation, settlement_commit = _settlement_fields(
-                data
-            )
             schema_version = _required_json_int(data["schema_version"])
             status = _required_json_string(data["status"])
             if status not in {STATUS_PENDING, STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
@@ -236,7 +205,6 @@ class RollbackState:
                 status=status,
                 commit=commit,
                 previous_commit=previous_commit,
-                challenge_hash=_optional_json_string(data.get("challenge_hash")),
                 deadline=_required_nonnegative_finite_json_number(data["deadline"]),
                 repo=_required_json_string(data["repo"]),
                 uv_path=_required_json_string(data["uv_path"]),
@@ -250,9 +218,6 @@ class RollbackState:
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=WorkerMeta.from_dict(replacement),
                 supervisor_owned=_optional_json_bool(data.get("supervisor_owned")),
-                settlement_transition=settlement_transition,
-                settlement_generation=settlement_generation,
-                settlement_commit=settlement_commit,
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervised deployment state is malformed"
@@ -269,37 +234,6 @@ class GatedWorker:
 
 
 _ABSENT: Final = object()
-
-
-def _settlement_fields(
-    data: dict[str, object],
-) -> tuple[str | None, int | None, str | None]:
-    """Parse the optional exact pending-mission settlement handoff.
-
-    Genuine absence means no settlement has begun. Once any handoff field is
-    present, all three are mandatory and strict because they are generation
-    authority: partial/corrupt state must fail closed rather than degrade to an
-    ordinary pending mission.
-
-    Returns:
-        The parsed transition, generation, and commit, or three ``None`` values
-        when no settlement handoff is present.
-    """
-    transition = data.get("settlement_transition", _ABSENT)
-    generation = data.get("settlement_generation", _ABSENT)
-    commit = data.get("settlement_commit", _ABSENT)
-    values = (transition, generation, commit)
-    if all(value is _ABSENT for value in values):
-        return None, None, None
-    if any(value is _ABSENT for value in values):
-        raise TypeError
-    if transition not in {SETTLEMENT_CONFIRM, SETTLEMENT_ROLLBACK}:
-        raise ValueError
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
-        raise ValueError
-    if not isinstance(commit, str) or COMMIT_RE.fullmatch(commit) is None:
-        raise ValueError
-    return transition, int(generation), commit
 
 
 def _retiring_flag(value: object) -> bool:
@@ -565,83 +499,18 @@ def _mission_candidate_alive(state: RollbackState) -> bool:
     return worker_alive(state.new_meta)
 
 
-def _settlement_spec(
-    state: RollbackState,
-) -> tuple[str, int, str] | None:
-    """Return and validate the exact pending-mission settlement handoff.
-
-    A programmatically constructed partial handoff must fail closed exactly like
-    malformed persisted JSON; callers must never silently fall back to ordinary
-    pending-mission authority once any settlement field exists.
-
-    Returns:
-        The exact transition, generation, and target commit, or ``None`` when no
-        settlement handoff has begun.
-    """
-    values = (
-        state.settlement_transition,
-        state.settlement_generation,
-        state.settlement_commit,
-    )
-    if all(value is None for value in values):
-        return None
-    transition, generation, commit = values
-    generation_valid = (
-        isinstance(generation, int)
-        and not isinstance(generation, bool)
-        and generation > state.generation
-    )
-    if (
-        transition not in {SETTLEMENT_CONFIRM, SETTLEMENT_ROLLBACK}
-        or not generation_valid
-        or not isinstance(commit, str)
-        or COMMIT_RE.fullmatch(commit) is None
-    ):
-        raise DeployCtlError("supervised deployment settlement handoff is malformed")
-    target = state.commit if transition == SETTLEMENT_CONFIRM else state.previous_commit
-    if commit != target:
-        raise DeployCtlError("supervised deployment settlement handoff targets the wrong commit")
-    return transition, int(generation), commit
-
-
 def _supervised_mission_authoritative(state: RollbackState) -> bool:
     """Return whether durable supervisor authority still belongs to this mission.
 
-    An ordinary pending mission requires exact applied generation equality. An
-    in-progress settlement may additionally own one exact reserved generation,
-    durably bound to its transition and target commit before that generation is
-    published. No higher desired/applied generation is accepted, even for the
-    same commit.
-
-    Returns:
-        ``True`` only when observed desired/applied authority is still exactly
-        attributable to this mission or its reserved settlement.
+    A pending mission owns exactly its published generation and candidate commit.
+    Confirmation or rollback publishes a newer desired generation only while the
+    deployment lock is held and immediately terminalizes the mission after the
+    requested worker is queue-ready.
     """
     supervisor_state = supervise.read_state()
-    try:
-        settlement = _settlement_spec(state)
-        desired = supervise.read_desired_strict()
-    except (DeployCtlError, supervise.DesiredIntentError):
-        return False
-    if settlement is None:
-        return (
-            supervisor_state.commit == state.commit
-            and supervisor_state.applied_generation == state.generation
-        )
-    _, generation, target = settlement
-    superseded = supervisor_state.applied_generation > generation or (
-        desired is not None and desired.generation > generation
-    )
-    desired_mismatch = (
-        desired is not None and desired.generation == generation and desired.commit != target
-    )
-    if superseded or desired_mismatch:
-        return False
-    if supervisor_state.applied_generation == generation:
-        return supervisor_state.commit == target
     return (
-        supervisor_state.applied_generation == state.generation
-        and supervisor_state.commit == state.commit
+        supervisor_state.commit == state.commit
+        and supervisor_state.applied_generation == state.generation
     )
 
 
@@ -668,235 +537,33 @@ def _pending_mission_rollback_due(state: RollbackState) -> bool:
     return time.time() >= state.deadline or not worker_alive(state.new_meta)
 
 
-def _settlement_exactly_applied(state: RollbackState) -> bool:
-    """Return whether the exact reserved settlement is applied and queue-ready."""
-    try:
-        settlement = _settlement_spec(state)
-        desired = supervise.read_desired_strict()
-    except (DeployCtlError, supervise.DesiredIntentError):
-        return False
-    if settlement is None or desired is None:
-        return False
-    _, generation, target = settlement
-    supervisor_state = supervise.read_state()
-    return (
-        desired.generation == generation
-        and desired.commit == target
-        and supervisor_state.applied_generation == generation
-        and supervisor_state.commit == target
-        and supervisor_state.ready
-    )
-
-
-def _read_desired_for_settlement() -> supervise.SupervisorDesired | None:
-    """Read strict desired authority while publishing a mission settlement.
-
-    Returns:
-        The current desired intent, or ``None`` when no desired intent exists.
-
-    Raises:
-        DeployCtlError: If durable desired authority is malformed or unreadable.
-    """
-    try:
-        return supervise.read_desired_strict()
-    except supervise.DesiredIntentError as exc:
-        raise DeployCtlError(str(exc)) from exc
-
-
-def _prepare_settlement_reservation(
-    current: RollbackState,
-    transition: str,
-    target: str,
-) -> tuple[RollbackState, int]:
-    """Resolve or durably reserve the exact settlement generation.
-
-    Args:
-        current: Current pending mission under the generation lock.
-        transition: Requested terminal settlement transition.
-        target: Exact commit the settlement must apply.
-
-    Returns:
-        The mission containing the exact reservation and its generation.
-
-    Raises:
-        DeployCtlError: If another transition owns the mission, an applied
-            confirmation cannot be superseded, or the target is inconsistent.
-    """
-    settlement = _settlement_spec(current)
-    if settlement is not None and settlement[0] != transition:
-        can_replace_confirmation = (
-            transition == SETTLEMENT_ROLLBACK and settlement[0] == SETTLEMENT_CONFIRM
-        )
-        if not can_replace_confirmation:
-            raise DeployCtlError("a different mission settlement transition is already pending")
-        if _settlement_exactly_applied(current):
-            raise DeployCtlError("the confirmation settlement is already applied")
-        settlement = None
-    if settlement is None:
-        generation = supervise.next_generation()
-        current = replace(
-            current,
-            settlement_transition=transition,
-            settlement_generation=generation,
-            settlement_commit=target,
-        )
-        _write_state(current)
-        return current, generation
-    _, generation, recorded_target = settlement
-    if recorded_target != target:
-        raise DeployCtlError("settlement target no longer matches the mission")
-    return current, generation
-
-
-def _validate_settlement_observations(
-    supervisor_state: supervise.SupervisorState,
-    desired: supervise.SupervisorDesired | None,
-    generation: int,
-    target: str,
-) -> None:
-    """Reject authority that contradicts or supersedes an exact settlement.
-
-    Args:
-        supervisor_state: Current durable applied supervisor authority.
-        desired: Current strict desired authority, if present.
-        generation: Reserved settlement generation.
-        target: Exact settlement target commit.
-
-    Raises:
-        DeployCtlError: If newer or contradictory authority is observed.
-    """
-    if supervisor_state.applied_generation > generation:
-        raise DeployCtlError("supervised deployment settlement was superseded")
-    if desired is not None and desired.generation > generation:
-        raise DeployCtlError("supervised deployment settlement was superseded")
-    if supervisor_state.applied_generation == generation and supervisor_state.commit != target:
-        raise DeployCtlError("settlement generation is applied to a different commit")
-    if desired is not None and desired.generation == generation and desired.commit != target:
-        raise DeployCtlError("settlement generation targets a different commit")
-
-
-def _write_settlement_desired(
-    state: RollbackState,
-    generation: int,
-    target: str,
-) -> None:
-    """Publish the exact desired intent for a durably reserved settlement.
-
-    Args:
-        state: Mission whose settlement owns the generation.
-        generation: Exact reserved generation.
-        target: Exact target commit.
-    """
-    supervise.write_desired(
-        supervise.SupervisorDesired(
-            schema_version=supervise.SCHEMA_VERSION,
-            generation=generation,
-            commit=target,
-            repo=state.repo,
-            uv_path=state.uv_path,
-            worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-            requested_at=time.time(),
-        )
-    )
-
-
-def _publish_settlement_intent(
-    state: RollbackState,
-    transition: str,
-) -> RollbackState:
-    """Durably bind and publish one exact mission settlement generation.
-
-    The deployment lock is held by callers. The shared generation lock makes
-    reservation and desired-intent publication one serialized authority
-    transition. The mission handoff is written first, so a crash or failed
-    desired write leaves replacement-blocking generation authority rather than
-    an unrepresented newer intent.
-
-    Returns:
-        The pending mission carrying the exact settlement reservation.
-
-    Raises:
-        DeployCtlError: If the mission changed, authority was superseded, or the
-            requested settlement conflicts with durable authority.
-    """
-    if transition not in {SETTLEMENT_CONFIRM, SETTLEMENT_ROLLBACK}:
-        raise DeployCtlError("unknown supervised deployment settlement transition")
-    target = state.commit if transition == SETTLEMENT_CONFIRM else state.previous_commit
-    with supervise.generation_lock():
-        current = _read_state()
-        if (
-            current is None
-            or current.status != STATUS_PENDING
-            or current.generation != state.generation
-        ):
-            raise DeployCtlError("supervised deployment mission changed during settlement")
-        current, generation = _prepare_settlement_reservation(current, transition, target)
-        supervisor_state = supervise.read_state()
-        desired = _read_desired_for_settlement()
-        _validate_settlement_observations(supervisor_state, desired, generation, target)
-        if desired is None or desired.generation < generation:
-            _write_settlement_desired(state, generation, target)
-    return current
-
-
 def settle_desired(commit: str, repo: str, uv_path: str) -> int:
-    """Durably settle a supervised mission target and await queue readiness.
+    """Request one exact supervisor target and await queue readiness.
 
-    When ``commit`` is the target of the currently pending supervised mission,
-    reserve and persist the exact mission settlement generation before publishing
-    that desired intent. Calls outside a pending mission retain the ordinary
-    newer-intent behavior used by existing lifecycle operations.
-
-    Args:
-        commit: Exact commit the settlement must run.
-        repo: Maintained checkout the commit belongs to.
-        uv_path: Recorded ``uv`` executable.
+    The external orchestrator owns transaction sequencing. This host-side
+    primitive is intentionally idempotent in effect: retries may allocate a new
+    supervisor generation, but they request the same exact commit and return only
+    after that generation is applied and queue-ready.
 
     Returns:
-        The exact written/resumed settlement generation.
+        The applied supervisor generation.
 
     Raises:
-        DeployCtlError: If the exact settlement is superseded, cannot be
-            published, or does not become queue-ready.
+        DeployCtlError: If the supervisor cannot apply or prove the target.
     """
-    mission = _read_state()
-    prepared: RollbackState | None = None
-    if (
-        mission is not None
-        and mission.status == STATUS_PENDING
-        and commit
-        in {
-            mission.commit,
-            mission.previous_commit,
-        }
-    ):
-        transition = SETTLEMENT_CONFIRM if commit == mission.commit else SETTLEMENT_ROLLBACK
-        prepared = _publish_settlement_intent(mission, transition)
-        settlement = _settlement_spec(prepared)
-        if settlement is None:
-            raise DeployCtlError("supervised deployment settlement was not reserved")
-        _, generation, _ = settlement
-    else:
-        generation = supervise.request_run(
-            commit,
-            repo=repo,
-            uv_path=uv_path,
-            worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-        )
-
+    generation = supervise.request_run(
+        commit,
+        repo=repo,
+        uv_path=uv_path,
+        worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+    )
     lifecycle_state.failpoint(lifecycle_state.FAILPOINT_MISSION_CONFIRM)
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
-        raise DeployCtlError("the external supervisor did not apply the settlement intent")
+        raise DeployCtlError("the external supervisor did not apply the requested target")
     if not supervise.wait_until_ready(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         raise DeployCtlError(
-            "the external supervisor did not prove the settled worker consumes the queue"
+            "the external supervisor did not prove the requested worker queue-ready"
         )
-    if prepared is not None:
-        if not _settlement_exactly_applied(prepared):
-            raise DeployCtlError(
-                "supervised deployment settlement was superseded before completion"
-            )
-        lifecycle_state.failpoint(lifecycle_state.FAILPOINT_MISSION_SETTLEMENT_APPLIED)
     return generation
 
 
@@ -1593,7 +1260,7 @@ def _restore_previous_locked(state: RollbackState) -> bool:
         append_deploy_log("supervised rollback could not restart previous worker")
         return False
     write_meta(restored)
-    _write_state(replace(state, status=STATUS_ROLLED_BACK, challenge_hash=None))
+    _write_state(replace(state, status=STATUS_ROLLED_BACK))
     cli.remove_cli_root(state.commit)
     if cli.reconcile_pointer(state.previous_commit):
         append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
@@ -1605,24 +1272,13 @@ def _restore_previous_locked(state: RollbackState) -> bool:
     return True
 
 
-def _clear_settlement(state: RollbackState, status: str) -> RollbackState:
-    """Return terminal mission history with no active settlement authority."""
-    return replace(
-        state,
-        status=status,
-        settlement_transition=None,
-        settlement_generation=None,
-        settlement_commit=None,
-    )
-
-
 def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
-    """Durably archive an exactly applied rollback settlement.
+    """Durably archive a queue-ready rollback target.
 
     Returns:
-        The terminal rolled-back mission state.
+        The terminal rolled-back state.
     """
-    terminal = _clear_settlement(replace(state, challenge_hash=None), STATUS_ROLLED_BACK)
+    terminal = replace(state, status=STATUS_ROLLED_BACK)
     _write_state(terminal)
     cli.remove_cli_root(state.commit)
     if cli.reconcile_pointer(state.previous_commit):
@@ -1636,12 +1292,12 @@ def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
 
 
 def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
-    """Durably archive an exactly applied confirmation settlement.
+    """Durably archive a queue-ready confirmed target.
 
     Returns:
-        The terminal confirmed mission state.
+        The terminal confirmed state.
     """
-    terminal = _clear_settlement(state, STATUS_CONFIRMED)
+    terminal = replace(state, status=STATUS_CONFIRMED)
     _write_state(terminal)
     try:
         cli.set_current(state.commit)
@@ -1650,24 +1306,6 @@ def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
     cli.gc_cli_roots((state.commit, state.previous_commit))
     append_deploy_log(f"supervised deployment confirmed commit {state.commit}")
     return terminal
-
-
-def _recover_applied_settlement(state: RollbackState) -> RollbackState:
-    """Finish an exact queue-ready settlement left pending by a prior crash.
-
-    Returns:
-        A terminal mission when exact settlement authority is already applied,
-        otherwise the input pending mission unchanged.
-    """
-    if state.status != STATUS_PENDING or not supervise.supervisor_running():
-        return state
-    settlement = _settlement_spec(state)
-    if settlement is None or not _settlement_exactly_applied(state):
-        return state
-    transition, _, _ = settlement
-    if transition == SETTLEMENT_CONFIRM:
-        return _finalize_supervised_confirmation(state)
-    return _finalize_supervised_rollback(state)
 
 
 def _rollback_locked(state: RollbackState) -> bool:
@@ -1689,8 +1327,6 @@ def _rollback_locked(state: RollbackState) -> bool:
         ``True`` only when checkout, worker, metadata, and state are restored and
         the candidate worker is proven dead.
     """
-    if state.status == STATUS_PENDING:
-        state = _recover_applied_settlement(state)
     if state.status != STATUS_PENDING:
         return True
     lifecycle_state.failpoint("mission_rollback")
@@ -1817,7 +1453,7 @@ def archive_mission(state: RollbackState, status: str) -> None:
     if status not in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
         msg = f"cannot archive a mission as {status!r}"
         raise DeployCtlError(msg)
-    _write_state(replace(state, status=status, challenge_hash=None))
+    _write_state(replace(state, status=status))
 
 
 def read_rollback_state() -> RollbackState | None:
@@ -2002,7 +1638,6 @@ def _prepare_locked(
         status=STATUS_PENDING,
         commit=commit,
         previous_commit=previous_commit,
-        challenge_hash=None,
         deadline=time.time() + options.confirm_window_seconds,
         repo=str(options.repo),
         uv_path=options.uv_path,
@@ -2266,27 +1901,6 @@ def _handle_checkout(options: Options, request: dict[str, object]) -> dict[str, 
         raise DeployCtlError("timed out waiting for the deployment lock") from exc
 
 
-def _generate_challenge() -> str:
-    """Return a fresh 7-character lowercase hexadecimal confirmation challenge.
-
-    Returns:
-        A challenge matching ``[0-9a-f]{7}``.
-    """
-    return secrets.token_hex(4)[:7]
-
-
-def _challenge_digest(challenge: str) -> str:
-    """Return the durable digest of one confirmation challenge.
-
-    Args:
-        challenge: Challenge string.
-
-    Returns:
-        Hex SHA-256 digest.
-    """
-    return hashlib.sha256(challenge.encode()).hexdigest()
-
-
 def _cli_target_commit(state: RollbackState | None) -> str | None:
     """Return the commit the global CLIs must resolve to right now.
 
@@ -2348,28 +1962,6 @@ def _reconcile_cli(state: RollbackState | None) -> None:
         append_deploy_log(f"reconciled maintained CLI pointer to commit {target}")
 
 
-def _verify_challenge(state: RollbackState, answer: object) -> None:
-    """Validate a second-confirmation challenge answer or roll back.
-
-    Args:
-        state: Live pending deployment state.
-        answer: Decoded challenge response.
-
-    Raises:
-        DeployCtlError: If the challenge response is unexpected, malformed, or
-            does not match the stored challenge.
-    """
-    if not isinstance(answer, str) or state.challenge_hash is None:
-        _rollback_locked(state)
-        raise DeployCtlError("unexpected challenge response; deployment was rolled back")
-    if CHALLENGE_RE.fullmatch(answer) is None:
-        _rollback_locked(state)
-        raise DeployCtlError("malformed challenge response; deployment was rolled back")
-    if not secrets.compare_digest(_challenge_digest(answer[::-1]), state.challenge_hash):
-        _rollback_locked(state)
-        raise DeployCtlError("challenge response is incorrect; deployment was rolled back")
-
-
 def _confirmation_response(state: RollbackState) -> dict[str, object]:
     """Build the terminal successful confirmation response.
 
@@ -2398,17 +1990,12 @@ def _confirmation_state(request: dict[str, object]) -> RollbackState:
     state = _read_state()
     if state is None:
         raise DeployCtlError("no checkout is pending confirmation")
-    if state.status == STATUS_PENDING:
-        state = _recover_applied_settlement(state)
     if state.status == STATUS_CONFIRMED:
         if request.get("commit") != state.commit:
             raise DeployCtlError("confirmation commit does not match the confirmed commit")
         return state
     if state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
-    if state.settlement_transition == SETTLEMENT_ROLLBACK:
-        _rollback_locked(state)
-        raise DeployCtlError("deployment rollback is already in progress")
     if _pending_mission_rollback_due(state):
         _rollback_locked(state)
         raise DeployCtlError("confirmation window lapsed; deployment was rolled back")
@@ -2418,36 +2005,8 @@ def _confirmation_state(request: dict[str, object]) -> RollbackState:
     return state
 
 
-def _issue_confirmation_challenge(state: RollbackState) -> dict[str, object]:
-    """Persist and return a fresh confirmation challenge.
-
-    Args:
-        state: Pending mission to challenge.
-
-    Returns:
-        Protocol response containing the plaintext challenge.
-    """
-    challenge = _generate_challenge()
-    _write_state(replace(state, challenge_hash=_challenge_digest(challenge)))
-    return {
-        "type": "confirm",
-        "ok": True,
-        "commit": state.commit,
-        "challenge": challenge,
-    }
-
-
-def _authorize_confirmation(state: RollbackState, answer: object) -> None:
-    """Verify challenge and lifecycle authority immediately before confirmation.
-
-    Args:
-        state: Pending mission being confirmed.
-        answer: Supplied challenge answer.
-
-    Raises:
-        DeployCtlError: If challenge, liveness, or lifecycle authority fails.
-    """
-    _verify_challenge(state, answer)
+def _authorize_confirmation(state: RollbackState) -> None:
+    """Recheck candidate liveness and lifecycle authority before confirmation."""
     if _pending_mission_rollback_due(state):
         _rollback_locked(state)
         raise DeployCtlError("candidate failed before confirmation; deployment was rolled back")
@@ -2496,7 +2055,7 @@ def _finalize_confirmation(state: RollbackState) -> RollbackState:
     """
     if supervise.supervisor_running():
         return _finalize_supervised_confirmation(state)
-    terminal = _clear_settlement(state, STATUS_CONFIRMED)
+    terminal = replace(state, status=STATUS_CONFIRMED)
     _write_state(terminal)
     try:
         cli.set_current(terminal.commit)
@@ -2508,23 +2067,15 @@ def _finalize_confirmation(state: RollbackState) -> RollbackState:
 
 
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
-    """Advance one pending deployment through the two-phase handshake.
-
-    Args:
-        request: Decoded confirm request.
-        options: Runtime options.
+    """Confirm one exact pending deployment as a single idempotent primitive.
 
     Returns:
-        Protocol response.
-
+        Protocol response for the confirmed deployment.
     """
     state = _confirmation_state(request)
     if state.status == STATUS_CONFIRMED:
         return _confirmation_response(state)
-    answer = request.get("challenge")
-    if answer is None:
-        return _issue_confirmation_challenge(state)
-    _authorize_confirmation(state, answer)
+    _authorize_confirmation(state)
     _prepare_confirmation_candidate(state, options)
     state = _finalize_confirmation(state)
     return _confirmation_response(state)
@@ -2560,8 +2111,7 @@ def _handle_status(options: Options) -> dict[str, object]:
         with deploy_lock(options.lock_timeout_seconds):
             state = _read_state()
             if state is not None and state.status == STATUS_PENDING:
-                state = _recover_applied_settlement(state)
-                if state.status == STATUS_PENDING and _pending_mission_rollback_due(state):
+                if _pending_mission_rollback_due(state):
                     _rollback_locked(state)
                     state = _read_state()
             meta = read_meta()
@@ -2579,7 +2129,7 @@ def _handle_status(options: Options) -> dict[str, object]:
         return {
             "type": "status",
             "ok": True,
-            "phase": "await-reversal" if state.challenge_hash is not None else "await-confirmation",
+            "phase": "await-confirmation",
             "proposed_commit": state.commit,
             "previous_commit": state.previous_commit,
             "deadline": state.deadline,

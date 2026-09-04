@@ -53,7 +53,6 @@ FAILPOINT_DB_RECOVERY: Final = "db_recovery"
 FAILPOINT_MISSION_PUBLISH: Final = "mission_publish"
 FAILPOINT_MISSION_CONFIRM: Final = "mission_confirm"
 FAILPOINT_MISSION_ROLLBACK: Final = "mission_rollback"
-FAILPOINT_MISSION_SETTLEMENT_APPLIED: Final = "mission_settlement_applied"
 FAILPOINT_SUPERVISOR_SPAWNING_WRITE: Final = "supervisor.spawning_write"
 FAILPOINT_SUPERVISOR_PID_UPGRADE: Final = "supervisor.pid_upgrade_write"
 FAILPOINT_SUPERVISOR_SPAWNING_CLEARANCE: Final = "supervisor.spawning_clearance"
@@ -311,14 +310,14 @@ def reconcile_authority_facts() -> AuthorityFacts:
         applied_generation=applied_generation,
         mission_status=mission.status if mission is not None else None,
         mission_generation=(
-            getattr(mission, "settlement_generation", None) or mission.generation
+            mission.generation
             if mission is not None and mission.status == "pending"
             else mission.generation
             if mission is not None
             else None
         ),
         mission_commit=(
-            getattr(mission, "settlement_commit", None) or mission.commit
+            mission.commit
             if mission is not None and mission.status == "pending"
             else mission.commit
             if mission is not None
