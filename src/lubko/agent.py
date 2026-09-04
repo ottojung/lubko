@@ -100,6 +100,7 @@ SECONDS_PER_DAY: Final = 86400
 PID_START_WINDOW_SECONDS: Final = 60
 SESSION_DISCOVER_TIMEOUT_SECONDS: Final = 60
 SESSION_DISCOVER_POLL_SECONDS: Final = 1
+STEER_POLL_SECONDS: Final = 0.2
 STOP_WAIT_SECONDS: Final = 10.0
 KILL_WAIT_SECONDS: Final = 5.0
 ABORT_WAIT_SECONDS: Final = 5.0
@@ -2253,6 +2254,15 @@ def _spawn_and_run(
                 _finalize_abort() if converged else _hold_abort(),
             )
             raise
+        observed = {
+            "id": aid,
+            "pid": proc.pid,
+            "pgid": proc.pid,
+            "start_time": start,
+            "invocation_id": iid,
+        }
+        if not _wait_for_steer_group_convergence(aid, observed):
+            return None
         update_meta(aid, _finalize_after(rc))
 
     return rc
@@ -2332,7 +2342,12 @@ def _wait_for_invocation_exit(
     *,
     is_continue: bool,
 ) -> int:
-    """Discover the native session if needed, then wait for the invocation.
+    """Discover the native session and enforce durable steer preemption while waiting.
+
+    The runner never blocks indefinitely inside one opaque ``proc.wait()``. It
+    periodically re-reads durable lifecycle intent so a steer remains effective
+    even if the submitting CLI dies immediately after the metadata transaction
+    and before it can signal the native invocation itself.
 
     Args:
         proc: The spawned invocation process.
@@ -2342,15 +2357,23 @@ def _wait_for_invocation_exit(
     Returns:
         The invocation's return code.
     """
-    if not is_continue:
-        deadline = time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
-        while time.time() < deadline and proc.poll() is None:
+    discovery_deadline = None if is_continue else time.time() + SESSION_DISCOVER_TIMEOUT_SECONDS
+    next_discovery = 0.0
+    while True:
+        now = time.time()
+        if discovery_deadline is not None and now < discovery_deadline and now >= next_discovery:
             sid = discover_session_id(aid)
             if sid:
                 update_meta(aid, _set_native_session(sid))
-                break
-            time.sleep(SESSION_DISCOVER_POLL_SECONDS)
-    return proc.wait()
+                discovery_deadline = None
+            else:
+                next_discovery = now + SESSION_DISCOVER_POLL_SECONDS
+        try:
+            return proc.wait(timeout=STEER_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            # The durable intent is the authority. This makes steer recovery
+            # independent of the lifetime of the CLI process that accepted it.
+            _interrupt_steer_if_needed(aid)
 
 
 def _kill_spawned_invocation(aid: str, pid: int, start: object, iid: str) -> None:
@@ -3149,24 +3172,127 @@ def _follow_attached(aid: str) -> int:
     return exit_code_for(read_meta(aid))
 
 
-def _interrupt_steer_if_needed(aid: str) -> None:
-    """Send SIGTERM to a live agent that is mid-steer, if applicable.
+def _interrupt_steer_if_needed(aid: str) -> bool:
+    """Hard-preempt and converge the exact invocation superseded by a steer.
 
-    A reuse decision that interrupted the running invocation only matters when
-    the runner is still executing the agent under a ``steer`` intent; an agent
-    that has already finished or never entered the steer intent needs no
-    signal.
+    Steering is a control operation, not a polite queued follow-up. Once the
+    durable ``steer`` intent is present, terminate the exact owned invocation
+    immediately, wait only a bounded grace period, then escalate to ``SIGKILL``.
+    The function succeeds only when the whole exact invocation group is proven
+    gone; leader exit alone is never sufficient authority for continuation.
 
     Args:
         aid: Lubko agent ID.
+
+    Returns:
+        ``True`` when no steer is currently targeting a live invocation, or when
+        the targeted exact invocation group has been positively converged.
     """
     current = read_meta(aid)
     if current is None:
-        return
+        return True
     intent, intent_malformed = _persisted_intent(current)
-    if intent_malformed or intent != "steer" or not is_alive(current):
-        return
+    if intent_malformed:
+        return False
+    if intent != "steer":
+        return True
+    if not group_alive(current):
+        return True
     send_signal_group(current, signal.SIGTERM)
+    if wait_group_dead(current, STOP_WAIT_SECONDS):
+        return True
+    send_signal_group(current, signal.SIGKILL)
+    return wait_group_dead(current, KILL_WAIT_SECONDS)
+
+
+def _wait_for_steer_group_convergence(aid: str, observed: Meta) -> bool:
+    """Prevent a steer continuation until the superseded exact group is gone.
+
+    ``proc.wait()`` proves only that the native invocation leader exited. A tool
+    or descendant from that same invocation may still be executing. If this was
+    a steer, retain the runner as the sole execution authority and keep retrying
+    exact bounded preemption until the old group is positively empty. This is
+    fail-closed: ambiguous ownership never authorizes the next invocation.
+
+    Args:
+        aid: Lubko agent ID.
+        observed: Exact invocation identity captured by the runner.
+
+    Returns:
+        ``True`` when continuation is safe, ``False`` when durable metadata is
+        unavailable or malformed and the runner must stop.
+    """
+    while True:
+        current = read_meta(aid)
+        if current is None:
+            return False
+        intent, intent_malformed = _persisted_intent(current)
+        if intent_malformed:
+            return False
+        if intent != "steer":
+            return True
+        if not group_alive(observed):
+            return True
+        if _interrupt_steer_if_needed(aid):
+            return not group_alive(observed)
+        time.sleep(STEER_POLL_SECONDS)
+
+
+def _promote_steer_after_claimed_runner_death(m: Meta, decision: dict[str, object]) -> str | None:
+    """Recover the oldest accepted steer left behind by a dead claimed runner.
+
+    Returns:
+        The promoted pending prompt, ``None`` when no accepted steer remains, or
+        ``None`` with ``decision["action"] == "busy"`` for malformed state.
+    """
+    sequence = _steer_sequence(m)
+    if sequence is None:
+        decision["action"] = "busy"
+        return None
+    queue = _steer_queue(m, sequence=sequence)
+    if queue is None:
+        decision["action"] = "busy"
+        return None
+    if not queue:
+        _set_active_runner(m, value=False)
+        return None
+    if _pop_into_pending(m, time.time()) is None:
+        decision["action"] = "busy"
+        return None
+    pending = _pending_prompt(m)
+    if pending is None:
+        decision["action"] = "busy"
+    return pending
+
+
+def _accept_stale_recovery_caller(
+    m: Meta,
+    decision: dict[str, object],
+    *,
+    prompt: str,
+    steer: bool,
+    pending: str | None,
+) -> bool:
+    """Accept or reject the caller without overwriting older recovered work.
+
+    Returns:
+        ``True`` when recovery may reserve a replacement runner.
+    """
+    if pending is not None:
+        if steer:
+            _queue_steer(m, prompt, time.time())
+            decision["steer_accepted"] = True
+        else:
+            decision["recover_busy"] = True
+        return True
+    next_prompt_count = _next_prompt_count(m)
+    if next_prompt_count is None:
+        decision["action"] = "busy"
+        return False
+    m["pending_prompt"] = prompt
+    m["last_prompt"] = _truncate(prompt, 500)
+    m["prompt_count"] = next_prompt_count
+    return True
 
 
 def _recover_stale_reservation(
@@ -3186,10 +3312,11 @@ def _recover_stale_reservation(
     fresh generation so the stale old generation is invalidated, and starts
     exactly one replacement runner.
 
-    A claimed runner that already consumed its prompt (no ``pending_prompt``
-    survives) is not recovered here: the stale claimed authority is dropped and
-    the caller falls through to an ordinary fresh start, so the consumed prompt
-    is never replayed.
+    A claimed runner that already consumed its ordinary prompt is not replayed.
+    If durable FIFO steers still survive, however, the oldest accepted steer is
+    promoted and recovered before any newer caller may reserve work. Only when
+    neither ``pending_prompt`` nor queued steer work survives is the stale claimed
+    authority dropped and the caller allowed to fall through to a fresh start.
 
     The already-accepted pending prompt is preserved and never overwritten. When
     an accepted prompt exists:
@@ -3237,40 +3364,16 @@ def _recover_stale_reservation(
         decision["action"] = "busy"
         return True
     if reservation_state == "claimed" and pending is None:
-        # The exact runner consumed the accepted prompt before dying; there is
-        # nothing to preserve and nothing to replay. Drop the dead claimed
-        # authority and let the caller's fresh start own the next invocation.
-        _set_active_runner(m, value=False)
-        return False
+        # The dead runner may have consumed its ordinary prompt but still own
+        # accepted FIFO steers. Recover that control work before newer callers.
+        pending = _promote_steer_after_claimed_runner_death(m, decision)
+        if pending is None:
+            return decision.get("action") == "busy"
     now = time.time()
     caller_pid = os.getpid()
     gen = current_gen + 1
-    accepted = pending is not None
-    if accepted:
-        if steer:
-            # A --steer that discovers the same stale reservation queues the
-            # steer deterministically behind the recovered invocation using the
-            # existing steer semantics, is durably accepted (success), and lets
-            # exactly one replacement runner execute the original prompt. The
-            # accepted pending prompt is never overwritten.
-            _queue_steer(m, prompt, now)
-            decision["steer_accepted"] = True
-        else:
-            # An ordinary recovery caller must not overwrite the accepted prompt;
-            # its own prompt is explicitly rejected (busy) while recovery of the
-            # original prompt proceeds via the spawned replacement runner.
-            decision["recover_busy"] = True
-    else:
-        # No accepted prompt survived: the recovery caller's prompt is the one
-        # to run and is accepted. A stale/idle --steer is equivalent to an
-        # ordinary prompt here, so it simply owns the recovered invocation.
-        next_prompt_count = _next_prompt_count(m)
-        if next_prompt_count is None:
-            decision["action"] = "busy"
-            return True
-        m["pending_prompt"] = prompt
-        m["last_prompt"] = _truncate(prompt, 500)
-        m["prompt_count"] = next_prompt_count
+    if not _accept_stale_recovery_caller(m, decision, prompt=prompt, steer=steer, pending=pending):
+        return True
     m["active_runner"] = True
     m["runner_gen"] = gen
     m["runner_reservation"] = {
@@ -3561,8 +3664,22 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
             _err(f"{PROG}: agent {aid} is recovering a reserved prompt; this prompt was rejected")
             return EXIT_ERROR
     elif action == "reuse" and decision.get("interrupt"):
-        _interrupt_steer_if_needed(aid)
+        if not _interrupt_steer_if_needed(aid):
+            _err(
+                f"{PROG}: steer for agent {aid} was durably accepted, but exact "
+                "preemption has not converged; continuation remains blocked"
+            )
+            return EXIT_ERROR
 
+    return _finish_prompt_dispatch(args, aid)
+
+
+def _finish_prompt_dispatch(args: argparse.Namespace, aid: str) -> int:
+    """Finish attached/detached prompt transport after execution ownership is set.
+
+    Returns:
+        The prompt transport exit code.
+    """
     if args.detach:
         if args.json:
             _out(json.dumps({"id": aid, "state": "running", "detached": True}))
@@ -3918,6 +4035,11 @@ def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals
         _out(f"steers:     {steer_error}")
     elif steers:
         _out(f"steers:     {len(steers)} queued: {_first_line(steers[0]['prompt'])}")
+    intent, intent_malformed = _persisted_intent(meta)
+    if intent_malformed:
+        _out("steer:      malformed persisted lifecycle intent")
+    elif intent == "steer":
+        _out("steer:      hard-preempting current invocation")
     _out(f"title:      {'<invalid>' if 'title' in error_fields else title or '-'}")
     if metadata_errors:
         _out(f"metadata:   malformed persisted summary metadata: {', '.join(metadata_errors)}")
@@ -3971,6 +4093,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         The JSON-safe mapping.
     """
     steers, steer_error = _status_steer_queue(meta)
+    intent, intent_malformed = _persisted_intent(meta)
     created_at, started_at, finished_at, prompt_count, cwd, title, metadata_errors = (
         _status_summary(meta)
     )
@@ -3994,6 +4117,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "prompts": prompt_count,
         "steers_pending": len(steers) if steers is not None else None,
         "next_steer": _first_line(steers[0]["prompt"]) if steers else None,
+        "steer_preempting": None if intent_malformed else intent == "steer",
         "steer_metadata_error": steer_error,
         "model": AGENT_MODEL,
         "variant": _status_optional_string(meta, "variant", metadata_errors),
