@@ -1,0 +1,55 @@
+name: Recover issue 615 implementation
+
+on:
+  push:
+    branches:
+      - issue-615-supervised-confirmation-authority
+
+permissions:
+  contents: write
+
+jobs:
+  recover:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: issue-615-supervised-confirmation-authority
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Apply fail-closed confirmation authority fix
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/lubko/deployctl.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''    if supervise.supervisor_running():
+              return _finalize_supervised_confirmation(state)
+          terminal = replace(state, status=STATUS_CONFIRMED)
+          '''
+          new = '''    if supervise.supervisor_running():
+              return _finalize_supervised_confirmation(state)
+          if state.supervisor_owned is not False:
+              msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
+              raise DeployCtlError(msg)
+          terminal = replace(state, status=STATUS_CONFIRMED)
+          '''
+          if old not in text:
+              raise SystemExit("expected confirmation terminalization block not found")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+      - name: Verify project checks
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy .
+          uv run pytest
+      - name: Commit recovered implementation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/lubko/deployctl.py
+          git commit -m "fix: preserve supervisor authority during confirmation"
+          git push origin HEAD:issue-615-supervised-confirmation-authority
