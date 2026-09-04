@@ -1269,7 +1269,11 @@ def _worker_retirement_state(meta: WorkerMeta) -> bool | None:
         if process_absence_proven(meta.pid, meta.start_time_ticks):
             return True
         return None
-    return not identity_matches(meta, identity)
+    if identity_matches(meta, identity):
+        return False
+    if meta.start_time_ticks is not None and identity.start_time_ticks != meta.start_time_ticks:
+        return True
+    return None
 
 
 def _worker_process_alive(meta: WorkerMeta) -> bool:
