@@ -100,7 +100,6 @@ from lubko._exact_signal import process_pgrp as _shared_process_pgrp
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import (
     load_database_config,
-    load_worker_protocol_range,
     load_worker_server,
 )
 from lubko.health import (
@@ -125,8 +124,7 @@ from lubko.protocol import (
     parse_payload,
 )
 from lubko.protocol_versioning import (
-    DEFAULT_VERSION_RANGE,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    CURRENT_PROTOCOL_VERSION,
     JobVersionDisposition,
     claim_version_predicate,
     reaper_disposition,
@@ -140,7 +138,6 @@ if TYPE_CHECKING:
     from psycopg.abc import RV, PQGen
 
     from lubko.config import DatabaseConfig
-    from lubko.protocol_versioning import ProtocolVersionRange
 
     JobsConnection = psycopg.Connection[tuple[Any, ...]]
 else:
@@ -732,20 +729,13 @@ class Settings:
     gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     gc_batch_limit: int = DEFAULT_GC_BATCH_LIMIT
     output_spool_max_bytes: int = DEFAULT_OUTPUT_SPOOL_MAX_BYTES
-    #: Supported protocol version window for this daemon. A daemon claims and
-    #: executes only jobs whose ``v`` lies inside this window, so a fleet can
-    #: run a bounded mixed-version set during a staggered, non-destructive
-    #: upgrade while older in-flight jobs keep running on daemons that still
-    #: advertise the older version. The window may never include a version this
-    #: build cannot parse.
-    supported_protocol_range: ProtocolVersionRange = DEFAULT_VERSION_RANGE
 
     def __post_init__(self) -> None:
         """Validate lease timing so a live worker's lease never expires idle.
 
         Raises:
             ValueError: If the server identity is empty, any timing value is
-                unusable, or the supported protocol window is invalid.
+                unusable.
         """
         self._validate_finite_timing()
         if not self.server:
@@ -758,7 +748,6 @@ class Settings:
         self._validate_lease_timing()
         self._validate_output_and_gc()
         self._validate_spool()
-        self._validate_protocol_range()
 
     def _validate_finite_timing(self) -> None:
         """Reject non-finite timing values before domain/order comparisons.
@@ -784,24 +773,6 @@ class Settings:
             value = getattr(self, field_name)
             if not math.isfinite(value):
                 msg = f"{field_name} must be finite"
-                raise ValueError(msg)
-
-    def _validate_protocol_range(self) -> None:
-        """Fail closed if the window includes an unparseable version.
-
-        Raises:
-            ValueError: If any version in the window exceeds what this build can
-                parse and execute.
-        """
-        window = self.supported_protocol_range
-        for version in range(window.min, window.max + 1):
-            if version not in SUPPORTED_PROTOCOL_VERSIONS:
-                msg = (
-                    f"supported protocol range [{window.min}, {window.max}] "
-                    f"includes version {version} which this build cannot parse; "
-                    "the daemon refuses to start rather than claim jobs it "
-                    "cannot safely execute"
-                )
                 raise ValueError(msg)
 
     def _validate_lease_timing(self) -> None:
@@ -896,30 +867,21 @@ class Settings:
             raise ValueError(msg)
 
     @classmethod
-    def from_environment(
-        cls, *, server: str, supported_protocol_range: ProtocolVersionRange | None = None
-    ) -> Settings:
+    def from_environment(cls, *, server: str) -> Settings:
         """Load worker settings from environment variables.
 
-        The execution-server identity and the supported protocol version window
-        are never environmental: they must be supplied explicitly, loaded from the
-        restricted worker configuration file by the entry point.
+        The execution-server identity is never environmental: it is supplied
+        explicitly from the restricted worker configuration file.
 
         Args:
             server: Non-empty execution-server identity from the config file.
-            supported_protocol_range: The daemon's supported protocol window from
-                the config file, or ``None`` to use the default current-version
-                window.
 
         Returns:
             Settings derived from the process environment plus the configured
-            server identity and protocol window.
+            server identity.
         """
         return cls(
             server=server,
-            supported_protocol_range=supported_protocol_range
-            if supported_protocol_range is not None
-            else DEFAULT_VERSION_RANGE,
             worker_id=os.getenv("LUBKO_WORKER_ID", socket.gethostname()),
             poll_interval_seconds=float(
                 os.getenv(
@@ -3437,7 +3399,7 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
             ("state,updated_at", UTC_ISO_SQL),
         ],
     )
-    version_fragment, version_params = claim_version_predicate(settings.supported_protocol_range)
+    version_fragment, version_params = claim_version_predicate()
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "WITH next AS (\n"
@@ -4076,15 +4038,10 @@ def reap_unsupported_jobs(conn: JobsConnection, settings: Settings, limit: int) 
         for job_id, version in cursor.fetchall():
             if version is None:
                 continue
-            if (
-                reaper_disposition(int(version), settings.supported_protocol_range)
-                is JobVersionDisposition.FAIL_CLOSED
-            ):
+            if reaper_disposition(int(version)) is JobVersionDisposition.FAIL_CLOSED:
                 diagnostic = (
-                    f"protocol version {version} is below the retired floor "
-                    f"{settings.supported_protocol_range.min} for supported window "
-                    f"[{settings.supported_protocol_range.min}, "
-                    f"{settings.supported_protocol_range.max}]; the job is failed closed"
+                    f"protocol version {version} is below the retired current version "
+                    f"{CURRENT_PROTOCOL_VERSION}; the job is failed closed"
                 )
                 if fail_unsupported_job(conn, job_id, diagnostic, server=settings.server):
                     reaped.append(job_id)
@@ -5776,9 +5733,7 @@ class Supervisor:
         if conn is None:
             return
         try:
-            payload = parse_payload(
-                claimed.payload, supported=self.settings.supported_protocol_range
-            )
+            payload = parse_payload(claimed.payload)
         except ProtocolError as exc:
             LOGGER.warning("rejecting unparseable job %s: %s", claimed.id, exc)
             self._finalize_immediate(
@@ -6736,17 +6691,12 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.exception("unable to load the worker server configuration")
         raise SystemExit(1) from None
     try:
-        protocol_range = load_worker_protocol_range()
-    except (OSError, ValueError):
-        LOGGER.exception("unable to load the worker protocol window configuration")
-        raise SystemExit(1) from None
-    try:
         database = load_database_config()
     except (OSError, ValueError):
         LOGGER.exception("unable to load database configuration")
         raise SystemExit(1) from None
     try:
-        settings = Settings.from_environment(server=server, supported_protocol_range=protocol_range)
+        settings = Settings.from_environment(server=server)
     except ValueError:
         LOGGER.exception("invalid worker runtime settings")
         raise SystemExit(1) from None

@@ -47,11 +47,9 @@ from lubko._exact_signal import open_pidfd as _open_exact_pidfd
 from lubko._exact_signal import pidfd_send_signal, process_pgrp
 from lubko.config import (
     load_database_config,
-    load_worker_protocol_range,
     load_worker_server,
 )
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
-from lubko.protocol_versioning import negotiate_submission_version
 from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import (
@@ -2573,13 +2571,6 @@ def _probe_server() -> str:
 def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     """Insert one pending queue probe job.
 
-    The probe is submitted at the highest protocol version this client shares
-    with the target server's supported window (see
-    :func:`lubko.protocol_versioning.negotiate_submission_version`), so a
-    mixed-version fleet converges new work onto the newest supported generation
-    while older in-flight jobs keep running on daemons that still advertise the
-    older version.
-
     Args:
         conn: Open PostgreSQL connection.
         cwd: Working directory for the probe process.
@@ -2587,14 +2578,11 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     Returns:
         The probe job identifier, or ``None`` if the insert failed.
     """
-    server_range = load_worker_protocol_range()
-    version = negotiate_submission_version(server_range)
     probe_payload = json.dumps(
         protocol.build_payload(
             server=_probe_server(),
             cwd=cwd,
             process=["/usr/bin/sleep", "60"],
-            version=version,
         )
     )
     with conn.cursor() as cursor:

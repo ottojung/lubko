@@ -38,16 +38,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 from uuid import UUID
 
-from lubko.protocol_versioning import (
-    DEFAULT_VERSION_RANGE,
-    unsupported_version_diagnostic,
-)
-
-if TYPE_CHECKING:
-    from lubko.protocol_versioning import ProtocolVersionRange
+from lubko.protocol_versioning import unsupported_version_diagnostic
 
 PROTOCOL_VERSION: Final = 4
 
@@ -246,9 +240,8 @@ def build_payload(
     ``server`` is required and names the execution server that must claim and
     run the job; there is no implicit or default server. ``process`` is the
     sole executable field: a required list of non-empty strings executed
-    directly as argv, never through a shell. ``version`` is the negotiated
-    protocol version (see :mod:`lubko.protocol_versioning`); it defaults to the
-    current version for a fresh install.
+    directly as argv, never through a shell. ``version`` defaults to the current
+    application protocol version.
 
     Args:
         server: Non-empty identity of the target execution server.
@@ -256,7 +249,7 @@ def build_payload(
             worker's ``Popen`` and therefore required to be a non-empty absolute
             POSIX path beginning with ``/``.
         process: Non-empty list of non-empty argv strings to execute directly.
-        version: Negotiated protocol version for the submission.
+        version: Application protocol version for the submission.
 
     Returns:
         The versioned payload dict.
@@ -343,7 +336,7 @@ def build_output_chunk_payload(  # ruff: ignore[too-many-arguments] -- every fie
         end: Byte offset where the chunk ends.
         value: Immutable decoded output text of the chunk.
         previous: UUID of the previous chunk in the chain, or ``None``.
-        version: Negotiated protocol version for the chunk; it must match the
+        version: Application protocol version for the chunk; it must match the
             owning root job's version.
 
     Returns:
@@ -618,19 +611,14 @@ def _decode_payload(data: object) -> dict[str, Any]:
     return data
 
 
-def _parse_version_and_type(
-    data: dict[str, Any], supported: ProtocolVersionRange
-) -> tuple[int, str]:
-    """Validate the version and type fields of a payload against a window.
+def _parse_version_and_type(data: dict[str, Any]) -> tuple[int, str]:
+    """Validate the version and type fields of a payload.
 
-    The ``v`` field must be an integer protocol version lying inside the
-    daemon's supported window (see :mod:`lubko.protocol_versioning`). A version
-    outside the window fails closed with a diagnostic rather than being silently
-    accepted or ignored.
+    The ``v`` field must name the exact protocol version this build supports.
+    Unsupported versions fail closed in application code.
 
     Args:
         data: The decoded payload mapping.
-        supported: The daemon's supported version window.
 
     Returns:
         The ``(version, type)`` pair.
@@ -642,7 +630,7 @@ def _parse_version_and_type(
     if not isinstance(version, int) or isinstance(version, bool):
         msg = "payload 'v' must be an integer protocol version"
         raise ProtocolError(msg)
-    diagnostic = unsupported_version_diagnostic(int(version), supported)
+    diagnostic = unsupported_version_diagnostic(int(version))
     if diagnostic is not None:
         raise ProtocolError(diagnostic)
     job_type = data.get("type")
@@ -652,20 +640,17 @@ def _parse_version_and_type(
     return int(version), str(job_type)
 
 
-def parse_payload(data: object, supported: ProtocolVersionRange | None = None) -> JobPayload:
+def parse_payload(data: object) -> JobPayload:
     """Parse and validate a ``command`` job payload against the binding.
 
     The stored ``payload`` column is opaque text; a raw JSON string is decoded
     before validation. ``output_chunk`` rows are rejected here; use
     :func:`parse_chunk_payload` for those. The payload's ``v`` must lie inside
-    ``supported`` (defaults to the current single-version window), failing
-    closed on any unsupported version.
+    this build supports, failing closed on any unsupported version.
 
     Args:
         data: The JSON object stored in the ``payload`` column, either as a
             raw JSON string or as an already-decoded mapping.
-        supported: The daemon's supported version window, or ``None`` for the
-            default current-version window.
 
     Returns:
         The parsed and validated command payload.
@@ -673,9 +658,8 @@ def parse_payload(data: object, supported: ProtocolVersionRange | None = None) -
     Raises:
         ProtocolError: If the payload violates the binding.
     """
-    window = supported if supported is not None else DEFAULT_VERSION_RANGE
     decoded = _decode_payload(data)
-    version, job_type = _parse_version_and_type(decoded, window)
+    version, job_type = _parse_version_and_type(decoded)
     if job_type != JOB_TYPE_COMMAND:
         msg = f"payload is not a command job: {job_type!r}"
         raise ProtocolError(msg)
@@ -690,14 +674,12 @@ def parse_payload(data: object, supported: ProtocolVersionRange | None = None) -
     )
 
 
-def parse_chunk_payload(data: object, supported: ProtocolVersionRange | None = None) -> OutputChunk:
+def parse_chunk_payload(data: object) -> OutputChunk:
     """Parse and validate an ``output_chunk`` payload against the binding.
 
     Args:
         data: The JSON object stored in the ``payload`` column, either as a
             raw JSON string or as an already-decoded mapping.
-        supported: The daemon's supported version window, or ``None`` for the
-            default current-version window.
 
     Returns:
         The parsed and validated chunk.
@@ -705,9 +687,8 @@ def parse_chunk_payload(data: object, supported: ProtocolVersionRange | None = N
     Raises:
         ProtocolError: If the payload violates the binding.
     """
-    window = supported if supported is not None else DEFAULT_VERSION_RANGE
     decoded = _decode_payload(data)
-    _version, job_type = _parse_version_and_type(decoded, window)
+    _version, job_type = _parse_version_and_type(decoded)
     if job_type != JOB_TYPE_OUTPUT_CHUNK:
         msg = f"payload is not an output_chunk: {job_type!r}"
         raise ProtocolError(msg)
