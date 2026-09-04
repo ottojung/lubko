@@ -381,12 +381,86 @@ def test_malformed_identity_file_is_not_usable_health(tmp_path: Path) -> None:
 
 
 def test_unsupported_schema_version_fails_closed() -> None:
-    """An old singular-schema (v1) snapshot is never treated as current."""
+    """A genuinely unknown health envelope is never treated as current."""
     data = json.loads(json.dumps(_snapshot().to_dict()))
-    data["schema_version"] = 1
+    data["schema_version"] = 2
     with pytest.raises(ValueError, match="schema"):
         WorkerHealth.from_dict(data)
     assert _from_dict_or_none(data) is None
+
+
+def test_minimal_legacy_v1_health_snapshot_is_readable() -> None:
+    """New supervisors can read the minimal snapshot written by the prior release."""
+    data: dict[str, object] = {
+        "schema_version": 1,
+        "worker_id": "phoebe-dev",
+        "worker_incarnation": "a" * 32,
+        "pid": 123,
+        "start_time_ticks": 456,
+        "started_at": 1000.0,
+        "published_at": 1001.0,
+        "alive": True,
+        "db_connected": True,
+        "db_connected_at": 1000.5,
+        "db_error_at": None,
+        "current_job_id": None,
+        "current_job_started_at": None,
+        "last_completed_job_id": None,
+        "last_completed_at": None,
+        "last_completed_status": None,
+        "shutting_down": False,
+    }
+    restored = WorkerHealth.from_dict(data)
+    assert restored.schema_version == 1
+    assert restored.worker_id == "phoebe-dev"
+    assert restored.active_jobs == 0
+    assert restored.completed_jobs == 0
+    assert restored.lease_safety_margin_seconds == pytest.approx(0.0)
+    assert restored.db_operation_deadline_seconds == pytest.approx(1.0)
+    assert restored.scan_batch_limit == 1
+    assert restored.gc_batch_limit == 1
+    assert restored.cancellation_batch_limit == 1
+    assert restored.recovery_batch_limit == 1
+    assert restored.oldest_active_job_id is None
+
+
+def test_current_snapshot_uses_previous_supervisor_compatibility_envelope() -> None:
+    """A current worker remains visible to a schema-v1 predecessor supervisor."""
+    payload = _snapshot().to_dict()
+    assert payload["schema_version"] == 1
+    assert payload["observability_version"] == 3
+    for field in (
+        "worker_id",
+        "worker_incarnation",
+        "pid",
+        "start_time_ticks",
+        "started_at",
+        "published_at",
+        "alive",
+        "db_connected",
+        "db_connected_at",
+        "db_error_at",
+        "shutting_down",
+    ):
+        assert field in payload
+
+
+def test_already_written_v3_snapshot_remains_readable() -> None:
+    """Snapshots emitted before the compatibility hotfix are not orphaned."""
+    payload = _snapshot().to_dict()
+    payload["schema_version"] = 3
+    payload.pop("observability_version")
+    restored = WorkerHealth.from_dict(payload)
+    assert restored.schema_version == 3
+    assert restored.worker_id == _snapshot().worker_id
+
+
+def test_unknown_observability_version_fails_closed() -> None:
+    """The additive rich-shape discriminator remains strict for current readers."""
+    payload = _snapshot().to_dict()
+    payload["observability_version"] = 99
+    with pytest.raises(ValueError, match="observability"):
+        WorkerHealth.from_dict(payload)
 
 
 @pytest.mark.parametrize(

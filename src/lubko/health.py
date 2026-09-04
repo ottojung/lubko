@@ -50,13 +50,23 @@ WORKER_LOG_SYMLINK_FILENAME: Final = "worker.log"
 WORKER_LOG_MAX_BYTES: Final = 2 * 1024 * 1024  # 2 MiB per file
 WORKER_LOG_BACKUP_COUNT: Final = 3
 
-#: Current on-disk schema version for the per-incarnation worker health
-#: snapshot. Version 1 exposed a misleading singular ``current_job_id``. Version
-#: 2 replaced it with concurrency-aware aggregates. Version 3 restores exactly
-#: one bounded identity: the oldest active root UUID, deterministically tie-broken
-#: by UUID string, while retaining all aggregate metrics. Old snapshots fail
-#: closed in the reader.
-WORKER_HEALTH_SCHEMA_VERSION: Final = 3
+#: Stable on-disk compatibility-envelope version for per-incarnation worker
+#: health. The external supervisor intentionally outlives workers across a
+#: version-changing deployment, so current writers remain on schema v1 and add
+#: richer observability fields compatibly. Previous supervisors ignore those
+#: additions while still proving exact worker identity and database readiness.
+WORKER_HEALTH_SCHEMA_VERSION: Final = 1
+#: Schema v3 was emitted by the first aggregate-health release before rolling
+#: upgrade compatibility was restored. Current readers retain support so those
+#: already-persisted snapshots remain inspectable/recoverable.
+_LEGACY_RICH_WORKER_HEALTH_SCHEMA_VERSION: Final = 3
+_READABLE_WORKER_HEALTH_SCHEMA_VERSIONS: Final = frozenset({
+    WORKER_HEALTH_SCHEMA_VERSION,
+    _LEGACY_RICH_WORKER_HEALTH_SCHEMA_VERSION,
+})
+#: Rich bounded-observability shape carried inside the stable schema-v1
+#: readiness envelope. Previous supervisors ignore this additive field.
+WORKER_HEALTH_OBSERVABILITY_VERSION: Final = 3
 
 LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
 
@@ -175,7 +185,8 @@ class WorkerHealth:
     supervises an unbounded number of concurrently active jobs, so a single id
     could never describe its true state.  This schema reports aggregates
     (``active_jobs``/``stopping_jobs``/``completed_jobs``), a bounded oldest
-    active age (never a job id), and bounded operational counters/timestamps
+    active age, exactly one bounded oldest-active root UUID, and bounded operational
+    counters/timestamps
     for lease safety, capture/spool pressure, scan batch pressure, periodic
     scan saturation, and database deadline recency.
     """
@@ -268,6 +279,7 @@ class WorkerHealth:
         """
         return {
             "schema_version": self.schema_version,
+            "observability_version": WORKER_HEALTH_OBSERVABILITY_VERSION,
             "worker_id": self.worker_id,
             "worker_incarnation": self.worker_incarnation,
             "pid": self.pid,
@@ -325,9 +337,20 @@ class WorkerHealth:
                 non-finite timestamp.
         """
         version = _required_json_int(data.get("schema_version"), "schema_version", minimum=0)
-        if version != WORKER_HEALTH_SCHEMA_VERSION:
+        if version not in _READABLE_WORKER_HEALTH_SCHEMA_VERSIONS:
             msg = f"unsupported worker health schema version: {version}"
             raise ValueError(msg)
+        observability_raw = data.get("observability_version")
+        if observability_raw is not None:
+            observability_version = _required_json_int(
+                observability_raw, "observability_version", minimum=1
+            )
+            if observability_version != WORKER_HEALTH_OBSERVABILITY_VERSION:
+                msg = f"unsupported worker health observability version: {observability_version}"
+                raise ValueError(msg)
+        rich_observability = (
+            version == _LEGACY_RICH_WORKER_HEALTH_SCHEMA_VERSION or observability_raw is not None
+        )
         return cls(
             schema_version=version,
             worker_id=_required_nonempty_str(data.get("worker_id"), "worker_id"),
@@ -361,13 +384,15 @@ class WorkerHealth:
                 minimum=0.0,
             ),
             lease_safety_margin_seconds=_required_finite_float(
-                data.get("lease_safety_margin_seconds"), "lease_safety_margin_seconds", minimum=0.0
+                data.get("lease_safety_margin_seconds", 0.0 if not rich_observability else None),
+                "lease_safety_margin_seconds",
+                minimum=0.0,
             ),
             min_lease_safety_remaining_seconds=_optional_finite_float(
                 data.get("min_lease_safety_remaining_seconds"), "min_lease_safety_remaining_seconds"
             ),
             db_operation_deadline_seconds=_required_finite_float(
-                data.get("db_operation_deadline_seconds"),
+                data.get("db_operation_deadline_seconds", 1.0 if not rich_observability else None),
                 "db_operation_deadline_seconds",
                 minimum_exclusive=0.0,
             ),
@@ -387,7 +412,9 @@ class WorkerHealth:
                 data.get("spool_held_bytes"), "spool_held_bytes", minimum=0
             ),
             scan_batch_limit=_required_json_int(
-                data.get("scan_batch_limit"), "scan_batch_limit", minimum=1
+                data.get("scan_batch_limit", 1 if not rich_observability else None),
+                "scan_batch_limit",
+                minimum=1,
             ),
             last_scan_batch_size=_optional_json_int_zero(
                 data.get("last_scan_batch_size"), "last_scan_batch_size", minimum=0
@@ -403,15 +430,21 @@ class WorkerHealth:
             recovery_overdue=_strict_bool(data, "recovery_overdue"),
             gc_overdue=_strict_bool(data, "gc_overdue"),
             gc_batch_limit=_required_json_int(
-                data.get("gc_batch_limit"), "gc_batch_limit", minimum=1
+                data.get("gc_batch_limit", 1 if not rich_observability else None),
+                "gc_batch_limit",
+                minimum=1,
             ),
             gc_batch_bound_hit=_strict_bool(data, "gc_batch_bound_hit"),
             cancellation_batch_limit=_required_json_int(
-                data.get("cancellation_batch_limit"), "cancellation_batch_limit", minimum=1
+                data.get("cancellation_batch_limit", 1 if not rich_observability else None),
+                "cancellation_batch_limit",
+                minimum=1,
             ),
             cancellation_batch_bound_hit=_strict_bool(data, "cancellation_batch_bound_hit"),
             recovery_batch_limit=_required_json_int(
-                data.get("recovery_batch_limit"), "recovery_batch_limit", minimum=1
+                data.get("recovery_batch_limit", 1 if not rich_observability else None),
+                "recovery_batch_limit",
+                minimum=1,
             ),
             recovery_batch_bound_hit=_strict_bool(data, "recovery_batch_bound_hit"),
             shutting_down=_strict_bool(data, "shutting_down"),

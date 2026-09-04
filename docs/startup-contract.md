@@ -10,6 +10,10 @@ Tini is PID 1 and launches `lubko-supervisor` as its direct child. The superviso
 
 The outer host/container/service environment is **trusted** to restart Lubko appropriately. Lubko does not declare, inspect, infer, or verify Docker, Podman, systemd, or any host restart policy. There is no runtime proof seam for outer host/service-manager behavior.
 
+## Rolling-upgrade readiness compatibility
+
+The supervisor intentionally outlives the maintained worker during a version-changing deployment. The per-incarnation worker-health file used for readiness is therefore a stable, additive **schema-v1 compatibility envelope**. New workers may add bounded observability fields, but they must keep the v1 identity/liveness/readiness fields and schema marker readable by the immediately previous supervisor. New supervisors likewise accept minimal legacy v1 snapshots with safe defaults for observability fields that did not exist yet. Current rich snapshots carry an additive `observability_version` marker so current readers can still fail closed on truncated/malformed rich metrics while previous supervisors safely ignore the marker. Additive health metrics do not justify a readiness-envelope version bump.
+
 ## Versioned artifacts
 
 `lubko-install` and `lubko-deploy bootstrap` publish repository-owned artifacts under `$XDG_STATE_HOME/lubko/deploy/`:
