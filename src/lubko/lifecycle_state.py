@@ -581,11 +581,17 @@ def authorize_recovery(facts: AuthorityFacts) -> bool:
     Returns:
         ``True`` when recovery may proceed.
     """
-    if facts.durable_malformed:
+    if facts.durable_malformed or facts.identity_observation_unknown:
         return False
     if not facts.unresolved_child:
         return False
-    return not facts.owned_worker_identity_proven
+    # Recovery is destructive authority over a possibly-live unpublished
+    # consumer. A structurally valid but contradictory snapshot must not be
+    # treated as permission merely because the maintained-worker identity is
+    # absent: require the centralized lifecycle invariants to be clean so a
+    # competing supervisor child, pre-spawn obligation, generation conflict,
+    # or any later invariant added to the authority model also fails closed.
+    return not check_authority_invariants(facts)
 
 
 def authorize_retirement(facts: AuthorityFacts) -> bool:
