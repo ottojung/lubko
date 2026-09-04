@@ -301,6 +301,25 @@ def test_unpinnable_leader_with_unknown_absence_fails_closed(
     assert h.sends == []
 
 
+def test_pinned_leader_with_unknown_identity_fails_closed(
+    h: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful pidfd pin does not turn an unreadable identity into absence."""
+    h.identity = None
+    calls: list[tuple[int, int | None]] = []
+
+    def absence(pid: int, ticks: int | None) -> bool:
+        calls.append((pid, ticks))
+        return False
+
+    monkeypatch.setattr(lifecycle, "process_absence_proven", absence)
+
+    assert run(h) is False
+    assert calls == [(LIVE.pid, LIVE.start_time_ticks)]
+    assert h.sends == []
+
+
 def test_unpinnable_leader_with_proven_absence_succeeds(
     h: Harness,
     monkeypatch: pytest.MonkeyPatch,
