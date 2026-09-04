@@ -37,7 +37,7 @@ import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import psycopg
 from psycopg.rows import tuple_row
@@ -1381,10 +1381,19 @@ def _stop_pinned(
     if meta.pid is None:
         return True
     identity = process_identity(meta.pid)
-    if identity is None or not identity_matches(meta, identity):
-        # The exact worker process is gone or its identity changed (a recycled
-        # PID can never be mis-signalled). Nothing to stop; retirement succeeds.
-        return True
+    retirement_proven: bool | None = None
+    if identity is None:
+        # The pidfd proves that some process was pinned, but a failed identity
+        # read is still ambiguous. Require positive absence proof before
+        # handing replacement authority to another worker.
+        retirement_proven = process_absence_proven(meta.pid, meta.start_time_ticks)
+    elif not identity_matches(meta, identity):
+        # A different start time proves PID reuse; the recorded worker is gone
+        # and the replacement occupant is never signalled.
+        retirement_proven = True
+    if retirement_proven is not None:
+        return retirement_proven
+    identity = cast("ProcessIdentity", identity)
     # Signal authorization requires the exact lifecycle token: an unowned live
     # process — a wrong token or none at all — is never signalled and
     # retirement is never claimed, so the caller holds rather than handing off
