@@ -1150,12 +1150,50 @@ def test_rollback_gate_refuses_malformed_authority(
     assert deployctl._read_state() is mission
 
 
+def test_rollback_gate_keeps_pending_when_final_readiness_is_superseded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost final readiness race leaves rollback pending for a later retry."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: mission.generation + 1)
+
+    def refuse(_state: deployctl.RollbackState) -> deployctl.RollbackState:
+        msg = "readiness superseded"
+        raise deployctl.DeployCtlError(msg)
+
+    monkeypatch.setattr(deployctl, "_finalize_supervised_rollback", refuse)
+    logged: list[str] = []
+    monkeypatch.setattr(deployctl, "append_deploy_log", logged.append)
+
+    assert deployctl._rollback_locked(mission) is False
+    assert logged == ["supervised rollback readiness was superseded before terminalization"]
+
+
 def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None:
     """_rollback_locked proceeds when the authority permits the transition."""
     mission = _make_mission(deployctl.STATUS_PENDING)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
-    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
+    generation = mission.generation + 1
+    monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: generation)
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.previous_commit, generation=generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=generation,
+            commit=mission.previous_commit,
+            ready=True,
+            holding=False,
+        ),
+    )
     monkeypatch.setattr(cli, "remove_cli_root", lambda _c: None)
     monkeypatch.setattr(cli, "reconcile_pointer", lambda _c: True)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
@@ -1257,3 +1295,46 @@ def test_publish_gate_allows_when_no_pending_mission(
     monkeypatch.setattr(deployctl, "check_postgres", lambda *_, **__: True)
     state, _gated = deployctl._prepare_locked(_options(), COMMIT, supervised=True)
     assert state.status == deployctl.STATUS_PENDING
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (None, 1, 0, True, False),
+        (None, 1, 1, False, True),
+        ("d" * 40, 1, 1, True, False),
+    ],
+)
+def test_rollback_terminalization_rejects_superseded_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    case: tuple[str | None, int, int, bool, bool],
+) -> None:
+    """Rollback remains pending when current supervisor authority supersedes its proof."""
+    desired_commit, desired_delta, applied_delta, ready, holding = case
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    desired_generation = mission.generation + desired_delta
+    applied_generation = mission.generation + applied_delta
+    commit = mission.previous_commit if desired_commit is None else desired_commit
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=commit, generation=desired_generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=applied_generation,
+            commit=commit,
+            ready=ready,
+            holding=holding,
+        ),
+    )
+    written = MagicMock()
+    monkeypatch.setattr(deployctl, "_write_state", written)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before rollback"):
+        deployctl._finalize_supervised_rollback(mission)
+
+    written.assert_not_called()
