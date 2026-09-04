@@ -374,3 +374,23 @@ def test_unreadable_retirement_liveness_never_authorizes_handoff(
 
     assert run(h) is False
     assert h.sends == [(LIVE.pid, signal.SIGTERM), (LIVE.pid, signal.SIGKILL)]
+
+
+@pytest.mark.parametrize(
+    "observed",
+    [
+        ProcessIdentity(
+            pid=LIVE.pid, pgid=LIVE.pgid + 1, sid=LIVE.sid, start_time_ticks=LIVE.start_time_ticks
+        ),
+        ProcessIdentity(
+            pid=LIVE.pid, pgid=LIVE.pgid, sid=LIVE.sid + 1, start_time_ticks=LIVE.start_time_ticks
+        ),
+    ],
+)
+def test_same_incarnation_identity_disagreement_fails_closed(
+    observed: ProcessIdentity, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PGID/SID disagreement cannot prove a still-present PID incarnation retired."""
+    monkeypatch.setattr(lifecycle, "process_identity", lambda _pid: observed)
+
+    assert lifecycle._worker_retirement_state(meta()) is None
