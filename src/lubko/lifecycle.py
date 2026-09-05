@@ -1892,6 +1892,21 @@ def _queue_deploy_candidate_converged(
     return child is not None and supervise.child_alive(child) and cli.current_commit() == commit
 
 
+def _queue_deploy_restore_converged(commit: str, minimum_generation: int) -> bool:
+    """Return whether restore authority still owns a live queue-ready child."""
+    status = supervise.read_status()
+    if (
+        status is None
+        or status.commit != commit
+        or status.applied_generation < minimum_generation
+        or not status.ready
+        or status.holding
+    ):
+        return False
+    child = status.child
+    return child is not None and supervise.child_alive(child)
+
+
 def _restore_after_handoff_failure(
     options: DeployOptions,
     commit: str,
@@ -1951,7 +1966,11 @@ def _restore_after_handoff_failure(
         supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS,
         commit=previous.git_commit,
     )
-    if restored and cli.reconcile_pointer(previous.git_commit):
+    if (
+        restored
+        and _queue_deploy_restore_converged(previous.git_commit, settle)
+        and cli.reconcile_pointer(previous.git_commit)
+    ):
         append_deploy_log(
             "queue deploy failed after durable success; supervisor restored previous commit "
             f"{previous.git_commit} and the maintained CLIs"
