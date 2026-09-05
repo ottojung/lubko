@@ -1,5 +1,6 @@
 """Regression tests for queue-deploy recovery child-liveness authority."""
 
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -17,8 +18,21 @@ def _previous(commit: str) -> lifecycle.WorkerMeta:
     return cast("lifecycle.WorkerMeta", SimpleNamespace(git_commit=commit))
 
 
-def _status(commit: str) -> SimpleNamespace:
-    return SimpleNamespace(commit=commit, child=object(), ready=True)
+def _status(
+    commit: str,
+    *,
+    generation: int = 0,
+    child: object | None = None,
+    ready: bool = True,
+    holding: bool = False,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        applied_generation=generation,
+        commit=commit,
+        child=child if child is not None else object(),
+        ready=ready,
+        holding=holding,
+    )
 
 
 def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
@@ -72,42 +86,119 @@ def test_restore_after_handoff_failure_accepts_live_ready_child(
     lifecycle._restore_after_handoff_failure(_options(), candidate, previous)
 
 
+@dataclass(frozen=True, slots=True)
+class _RestoreCase:
+    generation: int
+    ready_commit: str
+    restored_child_alive: bool
+    ready: bool
+    holding: bool
+    expected: bool
+
+
 @pytest.mark.parametrize(
-    ("applied_generation", "ready_commit", "expected_reconcile_count"),
+    "case",
     [
-        (8, "c" * 40, False),
-        (8, "b" * 40, True),
-        (7, "b" * 40, True),
+        _RestoreCase(
+            generation=7,
+            ready_commit="b" * 40,
+            restored_child_alive=True,
+            ready=True,
+            holding=False,
+            expected=True,
+        ),
+        _RestoreCase(
+            generation=8,
+            ready_commit="b" * 40,
+            restored_child_alive=True,
+            ready=True,
+            holding=False,
+            expected=True,
+        ),
+        _RestoreCase(
+            generation=8,
+            ready_commit="c" * 40,
+            restored_child_alive=True,
+            ready=True,
+            holding=False,
+            expected=False,
+        ),
+        _RestoreCase(
+            generation=6,
+            ready_commit="b" * 40,
+            restored_child_alive=True,
+            ready=True,
+            holding=False,
+            expected=False,
+        ),
+        _RestoreCase(
+            generation=7,
+            ready_commit="b" * 40,
+            restored_child_alive=False,
+            ready=True,
+            holding=False,
+            expected=False,
+        ),
+        _RestoreCase(
+            generation=7,
+            ready_commit="b" * 40,
+            restored_child_alive=True,
+            ready=False,
+            holding=False,
+            expected=False,
+        ),
+        _RestoreCase(
+            generation=7,
+            ready_commit="b" * 40,
+            restored_child_alive=True,
+            ready=True,
+            holding=True,
+            expected=False,
+        ),
     ],
-    ids=["newer-different-commit", "newer-same-commit", "exact-generation"],
+    ids=[
+        "exact-live",
+        "newer-same-commit-live",
+        "newer-different-commit",
+        "older-generation",
+        "dead-child",
+        "not-ready",
+        "holding",
+    ],
 )
-def test_restore_after_handoff_failure_binds_readiness_to_previous_commit(
+def test_restoration_requires_current_live_queue_ready_authority(
     monkeypatch: pytest.MonkeyPatch,
-    applied_generation: int,
-    ready_commit: str,
-    expected_reconcile_count: int,
+    case: _RestoreCase,
 ) -> None:
-    """Only readiness for the requested previous commit can authorize CLI restore."""
+    """Only compatible live queue-ready restore authority may reconcile the CLI."""
     candidate = "a" * 40
     previous_commit = "b" * 40
     previous = _previous(previous_commit)
-    candidate_status = _status(candidate)
+    candidate_child = object()
+    restored_child = object()
     observations = iter([
-        candidate_status,
-        SimpleNamespace(
-            applied_generation=applied_generation,
-            commit=ready_commit,
-            ready=True,
+        _status(candidate, child=candidate_child),
+        _status(
+            case.ready_commit,
+            generation=case.generation,
+            child=restored_child,
+            ready=case.ready,
+            holding=case.holding,
         ),
     ])
     reconciled: list[str] = []
 
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     monkeypatch.setattr(supervise, "read_status", lambda: next(observations))
-    monkeypatch.setattr(supervise, "child_alive", lambda _child: False)
+    monkeypatch.setattr(
+        supervise,
+        "child_alive",
+        lambda child: child is restored_child and case.restored_child_alive,
+    )
     monkeypatch.setattr(cli, "current_commit", lambda: candidate)
     monkeypatch.setattr(supervise, "request_run", lambda *_args, **_kwargs: 7)
     monkeypatch.setattr(supervise, "wait_for_generation", lambda *_args: True)
+    monkeypatch.setattr(supervise, "wait_until_ready", lambda *_args, **_kwargs: True)
 
     def record_reconcile(commit: str) -> bool:
         reconciled.append(commit)
@@ -118,4 +209,4 @@ def test_restore_after_handoff_failure_binds_readiness_to_previous_commit(
 
     lifecycle._restore_after_handoff_failure(_options(), candidate, previous)
 
-    assert reconciled == [previous_commit] * expected_reconcile_count
+    assert reconciled == ([previous_commit] if case.expected else [])
