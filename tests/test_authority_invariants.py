@@ -23,7 +23,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 if TYPE_CHECKING:
@@ -1013,6 +1013,21 @@ def test_confirm_gate_refuses_malformed_authority(
         lambda: (_ for _ in ()).throw(deployctl.DeployCtlError("malformed")),
     )
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=mission.generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
+    )
     monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
     monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
     with pytest.raises(deployctl.DeployCtlError, match="authority refuses confirmation"):
@@ -1422,3 +1437,106 @@ def test_rollback_terminalization_rejects_superseded_readiness(
         deployctl._finalize_supervised_rollback(mission)
 
     written.assert_not_called()
+
+
+def test_confirmation_rejects_newer_unapplied_different_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation cannot replace a newer desired commit that is not applied yet."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    newer = mission.generation + 1
+    other_commit = "b" * 40
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=other_commit, generation=newer),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+    settle = MagicMock()
+    rollback = MagicMock()
+    monkeypatch.setattr(deployctl, "settle_desired", settle)
+    monkeypatch.setattr(deployctl, "_rollback_locked", rollback)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._confirm_locked(
+            {"type": "confirm", "commit": mission.commit},
+            _options(),
+        )
+
+    settle.assert_not_called()
+    rollback.assert_not_called()
+
+
+def test_confirmation_authority_distinguishes_superseding_and_same_commit_intents() -> None:
+    """Different commits supersede a mission while same-commit replacements remain obligations."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    newer = mission.generation + 1
+    desired = cast(
+        "supervise.SupervisorDesired", SimpleNamespace(commit=mission.commit, generation=newer)
+    )
+    status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is True
+
+    desired = cast(
+        "supervise.SupervisorDesired", SimpleNamespace(commit="b" * 40, generation=newer)
+    )
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is False
+
+    status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit="b" * 40,
+            applied_generation=newer,
+            ready=True,
+            holding=False,
+        ),
+    )
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is False
+
+
+def test_confirmation_rejects_unreadable_desired_before_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable desired authority fails closed without publishing confirmation intent."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: (_ for _ in ()).throw(supervise.DesiredIntentError("malformed")),
+    )
+    settle = MagicMock()
+    rollback = MagicMock()
+    monkeypatch.setattr(deployctl, "settle_desired", settle)
+    monkeypatch.setattr(deployctl, "_rollback_locked", rollback)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._confirm_locked(
+            {"type": "confirm", "commit": mission.commit},
+            _options(),
+        )
+
+    settle.assert_not_called()
+    rollback.assert_not_called()
