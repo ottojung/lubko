@@ -507,19 +507,45 @@ def _mission_candidate_alive(state: RollbackState) -> bool:
     return _supervised_mission_active(state)
 
 
-def _supervised_mission_authoritative(state: RollbackState) -> bool:
-    """Return whether durable supervisor authority still belongs to this mission.
+def _supervised_mission_authority_matches(
+    state: RollbackState,
+    desired: supervise.SupervisorDesired | None,
+    status: supervise.SupervisorStatus | None,
+) -> bool:
+    """Return whether desired and applied authority remain compatible with a mission.
 
-    A pending mission owns exactly its published generation and candidate commit.
-    Confirmation or rollback publishes a newer desired generation only while the
-    deployment lock is held and immediately terminalizes the mission after the
-    requested worker is queue-ready.
+    A newer same-commit desired generation is still compatible: it can represent a
+    restart or migration obligation that confirmation must preserve and await. A
+    different commit, missing authority surface, or an applied generation outside
+    the mission-to-desired interval is superseding or contradictory authority.
     """
-    supervisor_state = supervise.read_state()
     return (
-        supervisor_state.commit == state.commit
-        and supervisor_state.applied_generation == state.generation
+        desired is not None
+        and status is not None
+        and desired.commit == state.commit
+        and desired.generation >= state.generation
+        and status.commit == state.commit
+        and state.generation <= status.applied_generation <= desired.generation
     )
+
+
+def _supervised_mission_authoritative(state: RollbackState) -> bool:
+    """Return whether durable supervisor authority still belongs to this mission."""
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        return False
+    return _supervised_mission_authority_matches(state, desired, supervise.read_status())
+
+
+def _require_confirmation_authority(state: RollbackState) -> None:
+    """Fail closed when supervised confirmation no longer owns durable authority."""
+    if state.supervisor_owned is False or not supervise.supervisor_running():
+        return
+    if not _supervised_mission_authoritative(state):
+        raise DeployCtlError(
+            "supervisor authority was superseded before confirmation; deployment remains pending"
+        )
 
 
 def _pending_mission_rollback_due(state: RollbackState) -> bool:
@@ -1420,12 +1446,12 @@ def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
                 "cannot confirm while supervisor desired authority is unreadable"
             ) from exc
         status = supervise.read_status()
-        if desired is None or status is None:
+        if not _supervised_mission_authority_matches(state, desired, status):
             raise DeployCtlError(
                 "the supervisor readiness proof was superseded before confirmation; "
                 "deployment remains pending"
             )
-        if desired.commit != state.commit or status.commit != state.commit:
+        if desired is None or status is None:
             raise DeployCtlError(
                 "the supervisor readiness proof was superseded before confirmation; "
                 "deployment remains pending"
@@ -2170,6 +2196,7 @@ def _confirmation_state(request: dict[str, object]) -> RollbackState:
         return state
     if state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
+    _require_confirmation_authority(state)
     if _pending_mission_rollback_due(state):
         raise DeployCtlError(_confirmation_rollback_error(state, "confirmation window lapsed"))
     if request.get("commit") != state.commit:
@@ -2183,6 +2210,7 @@ def _confirmation_state(request: dict[str, object]) -> RollbackState:
 
 def _authorize_confirmation(state: RollbackState) -> None:
     """Recheck candidate liveness and lifecycle authority before confirmation."""
+    _require_confirmation_authority(state)
     if _pending_mission_rollback_due(state):
         raise DeployCtlError(
             _confirmation_rollback_error(state, "candidate failed before confirmation")
