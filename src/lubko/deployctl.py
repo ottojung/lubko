@@ -1589,7 +1589,7 @@ def _restore_previous_locked(state: RollbackState) -> bool:
     return True
 
 
-def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
+def _finalize_supervised_rollback(state: RollbackState, expected_generation: int) -> RollbackState:
     """Durably archive only a still-current queue-ready rollback target.
 
     Terminalization is serialized with desired-generation writers. A restart,
@@ -1619,9 +1619,18 @@ def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
                 "deployment remains pending"
             )
         if (
-            desired.commit != state.previous_commit
-            or status.commit != state.previous_commit
-            or status.applied_generation != desired.generation
+            (
+                desired.commit,
+                status.commit,
+                desired.generation,
+                status.applied_generation,
+            )
+            != (
+                state.previous_commit,
+                state.previous_commit,
+                expected_generation,
+                expected_generation,
+            )
             or status.ready is not True
             or status.holding
         ):
@@ -1749,13 +1758,13 @@ def _rollback_locked(state: RollbackState) -> bool:
         )
         return False
     try:
-        settle_desired(state.previous_commit, state.repo, state.uv_path)
+        rollback_generation = settle_desired(state.previous_commit, state.repo, state.uv_path)
     except DeployCtlError:
         append_deploy_log("supervised rollback could not settle the previous commit")
         finalized = False
     else:
         try:
-            _finalize_supervised_rollback(state)
+            _finalize_supervised_rollback(state, rollback_generation)
         except DeployCtlError:
             append_deploy_log("supervised rollback readiness was superseded before terminalization")
             finalized = False

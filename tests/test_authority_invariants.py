@@ -1188,7 +1188,9 @@ def test_rollback_gate_keeps_pending_when_final_readiness_is_superseded(
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: mission.generation + 1)
 
-    def refuse(_state: deployctl.RollbackState) -> deployctl.RollbackState:
+    def refuse(
+        _state: deployctl.RollbackState, _expected_generation: int
+    ) -> deployctl.RollbackState:
         msg = "readiness superseded"
         raise deployctl.DeployCtlError(msg)
 
@@ -1400,6 +1402,7 @@ def test_publish_gate_allows_when_no_pending_mission(
     "case",
     [
         (None, 1, 0, True, False),
+        (None, 1, 1, True, False),
         (None, 1, 1, False, True),
         ("d" * 40, 1, 1, True, False),
     ],
@@ -1434,7 +1437,7 @@ def test_rollback_terminalization_rejects_superseded_readiness(
     monkeypatch.setattr(deployctl, "_write_state", written)
 
     with pytest.raises(deployctl.DeployCtlError, match="superseded before rollback"):
-        deployctl._finalize_supervised_rollback(mission)
+        deployctl._finalize_supervised_rollback(mission, mission.generation)
 
     written.assert_not_called()
 
