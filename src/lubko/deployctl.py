@@ -31,13 +31,14 @@ from psycopg.rows import tuple_row
 
 from lubko import cli, lifecycle_state, supervise
 from lubko.config import load_database_config
-from lubko.durable import write_json_durable
+from lubko.durable import DurabilityError, write_json_durable
 from lubko.lifecycle import (
     SCHEMA_VERSION,
     STATE_RUNNING,
     LockTimeoutError,
     ProcessIdentity,
     WorkerMeta,
+    WorkerMetadataError,
     _converge_unproven_spawn,
     append_deploy_log,
     check_postgres,
@@ -45,8 +46,8 @@ from lubko.lifecycle import (
     detach_standard_streams,
     process_identity,
     read_meta,
+    read_meta_strict,
     run_validation,
-    spawn_worker,
     stop_worker,
     worker_alive,
     worker_env,
@@ -64,8 +65,8 @@ LOGGER: Final = logging.getLogger(__name__)
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
-ROLLBACK_SCHEMA_VERSION: Final = 3
-SUPPORTED_ROLLBACK_SCHEMA_VERSIONS: Final = frozenset({2})
+ROLLBACK_SCHEMA_VERSION: Final = 4
+SUPPORTED_ROLLBACK_SCHEMA_VERSIONS: Final = frozenset({2, 3})
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
@@ -136,8 +137,10 @@ class RollbackState:
     git_timeout_seconds: float
     previous_retiring: bool
     previous_meta: WorkerMeta
-    new_meta: WorkerMeta
+    new_meta: WorkerMeta | None
     supervisor_owned: bool | None = None
+    previous_restart_meta: WorkerMeta | None = None
+    previous_restart_released: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize durable rollback state.
@@ -158,8 +161,12 @@ class RollbackState:
             "git_timeout_seconds": self.git_timeout_seconds,
             "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
-            "new_meta": self.new_meta.to_dict(),
+            "new_meta": None if self.new_meta is None else self.new_meta.to_dict(),
             "supervisor_owned": self.supervisor_owned,
+            "previous_restart_meta": (
+                None if self.previous_restart_meta is None else self.previous_restart_meta.to_dict()
+            ),
+            "previous_restart_released": self.previous_restart_released,
         }
         return result
 
@@ -179,8 +186,9 @@ class RollbackState:
         try:
             previous = data["previous_meta"]
             replacement = data["new_meta"]
-            if not isinstance(previous, dict) or not isinstance(replacement, dict):
+            if not isinstance(previous, dict):
                 raise TypeError
+            supervisor_owned = _optional_json_bool(data.get("supervisor_owned"))
             # The generation is recovery authority: it must be a genuine positive
             # JSON integer. Booleans, numeric/string/numeric-float values, and
             # zero or negative numbers are corruption; they must never silently
@@ -199,6 +207,29 @@ class RollbackState:
                 raise ValueError
             commit = _required_commit(data["commit"])
             previous_commit = _required_commit(data["previous_commit"])
+            repo = _required_json_string(data["repo"])
+            if replacement is None:
+                if supervisor_owned is not True:
+                    raise TypeError
+                replacement_meta = None
+            elif isinstance(replacement, dict):
+                try:
+                    replacement_meta = WorkerMeta.from_dict(replacement)
+                except (TypeError, ValueError):
+                    if supervisor_owned is not True or not _legacy_supervisor_placeholder(
+                        replacement, commit=commit, repo=repo
+                    ):
+                        raise
+                    replacement_meta = None
+            else:
+                raise TypeError
+            restart_meta, restart_released = _parse_previous_restart(
+                data,
+                supervisor_owned=supervisor_owned,
+                status=status,
+                repo=repo,
+                previous_commit=previous_commit,
+            )
             return cls(
                 schema_version=schema_version,
                 generation=generation,
@@ -206,7 +237,7 @@ class RollbackState:
                 commit=commit,
                 previous_commit=previous_commit,
                 deadline=_required_nonnegative_finite_json_number(data["deadline"]),
-                repo=_required_json_string(data["repo"]),
+                repo=repo,
                 uv_path=_required_json_string(data["uv_path"]),
                 stop_grace_seconds=_required_positive_finite_json_number(
                     data["stop_grace_seconds"]
@@ -216,8 +247,10 @@ class RollbackState:
                 ),
                 previous_retiring=_retiring_flag(data.get("previous_retiring", _ABSENT)),
                 previous_meta=WorkerMeta.from_dict(previous),
-                new_meta=WorkerMeta.from_dict(replacement),
-                supervisor_owned=_optional_json_bool(data.get("supervisor_owned")),
+                new_meta=replacement_meta,
+                supervisor_owned=supervisor_owned,
+                previous_restart_meta=restart_meta,
+                previous_restart_released=restart_released,
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervised deployment state is malformed"
@@ -234,6 +267,51 @@ class GatedWorker:
 
 
 _ABSENT: Final = object()
+
+
+def _parse_previous_restart(
+    data: dict[str, object],
+    *,
+    supervisor_owned: bool | None,
+    status: str,
+    repo: str,
+    previous_commit: str,
+) -> tuple[WorkerMeta | None, bool]:
+    """Parse and validate durable legacy rollback restart authority.
+
+    Args:
+        data: Decoded rollback state.
+        supervisor_owned: Durable mission ownership classification.
+        status: Parsed rollback mission status.
+        repo: Expected repository identity.
+        previous_commit: Commit the restart worker must run.
+
+    Returns:
+        The optional restart worker metadata and its release flag.
+
+    Raises:
+        TypeError: If restart authority is malformed or inconsistent.
+    """
+    restart_raw = data.get("previous_restart_meta")
+    if restart_raw is None:
+        restart_meta = None
+    elif isinstance(restart_raw, dict):
+        restart_meta = WorkerMeta.from_dict(restart_raw)
+    else:
+        raise TypeError
+    restart_released = _retiring_flag(data.get("previous_restart_released", _ABSENT))
+    if restart_meta is None:
+        if restart_released:
+            raise TypeError
+    elif (
+        supervisor_owned is not False
+        or status != STATUS_PENDING
+        or restart_meta.state != STATE_RUNNING
+        or restart_meta.repo != repo
+        or restart_meta.git_commit != previous_commit
+    ):
+        raise TypeError
+    return restart_meta, restart_released
 
 
 def _retiring_flag(value: object) -> bool:
@@ -422,38 +500,27 @@ def next_mission_generation() -> int:
             raise DeployCtlError(str(exc)) from exc
 
 
-def _placeholder_meta(commit: str, repo: str) -> WorkerMeta:
-    """Return an identity-less candidate record for a supervisor-owned mission.
-
-    When the external supervisor is live, the candidate process is spawned by
-    the daemon, not by deployctl, so deployctl never knows the candidate
-    identity at mission-publication time. The placeholder is recorded for
-    schema completeness and is deliberately never alive, so nothing in
-    deployctl can treat it as a real process; liveness is observed through the
-    supervisor's own durable state instead.
-
-    Args:
-        commit: Exact candidate commit.
-        repo: Maintained checkout the candidate belongs to.
+def _legacy_supervisor_placeholder(data: dict[str, object], *, commit: str, repo: str) -> bool:
+    """Recognize the exact identity-less sentinel emitted by older controllers.
 
     Returns:
-        A non-alive worker metadata record for the mission file.
+        Whether the mapping is the historical supervisor-owned sentinel.
     """
-    return WorkerMeta(
-        schema_version=SCHEMA_VERSION,
-        state=STATE_RUNNING,
-        pid=0,
-        pgid=0,
-        sid=0,
-        start_time_ticks=0,
-        token=None,
-        repo=repo,
-        git_commit=commit,
-        worker_id="",
-        log_path="",
-        started_at=None,
-        stopped_at=None,
-    )
+    return data == {
+        "schema_version": SCHEMA_VERSION,
+        "state": STATE_RUNNING,
+        "pid": 0,
+        "pgid": 0,
+        "sid": 0,
+        "start_time_ticks": 0,
+        "token": None,
+        "repo": repo,
+        "git_commit": commit,
+        "worker_id": "",
+        "log_path": "",
+        "started_at": None,
+        "stopped_at": None,
+    }
 
 
 def _supervised_mission_active(state: RollbackState) -> bool:
@@ -495,25 +562,114 @@ def _mission_candidate_alive(state: RollbackState) -> bool:
         ``True`` when the candidate consumer is currently live.
     """
     if state.supervisor_owned is False:
-        return worker_alive(state.new_meta)
+        return state.new_meta is not None and worker_alive(state.new_meta)
     if not supervise.supervisor_running():
         return False
     return _supervised_mission_active(state)
 
 
-def _supervised_mission_authoritative(state: RollbackState) -> bool:
-    """Return whether durable supervisor authority still belongs to this mission.
+def _supervised_confirmation_authority_matches(
+    state: RollbackState,
+    desired: supervise.SupervisorDesired | None,
+    status: supervise.SupervisorStatus | None,
+) -> bool:
+    """Return whether desired and applied authority remain compatible with a mission.
 
-    A pending mission owns exactly its published generation and candidate commit.
-    Confirmation or rollback publishes a newer desired generation only while the
-    deployment lock is held and immediately terminalizes the mission after the
-    requested worker is queue-ready.
+    A newer same-commit desired generation is still compatible: it can represent a
+    restart or migration obligation that confirmation must preserve and await. A
+    different commit, missing authority surface, or an applied generation outside
+    the mission-to-desired interval is superseding or contradictory authority.
     """
+    return (
+        desired is not None
+        and status is not None
+        and desired.commit == state.commit
+        and desired.generation >= state.generation
+        and status.commit == state.commit
+        and state.generation <= status.applied_generation <= desired.generation
+    )
+
+
+def _supervised_terminalization_authority_matches(
+    expected_commit: str,
+    expected_generation: int,
+    desired: supervise.SupervisorDesired | None,
+    status: supervise.SupervisorStatus | None,
+) -> bool:
+    """Return whether terminalization still owns one live queue-ready worker.
+
+    The status snapshot alone is not a synchronous liveness proof: the child can
+    exit after readiness was published but before deployctl acquires the
+    generation lock. Bind the exact settled desired/status generation to the
+    supervisor's durable child identity and re-prove that child alive before a
+    pending mission may become terminal.
+    """
+    if desired is None or status is None:
+        return False
+    if (
+        desired.commit != expected_commit
+        or desired.generation != expected_generation
+        or status.commit != expected_commit
+        or status.applied_generation != expected_generation
+    ):
+        return False
+    if status.ready is not True or status.holding or status.child is None:
+        return False
     supervisor_state = supervise.read_state()
     return (
-        supervisor_state.commit == state.commit
-        and supervisor_state.applied_generation == state.generation
+        supervisor_state.commit == expected_commit
+        and supervisor_state.applied_generation == expected_generation
+        and supervisor_state.ready
+        and not supervise.is_holding(supervisor_state)
+        and supervisor_state.child == status.child
+        and supervise.child_alive(status.child)
     )
+
+
+def _supervised_mission_authoritative(state: RollbackState) -> bool:
+    """Return whether durable supervisor authority remains compatible with this mission.
+
+    Pending confirmation may legitimately coexist with a newer same-commit
+    restart or migration generation. Treat that lifecycle obligation as
+    compatible while the mission is pending, but fail closed on unreadable,
+    missing, contradictory, or different-commit authority. Terminalization
+    still binds to the exact settled generation separately.
+    """
+    supervisor_state = supervise.read_state()
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        return False
+    status = supervise.read_status()
+    return (
+        status is not None
+        and supervisor_state.commit == status.commit
+        and supervisor_state.applied_generation == status.applied_generation
+        and _supervised_confirmation_authority_matches(state, desired, status)
+    )
+
+
+def _require_known_confirmation_ownership(state: RollbackState) -> None:
+    """Require an explicit durable owner before confirmation can advance."""
+    if state.supervisor_owned is None:
+        raise DeployCtlError("confirmation authority is unknown; deployment remains pending")
+
+
+def _require_confirmation_authority(state: RollbackState) -> None:
+    """Fail closed when supervised confirmation no longer owns durable authority."""
+    _require_known_confirmation_ownership(state)
+    if state.supervisor_owned is False or not supervise.supervisor_running():
+        return
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError as exc:
+        raise DeployCtlError(
+            "supervisor authority was superseded before confirmation; deployment remains pending"
+        ) from exc
+    if not _supervised_confirmation_authority_matches(state, desired, supervise.read_status()):
+        raise DeployCtlError(
+            "supervisor authority was superseded before confirmation; deployment remains pending"
+        )
 
 
 def _pending_mission_rollback_due(state: RollbackState) -> bool:
@@ -533,12 +689,26 @@ def _pending_mission_rollback_due(state: RollbackState) -> bool:
         ``True`` when the mission must roll back now.
     """
     if state.supervisor_owned is False:
-        return time.time() >= state.deadline or not worker_alive(state.new_meta)
+        return (
+            state.new_meta is None
+            or time.time() >= state.deadline
+            or not worker_alive(state.new_meta)
+        )
     if not supervise.supervisor_running():
         return True
     if not _supervised_mission_authoritative(state):
         return True
-    return time.time() >= state.deadline and not _supervised_mission_active(state)
+    if time.time() < state.deadline:
+        return False
+    status = supervise.read_status()
+    return (
+        status is None
+        or status.commit != state.commit
+        or status.applied_generation < state.generation
+        or status.ready is not True
+        or status.holding
+        or not _supervised_mission_active(state)
+    )
 
 
 def settle_desired(commit: str, repo: str, uv_path: str) -> int:
@@ -925,7 +1095,9 @@ def _candidate_response(state: RollbackState) -> dict[str, object]:
         "ok": True,
         "phase": "pending",
         "commit": state.commit,
-        "worker_pid": None if (state.new_meta.pid or 0) <= 0 else state.new_meta.pid,
+        "worker_pid": (
+            None if state.new_meta is None or (state.new_meta.pid or 0) <= 0 else state.new_meta.pid
+        ),
         "deadline": state.deadline,
     }
 
@@ -1205,50 +1377,82 @@ def _complete_handoff(
     raise DeployCtlError("cannot hand off a deployment with unknown supervisor ownership")
 
 
-def _restart_previous(state: RollbackState) -> WorkerMeta | None:
-    """Restore the previous known-good worker process.
-
-    A previous worker that was never told to retire and is still alive is
-    reused under its exact recorded identity (old watchdog behavior). Once the
-    controller has durably marked ``previous_retiring`` before stopping that
-    worker, a momentarily alive process is never trusted: retirement may have
-    begun, so the exact old identity is deterministically stopped and awaited
-    dead before a fresh previous-commit worker is spawned and verified. That
-    guarantees terminal ``rolled_back`` never means a worker that is about to
-    exit, so zero queue consumers cannot be the outcome of a completed
-    rollback.
+def _durable_previous_worker(
+    state: RollbackState,
+) -> tuple[bool, WorkerMeta | None]:
+    """Resolve a live durable worker before legacy rollback spawns another.
 
     Args:
         state: Rollback mission.
 
     Returns:
-        Restored worker metadata, or ``None`` on failure.
+        A pair of ``(resolved, worker)``. ``resolved`` means durable metadata
+        decides the retry: ``worker`` is adopted when exact previous-commit
+        authority is proven, while ``None`` means fail closed. An unresolved
+        result permits the normal previous-worker restart path.
     """
+    try:
+        current = read_meta_strict()
+    except WorkerMetadataError as exc:
+        append_deploy_log(f"legacy rollback cannot trust maintained worker metadata: {exc}")
+        return True, None
+    if current is None or not worker_alive(current):
+        return False, None
+    exact_previous = (
+        current.state == STATE_RUNNING
+        and current.repo == state.repo
+        and current.git_commit == state.previous_commit
+    )
+    if not exact_previous:
+        append_deploy_log(
+            "legacy rollback found a live maintained worker outside previous-commit authority"
+        )
+        return True, None
     previous = state.previous_meta
-    if not state.previous_retiring and worker_alive(previous):
-        return previous
-    if worker_alive(previous) and not stop_worker(previous, state.stop_grace_seconds):
-        return None
+    same_original_identity = (
+        current.pid == previous.pid
+        and current.pgid == previous.pgid
+        and current.sid == previous.sid
+        and current.start_time_ticks == previous.start_time_ticks
+        and current.token == previous.token
+    )
+    if state.previous_retiring and same_original_identity:
+        return False, None
+    return True, current
+
+
+def _spawn_gated_previous_worker(state: RollbackState, previous: WorkerMeta) -> GatedWorker | None:
+    """Spawn one previous-commit worker behind a non-consuming pipe gate.
+
+    Returns:
+        The gated worker, or ``None`` if spawning or identity proof fails.
+    """
     token = secrets.token_hex(16)
     env = worker_env(token)
     worker_id = env.get("LUBKO_WORKER_ID") or previous.worker_id or socket.gethostname()
+    reader, writer = os.pipe()
     try:
-        proc = spawn_worker(
-            Path(state.repo),
-            state.uv_path,
-            worker_log_path(token),
-            env,
+        proc = subprocess.Popen(
+            [sys.executable, "-c", GATED_SHIM_SOURCE, str(reader), state.uv_path],
+            cwd=Path(state.repo),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=(reader,),
+            env=env,
         )
     except OSError:
+        os.close(writer)
         return None
+    finally:
+        os.close(reader)
     identity = _wait_for_identity(proc)
     if identity is None or identity.pgid != proc.pid or identity.sid != proc.pid:
+        _close_gate(writer)
         if identity is not None:
-            LOGGER.error(
-                "worker pid %d is live without an acceptable identity; converging it",
-                proc.pid,
-            )
-        _converge_unproven_spawn(proc, state.stop_grace_seconds, identity)
+            _converge_unproven_spawn(proc, state.stop_grace_seconds, identity)
         return None
     meta = WorkerMeta(
         schema_version=SCHEMA_VERSION,
@@ -1265,10 +1469,117 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
         started_at=time.time(),
         stopped_at=None,
     )
-    if not worker_alive(meta) or not check_postgres(DEFAULT_POSTGRES_TIMEOUT_SECONDS):
-        stop_worker(meta, state.stop_grace_seconds)
+    return GatedWorker(proc=proc, gate_writer=writer, meta=meta)
+
+
+def _clear_previous_restart_obligation(state: RollbackState) -> None:
+    """Durably clear a proven-dead legacy rollback restart obligation."""
+    _write_state(
+        replace(
+            state,
+            previous_restart_meta=None,
+            previous_restart_released=False,
+        )
+    )
+
+
+def _recover_previous_restart(state: RollbackState) -> tuple[bool, WorkerMeta | None]:
+    """Resolve durable rollback restart authority before another spawn.
+
+    Returns:
+        Whether durable restart authority resolved the attempt and the worker to adopt, if any.
+    """
+    meta = state.previous_restart_meta
+    if meta is None:
+        return False, None
+    if not state.previous_restart_released:
+        if worker_alive(meta):
+            if not stop_worker(meta, state.stop_grace_seconds) or worker_alive(meta):
+                append_deploy_log(
+                    "legacy rollback could not converge an unreleased previous-worker spawn"
+                )
+                return True, None
+        _clear_previous_restart_obligation(state)
+        return False, None
+    if worker_alive(meta):
+        if _wait_for_released_worker(meta) and check_postgres(DEFAULT_POSTGRES_TIMEOUT_SECONDS):
+            return True, meta
+        if not stop_worker(meta, state.stop_grace_seconds) or worker_alive(meta):
+            append_deploy_log(
+                "legacy rollback could not converge an unhealthy released previous-worker spawn"
+            )
+            return True, None
+    _clear_previous_restart_obligation(state)
+    return False, None
+
+
+def _spawn_previous_worker(state: RollbackState, previous: WorkerMeta) -> WorkerMeta | None:
+    """Spawn, durably anchor, release, and verify one previous-commit worker.
+
+    Returns:
+        Verified previous-worker metadata, or ``None`` when restart cannot safely complete.
+    """
+    gated = _spawn_gated_previous_worker(state, previous)
+    if gated is None:
         return None
-    return meta
+    prepared = replace(state, previous_restart_meta=gated.meta, previous_restart_released=False)
+    try:
+        _write_state(prepared)
+    except DurabilityError:
+        _abort_gated_candidate(gated)
+        raise
+    try:
+        _release_gate(gated.gate_writer)
+    except DeployCtlError:
+        _abort_gated_candidate(gated)
+        _clear_previous_restart_obligation(prepared)
+        return None
+    released = replace(prepared, previous_restart_released=True)
+    try:
+        _write_state(released)
+    except DurabilityError:
+        _abort_gated_candidate(gated)
+        raise
+    if not _wait_for_released_worker(gated.meta) or not check_postgres(
+        DEFAULT_POSTGRES_TIMEOUT_SECONDS
+    ):
+        _abort_gated_candidate(gated)
+        _clear_previous_restart_obligation(released)
+        return None
+    return gated.meta
+
+
+def _restart_previous(state: RollbackState) -> WorkerMeta | None:
+    """Restore the previous known-good worker process.
+
+    A previous worker that was never told to retire and is still alive is
+    reused under its exact recorded identity (old watchdog behavior). Once the
+    controller has durably marked ``previous_retiring`` before stopping that
+    worker, a momentarily alive process is never trusted: retirement may have
+    begun, so the exact old identity is deterministically stopped and awaited
+    dead before a fresh previous-commit worker is spawned and verified. A live
+    durable worker published by an interrupted prior rollback is adopted only
+    when it proves exact previous-commit authority and is not that retiring
+    original identity.
+
+    Args:
+        state: Rollback mission.
+
+    Returns:
+        Restored worker metadata, or ``None`` on failure.
+    """
+    resolved, current = _durable_previous_worker(state)
+    if resolved:
+        return current
+    restart_resolved, restarted = _recover_previous_restart(state)
+    if restart_resolved:
+        return restarted
+    previous = state.previous_meta
+    if not state.previous_retiring and worker_alive(previous):
+        return previous
+    if worker_alive(previous) and not stop_worker(previous, state.stop_grace_seconds):
+        return None
+    return _spawn_previous_worker(state, previous)
 
 
 def _retire_candidate_locked(state: RollbackState) -> bool:
@@ -1286,6 +1597,9 @@ def _retire_candidate_locked(state: RollbackState) -> bool:
     Returns:
         ``True`` only when the candidate worker is proven dead.
     """
+    if state.new_meta is None:
+        append_deploy_log("legacy rollback is missing candidate identity metadata")
+        return False
     if not stop_worker(state.new_meta, state.stop_grace_seconds):
         append_deploy_log("supervised rollback could not stop the candidate worker")
         return False
@@ -1314,10 +1628,16 @@ def _restore_previous_locked(state: RollbackState) -> bool:
         return False
     restored = _restart_previous(state)
     if restored is None:
-        append_deploy_log("supervised rollback could not restart previous worker")
         return False
     write_meta(restored)
-    _write_state(replace(state, status=STATUS_ROLLED_BACK))
+    _write_state(
+        replace(
+            state,
+            status=STATUS_ROLLED_BACK,
+            previous_restart_meta=None,
+            previous_restart_released=False,
+        )
+    )
     cli.remove_cli_root(state.commit)
     if cli.reconcile_pointer(state.previous_commit):
         append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
@@ -1329,7 +1649,7 @@ def _restore_previous_locked(state: RollbackState) -> bool:
     return True
 
 
-def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
+def _finalize_supervised_rollback(state: RollbackState, expected_generation: int) -> RollbackState:
     """Durably archive only a still-current queue-ready rollback target.
 
     Terminalization is serialized with desired-generation writers. A restart,
@@ -1353,17 +1673,8 @@ def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
                 "cannot roll back while supervisor desired authority is unreadable"
             ) from exc
         status = supervise.read_status()
-        if desired is None or status is None:
-            raise DeployCtlError(
-                "the supervisor readiness proof was superseded before rollback; "
-                "deployment remains pending"
-            )
-        if (
-            desired.commit != state.previous_commit
-            or status.commit != state.previous_commit
-            or status.applied_generation != desired.generation
-            or status.ready is not True
-            or status.holding
+        if not _supervised_terminalization_authority_matches(
+            state.previous_commit, expected_generation, desired, status
         ):
             raise DeployCtlError(
                 "the supervisor readiness proof was superseded before rollback; "
@@ -1382,7 +1693,9 @@ def _finalize_supervised_rollback(state: RollbackState) -> RollbackState:
     return terminal
 
 
-def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
+def _finalize_supervised_confirmation(
+    state: RollbackState, expected_generation: int
+) -> RollbackState:
     """Durably archive only a still-current queue-ready supervisor target.
 
     Terminalization is serialized with desired-generation writers. A restart,
@@ -1405,20 +1718,8 @@ def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
                 "cannot confirm while supervisor desired authority is unreadable"
             ) from exc
         status = supervise.read_status()
-        if desired is None or status is None:
-            raise DeployCtlError(
-                "the supervisor readiness proof was superseded before confirmation; "
-                "deployment remains pending"
-            )
-        if desired.commit != state.commit or status.commit != state.commit:
-            raise DeployCtlError(
-                "the supervisor readiness proof was superseded before confirmation; "
-                "deployment remains pending"
-            )
-        if (
-            status.applied_generation != desired.generation
-            or status.ready is not True
-            or status.holding
+        if not _supervised_terminalization_authority_matches(
+            state.commit, expected_generation, desired, status
         ):
             raise DeployCtlError(
                 "the supervisor readiness proof was superseded before confirmation; "
@@ -1433,6 +1734,18 @@ def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
     cli.gc_cli_roots((state.commit, state.previous_commit))
     append_deploy_log(f"supervised deployment confirmed commit {state.commit}")
     return terminal
+
+
+def _rollback_legacy_locked(state: RollbackState) -> bool:
+    """Roll back one explicitly legacy-owned pending mission.
+
+    Returns:
+        ``True`` only when the legacy candidate is retired and the previous
+        checkout/worker are restored.
+    """
+    if not _retire_candidate_locked(state):
+        return False
+    return _restore_previous_locked(state)
 
 
 def _rollback_locked(state: RollbackState) -> bool:
@@ -1464,23 +1777,26 @@ def _rollback_locked(state: RollbackState) -> bool:
     if not lifecycle_state.authorize_mission_rollback(_mission_authority_facts(state.status)):
         append_deploy_log("lifecycle authority refuses rollback of the pending mission; holding")
         return False
+    if state.supervisor_owned is None:
+        append_deploy_log(
+            "rollback authority is unknown; holding pending mission without inferring ownership"
+        )
+        return False
     if state.supervisor_owned is False:
-        if not _retire_candidate_locked(state):
-            return False
-        return _restore_previous_locked(state)
+        return _rollback_legacy_locked(state)
     if not supervise.supervisor_running():
         append_deploy_log(
             "supervised rollback lost supervisor authority before settlement; holding pending mission"
         )
         return False
     try:
-        settle_desired(state.previous_commit, state.repo, state.uv_path)
+        rollback_generation = settle_desired(state.previous_commit, state.repo, state.uv_path)
     except DeployCtlError:
         append_deploy_log("supervised rollback could not settle the previous commit")
         finalized = False
     else:
         try:
-            _finalize_supervised_rollback(state)
+            _finalize_supervised_rollback(state, rollback_generation)
         except DeployCtlError:
             append_deploy_log("supervised rollback readiness was superseded before terminalization")
             finalized = False
@@ -1492,10 +1808,10 @@ def _rollback_locked(state: RollbackState) -> bool:
 def _watchdog_main(lock_timeout_seconds: float) -> None:
     """Retain rollback authority until the mission reaches a terminal state.
 
-    With a live external supervisor the watchdog only rolls back after the
-    confirmation deadline has passed without the daemon keeping the candidate
-    consumer live, so it never fights the supervisor's own bounded restart of a
-    transiently crashed candidate.
+    With a live external supervisor the watchdog delegates rollback policy to
+    the canonical pending-mission predicate, so durable authority, deadline,
+    and readiness decisions cannot drift from status/confirmation handling.
+    Supervisor absence still fails closed for supervisor-owned/unknown missions.
 
     Args:
         lock_timeout_seconds: Deployment-lock timeout for rollback attempts.
@@ -1509,15 +1825,16 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
         if state is None or state.status in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
             return
         if state.supervisor_owned is False:
-            should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
-        elif supervise.supervisor_running():
-            # While the supervisor is present, candidate liveness is a separate
-            # observation: only roll back after the deadline AND the exact child
-            # is no longer proven live.  A stale state.json child must not count
-            # as live.
-            should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
-                state
+            should_rollback = (
+                state.new_meta is None
+                or time.time() >= state.deadline
+                or not worker_alive(state.new_meta)
             )
+        elif supervise.supervisor_running():
+            # Reuse the canonical mission predicate used by status and
+            # confirmation so durable authority and deadline policy cannot
+            # drift between observers.
+            should_rollback = _pending_mission_rollback_due(state)
         else:
             # Pending supervised missions and missions with unknown lifecycle
             # authority must never enter the legacy direct rollback/worker
@@ -1647,7 +1964,10 @@ def _cleanup_pending_locked() -> None:
         return
     if state.status != STATUS_PENDING:
         raise DeployCtlError(f"unknown supervised deployment status {state.status!r}")
-    if _mission_candidate_alive(state) and time.time() < state.deadline:
+    if state.supervisor_owned is not False:
+        if not _pending_mission_rollback_due(state):
+            raise DeployCtlError("another supervised checkout is still pending confirmation")
+    elif _mission_candidate_alive(state) and time.time() < state.deadline:
         raise DeployCtlError("another supervised checkout is still pending confirmation")
     if not _rollback_locked(state):
         raise DeployCtlError("an unresolved rollback is still pending")
@@ -1797,11 +2117,11 @@ def _candidate_identity(
     commit: str,
     *,
     supervised: bool,
-) -> tuple[GatedWorker | None, WorkerMeta]:
+) -> tuple[GatedWorker | None, WorkerMeta | None]:
     """Produce the candidate identity record for a prepared mission.
 
-    With a live external supervisor the candidate is owned by the daemon, so a
-    never-alive placeholder is recorded; otherwise deployctl spawns the gated
+    With a live external supervisor the candidate identity is owned by the daemon
+    and is not duplicated in rollback state; otherwise deployctl spawns the gated
     candidate (one-time bootstrap / emergency path).
 
     Args:
@@ -1813,7 +2133,7 @@ def _candidate_identity(
         The ``(gated, new_meta)`` pair.
     """
     if supervised:
-        return None, _placeholder_meta(commit, str(options.repo))
+        return None, None
     gated = _spawn_gated_candidate(options, commit)
     return gated, gated.meta
 
@@ -2151,6 +2471,7 @@ def _confirmation_state(request: dict[str, object]) -> RollbackState:
         return state
     if state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
+    _require_known_confirmation_ownership(state)
     if _pending_mission_rollback_due(state):
         raise DeployCtlError(_confirmation_rollback_error(state, "confirmation window lapsed"))
     if request.get("commit") != state.commit:
@@ -2159,6 +2480,7 @@ def _confirmation_state(request: dict[str, object]) -> RollbackState:
                 state, "confirmation commit does not match the proposed commit"
             )
         )
+    _require_confirmation_authority(state)
     return state
 
 
@@ -2178,18 +2500,23 @@ def _authorize_confirmation(state: RollbackState) -> None:
                 "durable authority malformed)",
             )
         )
+    _require_confirmation_authority(state)
 
 
-def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> None:
+def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> int | None:
     """Prepare the exact candidate for terminal confirmation.
 
     Args:
         state: Pending mission being confirmed.
         options: Runtime options for legacy CLI preparation.
 
+    Returns:
+        The exact settled supervisor generation, or ``None`` for legacy ownership.
+
     Raises:
         DeployCtlError: If the legacy CLI environment cannot be prepared.
     """
+    _require_known_confirmation_ownership(state)
     if state.supervisor_owned is False:
         try:
             cli.build_cli_root(
@@ -2200,30 +2527,42 @@ def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> N
                 state, f"confirmed CLI environment could not be prepared: {exc}"
             )
             raise DeployCtlError(msg) from exc
+        if state.new_meta is None:
+            msg = _confirmation_rollback_error(
+                state, "legacy deployment is missing candidate identity metadata"
+            )
+            raise DeployCtlError(msg)
         write_meta(state.new_meta)
-        return
+        return None
     if not supervise.supervisor_running():
         msg = _confirmation_rollback_error(
             state, "cannot confirm a supervisor-owned deployment without a live supervisor"
         )
         raise DeployCtlError(msg)
-    settle_desired(state.commit, state.repo, state.uv_path)
+    return settle_desired(state.commit, state.repo, state.uv_path)
 
 
-def _finalize_confirmation(state: RollbackState) -> RollbackState:
+def _finalize_confirmation(
+    state: RollbackState, expected_generation: int | None = None
+) -> RollbackState:
     """Persist terminal confirmation and maintain the CLI pointer.
 
     Args:
         state: Pending mission whose candidate is prepared.
+        expected_generation: Exact supervisor generation established during
+            preparation, or ``None`` for explicitly legacy-owned confirmation.
 
     Returns:
         Terminal confirmed mission state.
     """
-    if state.supervisor_owned is not False:
+    _require_known_confirmation_ownership(state)
+    if state.supervisor_owned is True:
         if not supervise.supervisor_running():
             msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
             raise DeployCtlError(msg)
-        return _finalize_supervised_confirmation(state)
+        if expected_generation is None:
+            raise DeployCtlError("supervised confirmation is missing its settled generation")
+        return _finalize_supervised_confirmation(state, expected_generation)
     terminal = replace(state, status=STATUS_CONFIRMED)
     _write_state(terminal)
     try:
@@ -2245,8 +2584,8 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     if state.status == STATUS_CONFIRMED:
         return _confirmation_response(state)
     _authorize_confirmation(state)
-    _prepare_confirmation_candidate(state, options)
-    state = _finalize_confirmation(state)
+    expected_generation = _prepare_confirmation_candidate(state, options)
+    state = _finalize_confirmation(state, expected_generation)
     return _confirmation_response(state)
 
 

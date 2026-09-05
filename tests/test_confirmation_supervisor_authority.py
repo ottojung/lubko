@@ -96,11 +96,32 @@ def test_supervisor_owned_confirmation_requires_live_supervisor(
     _assert_supervisor_authority_requires_liveness(monkeypatch, supervisor_owned=True)
 
 
-def test_unknown_confirmation_ownership_requires_live_supervisor(
+def test_unknown_confirmation_ownership_fails_closed_before_liveness_or_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unknown confirmation ownership fails closed without a supervisor."""
-    _assert_supervisor_authority_requires_liveness(monkeypatch, supervisor_owned=None)
+    """Unknown durable ownership cannot select either confirmation lifecycle."""
+    state = _pending_state(supervisor_owned=None)
+
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("unknown ownership must fail before liveness or state mutation")
+
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
+    monkeypatch.setattr(supervise, "supervisor_running", unexpected)
+    monkeypatch.setattr(dc, "settle_desired", unexpected)
+    monkeypatch.setattr(cli, "build_cli_root", unexpected)
+    monkeypatch.setattr(dc, "write_meta", unexpected)
+    monkeypatch.setattr(dc, "_write_state", unexpected)
+    monkeypatch.setattr(cli, "set_current", unexpected)
+
+    operations = (
+        lambda: dc._confirmation_state({"commit": COMMIT}),
+        lambda: dc._require_confirmation_authority(state),
+        lambda: dc._prepare_confirmation_candidate(state, _options()),
+        lambda: dc._finalize_confirmation(state),
+    )
+    for operation in operations:
+        with pytest.raises(dc.DeployCtlError, match="confirmation authority is unknown"):
+            operation()
 
 
 def test_explicit_legacy_confirmation_can_terminalize_without_supervisor(
@@ -212,6 +233,37 @@ def test_explicit_legacy_rollback_ignores_live_supervisor(
 
     assert dc._rollback_locked(state) is True
     assert steps == ["retire", "restore"]
+
+
+@pytest.mark.parametrize("supervisor_live", [False, True])
+def test_unknown_rollback_ownership_fails_closed_without_inference(
+    monkeypatch: pytest.MonkeyPatch, *, supervisor_live: bool
+) -> None:
+    """Unknown durable ownership cannot be classified from daemon liveness."""
+    state = _pending_state(supervisor_owned=None)
+    logged: list[str] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: supervisor_live)
+    monkeypatch.setattr(dc, "append_deploy_log", logged.append)
+    monkeypatch.setattr(
+        dc,
+        "settle_desired",
+        lambda *_args: pytest.fail("unknown rollback must not publish supervisor desired state"),
+    )
+    monkeypatch.setattr(
+        dc,
+        "_retire_candidate_locked",
+        lambda _state: pytest.fail("unknown rollback must not retire candidate workers"),
+    )
+    monkeypatch.setattr(
+        dc,
+        "_restore_previous_locked",
+        lambda _state: pytest.fail("unknown rollback must not restore legacy worker state"),
+    )
+
+    assert dc._rollback_locked(state) is False
+    assert logged == [
+        "rollback authority is unknown; holding pending mission without inferring ownership"
+    ]
 
 
 def test_legacy_authority_does_not_sample_supervisor_liveness_between_phases(

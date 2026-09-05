@@ -23,7 +23,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 if TYPE_CHECKING:
@@ -1013,6 +1013,21 @@ def test_confirm_gate_refuses_malformed_authority(
         lambda: (_ for _ in ()).throw(deployctl.DeployCtlError("malformed")),
     )
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=mission.generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
+    )
     monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
     monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: None)
     with pytest.raises(deployctl.DeployCtlError, match="authority refuses confirmation"):
@@ -1040,6 +1055,7 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None
         "read_desired_strict",
         lambda: SimpleNamespace(commit=mission.commit, generation=mission.generation),
     )
+    child = SimpleNamespace(marker="confirm-child")
     monkeypatch.setattr(
         supervise,
         "read_status",
@@ -1048,8 +1064,21 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None
             commit=mission.commit,
             ready=True,
             holding=False,
+            child=child,
         ),
     )
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: SimpleNamespace(
+            applied_generation=mission.generation,
+            commit=mission.commit,
+            ready=True,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate is child)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
     monkeypatch.setattr(cli, "set_current", lambda _c: None)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _c: None)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
@@ -1089,7 +1118,7 @@ def test_confirmation_holds_for_superseding_unready_generation(
     monkeypatch.setattr(deployctl, "_write_state", written)
 
     with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
-        deployctl._finalize_supervised_confirmation(mission)
+        deployctl._finalize_supervised_confirmation(mission, newer_generation)
 
     written.assert_not_called()
 
@@ -1120,7 +1149,7 @@ def test_confirmation_holds_while_current_generation_is_holding(
     monkeypatch.setattr(deployctl, "_write_state", written)
 
     with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
-        deployctl._finalize_supervised_confirmation(mission)
+        deployctl._finalize_supervised_confirmation(mission, generation)
 
     written.assert_not_called()
 
@@ -1173,7 +1202,9 @@ def test_rollback_gate_keeps_pending_when_final_readiness_is_superseded(
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: mission.generation + 1)
 
-    def refuse(_state: deployctl.RollbackState) -> deployctl.RollbackState:
+    def refuse(
+        _state: deployctl.RollbackState, _expected_generation: int
+    ) -> deployctl.RollbackState:
         msg = "readiness superseded"
         raise deployctl.DeployCtlError(msg)
 
@@ -1207,6 +1238,52 @@ def test_supervised_rollback_does_not_fall_back_to_legacy_without_supervisor(
     ]
 
 
+def test_watchdog_uses_canonical_supervised_rollback_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watchdog delegates live-supervisor rollback policy to the canonical predicate."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    due = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", due)
+    monkeypatch.setattr(deployctl, "deploy_lock", lambda _timeout: nullcontext())
+    rollback = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_rollback_locked", rollback)
+
+    deployctl._watchdog_main(1.0)
+
+    due.assert_called_once_with(mission)
+    rollback.assert_called_once_with(mission)
+
+
+def test_watchdog_respects_canonical_pending_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical pending decision prevents watchdog rollback side effects."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    due = MagicMock(return_value=False)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", due)
+    rollback = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_rollback_locked", rollback)
+
+    class WatchdogTestCompleteError(RuntimeError):
+        pass
+
+    def stop_after_first_iteration(_seconds: float) -> None:
+        raise WatchdogTestCompleteError
+
+    monkeypatch.setattr(time, "sleep", stop_after_first_iteration)
+
+    with pytest.raises(WatchdogTestCompleteError):
+        deployctl._watchdog_main(1.0)
+
+    due.assert_called_once_with(mission)
+    rollback.assert_not_called()
+
+
 def test_watchdog_supervised_rollback_race_stays_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1214,7 +1291,7 @@ def test_watchdog_supervised_rollback_race_stays_pending(
     mission = replace(_make_mission(deployctl.STATUS_PENDING), deadline=time.time() - 1.0)
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
-    observations = iter((True, False))
+    observations = iter((True, False, False))
     monkeypatch.setattr(supervise, "supervisor_running", lambda: next(observations))
     monkeypatch.setattr(deployctl, "_supervised_mission_active", lambda _state: False)
     monkeypatch.setattr(deployctl, "deploy_lock", lambda _timeout: nullcontext())
@@ -1268,6 +1345,7 @@ def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> Non
         "read_desired_strict",
         lambda: SimpleNamespace(commit=mission.previous_commit, generation=generation),
     )
+    child = SimpleNamespace(marker="rollback-gate-child")
     monkeypatch.setattr(
         supervise,
         "read_status",
@@ -1276,8 +1354,21 @@ def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> Non
             commit=mission.previous_commit,
             ready=True,
             holding=False,
+            child=child,
         ),
     )
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: SimpleNamespace(
+            applied_generation=generation,
+            commit=mission.previous_commit,
+            ready=True,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate is child)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
     monkeypatch.setattr(cli, "remove_cli_root", lambda _c: None)
     monkeypatch.setattr(cli, "reconcile_pointer", lambda _c: True)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
@@ -1385,6 +1476,7 @@ def test_publish_gate_allows_when_no_pending_mission(
     "case",
     [
         (None, 1, 0, True, False),
+        (None, 1, 1, True, False),
         (None, 1, 1, False, True),
         ("d" * 40, 1, 1, True, False),
     ],
@@ -1419,6 +1511,303 @@ def test_rollback_terminalization_rejects_superseded_readiness(
     monkeypatch.setattr(deployctl, "_write_state", written)
 
     with pytest.raises(deployctl.DeployCtlError, match="superseded before rollback"):
-        deployctl._finalize_supervised_rollback(mission)
+        deployctl._finalize_supervised_rollback(mission, mission.generation)
 
     written.assert_not_called()
+
+
+def test_confirmation_rejects_newer_unapplied_different_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation cannot replace a newer desired commit that is not applied yet."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    newer = mission.generation + 1
+    other_commit = "b" * 40
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=other_commit, generation=newer),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+    settle = MagicMock()
+    rollback = MagicMock()
+    monkeypatch.setattr(deployctl, "settle_desired", settle)
+    monkeypatch.setattr(deployctl, "_rollback_locked", rollback)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._confirm_locked(
+            {"type": "confirm", "commit": mission.commit},
+            _options(),
+        )
+
+    settle.assert_not_called()
+    rollback.assert_not_called()
+
+
+def test_confirmation_authority_distinguishes_superseding_and_same_commit_intents() -> None:
+    """Different commits supersede a mission while same-commit replacements remain obligations."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    newer = mission.generation + 1
+    desired = cast(
+        "supervise.SupervisorDesired", SimpleNamespace(commit=mission.commit, generation=newer)
+    )
+    status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is True
+
+    desired = cast(
+        "supervise.SupervisorDesired", SimpleNamespace(commit="b" * 40, generation=newer)
+    )
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is False
+
+    status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit="b" * 40,
+            applied_generation=newer,
+            ready=True,
+            holding=False,
+        ),
+    )
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is False
+
+
+def test_confirmation_rejects_unreadable_desired_before_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable desired authority fails closed without publishing confirmation intent."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: (_ for _ in ()).throw(supervise.DesiredIntentError("malformed")),
+    )
+    settle = MagicMock()
+    rollback = MagicMock()
+    monkeypatch.setattr(deployctl, "settle_desired", settle)
+    monkeypatch.setattr(deployctl, "_rollback_locked", rollback)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._confirm_locked(
+            {"type": "confirm", "commit": mission.commit},
+            _options(),
+        )
+
+    settle.assert_not_called()
+    rollback.assert_not_called()
+
+
+def test_confirmation_terminalization_rejects_newer_same_commit_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation stays pending when a newer same-commit generation wins."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    expected_generation = mission.generation + 1
+    newer_generation = expected_generation + 1
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=newer_generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=newer_generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+    written = MagicMock()
+    monkeypatch.setattr(deployctl, "_write_state", written)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._finalize_supervised_confirmation(mission, expected_generation)
+
+    written.assert_not_called()
+
+
+def test_confirmation_terminalization_accepts_exact_settled_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation succeeds only when desired and applied match settlement."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    expected_generation = mission.generation + 1
+    child = SimpleNamespace(marker="settled-child")
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=expected_generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=expected_generation,
+            ready=True,
+            holding=False,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=expected_generation,
+            ready=True,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate is child)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
+    written: list[deployctl.RollbackState] = []
+    monkeypatch.setattr(deployctl, "_write_state", written.append)
+    monkeypatch.setattr(cli, "set_current", lambda _commit: None)
+    monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
+    monkeypatch.setattr(deployctl, "append_deploy_log", lambda _message: None)
+
+    terminal = deployctl._finalize_supervised_confirmation(mission, expected_generation)
+
+    assert terminal.status == deployctl.STATUS_CONFIRMED
+    assert written == [terminal]
+
+
+def test_confirmation_terminalization_rejects_dead_settled_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation keeps a mission pending when its settled child has died."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    expected_generation = mission.generation + 1
+    child = SimpleNamespace(marker="dead-child")
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=expected_generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=expected_generation,
+            ready=True,
+            holding=False,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=expected_generation,
+            ready=True,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: False)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
+    written = MagicMock()
+    monkeypatch.setattr(deployctl, "_write_state", written)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._finalize_supervised_confirmation(mission, expected_generation)
+
+    written.assert_not_called()
+
+
+def test_rollback_terminalization_requires_live_settled_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback terminalizes only while its exact restored child is still live."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    expected_generation = mission.generation + 1
+    child = SimpleNamespace(marker="rollback-child")
+    alive = [False]
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.previous_commit, generation=expected_generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.previous_commit,
+            applied_generation=expected_generation,
+            ready=True,
+            holding=False,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: SimpleNamespace(
+            commit=mission.previous_commit,
+            applied_generation=expected_generation,
+            ready=True,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(supervise, "child_alive", lambda candidate: alive[0] and candidate is child)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
+    written: list[deployctl.RollbackState] = []
+    monkeypatch.setattr(deployctl, "_write_state", written.append)
+    monkeypatch.setattr(cli, "remove_cli_root", lambda _commit: None)
+    monkeypatch.setattr(cli, "reconcile_pointer", lambda _commit: True)
+    monkeypatch.setattr(deployctl, "append_deploy_log", lambda _message: None)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before rollback"):
+        deployctl._finalize_supervised_rollback(mission, expected_generation)
+    assert written == []
+
+    alive[0] = True
+    terminal = deployctl._finalize_supervised_rollback(mission, expected_generation)
+    assert terminal.status == deployctl.STATUS_ROLLED_BACK
+    assert written == [terminal]
+
+
+def test_confirmation_preparation_returns_settled_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preparation preserves the exact generation selected by settlement."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    settled_generation = mission.generation + 3
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    settle = MagicMock(return_value=settled_generation)
+    monkeypatch.setattr(deployctl, "settle_desired", settle)
+
+    result = deployctl._prepare_confirmation_candidate(mission, _options())
+
+    assert result == settled_generation
+    settle.assert_called_once_with(mission.commit, mission.repo, mission.uv_path)
