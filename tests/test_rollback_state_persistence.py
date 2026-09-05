@@ -36,6 +36,25 @@ def _meta(commit: str, pid: int) -> lifecycle.WorkerMeta:
     )
 
 
+def _identityless_supervisor_sentinel() -> dict[str, object]:
+    """Return the exact sentinel emitted by earlier supervisor-aware controllers."""
+    return {
+        "schema_version": lifecycle.SCHEMA_VERSION,
+        "state": lifecycle.STATE_RUNNING,
+        "pid": 0,
+        "pgid": 0,
+        "sid": 0,
+        "start_time_ticks": 0,
+        "token": None,
+        "repo": "/r",
+        "git_commit": NEW,
+        "worker_id": "",
+        "log_path": "",
+        "started_at": None,
+        "stopped_at": None,
+    }
+
+
 def _options() -> deployctl.Options:
     """Return bounded deployment options for an isolated test checkout."""
     return deployctl.Options(
@@ -188,6 +207,24 @@ def test_missing_candidate_identity_requires_explicit_supervisor_ownership(
     """Legacy or unknown ownership cannot omit the candidate process identity."""
     payload = _supervised_mission().to_dict()
     payload["supervisor_owned"] = supervisor_owned
+    with pytest.raises(deployctl.DeployCtlError, match="malformed"):
+        deployctl.RollbackState.from_dict(payload)
+
+
+def test_exact_identityless_supervisor_sentinel_normalizes_to_absent_identity() -> None:
+    """Previously persisted supervisor sentinels remain recoverable after upgrade."""
+    payload = _supervised_mission().to_dict()
+    payload["new_meta"] = _identityless_supervisor_sentinel()
+    parsed = deployctl.RollbackState.from_dict(payload)
+    assert parsed.new_meta is None
+
+
+def test_near_miss_identityless_supervisor_sentinel_fails_closed() -> None:
+    """Only the exact historical sentinel bypasses strict worker identity parsing."""
+    payload = _supervised_mission().to_dict()
+    sentinel = _identityless_supervisor_sentinel()
+    sentinel["worker_id"] = "unexpected"
+    payload["new_meta"] = sentinel
     with pytest.raises(deployctl.DeployCtlError, match="malformed"):
         deployctl.RollbackState.from_dict(payload)
 
