@@ -6,6 +6,7 @@ import signal
 import subprocess
 import time
 from dataclasses import replace
+from typing import cast
 
 import pytest
 
@@ -242,7 +243,7 @@ def _install_failing_identity(
         spawned.append(fake)
         return fake
 
-    monkeypatch.setattr(dc, "spawn_worker", fake_spawn)
+    monkeypatch.setattr(subprocess, "Popen", fake_spawn)
     return delivered
 
 
@@ -319,7 +320,7 @@ def test_repeated_retries_never_leave_a_live_worker_behind(
         occupants[fake.pid] = unproven_anchor(fake)
         return fake
 
-    monkeypatch.setattr(dc, "spawn_worker", counting_spawn)
+    monkeypatch.setattr(subprocess, "Popen", counting_spawn)
 
     results = [dc.restart_previous(retiring_state) for _ in range(3)]
 
@@ -356,7 +357,7 @@ def test_reused_occupant_between_proof_and_pin_is_never_signalled(
         spawned.append(fake)
         return fake
 
-    monkeypatch.setattr(dc, "spawn_worker", spawn)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
 
     restored = dc.restart_previous(retiring_state)
 
@@ -389,8 +390,10 @@ def test_restore_retry_reuses_durable_previous_worker_after_state_write_failure(
         spawned.append(fake)
         return fake
 
-    monkeypatch.setattr(dc, "spawn_worker", spawn)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
     monkeypatch.setattr(dc, "_wait_for_identity", lambda _proc: identity)
+    monkeypatch.setattr(dc, "_release_gate", dc._close_gate)
+    monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _meta: True)
     monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
     monkeypatch.setattr(
         dc,
@@ -399,9 +402,13 @@ def test_restore_retry_reuses_durable_previous_worker_after_state_write_failure(
     )
     monkeypatch.setattr(dc, "write_meta", published.append)
 
+    terminal_crash_pending = True
+
     def write_state(value: dc.RollbackState) -> None:
+        nonlocal terminal_crash_pending
         state_writes.append(value)
-        if len(state_writes) == 1:
+        if value.status == dc.STATUS_ROLLED_BACK and terminal_crash_pending:
+            terminal_crash_pending = False
             msg = "simulated crash after worker metadata publication"
             raise OSError(msg)
 
@@ -420,6 +427,125 @@ def test_restore_retry_reuses_durable_previous_worker_after_state_write_failure(
     assert len(spawned) == 1
     assert published == [restored, restored]
     assert state_writes[-1].status == dc.STATUS_ROLLED_BACK
+
+
+def test_released_previous_worker_is_adopted_after_metadata_publication_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A released exact worker remains durable authority before ``write_meta``."""
+    state = pending_state(previous_retiring=True)
+    fake = FakePopen(42005, mode="converges")
+    restored = replace(
+        state.previous_meta,
+        pid=fake.pid,
+        pgid=fake.pid,
+        sid=fake.pid,
+        start_time_ticks=fake.pid * 10,
+        token="restart-token",  # ruff: ignore[hardcoded-password-func-arg]
+    )
+    gated = dc.GatedWorker(
+        proc=cast("subprocess.Popen[bytes]", fake), gate_writer=99, meta=restored
+    )
+    spawned: list[dc.GatedWorker] = []
+    released: list[int] = []
+    state_writes: list[dc.RollbackState] = []
+    published: list[lifecycle.WorkerMeta] = []
+    metadata_crash_pending = True
+
+    monkeypatch.setattr(dc, "_checkout", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(dc, "read_meta_strict", lambda: None)
+    monkeypatch.setattr(dc, "worker_alive", lambda meta: meta == restored)
+    monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
+    monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _meta: True)
+
+    def spawn_gated(_state: dc.RollbackState, _previous: lifecycle.WorkerMeta) -> dc.GatedWorker:
+        spawned.append(gated)
+        return gated
+
+    monkeypatch.setattr(dc, "_spawn_gated_previous_worker", spawn_gated)
+    monkeypatch.setattr(dc, "_release_gate", released.append)
+    monkeypatch.setattr(dc, "_write_state", state_writes.append)
+
+    def write_meta(meta: lifecycle.WorkerMeta) -> None:
+        nonlocal metadata_crash_pending
+        if metadata_crash_pending:
+            metadata_crash_pending = False
+            msg = "simulated crash before worker metadata publication"
+            raise OSError(msg)
+        published.append(meta)
+
+    monkeypatch.setattr(dc, "write_meta", write_meta)
+    monkeypatch.setattr(deploy_cli, "remove_cli_root", lambda _commit: None)
+    monkeypatch.setattr(deploy_cli, "reconcile_pointer", lambda _commit: True)
+
+    with pytest.raises(OSError, match="before worker metadata publication"):
+        dc._restore_previous_locked(state)
+
+    assert spawned == [gated]
+    assert released == [gated.gate_writer]
+    assert published == []
+    recovery = state_writes[-1]
+    assert recovery.previous_restart_meta == restored
+    assert recovery.previous_restart_released is True
+
+    assert dc._restore_previous_locked(recovery)
+    assert spawned == [gated]
+    assert published == [restored]
+    terminal = state_writes[-1]
+    assert terminal.status == dc.STATUS_ROLLED_BACK
+    assert terminal.previous_restart_meta is None
+    assert terminal.previous_restart_released is False
+
+
+def test_unreleased_previous_restart_is_converged_before_another_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry retires an anchored gated worker before permitting replacement."""
+    base = pending_state(previous_retiring=True)
+    restart = replace(
+        base.previous_meta,
+        pid=42006,
+        pgid=42006,
+        sid=42006,
+        start_time_ticks=420060,
+        token="unreleased-restart-token",  # ruff: ignore[hardcoded-password-func-arg]
+    )
+    state = replace(
+        base,
+        previous_restart_meta=restart,
+        previous_restart_released=False,
+    )
+    restart_alive = True
+    events: list[tuple[str, object]] = []
+
+    monkeypatch.setattr(dc, "read_meta_strict", lambda: None)
+
+    def alive(meta: lifecycle.WorkerMeta) -> bool:
+        return restart_alive and meta == restart
+
+    def stop(meta: lifecycle.WorkerMeta, _grace: float) -> bool:
+        nonlocal restart_alive
+        assert meta == restart
+        events.append(("stop", meta))
+        restart_alive = False
+        return True
+
+    def write_state(value: dc.RollbackState) -> None:
+        events.append(("state", value))
+
+    def spawn_gated(_state: dc.RollbackState, _previous: lifecycle.WorkerMeta) -> None:
+        events.append(("spawn", _previous))
+
+    monkeypatch.setattr(dc, "worker_alive", alive)
+    monkeypatch.setattr(dc, "stop_worker", stop)
+    monkeypatch.setattr(dc, "_write_state", write_state)
+    monkeypatch.setattr(dc, "_spawn_gated_previous_worker", spawn_gated)
+
+    assert dc.restart_previous(state) is None
+    assert [kind for kind, _value in events] == ["stop", "state", "spawn"]
+    cleared = cast("dc.RollbackState", events[1][1])
+    assert cleared.previous_restart_meta is None
+    assert cleared.previous_restart_released is False
 
 
 def test_live_mismatched_durable_worker_blocks_legacy_restart(
@@ -442,7 +568,7 @@ def test_live_mismatched_durable_worker_blocks_legacy_restart(
     def forbid_spawn(*_args: object, **_kwargs: object) -> FakePopen:
         pytest.fail("mismatched live authority must block spawning")
 
-    monkeypatch.setattr(dc, "spawn_worker", forbid_spawn)
+    monkeypatch.setattr(subprocess, "Popen", forbid_spawn)
     assert dc.restart_previous(state) is None
 
 
@@ -478,8 +604,10 @@ def test_dead_durable_restored_metadata_allows_one_safe_restart(
         spawned.append(fake)
         return fake
 
-    monkeypatch.setattr(dc, "spawn_worker", spawn)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
     monkeypatch.setattr(dc, "_wait_for_identity", lambda _proc: identity)
+    monkeypatch.setattr(dc, "_release_gate", dc._close_gate)
+    monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _meta: True)
     monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
     restored = dc.restart_previous(state)
     assert restored is not None
@@ -506,7 +634,7 @@ def test_retiring_original_durable_worker_is_still_replaced(
     def failed_spawn(*_args: object, **_kwargs: object) -> FakePopen:
         raise OSError
 
-    monkeypatch.setattr(dc, "spawn_worker", failed_spawn)
+    monkeypatch.setattr(subprocess, "Popen", failed_spawn)
     assert dc.restart_previous(state) is None
     assert stopped == [original]
 
