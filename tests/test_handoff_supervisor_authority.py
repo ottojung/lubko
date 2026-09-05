@@ -1,44 +1,41 @@
-"""Prepared deployment handoffs preserve their durable ownership authority."""
+"""Handoff authority must come from durable mission ownership."""
 
 from __future__ import annotations
 
-import math
-import time
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-import lubko.deployctl as dc
+from lubko import deployctl as dc
 from lubko import lifecycle, supervise
-from lubko import supervisor as supervisor_mod
 
-COMMIT = "2" * 40
-PREVIOUS_COMMIT = "1" * 40
+COMMIT = "a" * 40
+PREVIOUS_COMMIT = "b" * 40
 
 
 def _meta(commit: str, pid: int) -> lifecycle.WorkerMeta:
-    """Return a minimal valid worker authority record."""
+    """Return a deterministic valid worker identity."""
     return lifecycle.WorkerMeta(
         schema_version=lifecycle.SCHEMA_VERSION,
         state=lifecycle.STATE_RUNNING,
         pid=pid,
         pgid=pid,
         sid=pid,
-        start_time_ticks=pid,
-        token=f"token-{pid}",
+        start_time_ticks=pid * 10,
+        token=f"{pid:032x}",
         repo="/workspace/Lubko",
         git_commit=commit,
-        worker_id="w",
-        log_path="",
+        worker_id="worker",
+        log_path="/tmp/lubko.log",
         started_at=1.0,
         stopped_at=None,
     )
 
 
 def _state(*, supervisor_owned: bool | None) -> dc.RollbackState:
-    """Return a valid pending handoff mission."""
+    """Return one pending mission with explicit durable ownership."""
     return dc.RollbackState(
         schema_version=dc.ROLLBACK_SCHEMA_VERSION,
         generation=1,
@@ -74,6 +71,7 @@ def _options() -> dc.Options:
 
 def _gated(state: dc.RollbackState) -> dc.GatedWorker:
     """Return a harmless gated-candidate test record."""
+    assert state.new_meta is not None
     return dc.GatedWorker(proc=MagicMock(), gate_writer=9, meta=state.new_meta)
 
 
@@ -96,124 +94,48 @@ def test_supervisor_owned_handoff_remains_supervised_when_daemon_is_temporarily_
         waited.append((s, window))
         return live
 
-    monkeypatch.setattr(dc, "_wait_for_supervisor_mission", wait)
+    monkeypatch.setattr(dc, "_wait_for_supervised_candidate", wait)
 
-    assert dc._complete_handoff(_options(), state, None) == live
-    assert published == [(state, 2.0)]
-    assert waited == [(state, 3.0)]
+    result = dc._complete_handoff(state, _gated(state), _options())
+
+    assert result == live
+    assert published == [(state, _options().lock_timeout_seconds)]
+    assert waited == [(state, _options().confirm_window_seconds)]
 
 
-def test_legacy_handoff_aborts_gated_candidate_if_supervisor_appears(
+def test_legacy_handoff_releases_gate_only_for_explicit_legacy_ownership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A live supervisor cannot silently adopt legacy preparation artifacts."""
+    """Only explicit legacy ownership may operate the deployctl-owned gate."""
     state = _state(supervisor_owned=False)
     gated = _gated(state)
-    aborted: list[dc.GatedWorker] = []
-    rolled_back: list[dc.RollbackState] = []
-    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
-    monkeypatch.setattr(dc, "_abort_gated_candidate", aborted.append)
+    released: list[dc.GatedWorker] = []
+    monkeypatch.setattr(dc, "_release_gate", released.append)
+    monkeypatch.setattr(dc, "_write_state", lambda _state: None)
+    monkeypatch.setattr(dc, "_fork_watchdog", lambda _timeout: None)
 
-    def rollback(s: dc.RollbackState) -> bool:
-        rolled_back.append(s)
-        return True
+    result = dc._complete_handoff(state, gated, _options())
 
-    monkeypatch.setattr(dc, "_rollback_locked", rollback)
-    monkeypatch.setattr(
-        dc,
-        "stop_worker",
-        lambda *_args: pytest.fail("legacy destructive handoff must not begin"),
-    )
-
-    with pytest.raises(dc.DeployCtlError, match="became authoritative"):
-        dc._complete_handoff(_options(), state, gated)
-
-    assert aborted == [gated]
-    assert rolled_back == [state]
+    assert result == state
+    assert released == [gated]
 
 
-def test_legacy_handoff_stays_pending_if_supervisor_takeover_cannot_roll_back(
+def test_unknown_handoff_ownership_fails_closed_without_touching_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Failed takeover convergence never crosses the legacy destructive boundary."""
-    state = _state(supervisor_owned=False)
-    gated = _gated(state)
-    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
-    monkeypatch.setattr(dc, "_abort_gated_candidate", lambda _gated: None)
-    monkeypatch.setattr(dc, "_rollback_locked", lambda _state: False)
-
-    with pytest.raises(dc.DeployCtlError, match="rollback remains pending"):
-        dc._complete_handoff(_options(), state, gated)
-
-
-def test_unknown_handoff_ownership_fails_closed_and_converges_gated_candidate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Unknown ownership is never inferred from current daemon liveness."""
+    """Unknown durable ownership cannot operate either authority path."""
     state = _state(supervisor_owned=None)
     gated = _gated(state)
-    aborted: list[dc.GatedWorker] = []
-    monkeypatch.setattr(dc, "_abort_gated_candidate", aborted.append)
     monkeypatch.setattr(
-        supervise,
-        "supervisor_running",
-        lambda: pytest.fail("unknown ownership must not be inferred from liveness"),
+        dc,
+        "_release_gate",
+        lambda _gated: pytest.fail("unknown ownership must not release legacy gate"),
+    )
+    monkeypatch.setattr(
+        dc,
+        "publish_mission",
+        lambda _state, _timeout: pytest.fail("unknown ownership must not publish supervised mission"),
     )
 
-    with pytest.raises(dc.DeployCtlError, match="unknown supervisor ownership"):
-        dc._complete_handoff(_options(), state, gated)
-
-    assert aborted == [gated]
-
-
-def test_stable_legacy_handoff_keeps_its_prepared_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Explicit legacy authority retains the ordinary gated handoff when safe."""
-    state = _state(supervisor_owned=False)
-    gated = _gated(state)
-    writes: list[dc.RollbackState] = []
-    released: list[int] = []
-    monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
-    monkeypatch.setattr(dc, "_write_state", writes.append)
-    monkeypatch.setattr(dc, "stop_worker", lambda *_args: True)
-    monkeypatch.setattr(dc, "_release_gate", released.append)
-    monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _meta: True)
-    monkeypatch.setattr(time, "time", lambda: 50.0)
-
-    live = dc._complete_handoff(_options(), state, gated)
-
-    assert live.previous_retiring is True
-    assert math.isclose(live.deadline, 53.0)
-    assert released == [9]
-    assert writes == [replace(state, previous_retiring=True), live]
-
-
-def test_supervisor_never_adopts_explicit_legacy_pending_mission() -> None:
-    """A durable legacy mission cannot become supervisor authority at startup."""
-    daemon = supervisor_mod.SupervisorDaemon(supervisor_mod.Settings())
-    mission = _state(supervisor_owned=False)
-
-    assert daemon._derive_with_mission(mission, 0, None) == ("hold", None)
-    assert daemon._message == (
-        "pending deployment mission is not supervisor-owned; holding without a worker"
-    )
-
-
-def test_supervisor_fails_closed_on_unknown_pending_mission_ownership() -> None:
-    """Unknown durable ownership cannot be inferred as supervisor authority."""
-    daemon = supervisor_mod.SupervisorDaemon(supervisor_mod.Settings())
-    mission = _state(supervisor_owned=None)
-
-    assert daemon._derive_with_mission(mission, 0, None) == ("hold", None)
-
-
-def test_newer_desired_intent_can_supersede_legacy_pending_mission() -> None:
-    """A strictly newer explicit desired generation still owns reconciliation."""
-    daemon = supervisor_mod.SupervisorDaemon(supervisor_mod.Settings())
-    mission = _state(supervisor_owned=False)
-
-    assert daemon._derive_with_mission(mission, 2, PREVIOUS_COMMIT) == (
-        "run",
-        PREVIOUS_COMMIT,
-    )
+    with pytest.raises(dc.DeployCtlError, match="ownership"):
+        dc._complete_handoff(state, gated, _options())
