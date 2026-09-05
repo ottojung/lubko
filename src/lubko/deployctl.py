@@ -620,6 +620,7 @@ def _supervised_terminalization_authority_matches(
         supervisor_state.commit == expected_commit
         and supervisor_state.applied_generation == expected_generation
         and supervisor_state.ready
+        and not supervise.is_holding(supervisor_state)
         and supervisor_state.child == status.child
         and supervise.child_alive(status.child)
     )

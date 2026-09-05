@@ -1078,6 +1078,7 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None
         ),
     )
     monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate is child)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
     monkeypatch.setattr(cli, "set_current", lambda _c: None)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _c: None)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
@@ -1367,6 +1368,7 @@ def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> Non
         ),
     )
     monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate is child)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
     monkeypatch.setattr(cli, "remove_cli_root", lambda _c: None)
     monkeypatch.setattr(cli, "reconcile_pointer", lambda _c: True)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
@@ -1684,6 +1686,7 @@ def test_confirmation_terminalization_accepts_exact_settled_generation(
         ),
     )
     monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate is child)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
     written: list[deployctl.RollbackState] = []
     monkeypatch.setattr(deployctl, "_write_state", written.append)
     monkeypatch.setattr(cli, "set_current", lambda _commit: None)
@@ -1731,6 +1734,7 @@ def test_confirmation_terminalization_rejects_dead_settled_child(
         ),
     )
     monkeypatch.setattr(supervise, "child_alive", lambda _child: False)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
     written = MagicMock()
     monkeypatch.setattr(deployctl, "_write_state", written)
 
@@ -1776,6 +1780,7 @@ def test_rollback_terminalization_requires_live_settled_child(
         ),
     )
     monkeypatch.setattr(supervise, "child_alive", lambda candidate: alive[0] and candidate is child)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
     written: list[deployctl.RollbackState] = []
     monkeypatch.setattr(deployctl, "_write_state", written.append)
     monkeypatch.setattr(cli, "remove_cli_root", lambda _commit: None)
