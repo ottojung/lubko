@@ -23,7 +23,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 if TYPE_CHECKING:
@@ -1448,6 +1448,7 @@ def test_confirmation_rejects_newer_unapplied_different_commit(
     other_commit = "b" * 40
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
     monkeypatch.setattr(
         supervise,
         "read_desired_strict",
@@ -1482,25 +1483,35 @@ def test_confirmation_authority_distinguishes_superseding_and_same_commit_intent
     """Different commits supersede a mission while same-commit replacements remain obligations."""
     mission = _make_mission(deployctl.STATUS_PENDING)
     newer = mission.generation + 1
-    desired = SimpleNamespace(commit=mission.commit, generation=newer)
-    status = SimpleNamespace(
-        commit=mission.commit,
-        applied_generation=mission.generation,
-        ready=True,
-        holding=False,
+    desired = cast(
+        "supervise.SupervisorDesired", SimpleNamespace(commit=mission.commit, generation=newer)
     )
-    assert deployctl._supervised_mission_authority_matches(mission, desired, status) is True
-
-    desired = SimpleNamespace(commit="b" * 40, generation=newer)
-    assert deployctl._supervised_mission_authority_matches(mission, desired, status) is False
-
-    status = SimpleNamespace(
-        commit="b" * 40,
-        applied_generation=newer,
-        ready=True,
-        holding=False,
+    status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
     )
-    assert deployctl._supervised_mission_authority_matches(mission, desired, status) is False
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is True
+
+    desired = cast(
+        "supervise.SupervisorDesired", SimpleNamespace(commit="b" * 40, generation=newer)
+    )
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is False
+
+    status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit="b" * 40,
+            applied_generation=newer,
+            ready=True,
+            holding=False,
+        ),
+    )
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is False
 
 
 def test_confirmation_rejects_unreadable_desired_before_settlement(
@@ -1510,6 +1521,7 @@ def test_confirmation_rejects_unreadable_desired_before_settlement(
     mission = _make_mission(deployctl.STATUS_PENDING)
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", lambda _s: False)
     monkeypatch.setattr(
         supervise,
         "read_desired_strict",
