@@ -141,6 +141,11 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
 
     candidate = _meta(NEW, 2)
     lifecycle.write_meta(candidate)
+    assert candidate.pid is not None
+    assert candidate.pgid is not None
+    assert candidate.sid is not None
+    assert candidate.start_time_ticks is not None
+    assert candidate.worker_id is not None
     child = supervise.WorkerChild(
         pid=candidate.pid,
         pgid=candidate.pgid,
