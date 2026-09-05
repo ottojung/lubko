@@ -538,8 +538,15 @@ def _supervised_mission_authoritative(state: RollbackState) -> bool:
     )
 
 
+def _require_known_confirmation_ownership(state: RollbackState) -> None:
+    """Require an explicit durable owner before confirmation can advance."""
+    if state.supervisor_owned is None:
+        raise DeployCtlError("confirmation authority is unknown; deployment remains pending")
+
+
 def _require_confirmation_authority(state: RollbackState) -> None:
     """Fail closed when supervised confirmation no longer owns durable authority."""
+    _require_known_confirmation_ownership(state)
     if state.supervisor_owned is False or not supervise.supervisor_running():
         return
     try:
@@ -2258,6 +2265,7 @@ def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> N
     Raises:
         DeployCtlError: If the legacy CLI environment cannot be prepared.
     """
+    _require_known_confirmation_ownership(state)
     if state.supervisor_owned is False:
         try:
             cli.build_cli_root(
@@ -2292,7 +2300,8 @@ def _finalize_confirmation(state: RollbackState) -> RollbackState:
     Returns:
         Terminal confirmed mission state.
     """
-    if state.supervisor_owned is not False:
+    _require_known_confirmation_ownership(state)
+    if state.supervisor_owned is True:
         if not supervise.supervisor_running():
             msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
             raise DeployCtlError(msg)
