@@ -319,6 +319,78 @@ def test_newer_generation_same_commit_authority_fails_closed(
     assert settlement == {OLD_COMMIT: 1}
 
 
+def test_newer_generation_same_commit_compatible_authority_stays_pending(
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compatible newer same-commit lifecycle generation does not trigger rollback."""
+    del cli_stubs, status_env
+    generation = GENERATION + 1
+    live_supervisor[0] = replace(live_supervisor[0], applied_generation=generation)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=NEW_COMMIT, generation=generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=generation,
+            commit=NEW_COMMIT,
+            ready=True,
+            holding=False,
+        ),
+    )
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "await-confirmation"
+    assert settlement == {}
+    current = dc._read_state()
+    assert current is not None
+    assert current.status == dc.STATUS_PENDING
+
+
+def test_newer_generation_same_commit_restart_backoff_stays_pending(
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compatible same-commit restart backoff remains retryable before deadline."""
+    del cli_stubs, status_env
+    generation = GENERATION + 1
+    live_supervisor[0] = replace(live_supervisor[0], applied_generation=generation, child=None)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=NEW_COMMIT, generation=generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=generation,
+            commit=NEW_COMMIT,
+            ready=False,
+            holding=False,
+        ),
+    )
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "await-confirmation"
+    assert settlement == {}
+    current = dc._read_state()
+    assert current is not None
+    assert current.status == dc.STATUS_PENDING
+
+
 def test_wait_until_ready_polls_through_transient_child_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

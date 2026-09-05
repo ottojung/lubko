@@ -591,11 +591,25 @@ def _supervised_confirmation_authority_matches(
 
 
 def _supervised_mission_authoritative(state: RollbackState) -> bool:
-    """Return whether durable supervisor authority still belongs to this mission."""
+    """Return whether durable supervisor authority remains compatible with this mission.
+
+    Pending confirmation may legitimately coexist with a newer same-commit
+    restart or migration generation. Treat that lifecycle obligation as
+    compatible while the mission is pending, but fail closed on unreadable,
+    missing, contradictory, or different-commit authority. Terminalization
+    still binds to the exact settled generation separately.
+    """
     supervisor_state = supervise.read_state()
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        return False
+    status = supervise.read_status()
     return (
-        supervisor_state.commit == state.commit
-        and supervisor_state.applied_generation == state.generation
+        status is not None
+        and supervisor_state.commit == status.commit
+        and supervisor_state.applied_generation == status.applied_generation
+        and _supervised_confirmation_authority_matches(state, desired, status)
     )
 
 
