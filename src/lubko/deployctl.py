@@ -2224,6 +2224,7 @@ def _confirmation_state(request: dict[str, object]) -> RollbackState:
         return state
     if state.status != STATUS_PENDING:
         raise DeployCtlError("no checkout is pending confirmation")
+    _require_known_confirmation_ownership(state)
     if _pending_mission_rollback_due(state):
         raise DeployCtlError(_confirmation_rollback_error(state, "confirmation window lapsed"))
     if request.get("commit") != state.commit:

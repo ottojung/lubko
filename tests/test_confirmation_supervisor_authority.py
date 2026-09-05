@@ -105,6 +105,7 @@ def test_unknown_confirmation_ownership_fails_closed_before_liveness_or_mutation
     def unexpected(*_args: object, **_kwargs: object) -> None:
         pytest.fail("unknown ownership must fail before liveness or state mutation")
 
+    monkeypatch.setattr(dc, "_read_state", lambda: state)
     monkeypatch.setattr(supervise, "supervisor_running", unexpected)
     monkeypatch.setattr(dc, "settle_desired", unexpected)
     monkeypatch.setattr(cli, "build_cli_root", unexpected)
@@ -113,6 +114,7 @@ def test_unknown_confirmation_ownership_fails_closed_before_liveness_or_mutation
     monkeypatch.setattr(cli, "set_current", unexpected)
 
     operations = (
+        lambda: dc._confirmation_state({"commit": COMMIT}),
         lambda: dc._require_confirmation_authority(state),
         lambda: dc._prepare_confirmation_candidate(state, _options()),
         lambda: dc._finalize_confirmation(state),
