@@ -662,7 +662,17 @@ def _pending_mission_rollback_due(state: RollbackState) -> bool:
         return True
     if not _supervised_mission_authoritative(state):
         return True
-    return time.time() >= state.deadline and not _supervised_mission_active(state)
+    if time.time() < state.deadline:
+        return False
+    status = supervise.read_status()
+    return (
+        status is None
+        or status.commit != state.commit
+        or status.applied_generation < state.generation
+        or status.ready is not True
+        or status.holding
+        or not _supervised_mission_active(state)
+    )
 
 
 def settle_desired(commit: str, repo: str, uv_path: str) -> int:
