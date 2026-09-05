@@ -1964,7 +1964,10 @@ def _cleanup_pending_locked() -> None:
         return
     if state.status != STATUS_PENDING:
         raise DeployCtlError(f"unknown supervised deployment status {state.status!r}")
-    if _mission_candidate_alive(state) and time.time() < state.deadline:
+    if state.supervisor_owned is not False:
+        if not _pending_mission_rollback_due(state):
+            raise DeployCtlError("another supervised checkout is still pending confirmation")
+    elif _mission_candidate_alive(state) and time.time() < state.deadline:
         raise DeployCtlError("another supervised checkout is still pending confirmation")
     if not _rollback_locked(state):
         raise DeployCtlError("an unresolved rollback is still pending")
