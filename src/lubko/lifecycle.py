@@ -1946,7 +1946,11 @@ def _restore_after_handoff_failure(
         return
     restored = supervise.wait_for_generation(
         settle, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS
-    ) and supervise.wait_until_ready(settle, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS)
+    ) and supervise.wait_until_ready(
+        settle,
+        supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        commit=previous.git_commit,
+    )
     if restored and cli.reconcile_pointer(previous.git_commit):
         append_deploy_log(
             "queue deploy failed after durable success; supervisor restored previous commit "
