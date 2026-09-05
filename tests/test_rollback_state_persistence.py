@@ -194,6 +194,7 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
         )
     )
     monkeypatch.setattr(supervise, "child_alive", lambda _child: True)
+    monkeypatch.setattr(supervise, "is_holding", lambda _state: False)
 
     after_child = deployctl.read_rollback_state()
     assert after_child is not None
@@ -210,6 +211,7 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
             commit=NEW,
             ready=True,
             holding=False,
+            child=child,
         ),
     )
     monkeypatch.setattr(cli, "set_current", lambda _commit: None)
