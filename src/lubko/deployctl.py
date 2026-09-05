@@ -590,6 +590,41 @@ def _supervised_confirmation_authority_matches(
     )
 
 
+def _supervised_terminalization_authority_matches(
+    expected_commit: str,
+    expected_generation: int,
+    desired: supervise.SupervisorDesired | None,
+    status: supervise.SupervisorStatus | None,
+) -> bool:
+    """Return whether terminalization still owns one live queue-ready worker.
+
+    The status snapshot alone is not a synchronous liveness proof: the child can
+    exit after readiness was published but before deployctl acquires the
+    generation lock. Bind the exact settled desired/status generation to the
+    supervisor's durable child identity and re-prove that child alive before a
+    pending mission may become terminal.
+    """
+    if desired is None or status is None:
+        return False
+    if (
+        desired.commit != expected_commit
+        or desired.generation != expected_generation
+        or status.commit != expected_commit
+        or status.applied_generation != expected_generation
+    ):
+        return False
+    if status.ready is not True or status.holding or status.child is None:
+        return False
+    supervisor_state = supervise.read_state()
+    return (
+        supervisor_state.commit == expected_commit
+        and supervisor_state.applied_generation == expected_generation
+        and supervisor_state.ready
+        and supervisor_state.child == status.child
+        and supervise.child_alive(status.child)
+    )
+
+
 def _supervised_mission_authoritative(state: RollbackState) -> bool:
     """Return whether durable supervisor authority remains compatible with this mission.
 
@@ -1637,26 +1672,8 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
                 "cannot roll back while supervisor desired authority is unreadable"
             ) from exc
         status = supervise.read_status()
-        if desired is None or status is None:
-            raise DeployCtlError(
-                "the supervisor readiness proof was superseded before rollback; "
-                "deployment remains pending"
-            )
-        if (
-            (
-                desired.commit,
-                status.commit,
-                desired.generation,
-                status.applied_generation,
-            )
-            != (
-                state.previous_commit,
-                state.previous_commit,
-                expected_generation,
-                expected_generation,
-            )
-            or status.ready is not True
-            or status.holding
+        if not _supervised_terminalization_authority_matches(
+            state.previous_commit, expected_generation, desired, status
         ):
             raise DeployCtlError(
                 "the supervisor readiness proof was superseded before rollback; "
@@ -1700,21 +1717,8 @@ def _finalize_supervised_confirmation(
                 "cannot confirm while supervisor desired authority is unreadable"
             ) from exc
         status = supervise.read_status()
-        if not _supervised_confirmation_authority_matches(state, desired, status):
-            raise DeployCtlError(
-                "the supervisor readiness proof was superseded before confirmation; "
-                "deployment remains pending"
-            )
-        if desired is None or status is None:
-            raise DeployCtlError(
-                "the supervisor readiness proof was superseded before confirmation; "
-                "deployment remains pending"
-            )
-        if (
-            desired.generation != expected_generation
-            or status.applied_generation != expected_generation
-            or status.ready is not True
-            or status.holding
+        if not _supervised_terminalization_authority_matches(
+            state.commit, expected_generation, desired, status
         ):
             raise DeployCtlError(
                 "the supervisor readiness proof was superseded before confirmation; "

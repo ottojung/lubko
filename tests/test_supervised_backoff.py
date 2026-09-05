@@ -181,7 +181,10 @@ def live_supervisor(monkeypatch: pytest.MonkeyPatch) -> list[supervise.Superviso
 
 
 @pytest.fixture
-def settlement(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+def settlement(
+    monkeypatch: pytest.MonkeyPatch,
+    live_supervisor: list[supervise.SupervisorState],
+) -> dict[str, int]:
     """Record supervised settlements instead of talking to a real daemon.
 
     Returns:
@@ -195,6 +198,16 @@ def settlement(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         recorded[commit] = recorded.get(commit, 0) + 1
         settled["commit"] = commit
         settled["generation"] = generation
+        child = _live_candidate()
+        live_supervisor[0] = replace(
+            live_supervisor[0],
+            commit=commit,
+            applied_generation=generation,
+            child=child,
+            ready=True,
+            next_attempt_at=None,
+        )
+        monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate == child)
         return generation
 
     monkeypatch.setattr(dc, "settle_desired", record)
@@ -212,6 +225,7 @@ def settlement(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
             commit=settled["commit"],
             ready=True,
             holding=False,
+            child=live_supervisor[0].child,
         ),
     )
     return recorded
@@ -305,6 +319,7 @@ def test_expired_deadline_rolls_back_live_but_not_ready_candidate(
             commit=OLD_COMMIT if rolled_back else NEW_COMMIT,
             ready=rolled_back,
             holding=False,
+            child=live_supervisor[0].child,
         )
 
     monkeypatch.setattr(supervise, "read_status", status)
@@ -347,6 +362,7 @@ def test_expired_deadline_rolls_back_compatible_newer_live_but_not_ready_candida
             commit=OLD_COMMIT if rolled_back else NEW_COMMIT,
             ready=rolled_back,
             holding=False,
+            child=live_supervisor[0].child,
         )
 
     monkeypatch.setattr(supervise, "read_desired_strict", desired)

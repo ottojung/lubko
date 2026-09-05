@@ -210,6 +210,7 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
             commit=NEW,
             ready=True,
             holding=False,
+            child=child,
         ),
     )
     monkeypatch.setattr(cli, "set_current", lambda _commit: None)
