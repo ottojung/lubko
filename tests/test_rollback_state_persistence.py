@@ -183,7 +183,7 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
 
 @pytest.mark.parametrize("supervisor_owned", [False, None])
 def test_missing_candidate_identity_requires_explicit_supervisor_ownership(
-    supervisor_owned: bool | None,
+    supervisor_owned: object,
 ) -> None:
     """Legacy or unknown ownership cannot omit the candidate process identity."""
     payload = _supervised_mission().to_dict()
