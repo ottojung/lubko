@@ -1,0 +1,163 @@
+name: issue-634-patch
+
+on:
+  push:
+    branches:
+      - issue-634-rollback-state
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: issue-634-rollback-state
+      - name: Apply production patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/lubko/deployctl.py")
+          text = path.read_text()
+
+          def once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected one match, got {count}: {old[:80]!r}")
+              text = text.replace(old, new, 1)
+
+          once("    new_meta: WorkerMeta\n", "    new_meta: WorkerMeta | None\n")
+          once(
+              '            "new_meta": self.new_meta.to_dict(),\n',
+              '            "new_meta": None if self.new_meta is None else self.new_meta.to_dict(),\n',
+          )
+          once(
+              '            previous = data["previous_meta"]\n'
+              '            replacement = data["new_meta"]\n'
+              '            if not isinstance(previous, dict) or not isinstance(replacement, dict):\n'
+              '                raise TypeError\n',
+              '            previous = data["previous_meta"]\n'
+              '            replacement = data["new_meta"]\n'
+              '            if not isinstance(previous, dict):\n'
+              '                raise TypeError\n'
+              '            supervisor_owned = _optional_json_bool(data.get("supervisor_owned"))\n',
+          )
+          once(
+              '            commit = _required_commit(data["commit"])\n'
+              '            previous_commit = _required_commit(data["previous_commit"])\n'
+              '            return cls(\n',
+              '            commit = _required_commit(data["commit"])\n'
+              '            previous_commit = _required_commit(data["previous_commit"])\n'
+              '            repo = _required_json_string(data["repo"])\n'
+              '            if replacement is None:\n'
+              '                if supervisor_owned is not True:\n'
+              '                    raise TypeError\n'
+              '                replacement_meta = None\n'
+              '            elif isinstance(replacement, dict):\n'
+              '                try:\n'
+              '                    replacement_meta = WorkerMeta.from_dict(replacement)\n'
+              '                except (TypeError, ValueError):\n'
+              '                    if supervisor_owned is not True or not _legacy_supervisor_placeholder(\n'
+              '                        replacement, commit=commit, repo=repo\n'
+              '                    ):\n'
+              '                        raise\n'
+              '                    replacement_meta = None\n'
+              '            else:\n'
+              '                raise TypeError\n'
+              '            return cls(\n',
+          )
+          once('                repo=_required_json_string(data["repo"]),\n', '                repo=repo,\n')
+          once(
+              '                previous_meta=WorkerMeta.from_dict(previous),\n'
+              '                new_meta=WorkerMeta.from_dict(replacement),\n'
+              '                supervisor_owned=_optional_json_bool(data.get("supervisor_owned")),\n',
+              '                previous_meta=WorkerMeta.from_dict(previous),\n'
+              '                new_meta=replacement_meta,\n'
+              '                supervisor_owned=supervisor_owned,\n',
+          )
+
+          start = text.index("def _placeholder_meta(")
+          end = text.index("def _supervised_mission_active(", start)
+          text = text[:start] + text[end:]
+
+          insert_at = text.index("\ndef _supervised_mission_active(")
+          helper = '''\n\ndef _legacy_supervisor_placeholder(\n    data: dict[str, object], *, commit: str, repo: str\n) -> bool:\n    \"\"\"Recognize the exact identity-less sentinel emitted by older controllers.\"\"\"\n    return data == {\n        \"schema_version\": SCHEMA_VERSION,\n        \"state\": STATE_RUNNING,\n        \"pid\": 0,\n        \"pgid\": 0,\n        \"sid\": 0,\n        \"start_time_ticks\": 0,\n        \"token\": None,\n        \"repo\": repo,\n        \"git_commit\": commit,\n        \"worker_id\": \"\",\n        \"log_path\": \"\",\n        \"started_at\": None,\n        \"stopped_at\": None,\n    }\n'''
+          text = text[:insert_at] + helper + text[insert_at:]
+
+          once(
+              "        return worker_alive(state.new_meta)\n",
+              "        return state.new_meta is not None and worker_alive(state.new_meta)\n",
+          )
+          once(
+              "        return time.time() >= state.deadline or not worker_alive(state.new_meta)\n",
+              "        return (\n"
+              "            state.new_meta is None\n"
+              "            or time.time() >= state.deadline\n"
+              "            or not worker_alive(state.new_meta)\n"
+              "        )\n",
+          )
+          once(
+              '        "worker_pid": None if (state.new_meta.pid or 0) <= 0 else state.new_meta.pid,\n',
+              '        "worker_pid": (\n'
+              '            None if state.new_meta is None or (state.new_meta.pid or 0) <= 0 else state.new_meta.pid\n'
+              '        ),\n',
+          )
+          once(
+              "    if not stop_worker(state.new_meta, state.stop_grace_seconds):\n",
+              '    if state.new_meta is None:\n'
+              '        append_deploy_log("legacy rollback is missing candidate identity metadata")\n'
+              '        return False\n'
+              '    if not stop_worker(state.new_meta, state.stop_grace_seconds):\n',
+          )
+          once(
+              "            should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)\n",
+              "            should_rollback = (\n"
+              "                state.new_meta is None\n"
+              "                or time.time() >= state.deadline\n"
+              "                or not worker_alive(state.new_meta)\n"
+              "            )\n",
+          )
+          once(
+              ") -> tuple[GatedWorker | None, WorkerMeta]:\n",
+              ") -> tuple[GatedWorker | None, WorkerMeta | None]:\n",
+          )
+          once(
+              "    With a live external supervisor the candidate is owned by the daemon, so a\n"
+              "    never-alive placeholder is recorded; otherwise deployctl spawns the gated\n"
+              "    candidate (one-time bootstrap / emergency path).\n",
+              "    With a live external supervisor the candidate identity is owned by the daemon\n"
+              "    and is not duplicated in rollback state; otherwise deployctl spawns the gated\n"
+              "    candidate (one-time bootstrap / emergency path).\n",
+          )
+          once(
+              "    if supervised:\n        return None, _placeholder_meta(commit, str(options.repo))\n",
+              "    if supervised:\n        return None, None\n",
+          )
+          once(
+              "        write_meta(state.new_meta)\n        return\n",
+              '        if state.new_meta is None:\n'
+              '            msg = _confirmation_rollback_error(\n'
+              '                state, "legacy deployment is missing candidate identity metadata"\n'
+              '            )\n'
+              '            raise DeployCtlError(msg)\n'
+              '        write_meta(state.new_meta)\n'
+              '        return\n',
+          )
+
+          path.write_text(text)
+          PY
+          uv run ruff format src/lubko/deployctl.py
+          uv run ruff check src/lubko/deployctl.py
+          uv run mypy src/lubko/deployctl.py
+          git diff --check
+      - name: Commit production patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/lubko/deployctl.py
+          git commit -m "fix: make supervised rollback state self-readable"
+          git push origin HEAD:issue-634-rollback-state
