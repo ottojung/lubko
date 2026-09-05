@@ -92,7 +92,7 @@ jobs:
           text = text[:start] + text[end:]
 
           insert_at = text.index("\ndef _supervised_mission_active(")
-          helper = '''\n\ndef _legacy_supervisor_placeholder(\n    data: dict[str, object], *, commit: str, repo: str\n) -> bool:\n    \"\"\"Recognize the exact identity-less sentinel emitted by older controllers.\"\"\"\n    return data == {\n        \"schema_version\": SCHEMA_VERSION,\n        \"state\": STATE_RUNNING,\n        \"pid\": 0,\n        \"pgid\": 0,\n        \"sid\": 0,\n        \"start_time_ticks\": 0,\n        \"token\": None,\n        \"repo\": repo,\n        \"git_commit\": commit,\n        \"worker_id\": \"\",\n        \"log_path\": \"\",\n        \"started_at\": None,\n        \"stopped_at\": None,\n    }\n'''
+          helper = '''\n\ndef _legacy_supervisor_placeholder(\n    data: dict[str, object], *, commit: str, repo: str\n) -> bool:\n    \"\"\"Recognize the exact identity-less sentinel emitted by older controllers.\n\n    Returns:\n        Whether the mapping is the historical supervisor-owned sentinel.\n    \"\"\"\n    return data == {\n        \"schema_version\": SCHEMA_VERSION,\n        \"state\": STATE_RUNNING,\n        \"pid\": 0,\n        \"pgid\": 0,\n        \"sid\": 0,\n        \"start_time_ticks\": 0,\n        \"token\": None,\n        \"repo\": repo,\n        \"git_commit\": commit,\n        \"worker_id\": \"\",\n        \"log_path\": \"\",\n        \"started_at\": None,\n        \"stopped_at\": None,\n    }\n'''
           text = text[:insert_at] + helper + text[insert_at:]
 
           once(
