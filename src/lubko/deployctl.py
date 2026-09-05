@@ -136,7 +136,7 @@ class RollbackState:
     git_timeout_seconds: float
     previous_retiring: bool
     previous_meta: WorkerMeta
-    new_meta: WorkerMeta
+    new_meta: WorkerMeta | None
     supervisor_owned: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -158,7 +158,7 @@ class RollbackState:
             "git_timeout_seconds": self.git_timeout_seconds,
             "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
-            "new_meta": self.new_meta.to_dict(),
+            "new_meta": None if self.new_meta is None else self.new_meta.to_dict(),
             "supervisor_owned": self.supervisor_owned,
         }
         return result
@@ -179,8 +179,9 @@ class RollbackState:
         try:
             previous = data["previous_meta"]
             replacement = data["new_meta"]
-            if not isinstance(previous, dict) or not isinstance(replacement, dict):
+            if not isinstance(previous, dict):
                 raise TypeError
+            supervisor_owned = _optional_json_bool(data.get("supervisor_owned"))
             # The generation is recovery authority: it must be a genuine positive
             # JSON integer. Booleans, numeric/string/numeric-float values, and
             # zero or negative numbers are corruption; they must never silently
@@ -199,6 +200,22 @@ class RollbackState:
                 raise ValueError
             commit = _required_commit(data["commit"])
             previous_commit = _required_commit(data["previous_commit"])
+            repo = _required_json_string(data["repo"])
+            if replacement is None:
+                if supervisor_owned is not True:
+                    raise TypeError
+                replacement_meta = None
+            elif isinstance(replacement, dict):
+                try:
+                    replacement_meta = WorkerMeta.from_dict(replacement)
+                except (TypeError, ValueError):
+                    if supervisor_owned is not True or not _legacy_supervisor_placeholder(
+                        replacement, commit=commit, repo=repo
+                    ):
+                        raise
+                    replacement_meta = None
+            else:
+                raise TypeError
             return cls(
                 schema_version=schema_version,
                 generation=generation,
@@ -206,7 +223,7 @@ class RollbackState:
                 commit=commit,
                 previous_commit=previous_commit,
                 deadline=_required_nonnegative_finite_json_number(data["deadline"]),
-                repo=_required_json_string(data["repo"]),
+                repo=repo,
                 uv_path=_required_json_string(data["uv_path"]),
                 stop_grace_seconds=_required_positive_finite_json_number(
                     data["stop_grace_seconds"]
@@ -216,8 +233,8 @@ class RollbackState:
                 ),
                 previous_retiring=_retiring_flag(data.get("previous_retiring", _ABSENT)),
                 previous_meta=WorkerMeta.from_dict(previous),
-                new_meta=WorkerMeta.from_dict(replacement),
-                supervisor_owned=_optional_json_bool(data.get("supervisor_owned")),
+                new_meta=replacement_meta,
+                supervisor_owned=supervisor_owned,
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervised deployment state is malformed"
@@ -422,38 +439,27 @@ def next_mission_generation() -> int:
             raise DeployCtlError(str(exc)) from exc
 
 
-def _placeholder_meta(commit: str, repo: str) -> WorkerMeta:
-    """Return an identity-less candidate record for a supervisor-owned mission.
-
-    When the external supervisor is live, the candidate process is spawned by
-    the daemon, not by deployctl, so deployctl never knows the candidate
-    identity at mission-publication time. The placeholder is recorded for
-    schema completeness and is deliberately never alive, so nothing in
-    deployctl can treat it as a real process; liveness is observed through the
-    supervisor's own durable state instead.
-
-    Args:
-        commit: Exact candidate commit.
-        repo: Maintained checkout the candidate belongs to.
+def _legacy_supervisor_placeholder(data: dict[str, object], *, commit: str, repo: str) -> bool:
+    """Recognize the exact identity-less sentinel emitted by older controllers.
 
     Returns:
-        A non-alive worker metadata record for the mission file.
+        Whether the mapping is the historical supervisor-owned sentinel.
     """
-    return WorkerMeta(
-        schema_version=SCHEMA_VERSION,
-        state=STATE_RUNNING,
-        pid=0,
-        pgid=0,
-        sid=0,
-        start_time_ticks=0,
-        token=None,
-        repo=repo,
-        git_commit=commit,
-        worker_id="",
-        log_path="",
-        started_at=None,
-        stopped_at=None,
-    )
+    return data == {
+        "schema_version": SCHEMA_VERSION,
+        "state": STATE_RUNNING,
+        "pid": 0,
+        "pgid": 0,
+        "sid": 0,
+        "start_time_ticks": 0,
+        "token": None,
+        "repo": repo,
+        "git_commit": commit,
+        "worker_id": "",
+        "log_path": "",
+        "started_at": None,
+        "stopped_at": None,
+    }
 
 
 def _supervised_mission_active(state: RollbackState) -> bool:
@@ -495,7 +501,7 @@ def _mission_candidate_alive(state: RollbackState) -> bool:
         ``True`` when the candidate consumer is currently live.
     """
     if state.supervisor_owned is False:
-        return worker_alive(state.new_meta)
+        return state.new_meta is not None and worker_alive(state.new_meta)
     if not supervise.supervisor_running():
         return False
     return _supervised_mission_active(state)
@@ -533,7 +539,11 @@ def _pending_mission_rollback_due(state: RollbackState) -> bool:
         ``True`` when the mission must roll back now.
     """
     if state.supervisor_owned is False:
-        return time.time() >= state.deadline or not worker_alive(state.new_meta)
+        return (
+            state.new_meta is None
+            or time.time() >= state.deadline
+            or not worker_alive(state.new_meta)
+        )
     if not supervise.supervisor_running():
         return True
     if not _supervised_mission_authoritative(state):
@@ -925,7 +935,9 @@ def _candidate_response(state: RollbackState) -> dict[str, object]:
         "ok": True,
         "phase": "pending",
         "commit": state.commit,
-        "worker_pid": None if (state.new_meta.pid or 0) <= 0 else state.new_meta.pid,
+        "worker_pid": (
+            None if state.new_meta is None or (state.new_meta.pid or 0) <= 0 else state.new_meta.pid
+        ),
         "deadline": state.deadline,
     }
 
@@ -1286,6 +1298,9 @@ def _retire_candidate_locked(state: RollbackState) -> bool:
     Returns:
         ``True`` only when the candidate worker is proven dead.
     """
+    if state.new_meta is None:
+        append_deploy_log("legacy rollback is missing candidate identity metadata")
+        return False
     if not stop_worker(state.new_meta, state.stop_grace_seconds):
         append_deploy_log("supervised rollback could not stop the candidate worker")
         return False
@@ -1509,7 +1524,11 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
         if state is None or state.status in {STATUS_CONFIRMED, STATUS_ROLLED_BACK}:
             return
         if state.supervisor_owned is False:
-            should_rollback = time.time() >= state.deadline or not worker_alive(state.new_meta)
+            should_rollback = (
+                state.new_meta is None
+                or time.time() >= state.deadline
+                or not worker_alive(state.new_meta)
+            )
         elif supervise.supervisor_running():
             # While the supervisor is present, candidate liveness is a separate
             # observation: only roll back after the deadline AND the exact child
@@ -1797,11 +1816,11 @@ def _candidate_identity(
     commit: str,
     *,
     supervised: bool,
-) -> tuple[GatedWorker | None, WorkerMeta]:
+) -> tuple[GatedWorker | None, WorkerMeta | None]:
     """Produce the candidate identity record for a prepared mission.
 
-    With a live external supervisor the candidate is owned by the daemon, so a
-    never-alive placeholder is recorded; otherwise deployctl spawns the gated
+    With a live external supervisor the candidate identity is owned by the daemon
+    and is not duplicated in rollback state; otherwise deployctl spawns the gated
     candidate (one-time bootstrap / emergency path).
 
     Args:
@@ -1813,7 +1832,7 @@ def _candidate_identity(
         The ``(gated, new_meta)`` pair.
     """
     if supervised:
-        return None, _placeholder_meta(commit, str(options.repo))
+        return None, None
     gated = _spawn_gated_candidate(options, commit)
     return gated, gated.meta
 
@@ -2200,6 +2219,11 @@ def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> N
                 state, f"confirmed CLI environment could not be prepared: {exc}"
             )
             raise DeployCtlError(msg) from exc
+        if state.new_meta is None:
+            msg = _confirmation_rollback_error(
+                state, "legacy deployment is missing candidate identity metadata"
+            )
+            raise DeployCtlError(msg)
         write_meta(state.new_meta)
         return
     if not supervise.supervisor_running():
