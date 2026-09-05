@@ -214,6 +214,37 @@ def test_explicit_legacy_rollback_ignores_live_supervisor(
     assert steps == ["retire", "restore"]
 
 
+@pytest.mark.parametrize("supervisor_live", [False, True])
+def test_unknown_rollback_ownership_fails_closed_without_inference(
+    monkeypatch: pytest.MonkeyPatch, *, supervisor_live: bool
+) -> None:
+    """Unknown durable ownership cannot be classified from daemon liveness."""
+    state = _pending_state(supervisor_owned=None)
+    logged: list[str] = []
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: supervisor_live)
+    monkeypatch.setattr(dc, "append_deploy_log", logged.append)
+    monkeypatch.setattr(
+        dc,
+        "settle_desired",
+        lambda *_args: pytest.fail("unknown rollback must not publish supervisor desired state"),
+    )
+    monkeypatch.setattr(
+        dc,
+        "_retire_candidate_locked",
+        lambda _state: pytest.fail("unknown rollback must not retire candidate workers"),
+    )
+    monkeypatch.setattr(
+        dc,
+        "_restore_previous_locked",
+        lambda _state: pytest.fail("unknown rollback must not restore legacy worker state"),
+    )
+
+    assert dc._rollback_locked(state) is False
+    assert logged == [
+        "rollback authority is unknown; holding pending mission without inferring ownership"
+    ]
+
+
 def test_legacy_authority_does_not_sample_supervisor_liveness_between_phases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

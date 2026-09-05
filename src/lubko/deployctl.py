@@ -1482,6 +1482,18 @@ def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
     return terminal
 
 
+def _rollback_legacy_locked(state: RollbackState) -> bool:
+    """Roll back one explicitly legacy-owned pending mission.
+
+    Returns:
+        ``True`` only when the legacy candidate is retired and the previous
+        checkout/worker are restored.
+    """
+    if not _retire_candidate_locked(state):
+        return False
+    return _restore_previous_locked(state)
+
+
 def _rollback_locked(state: RollbackState) -> bool:
     """Restore the exact previous known-good commit and worker.
 
@@ -1511,10 +1523,13 @@ def _rollback_locked(state: RollbackState) -> bool:
     if not lifecycle_state.authorize_mission_rollback(_mission_authority_facts(state.status)):
         append_deploy_log("lifecycle authority refuses rollback of the pending mission; holding")
         return False
+    if state.supervisor_owned is None:
+        append_deploy_log(
+            "rollback authority is unknown; holding pending mission without inferring ownership"
+        )
+        return False
     if state.supervisor_owned is False:
-        if not _retire_candidate_locked(state):
-            return False
-        return _restore_previous_locked(state)
+        return _rollback_legacy_locked(state)
     if not supervise.supervisor_running():
         append_deploy_log(
             "supervised rollback lost supervisor authority before settlement; holding pending mission"
