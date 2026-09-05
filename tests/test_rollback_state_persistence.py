@@ -97,6 +97,44 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     supervise.state_path().parent.mkdir(parents=True, exist_ok=True)
 
 
+def _establish_pending_supervisor_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    state: deployctl.RollbackState,
+    worker_id: str,
+) -> None:
+    """Publish compatible desired/applied authority for a pending mission."""
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    supervise.write_desired(
+        supervise.SupervisorDesired(
+            schema_version=supervise.SCHEMA_VERSION,
+            generation=state.generation,
+            commit=state.commit,
+            repo=state.repo,
+            uv_path=state.uv_path,
+            worker_id=worker_id,
+        )
+    )
+    supervise.write_state(
+        replace(
+            supervise.read_state(),
+            commit=state.commit,
+            applied_generation=state.generation,
+            child=None,
+            ready=False,
+        )
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=state.generation,
+            commit=state.commit,
+            ready=False,
+            holding=False,
+        ),
+    )
+
+
 def test_supervised_prepare_state_stays_readable_through_status_and_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -125,16 +163,7 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
     assert before_child == state
     assert before_child.new_meta is None
 
-    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
-    supervise.write_state(
-        replace(
-            supervise.read_state(),
-            commit=NEW,
-            applied_generation=state.generation,
-            child=None,
-            ready=False,
-        )
-    )
+    _establish_pending_supervisor_authority(monkeypatch, state, previous.worker_id or "w")
     monkeypatch.setattr(deployctl, "_reconcile_cli", lambda _state: None)
     status = deployctl._handle_status(_options())
     assert status["phase"] == "await-confirmation"
@@ -171,16 +200,6 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
     assert after_child.new_meta is None
     assert deployctl._handle_status(_options())["phase"] == "await-confirmation"
 
-    supervise.write_desired(
-        supervise.SupervisorDesired(
-            schema_version=supervise.SCHEMA_VERSION,
-            generation=state.generation,
-            commit=NEW,
-            repo=state.repo,
-            uv_path=state.uv_path,
-            worker_id=candidate.worker_id,
-        )
-    )
     monkeypatch.setattr(deployctl, "settle_desired", lambda *_, **__: state.generation)
     monkeypatch.setattr(supervise, "generation_lock", nullcontext)
     monkeypatch.setattr(
