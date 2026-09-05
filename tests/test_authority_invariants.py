@@ -1104,7 +1104,7 @@ def test_confirmation_holds_for_superseding_unready_generation(
     monkeypatch.setattr(deployctl, "_write_state", written)
 
     with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
-        deployctl._finalize_supervised_confirmation(mission)
+        deployctl._finalize_supervised_confirmation(mission, newer_generation)
 
     written.assert_not_called()
 
@@ -1135,7 +1135,7 @@ def test_confirmation_holds_while_current_generation_is_holding(
     monkeypatch.setattr(deployctl, "_write_state", written)
 
     with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
-        deployctl._finalize_supervised_confirmation(mission)
+        deployctl._finalize_supervised_confirmation(mission, generation)
 
     written.assert_not_called()
 
@@ -1543,3 +1543,85 @@ def test_confirmation_rejects_unreadable_desired_before_settlement(
 
     settle.assert_not_called()
     rollback.assert_not_called()
+
+
+def test_confirmation_terminalization_rejects_newer_same_commit_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation stays pending when a newer same-commit generation wins."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    expected_generation = mission.generation + 1
+    newer_generation = expected_generation + 1
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=newer_generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=newer_generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+    written = MagicMock()
+    monkeypatch.setattr(deployctl, "_write_state", written)
+
+    with pytest.raises(deployctl.DeployCtlError, match="superseded before confirmation"):
+        deployctl._finalize_supervised_confirmation(mission, expected_generation)
+
+    written.assert_not_called()
+
+
+def test_confirmation_terminalization_accepts_exact_settled_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation succeeds only when desired and applied match settlement."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    expected_generation = mission.generation + 1
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.commit, generation=expected_generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=expected_generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+    written: list[deployctl.RollbackState] = []
+    monkeypatch.setattr(deployctl, "_write_state", written.append)
+    monkeypatch.setattr(cli, "set_current", lambda _commit: None)
+    monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
+    monkeypatch.setattr(deployctl, "append_deploy_log", lambda _message: None)
+
+    terminal = deployctl._finalize_supervised_confirmation(mission, expected_generation)
+
+    assert terminal.status == deployctl.STATUS_CONFIRMED
+    assert written == [terminal]
+
+
+def test_confirmation_preparation_returns_settled_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preparation preserves the exact generation selected by settlement."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    settled_generation = mission.generation + 3
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    settle = MagicMock(return_value=settled_generation)
+    monkeypatch.setattr(deployctl, "settle_desired", settle)
+
+    result = deployctl._prepare_confirmation_candidate(mission, _options())
+
+    assert result == settled_generation
+    settle.assert_called_once_with(mission.commit, mission.repo, mission.uv_path)

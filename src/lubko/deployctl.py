@@ -1651,7 +1651,9 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
     return terminal
 
 
-def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
+def _finalize_supervised_confirmation(
+    state: RollbackState, expected_generation: int
+) -> RollbackState:
     """Durably archive only a still-current queue-ready supervisor target.
 
     Terminalization is serialized with desired-generation writers. A restart,
@@ -1685,7 +1687,8 @@ def _finalize_supervised_confirmation(state: RollbackState) -> RollbackState:
                 "deployment remains pending"
             )
         if (
-            status.applied_generation != desired.generation
+            desired.generation != expected_generation
+            or status.applied_generation != expected_generation
             or status.ready is not True
             or status.holding
         ):
@@ -2471,12 +2474,15 @@ def _authorize_confirmation(state: RollbackState) -> None:
     _require_confirmation_authority(state)
 
 
-def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> None:
+def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> int | None:
     """Prepare the exact candidate for terminal confirmation.
 
     Args:
         state: Pending mission being confirmed.
         options: Runtime options for legacy CLI preparation.
+
+    Returns:
+        The exact settled supervisor generation, or ``None`` for legacy ownership.
 
     Raises:
         DeployCtlError: If the legacy CLI environment cannot be prepared.
@@ -2498,20 +2504,24 @@ def _prepare_confirmation_candidate(state: RollbackState, options: Options) -> N
             )
             raise DeployCtlError(msg)
         write_meta(state.new_meta)
-        return
+        return None
     if not supervise.supervisor_running():
         msg = _confirmation_rollback_error(
             state, "cannot confirm a supervisor-owned deployment without a live supervisor"
         )
         raise DeployCtlError(msg)
-    settle_desired(state.commit, state.repo, state.uv_path)
+    return settle_desired(state.commit, state.repo, state.uv_path)
 
 
-def _finalize_confirmation(state: RollbackState) -> RollbackState:
+def _finalize_confirmation(
+    state: RollbackState, expected_generation: int | None = None
+) -> RollbackState:
     """Persist terminal confirmation and maintain the CLI pointer.
 
     Args:
         state: Pending mission whose candidate is prepared.
+        expected_generation: Exact supervisor generation established during
+            preparation, or ``None`` for explicitly legacy-owned confirmation.
 
     Returns:
         Terminal confirmed mission state.
@@ -2521,7 +2531,9 @@ def _finalize_confirmation(state: RollbackState) -> RollbackState:
         if not supervise.supervisor_running():
             msg = "cannot confirm a supervisor-owned deployment without a live supervisor"
             raise DeployCtlError(msg)
-        return _finalize_supervised_confirmation(state)
+        if expected_generation is None:
+            raise DeployCtlError("supervised confirmation is missing its settled generation")
+        return _finalize_supervised_confirmation(state, expected_generation)
     terminal = replace(state, status=STATUS_CONFIRMED)
     _write_state(terminal)
     try:
@@ -2543,8 +2555,8 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     if state.status == STATUS_CONFIRMED:
         return _confirmation_response(state)
     _authorize_confirmation(state)
-    _prepare_confirmation_candidate(state, options)
-    state = _finalize_confirmation(state)
+    expected_generation = _prepare_confirmation_candidate(state, options)
+    state = _finalize_confirmation(state, expected_generation)
     return _confirmation_response(state)
 
 
