@@ -38,6 +38,7 @@ from lubko.lifecycle import (
     LockTimeoutError,
     ProcessIdentity,
     WorkerMeta,
+    WorkerMetadataError,
     _converge_unproven_spawn,
     append_deploy_log,
     check_postgres,
@@ -45,6 +46,7 @@ from lubko.lifecycle import (
     detach_standard_streams,
     process_identity,
     read_meta,
+    read_meta_strict,
     run_validation,
     spawn_worker,
     stop_worker,
@@ -1249,30 +1251,60 @@ def _complete_handoff(
     raise DeployCtlError("cannot hand off a deployment with unknown supervisor ownership")
 
 
-def _restart_previous(state: RollbackState) -> WorkerMeta | None:
-    """Restore the previous known-good worker process.
-
-    A previous worker that was never told to retire and is still alive is
-    reused under its exact recorded identity (old watchdog behavior). Once the
-    controller has durably marked ``previous_retiring`` before stopping that
-    worker, a momentarily alive process is never trusted: retirement may have
-    begun, so the exact old identity is deterministically stopped and awaited
-    dead before a fresh previous-commit worker is spawned and verified. That
-    guarantees terminal ``rolled_back`` never means a worker that is about to
-    exit, so zero queue consumers cannot be the outcome of a completed
-    rollback.
+def _durable_previous_worker(
+    state: RollbackState,
+) -> tuple[bool, WorkerMeta | None]:
+    """Resolve a live durable worker before legacy rollback spawns another.
 
     Args:
         state: Rollback mission.
 
     Returns:
-        Restored worker metadata, or ``None`` on failure.
+        A pair of ``(resolved, worker)``. ``resolved`` means durable metadata
+        decides the retry: ``worker`` is adopted when exact previous-commit
+        authority is proven, while ``None`` means fail closed. An unresolved
+        result permits the normal previous-worker restart path.
     """
+    try:
+        current = read_meta_strict()
+    except WorkerMetadataError as exc:
+        append_deploy_log(f"legacy rollback cannot trust maintained worker metadata: {exc}")
+        return True, None
+    if current is None or not worker_alive(current):
+        return False, None
+    exact_previous = (
+        current.state == STATE_RUNNING
+        and current.repo == state.repo
+        and current.git_commit == state.previous_commit
+    )
+    if not exact_previous:
+        append_deploy_log(
+            "legacy rollback found a live maintained worker outside previous-commit authority"
+        )
+        return True, None
     previous = state.previous_meta
-    if not state.previous_retiring and worker_alive(previous):
-        return previous
-    if worker_alive(previous) and not stop_worker(previous, state.stop_grace_seconds):
-        return None
+    same_original_identity = (
+        current.pid == previous.pid
+        and current.pgid == previous.pgid
+        and current.sid == previous.sid
+        and current.start_time_ticks == previous.start_time_ticks
+        and current.token == previous.token
+    )
+    if state.previous_retiring and same_original_identity:
+        return False, None
+    return True, current
+
+
+def _spawn_previous_worker(state: RollbackState, previous: WorkerMeta) -> WorkerMeta | None:
+    """Spawn and verify one replacement previous-commit worker.
+
+    Args:
+        state: Rollback mission.
+        previous: Previous worker metadata used for fallback identity fields.
+
+    Returns:
+        Verified replacement worker metadata, or ``None`` on failure.
+    """
     token = secrets.token_hex(16)
     env = worker_env(token)
     worker_id = env.get("LUBKO_WORKER_ID") or previous.worker_id or socket.gethostname()
@@ -1313,6 +1345,36 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
         stop_worker(meta, state.stop_grace_seconds)
         return None
     return meta
+
+
+def _restart_previous(state: RollbackState) -> WorkerMeta | None:
+    """Restore the previous known-good worker process.
+
+    A previous worker that was never told to retire and is still alive is
+    reused under its exact recorded identity (old watchdog behavior). Once the
+    controller has durably marked ``previous_retiring`` before stopping that
+    worker, a momentarily alive process is never trusted: retirement may have
+    begun, so the exact old identity is deterministically stopped and awaited
+    dead before a fresh previous-commit worker is spawned and verified. A live
+    durable worker published by an interrupted prior rollback is adopted only
+    when it proves exact previous-commit authority and is not that retiring
+    original identity.
+
+    Args:
+        state: Rollback mission.
+
+    Returns:
+        Restored worker metadata, or ``None`` on failure.
+    """
+    resolved, current = _durable_previous_worker(state)
+    if resolved:
+        return current
+    previous = state.previous_meta
+    if not state.previous_retiring and worker_alive(previous):
+        return previous
+    if worker_alive(previous) and not stop_worker(previous, state.stop_grace_seconds):
+        return None
+    return _spawn_previous_worker(state, previous)
 
 
 def _retire_candidate_locked(state: RollbackState) -> bool:
