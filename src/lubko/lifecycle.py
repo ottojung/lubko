@@ -1882,6 +1882,16 @@ def _finish_queue_deploy(
     _restore_after_handoff_failure(options, commit, previous)
 
 
+def _queue_deploy_candidate_converged(
+    commit: str, status: supervise.SupervisorStatus | None
+) -> bool:
+    """Return whether post-success recovery still owns a live candidate."""
+    if status is None or status.commit != commit or not status.ready:
+        return False
+    child = status.child
+    return child is not None and supervise.child_alive(child) and cli.current_commit() == commit
+
+
 def _restore_after_handoff_failure(
     options: DeployOptions,
     commit: str,
@@ -1915,13 +1925,7 @@ def _restore_after_handoff_failure(
         )
         return
     status = supervise.read_status()
-    if (
-        status is not None
-        and status.commit == commit
-        and status.child is not None
-        and status.ready
-        and cli.current_commit() == commit
-    ):
+    if _queue_deploy_candidate_converged(commit, status):
         append_deploy_log(f"queue deploy fully converged on commit {commit}; nothing to restore")
         return
     if previous is None or previous.git_commit is None:
