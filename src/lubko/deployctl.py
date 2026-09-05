@@ -1803,10 +1803,10 @@ def _rollback_locked(state: RollbackState) -> bool:
 def _watchdog_main(lock_timeout_seconds: float) -> None:
     """Retain rollback authority until the mission reaches a terminal state.
 
-    With a live external supervisor the watchdog only rolls back after the
-    confirmation deadline has passed without the daemon keeping the candidate
-    consumer live, so it never fights the supervisor's own bounded restart of a
-    transiently crashed candidate.
+    With a live external supervisor the watchdog delegates rollback policy to
+    the canonical pending-mission predicate, so durable authority, deadline,
+    and readiness decisions cannot drift from status/confirmation handling.
+    Supervisor absence still fails closed for supervisor-owned/unknown missions.
 
     Args:
         lock_timeout_seconds: Deployment-lock timeout for rollback attempts.
@@ -1826,13 +1826,10 @@ def _watchdog_main(lock_timeout_seconds: float) -> None:
                 or not worker_alive(state.new_meta)
             )
         elif supervise.supervisor_running():
-            # While the supervisor is present, candidate liveness is a separate
-            # observation: only roll back after the deadline AND the exact child
-            # is no longer proven live.  A stale state.json child must not count
-            # as live.
-            should_rollback = time.time() >= state.deadline and not _supervised_mission_active(
-                state
-            )
+            # Reuse the canonical mission predicate used by status and
+            # confirmation so durable authority and deadline policy cannot
+            # drift between observers.
+            should_rollback = _pending_mission_rollback_due(state)
         else:
             # Pending supervised missions and missions with unknown lifecycle
             # authority must never enter the legacy direct rollback/worker

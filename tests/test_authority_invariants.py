@@ -1224,6 +1224,52 @@ def test_supervised_rollback_does_not_fall_back_to_legacy_without_supervisor(
     ]
 
 
+def test_watchdog_uses_canonical_supervised_rollback_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watchdog delegates live-supervisor rollback policy to the canonical predicate."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    due = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", due)
+    monkeypatch.setattr(deployctl, "deploy_lock", lambda _timeout: nullcontext())
+    rollback = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_rollback_locked", rollback)
+
+    deployctl._watchdog_main(1.0)
+
+    due.assert_called_once_with(mission)
+    rollback.assert_called_once_with(mission)
+
+
+def test_watchdog_respects_canonical_pending_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical pending decision prevents watchdog rollback side effects."""
+    mission = _make_mission(deployctl.STATUS_PENDING)
+    monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    due = MagicMock(return_value=False)
+    monkeypatch.setattr(deployctl, "_pending_mission_rollback_due", due)
+    rollback = MagicMock(return_value=True)
+    monkeypatch.setattr(deployctl, "_rollback_locked", rollback)
+
+    class WatchdogTestCompleteError(RuntimeError):
+        pass
+
+    def stop_after_first_iteration(_seconds: float) -> None:
+        raise WatchdogTestCompleteError
+
+    monkeypatch.setattr(time, "sleep", stop_after_first_iteration)
+
+    with pytest.raises(WatchdogTestCompleteError):
+        deployctl._watchdog_main(1.0)
+
+    due.assert_called_once_with(mission)
+    rollback.assert_not_called()
+
+
 def test_watchdog_supervised_rollback_race_stays_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1231,7 +1277,7 @@ def test_watchdog_supervised_rollback_race_stays_pending(
     mission = replace(_make_mission(deployctl.STATUS_PENDING), deadline=time.time() - 1.0)
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
-    observations = iter((True, False))
+    observations = iter((True, False, False))
     monkeypatch.setattr(supervise, "supervisor_running", lambda: next(observations))
     monkeypatch.setattr(deployctl, "_supervised_mission_active", lambda _state: False)
     monkeypatch.setattr(deployctl, "deploy_lock", lambda _timeout: nullcontext())
