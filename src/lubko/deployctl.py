@@ -31,7 +31,7 @@ from psycopg.rows import tuple_row
 
 from lubko import cli, lifecycle_state, supervise
 from lubko.config import load_database_config
-from lubko.durable import write_json_durable
+from lubko.durable import DurabilityError, write_json_durable
 from lubko.lifecycle import (
     SCHEMA_VERSION,
     STATE_RUNNING,
@@ -48,7 +48,6 @@ from lubko.lifecycle import (
     read_meta,
     read_meta_strict,
     run_validation,
-    spawn_worker,
     stop_worker,
     worker_alive,
     worker_env,
@@ -66,8 +65,8 @@ LOGGER: Final = logging.getLogger(__name__)
 
 EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
-ROLLBACK_SCHEMA_VERSION: Final = 3
-SUPPORTED_ROLLBACK_SCHEMA_VERSIONS: Final = frozenset({2})
+ROLLBACK_SCHEMA_VERSION: Final = 4
+SUPPORTED_ROLLBACK_SCHEMA_VERSIONS: Final = frozenset({2, 3})
 STATUS_PENDING: Final = "pending"
 STATUS_CONFIRMED: Final = "confirmed"
 STATUS_ROLLED_BACK: Final = "rolled_back"
@@ -140,6 +139,8 @@ class RollbackState:
     previous_meta: WorkerMeta
     new_meta: WorkerMeta | None
     supervisor_owned: bool | None = None
+    previous_restart_meta: WorkerMeta | None = None
+    previous_restart_released: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize durable rollback state.
@@ -162,6 +163,10 @@ class RollbackState:
             "previous_meta": self.previous_meta.to_dict(),
             "new_meta": None if self.new_meta is None else self.new_meta.to_dict(),
             "supervisor_owned": self.supervisor_owned,
+            "previous_restart_meta": (
+                None if self.previous_restart_meta is None else self.previous_restart_meta.to_dict()
+            ),
+            "previous_restart_released": self.previous_restart_released,
         }
         return result
 
@@ -218,6 +223,13 @@ class RollbackState:
                     replacement_meta = None
             else:
                 raise TypeError
+            restart_meta, restart_released = _parse_previous_restart(
+                data,
+                supervisor_owned=supervisor_owned,
+                status=status,
+                repo=repo,
+                previous_commit=previous_commit,
+            )
             return cls(
                 schema_version=schema_version,
                 generation=generation,
@@ -237,6 +249,8 @@ class RollbackState:
                 previous_meta=WorkerMeta.from_dict(previous),
                 new_meta=replacement_meta,
                 supervisor_owned=supervisor_owned,
+                previous_restart_meta=restart_meta,
+                previous_restart_released=restart_released,
             )
         except (KeyError, TypeError, ValueError) as exc:
             msg = "supervised deployment state is malformed"
@@ -253,6 +267,51 @@ class GatedWorker:
 
 
 _ABSENT: Final = object()
+
+
+def _parse_previous_restart(
+    data: dict[str, object],
+    *,
+    supervisor_owned: bool | None,
+    status: str,
+    repo: str,
+    previous_commit: str,
+) -> tuple[WorkerMeta | None, bool]:
+    """Parse and validate durable legacy rollback restart authority.
+
+    Args:
+        data: Decoded rollback state.
+        supervisor_owned: Durable mission ownership classification.
+        status: Parsed rollback mission status.
+        repo: Expected repository identity.
+        previous_commit: Commit the restart worker must run.
+
+    Returns:
+        The optional restart worker metadata and its release flag.
+
+    Raises:
+        TypeError: If restart authority is malformed or inconsistent.
+    """
+    restart_raw = data.get("previous_restart_meta")
+    if restart_raw is None:
+        restart_meta = None
+    elif isinstance(restart_raw, dict):
+        restart_meta = WorkerMeta.from_dict(restart_raw)
+    else:
+        raise TypeError
+    restart_released = _retiring_flag(data.get("previous_restart_released", _ABSENT))
+    if restart_meta is None:
+        if restart_released:
+            raise TypeError
+    elif (
+        supervisor_owned is not False
+        or status != STATUS_PENDING
+        or restart_meta.state != STATE_RUNNING
+        or restart_meta.repo != repo
+        or restart_meta.git_commit != previous_commit
+    ):
+        raise TypeError
+    return restart_meta, restart_released
 
 
 def _retiring_flag(value: object) -> bool:
@@ -1302,36 +1361,38 @@ def _durable_previous_worker(
     return True, current
 
 
-def _spawn_previous_worker(state: RollbackState, previous: WorkerMeta) -> WorkerMeta | None:
-    """Spawn and verify one replacement previous-commit worker.
-
-    Args:
-        state: Rollback mission.
-        previous: Previous worker metadata used for fallback identity fields.
+def _spawn_gated_previous_worker(state: RollbackState, previous: WorkerMeta) -> GatedWorker | None:
+    """Spawn one previous-commit worker behind a non-consuming pipe gate.
 
     Returns:
-        Verified replacement worker metadata, or ``None`` on failure.
+        The gated worker, or ``None`` if spawning or identity proof fails.
     """
     token = secrets.token_hex(16)
     env = worker_env(token)
     worker_id = env.get("LUBKO_WORKER_ID") or previous.worker_id or socket.gethostname()
+    reader, writer = os.pipe()
     try:
-        proc = spawn_worker(
-            Path(state.repo),
-            state.uv_path,
-            worker_log_path(token),
-            env,
+        proc = subprocess.Popen(
+            [sys.executable, "-c", GATED_SHIM_SOURCE, str(reader), state.uv_path],
+            cwd=Path(state.repo),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=(reader,),
+            env=env,
         )
     except OSError:
+        os.close(writer)
         return None
+    finally:
+        os.close(reader)
     identity = _wait_for_identity(proc)
     if identity is None or identity.pgid != proc.pid or identity.sid != proc.pid:
+        _close_gate(writer)
         if identity is not None:
-            LOGGER.error(
-                "worker pid %d is live without an acceptable identity; converging it",
-                proc.pid,
-            )
-        _converge_unproven_spawn(proc, state.stop_grace_seconds, identity)
+            _converge_unproven_spawn(proc, state.stop_grace_seconds, identity)
         return None
     meta = WorkerMeta(
         schema_version=SCHEMA_VERSION,
@@ -1348,10 +1409,84 @@ def _spawn_previous_worker(state: RollbackState, previous: WorkerMeta) -> Worker
         started_at=time.time(),
         stopped_at=None,
     )
-    if not worker_alive(meta) or not check_postgres(DEFAULT_POSTGRES_TIMEOUT_SECONDS):
-        stop_worker(meta, state.stop_grace_seconds)
+    return GatedWorker(proc=proc, gate_writer=writer, meta=meta)
+
+
+def _clear_previous_restart_obligation(state: RollbackState) -> None:
+    """Durably clear a proven-dead legacy rollback restart obligation."""
+    _write_state(
+        replace(
+            state,
+            previous_restart_meta=None,
+            previous_restart_released=False,
+        )
+    )
+
+
+def _recover_previous_restart(state: RollbackState) -> tuple[bool, WorkerMeta | None]:
+    """Resolve durable rollback restart authority before another spawn.
+
+    Returns:
+        Whether durable restart authority resolved the attempt and the worker to adopt, if any.
+    """
+    meta = state.previous_restart_meta
+    if meta is None:
+        return False, None
+    if not state.previous_restart_released:
+        if worker_alive(meta):
+            if not stop_worker(meta, state.stop_grace_seconds) or worker_alive(meta):
+                append_deploy_log(
+                    "legacy rollback could not converge an unreleased previous-worker spawn"
+                )
+                return True, None
+        _clear_previous_restart_obligation(state)
+        return False, None
+    if worker_alive(meta):
+        if _wait_for_released_worker(meta) and check_postgres(DEFAULT_POSTGRES_TIMEOUT_SECONDS):
+            return True, meta
+        if not stop_worker(meta, state.stop_grace_seconds) or worker_alive(meta):
+            append_deploy_log(
+                "legacy rollback could not converge an unhealthy released previous-worker spawn"
+            )
+            return True, None
+    _clear_previous_restart_obligation(state)
+    return False, None
+
+
+def _spawn_previous_worker(state: RollbackState, previous: WorkerMeta) -> WorkerMeta | None:
+    """Spawn, durably anchor, release, and verify one previous-commit worker.
+
+    Returns:
+        Verified previous-worker metadata, or ``None`` when restart cannot safely complete.
+    """
+    gated = _spawn_gated_previous_worker(state, previous)
+    if gated is None:
         return None
-    return meta
+    prepared = replace(state, previous_restart_meta=gated.meta, previous_restart_released=False)
+    try:
+        _write_state(prepared)
+    except DurabilityError:
+        _abort_gated_candidate(gated)
+        raise
+    try:
+        _release_gate(gated.gate_writer)
+    except DeployCtlError:
+        _abort_gated_candidate(gated)
+        _clear_previous_restart_obligation(prepared)
+        return None
+    released = replace(prepared, previous_restart_released=True)
+    try:
+        _write_state(released)
+    except DurabilityError:
+        _abort_gated_candidate(gated)
+        raise
+    if not _wait_for_released_worker(gated.meta) or not check_postgres(
+        DEFAULT_POSTGRES_TIMEOUT_SECONDS
+    ):
+        _abort_gated_candidate(gated)
+        _clear_previous_restart_obligation(released)
+        return None
+    return gated.meta
 
 
 def _restart_previous(state: RollbackState) -> WorkerMeta | None:
@@ -1376,6 +1511,9 @@ def _restart_previous(state: RollbackState) -> WorkerMeta | None:
     resolved, current = _durable_previous_worker(state)
     if resolved:
         return current
+    restart_resolved, restarted = _recover_previous_restart(state)
+    if restart_resolved:
+        return restarted
     previous = state.previous_meta
     if not state.previous_retiring and worker_alive(previous):
         return previous
@@ -1430,10 +1568,16 @@ def _restore_previous_locked(state: RollbackState) -> bool:
         return False
     restored = _restart_previous(state)
     if restored is None:
-        append_deploy_log("supervised rollback could not restart previous worker")
         return False
     write_meta(restored)
-    _write_state(replace(state, status=STATUS_ROLLED_BACK))
+    _write_state(
+        replace(
+            state,
+            status=STATUS_ROLLED_BACK,
+            previous_restart_meta=None,
+            previous_restart_released=False,
+        )
+    )
     cli.remove_cli_root(state.commit)
     if cli.reconcile_pointer(state.previous_commit):
         append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
