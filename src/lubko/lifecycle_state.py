@@ -613,6 +613,48 @@ def authorize_retirement(facts: AuthorityFacts) -> bool:
     return facts.current_child_identity_proven
 
 
+@dataclass(frozen=True, slots=True)
+class SupervisorConvergenceFacts:
+    """Desired/applied supervisor facts used for terminal convergence proof."""
+
+    target_commit: str
+    minimum_generation: int
+    desired_commit: str
+    desired_generation: int
+    applied_commit: str | None
+    applied_generation: int
+    ready: bool | None
+    holding: bool
+    live_child: bool
+
+
+def authorize_supervisor_convergence(facts: SupervisorConvergenceFacts) -> bool:
+    """Decide whether desired/applied supervisor authority has converged.
+
+    A caller may accept a newer generation only when durable desired authority
+    still selects the same exact commit and the applied generation is within
+    the closed interval from the caller's minimum generation through the
+    current desired generation. This keeps compatible same-commit settlement
+    valid while rejecting superseded commits and impossible generation order.
+
+    Args:
+        facts: Desired/applied authority snapshot for the terminal proof.
+
+    Returns:
+        ``True`` only when current desired and applied authority are compatible
+        with the caller's exact commit/generation and the worker is live/ready.
+    """
+    if facts.minimum_generation < 0:
+        return False
+    if facts.desired_commit != facts.target_commit or facts.applied_commit != facts.target_commit:
+        return False
+    if facts.desired_generation < facts.minimum_generation:
+        return False
+    if not facts.minimum_generation <= facts.applied_generation <= facts.desired_generation:
+        return False
+    return facts.ready is True and not facts.holding and facts.live_child
+
+
 def authorize_mission_publish(facts: AuthorityFacts) -> bool:
     """Decide whether a new supervised mission may be published.
 

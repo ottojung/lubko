@@ -1,5 +1,7 @@
 """Regression tests for queue-deploy recovery child-liveness authority."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +37,10 @@ def _status(
     )
 
 
+def _desired(commit: str, generation: int) -> SimpleNamespace:
+    return SimpleNamespace(commit=commit, generation=generation)
+
+
 def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -55,6 +61,8 @@ def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
         return 7
 
     monkeypatch.setattr(supervise, "request_run", record_restore)
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: _desired(previous_commit, 7))
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
     monkeypatch.setattr(supervise, "wait_for_generation", lambda *_args: True)
     monkeypatch.setattr(supervise, "wait_until_ready", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(cli, "reconcile_pointer", lambda _commit: True)
@@ -88,8 +96,10 @@ def test_restore_after_handoff_failure_accepts_live_ready_child(
 
 @dataclass(frozen=True, slots=True)
 class _RestoreCase:
-    generation: int
-    ready_commit: str
+    desired_generation: int
+    desired_commit: str
+    applied_generation: int
+    applied_commit: str
     restored_child_alive: bool
     ready: bool
     holding: bool
@@ -100,56 +110,100 @@ class _RestoreCase:
     "case",
     [
         _RestoreCase(
-            generation=7,
-            ready_commit="b" * 40,
+            desired_generation=7,
+            desired_commit="b" * 40,
+            applied_generation=7,
+            applied_commit="b" * 40,
             restored_child_alive=True,
             ready=True,
             holding=False,
             expected=True,
         ),
         _RestoreCase(
-            generation=8,
-            ready_commit="b" * 40,
+            desired_generation=8,
+            desired_commit="b" * 40,
+            applied_generation=7,
+            applied_commit="b" * 40,
             restored_child_alive=True,
             ready=True,
             holding=False,
             expected=True,
         ),
         _RestoreCase(
-            generation=8,
-            ready_commit="c" * 40,
+            desired_generation=8,
+            desired_commit="b" * 40,
+            applied_generation=8,
+            applied_commit="b" * 40,
+            restored_child_alive=True,
+            ready=True,
+            holding=False,
+            expected=True,
+        ),
+        _RestoreCase(
+            desired_generation=8,
+            desired_commit="c" * 40,
+            applied_generation=7,
+            applied_commit="b" * 40,
             restored_child_alive=True,
             ready=True,
             holding=False,
             expected=False,
         ),
         _RestoreCase(
-            generation=6,
-            ready_commit="b" * 40,
+            desired_generation=8,
+            desired_commit="c" * 40,
+            applied_generation=8,
+            applied_commit="c" * 40,
             restored_child_alive=True,
             ready=True,
             holding=False,
             expected=False,
         ),
         _RestoreCase(
-            generation=7,
-            ready_commit="b" * 40,
+            desired_generation=7,
+            desired_commit="b" * 40,
+            applied_generation=8,
+            applied_commit="b" * 40,
+            restored_child_alive=True,
+            ready=True,
+            holding=False,
+            expected=False,
+        ),
+        _RestoreCase(
+            desired_generation=7,
+            desired_commit="b" * 40,
+            applied_generation=6,
+            applied_commit="b" * 40,
+            restored_child_alive=True,
+            ready=True,
+            holding=False,
+            expected=False,
+        ),
+        _RestoreCase(
+            desired_generation=7,
+            desired_commit="b" * 40,
+            applied_generation=7,
+            applied_commit="b" * 40,
             restored_child_alive=False,
             ready=True,
             holding=False,
             expected=False,
         ),
         _RestoreCase(
-            generation=7,
-            ready_commit="b" * 40,
+            desired_generation=7,
+            desired_commit="b" * 40,
+            applied_generation=7,
+            applied_commit="b" * 40,
             restored_child_alive=True,
             ready=False,
             holding=False,
             expected=False,
         ),
         _RestoreCase(
-            generation=7,
-            ready_commit="b" * 40,
+            desired_generation=7,
+            desired_commit="b" * 40,
+            applied_generation=7,
+            applied_commit="b" * 40,
             restored_child_alive=True,
             ready=True,
             holding=True,
@@ -158,8 +212,11 @@ class _RestoreCase:
     ],
     ids=[
         "exact-live",
-        "newer-same-commit-live",
-        "newer-different-commit",
+        "newer-same-commit-desired",
+        "newer-same-commit-applied",
+        "newer-different-desired",
+        "newer-different-applied",
+        "applied-ahead-of-desired",
         "older-generation",
         "dead-child",
         "not-ready",
@@ -179,8 +236,8 @@ def test_restoration_requires_current_live_queue_ready_authority(
     observations = iter([
         _status(candidate, child=candidate_child),
         _status(
-            case.ready_commit,
-            generation=case.generation,
+            case.applied_commit,
+            generation=case.applied_generation,
             child=restored_child,
             ready=case.ready,
             holding=case.holding,
@@ -190,6 +247,12 @@ def test_restoration_requires_current_live_queue_ready_authority(
 
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     monkeypatch.setattr(supervise, "read_status", lambda: next(observations))
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: _desired(case.desired_commit, case.desired_generation),
+    )
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
     monkeypatch.setattr(
         supervise,
         "child_alive",
@@ -210,3 +273,54 @@ def test_restoration_requires_current_live_queue_ready_authority(
     lifecycle._restore_after_handoff_failure(_options(), candidate, previous)
 
     assert reconciled == ([previous_commit] if case.expected else [])
+
+
+def test_restore_holds_generation_lock_through_cli_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Final authority proof and CLI reconciliation share one generation lock."""
+    candidate = "a" * 40
+    previous_commit = "b" * 40
+    previous = _previous(previous_commit)
+    candidate_child = object()
+    restored_child = object()
+    observations = iter([
+        _status(candidate, child=candidate_child),
+        _status(previous_commit, generation=7, child=restored_child),
+    ])
+    held = False
+
+    @contextmanager
+    def generation_lock() -> Iterator[None]:
+        nonlocal held
+        assert not held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "read_status", lambda: next(observations))
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: _desired(previous_commit, 7))
+    monkeypatch.setattr(supervise, "child_alive", lambda child: child is restored_child)
+    monkeypatch.setattr(supervise, "generation_lock", generation_lock)
+    monkeypatch.setattr(cli, "current_commit", lambda: candidate)
+    monkeypatch.setattr(supervise, "request_run", lambda *_args, **_kwargs: 7)
+    monkeypatch.setattr(supervise, "wait_for_generation", lambda *_args: True)
+    monkeypatch.setattr(supervise, "wait_until_ready", lambda *_args, **_kwargs: True)
+
+    reconciled: list[str] = []
+
+    def reconcile(commit: str) -> bool:
+        assert held
+        reconciled.append(commit)
+        return True
+
+    monkeypatch.setattr(cli, "reconcile_pointer", reconcile)
+    monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
+
+    lifecycle._restore_after_handoff_failure(_options(), candidate, previous)
+
+    assert reconciled == [previous_commit]
+    assert not held

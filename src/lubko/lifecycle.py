@@ -1894,17 +1894,27 @@ def _queue_deploy_candidate_converged(
 
 def _queue_deploy_restore_converged(commit: str, minimum_generation: int) -> bool:
     """Return whether restore authority still owns a live queue-ready child."""
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        return False
     status = supervise.read_status()
-    if (
-        status is None
-        or status.commit != commit
-        or status.applied_generation < minimum_generation
-        or not status.ready
-        or status.holding
-    ):
+    if desired is None or status is None:
         return False
     child = status.child
-    return child is not None and supervise.child_alive(child)
+    return lifecycle_state.authorize_supervisor_convergence(
+        lifecycle_state.SupervisorConvergenceFacts(
+            target_commit=commit,
+            minimum_generation=minimum_generation,
+            desired_commit=desired.commit,
+            desired_generation=desired.generation,
+            applied_commit=status.commit,
+            applied_generation=status.applied_generation,
+            ready=status.ready,
+            holding=status.holding,
+            live_child=child is not None and supervise.child_alive(child),
+        )
+    )
 
 
 def _restore_after_handoff_failure(
@@ -1966,11 +1976,13 @@ def _restore_after_handoff_failure(
         supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS,
         commit=previous.git_commit,
     )
-    if (
-        restored
-        and _queue_deploy_restore_converged(previous.git_commit, settle)
-        and cli.reconcile_pointer(previous.git_commit)
-    ):
+    reconciled = False
+    if restored:
+        with supervise.generation_lock():
+            reconciled = _queue_deploy_restore_converged(
+                previous.git_commit, settle
+            ) and cli.reconcile_pointer(previous.git_commit)
+    if reconciled:
         append_deploy_log(
             "queue deploy failed after durable success; supervisor restored previous commit "
             f"{previous.git_commit} and the maintained CLIs"
