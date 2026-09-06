@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 Meta = dict[str, Any]
 
 # Implementation details (hidden from the user-facing interface).
-AGENT_MODEL: Final = "opencode-go/hy3"
+AGENT_MODEL: Final = "muse-v2.5"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
