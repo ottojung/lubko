@@ -1882,14 +1882,31 @@ def _finish_queue_deploy(
     _restore_after_handoff_failure(options, commit, previous)
 
 
-def _queue_deploy_candidate_converged(
-    commit: str, status: supervise.SupervisorStatus | None
-) -> bool:
-    """Return whether post-success recovery still owns a live candidate."""
-    if status is None or status.commit != commit or not status.ready:
-        return False
-    child = status.child
-    return child is not None and supervise.child_alive(child) and cli.current_commit() == commit
+def _queue_deploy_candidate_converged(commit: str) -> bool:
+    """Return whether current authority still converges on a live candidate."""
+    with supervise.generation_lock():
+        try:
+            desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError:
+            return False
+        status = supervise.read_status()
+        if desired is None or status is None:
+            return False
+        child = status.child
+        converged = lifecycle_state.authorize_supervisor_convergence(
+            lifecycle_state.SupervisorConvergenceFacts(
+                target_commit=commit,
+                minimum_generation=status.applied_generation,
+                desired_commit=desired.commit,
+                desired_generation=desired.generation,
+                applied_commit=status.commit,
+                applied_generation=status.applied_generation,
+                ready=status.ready,
+                holding=status.holding,
+                live_child=child is not None and supervise.child_alive(child),
+            )
+        )
+        return converged and cli.current_commit() == commit
 
 
 def _queue_deploy_restore_converged(commit: str, minimum_generation: int) -> bool:
@@ -1949,8 +1966,7 @@ def _restore_after_handoff_failure(
             "restore"
         )
         return
-    status = supervise.read_status()
-    if _queue_deploy_candidate_converged(commit, status):
+    if _queue_deploy_candidate_converged(commit):
         append_deploy_log(f"queue deploy fully converged on commit {commit}; nothing to restore")
         return
     if previous is None or previous.git_commit is None:
