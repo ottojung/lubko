@@ -40,6 +40,12 @@ The existing `lubko_worker` role/access grants are frozen infrastructure. Lubko
 does not introduce per-server database principals. Every execution server uses
 the application-level `server` field and exact server predicates described below.
 
+For installations that predate this frozen contract, the canonical baseline
+migration contains one idempotent cutover that drops only the known historical
+Lubko payload CHECK constraints and payload expression indexes. That cleanup is
+a compatibility step to reach the frozen state, not permission for later
+protocol upgrades to mutate PostgreSQL metadata.
+
 ### Startup verification
 
 The worker verifies the two-column structural table contract before consuming

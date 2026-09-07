@@ -181,7 +181,10 @@ def live_supervisor(monkeypatch: pytest.MonkeyPatch) -> list[supervise.Superviso
 
 
 @pytest.fixture
-def settlement(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+def settlement(
+    monkeypatch: pytest.MonkeyPatch,
+    live_supervisor: list[supervise.SupervisorState],
+) -> dict[str, int]:
     """Record supervised settlements instead of talking to a real daemon.
 
     Returns:
@@ -195,6 +198,16 @@ def settlement(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
         recorded[commit] = recorded.get(commit, 0) + 1
         settled["commit"] = commit
         settled["generation"] = generation
+        child = _live_candidate()
+        live_supervisor[0] = replace(
+            live_supervisor[0],
+            commit=commit,
+            applied_generation=generation,
+            child=child,
+            ready=True,
+            next_attempt_at=None,
+        )
+        monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate == child)
         return generation
 
     monkeypatch.setattr(dc, "settle_desired", record)
@@ -212,6 +225,7 @@ def settlement(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
             commit=settled["commit"],
             ready=True,
             holding=False,
+            child=live_supervisor[0].child,
         ),
     )
     return recorded
@@ -254,7 +268,6 @@ def test_status_survives_restart_backoff(
 
 
 def test_expired_deadline_rolls_back_despite_matching_authority(
-    mission: dc.RollbackState,
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
@@ -262,13 +275,158 @@ def test_expired_deadline_rolls_back_despite_matching_authority(
 ) -> None:
     """Once the mission deadline passes without a live candidate, roll back."""
     del cli_stubs, status_env, live_supervisor
-    dc._write_state(replace(mission, deadline=time.time() - 1.0))
+    current = dc._read_state()
+    assert current is not None
+    dc._write_state(replace(current, deadline=time.time() - 1.0))
 
     response = dc._handle_status(_options())
 
     assert response["phase"] == "idle"
     assert response["last_outcome"] == dc.STATUS_ROLLED_BACK
     assert settlement == {OLD_COMMIT: 1}
+
+
+def _live_candidate() -> supervise.WorkerChild:
+    """Return one stable live worker identity for deadline tests."""
+    return supervise.WorkerChild(
+        pid=300,
+        pgid=300,
+        sid=300,
+        start_time_ticks=3000,
+        token=f"worker-auth-{300}",
+        worker_id="worker",
+        spawned_at=1.0,
+    )
+
+
+def test_expired_deadline_rolls_back_live_but_not_ready_candidate(
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired mission requires queue readiness, not only a live child."""
+    del cli_stubs, status_env
+    child = _live_candidate()
+    live_supervisor[0] = replace(live_supervisor[0], child=child)
+    monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate == child)
+
+    def status() -> SimpleNamespace:
+        rolled_back = OLD_COMMIT in settlement
+        return SimpleNamespace(
+            applied_generation=GENERATION + 10 if rolled_back else GENERATION,
+            commit=OLD_COMMIT if rolled_back else NEW_COMMIT,
+            ready=rolled_back,
+            holding=False,
+            child=live_supervisor[0].child,
+        )
+
+    monkeypatch.setattr(supervise, "read_status", status)
+    current = dc._read_state()
+    assert current is not None
+    dc._write_state(replace(current, deadline=time.time() - 1.0))
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "idle"
+    assert response["last_outcome"] == dc.STATUS_ROLLED_BACK
+    assert settlement == {OLD_COMMIT: 1}
+
+
+def test_expired_deadline_rolls_back_compatible_newer_live_but_not_ready_candidate(
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer same-commit generation must still be queue-ready after the deadline."""
+    del cli_stubs, status_env
+    child = _live_candidate()
+    generation = GENERATION + 1
+    live_supervisor[0] = replace(live_supervisor[0], applied_generation=generation, child=child)
+    monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate == child)
+
+    def desired() -> SimpleNamespace:
+        rolled_back = OLD_COMMIT in settlement
+        return SimpleNamespace(
+            commit=OLD_COMMIT if rolled_back else NEW_COMMIT,
+            generation=GENERATION + 10 if rolled_back else generation,
+        )
+
+    def status() -> SimpleNamespace:
+        rolled_back = OLD_COMMIT in settlement
+        return SimpleNamespace(
+            applied_generation=GENERATION + 10 if rolled_back else generation,
+            commit=OLD_COMMIT if rolled_back else NEW_COMMIT,
+            ready=rolled_back,
+            holding=False,
+            child=live_supervisor[0].child,
+        )
+
+    monkeypatch.setattr(supervise, "read_desired_strict", desired)
+    monkeypatch.setattr(supervise, "read_status", status)
+    current = dc._read_state()
+    assert current is not None
+    dc._write_state(replace(current, deadline=time.time() - 1.0))
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "idle"
+    assert response["last_outcome"] == dc.STATUS_ROLLED_BACK
+    assert settlement == {OLD_COMMIT: 1}
+
+
+def test_future_deadline_keeps_live_but_not_ready_candidate_pending(
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Before the deadline, live non-readiness remains retryable."""
+    del cli_stubs, status_env
+    child = _live_candidate()
+    live_supervisor[0] = replace(live_supervisor[0], child=child)
+    monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate == child)
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=GENERATION,
+            commit=NEW_COMMIT,
+            ready=False,
+            holding=False,
+        ),
+    )
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "await-confirmation"
+    assert settlement == {}
+
+
+def test_expired_deadline_keeps_queue_ready_live_candidate_pending(
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authoritative queue-ready live candidate remains confirmable after the deadline."""
+    del cli_stubs, status_env
+    child = _live_candidate()
+    live_supervisor[0] = replace(live_supervisor[0], child=child)
+    monkeypatch.setattr(supervise, "child_alive", lambda candidate: candidate == child)
+    current = dc._read_state()
+    assert current is not None
+    dc._write_state(replace(current, deadline=time.time() - 1.0))
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "await-confirmation"
+    assert settlement == {}
 
 
 def test_superseded_authority_fails_closed_before_deadline(
@@ -317,6 +475,78 @@ def test_newer_generation_same_commit_authority_fails_closed(
     with pytest.raises(dc.DeployCtlError, match="rolled back"):
         dc._confirm_locked({"type": "confirm", "commit": NEW_COMMIT}, _options())
     assert settlement == {OLD_COMMIT: 1}
+
+
+def test_newer_generation_same_commit_compatible_authority_stays_pending(
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compatible newer same-commit lifecycle generation does not trigger rollback."""
+    del cli_stubs, status_env
+    generation = GENERATION + 1
+    live_supervisor[0] = replace(live_supervisor[0], applied_generation=generation)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=NEW_COMMIT, generation=generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=generation,
+            commit=NEW_COMMIT,
+            ready=True,
+            holding=False,
+        ),
+    )
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "await-confirmation"
+    assert settlement == {}
+    current = dc._read_state()
+    assert current is not None
+    assert current.status == dc.STATUS_PENDING
+
+
+def test_newer_generation_same_commit_restart_backoff_stays_pending(
+    live_supervisor: list[supervise.SupervisorState],
+    settlement: dict[str, int],
+    cli_stubs: None,
+    status_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compatible same-commit restart backoff remains retryable before deadline."""
+    del cli_stubs, status_env
+    generation = GENERATION + 1
+    live_supervisor[0] = replace(live_supervisor[0], applied_generation=generation, child=None)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=NEW_COMMIT, generation=generation),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=generation,
+            commit=NEW_COMMIT,
+            ready=False,
+            holding=False,
+        ),
+    )
+
+    response = dc._handle_status(_options())
+
+    assert response["phase"] == "await-confirmation"
+    assert settlement == {}
+    current = dc._read_state()
+    assert current is not None
+    assert current.status == dc.STATUS_PENDING
 
 
 def test_wait_until_ready_polls_through_transient_child_none(

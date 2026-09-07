@@ -1882,6 +1882,58 @@ def _finish_queue_deploy(
     _restore_after_handoff_failure(options, commit, previous)
 
 
+def _queue_deploy_candidate_converged(commit: str) -> bool:
+    """Return whether current authority still converges on a live candidate."""
+    with supervise.generation_lock():
+        try:
+            desired = supervise.read_desired_strict()
+        except supervise.DesiredIntentError:
+            return False
+        status = supervise.read_status()
+        if desired is None or status is None:
+            return False
+        child = status.child
+        converged = lifecycle_state.authorize_supervisor_convergence(
+            lifecycle_state.SupervisorConvergenceFacts(
+                target_commit=commit,
+                minimum_generation=status.applied_generation,
+                desired_commit=desired.commit,
+                desired_generation=desired.generation,
+                applied_commit=status.commit,
+                applied_generation=status.applied_generation,
+                ready=status.ready,
+                holding=status.holding,
+                live_child=child is not None and supervise.child_alive(child),
+            )
+        )
+        return converged and cli.current_commit() == commit
+
+
+def _queue_deploy_restore_converged(commit: str, minimum_generation: int) -> bool:
+    """Return whether restore authority still owns a live queue-ready child."""
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        return False
+    status = supervise.read_status()
+    if desired is None or status is None:
+        return False
+    child = status.child
+    return lifecycle_state.authorize_supervisor_convergence(
+        lifecycle_state.SupervisorConvergenceFacts(
+            target_commit=commit,
+            minimum_generation=minimum_generation,
+            desired_commit=desired.commit,
+            desired_generation=desired.generation,
+            applied_commit=status.commit,
+            applied_generation=status.applied_generation,
+            ready=status.ready,
+            holding=status.holding,
+            live_child=child is not None and supervise.child_alive(child),
+        )
+    )
+
+
 def _restore_after_handoff_failure(
     options: DeployOptions,
     commit: str,
@@ -1914,14 +1966,7 @@ def _restore_after_handoff_failure(
             "restore"
         )
         return
-    status = supervise.read_status()
-    if (
-        status is not None
-        and status.commit == commit
-        and status.child is not None
-        and status.ready
-        and cli.current_commit() == commit
-    ):
+    if _queue_deploy_candidate_converged(commit):
         append_deploy_log(f"queue deploy fully converged on commit {commit}; nothing to restore")
         return
     if previous is None or previous.git_commit is None:
@@ -1942,8 +1987,18 @@ def _restore_after_handoff_failure(
         return
     restored = supervise.wait_for_generation(
         settle, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS
-    ) and supervise.wait_until_ready(settle, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS)
-    if restored and cli.reconcile_pointer(previous.git_commit):
+    ) and supervise.wait_until_ready(
+        settle,
+        supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        commit=previous.git_commit,
+    )
+    reconciled = False
+    if restored:
+        with supervise.generation_lock():
+            reconciled = _queue_deploy_restore_converged(
+                previous.git_commit, settle
+            ) and cli.reconcile_pointer(previous.git_commit)
+    if reconciled:
         append_deploy_log(
             "queue deploy failed after durable success; supervisor restored previous commit "
             f"{previous.git_commit} and the maintained CLIs"

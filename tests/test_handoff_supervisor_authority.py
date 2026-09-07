@@ -74,6 +74,7 @@ def _options() -> dc.Options:
 
 def _gated(state: dc.RollbackState) -> dc.GatedWorker:
     """Return a harmless gated-candidate test record."""
+    assert state.new_meta is not None
     return dc.GatedWorker(proc=MagicMock(), gate_writer=9, meta=state.new_meta)
 
 
