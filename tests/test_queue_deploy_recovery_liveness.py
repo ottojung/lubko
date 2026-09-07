@@ -50,9 +50,12 @@ def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
     previous = _previous(previous_commit)
     status = _status(candidate)
     requested: list[str] = []
+    desired = iter([_desired(candidate, 0), _desired(previous_commit, 7)])
 
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     monkeypatch.setattr(supervise, "read_status", lambda: status)
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: next(desired))
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
     monkeypatch.setattr(supervise, "child_alive", lambda _child: False)
     monkeypatch.setattr(cli, "current_commit", lambda: candidate)
 
@@ -61,8 +64,6 @@ def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
         return 7
 
     monkeypatch.setattr(supervise, "request_run", record_restore)
-    monkeypatch.setattr(supervise, "read_desired_strict", lambda: _desired(previous_commit, 7))
-    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
     monkeypatch.setattr(supervise, "wait_for_generation", lambda *_args: True)
     monkeypatch.setattr(supervise, "wait_until_ready", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(cli, "reconcile_pointer", lambda _commit: True)
@@ -79,19 +80,163 @@ def test_restore_after_handoff_failure_accepts_live_ready_child(
     """A synchronously live ready child remains a valid convergence proof."""
     candidate = "a" * 40
     previous = _previous("b" * 40)
-    status = _status(candidate)
+    status = _status(candidate, generation=7)
 
     def fail_restore(*_args: object, **_kwargs: object) -> int:
         raise AssertionError
 
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     monkeypatch.setattr(supervise, "read_status", lambda: status)
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: _desired(candidate, 7))
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
     monkeypatch.setattr(supervise, "child_alive", lambda child: child is status.child)
     monkeypatch.setattr(cli, "current_commit", lambda: candidate)
     monkeypatch.setattr(supervise, "request_run", fail_restore)
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
 
     lifecycle._restore_after_handoff_failure(_options(), candidate, previous)
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateCase:
+    desired_generation: int
+    desired_commit: str
+    applied_generation: int
+    applied_commit: str
+    child_alive: bool
+    cli_commit: str
+    expected: bool
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _CandidateCase(
+            desired_generation=7,
+            desired_commit="a" * 40,
+            applied_generation=7,
+            applied_commit="a" * 40,
+            child_alive=True,
+            cli_commit="a" * 40,
+            expected=True,
+        ),
+        _CandidateCase(
+            desired_generation=8,
+            desired_commit="a" * 40,
+            applied_generation=7,
+            applied_commit="a" * 40,
+            child_alive=True,
+            cli_commit="a" * 40,
+            expected=True,
+        ),
+        _CandidateCase(
+            desired_generation=8,
+            desired_commit="a" * 40,
+            applied_generation=8,
+            applied_commit="a" * 40,
+            child_alive=True,
+            cli_commit="a" * 40,
+            expected=True,
+        ),
+        _CandidateCase(
+            desired_generation=8,
+            desired_commit="c" * 40,
+            applied_generation=7,
+            applied_commit="a" * 40,
+            child_alive=True,
+            cli_commit="a" * 40,
+            expected=False,
+        ),
+        _CandidateCase(
+            desired_generation=7,
+            desired_commit="a" * 40,
+            applied_generation=7,
+            applied_commit="a" * 40,
+            child_alive=False,
+            cli_commit="a" * 40,
+            expected=False,
+        ),
+        _CandidateCase(
+            desired_generation=7,
+            desired_commit="a" * 40,
+            applied_generation=7,
+            applied_commit="a" * 40,
+            child_alive=True,
+            cli_commit="c" * 40,
+            expected=False,
+        ),
+    ],
+    ids=[
+        "exact-authority",
+        "newer-same-commit-desired",
+        "newer-same-commit-applied",
+        "newer-different-commit-desired",
+        "dead-child",
+        "cli-mismatch",
+    ],
+)
+def test_candidate_convergence_requires_current_compatible_authority(
+    monkeypatch: pytest.MonkeyPatch, case: _CandidateCase
+) -> None:
+    """Candidate convergence follows the shared desired/applied authority policy."""
+    candidate = "a" * 40
+    status = _status(case.applied_commit, generation=case.applied_generation)
+
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: _desired(case.desired_commit, case.desired_generation),
+    )
+    monkeypatch.setattr(supervise, "read_status", lambda: status)
+    monkeypatch.setattr(supervise, "child_alive", lambda _child: case.child_alive)
+    monkeypatch.setattr(cli, "current_commit", lambda: case.cli_commit)
+
+    assert lifecycle._queue_deploy_candidate_converged(candidate) is case.expected
+
+
+def test_candidate_convergence_holds_generation_lock_through_cli_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Desired, applied, liveness, and CLI proof share one generation lock."""
+    candidate = "a" * 40
+    status = _status(candidate, generation=7)
+    held = False
+
+    @contextmanager
+    def generation_lock() -> Iterator[None]:
+        nonlocal held
+        assert not held
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    def desired() -> SimpleNamespace:
+        assert held
+        return _desired(candidate, 7)
+
+    def current_status() -> SimpleNamespace:
+        assert held
+        return status
+
+    def child_alive(_child: object) -> bool:
+        assert held
+        return True
+
+    def current_commit() -> str:
+        assert held
+        return candidate
+
+    monkeypatch.setattr(supervise, "generation_lock", generation_lock)
+    monkeypatch.setattr(supervise, "read_desired_strict", desired)
+    monkeypatch.setattr(supervise, "read_status", current_status)
+    monkeypatch.setattr(supervise, "child_alive", child_alive)
+    monkeypatch.setattr(cli, "current_commit", current_commit)
+
+    assert lifecycle._queue_deploy_candidate_converged(candidate)
+    assert not held
 
 
 @dataclass(frozen=True, slots=True)
