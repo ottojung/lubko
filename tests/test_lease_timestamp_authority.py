@@ -93,9 +93,15 @@ def test_recovery_uses_strict_lease_timestamp_authority() -> None:
     conn = _Conn()
     recover_stale_jobs(cast("JobsConnection", conn), "test-server")
     query, params = conn.queries[0]
-    assert "jsonb_typeof((payload::jsonb)->'state'->'lease_expires_at') = 'string'" in query
+    assert (
+        "jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'lease_expires_at') = 'string'"  # ruff: ignore[line-too-long]
+        in query
+    )
     assert "~ %(lease_expires_at_pattern)s" in query
-    assert "left((payload::jsonb)->'state'->>'lease_expires_at', 4) <> '0000'" in query
+    assert (
+        "left(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'lease_expires_at', 4) <> '0000'"  # ruff: ignore[line-too-long]
+        in query
+    )
     assert "lease_expires_at' IS NOT NULL" not in query
     assert "FOR UPDATE SKIP LOCKED" in query
     assert isinstance(params, dict)

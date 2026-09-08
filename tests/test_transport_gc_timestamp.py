@@ -102,17 +102,34 @@ def test_gc_revalidates_timestamp_authority_before_phase_two_deletion() -> None:
         (mark_query, mark_params),
         (drain_query, drain_params),
     ):
-        assert "jsonb_typeof((payload::jsonb)->'state'->'finished_at') = 'string'" in query
+        assert (
+            "jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'finished_at') = 'string'"  # ruff: ignore[line-too-long]
+            in query
+        )
         assert "~ %(gc_finished_at_pattern)s" in query
-        assert "left((payload::jsonb)->'state'->>'finished_at', 4) <> '0000'" in query
+        assert (
+            "left(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'finished_at', 4) <> '0000'"  # ruff: ignore[line-too-long]
+            in query
+        )
         assert "finished_at') < gc_params.cutoff" in query
         assert isinstance(params, dict)
         assert params["gc_finished_at_pattern"] == GC_FINISHED_AT_PATTERN
 
     assert "IN ('succeeded', 'failed', 'cancelled')" in drain_query
-    assert "(payload::jsonb)->'state'->'gc' = 'true'::jsonb" in drain_query
-    assert "(payload::jsonb)->'state'->'gc' IS NULL" in mark_query
-    assert "(payload::jsonb)->'state'->'gc' = 'null'::jsonb" in mark_query
-    assert "(payload::jsonb)->'state'->'gc' = 'false'::jsonb" in mark_query
+    assert (
+        "((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'gc' = 'true'::jsonb"
+        in drain_query
+    )
+    assert (
+        "((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'gc' IS NULL" in mark_query
+    )
+    assert (
+        "((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'gc' = 'null'::jsonb"
+        in mark_query
+    )
+    assert (
+        "((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'gc' = 'false'::jsonb"
+        in mark_query
+    )
     assert "->>'gc'" not in mark_query
     assert "->>'gc'" not in drain_query
