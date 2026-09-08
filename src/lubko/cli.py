@@ -484,10 +484,10 @@ def _manifest_digest(data: object, commit: str) -> bytes | None:
         return None
 
 
-def runtime_is_usable(commit: str) -> bool:
+def runtime_is_usable(commit: str) -> bool:  # ruff: ignore[too-many-return-statements]
     """Return whether a commit runtime is complete, exactly bound, and sealed.
 
-    An unsealed, incomplete, wrong-commit, corrupt, or content-tampered tree is
+    An incomplete, wrong-commit, corrupt, or content-tampered tree is
     deliberately reported unusable so callers fail closed instead of launching
     arbitrary mutable code. The manifest's ``content_digest`` is recomputed over
     the current tree on every call, so a runtime that was unsealed, modified,
@@ -512,6 +512,22 @@ def runtime_is_usable(commit: str) -> bool:
     if expected is None:
         return False
     root = cli_commit_dir(commit)
+    try:
+        if _runtime_content_digest(root) != expected:
+            return False
+    except OSError:
+        return False
+    if _tree_is_read_only(root):
+        return True
+    # `cli/current` is the independently confirmed recovery anchor.  A failed
+    # deployment may have left its permission bits writable without changing
+    # any manifest-bound content.  In that exact case, restore the seal in
+    # place instead of treating the already-proven runtime as disposable.
+    # Candidate runtimes never get this privilege, and modified content was
+    # rejected above before any chmod occurs.
+    if current_commit() != commit:
+        return False
+    seal_runtime(commit)
     if not _tree_is_read_only(root):
         return False
     try:
@@ -631,6 +647,12 @@ def build_cli_root(repo: Path, commit: str, uv_path: str, timeout_seconds: float
     destination = cli_commit_dir(commit)
     if runtime_is_usable(commit):
         return destination
+    if current_commit() == commit:
+        msg = (
+            f"refusing to rebuild confirmed CLI environment for commit {commit}; "
+            "its manifest-bound content identity could not be restored"
+        )
+        raise CliError(msg)
     unseal_runtime(commit)
     if destination.exists():
         shutil.rmtree(destination)

@@ -525,3 +525,41 @@ def test_install_fails_closed_when_deploy_lock_is_busy(
     assert "deployment lock" in capsys.readouterr().err
     assert cli.current_commit() is None
     assert (bin_dir / "lubko-agent").is_file()
+
+
+def test_current_runtime_reseals_writable_content_identical_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The confirmed runtime self-reseals when only write bits drifted."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = head_commit(repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, head, "uv", 60.0)
+    cli.set_current(head)
+
+    cli.unseal_runtime(head)
+    assert not cli._tree_is_read_only(cli.cli_commit_dir(head))
+
+    assert cli.runtime_is_usable(head)
+    assert cli._tree_is_read_only(cli.cli_commit_dir(head))
+
+
+def test_current_runtime_never_rebuilds_tampered_writable_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writable confirmed content is re-sealed only when identity still matches."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = head_commit(repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    cli.build_cli_root(repo, head, "uv", 60.0)
+    cli.set_current(head)
+
+    cli.unseal_runtime(head)
+    marker = cli.cli_commit_dir(head) / "marker.txt"
+    marker.write_text("tampered\n", encoding="utf-8")
+
+    assert not cli.runtime_is_usable(head)
+    assert not cli._tree_is_read_only(cli.cli_commit_dir(head))
+    with pytest.raises(cli.CliError, match="refusing to rebuild confirmed CLI environment"):
+        cli.build_cli_root(repo, head, "uv", 60.0)
+    assert marker.read_text(encoding="utf-8") == "tampered\n"
