@@ -49,6 +49,8 @@ from typing import TYPE_CHECKING, Final
 
 from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
+from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
+from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
 from lubko.durable import write_json_durable
 from lubko.health import validate_incarnation_token
 from lubko.state import rollback_state_path, state_root
@@ -59,10 +61,6 @@ if TYPE_CHECKING:
 SCHEMA_VERSION: Final = 1
 
 BOOT_ID_PATH: Final = Path("/proc/sys/kernel/random/boot_id")
-
-STAT_MIN_FIELDS: Final = 20
-STAT_STARTTIME_FIELD_INDEX: Final = 19
-STAT_STATE_FIELD_INDEX: Final = 0
 
 MODE_RUN: Final = "run"
 MODE_IDLE: Final = "idle"
@@ -1825,30 +1823,21 @@ def wait_until_ready(generation: int, timeout_seconds: float, *, commit: str | N
 def proc_start_ticks(pid: int) -> int | None:
     """Return a process start time in clock ticks, or ``None`` if unknown.
 
+    Delegates to the shared ``_exact_signal.proc_start_ticks`` primitive.
+
     Args:
         pid: Process ID to inspect.
 
     Returns:
         The start time in clock ticks, or ``None`` when unreadable.
     """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return None
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return None
-    fields = stat[close_paren + 2 :].split()
-    if len(fields) < STAT_MIN_FIELDS:
-        return None
-    try:
-        return int(fields[STAT_STARTTIME_FIELD_INDEX])
-    except ValueError:
-        return None
+    return _shared_proc_start_ticks(pid)
 
 
 def _process_is_zombie(pid: int) -> bool:
     """Return whether a process is a zombie or dead.
+
+    Delegates to the shared ``_exact_signal.process_is_zombie`` primitive.
 
     Args:
         pid: Process ID to inspect.
@@ -1856,17 +1845,7 @@ def _process_is_zombie(pid: int) -> bool:
     Returns:
         ``True`` when the process is zombie, dead, or unreadable.
     """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return True
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return True
-    fields = stat[close_paren + 2 :].split()
-    if not fields:
-        return True
-    return fields[STAT_STATE_FIELD_INDEX] in {b"Z", b"X"}
+    return _shared_process_is_zombie(pid)
 
 
 def child_alive(child: WorkerChild) -> bool:

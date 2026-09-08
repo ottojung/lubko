@@ -39,6 +39,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 
 from lubko._exact_signal import pidfd_send_signal
+from lubko._exact_signal import proc_cpu_seconds as _shared_proc_cpu_seconds
+from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
+from lubko._exact_signal import process_state_char as _shared_process_state_char
 from lubko.durable import write_text_durable
 from lubko.worker import group_has_members
 
@@ -353,28 +356,22 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
 def proc_start_ticks(pid: int) -> int | None:
     """Return the process start time in clock ticks (unique per boot).
 
+    Delegates to the shared ``_exact_signal.proc_start_ticks`` primitive.
+
     Args:
         pid: Process ID to inspect.
 
     Returns:
         The start time in clock ticks, or ``None`` when unavailable.
     """
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    rest = stat[stat.rfind(")") + 1 :].split()
-    try:
-        return int(rest[19])
-    except (ValueError, IndexError):
-        return None
+    return _shared_proc_start_ticks(pid)
 
 
 def proc_cpu_seconds(pid: int | None) -> float | None:
     """Return the total CPU time in seconds used by a process, or ``None``.
 
-    Reads the user and system CPU time of the process from Linux
-    ``/proc/<pid>/stat`` and converts clock ticks to seconds.
+    Delegates to the shared ``_exact_signal.proc_cpu_seconds`` primitive.
+    Accepts ``None`` for backward-compatible callers.
 
     Args:
         pid: Process ID to inspect, or ``None``.
@@ -384,22 +381,7 @@ def proc_cpu_seconds(pid: int | None) -> float | None:
     """
     if not pid:
         return None
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    rest = stat[stat.rfind(")") + 1 :].split()
-    try:
-        ticks = int(rest[11]) + int(rest[12])
-    except (ValueError, IndexError):
-        return None
-    try:
-        ticks_per_second = os.sysconf("SC_CLK_TCK")
-    except (ValueError, OSError):
-        return None
-    if not ticks_per_second:
-        return None
-    return ticks / ticks_per_second
+    return _shared_proc_cpu_seconds(int(pid))
 
 
 def env_has_marker(pid: int, aid: str) -> bool:
@@ -1080,8 +1062,10 @@ def _runner_marker_alive(aid: str, expected_gen: int) -> bool:
 def _is_zombie(pid: int) -> bool:
     """Return whether a live PID names a zombie (defunct) process.
 
-    A zombie can no longer do work, so it must never be trusted as a live
-    owner of a reservation.
+    Uses the shared ``process_state_char`` primitive and adapts the unknown
+    (unreadable) case to ``False``.  This is correct when the caller already
+    knows the process exists (e.g. via a pidfd pin) and will handle
+    unreadable stat separately via ``proc_start_ticks``.
 
     Args:
         pid: Process ID to inspect.
@@ -1089,14 +1073,10 @@ def _is_zombie(pid: int) -> bool:
     Returns:
         ``True`` when the process is a zombie and cannot bring up a runner.
     """
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
+    state = _shared_process_state_char(pid)
+    if state is None:
         return False
-    rest = stat[stat.rfind(")") + 1 :].split()
-    if not rest:
-        return False
-    return rest[0] == "Z"
+    return state in {"Z", "X"}
 
 
 def _owner_alive(owner: object, owner_ticks: object) -> bool:

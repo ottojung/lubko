@@ -41,9 +41,20 @@ from typing import TYPE_CHECKING, Final, cast
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, lifecycle_state, protocol, startup_contract, supervise, toolchain
+from lubko import (
+    _exact_signal,
+    cli,
+    lifecycle_state,
+    protocol,
+    startup_contract,
+    supervise,
+    toolchain,
+)
 from lubko._exact_signal import open_pidfd as _open_exact_pidfd
 from lubko._exact_signal import pidfd_send_signal, process_pgrp
+from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
+from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
+from lubko._exact_signal import process_ppid as _shared_process_ppid
 from lubko.config import (
     load_database_config,
     load_worker_server,
@@ -98,12 +109,6 @@ LOCK_POLL_INTERVAL_SECONDS: Final = 0.1
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 5.0
 SESSION_WAIT_INTERVAL_SECONDS: Final = 0.01
 UV_HTTP_TIMEOUT: Final = "30"
-
-STAT_MIN_FIELDS: Final = 20
-STAT_STARTTIME_FIELD_INDEX: Final = 19
-STAT_STATE_FIELD_INDEX: Final = 0
-STAT_PPID_FIELD_INDEX: Final = 1
-STAT_PPID_MIN_FIELDS: Final = 2
 
 VALIDATION_STEPS: Final = (
     ("sync",),
@@ -400,8 +405,7 @@ def lock_path() -> Path:
 def proc_start_ticks(pid: int) -> int | None:
     """Return a process start time in clock ticks, or ``None`` if unknown.
 
-    The start time is unique per process on a boot and survives PID reuse, so
-    it anchors identity checks.
+    Delegates to the shared ``_exact_signal.proc_start_ticks`` primitive.
 
     Args:
         pid: Process ID to inspect.
@@ -409,24 +413,13 @@ def proc_start_ticks(pid: int) -> int | None:
     Returns:
         The start time in clock ticks, or ``None`` when unreadable.
     """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return None
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return None
-    fields = stat[close_paren + 2 :].split()
-    if len(fields) < STAT_MIN_FIELDS:
-        return None
-    try:
-        return int(fields[STAT_STARTTIME_FIELD_INDEX])
-    except ValueError:
-        return None
+    return _shared_proc_start_ticks(pid)
 
 
 def process_is_zombie(pid: int) -> bool:
     """Return whether a process is a zombie or dead.
+
+    Delegates to the shared ``_exact_signal.process_is_zombie`` primitive.
 
     Args:
         pid: Process ID to inspect.
@@ -434,17 +427,7 @@ def process_is_zombie(pid: int) -> bool:
     Returns:
         ``True`` when the process is zombie, dead, or unreadable.
     """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return True
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return True
-    fields = stat[close_paren + 2 :].split()
-    if not fields:
-        return True
-    return fields[STAT_STATE_FIELD_INDEX] in {b"Z", b"X"}
+    return _shared_process_is_zombie(pid)
 
 
 def process_identity(pid: int) -> ProcessIdentity | None:
@@ -561,12 +544,12 @@ def process_absence_proven(pid: int, start_time_ticks: int | None) -> bool:
         return False
     close_paren = stat.rfind(b")")
     fields = stat[close_paren + 2 :].split() if close_paren != -1 else []
-    if len(fields) < STAT_MIN_FIELDS:
+    if len(fields) < _exact_signal.STAT_MIN_FIELDS:
         return False
-    if fields[STAT_STATE_FIELD_INDEX] in {b"Z", b"X"}:
+    if fields[_exact_signal.STAT_STATE_FIELD_INDEX] in {b"Z", b"X"}:
         return True
     try:
-        observed_start = int(fields[STAT_STARTTIME_FIELD_INDEX])
+        observed_start = int(fields[_exact_signal.STAT_STARTTIME_FIELD_INDEX])
     except ValueError:
         observed_start = None
     return (
@@ -2729,26 +2712,15 @@ def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
 def _read_ppid(pid: int) -> int | None:
     """Read the exact parent process ID of a live process.
 
+    Delegates to the shared ``_exact_signal.process_ppid`` primitive.
+
     Args:
         pid: Process whose parent to inspect.
 
     Returns:
         The parent PID, or ``None`` when the process is gone or unreadable.
     """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return None
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return None
-    fields = stat[close_paren + 2 :].split()
-    if len(fields) < STAT_PPID_MIN_FIELDS:
-        return None
-    try:
-        return int(fields[STAT_PPID_FIELD_INDEX])
-    except ValueError:
-        return None
+    return _shared_process_ppid(pid)
 
 
 def _spawned_by_recovery_worker(process_pid: int, recovery_worker_pid: int) -> bool:

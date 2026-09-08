@@ -36,7 +36,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from lubko import _exact_signal
 from lubko import config as _config
+from lubko._exact_signal import _read_proc_stat, _split_stat_fields
 from lubko.durable import (
     DurabilityError,
     fsync_directory,
@@ -741,23 +743,11 @@ def install_and_validate_startup_definition(bin_home: Path) -> str | None:
     return None
 
 
-def _read_proc_stat(pid: int) -> bytes | None:
-    """Read the raw ``/proc/<pid>/stat`` bytes, or ``None`` if unreadable.
-
-    Args:
-        pid: Process ID to inspect.
-
-    Returns:
-        The raw stat bytes, or ``None`` when the process is gone.
-    """
-    try:
-        return (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return None
-
-
 def _parse_stat_fields(stat: bytes | None) -> tuple[int, int, str] | None:
     """Extract the minimal identity fields from ``/proc/<pid>/stat`` bytes.
+
+    Uses the shared ``_exact_signal._split_stat_fields`` helper for the
+    canonical ``/proc/<pid>/stat`` parsing.
 
     Args:
         stat: Raw ``/proc/<pid>/stat`` bytes, or ``None`` when unreadable.
@@ -768,16 +758,13 @@ def _parse_stat_fields(stat: bytes | None) -> tuple[int, int, str] | None:
     """
     if stat is None:
         return None
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return None
-    fields = stat[close_paren + 2 :].split()
-    if len(fields) < STAT_MIN_FIELDS:
+    fields = _split_stat_fields(stat)
+    if fields is None:
         return None
     try:
-        ppid = int(fields[STAT_PPID_FIELD_INDEX])
-        start_time_ticks = int(fields[STAT_STARTTIME_FIELD_INDEX])
-        state = fields[STAT_STATE_FIELD_INDEX].decode("ascii", "replace")
+        ppid = int(fields[_exact_signal.STAT_PPID_FIELD_INDEX])
+        start_time_ticks = int(fields[_exact_signal.STAT_STARTTIME_FIELD_INDEX])
+        state = fields[_exact_signal.STAT_STATE_FIELD_INDEX].decode("ascii", "replace")
     except (ValueError, UnicodeDecodeError):
         return None
     return ppid, start_time_ticks, state
@@ -1134,13 +1121,3 @@ def _read_cmdline(pid: int) -> str:
     except OSError:
         return ""
     return " ".join(part.decode("utf-8", "replace") for part in raw.split(b"\0") if part)
-
-
-#: Minimum field count of a ``/proc/<pid>/stat`` line we can interpret.
-STAT_MIN_FIELDS: Final = 20
-#: Index of the process state field in ``/proc/<pid>/stat``.
-STAT_STATE_FIELD_INDEX: Final = 0
-#: Index of the parent-PID field in ``/proc/<pid>/stat``.
-STAT_PPID_FIELD_INDEX: Final = 1
-#: Index of the start-time (clock ticks) field in ``/proc/<pid>/stat``.
-STAT_STARTTIME_FIELD_INDEX: Final = 19
