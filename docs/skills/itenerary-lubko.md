@@ -1,96 +1,53 @@
 # Lubko scheduled-work itinerary
 
-## What this document is
+## Scope
 
 This is the **sole entry point** for scheduled ChatGPT tasks that maintain the Lubko repository itself.
 
-The target repository is:
+Target repository:
 
 <https://github.com/ottojung/lubko>
 
-A scheduled task should point only to this document. This document supplies the Lubko-specific work-selection and release-flow policy, then delegates shared scheduled-orchestrator mechanics and Lubko operation to the canonical reusable documents.
+Before acting, study and obey:
 
-## Start every scheduled run here
+- <https://github.com/ottojung/lubko/blob/main/docs/SKILL.md>
+- <https://github.com/ottojung/lubko/blob/main/docs/skills/scheduled.md>
 
-At the start of every run:
+`docs/skills/scheduled.md` owns the reusable scheduled-orchestrator mechanics. This itinerary contains only Lubko-specific work-selection, integration, and completion policy; do not restate the shared mechanics here.
 
-1. Study <https://github.com/ottojung/lubko/blob/main/docs/SKILL.md> and obey it for normal Lubko operation.
-2. Study <https://github.com/ottojung/lubko/blob/main/docs/skills/scheduled.md> and obey its scheduled-run, ownership, abandonment, recovery, and liveness rules.
-3. Treat <https://github.com/ottojung/lubko> as the target repository.
-4. Inspect the target repository's own operating instructions and current GitHub state before acting.
-5. Determine the concrete work to do according to the policy below.
-6. Continue until that work reaches the completion condition in this document; do not stop after merely inspecting or reporting what could be done.
+## Work selection
 
-## Choosing which work to do
+Apply `docs/skills/scheduled.md`, with these Lubko-specific choices:
 
-Inspect the Lubko repository's open GitHub issues and their canonical orchestrator status comments before choosing work.
+- Prefer inheriting abandoned issue-tracked work over selecting a new issue.
+- If there is no abandoned work to inherit, choose an actionable open Lubko issue that is neither actively owned nor already completed under the shared scheduled-work protocol.
+- Once selected, drive the issue to the Lubko-specific completion condition below.
 
-Apply the ownership rules from `docs/skills/scheduled.md`, with this Lubko-specific selection policy:
+## Release integration
 
-- A `working` status whose canonical status comment was updated less than 10 minutes ago is actively owned by another orchestrator. Do not intentionally work on that issue.
-- A `working` status whose canonical status comment was updated at least 10 minutes ago is abandoned and inheritable.
-- **Prefer inheriting abandoned work over selecting a new issue.**
-- A `completed` orchestrator status is finished scheduled work. Do not select it as new work merely because the GitHub issue remains open.
-- If there is no abandoned work to inherit, choose an actionable open Lubko issue that has neither an active `working` status nor a `completed` orchestrator status.
+Scheduled Lubko work accumulates in one current active `release/*` branch. A human promotes that release branch into `main`.
 
-Immediately after choosing an issue, claim or inherit it through the canonical orchestrator status comment exactly as `docs/skills/scheduled.md` requires, then re-read the comment to confirm ownership before starting substantial work.
+- The active release branch is the latest `release/*` branch that has **never** been promoted into `main`.
+- A release branch is permanently retired after its first promotion into `main`, even if commits are accidentally added to it later.
+- If no active release branch exists, create one from current `main`.
+- Reuse the same active release branch across scheduled issues; do not create one release branch per issue.
+- Before starting issue work, merge current `main` into the active release branch and verify the result.
+- Start each issue branch from the active release branch in an isolated worktree.
+- Open the issue PR against the active release branch, not `main`.
+- After required implementation, verification, and orchestrator review, merge the issue PR into the active release branch.
+- After that merge, merge the latest `main` into the active release branch again and verify the exact resulting release head.
+- If work is accidentally added to a retired release branch, preserve any unique work by moving it onto the active release branch, then stop using the retired branch.
+- There must be at most one open release-promotion PR targeting `main`, and it must come from the current active release branch. Close stale or redundant promotion PRs after verifying that the active release contains any needed work.
 
-When inheriting, reconstruct the existing work from objective state: the status comment's recorded resources, Lubko jobs and agents, worktrees, branches, PRs, issue discussion, CI, and any other durable state.
+Scheduled orchestrators must not merge issue/task PRs into `main` and must not merge `release/*` into `main`. Promotion into `main` is the human review boundary.
 
-Once an issue is selected, **drive it until completion**. Do not substitute a status report, partial implementation, or recommendation for completion when the remaining work is actionable.
+## Completion
 
-## Lubko release-branch workflow
+A scheduled Lubko issue is complete when:
 
-Scheduled/unattended Lubko work must not be merged directly into `main`. Completed scheduled work accumulates in the latest active unmerged `release/*` branch. A human periodically reviews that release branch and promotes it into `main`.
+- its reviewed work is merged into the current active release branch;
+- the release branch is reconciled with current `main`;
+- the repository-required verification passes on the exact resulting release head;
+- no unresolved review blocker remains.
 
-### Release branch lifecycle
-
-- Find the latest active unmerged `release/*` branch.
-- If none exists, create one from the current `main`.
-- Do not create one release branch per issue.
-- Reuse the latest active release branch across scheduled runs and across multiple completed issues.
-- Once that release branch has been merged into `main`, stop using it and create a fresh release branch from the new `main` head.
-- A date/timestamp-based name such as `release/2026-08-15` is acceptable.
-
-### Keep the release branch reconciled with `main`
-
-Whenever a scheduled invocation begins operating on the current release branch, first update `main` and merge it into the release branch:
-
-```sh
-git checkout <release-branch>
-git merge origin/main
-```
-
-Resolve conflicts and verify the release branch before starting new work.
-
-After merging a completed task PR into the release branch, merge the latest `main` into the release branch again and run the required verification.
-
-This does not guarantee that a future `main` commit cannot conflict, but it ensures the unattended release branch is reconciled with the latest known `main` whenever the scheduled orchestrator operates.
-
-### Issue branches and PRs
-
-For each Lubko issue:
-
-- start from the current `release/*` branch;
-- create a normal issue/task branch in an isolated worktree as required by `docs/SKILL.md`;
-- implement, test, and independently review the work;
-- push the task branch normally;
-- open the task PR against the **current release branch**, not `main`;
-- merge the completed/reviewed task PR into the release branch;
-- use the updated release branch as the base for subsequent Lubko work.
-
-Hard rules:
-
-```text
-Scheduled orchestrator MAY:
-    create release/* from main
-    merge main -> release/*
-    create task branches from release/*
-    merge reviewed task PRs -> release/*
-
-Scheduled orchestrator MUST NOT:
-    merge unattended task PRs -> main
-    merge release/* -> main
-```
-
-Promotion of `release/*` into `main` is the human review boundary.
+After those conditions hold, complete the shared orchestrator workflow according to `docs/skills/scheduled.md`.
