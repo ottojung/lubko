@@ -68,7 +68,7 @@ EXIT_OK: Final = 0
 EXIT_ERROR: Final = 1
 ROLLBACK_SCHEMA_VERSION: Final = 4
 #: Stable on-disk compatibility envelope for supervisor-owned missions.
-#: The deployed 7b1e supervisor understands schema 3 and ignores additive fields.
+#: Schema-3 predecessor supervisors understand this envelope and ignore additive fields.
 SUPERVISOR_ROLLBACK_WIRE_SCHEMA_VERSION: Final = 3
 SUPPORTED_ROLLBACK_SCHEMA_VERSIONS: Final = frozenset({2, 3})
 STATUS_PENDING: Final = "pending"

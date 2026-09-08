@@ -90,10 +90,10 @@ def _supervised_mission() -> deployctl.RollbackState:
     )
 
 
-def _assert_deployed_v3_reader_accepts(payload: dict[str, object]) -> None:
-    """Assert the frozen rollback subset parsed by deployed supervisor `7b1e4048`.
+def _assert_schema3_predecessor_reader_accepts(payload: dict[str, object]) -> None:
+    """Assert the frozen rollback subset required by schema-3 predecessor supervisors.
 
-    The deployed schema-3 parser requires these fields and delegates both worker
+    The predecessor schema-3 parser requires these fields and delegates both worker
     mappings to ``WorkerMeta.from_dict``. It ignores additive keys. Keeping this
     contract executable prevents a future controller from publishing a mission
     the already-running trusted supervisor cannot read.
@@ -135,11 +135,11 @@ def _assert_deployed_v3_reader_accepts(payload: dict[str, object]) -> None:
     assert candidate.worker_id is None
 
 
-def test_supervisor_owned_wire_is_readable_by_deployed_v3_supervisor() -> None:
-    """The first upgrade cannot publish state the running trusted supervisor rejects."""
+def test_supervisor_owned_wire_is_readable_by_schema3_predecessor() -> None:
+    """A rolling upgrade cannot publish state the running trusted predecessor rejects."""
     payload = _supervised_mission().to_dict()
 
-    _assert_deployed_v3_reader_accepts(payload)
+    _assert_schema3_predecessor_reader_accepts(payload)
     parsed = deployctl.RollbackState.from_dict(payload)
     assert parsed.new_meta is None
     assert parsed.supervisor_owned is True
