@@ -61,7 +61,7 @@ class _BackendFailureRule:
 
 
 # Implementation details (hidden from the user-facing interface).
-AGENT_MODEL: Final = "muse-v2.5"
+AGENT_MODEL: Final = "opencode-go/mimo-v2.5"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
@@ -125,6 +125,7 @@ BACKEND_CLASSIFICATION_MAX_CHARS: Final = 80
 BACKEND_FIELD_MAX_CHARS: Final = 200
 BACKEND_RETRY_MAX_ATTEMPTS: Final = 2
 BACKEND_RETRY_BASE_SECONDS: Final = 0.5
+MODEL_CATALOG_TIMEOUT_SECONDS: Final = 10.0
 BACKEND_FAILURE_RULES: Final = (
     _BackendFailureRule(
         marker="Unexpected server error",
@@ -1816,6 +1817,42 @@ def _persisted_variant(meta: Meta) -> str:
     return variant
 
 
+def _configured_model_available(env: dict[str, str]) -> bool | None:
+    """Return whether OpenCode positively lists the configured agent model.
+
+    Catalog lookup is diagnostic authority only when OpenCode successfully
+    returns a catalog.  Transport, executable, and timeout failures remain
+    inconclusive so ordinary backend handling can report the real failure.
+
+    Args:
+        env: Environment used for the underlying OpenCode invocation.
+
+    Returns:
+        ``True`` when the configured model is listed, ``False`` when a
+        successful catalog proves it absent, or ``None`` when enumeration is
+        inconclusive.
+    """
+    executable = shutil.which("opencode", path=env.get("PATH"))
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "models"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=MODEL_CATALOG_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    models = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return AGENT_MODEL in models
+
+
 def build_agent_command(meta: Meta, prompt: str, *, is_continue: bool) -> list[str] | None:
     """Return the argv used to launch the underlying agent for this invocation.
 
@@ -3260,6 +3297,9 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     running = derive_state(meta) == "running"
     if running and not args.steer and (is_alive(meta) or reservation_in_flight(meta)):
         _err(f"{PROG}: agent {aid} is still running; use --steer to redirect it")
+        return EXIT_ERROR
+    if _configured_model_available(dict(os.environ)) is False:
+        _err(f"{PROG}: configured OpenCode model {AGENT_MODEL!r} is unavailable")
         return EXIT_ERROR
     return _dispatch_invocation(args, prompt)
 
