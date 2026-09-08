@@ -32,19 +32,17 @@ pytestmark = pytest.mark.skipif(DSN is None, reason="real PostgreSQL DSN not con
 
 
 def _payload(*, server: str, status: str, **state: object) -> str:
-    return json.dumps(
-        {
-            "v": CURRENT_PROTOCOL_VERSION,
-            "type": "command",
-            "server": server,
-            "request": {"cwd": "/", "process": ["true"]},
-            "state": {
-                "status": status,
-                "created_at": "2026-01-01T00:00:00.000000Z",
-                **state,
-            },
-        }
-    )
+    return json.dumps({
+        "v": CURRENT_PROTOCOL_VERSION,
+        "type": "command",
+        "server": server,
+        "request": {"cwd": "/", "process": ["true"]},
+        "state": {
+            "status": status,
+            "created_at": "2026-01-01T00:00:00.000000Z",
+            **state,
+        },
+    })
 
 
 def _insert(conn: psycopg.Connection[object], payload: str) -> UUID:
@@ -74,18 +72,16 @@ def test_malformed_rows_do_not_poison_worker_operations() -> None:
         unrelated = _insert(conn, "[]")
         future = _insert(
             conn,
-            json.dumps(
-                {
-                    "v": CURRENT_PROTOCOL_VERSION + 1000,
-                    "type": "command",
-                    "server": server,
-                    "request": {"cwd": "/", "process": ["false"]},
-                    "state": {
-                        "status": "pending",
-                        "created_at": "2026-01-01T00:00:00.000001Z",
-                    },
-                }
-            ),
+            json.dumps({
+                "v": CURRENT_PROTOCOL_VERSION + 1000,
+                "type": "command",
+                "server": server,
+                "request": {"cwd": "/", "process": ["false"]},
+                "state": {
+                    "status": "pending",
+                    "created_at": "2026-01-01T00:00:00.000001Z",
+                },
+            }),
         )
         other_server = _insert(conn, _payload(server="other-server", status="pending"))
         pending = _insert(conn, _payload(server=server, status="pending"))
