@@ -655,17 +655,23 @@ def _supervised_confirmation_authority_matches(
 ) -> bool:
     """Return whether desired and applied authority remain compatible with a mission.
 
-    A newer same-commit desired generation is still compatible: it can represent a
-    restart or migration obligation that confirmation must preserve and await. A
-    different commit, missing authority surface, or an applied generation outside
-    the mission-to-desired interval is superseding or contradictory authority.
+    The mission itself may be the newest durable supervisor intent. In that case
+    ``desired`` legitimately still names an older generation (and may still name
+    the previous commit) while the supervisor has applied the mission generation
+    directly. That older desired intent is superseded by the mission, so exact
+    application of the mission remains compatible.
+
+    A desired generation at or after the mission is different: it is a newer
+    lifecycle obligation and must name the same commit, with the applied generation
+    bounded between the mission and desired generations. Missing, contradictory,
+    or otherwise out-of-range authority still fails closed.
     """
+    if desired is None or status is None or status.commit != state.commit:
+        return False
+    if desired.generation < state.generation:
+        return status.applied_generation == state.generation
     return (
-        desired is not None
-        and status is not None
-        and desired.commit == state.commit
-        and desired.generation >= state.generation
-        and status.commit == state.commit
+        desired.commit == state.commit
         and state.generation <= status.applied_generation <= desired.generation
     )
 
