@@ -1,8 +1,9 @@
 # Repository governance contract
 
-This document is the change-integrity contract for the default branch. It is
-the source of truth for how a commit becomes the tip of `main`; every other
-place that describes branch protection must stay consistent with it.
+This document is the change-integrity contract for `main` and active `release/*`
+branches. It is the source of truth for how a commit becomes the tip of `main`
+or of an active release branch; every other place that describes branch
+protection must stay consistent with it.
 
 Lubko validates one canonical pipeline. That pipeline is the only thing that
 may authorize `main` to advance, and it is enforced by a GitHub ruleset, not by
@@ -89,3 +90,53 @@ recoverable ruleset modification.
 The enforcement is configured in the active `main1` repository ruleset
 (target `branch`, default-branch ref condition). It carries the rules
 `deletion`, `non_fast_forward`, `pull_request`, and `required_status_checks`.
+
+# Release-branch integrity contract
+
+This section extends the change-integrity contract to active `release/*`
+branches. The same class of protection that guards `main` must also guard the
+branches where release integration occurs.
+
+## The contract
+
+For branches matching `release/*`:
+
+1. **No direct pushes.** Every change reaches a release branch through a pull
+   request. The `release1` repository ruleset's `pull_request` rule blocks
+   updates that are not made via a merged PR. Direct pushes are prohibited
+   entirely — they are not validated after the fact, they are rejected.
+2. **Canonical CI must pass on an up-to-date integration.** The same `test` job
+   in `.github/workflows/ci.yml` that gates `main` must complete successfully
+   on the release-branch integration. The ruleset's `required_status_checks`
+   rule (with strict policy enabled) blocks a merge unless a passing `test`
+   check exists on an integration that includes the latest base-branch state.
+3. **No silent bypass.** The ruleset has no bypass actors. Administrators and
+   bots cannot override the contract through a normal path.
+4. **Same test command.** The release branch uses the identical canonical
+   validation pipeline as `main`: frozen sync, formatting, lint, strict types,
+   and the complete test suite.
+5. **Branch creation is not blocked.** The ruleset is created with
+   `do_not_enforce_on_create: true`. A new release branch can be created from
+   `main` without passing CI first or requiring a PR; once the branch exists,
+   all subsequent advancement requires the PR + CI path.
+
+## Why a separate ruleset
+
+A dedicated `release1` ruleset (rather than extending `main1`) keeps the
+release-branch contract auditable as its own ruleset. The `release/*` ref
+pattern targets all active release branches, and `do_not_enforce_on_create`
+preserves the branch-creation bootstrap path without creating a loophole for
+subsequent unvalidated advancement.
+
+## Required check name
+
+The ruleset references the same `test` check name as the `main1` ruleset.
+Renaming the job in `.github/workflows/ci.yml` is a governance change that
+must be paired with an update to both `main1` and `release1` rulesets.
+
+## Where it lives
+
+The enforcement is configured in the active `release1` repository ruleset
+(target `branch`, ref pattern `release/*`). It carries the rules `deletion`,
+`non_fast_forward`, `pull_request`, and `required_status_checks` (strict, with
+`do_not_enforce_on_create: true`).
