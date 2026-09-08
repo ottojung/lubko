@@ -36,7 +36,7 @@ _READY_SCRIPT = "import os,sys;os.write(int(sys.argv[1]),b'\\n');sys.stdin.read(
 
 def _spawn_ready_child(
     *,
-    aid: str,
+    aid: str | None = None,
     iid: str | None = None,
     start_new_session: bool = True,
 ) -> tuple[subprocess.Popen[bytes], int]:
@@ -48,6 +48,11 @@ def _spawn_ready_child(
     closes both ends of the pipe, and positively reads the child's identity
     from ``/proc`` once — no polling, no sleep.
 
+    When *aid* is ``None`` no ``LUBKO_AGENT_ID`` or invocation markers are
+    injected — the child inherits a clean inherited environment.  When *aid*
+    is given, the corresponding marker (and optionally *iid*) is set so that
+    ``send_signal_group`` verification can succeed.
+
     ``start_new_session`` defaults to ``True`` so the child is its own session
     leader (``pid == pgid``), the common test requirement.
 
@@ -58,7 +63,8 @@ def _spawn_ready_child(
         leaves the child un-reaped.
     """
     env = dict(os.environ)
-    env["LUBKO_AGENT_ID"] = aid
+    if aid is not None:
+        env["LUBKO_AGENT_ID"] = aid
     if iid is not None:
         env[agent.INVOCATION_ID_VAR] = iid
     rd, wr = os.pipe()
@@ -695,7 +701,7 @@ def test_unrecorded_invocation_live_child_keeps_blocking_hold(
     monkeypatch.setattr(agent, "ABORT_REAP_SECONDS", 0.0)
     monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
 
-    proc, rd = _spawn_ready_child(aid=aid, iid=iid)
+    proc, rd = _spawn_ready_child()
     try:
         start = _await_ready(proc, rd)
         agent._kill_unrecorded_invocation(aid, proc, start, iid)
@@ -879,7 +885,7 @@ def test_delete_honors_unresolved_child_until_exactly_proven_gone(
     seed["delete_pending"] = True
     agent.write_meta(aid, seed)
 
-    proc, rd = _spawn_ready_child(aid=aid, iid=iid)
+    proc, rd = _spawn_ready_child()
     try:
         marker = {
             "pid": proc.pid,
@@ -947,7 +953,7 @@ def test_spawn_gate_refusal_durably_records_child_before_any_cleanup(
     seed["stop_reason"] = "kill"
     agent.write_meta(aid, seed)
 
-    proc, rd = _spawn_ready_child(aid=aid, iid=iid)
+    proc, rd = _spawn_ready_child()
     try:
         start = _await_ready(proc, rd)
         blocked: dict[str, bool] = {}
