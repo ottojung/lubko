@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 from lubko._exact_signal import open_pidfd as _open_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
+from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko.state import worker_state_dir
 
 LOGGER: Final = logging.getLogger(__name__)
@@ -1080,19 +1081,10 @@ def worker_health_payload(
     }
 
 
-# ---------------------------------------------------------------------------
-# Process identity helpers
-# ---------------------------------------------------------------------------
-
-STAT_MIN_FIELDS: Final = 20
-STAT_STARTTIME_FIELD_INDEX: Final = 19
-
-
 def proc_start_ticks(pid: int) -> int | None:
     """Return a process start time in clock ticks, or ``None`` if unknown.
 
-    The start time is unique per process on a boot and survives PID reuse,
-    so it anchors identity checks.
+    Delegates to the shared ``_exact_signal.proc_start_ticks`` primitive.
 
     Args:
         pid: Process ID to inspect.
@@ -1100,20 +1092,7 @@ def proc_start_ticks(pid: int) -> int | None:
     Returns:
         The start time in clock ticks, or ``None`` when unreadable.
     """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return None
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return None
-    fields = stat[close_paren + 2 :].split()
-    if len(fields) < STAT_MIN_FIELDS:
-        return None
-    try:
-        return int(fields[STAT_STARTTIME_FIELD_INDEX])
-    except ValueError:
-        return None
+    return _shared_proc_start_ticks(pid)
 
 
 # ---------------------------------------------------------------------------

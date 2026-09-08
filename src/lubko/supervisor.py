@@ -85,6 +85,7 @@ from lubko import cli, deployctl, lifecycle, lifecycle_state, supervise
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
+from lubko._exact_signal import process_ppid as _shared_process_ppid
 from lubko.config import load_database_config
 from lubko.durable import DurabilityError, remove_durable
 from lubko.health import (
@@ -267,8 +268,6 @@ DB_CHECK_INTERVAL_SECONDS: Final = 15.0
 #: Bounded per-step timeout for preparing the migrated commit's CLI
 #: environment during cold-migration completion.
 COLD_MIGRATION_CLI_TIMEOUT_SECONDS: Final = cli.DEFAULT_BUILD_TIMEOUT_SECONDS
-STAT_PPID_FIELD_INDEX: Final = 1
-STAT_PPID_MIN_FIELDS: Final = 2
 
 #: ``PR_SET_PDEATHSIG`` from ``linux/prctl.h``: ask the kernel to deliver a
 #: signal to the forked child whenever its parent thread dies.
@@ -479,26 +478,15 @@ def _identity_is_private_session(identity: ProcessIdentity) -> bool:
 def _process_ppid(pid: int) -> int | None:
     """Return the exact parent process ID of a live process.
 
+    Delegates to the shared ``_exact_signal.process_ppid`` primitive.
+
     Args:
         pid: Process whose parent to inspect.
 
     Returns:
         The parent PID, or ``None`` when the process is gone or unreadable.
     """
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
-    except OSError:
-        return None
-    close_paren = stat.rfind(b")")
-    if close_paren == -1:
-        return None
-    fields = stat[close_paren + 2 :].split()
-    if len(fields) < STAT_PPID_MIN_FIELDS:
-        return None
-    try:
-        return int(fields[STAT_PPID_FIELD_INDEX])
-    except ValueError:
-        return None
+    return _shared_process_ppid(pid)
 
 
 def _runtime_dir(commit: str | None) -> str:
