@@ -68,6 +68,27 @@ def missing_entry_points() -> list[str]:
     return [entry for entry in cli.ENTRY_POINTS if not (bin_home() / entry).is_file()]
 
 
+def invalid_entry_points() -> list[str]:
+    """Return stable launchers whose installed bytes or mode violate the contract.
+
+    Returns:
+        Entry-point names that are symlinks, unreadable, non-executable, or do not
+        exactly match the launcher source for the current state-root contract.
+    """
+    invalid: list[str] = []
+    for entry in cli.ENTRY_POINTS:
+        path = bin_home() / entry
+        try:
+            actual = path.read_text(encoding="utf-8")
+            mode = path.stat().st_mode
+        except OSError:
+            invalid.append(entry)
+            continue
+        if path.is_symlink() or actual != cli.launcher_source(entry) or not (mode & 0o111):
+            invalid.append(entry)
+    return invalid
+
+
 def _out(message: str) -> None:
     """Write a user-facing line to standard output.
 
@@ -95,6 +116,10 @@ def _verify_installed() -> int:
     missing = missing_entry_points()
     if missing:
         _err("installed tools missing from the bin directory: " + ", ".join(missing))
+        return EXIT_ERROR
+    invalid = invalid_entry_points()
+    if invalid:
+        _err("installed launcher contract mismatch: " + ", ".join(invalid))
         return EXIT_ERROR
     commit = cli.current_commit()
     if commit is None:

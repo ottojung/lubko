@@ -448,6 +448,28 @@ def test_legacy_supervisor_runtime_file_is_inert(
     assert legacy.read_text(encoding="utf-8") == "d" * 40 + "\n"
 
 
+def test_dry_run_rejects_stale_launcher_until_install_repairs_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Startup verification rejects an old supervisor launcher before it can run."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    bin_dir = installable_bin(monkeypatch, tmp_path)
+    assert install.main(["--repo", str(repo)]) == install.EXIT_OK
+    capsys.readouterr()
+    launcher = bin_dir / "lubko-supervisor"
+    launcher.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    launcher.chmod(0o755)
+
+    assert install.main(["--repo", str(repo), "--dry-run"]) == install.EXIT_ERROR
+    assert "launcher contract mismatch: lubko-supervisor" in capsys.readouterr().err
+
+    assert install.main(["--repo", str(repo)]) == install.EXIT_OK
+    assert launcher.read_text(encoding="utf-8") == cli.launcher_source("lubko-supervisor")
+
+
 def test_install_rechecks_authority_under_deploy_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
