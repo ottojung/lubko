@@ -1328,10 +1328,13 @@ def test_group_alive_stays_true_when_live_leader_environ_unreadable(
         meta["pid"] = owner.pid
         meta["start_time"] = agent.proc_start_ticks(owner.pid)
         agent.write_meta(aid, meta)
+        original_read_bytes = pathlib.Path.read_bytes
 
         def unreadable_environ(_self: Path) -> bytes:
-            failure = OSError(errno.EACCES, "environ uninspectable")
-            raise failure
+            if "environ" in str(_self):
+                failure = OSError(errno.EACCES, "environ uninspectable")
+                raise failure
+            return original_read_bytes(_self)
 
         # is_alive collapses the marker-read failure to False; group_alive
         # must still refuse to declare the group dead.
@@ -1346,10 +1349,12 @@ def test_group_alive_stays_true_when_live_leader_environ_unreadable(
 
         # A positively recycled leader slot (different ticks) still falls
         # through to the exact member scan, which proves the group empty.
-        def readable_foreign(_self: Path) -> bytes:
-            return b"LUBKO_AGENT_ID=other\0"
+        def readable_foreign_environ(_self: Path) -> bytes:
+            if "environ" in str(_self):
+                return b"LUBKO_AGENT_ID=other\0"
+            return original_read_bytes(_self)
 
-        monkeypatch.setattr(pathlib.Path, "read_bytes", readable_foreign)
+        monkeypatch.setattr(pathlib.Path, "read_bytes", readable_foreign_environ)
         stale = dict(meta)
         stale["pid"] = os.getpid()  # live process with mismatching ticks
         stale["start_time"] = 1
