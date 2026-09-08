@@ -10,7 +10,6 @@ if TYPE_CHECKING:
 
 import pytest
 
-from lubko import startup_contract as sc
 from lubko import supervise, supervisor
 
 
@@ -66,9 +65,6 @@ def test_malformed_supervisor_identity_fails_closed_without_mutation(
     with pytest.raises(supervise.MalformedSupervisorIdentityError):
         supervise.read_supervisor_pid()
     assert supervise.supervisor_running() is False
-    proof = sc.verify_live_topology()
-    assert proof.ok is False
-    assert "identity record is malformed" in proof.message
     assert isolated_state.read_text(encoding="utf-8") == raw
 
 

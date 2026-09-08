@@ -1,30 +1,19 @@
-"""Versioned, repository-owned supervisor startup contract and live topology proof.
+"""Versioned, repository-owned supervisor startup contract.
 
 The production reliability guarantee depends on ``lubko-supervisor`` being the
 container's long-lived process owner, restored after a container or host
 restart. That guarantee is only end-to-end when the deployment actually starts
 the supervisor that way; this module makes the contract an authoritative,
 versioned, repository-owned definition (including a generated, installable
-startup launcher) and gives the maintained status surface a deterministic proof
-of the live process topology, not merely an inference from worker liveness.
+startup launcher).
 
 The supported startup definition is::
 
     tini-static -- lubko-supervisor
 
-Tini is the container init: it launches the supervisor as its direct child and
-reaps zombies / forwards signals. The outer host/container environment is trusted
-to restart Lubko appropriately; that external setup is intentionally outside this
-contract and is neither declared nor inspected by Lubko.
-
-The live proof walks the exact process tree and rejects unsupported topologies
-such as ``tini-static -- sleep infinity``: the supervisor must be a live
-``lubko-supervisor`` directly parented to the Tini init, and the running worker
-must be the supervisor's direct child. The supervisor and worker are each bound
-to their exact recorded start-time ticks after every ``/proc`` read, so a PID
-reuse after the proof is detected rather than trusted. Nothing here signals by
-process name; the topology is proven by exact parent/child identity read from
-``/proc``.
+The outer host/container environment is trusted to restart Lubko appropriately;
+that external setup is intentionally outside this contract and is neither
+declared nor inspected by Lubko.
 """
 
 from __future__ import annotations
@@ -36,9 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from lubko import _exact_signal
 from lubko import config as _config
-from lubko._exact_signal import _read_proc_stat, _split_stat_fields
 from lubko.durable import (
     DurabilityError,
     fsync_directory,
@@ -46,28 +33,8 @@ from lubko.durable import (
     write_json_durable,
 )
 from lubko.state import state_root
-from lubko.supervise import (
-    MalformedSupervisorIdentityError,
-    read_status,
-    read_supervisor_pid,
-    supervisor_running,
-)
 
 CONTRACT_SCHEMA_VERSION: Final = 1
-
-#: Process table entry for the init process (PID 1).
-INIT_PID: Final = 1
-
-#: Command-line markers that identify a supported Tini init process.
-DEFAULT_INIT_MARKERS: Final = ("tini-static", "tini")
-
-#: Command-line markers that identify the supported supervisor binary.
-DEFAULT_SUPERVISOR_MARKERS: Final = ("lubko-supervisor", "lubko.supervisor")
-
-#: Command-line fragments that mark an unsupported placeholder topology the
-#: contract must never accept as a supervisor (for example the legacy
-#: ``sleep infinity`` child of Tini).
-UNSUPPORTED_SUPERVISOR_MARKERS: Final = ("sleep infinity",)
 
 #: Name of the generated, versioned startup launcher the container should run.
 STARTUP_LAUNCHER_NAME: Final = "lubko-startup"
@@ -132,11 +99,8 @@ class StartupContract:
     """
 
     schema_version: int
-    init_markers: tuple[str, ...]
     init_command: tuple[str, ...]
-    supervisor_markers: tuple[str, ...]
     supervisor_command: tuple[str, ...]
-    worker_relationship: str
     required_state_dirs: tuple[str, ...]
     required_config_files: tuple[str, ...]
 
@@ -148,11 +112,8 @@ class StartupContract:
         """
         return {
             "schema_version": self.schema_version,
-            "init_markers": list(self.init_markers),
             "init_command": list(self.init_command),
-            "supervisor_markers": list(self.supervisor_markers),
             "supervisor_command": list(self.supervisor_command),
-            "worker_relationship": self.worker_relationship,
             "required_state_dirs": list(self.required_state_dirs),
             "required_config_files": list(self.required_config_files),
         }
@@ -162,7 +123,9 @@ class StartupContract:
         """Parse a stored contract strictly.
 
         Args:
-            data: Mapping produced by :meth:`to_dict`.
+            data: Mapping produced by :meth:`to_dict`. Legacy schema-v1 keys
+                (``init_markers``, ``supervisor_markers``,
+                ``worker_relationship``) are silently ignored.
 
         Returns:
             The parsed contract.
@@ -174,11 +137,7 @@ class StartupContract:
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             msg = "startup contract is malformed"
             raise TypeError(msg)
-        init_markers = _require_str_tuple(data.get("init_markers"), "init_markers")
         init_command = _require_str_tuple(data.get("init_command"), "init_command")
-        supervisor_markers = _require_str_tuple(
-            data.get("supervisor_markers"), "supervisor_markers"
-        )
         supervisor_command = _require_str_tuple(
             data.get("supervisor_command"), "supervisor_command"
         )
@@ -188,17 +147,10 @@ class StartupContract:
         required_config_files = _require_str_tuple(
             data.get("required_config_files"), "required_config_files"
         )
-        worker_relationship = data.get("worker_relationship")
-        if not isinstance(worker_relationship, str):
-            msg = "startup contract is malformed"
-            raise TypeError(msg)
         return cls(
             schema_version=schema_version,
-            init_markers=init_markers,
             init_command=init_command,
-            supervisor_markers=supervisor_markers,
             supervisor_command=supervisor_command,
-            worker_relationship=worker_relationship,
             required_state_dirs=required_state_dirs,
             required_config_files=required_config_files,
         )
@@ -207,68 +159,11 @@ class StartupContract:
 #: The canonical supported startup contract shipped with the code.
 CURRENT_CONTRACT: Final = StartupContract(
     schema_version=CONTRACT_SCHEMA_VERSION,
-    init_markers=DEFAULT_INIT_MARKERS,
     init_command=("tini-static", "--"),
-    supervisor_markers=DEFAULT_SUPERVISOR_MARKERS,
     supervisor_command=("lubko-supervisor",),
-    worker_relationship="direct-child",
     required_state_dirs=("supervisor", "worker", "deploy"),
     required_config_files=DEFAULT_CONFIG_FILES,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessInfo:
-    """Exact, minimal identity of one live process read from ``/proc``."""
-
-    pid: int
-    ppid: int
-    cmdline: str
-    start_time_ticks: int
-    zombie: bool
-
-
-@dataclass(frozen=True, slots=True)
-class TopologyTargets:
-    """The exact processes and recorded identities a topology proof must bind."""
-
-    init_pid: int
-    supervisor_pid: int
-    worker_pid: int | None
-    supervisor_start_ticks: int | None
-    worker_start_ticks: int | None
-
-
-@dataclass(frozen=True, slots=True)
-class TopologyProof:
-    """Deterministic proof of the live supervisor startup topology.
-
-    ``ok`` is ``True`` only when the init process is a supported Tini, the
-    supervisor is that init's live direct child running the supported binary
-    (specifically not the ``sleep infinity`` placeholder), the recorded
-    supervisor instance is still the exact live process (start ticks match
-    after every ``/proc`` read), and — when a worker is running — it is the
-    supervisor's direct child whose recorded instance is also still exact.
-    ``message`` explains the first failing link so an unsupported topology is
-    rejected with a clear, operator-actionable reason.
-    """
-
-    ok: bool
-    contract_version: int
-    init_pid: int
-    init_cmdline: str
-    init_is_tini: bool
-    supervisor_pid: int
-    supervisor_cmdline: str
-    supervisor_present: bool
-    supervisor_is_contract_binary: bool
-    supervisor_under_init: bool
-    supervisor_identity_matches: bool
-    uses_sleep_placeholder: bool
-    worker_pid: int | None
-    worker_is_direct_child: bool
-    worker_identity_matches: bool
-    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -437,7 +332,6 @@ def generate_startup_launcher_content() -> str:
     return (
         "#!/bin/sh\n"
         "# Generated by lubko; repository-owned versioned startup contract.\n"
-        "# Container entrypoint: exec tini-static -- lubko-supervisor.\n"
         f"exec {command}\n"
     )
 
@@ -675,8 +569,7 @@ def validate_startup_definition() -> ContractPathValidation:
     """Validate the installed startup definition matches the current contract.
 
     A missing or divergent definition means the supported deployment path did
-    not install the authoritative startup definition (or it drifted), so the
-    restart/topology proof must not report the supported topology as active.
+    not install the authoritative startup definition (or it drifted).
 
     Returns:
         The startup definition validation result.
@@ -711,10 +604,7 @@ def install_and_validate_startup_definition(bin_home: Path) -> str | None:
     install/validation, and the required state-directory validation into one
     fail-closed step so callers (install/bootstrap) cannot record a successful
     deployment while the repository-owned startup definition or its state mounts
-    are missing or have drifted. The deployment remains container-agnostic: it
-    installs the authoritative definition this repo owns, but cannot mutate the
-    outer container manager. Outer host/service-manager behavior is trusted and
-    intentionally outside this verifier.
+    are missing or have drifted.
 
     Args:
         bin_home: Directory containing the launcher scripts.
@@ -743,347 +633,6 @@ def install_and_validate_startup_definition(bin_home: Path) -> str | None:
     return None
 
 
-def _parse_stat_fields(stat: bytes | None) -> tuple[int, int, str] | None:
-    """Extract the minimal identity fields from ``/proc/<pid>/stat`` bytes.
-
-    Uses the shared ``_exact_signal._split_stat_fields`` helper for the
-    canonical ``/proc/<pid>/stat`` parsing.
-
-    Args:
-        stat: Raw ``/proc/<pid>/stat`` bytes, or ``None`` when unreadable.
-
-    Returns:
-        ``(ppid, start_time_ticks, state)`` when the line is parseable, else
-        ``None``.
-    """
-    if stat is None:
-        return None
-    fields = _split_stat_fields(stat)
-    if fields is None:
-        return None
-    try:
-        ppid = int(fields[_exact_signal.STAT_PPID_FIELD_INDEX])
-        start_time_ticks = int(fields[_exact_signal.STAT_STARTTIME_FIELD_INDEX])
-        state = fields[_exact_signal.STAT_STATE_FIELD_INDEX].decode("ascii", "replace")
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return ppid, start_time_ticks, state
-
-
-def read_process_info(pid: int) -> ProcessInfo | None:
-    """Return the exact identity of a live process, or ``None`` if unknown.
-
-    The process identity is captured atomically with respect to the command-line
-    read: the stat (PID/PPID/start-ticks/state) is read first, the command line
-    is read second, and then the stat is re-read. If the second stat diverges
-    from the first, the PID was recycled between the two reads, so the identity
-    is rejected rather than returned as a spliced (and therefore forgeable)
-    combination of an old start tick with a new occupant's command line. This
-    closes the splice a recycled PID would otherwise open against the later
-    start-tick comparison in :func:`evaluate_topology`.
-
-    Args:
-        pid: Process ID to inspect.
-
-    Returns:
-        The process identity, or ``None`` when the process is gone, unreadable,
-        or its identity changed across the observation.
-    """
-    stat_first = _read_proc_stat(pid)
-    first = _parse_stat_fields(stat_first)
-    if first is None:
-        return None
-    cmdline = _read_cmdline(pid)
-    stat_second = _read_proc_stat(pid)
-    second = _parse_stat_fields(stat_second)
-    if second is None or second != first:
-        return None
-    ppid, start_time_ticks, state = first
-    return ProcessInfo(
-        pid=pid,
-        ppid=ppid,
-        cmdline=cmdline,
-        start_time_ticks=start_time_ticks,
-        zombie=state in {"Z", "X"},
-    )
-
-
-def evaluate_topology(
-    targets: TopologyTargets,
-    processes: dict[int, ProcessInfo | None],
-    *,
-    contract: StartupContract = CURRENT_CONTRACT,
-) -> TopologyProof:
-    """Prove the startup topology from an exact process-table snapshot.
-
-    The snapshot is the single source of truth: this function signals nothing
-    and infers nothing from queue state. It proves the init process is a
-    supported Tini, the supervisor is that init's live direct child running the
-    supported binary (and explicitly not the ``sleep infinity`` placeholder),
-    the recorded supervisor instance is still the exact live process (its start
-    ticks match those captured before the ``/proc`` reads), and — when a worker
-    is present — the worker is the supervisor's direct child whose recorded
-    instance is also still exact.
-
-    Args:
-        targets: The exact process IDs and recorded start ticks to bind.
-        processes: Mapping of PID to its exact :class:`ProcessInfo` (or
-            ``None`` when the process is gone); must include at least the init
-            and supervisor PIDs and any running worker PID.
-        contract: The contract whose markers define a supported topology.
-
-    Returns:
-        The structured topology proof.
-    """
-    init = processes.get(targets.init_pid)
-    supervisor = processes.get(targets.supervisor_pid)
-    worker = processes.get(targets.worker_pid) if targets.worker_pid is not None else None
-
-    init_is_tini = (
-        init is not None
-        and not init.zombie
-        and _cmdline_has_any(init.cmdline, contract.init_markers)
-    )
-
-    supervisor_present = supervisor is not None and not supervisor.zombie
-    supervisor_is_contract_binary = (
-        supervisor is not None
-        and not supervisor.zombie
-        and _cmdline_has_any(supervisor.cmdline, contract.supervisor_markers)
-    )
-    uses_sleep_placeholder = (
-        supervisor is not None
-        and not supervisor.zombie
-        and _cmdline_has_any(supervisor.cmdline, UNSUPPORTED_SUPERVISOR_MARKERS)
-    )
-    supervisor_under_init = (
-        supervisor is not None
-        and not supervisor.zombie
-        and supervisor.ppid == targets.init_pid
-        and (init is not None and not init.zombie)
-    )
-    supervisor_identity_matches = targets.supervisor_start_ticks is None or (
-        supervisor is not None and supervisor.start_time_ticks == targets.supervisor_start_ticks
-    )
-
-    worker_is_direct_child = False
-    worker_identity_matches = True
-    if targets.worker_pid is not None:
-        worker_is_direct_child = (
-            worker is not None
-            and not worker.zombie
-            and worker.ppid == targets.supervisor_pid
-            and supervisor_present
-        )
-        worker_identity_matches = targets.worker_start_ticks is None or (
-            worker is not None and worker.start_time_ticks == targets.worker_start_ticks
-        )
-
-    ok = (
-        init_is_tini
-        and supervisor_under_init
-        and supervisor_is_contract_binary
-        and not uses_sleep_placeholder
-        and supervisor_identity_matches
-        and (targets.worker_pid is None or (worker_is_direct_child and worker_identity_matches))
-    )
-
-    message = _topology_message(
-        TopologyProof(
-            ok=ok,
-            contract_version=contract.schema_version,
-            init_pid=targets.init_pid,
-            init_cmdline="" if init is None else init.cmdline,
-            init_is_tini=init_is_tini,
-            supervisor_pid=targets.supervisor_pid,
-            supervisor_cmdline="" if supervisor is None else supervisor.cmdline,
-            supervisor_present=supervisor_present,
-            supervisor_is_contract_binary=supervisor_is_contract_binary,
-            supervisor_under_init=supervisor_under_init,
-            supervisor_identity_matches=supervisor_identity_matches,
-            uses_sleep_placeholder=uses_sleep_placeholder,
-            worker_pid=targets.worker_pid,
-            worker_is_direct_child=worker_is_direct_child,
-            worker_identity_matches=worker_identity_matches,
-            message="",
-        )
-    )
-
-    return TopologyProof(
-        ok=ok,
-        contract_version=contract.schema_version,
-        init_pid=targets.init_pid,
-        init_cmdline="" if init is None else init.cmdline,
-        init_is_tini=init_is_tini,
-        supervisor_pid=targets.supervisor_pid,
-        supervisor_cmdline="" if supervisor is None else supervisor.cmdline,
-        supervisor_present=supervisor_present,
-        supervisor_is_contract_binary=supervisor_is_contract_binary,
-        supervisor_under_init=supervisor_under_init,
-        supervisor_identity_matches=supervisor_identity_matches,
-        uses_sleep_placeholder=uses_sleep_placeholder,
-        worker_pid=targets.worker_pid,
-        worker_is_direct_child=worker_is_direct_child,
-        worker_identity_matches=worker_identity_matches,
-        message=message,
-    )
-
-
-def verify_live_topology(
-    contract: StartupContract = CURRENT_CONTRACT,
-) -> TopologyProof:
-    """Prove the live startup topology from the real process table.
-
-    The supervisor identity is bound to its recorded durable identity (PID and
-    start time) so a recycled or replaced process can never satisfy the proof;
-    the worker PID and start ticks come from the live supervisor status, which
-    is itself bound to the same exact supervisor incarnation. Every ``/proc``
-    read happens before the recorded start ticks are re-compared, so a PID
-    reuse after the reads is detected.
-
-    Args:
-        contract: The contract whose markers define a supported topology.
-
-    Returns:
-        The structured live topology proof. ``ok`` is ``False`` with a clear
-        message when no supervisor is recorded or it is not live.
-    """
-    try:
-        recorded = read_supervisor_pid()
-    except MalformedSupervisorIdentityError:
-        return _unproven(contract, "supervisor identity record is malformed")
-    if recorded is None:
-        return _unproven(contract, "no supervisor identity is recorded")
-    supervisor_pid, supervisor_start_ticks = recorded
-    if not supervisor_running():
-        return _unproven(contract, f"supervisor pid {supervisor_pid} is not a live supervisor")
-    worker_pid: int | None = None
-    worker_start_ticks: int | None = None
-    status = read_status()
-    if status is not None and status.child is not None and not status.holding:
-        worker_pid = status.child.pid
-        worker_start_ticks = status.child.start_time_ticks
-    processes: dict[int, ProcessInfo | None] = {
-        INIT_PID: read_process_info(INIT_PID),
-        supervisor_pid: read_process_info(supervisor_pid),
-    }
-    if worker_pid is not None:
-        processes[worker_pid] = read_process_info(worker_pid)
-    return evaluate_topology(
-        TopologyTargets(
-            init_pid=INIT_PID,
-            supervisor_pid=supervisor_pid,
-            worker_pid=worker_pid,
-            supervisor_start_ticks=supervisor_start_ticks,
-            worker_start_ticks=worker_start_ticks,
-        ),
-        processes,
-        contract=contract,
-    )
-
-
-def _unproven(contract: StartupContract, message: str) -> TopologyProof:
-    """Build a failed topology proof with no process evidence.
-
-    Args:
-        contract: The contract whose version to record.
-        message: The reason the proof could not be established.
-
-    Returns:
-        A proof with ``ok=False``.
-    """
-    return TopologyProof(
-        ok=False,
-        contract_version=contract.schema_version,
-        init_pid=INIT_PID,
-        init_cmdline="",
-        init_is_tini=False,
-        supervisor_pid=0,
-        supervisor_cmdline="",
-        supervisor_present=False,
-        supervisor_is_contract_binary=False,
-        supervisor_under_init=False,
-        supervisor_identity_matches=False,
-        uses_sleep_placeholder=False,
-        worker_pid=None,
-        worker_is_direct_child=False,
-        worker_identity_matches=False,
-        message=message,
-    )
-
-
-def _cmdline_has_any(cmdline: str, markers: tuple[str, ...]) -> bool:
-    """Return whether a command line contains any of the markers.
-
-    Args:
-        cmdline: Joined process command line.
-        markers: Substrings that identify a process family.
-
-    Returns:
-        ``True`` when at least one marker is present.
-    """
-    return any(marker in cmdline for marker in markers)
-
-
-def _topology_message(proof: TopologyProof) -> str:
-    """Build a human-readable explanation of the topology proof outcome.
-
-    Args:
-        proof: The structured topology proof whose fields decide the message.
-
-    Returns:
-        A single-line, operator-actionable message.
-    """
-    if proof.ok:
-        if proof.worker_pid is None:
-            return "startup contract satisfied (tini -> supervisor; no worker claimed yet)"
-        return "startup contract satisfied (tini -> supervisor -> worker direct child)"
-    reasons: list[tuple[bool, str]] = [
-        (
-            not proof.init_is_tini,
-            (
-                "init process (PID 1) is not a supported Tini; the supervisor has no "
-                "reaper/signal-forwarding init"
-            ),
-        ),
-        (
-            not proof.supervisor_present,
-            "supervisor process is absent or a zombie; the contract cannot be proven",
-        ),
-        (
-            proof.uses_sleep_placeholder,
-            (
-                "unsupported placeholder topology: Tini launched 'sleep infinity' instead of "
-                "lubko-supervisor; the worker has no supported supervisor"
-            ),
-        ),
-        (
-            not proof.supervisor_is_contract_binary,
-            "process under Tini is not the supported lubko-supervisor binary",
-        ),
-        (
-            not proof.supervisor_under_init,
-            "supervisor is not the direct child of the Tini init process",
-        ),
-        (
-            not proof.supervisor_identity_matches,
-            "recorded supervisor identity is gone or its PID was reused after the proof",
-        ),
-        (
-            proof.worker_pid is not None and not proof.worker_is_direct_child,
-            "running worker is not the direct child of the supervisor",
-        ),
-        (
-            proof.worker_pid is not None and not proof.worker_identity_matches,
-            "recorded worker identity is gone or its PID was reused after the proof",
-        ),
-    ]
-    for condition, reason in reasons:
-        if condition:
-            return reason
-    return "startup contract not satisfied"
-
-
 def _require_str_tuple(value: object, field: str) -> tuple[str, ...]:
     """Coerce a stored contract field into a tuple of strings.
 
@@ -1105,19 +654,3 @@ def _require_str_tuple(value: object, field: str) -> tuple[str, ...]:
         msg = f"startup contract field {field} is malformed"
         raise TypeError(msg)
     return tuple(value)
-
-
-def _read_cmdline(pid: int) -> str:
-    """Read the joined command line of a live process.
-
-    Args:
-        pid: Process whose command line to inspect.
-
-    Returns:
-        The joined command line, or ``""`` when unreadable.
-    """
-    try:
-        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
-    except OSError:
-        return ""
-    return " ".join(part.decode("utf-8", "replace") for part in raw.split(b"\0") if part)

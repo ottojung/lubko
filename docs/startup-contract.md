@@ -1,14 +1,14 @@
 # Supervisor startup contract
 
-Lubko requires a simple observable process topology:
+Lubko requires a simple startup command:
 
 ```
 tini-static -- lubko-supervisor
 ```
 
-Tini is PID 1 and launches `lubko-supervisor` as its direct child. The supervisor owns the maintained worker as its direct child. Lubko verifies this process topology, exact process identities, the installed startup launcher/definition, required private state directories, and private config permissions.
+Tini is PID 1 and launches `lubko-supervisor` as its direct child. The supervisor owns the maintained worker as its direct child. Lubko validates the installed startup artifacts (launcher, definition, state directories, and private config permissions).
 
-The outer host/container/service environment is **trusted** to restart Lubko appropriately. Lubko does not declare, inspect, infer, or verify Docker, Podman, systemd, or any host restart policy. There is no runtime proof seam for outer host/service-manager behavior.
+The outer host/container/service environment is **trusted** to restart Lubko appropriately. Lubko does not declare, inspect, infer, or verify Docker, Podman, systemd, or any host restart policy. There is no runtime proof seam for outer host/service-manager behavior, and Lubko does not inspect the live process topology.
 
 ## Rolling-upgrade readiness compatibility
 
@@ -30,7 +30,7 @@ Supervisor-owned deployment missions also use a stable backward-readable schema-
 - `lubko-startup-definition.json` — the exact `tini-static -- lubko-supervisor` startup definition plus required state/config paths;
 - `lubko-startup` — the generated launcher.
 
-`lubko-deploy startup-contract` validates those artifacts and the live process topology. It does not inspect anything outside the Lubko environment.
+`lubko-deploy startup-contract` validates those artifacts. It does not inspect the live process topology or anything outside the Lubko environment.
 
 ## Migrating from the legacy placeholder
 
