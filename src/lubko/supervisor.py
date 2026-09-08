@@ -753,6 +753,17 @@ class SupervisorDaemon:
             desired = supervise.read_desired_strict()
         except supervise.DesiredIntentError:
             self._bootstrap_hold_logged = False
+            confirmed = cli.current_commit()
+            if commit is not None and confirmed == commit and cli.runtime_is_usable(commit):
+                self._message = (
+                    "corrupt desired supervisor state; continuing recovery of independently "
+                    f"confirmed runtime {commit}"
+                )
+                LOGGER.exception(
+                    "corrupt desired supervisor state; continuing confirmed recovery %s",
+                    commit,
+                )
+                return False
             self._message = "corrupt desired supervisor state; holding without a worker"
             LOGGER.exception("corrupt desired supervisor state; holding without a worker")
             self._ensure_held()
@@ -937,7 +948,8 @@ class SupervisorDaemon:
         and the desired run intent share one monotonic generation space, and
         precedence is purely generation-based:
 
-        - a corrupt/unreadable mission fails closed into a hold;
+        - corrupt/unreadable mutable deployment state falls back to the sealed
+          commit behind `cli/current`;
         - a mission older than the desired intent is stale history and cannot
           override the desired commit, whatever its status;
         - a newer pending mission is the active candidate intent and is run;
@@ -958,8 +970,22 @@ class SupervisorDaemon:
             desired = supervise.read_desired_strict()
         except supervise.DesiredIntentError:
             self._bootstrap_hold_logged = False
-            self._message = "corrupt desired supervisor state; holding without a worker"
-            LOGGER.exception("corrupt desired supervisor state; holding without a worker")
+            confirmed = cli.current_commit()
+            if confirmed is not None and cli.runtime_is_usable(confirmed):
+                self._message = (
+                    "corrupt desired supervisor state; restoring independently confirmed "
+                    f"runtime {confirmed}"
+                )
+                LOGGER.exception(
+                    "corrupt desired supervisor state; restoring confirmed runtime %s",
+                    confirmed,
+                )
+                return "run", confirmed
+            self._message = (
+                "corrupt desired supervisor state and no usable confirmed runtime; "
+                "holding without a worker"
+            )
+            LOGGER.exception("%s", self._message)
             return "hold", None
         desired_gen = desired.generation if desired is not None else 0
         desired_commit = desired.commit if desired is not None else None
@@ -967,8 +993,22 @@ class SupervisorDaemon:
             mission = deployctl.read_rollback_state()
         except deployctl.DeployCtlError:
             self._bootstrap_hold_logged = False
-            self._message = "corrupt supervised-deployment state; holding without a worker"
-            LOGGER.exception("corrupt supervised-deployment state; holding without a worker")
+            confirmed = cli.current_commit()
+            if confirmed is not None and cli.runtime_is_usable(confirmed):
+                self._message = (
+                    "corrupt supervised-deployment state; restoring independently confirmed "
+                    f"runtime {confirmed}"
+                )
+                LOGGER.exception(
+                    "corrupt supervised-deployment state; restoring confirmed runtime %s",
+                    confirmed,
+                )
+                return "run", confirmed
+            self._message = (
+                "corrupt supervised-deployment state and no usable confirmed runtime; "
+                "holding without a worker"
+            )
+            LOGGER.exception("%s", self._message)
             return "hold", None
         if mission is None:
             if desired is None:

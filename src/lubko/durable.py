@@ -8,8 +8,6 @@ recover after a crash or a restart:
 * ``supervisor/desired.json`` — the explicit supervisor run intent;
 * ``supervisor/state.json`` — the daemon's own applied generation and mode;
 * ``supervisor/supervisor.pid`` — the exact live supervisor identity;
-* ``supervisor/supervisor-runtime`` — the override authorizing which
-  supervisor runtime starts;
 * ``cli/current`` — the maintained CLI active-pointer symlink;
 * ``toolchain.json`` — the recorded ``uv`` executable.
 
@@ -711,7 +709,7 @@ def remove_durable(path: Path) -> None:
     removal is recorded durably: a crash after this returns must never bring the
     removed authority back.  This is the authoritative counterpart of the
     durable write primitives and must be used for every recovery/control-state
-    removal (for example the supervisor-runtime override, the supervisor
+    removal (for example the supervisor
     pidfile on shutdown, and rollback-state repair/migration clearing).
     Observation-only status/readiness cleanup is intentionally *not* routed
     through here.
