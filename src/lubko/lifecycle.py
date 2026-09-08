@@ -110,6 +110,9 @@ SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 5.0
 SESSION_WAIT_INTERVAL_SECONDS: Final = 0.01
 UV_HTTP_TIMEOUT: Final = "30"
 
+#: Deterministic sentinel the probe payload writes to stdout on successful exec.
+READINESS_SENTINEL: Final = "lubko-readiness-sentinel"
+
 VALIDATION_STEPS: Final = (
     ("sync",),
     ("run", "ruff", "format", "--check", "."),
@@ -2683,21 +2686,76 @@ def _probe_server() -> str:
         raise RuntimeError(msg) from exc
 
 
+def _probe_python_path(cwd: str) -> str:
+    """Return the absolute path to the candidate worker's Python interpreter.
+
+    The probe uses the same sealed runtime Python that runs the worker, not
+    any host-installed interpreter.  This is portable across environments
+    (Guix, Nix, containerised hosts) where ``/usr/bin/sleep`` or
+    ``/usr/bin/python3`` may not exist.
+
+    Args:
+        cwd: Working directory of the probe job (the per-commit runtime root).
+
+    Returns:
+        The absolute Python interpreter path inside the sealed runtime.
+
+    Raises:
+        FileNotFoundError: When the sealed runtime Python is absent.
+    """
+    python = Path(cwd) / ".venv" / "bin" / "python"
+    if not python.is_file():
+        msg = (
+            f"sealed runtime Python not found at {python}; "
+            "the candidate worker cannot execute a probe"
+        )
+        raise FileNotFoundError(msg)
+    return str(python)
+
+
+def _probe_process(cwd: str) -> list[str]:
+    """Return the probe process argv that emits a readiness sentinel.
+
+    The probe writes ``READINESS_SENTINEL`` followed by a newline to stdout,
+    flushes, then blocks until cancelled.  Positive appearance of the sentinel
+    in the published output proves successful exec inside the exact worker
+    runtime.
+
+    Args:
+        cwd: Working directory of the probe job.
+
+    Returns:
+        A three-element argv list.
+    """
+    python = _probe_python_path(cwd)
+    script = (
+        f"import time,sys;"
+        f"sys.stdout.write({READINESS_SENTINEL!r}+'\\n');"
+        f"sys.stdout.flush();"
+        f"time.sleep(3600)"
+    )
+    return [python, "-c", script]
+
+
 def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     """Insert one pending queue probe job.
 
     Args:
         conn: Open PostgreSQL connection.
-        cwd: Working directory for the probe process.
+        cwd: Working directory for the probe process (per-commit runtime root).
 
     Returns:
         The probe job identifier, or ``None`` if the insert failed.
     """
+    try:
+        process = _probe_process(cwd)
+    except FileNotFoundError:
+        return None
     probe_payload = json.dumps(
         protocol.build_payload(
             server=_probe_server(),
             cwd=cwd,
-            process=["/usr/bin/sleep", "60"],
+            process=process,
         )
     )
     with conn.cursor() as cursor:
@@ -2781,6 +2839,32 @@ def _parse_probe_claim_state(
     return status, owner, process_pid
 
 
+def _read_probe_sentinel(conn: JobsConnection, probe_id: UUID) -> bool:
+    """Return whether the probe's published stdout contains the readiness sentinel.
+
+    The worker publishes output tails to the database; a positive sentinel
+    match proves the probe payload actually ``exec``'d inside the exact worker
+    runtime rather than failing at the OS level (exit 127 for missing
+    executables, bad working directory, etc.).
+
+    Args:
+        conn: Open PostgreSQL connection.
+        probe_id: Probe job identifier.
+
+    Returns:
+        ``True`` when the sentinel string is present in the published stdout.
+    """
+    with conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT (payload::jsonb)->'output'->'stdout'->>'tail' FROM lubko.jobs WHERE id = %s",
+            (probe_id,),
+        )
+        row = cursor.fetchone()
+    if row is None or row[0] is None:
+        return False
+    return READINESS_SENTINEL in str(row[0])
+
+
 def _wait_for_probe_claim(
     conn: JobsConnection,
     probe_id: UUID,
@@ -2788,7 +2872,7 @@ def _wait_for_probe_claim(
     recovery_worker_pid: int,
     timeout_seconds: float,
 ) -> bool:
-    """Wait until the exact recovery worker claims the probe job.
+    """Wait until the exact recovery worker claims and successfully executes the probe.
 
     ``worker_id`` alone is not proof of identity: it defaults to the host name
     and is shared by every worker on the machine. The claim is therefore bound
@@ -2796,6 +2880,12 @@ def _wait_for_probe_claim(
     ``process_pid`` of the probe command and verifying, from ``/proc``, that
     the command process is a descendant of the recovery worker. The worker_id
     match is retained as an additional check.
+
+    Claiming the row and spawning a process is not sufficient: the requested
+    executable may not exist in the worker's runtime (exit 127), or the
+    working directory may be invalid.  Success therefore additionally requires
+    the deterministic ``READINESS_SENTINEL`` to appear in the published stdout
+    output of the probe, proving that the payload actually ``exec``'d.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -2807,7 +2897,8 @@ def _wait_for_probe_claim(
     Returns:
         ``True`` only when the exact recovery worker claimed and executed the
         probe; ``False`` on timeout, terminal status, a different worker_id,
-        or a claim whose process was not spawned by the recovery worker.
+        a claim whose process was not spawned by the recovery worker, or a
+        claim whose payload never produced positive execution evidence.
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -2817,9 +2908,7 @@ def _wait_for_probe_claim(
                 (probe_id,),
             )
             row = cursor.fetchone()
-        if row is None:
-            return False
-        claim = _parse_probe_claim_state(row[0])
+        claim = _parse_probe_claim_state(row[0]) if row is not None else None
         if claim is None:
             return False
         status, owner, process_pid = claim
@@ -2829,7 +2918,12 @@ def _wait_for_probe_claim(
             if process_pid is None:
                 time.sleep(LOCK_POLL_INTERVAL_SECONDS)
                 continue
-            return _spawned_by_recovery_worker(process_pid, recovery_worker_pid)
+            if not _spawned_by_recovery_worker(process_pid, recovery_worker_pid):
+                return False
+            if not _read_probe_sentinel(conn, probe_id):
+                time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+                continue
+            return True
         if status in {"succeeded", "failed", "cancelled"}:
             return False
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
@@ -2878,7 +2972,10 @@ def verify_worker_consumes_queue(
     This is the public readiness proof used by the external supervisor: PID
     aliveness and database connectivity do not prove a worker is the queue
     consumer, so a probe job must be claimed and executed by the exact process.
-    The probe is cancelled, awaited terminal, and removed in all cases.
+    The probe payload uses the sealed runtime's Python to emit a deterministic
+    sentinel on successful exec; the sentinel must appear in the published
+    output before readiness succeeds.  The probe is cancelled, awaited terminal,
+    and removed in all cases.
 
     Args:
         worker_id: Worker identifier the worker records on claims.
@@ -2887,7 +2984,8 @@ def verify_worker_consumes_queue(
         timeout_seconds: Maximum seconds to wait for the probe to be claimed.
 
     Returns:
-        ``True`` only when the exact worker consumed the probe.
+        ``True`` only when the exact worker consumed the probe and the payload
+        produced positive execution evidence.
     """
     return _verify_queue_roundtrip(worker_id, cwd, worker_pid, timeout_seconds)
 
@@ -2903,10 +3001,12 @@ def _verify_queue_roundtrip(
     A probe job is inserted and must be claimed and executed by the exact
     recovery worker: the claim is bound to the supplied PID through the
     persisted ``process_pid`` descendant check, with ``worker_id`` as an
-    additional check. If any other worker claims the probe, one-consumer
-    semantics are violated and the repair fails. The probe is cancelled,
-    awaited terminal, and removed in all cases, so the roundtrip leaves no
-    queue row and no process behind.
+    additional check.  The probe payload uses the sealed runtime's Python to
+    emit a deterministic sentinel on successful exec; the sentinel must appear
+    in the published output before readiness succeeds.  If any other worker
+    claims the probe, one-consumer semantics are violated and the repair fails.
+    The probe is cancelled, awaited terminal, and removed in all cases, so the
+    roundtrip leaves no queue row and no process behind.
 
     Args:
         worker_id: Worker identifier the recovery worker will record on claims.
