@@ -48,6 +48,18 @@ if TYPE_CHECKING:
 # Agent metadata: a JSON-serializable mapping with heterogeneous values.
 Meta = dict[str, Any]
 
+
+@dataclass(frozen=True)
+class _BackendFailureRule:
+    """One bounded backend-failure classification rule."""
+
+    marker: str
+    classification: str
+    provider: str
+    transient: bool
+    automatic_retry_safe: bool
+
+
 # Implementation details (hidden from the user-facing interface).
 AGENT_MODEL: Final = "muse-v2.5"
 DEFAULT_VARIANT: Final = "low"
@@ -113,6 +125,15 @@ BACKEND_CLASSIFICATION_MAX_CHARS: Final = 80
 BACKEND_FIELD_MAX_CHARS: Final = 200
 BACKEND_RETRY_MAX_ATTEMPTS: Final = 2
 BACKEND_RETRY_BASE_SECONDS: Final = 0.5
+BACKEND_FAILURE_RULES: Final = (
+    _BackendFailureRule(
+        marker="Unexpected server error",
+        classification="transient_backend_server_error",
+        provider="opencode",
+        transient=True,
+        automatic_retry_safe=False,
+    ),
+)
 FOLD_WIDTH: Final = 80
 DEFAULT_RETENTION_DAYS: Final = 14
 RUNNER_ARGV_LENGTH: Final = 3
@@ -2270,7 +2291,9 @@ def _spawn_and_run(
         }
         if not _wait_for_steer_group_convergence(aid, observed):
             return None
-        backend_error = _classify_backend_failure(ctx.log_path, invocation_log_start, rc)
+        backend_error = _classify_backend_failure(
+            ctx.log_path, invocation_log_start, rc, is_continue=is_continue
+        )
         update_meta(aid, _finalize_after(rc, backend_error))
 
     return rc
@@ -2712,8 +2735,10 @@ def _invocation_log_slice(log_path: Path, start: int) -> tuple[str, int] | None:
     return data.decode("utf-8", errors="replace"), max(0, end - start)
 
 
-def _classify_backend_failure(log_path: Path, start: int, rc: int) -> Meta | None:
-    """Classify a bounded diagnostic slice produced by one failed invocation.
+def _classify_backend_failure(
+    log_path: Path, start: int, rc: int, *, is_continue: bool = False
+) -> Meta | None:
+    """Classify one invocation through the bounded backend-rule abstraction.
 
     Returns:
         Structured backend diagnostics for a recognized failure, otherwise ``None``.
@@ -2724,17 +2749,22 @@ def _classify_backend_failure(log_path: Path, start: int, rc: int) -> Meta | Non
     if snapshot is None:
         return None
     text, appended_bytes = snapshot
-    if "Unexpected server error" not in text:
+    rule = next(
+        (candidate for candidate in BACKEND_FAILURE_RULES if candidate.marker in text), None
+    )
+    if rule is None:
         return None
     match = re.search(r'"ref"\s*:\s*"([^"\r\n]+)"', text)
     return {
-        "classification": "transient_backend_server_error",
-        "provider": "opencode",
+        "classification": rule.classification,
+        "provider": rule.provider,
         "model": AGENT_MODEL,
+        "request_boundary": "continuation" if is_continue else "fresh_session",
         "reference": match.group(1) if match else None,
-        "transient": True,
-        "automatic_retry_safe": False,
-        "fresh_session_useful": None,
+        "transient": rule.transient,
+        "automatic_retry_safe": rule.automatic_retry_safe,
+        "fresh_session_useful": None if is_continue else False,
+        "backend_scope": "unknown",
         "diagnostic_bytes": min(appended_bytes, BACKEND_DIAGNOSTIC_MAX_BYTES),
     }
 
@@ -4069,7 +4099,21 @@ def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
         _out("  ".join(row[i].ljust(widths[i]) for i in range(6)))
 
 
-def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals,complex-structure]
+def _print_backend_status(meta: Meta) -> None:
+    """Print the sanitized backend failure and its recovery guidance."""
+    backend_error = _status_backend_error(meta)
+    if backend_error is None:
+        return
+    ref = backend_error.get("reference")
+    suffix = f" (ref {ref})" if isinstance(ref, str) and ref else ""
+    _out(f"backend:    {backend_error['classification']}{suffix}")
+    retry = "safe" if backend_error.get("automatic_retry_safe") is True else "unsafe"
+    fresh = backend_error.get("fresh_session_useful")
+    fresh_text = "no evidence it helps" if fresh is False else "unknown"
+    _out(f"recovery:   automatic retry {retry}; fresh session {fresh_text}")
+
+
+def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals]
     """Show detailed status of one agent.
 
     Args:
@@ -4129,11 +4173,7 @@ def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals
         _out("steer:      malformed persisted lifecycle intent")
     elif intent == "steer":
         _out("steer:      hard-preempting current invocation")
-    backend_error = _status_backend_error(meta)
-    if backend_error is not None:
-        ref = backend_error.get("reference")
-        suffix = f" (ref {ref})" if isinstance(ref, str) and ref else ""
-        _out(f"backend:    {backend_error['classification']}{suffix}")
+    _print_backend_status(meta)
     _out(f"title:      {'<invalid>' if 'title' in error_fields else title or '-'}")
     if metadata_errors:
         _out(f"metadata:   malformed persisted summary metadata: {', '.join(metadata_errors)}")
@@ -4191,7 +4231,7 @@ def _status_backend_error(meta: Meta) -> Meta | None:
     ):
         return None
     result: Meta = {"classification": classification}
-    for key in ("provider", "model", "reference"):
+    for key in ("provider", "model", "request_boundary", "reference", "backend_scope"):
         item = value.get(key)
         if isinstance(item, str) and len(item) <= BACKEND_FIELD_MAX_CHARS:
             result[key] = item

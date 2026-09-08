@@ -29,6 +29,9 @@ def test_classifies_backend_server_error_from_current_invocation(tmp_path: Path)
     assert error is not None
     assert error["classification"] == "transient_backend_server_error"
     assert error["reference"] == "err_abc123"
+    assert error["request_boundary"] == "fresh_session"
+    assert error["fresh_session_useful"] is False
+    assert error["backend_scope"] == "unknown"
     assert error["transient"] is True
     assert error["automatic_retry_safe"] is False
     assert error["diagnostic_bytes"] <= agent.BACKEND_DIAGNOSTIC_MAX_BYTES
@@ -127,3 +130,60 @@ def test_ambiguous_backend_acceptance_is_never_replayed(monkeypatch: pytest.Monk
     )
     assert agent._run_with_backend_retries("abc123", run_once) == 1
     assert calls == 1
+
+
+def test_continuation_backend_error_keeps_fresh_session_help_unknown(tmp_path: Path) -> None:
+    """Continuation failures do not invent evidence that a fresh session helps."""
+    log = tmp_path / "output.log"
+    log.write_text("Unexpected server error\n", encoding="utf-8")
+    error = agent._classify_backend_failure(log, 0, 1, is_continue=True)
+    assert error is not None
+    assert error["request_boundary"] == "continuation"
+    assert error["fresh_session_useful"] is None
+
+
+def test_retry_interruption_never_starts_another_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interruption propagates immediately instead of duplicating an invocation."""
+    calls = 0
+
+    def run_once() -> int:
+        nonlocal calls
+        calls += 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "lubko.agent.time.sleep",
+        lambda _delay: (_ for _ in ()).throw(AssertionError("must not sleep")),
+    )
+    interrupted = False
+    try:
+        agent._run_with_backend_retries("abc123", run_once)
+    except KeyboardInterrupt:
+        interrupted = True
+    assert interrupted is True
+    assert calls == 1
+
+
+def test_status_sanitizes_backend_diagnostics() -> None:
+    """Status exposes actionable bounded fields without arbitrary persisted data."""
+    meta: agent.Meta = {
+        "backend_error": {
+            "classification": "transient_backend_server_error",
+            "provider": "opencode",
+            "model": "model",
+            "request_boundary": "continuation",
+            "reference": "err_abc",
+            "transient": True,
+            "automatic_retry_safe": False,
+            "fresh_session_useful": None,
+            "backend_scope": "unknown",
+            "diagnostic_bytes": 42,
+            "secret": "must-not-escape",
+        }
+    }
+    status = agent._status_json("abc123", meta, "failed", alive=False)
+    backend = status["backend_error"]
+    assert isinstance(backend, dict)
+    assert backend["request_boundary"] == "continuation"
+    assert backend["backend_scope"] == "unknown"
+    assert "secret" not in backend
