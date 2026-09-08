@@ -31,11 +31,11 @@ Scheduled Lubko work accumulates in one current active `release/*` branch. A hum
 - A release branch is permanently retired after its first promotion into `main`, even if commits are accidentally added to it later.
 - If no active release branch exists, create one from current `main`.
 - Reuse the same active release branch across scheduled issues; do not create one release branch per issue.
-- Before starting issue work, merge current `main` into the active release branch and verify the result.
+- Before starting issue work, merge current `main` into the active release branch via a pull request (direct pushes to release branches are prohibited by the `release1` ruleset).
 - Start each issue branch from the active release branch in an isolated worktree.
 - Open the issue PR against the active release branch, not `main`.
 - After required implementation, verification, and orchestrator review, merge the issue PR into the active release branch.
-- After that merge, merge the latest `main` into the active release branch again and verify the exact resulting release head.
+- After that merge, merge the latest `main` into the active release branch via a pull request and verify the exact resulting release head.
 - If work is accidentally added to a retired release branch, preserve any unique work by moving it onto the active release branch, then stop using the retired branch.
 - There must be at most one open release-promotion PR targeting `main`, and it must come from the current active release branch. Close stale or redundant promotion PRs after verifying that the active release contains any needed work.
 
