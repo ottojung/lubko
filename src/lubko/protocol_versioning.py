@@ -75,7 +75,7 @@ def claim_version_predicate() -> tuple[str, dict[str, int]]:
     application reaper instead.
     """
     fragment = (
-        "AND jsonb_typeof((payload::jsonb)->'v') = 'number'\n"
-        "AND (payload::jsonb)->>'v' = %(protocol_version)s::text\n"
+        "AND jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'v') = 'number'\n"
+        "AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'v' = %(protocol_version)s::text\n"  # ruff: ignore[line-too-long]
     )
     return fragment, {"protocol_version": CURRENT_PROTOCOL_VERSION}
