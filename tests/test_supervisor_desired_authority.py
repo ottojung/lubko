@@ -1,10 +1,10 @@
-"""Fail-closed supervisor handling of malformed desired authority (#521)."""
+"""Supervisor authority recovery through the independent confirmed runtime anchor."""
 
 from __future__ import annotations
 
 import pytest
 
-from lubko import deployctl, lifecycle, supervise, supervisor
+from lubko import cli, deployctl, lifecycle, supervise, supervisor
 
 
 def _malformed_desired() -> supervise.SupervisorDesired | None:
@@ -12,83 +12,70 @@ def _malformed_desired() -> supervise.SupervisorDesired | None:
     raise supervise.DesiredIntentError(message)
 
 
-def test_derive_action_holds_before_mission_precedence_on_malformed_desired(
+def _malformed_mission() -> deployctl.RollbackState | None:
+    message = "malformed candidate mission"
+    raise deployctl.DeployCtlError(message)
+
+
+def test_derive_action_restores_confirmed_before_mission_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Malformed desired authority blocks mission precedence before mission reads."""
+    """Malformed desired state cannot hide the independently confirmed runtime."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    confirmed = "a" * 40
     mission_reads: list[bool] = []
     monkeypatch.setattr(supervise, "read_desired_strict", _malformed_desired)
-    monkeypatch.setattr(
-        deployctl,
-        "read_rollback_state",
-        lambda: mission_reads.append(True),
-    )
+    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission_reads.append(True))
+    monkeypatch.setattr(cli, "current_commit", lambda: confirmed)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda commit: commit == confirmed)
 
     action = daemon._derive_action(supervise.SupervisorState.from_dict({}))
 
-    assert action == ("hold", None)
+    assert action == ("run", confirmed)
     assert mission_reads == []
 
 
-def test_reconcile_holds_before_reading_mutable_worker_state_on_malformed_desired(
+def test_reconcile_restores_confirmed_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reconciliation treats malformed desired authority as a hold."""
+    """Reconciliation keeps service available from the independent confirmed anchor."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
-    held: list[bool] = []
+    confirmed = "a" * 40
+    ensured: list[str] = []
     monkeypatch.setattr(supervise, "read_desired_strict", _malformed_desired)
-    monkeypatch.setattr(
-        supervisor,
-        "read_state",
-        lambda: supervise.SupervisorState.from_dict({}),
-    )
-    monkeypatch.setattr(daemon, "_ensure_held", lambda: held.append(True))
+    monkeypatch.setattr(cli, "current_commit", lambda: confirmed)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda commit: commit == confirmed)
+    monkeypatch.setattr(supervisor, "read_state", lambda: supervise.SupervisorState.from_dict({}))
+    monkeypatch.setattr(daemon, "_ensure_worker", ensured.append)
     monkeypatch.setattr(daemon, "_maybe_reset_backoff", lambda _state, _now: None)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
+    monkeypatch.setattr(daemon, "_complete_cold_migration", lambda: None)
 
     daemon.reconcile(0.0)
 
-    assert held == [True]
+    assert ensured == [confirmed]
     assert daemon._message is not None
-    assert "corrupt desired supervisor state" in daemon._message
+    assert "independently confirmed runtime" in daemon._message
 
 
-def test_reconcile_converges_hold_if_desired_corrupts_between_reads(
+def test_corrupt_candidate_mission_restores_confirmed_not_desired_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A mid-tick desired corruption cannot leave a selected worker running."""
+    """Unreadable candidate state cannot outrank the independently confirmed runtime."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
-    desired = supervise.SupervisorDesired(
-        schema_version=supervise.SCHEMA_VERSION,
-        generation=1,
-        commit="a" * 40,
-        repo="/workspace/Lubko",
-        uv_path="/usr/bin/uv",
-        worker_id=None,
-    )
-    reads = iter((desired,))
+    confirmed = "a" * 40
+    candidate = _desired("b" * 40, generation=7)
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: candidate)
+    monkeypatch.setattr(deployctl, "read_rollback_state", _malformed_mission)
+    monkeypatch.setattr(cli, "current_commit", lambda: confirmed)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda commit: commit == confirmed)
 
-    def changing_desired() -> supervise.SupervisorDesired | None:
-        try:
-            return next(reads)
-        except StopIteration:
-            return _malformed_desired()
+    action = daemon._derive_action(supervise.SupervisorState.from_dict({}))
 
-    held: list[bool] = []
-    monkeypatch.setattr(supervise, "read_desired_strict", changing_desired)
-    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
-    monkeypatch.setattr(
-        supervisor,
-        "read_state",
-        lambda: supervise.SupervisorState.from_dict({}),
-    )
-    monkeypatch.setattr(daemon, "_ensure_held", lambda: held.append(True))
-
-    daemon.reconcile(0.0)
-
-    assert held == [True]
+    assert action == ("run", confirmed)
     assert daemon._message is not None
-    assert "corrupt desired supervisor state" in daemon._message
+    assert "restoring independently confirmed runtime" in daemon._message
 
 
 def test_malformed_desired_cannot_advance_pending_mission_generation(
@@ -142,23 +129,42 @@ def _desired(commit: str, generation: int = 1) -> supervise.SupervisorDesired:
     )
 
 
-def test_pre_spawn_revalidation_blocks_malformed_desired(
+def test_pre_spawn_revalidation_restores_confirmed_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Malformed durable intent at the last spawn gate cannot reach spawning."""
+    """The final generation-locked spawn gate still selects confirmed A."""
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    confirmed = "a" * 40
+    spawned: list[str] = []
+    monkeypatch.setattr(supervise, "read_desired_strict", _malformed_desired)
+    monkeypatch.setattr(cli, "current_commit", lambda: confirmed)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda commit: commit == confirmed)
+    monkeypatch.setattr(supervisor, "read_state", lambda: supervise.SupervisorState.from_dict({}))
+    monkeypatch.setattr(supervisor, "write_state", lambda _state: None)
+
+    def spawn(commit: str) -> None:
+        spawned.append(commit)
+
+    monkeypatch.setattr(daemon, "_spawn_worker", spawn)
+
+    daemon._spawn_and_publish(confirmed)
+
+    assert spawned == [confirmed]
+
+
+def test_malformed_authority_holds_without_usable_confirmed_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery remains fail-closed when there is no trusted confirmed runtime."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
     monkeypatch.setattr(supervise, "read_desired_strict", _malformed_desired)
-    monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
-    monkeypatch.setattr(
-        daemon,
-        "_spawn_worker",
-        lambda _commit: pytest.fail("malformed desired authority reached _spawn_worker"),
-    )
+    monkeypatch.setattr(cli, "current_commit", lambda: None)
 
-    daemon._spawn_and_publish("a" * 40)
+    action = daemon._derive_action(supervise.SupervisorState.from_dict({}))
 
+    assert action == ("hold", None)
     assert daemon._message is not None
-    assert "corrupt desired supervisor state" in daemon._message
+    assert "no usable confirmed runtime" in daemon._message
 
 
 def test_pre_spawn_revalidation_blocks_superseded_commit(

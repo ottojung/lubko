@@ -41,7 +41,6 @@ import fcntl
 import json
 import math
 import os
-import re
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
@@ -50,7 +49,7 @@ from typing import TYPE_CHECKING, Final
 
 from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
-from lubko.durable import remove_durable, write_bytes_durable, write_json_durable
+from lubko.durable import write_json_durable
 from lubko.health import validate_incarnation_token
 from lubko.state import rollback_state_path, state_root
 
@@ -60,8 +59,6 @@ if TYPE_CHECKING:
 SCHEMA_VERSION: Final = 1
 
 BOOT_ID_PATH: Final = Path("/proc/sys/kernel/random/boot_id")
-
-SUPERVISOR_RUNTIME_COMMIT_RE: Final = re.compile(r"^[0-9a-f]{40}\n\Z")
 
 STAT_MIN_FIELDS: Final = 20
 STAT_STARTTIME_FIELD_INDEX: Final = 19
@@ -949,21 +946,6 @@ def supervisor_pid_path() -> Path:
         The ``supervisor.pid`` path.
     """
     return supervisor_dir() / "supervisor.pid"
-
-
-def supervisor_runtime_override_path() -> Path:
-    """Return the path of the temporary supervisor-runtime override pointer.
-
-    This is a plain text file containing exactly one 40-hex commit followed
-    by a newline.  The stable ``lubko-supervisor`` shell launcher reads it
-    to choose which runtime the *supervisor daemon itself* runs from, while
-    ``cli/current``, ``desired.json``, and the confirmed worker commit
-    remain untouched.
-
-    Returns:
-        The ``supervisor-runtime`` path (no extension, plain text).
-    """
-    return supervisor_dir() / "supervisor-runtime"
 
 
 class ConsumerLockTimeoutError(Exception):
@@ -2628,73 +2610,3 @@ def _child_from_dict(data: dict[str, object]) -> WorkerChild:
         worker_id=worker_id,
         spawned_at=spawned_at,
     )
-
-
-# ---------------------------------------------------------------------------
-# Supervisor-runtime override (plain-text 40-hex commit pointer)
-# ---------------------------------------------------------------------------
-
-
-def read_supervisor_runtime_override() -> str | None:
-    """Read the supervisor-runtime override commit, if present and valid.
-
-    The override is a plain text file containing exactly one 40-hex commit
-    followed by a newline.  The stable ``lubko-supervisor`` shell launcher
-    reads it to choose which runtime the daemon runs from; ``cli/current``
-    and ``desired.json`` remain untouched.
-
-    Returns:
-        The 40-hex commit, or ``None`` when absent or malformed.
-    """
-    path = supervisor_runtime_override_path()
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    if not SUPERVISOR_RUNTIME_COMMIT_RE.fullmatch(raw):
-        return None
-    return raw[:40]
-
-
-def write_supervisor_runtime_override(commit: str) -> None:
-    """Crash-durably publish the supervisor-runtime override pointer.
-
-    The file contains exactly one 40-hex commit followed by a newline.  It is
-    recovery authority: the ``lubko-supervisor`` launcher reads it to choose
-    which runtime the daemon starts from, so the write must be confirmed
-    durable before the staged runtime is treated as active.
-
-    Args:
-        commit: Exact 40-hex commit the supervisor launcher should run.
-
-    Note:
-        Fails closed: the write raises :class:`DurabilityError` from
-        :func:`lubko.durable.write_bytes_durable` when it cannot be confirmed
-        durable.
-    """
-    write_bytes_durable(supervisor_runtime_override_path(), f"{commit}\n".encode())
-
-
-def clear_supervisor_runtime_override() -> bool:
-    """Crash-durably remove the supervisor-runtime override pointer if present.
-
-    Only regular files are removed: symlinks, directories, and other special
-    entries are never silently deleted. The removal is authoritative state
-    cleanup, so it is routed through :func:`lubko.durable.remove_durable` to
-    fsync the parent directory and fail closed when the removal cannot be
-    confirmed.
-
-    Returns:
-        ``True`` when the override was present and removed, ``False``
-        when it was already absent.
-
-    Note:
-        Fails closed: the underlying :func:`lubko.durable.remove_durable`
-        raises :class:`DurabilityError` when the removal cannot be confirmed
-        durable.
-    """
-    path = supervisor_runtime_override_path()
-    if not path.is_file() or path.is_symlink():
-        return False
-    remove_durable(path)
-    return True

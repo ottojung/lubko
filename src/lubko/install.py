@@ -165,9 +165,9 @@ def _version_change_refusal(commit: str) -> str | None:
     """Return why a version-changing install must be refused, if so.
 
     The supervisor daemon and its maintained worker are authoritative for the
-    runtime they run: the durable desired intent, the applied state, and the
-    supervisor-runtime override each name a commit that must stay startable
-    and coherent with the global CLIs. Installing a different commit would
+    runtime they run: the durable desired intent and applied state each name a
+    commit that must stay startable and coherent with the global CLIs.
+    Installing a different commit would
     switch ``cli/current`` away from the worker's commit and garbage-collect
     or strand the worker's runtime, silently diverging the worker from the
     CLIs and setting up a later outage (for example after a restart).
@@ -236,8 +236,8 @@ def _activate_under_deploy_lock(repo: Path, commit: str, uv_path: str) -> int:
     """Build, activate, and garbage-collect under the deployment lock.
 
     The supervisor-authoritative divergence guard is re-evaluated inside the
-    lock so a concurrent deploy cannot change desired/applied/override
-    authority between the check and the CLI mutation (fail closed against
+    lock so a concurrent deploy cannot change desired/applied authority
+    between the check and the CLI mutation (fail closed against
     the check-to-mutation TOCTOU window).
 
     Args:
