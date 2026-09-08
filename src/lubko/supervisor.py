@@ -101,6 +101,7 @@ from lubko.supervise import (
     MODE_RUN,
     SCHEMA_VERSION,
     ConsumerLockTimeoutError,
+    GenerationLockTimeoutError,
     LastExit,
     MalformedSupervisorIdentityError,
     SpawningObligation,
@@ -1429,6 +1430,41 @@ class SupervisorDaemon:
                     recover_owned_groups(meta.token or "")
         self._spawn_and_publish(commit)
 
+    def _acquire_generation_lock_and_spawn(self, commit: str) -> tuple[WorkerChild | None, bool]:
+        """Acquire the generation lock and spawn the worker.
+
+        Returns:
+            A tuple of ``(child, early_return)``. When ``early_return`` is
+            ``True`` the caller must return immediately (timeout or intent
+            changed). When ``early_return`` is ``False``, ``child`` is
+            ``None`` on spawn failure or a valid ``WorkerChild`` on success.
+        """
+        try:
+            return self._spawn_under_generation_lock(commit)
+        except GenerationLockTimeoutError:
+            self._message = "generation lock timed out before spawn; deferring to next tick"
+            LOGGER.warning("%s", self._message)
+            return None, True
+
+    def _spawn_under_generation_lock(self, commit: str) -> tuple[WorkerChild | None, bool]:
+        """Spawn under the generation lock after acquiring it.
+
+        Returns:
+            ``(child, early_return)`` as described in
+            :meth:`_acquire_generation_lock_and_spawn`.
+        """
+        with supervise.generation_lock():
+            action, authorized_commit = self._derive_action(read_state())
+            if action != "run" or authorized_commit != commit:
+                if action == "run":
+                    self._message = (
+                        "worker intent changed before the pre-spawn boundary; "
+                        "holding for a fresh reconciliation"
+                    )
+                return None, True
+            child = self._spawn_worker(commit)
+            return child, False
+
     def _spawn_and_publish(self, commit: str) -> None:
         """Spawn the worker and run the fail-closed child+meta publication.
 
@@ -1445,16 +1481,9 @@ class SupervisorDaemon:
         # desired/mission publication through this lock. Hold it across the
         # final strict read and the pre-Popen obligation/spawn so a newer
         # supported intent writer cannot slip between those two boundaries.
-        with supervise.generation_lock():
-            action, authorized_commit = self._derive_action(read_state())
-            if action != "run" or authorized_commit != commit:
-                if action == "run":
-                    self._message = (
-                        "worker intent changed before the pre-spawn boundary; "
-                        "holding for a fresh reconciliation"
-                    )
-                return
-            child = self._spawn_worker(commit)
+        child, early_return = self._acquire_generation_lock_and_spawn(commit)
+        if early_return:
+            return
         now = time.monotonic()
         if child is None:
             state = replace(

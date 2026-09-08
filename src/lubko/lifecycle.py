@@ -1979,29 +1979,42 @@ def _finish_queue_deploy(
 
 def _queue_deploy_candidate_converged(commit: str) -> bool:
     """Return whether current authority still converges on a live candidate."""
-    with supervise.generation_lock():
-        try:
-            desired = supervise.read_desired_strict()
-        except supervise.DesiredIntentError:
-            return False
-        status = supervise.read_status()
-        if desired is None or status is None:
-            return False
-        child = status.child
-        converged = lifecycle_state.authorize_supervisor_convergence(
-            lifecycle_state.SupervisorConvergenceFacts(
-                target_commit=commit,
-                minimum_generation=status.applied_generation,
-                desired_commit=desired.commit,
-                desired_generation=desired.generation,
-                applied_commit=status.commit,
-                applied_generation=status.applied_generation,
-                ready=status.ready,
-                holding=status.holding,
-                live_child=child is not None and supervise.child_alive(child),
-            )
+    try:
+        with supervise.generation_lock():
+            return _check_candidate_convergence(commit)
+    except supervise.GenerationLockTimeoutError:
+        return False
+
+
+def _check_candidate_convergence(commit: str) -> bool:
+    """Check convergence under the already-held generation lock.
+
+    Returns:
+        ``True`` when current authority converges on a live candidate for
+        ``commit``.
+    """
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        return False
+    status = supervise.read_status()
+    if desired is None or status is None:
+        return False
+    child = status.child
+    converged = lifecycle_state.authorize_supervisor_convergence(
+        lifecycle_state.SupervisorConvergenceFacts(
+            target_commit=commit,
+            minimum_generation=status.applied_generation,
+            desired_commit=desired.commit,
+            desired_generation=desired.generation,
+            applied_commit=status.commit,
+            applied_generation=status.applied_generation,
+            ready=status.ready,
+            holding=status.holding,
+            live_child=child is not None and supervise.child_alive(child),
         )
-        return converged and cli.current_commit() == commit
+    )
+    return converged and cli.current_commit() == commit
 
 
 def _queue_deploy_restore_converged(commit: str, minimum_generation: int) -> bool:
@@ -2074,7 +2087,7 @@ def _restore_after_handoff_failure(
             uv_path=options.uv_path,
             worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
         )
-    except OSError as exc:
+    except (OSError, supervise.GenerationLockTimeoutError) as exc:
         append_deploy_log(
             f"queue deploy failed after durable success and restoring the previous commit "
             f"errored: {exc}"
@@ -2089,10 +2102,13 @@ def _restore_after_handoff_failure(
     )
     reconciled = False
     if restored:
-        with supervise.generation_lock():
-            reconciled = _queue_deploy_restore_converged(
-                previous.git_commit, settle
-            ) and cli.reconcile_pointer(previous.git_commit)
+        try:
+            with supervise.generation_lock():
+                reconciled = _queue_deploy_restore_converged(
+                    previous.git_commit, settle
+                ) and cli.reconcile_pointer(previous.git_commit)
+        except supervise.GenerationLockTimeoutError:
+            pass
     if reconciled:
         append_deploy_log(
             "queue deploy failed after durable success; supervisor restored previous commit "
@@ -2242,12 +2258,16 @@ def _deploy_through_supervisor(options: DeployOptions, commit: str) -> WorkerMet
     """
     worker_id = os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
     _out("requesting the external supervisor to start the worker ...")
-    generation = supervise.request_run(
-        commit,
-        repo=str(options.repo),
-        uv_path=options.uv_path,
-        worker_id=worker_id,
-    )
+    try:
+        generation = supervise.request_run(
+            commit,
+            repo=str(options.repo),
+            uv_path=options.uv_path,
+            worker_id=worker_id,
+        )
+    except supervise.GenerationLockTimeoutError:
+        _err("generation lock timed out; another lifecycle transition is in progress")
+        raise DeployAbortedError from None
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         _err("the external supervisor did not apply the requested worker start")
         raise DeployAbortedError
@@ -2495,12 +2515,16 @@ def _complete_deploy_handoff(
     elif options.bootstrap or options.direct_spawn:
         new_meta = _deploy_direct(options, previous, state, commit)
         log_file = worker_log_path(new_meta.token)
-        supervise.request_run(
-            commit,
-            repo=str(options.repo),
-            uv_path=options.uv_path,
-            worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-        )
+        try:
+            supervise.request_run(
+                commit,
+                repo=str(options.repo),
+                uv_path=options.uv_path,
+                worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+            )
+        except supervise.GenerationLockTimeoutError:
+            _err("generation lock timed out; another lifecycle transition is in progress")
+            raise DeployAbortedError from None
         _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     else:
         _err(
@@ -4561,27 +4585,31 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
         # explicit recovery path.
         remove_durable(rollback_state_path())
         append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
-    with supervise.generation_lock():
-        generation = supervise.next_generation()
-        # The migration flag travels inside this one atomically written
-        # desired intent: publishing the migrated target commit and recording
-        # the convergence obligation is a single durable transition, so no
-        # crash can leave the supervisor running the migrated commit without
-        # its completion obligation (nor an orphaned migration intent without
-        # a published commit).
-        supervise.write_desired(
-            supervise.SupervisorDesired(
-                schema_version=supervise.SCHEMA_VERSION,
-                generation=generation,
-                commit=commit,
-                repo=str(repo),
-                uv_path=uv_path,
-                worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-                restart=False,
-                requested_at=time.time(),
-                migration=True,
+    try:
+        with supervise.generation_lock():
+            generation = supervise.next_generation()
+            # The migration flag travels inside this one atomically written
+            # desired intent: publishing the migrated target commit and recording
+            # the convergence obligation is a single durable transition, so no
+            # crash can leave the supervisor running the migrated commit without
+            # its completion obligation (nor an orphaned migration intent without
+            # a published commit).
+            supervise.write_desired(
+                supervise.SupervisorDesired(
+                    schema_version=supervise.SCHEMA_VERSION,
+                    generation=generation,
+                    commit=commit,
+                    repo=str(repo),
+                    uv_path=uv_path,
+                    worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+                    restart=False,
+                    requested_at=time.time(),
+                    migration=True,
+                )
             )
-        )
+    except supervise.GenerationLockTimeoutError:
+        _err("generation lock timed out; another lifecycle transition is in progress")
+        return EXIT_ERROR
     if (
         mission is not None
         and mission.status == deployctl.STATUS_PENDING
