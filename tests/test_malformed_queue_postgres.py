@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from uuid import UUID
 
 import psycopg
 import pytest
@@ -23,9 +23,6 @@ from lubko.worker import (
     recover_stale_jobs,
     request_cancel,
 )
-
-if TYPE_CHECKING:
-    from uuid import UUID
 
 DSN = os.environ.get("LUBKO_TEST_POSTGRES_DSN")
 pytestmark = pytest.mark.skipif(DSN is None, reason="real PostgreSQL DSN not configured")
@@ -49,8 +46,10 @@ def _insert(conn: psycopg.Connection[object], payload: str) -> UUID:
     with conn.cursor() as cursor:
         cursor.execute("INSERT INTO lubko.jobs(payload) VALUES (%s) RETURNING id", (payload,))
         row = cursor.fetchone()
-    assert row is not None
-    return row[0]
+    assert isinstance(row, tuple)
+    value = row[0]
+    assert isinstance(value, UUID)
+    return value
 
 
 def test_malformed_rows_do_not_poison_worker_operations() -> None:
