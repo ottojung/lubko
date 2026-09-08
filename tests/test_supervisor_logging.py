@@ -34,6 +34,17 @@ def _exception(logger: logging.Logger, message: str, detail: str) -> None:
         logger.exception(message)
 
 
+def _raise_other_failure(detail: str) -> None:
+    raise ValueError(detail)
+
+
+def _other_exception(logger: logging.Logger, message: str, detail: str) -> None:
+    try:
+        _raise_other_failure(detail)
+    except ValueError:
+        logger.exception(message)
+
+
 def test_identical_persistent_failures_are_coalesced_and_recover(tmp_path: Path) -> None:
     """Thousands of identical failures retain one full traceback plus summaries."""
     log = tmp_path / "supervisor.log"
@@ -72,6 +83,20 @@ def test_changed_failure_gets_a_fresh_diagnostic(tmp_path: Path) -> None:
     assert "persistent supervisor diagnostic changed after 1 suppressed repeats" in contents
     assert "ValueError: first" in contents
     assert "ValueError: second" in contents
+
+
+def test_same_error_text_from_distinct_origins_is_not_coalesced(tmp_path: Path) -> None:
+    """Traceback structure distinguishes otherwise identical diagnostics."""
+    log = tmp_path / "supervisor.log"
+    handler = supervisor._BoundedSupervisorLogHandler(log, max_bytes=1_000_000, backup_count=1)
+    logger = _logger(handler)
+    for emit_failure in (_exception, _other_exception):
+        handler.begin_reconciliation_cycle()
+        emit_failure(logger, "corrupt durable state", "same failure")
+        handler.end_reconciliation_cycle()
+    handler.close()
+    contents = log.read_text()
+    assert contents.count("Traceback (most recent call last)") == 2
 
 
 def test_supervisor_log_retention_is_bounded(tmp_path: Path) -> None:

@@ -151,22 +151,30 @@ class _BoundedSupervisorLogHandler(RotatingFileHandler):
             msg = "repeat_interval must be positive"
             raise ValueError(msg)
         self._repeat_interval = repeat_interval
-        self._failure_key: tuple[int, str, str, str] | None = None
+        self._failure_key: tuple[int, str, str, str, tuple[str, ...]] | None = None
         self._failure_repeats = 0
         self._cycle_saw_failure = False
 
     @staticmethod
-    def _failure_fingerprint(record: logging.LogRecord) -> tuple[int, str, str, str] | None:
+    def _failure_fingerprint(
+        record: logging.LogRecord,
+    ) -> tuple[int, str, str, str, tuple[str, ...]] | None:
         if record.exc_info is None:
             return None
-        exc_type, exc, _traceback = record.exc_info
+        exc_type, exc, traceback = record.exc_info
         if exc_type is None or exc is None:
             return None
+        traceback_signature: list[str] = []
+        while traceback is not None:
+            code = traceback.tb_frame.f_code
+            traceback_signature.append(f"{code.co_filename}:{code.co_name}:{traceback.tb_lineno}")
+            traceback = traceback.tb_next
         return (
             record.levelno,
             record.getMessage(),
             f"{exc_type.__module__}.{exc_type.__qualname__}",
             str(exc),
+            tuple(traceback_signature),
         )
 
     def begin_reconciliation_cycle(self) -> None:
