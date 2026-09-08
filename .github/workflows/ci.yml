@@ -12,6 +12,20 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      LUBKO_TEST_POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
