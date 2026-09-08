@@ -61,7 +61,7 @@ class _BackendFailureRule:
 
 
 # Implementation details (hidden from the user-facing interface).
-AGENT_MODEL: Final = "opencode/mimo-v2.5-free"
+AGENT_MODEL: Final = "opencode-go/mimo-v2.5"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
