@@ -68,6 +68,27 @@ def missing_entry_points() -> list[str]:
     return [entry for entry in cli.ENTRY_POINTS if not (bin_home() / entry).is_file()]
 
 
+def invalid_entry_points() -> list[str]:
+    """Return stable launchers whose installed bytes or mode violate the contract.
+
+    Returns:
+        Entry-point names that are symlinks, unreadable, non-executable, or do not
+        exactly match the launcher source for the current state-root contract.
+    """
+    invalid: list[str] = []
+    for entry in cli.ENTRY_POINTS:
+        path = bin_home() / entry
+        try:
+            actual = path.read_text(encoding="utf-8")
+            mode = path.stat().st_mode
+        except OSError:
+            invalid.append(entry)
+            continue
+        if path.is_symlink() or actual != cli.launcher_source(entry) or not (mode & 0o111):
+            invalid.append(entry)
+    return invalid
+
+
 def _out(message: str) -> None:
     """Write a user-facing line to standard output.
 
@@ -95,6 +116,10 @@ def _verify_installed() -> int:
     missing = missing_entry_points()
     if missing:
         _err("installed tools missing from the bin directory: " + ", ".join(missing))
+        return EXIT_ERROR
+    invalid = invalid_entry_points()
+    if invalid:
+        _err("installed launcher contract mismatch: " + ", ".join(invalid))
         return EXIT_ERROR
     commit = cli.current_commit()
     if commit is None:
@@ -165,9 +190,9 @@ def _version_change_refusal(commit: str) -> str | None:
     """Return why a version-changing install must be refused, if so.
 
     The supervisor daemon and its maintained worker are authoritative for the
-    runtime they run: the durable desired intent, the applied state, and the
-    supervisor-runtime override each name a commit that must stay startable
-    and coherent with the global CLIs. Installing a different commit would
+    runtime they run: the durable desired intent and applied state each name a
+    commit that must stay startable and coherent with the global CLIs.
+    Installing a different commit would
     switch ``cli/current`` away from the worker's commit and garbage-collect
     or strand the worker's runtime, silently diverging the worker from the
     CLIs and setting up a later outage (for example after a restart).
@@ -236,8 +261,8 @@ def _activate_under_deploy_lock(repo: Path, commit: str, uv_path: str) -> int:
     """Build, activate, and garbage-collect under the deployment lock.
 
     The supervisor-authoritative divergence guard is re-evaluated inside the
-    lock so a concurrent deploy cannot change desired/applied/override
-    authority between the check and the CLI mutation (fail closed against
+    lock so a concurrent deploy cannot change desired/applied authority
+    between the check and the CLI mutation (fail closed against
     the check-to-mutation TOCTOU window).
 
     Args:

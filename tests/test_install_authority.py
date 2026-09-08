@@ -155,7 +155,7 @@ def write_desired_commit(commit: str, repo: Path) -> None:
     )
 
 
-def test_gc_preserves_desired_applied_and_override_runtimes(
+def test_gc_preserves_current_desired_and_applied_runtimes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -189,14 +189,14 @@ def test_gc_preserves_desired_applied_and_override_runtimes(
             boot_id=None,
         )
     )
-    override = "c" * 40
-    supervise.write_supervisor_runtime_override(override)
-    cli.cli_commit_dir(override).mkdir(parents=True)
+    stale = "c" * 40
+    cli.cli_commit_dir(stale).mkdir(parents=True)
 
     cli.gc_cli_roots(())
 
-    for commit in (first, second, override):
+    for commit in (first, second):
         assert cli.cli_commit_dir(commit).is_dir()
+    assert not cli.cli_commit_dir(stale).exists()
     cli.remove_cli_root(first)
     cli.remove_cli_root(second)
     assert cli.cli_commit_dir(first).is_dir()
@@ -428,27 +428,46 @@ def test_same_commit_install_succeeds_and_gcs_stale_roots(
     assert meta is not None
 
 
-def test_install_refuses_version_change_over_override(
+def test_legacy_supervisor_runtime_file_is_inert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leftover legacy override file cannot select or block a runtime."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    head = head_commit(repo)
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    installable_bin(monkeypatch, tmp_path)
+    legacy = supervise.supervisor_dir() / "supervisor-runtime"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("d" * 40 + "\n", encoding="utf-8")
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_OK
+    assert cli.current_commit() == head
+    assert legacy.read_text(encoding="utf-8") == "d" * 40 + "\n"
+
+
+def test_dry_run_rejects_stale_launcher_until_install_repairs_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A bootstrap override naming another commit blocks version-changing installs."""
+    """Startup verification rejects an old supervisor launcher before it can run."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
-    head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
     bin_dir = installable_bin(monkeypatch, tmp_path)
-    override = "d" * 40
-    supervise.write_supervisor_runtime_override(override)
+    assert install.main(["--repo", str(repo)]) == install.EXIT_OK
+    capsys.readouterr()
+    launcher = bin_dir / "lubko-supervisor"
+    launcher.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    launcher.chmod(0o755)
 
-    code = install.main(["--repo", str(repo)])
+    assert install.main(["--repo", str(repo), "--dry-run"]) == install.EXIT_ERROR
+    assert "launcher contract mismatch: lubko-supervisor" in capsys.readouterr().err
 
-    assert code == install.EXIT_ERROR
-    err = capsys.readouterr().err
-    assert f"refusing to install commit {head}" in err
-    assert override in err
-    assert cli.current_commit() is None
-    assert (bin_dir / "lubko-agent").is_file()
+    assert install.main(["--repo", str(repo)]) == install.EXIT_OK
+    assert launcher.read_text(encoding="utf-8") == cli.launcher_source("lubko-supervisor")
 
 
 def test_install_rechecks_authority_under_deploy_lock(

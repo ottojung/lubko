@@ -517,6 +517,42 @@ def test_status_command_reports_contract(
     assert "startup topology: OK" in out
 
 
+def test_status_definition_fails_when_live_activation_ignores_installed_definition(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Do not report a static definition active behind an outer PID1 wrapper."""
+    proof = TopologyProof(
+        ok=False,
+        contract_version=CONTRACT_SCHEMA_VERSION,
+        init_pid=1,
+        init_cmdline="tini-static -- /var/lib/lubko/from-host/run-lubko-supervisor",
+        init_is_tini=True,
+        supervisor_pid=10,
+        supervisor_cmdline="lubko-supervisor",
+        supervisor_present=True,
+        supervisor_is_contract_binary=True,
+        supervisor_under_init=False,
+        supervisor_identity_matches=True,
+        uses_sleep_placeholder=False,
+        worker_pid=20,
+        worker_is_direct_child=True,
+        worker_identity_matches=True,
+        message="supervisor is not the direct child of the Tini init process",
+    )
+    _patch_status_surface(monkeypatch, proof)
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "read_status", lambda: None)
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: None)
+    monkeypatch.setattr(lifecycle, "worker_state", lambda _meta: "stopped")
+
+    assert lifecycle.status_cmd() == lifecycle.EXIT_OK
+    out = capsys.readouterr().out
+    assert "startup definition: FAIL" in out
+    assert "live init/supervisor activation does not consume it" in out
+    assert "startup topology: FAIL" in out
+
+
 def test_status_command_surfaces_corruption(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

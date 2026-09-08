@@ -90,6 +90,61 @@ def _supervised_mission() -> deployctl.RollbackState:
     )
 
 
+def _assert_schema3_predecessor_reader_accepts(payload: dict[str, object]) -> None:
+    """Assert the frozen rollback subset required by schema-3 predecessor supervisors.
+
+    The predecessor schema-3 parser requires these fields and delegates both worker
+    mappings to ``WorkerMeta.from_dict``. It ignores additive keys. Keeping this
+    contract executable prevents a future controller from publishing a mission
+    the already-running trusted supervisor cannot read.
+    """
+    assert payload["schema_version"] == 3
+    generation = payload["generation"]
+    assert isinstance(generation, int)
+    assert not isinstance(generation, bool)
+    assert generation > 0
+    assert payload["status"] in {
+        deployctl.STATUS_PENDING,
+        deployctl.STATUS_CONFIRMED,
+        deployctl.STATUS_ROLLED_BACK,
+    }
+    assert isinstance(payload["commit"], str)
+    assert len(payload["commit"]) == 40
+    assert isinstance(payload["previous_commit"], str)
+    assert len(payload["previous_commit"]) == 40
+    assert isinstance(payload["deadline"], (int, float))
+    assert not isinstance(payload["deadline"], bool)
+    assert isinstance(payload["repo"], str)
+    assert isinstance(payload["uv_path"], str)
+    assert isinstance(payload["stop_grace_seconds"], (int, float))
+    assert isinstance(payload["git_timeout_seconds"], (int, float))
+    assert isinstance(payload["previous_retiring"], bool)
+    assert isinstance(payload["previous_meta"], dict)
+    assert isinstance(payload["new_meta"], dict)
+    lifecycle.WorkerMeta.from_dict(payload["previous_meta"])
+    candidate = lifecycle.WorkerMeta.from_dict(payload["new_meta"])
+    assert payload["supervisor_owned"] is True
+    assert candidate.state == lifecycle.STATE_STOPPED
+    assert candidate.git_commit == NEW
+    assert candidate.repo == "/r"
+    assert candidate.pid is None
+    assert candidate.pgid is None
+    assert candidate.sid is None
+    assert candidate.start_time_ticks is None
+    assert candidate.token is None
+    assert candidate.worker_id is None
+
+
+def test_supervisor_owned_wire_is_readable_by_schema3_predecessor() -> None:
+    """A rolling upgrade cannot publish state the running trusted predecessor rejects."""
+    payload = _supervised_mission().to_dict()
+
+    _assert_schema3_predecessor_reader_accepts(payload)
+    parsed = deployctl.RollbackState.from_dict(payload)
+    assert parsed.new_meta is None
+    assert parsed.supervisor_owned is True
+
+
 @pytest.fixture(autouse=True)
 def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate every durable authority surface."""
