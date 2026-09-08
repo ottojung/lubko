@@ -101,9 +101,15 @@ def test_cancellation_timestamp_authority_accepts_only_canonical_worker_shape() 
 
 
 def _assert_strict_cancel_predicate(query: str, params: object) -> None:
-    assert "jsonb_typeof((payload::jsonb)->'state'->'cancel_requested_at') = 'string'" in query
+    assert (
+        "jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'cancel_requested_at') = 'string'"  # ruff: ignore[line-too-long]
+        in query
+    )
     assert "~ %(cancel_requested_at_pattern)s" in query
-    assert "left((payload::jsonb)->'state'->>'cancel_requested_at', 4) <> '0000'" in query
+    assert (
+        "left(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'cancel_requested_at', 4) <> '0000'"  # ruff: ignore[line-too-long]
+        in query
+    )
     assert "cancel_requested_at' IS NOT NULL" not in query
     assert isinstance(params, dict)
     assert params["cancel_requested_at_pattern"] == CANCEL_REQUESTED_AT_PATTERN
