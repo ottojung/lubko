@@ -96,6 +96,13 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
+"scripts/check_test_budget.py" = [
+    # This script intentionally invokes `uv run pytest` as an unshelled subprocess
+    # to measure its real wall-clock duration.  shell=True would change process-group
+    # semantics and break the measurement.
+    "subprocess-without-shell-equals-true",
+    "suspicious-subprocess-import",
+]
 "tests/**/*.py" = [
     # Tests assert invariants of the worker's internal state machine (outage
     # convergence, deadline derivation), which are deliberately not public API.
