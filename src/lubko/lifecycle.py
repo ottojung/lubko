@@ -288,8 +288,11 @@ def parse_supervisor_candidate_meta(
     if not isinstance(replacement, dict):
         raise TypeError
 
-    context_is_exact = isinstance(commit, str) and isinstance(repo, str)
-    if context_is_exact and replacement == supervisor_candidate_wire_descriptor(commit, repo):
+    if (
+        isinstance(commit, str)
+        and isinstance(repo, str)
+        and replacement == supervisor_candidate_wire_descriptor(commit, repo)
+    ):
         if supervisor_owned is not True:
             raise TypeError
         return None
@@ -297,11 +300,9 @@ def parse_supervisor_candidate_meta(
     try:
         return WorkerMeta.from_dict(replacement)
     except (TypeError, ValueError):
-        if (
-            supervisor_owned is not True
-            or not context_is_exact
-            or not _legacy_supervisor_candidate_placeholder(replacement, commit=commit, repo=repo)
-        ):
+        if supervisor_owned is not True or not isinstance(commit, str) or not isinstance(repo, str):
+            raise
+        if not _legacy_supervisor_candidate_placeholder(replacement, commit=commit, repo=repo):
             raise
         return None
 
