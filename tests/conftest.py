@@ -2,11 +2,35 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
+from collections.abc import Iterator
 from itertools import count
+from pathlib import Path
 
 import pytest
 
 _STATE_HOME_IDS = count()
+_EXEC_TMP_ROOT = Path(__file__).resolve().parents[1] / ".pytest_cache" / "exec-tmp"
+
+
+@pytest.fixture
+def tmp_path() -> Iterator[Path]:
+    """Provide a per-test temporary directory on the executable workspace filesystem.
+
+    Some Lubko tests intentionally create and execute fake programs. Pytest's
+    built-in ``tmp_path`` inherits the system temporary filesystem, which is
+    mounted ``noexec`` in the production-like Lubko container. Keep the familiar
+    fixture name while rooting it under the repository's ignored pytest cache so
+    ordinary tests need no special setup and executable-fixture tests remain
+    representative. ``mkdtemp`` gives parallel test runs disjoint directories.
+    """
+    _EXEC_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    path = Path(tempfile.mkdtemp(prefix="test-", dir=_EXEC_TMP_ROOT))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
