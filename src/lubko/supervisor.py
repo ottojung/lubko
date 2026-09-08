@@ -215,7 +215,7 @@ class _BoundedSupervisorLogHandler(RotatingFileHandler):
             return
         self._cycle_saw_failure = True
         if fingerprint != self._failure_key:
-            if self._failure_key is not None and self._failure_repeats:
+            if self._failure_key is not None:
                 self._emit_compact(
                     logging.INFO,
                     "persistent supervisor diagnostic changed after %d suppressed repeats",

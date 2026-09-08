@@ -103,6 +103,23 @@ def test_changed_failure_gets_a_fresh_diagnostic(tmp_path: Path) -> None:
     assert "ValueError: second" in contents
 
 
+def test_single_failure_then_changed_failure_logs_transition(tmp_path: Path) -> None:
+    """A changed one-shot failure emits an explicit transition before its fresh diagnostic."""
+    log = tmp_path / "supervisor.log"
+    handler = supervisor._BoundedSupervisorLogHandler(
+        log, max_bytes=1_000_000, backup_count=1, repeat_interval=100
+    )
+    logger = _logger(handler)
+    for detail in ("first", "second"):
+        handler.begin_reconciliation_cycle()
+        _exception(logger, "corrupt durable state", detail)
+        handler.end_reconciliation_cycle()
+    handler.close()
+    contents = log.read_text()
+    assert contents.count("Traceback (most recent call last)") == 2
+    assert "persistent supervisor diagnostic changed after 0 suppressed repeats" in contents
+
+
 def test_same_error_text_from_distinct_origins_is_not_coalesced(tmp_path: Path) -> None:
     """Traceback structure distinguishes otherwise identical diagnostics."""
     log = tmp_path / "supervisor.log"
