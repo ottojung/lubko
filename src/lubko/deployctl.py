@@ -17,7 +17,7 @@ import os
 import re
 import secrets
 import socket
-import subprocess
+import subprocess  # ruff: ignore[suspicious-subprocess-import] — required for process management; no shell injection
 import sys
 import time
 from contextlib import suppress
@@ -857,8 +857,8 @@ def _run_git(repo: Path, args: Sequence[str], timeout: float) -> subprocess.Comp
     Returns:
         Completed Git process.
     """
-    return subprocess.run(
-        ["git", *args],
+    return subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true] — callers pass only hardcoded git args
+        ["git", *args],  # ruff: ignore[start-process-with-partial-path] — git is a system tool on PATH
         cwd=repo,
         capture_output=True,
         text=True,
@@ -991,7 +991,7 @@ def _spawn_gated_candidate(options: Options, commit: str) -> GatedWorker:
     worker_id = env.get("LUBKO_WORKER_ID") or socket.gethostname()
     reader, writer = os.pipe()
     try:
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # ruff: ignore[subprocess-without-shell-equals-true] — sys.executable with known GATED_SHIM_SOURCE script
             [sys.executable, "-c", GATED_SHIM_SOURCE, str(reader), options.uv_path],
             cwd=options.repo,
             stdin=subprocess.DEVNULL,
@@ -1510,7 +1510,7 @@ def _spawn_gated_previous_worker(state: RollbackState, previous: WorkerMeta) -> 
     worker_id = env.get("LUBKO_WORKER_ID") or previous.worker_id or socket.gethostname()
     reader, writer = os.pipe()
     try:
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # ruff: ignore[subprocess-without-shell-equals-true] — sys.executable with known GATED_SHIM_SOURCE script
             [sys.executable, "-c", GATED_SHIM_SOURCE, str(reader), state.uv_path],
             cwd=Path(state.repo),
             stdin=subprocess.DEVNULL,

@@ -68,12 +68,6 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
-"src/lubko/deployctl.py" = [
-    "hardcoded-sql-expression",
-    "start-process-with-partial-path",
-    "subprocess-without-shell-equals-true",
-    "suspicious-subprocess-import",
-]
 "src/lubko/agent.py" = [
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
