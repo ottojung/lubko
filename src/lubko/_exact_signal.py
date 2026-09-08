@@ -244,7 +244,9 @@ def process_pgrp(pid: int) -> int | None:
     """Return the exact process group of a running process.
 
     Zombie and dead processes report no group. Unreadable or unparseable
-    process table entries are ignored.
+    process table entries are ignored.  State and pgrp are derived from a
+    single ``/proc/<pid>/stat`` snapshot so PID exit/reuse between
+    observations cannot mix processes.
 
     Args:
         pid: Process ID to inspect.
@@ -252,14 +254,17 @@ def process_pgrp(pid: int) -> int | None:
     Returns:
         The process group ID, or ``None`` if the process is dead or unknown.
     """
-    state = process_state_char(pid)
-    if state is None or state in {"Z", "X"}:
-        return None
     stat = _read_proc_stat(pid)
     if stat is None:
         return None
     fields = _split_stat_fields(stat)
     if fields is None:
+        return None
+    try:
+        state = fields[STAT_STATE_FIELD_INDEX].decode("ascii", "replace")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if state in {"Z", "X"}:
         return None
     try:
         return int(fields[STAT_PGRP_FIELD_INDEX])
