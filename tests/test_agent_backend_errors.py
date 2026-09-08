@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import subprocess
 from typing import TYPE_CHECKING
 
 from lubko import agent
@@ -10,6 +12,17 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import pytest
+
+
+def _stub_opencode_executable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+    executable = str(tmp_path / "opencode")
+
+    def which(_name: str, *, path: str | None = None) -> str:
+        del path
+        return executable
+
+    monkeypatch.setattr("lubko.agent.shutil.which", which)
+    return executable
 
 
 def test_classifies_backend_server_error_from_current_invocation(tmp_path: Path) -> None:
@@ -187,3 +200,70 @@ def test_status_sanitizes_backend_diagnostics() -> None:
     assert backend["request_boundary"] == "continuation"
     assert backend["backend_scope"] == "unknown"
     assert "secret" not in backend
+
+
+def test_configured_model_catalog_presence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A successful catalog positively proves the configured model is available."""
+    calls: list[tuple[object, ...]] = []
+
+    def run(*args: object, **kwargs: object) -> object:
+        calls.append(args)
+        assert kwargs["timeout"] == agent.MODEL_CATALOG_TIMEOUT_SECONDS
+        return subprocess.CompletedProcess(
+            ["opencode", "models"], 0, stdout=f"other/model\n{agent.AGENT_MODEL}\n"
+        )
+
+    executable = _stub_opencode_executable(monkeypatch, tmp_path)
+    monkeypatch.setattr("lubko.agent.subprocess.run", run)
+    assert agent._configured_model_available({"HOME": str(tmp_path)}) is True
+    assert calls == [([executable, "models"],)]
+
+
+def test_configured_model_catalog_absence_is_authoritative(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A successful catalog proves an unlisted configured model unavailable."""
+    executable = _stub_opencode_executable(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "lubko.agent.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [executable, "models"], 0, stdout="opencode/other-model\n"
+        ),
+    )
+    assert agent._configured_model_available({}) is False
+
+
+def test_configured_model_catalog_failure_is_inconclusive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Catalog transport failure never hides the ordinary backend failure path."""
+    executable = _stub_opencode_executable(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "lubko.agent.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([executable, "models"], 1, stdout=""),
+    )
+    assert agent._configured_model_available({}) is None
+
+
+def test_unavailable_configured_model_rejects_without_mutating_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Known model absence rejects a prompt before durable invocation authority changes."""
+    meta = agent.idle_meta("abc123", str(tmp_path), "model unavailable")
+    before = dict(meta)
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+    monkeypatch.setattr(agent, "_configured_model_available", lambda _env: False)
+
+    def must_not_dispatch(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError
+
+    monkeypatch.setattr(agent, "_dispatch_invocation", must_not_dispatch)
+    args = argparse.Namespace(
+        id="abc123",
+        prompt_text=None,
+        prompt="do work",
+        steer=False,
+    )
+
+    assert agent.cmd_prompt(args) == agent.EXIT_ERROR
+    assert meta == before
