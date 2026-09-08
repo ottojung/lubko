@@ -137,5 +137,6 @@ must be paired with an update to both `main1` and `release1` rulesets.
 ## Where it lives
 
 The enforcement is configured in the active `release1` repository ruleset
-(target `branch`, ref pattern `release/*`). It carries the rules `pull_request`
-and `required_status_checks` (strict, with `do_not_enforce_on_create: true`).
+(target `branch`, ref pattern `release/*`). It carries the rules `deletion`,
+`non_fast_forward`, `pull_request`, and `required_status_checks` (strict, with
+`do_not_enforce_on_create: true`).
