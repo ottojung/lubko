@@ -94,17 +94,3 @@ Scheduled orchestrator MUST NOT:
 ```
 
 Promotion of `release/*` into `main` is the human review boundary.
-
-## Completion for a selected issue
-
-A selected issue is complete for scheduled orchestration only when:
-
-- implementation is complete;
-- required tests and validation are complete;
-- the orchestrator has reviewed the PR diff itself through the GitHub plugin as required by `docs/SKILL.md`;
-- the task PR has been merged into the current `release/*` branch;
-- the release branch has been reconciled with the latest `main` and required verification passes;
-- the issue's canonical orchestrator status comment has been updated to `completed` with useful final durable resource handles.
-
-A `completed` status remains complete scheduled work even if the GitHub issue stays open while awaiting human promotion of the release branch.
-
