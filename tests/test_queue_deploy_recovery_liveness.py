@@ -204,7 +204,7 @@ def test_candidate_convergence_holds_generation_lock_through_cli_decision(
     held = False
 
     @contextmanager
-    def generation_lock() -> Iterator[None]:
+    def generation_lock(**_kwargs: object) -> Iterator[None]:
         nonlocal held
         assert not held
         held = True
@@ -436,7 +436,7 @@ def test_restore_holds_generation_lock_through_cli_reconciliation(
     held = False
 
     @contextmanager
-    def generation_lock() -> Iterator[None]:
+    def generation_lock(**_kwargs: object) -> Iterator[None]:
         nonlocal held
         assert not held
         held = True
