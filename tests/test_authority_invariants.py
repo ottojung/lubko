@@ -1556,6 +1556,79 @@ def test_confirmation_rejects_newer_unapplied_different_commit(
     rollback.assert_not_called()
 
 
+def test_confirmation_authority_accepts_direct_mission_over_older_desired() -> None:
+    """A mission may directly outrank the older desired intent it supersedes."""
+    mission = replace(_make_mission(deployctl.STATUS_PENDING), generation=2)
+    desired = cast(
+        "supervise.SupervisorDesired",
+        SimpleNamespace(commit=mission.previous_commit, generation=1),
+    )
+    status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+
+    assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is True
+
+    newer_status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation + 1,
+            ready=True,
+            holding=False,
+        ),
+    )
+    assert (
+        deployctl._supervised_confirmation_authority_matches(mission, desired, newer_status)
+        is False
+    )
+
+
+def test_ready_direct_mission_is_not_rollback_due_with_older_desired(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live applied mission stays confirmable after its older desired intent."""
+    mission = replace(
+        _make_mission(deployctl.STATUS_PENDING),
+        generation=2,
+        deadline=time.time() - 1.0,
+        supervisor_owned=True,
+    )
+    desired = cast(
+        "supervise.SupervisorDesired",
+        SimpleNamespace(commit=mission.previous_commit, generation=1),
+    )
+    status = cast(
+        "supervise.SupervisorStatus",
+        SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+            ready=True,
+            holding=False,
+        ),
+    )
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: SimpleNamespace(
+            commit=mission.commit,
+            applied_generation=mission.generation,
+        ),
+    )
+    monkeypatch.setattr(supervise, "read_desired_strict", lambda: desired)
+    monkeypatch.setattr(supervise, "read_status", lambda: status)
+    monkeypatch.setattr(deployctl, "_supervised_mission_active", lambda _state: True)
+
+    assert deployctl._pending_mission_rollback_due(mission) is False
+
+
 def test_confirmation_authority_distinguishes_superseding_and_same_commit_intents() -> None:
     """Different commits supersede a mission while same-commit replacements remain obligations."""
     mission = _make_mission(deployctl.STATUS_PENDING)
