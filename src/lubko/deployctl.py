@@ -35,7 +35,6 @@ from lubko.durable import DurabilityError, write_json_durable
 from lubko.lifecycle import (
     SCHEMA_VERSION,
     STATE_RUNNING,
-    STATE_STOPPED,
     LockTimeoutError,
     ProcessIdentity,
     WorkerMeta,
@@ -45,11 +44,13 @@ from lubko.lifecycle import (
     check_postgres,
     deploy_lock,
     detach_standard_streams,
+    parse_supervisor_candidate_meta,
     process_identity,
     read_meta,
     read_meta_strict,
     run_validation,
     stop_worker,
+    supervisor_candidate_wire_descriptor,
     worker_alive,
     worker_env,
     worker_log_path,
@@ -169,7 +170,7 @@ class RollbackState:
             "previous_retiring": self.previous_retiring,
             "previous_meta": self.previous_meta.to_dict(),
             "new_meta": (
-                _supervisor_candidate_wire_descriptor(self.commit, self.repo)
+                supervisor_candidate_wire_descriptor(self.commit, self.repo)
                 if supervisor_wire
                 else None
                 if self.new_meta is None
@@ -221,7 +222,7 @@ class RollbackState:
             commit = _required_commit(data["commit"])
             previous_commit = _required_commit(data["previous_commit"])
             repo = _required_json_string(data["repo"])
-            replacement_meta = _parse_candidate_meta(
+            replacement_meta = parse_supervisor_candidate_meta(
                 replacement, supervisor_owned=supervisor_owned, commit=commit, repo=repo
             )
             restart_meta, restart_released = _parse_previous_restart(
@@ -499,108 +500,6 @@ def next_mission_generation() -> int:
             return supervise.next_generation()
         except supervise.MissionAuthorityError as exc:
             raise DeployCtlError(str(exc)) from exc
-
-
-def _parse_candidate_meta(
-    replacement: object,
-    *,
-    supervisor_owned: bool | None,
-    commit: str,
-    repo: str,
-) -> WorkerMeta | None:
-    """Parse candidate metadata without inventing supervisor-owned process authority.
-
-    Args:
-        replacement: Raw ``new_meta`` value.
-        supervisor_owned: Durable ownership classification.
-        commit: Candidate commit named by the mission.
-        repo: Repository named by the mission.
-
-    Returns:
-        Legacy candidate process metadata, or ``None`` when candidate identity
-        belongs exclusively to the external supervisor.
-
-    Raises:
-        TypeError: If the candidate metadata cannot be trusted.
-        ValueError: If legacy worker metadata is malformed.
-    """
-    if replacement is None:
-        if supervisor_owned is not True:
-            raise TypeError
-        return None
-    if not isinstance(replacement, dict):
-        raise TypeError
-    if _supervisor_candidate_wire_descriptor_matches(replacement, commit=commit, repo=repo):
-        if supervisor_owned is not True:
-            raise TypeError
-        return None
-    try:
-        return WorkerMeta.from_dict(replacement)
-    except (TypeError, ValueError):
-        if supervisor_owned is not True or not _legacy_supervisor_placeholder(
-            replacement, commit=commit, repo=repo
-        ):
-            raise
-        return None
-
-
-def _supervisor_candidate_wire_descriptor(commit: str, repo: str) -> dict[str, object]:
-    """Return the stable schema-3 non-process candidate compatibility record.
-
-    Supervisor-owned candidate identity lives exclusively in ``supervisor/state.json``.
-    This descriptor exists only because older schema-3 readers require ``new_meta``
-    to be a parseable ``WorkerMeta`` mapping. It deliberately carries no PID,
-    process-group, session, start-time, token, or worker identity authority.
-    """
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "state": STATE_STOPPED,
-        "pid": None,
-        "pgid": None,
-        "sid": None,
-        "start_time_ticks": None,
-        "token": None,
-        "repo": repo,
-        "git_commit": commit,
-        "worker_id": None,
-        "log_path": "",
-        "started_at": None,
-        "stopped_at": None,
-    }
-
-
-def _supervisor_candidate_wire_descriptor_matches(
-    data: dict[str, object], *, commit: str, repo: str
-) -> bool:
-    """Recognize exactly the non-authoritative supervisor candidate wire record.
-
-    Returns:
-        ``True`` only for the exact stable compatibility descriptor.
-    """
-    return data == _supervisor_candidate_wire_descriptor(commit, repo)
-
-
-def _legacy_supervisor_placeholder(data: dict[str, object], *, commit: str, repo: str) -> bool:
-    """Recognize the exact identity-less sentinel emitted by older controllers.
-
-    Returns:
-        Whether the mapping is the historical supervisor-owned sentinel.
-    """
-    return data == {
-        "schema_version": SCHEMA_VERSION,
-        "state": STATE_RUNNING,
-        "pid": 0,
-        "pgid": 0,
-        "sid": 0,
-        "start_time_ticks": 0,
-        "token": None,
-        "repo": repo,
-        "git_commit": commit,
-        "worker_id": "",
-        "log_path": "",
-        "started_at": None,
-        "stopped_at": None,
-    }
 
 
 def _supervised_mission_active(state: RollbackState) -> bool:

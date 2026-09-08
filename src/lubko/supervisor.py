@@ -75,8 +75,9 @@ import sys
 import time
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, override
 
 import psycopg
 
@@ -128,6 +129,122 @@ if TYPE_CHECKING:
     from lubko.supervise import SupervisorState
 
 LOGGER: Final = logging.getLogger(__name__)
+
+_SUPERVISOR_LOG_MAX_BYTES: Final = 4 * 1024 * 1024
+_SUPERVISOR_LOG_BACKUP_COUNT: Final = 2
+_PERSISTENT_DIAGNOSTIC_REPEAT_INTERVAL: Final = 256
+
+
+class _BoundedSupervisorLogHandler(RotatingFileHandler):
+    """Bound and coalesce the supervisor's durable diagnostic log."""
+
+    def __init__(
+        self,
+        filename: str | Path,
+        *,
+        max_bytes: int = _SUPERVISOR_LOG_MAX_BYTES,
+        backup_count: int = _SUPERVISOR_LOG_BACKUP_COUNT,
+        repeat_interval: int = _PERSISTENT_DIAGNOSTIC_REPEAT_INTERVAL,
+    ) -> None:
+        super().__init__(filename, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
+        if repeat_interval <= 0:
+            msg = "repeat_interval must be positive"
+            raise ValueError(msg)
+        self._repeat_interval = repeat_interval
+        self._failure_key: tuple[int, str, str, str, tuple[str, ...]] | None = None
+        self._failure_repeats = 0
+        self._cycle_saw_failure = False
+
+    @staticmethod
+    def _failure_fingerprint(
+        record: logging.LogRecord,
+    ) -> tuple[int, str, str, str, tuple[str, ...]] | None:
+        if record.exc_info is None:
+            return None
+        exc_type, exc, traceback = record.exc_info
+        if exc_type is None or exc is None:
+            return None
+        traceback_signature: list[str] = []
+        while traceback is not None:
+            code = traceback.tb_frame.f_code
+            traceback_signature.append(f"{code.co_filename}:{code.co_name}:{traceback.tb_lineno}")
+            traceback = traceback.tb_next
+        return (
+            record.levelno,
+            record.getMessage(),
+            f"{exc_type.__module__}.{exc_type.__qualname__}",
+            str(exc),
+            tuple(traceback_signature),
+        )
+
+    def begin_reconciliation_cycle(self) -> None:
+        """Start tracking whether this reconciliation emits the active failure."""
+        self._cycle_saw_failure = False
+
+    def end_reconciliation_cycle(self) -> None:
+        """Emit a recovery transition after a clean reconciliation cycle."""
+        if self._failure_key is None or self._cycle_saw_failure:
+            return
+        repeats = self._failure_repeats
+        self._failure_key = None
+        self._failure_repeats = 0
+        self._emit_compact(
+            logging.INFO,
+            "persistent supervisor diagnostic recovered after %d suppressed repeats",
+            (repeats,),
+        )
+
+    def _emit_compact(self, level: int, message: str, args: tuple[object, ...]) -> None:
+        record = logging.LogRecord(
+            name=LOGGER.name,
+            level=level,
+            pathname=__file__,
+            lineno=0,
+            msg=message,
+            args=args,
+            exc_info=None,
+        )
+        super().emit(record)
+
+    @override
+    def emit(self, record: logging.LogRecord) -> None:
+        """Write one record, coalescing unchanged exception diagnostics."""
+        fingerprint = self._failure_fingerprint(record)
+        if fingerprint is None:
+            super().emit(record)
+            return
+        self._cycle_saw_failure = True
+        if fingerprint != self._failure_key:
+            if self._failure_key is not None:
+                self._emit_compact(
+                    logging.INFO,
+                    "persistent supervisor diagnostic changed after %d suppressed repeats",
+                    (self._failure_repeats,),
+                )
+            self._failure_key = fingerprint
+            self._failure_repeats = 0
+            super().emit(record)
+            return
+        self._failure_repeats += 1
+        if self._failure_repeats % self._repeat_interval == 0:
+            self._emit_compact(
+                record.levelno,
+                "persistent supervisor diagnostic repeated %d times: %s",
+                (self._failure_repeats, record.getMessage()),
+            )
+
+    @override
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Keep logging failures outside lifecycle authority decisions."""
+        del record
+
+
+def _durable_log_handlers() -> list[_BoundedSupervisorLogHandler]:
+    return [
+        handler for handler in LOGGER.handlers if isinstance(handler, _BoundedSupervisorLogHandler)
+    ]
+
+
 BOOTSTRAP_HOLD_MESSAGE: Final = (
     "supervisor is healthy; no worker is being started intentionally because no explicit "
     "desired commit/run intent exists; establish initial deployment authority with "
@@ -669,10 +786,16 @@ class SupervisorDaemon:
             self._install_signal_handlers()
             self._write_status("starting")
             while not self._stopping:
+                diagnostic_handlers = _durable_log_handlers()
+                for handler in diagnostic_handlers:
+                    handler.begin_reconciliation_cycle()
                 try:
                     self.reconcile(time.monotonic())
                 except Exception:
                     LOGGER.exception("supervisor tick failed; continuing")
+                finally:
+                    for handler in diagnostic_handlers:
+                        handler.end_reconciliation_cycle()
                 self._write_status()
                 time.sleep(self.settings.poll_interval_seconds)
             self._shutdown()
@@ -3088,11 +3211,13 @@ class SupervisorDaemon:
                 db_ready = None
             self._next_db_check_at = now + DB_CHECK_INTERVAL_SECONDS
         mission = None
+        effective_message = self._message if message is None else message
         try:
             rollback = deployctl.read_rollback_state()
         except deployctl.DeployCtlError:
             rollback = None
-            self._message = "corrupt supervised-deployment state; holding without a worker"
+            if effective_message is None:
+                effective_message = "corrupt supervised-deployment state"
         if rollback is not None:
             mission = rollback.status
         worker_health = worker_health_payload(read_worker_health())
@@ -3113,7 +3238,7 @@ class SupervisorDaemon:
                 mission=mission,
                 db_ready=db_ready,
                 ready=state.ready if state.child is not None else None,
-                message=self._message if message is None else message,
+                message=effective_message,
                 worker_health=worker_health,
                 holding=is_holding(state),
             )
@@ -3205,7 +3330,7 @@ def main(argv: list[str] | None = None) -> int:
     logger = logging.getLogger("lubko.supervisor")
     with suppress(OSError):
         supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)
-        handler = logging.FileHandler(supervisor_log_path())
+        handler = _BoundedSupervisorLogHandler(supervisor_log_path())
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logger.addHandler(handler)
     try:
