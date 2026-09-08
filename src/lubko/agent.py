@@ -48,6 +48,18 @@ if TYPE_CHECKING:
 # Agent metadata: a JSON-serializable mapping with heterogeneous values.
 Meta = dict[str, Any]
 
+
+@dataclass(frozen=True)
+class _BackendFailureRule:
+    """One bounded backend-failure classification rule."""
+
+    marker: str
+    classification: str
+    provider: str
+    transient: bool
+    automatic_retry_safe: bool
+
+
 # Implementation details (hidden from the user-facing interface).
 AGENT_MODEL: Final = "muse-v2.5"
 DEFAULT_VARIANT: Final = "low"
@@ -108,6 +120,20 @@ ABORT_REAP_SECONDS: Final = 5.0
 IDLE_BREAK_SECONDS: Final = 5
 STABLE_TERMINAL_SECONDS: Final = 0.5
 STATUS_TAIL_LINES: Final = 50
+BACKEND_DIAGNOSTIC_MAX_BYTES: Final = 16 * 1024
+BACKEND_CLASSIFICATION_MAX_CHARS: Final = 80
+BACKEND_FIELD_MAX_CHARS: Final = 200
+BACKEND_RETRY_MAX_ATTEMPTS: Final = 2
+BACKEND_RETRY_BASE_SECONDS: Final = 0.5
+BACKEND_FAILURE_RULES: Final = (
+    _BackendFailureRule(
+        marker="Unexpected server error",
+        classification="transient_backend_server_error",
+        provider="opencode",
+        transient=True,
+        automatic_retry_safe=False,
+    ),
+)
 FOLD_WIDTH: Final = 80
 DEFAULT_RETENTION_DAYS: Final = 14
 RUNNER_ARGV_LENGTH: Final = 3
@@ -303,6 +329,7 @@ def idle_meta(aid: str, cwd: str, title: str | None) -> Meta:
         "finished_at": None,
         "exit_code": None,
         "exit_signal": None,
+        "backend_error": None,
         "intent": None,
         "delete_pending": False,
         "stop_reason": None,
@@ -2182,6 +2209,7 @@ def _spawn_and_run(
         _fail_invocation_closed(aid, f"failed to open agent log: {exc}")
         return None
     with log:
+        invocation_log_start = log.tell()
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -2263,7 +2291,10 @@ def _spawn_and_run(
         }
         if not _wait_for_steer_group_convergence(aid, observed):
             return None
-        update_meta(aid, _finalize_after(rc))
+        backend_error = _classify_backend_failure(
+            ctx.log_path, invocation_log_start, rc, is_continue=is_continue
+        )
+        update_meta(aid, _finalize_after(rc, backend_error))
 
     return rc
 
@@ -2283,12 +2314,6 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     meta = read_meta(aid)
     if meta is None:
         return None
-    # A fresh, durable identity for exactly this invocation. It is stamped
-    # into the spawned process environment (inherited by the whole process
-    # tree) and recorded in metadata, so later signalling can prove
-    # invocation-exact membership even across PGID/PID recycling.
-    iid = uuid.uuid4().hex
-    ctx.env[INVOCATION_ID_VAR] = iid
     ctx.env["LUBKO_PROMPT"] = prompt
     cmd = build_agent_command(meta, prompt, is_continue=is_continue)
     if cmd is None:
@@ -2309,11 +2334,49 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     if not _claim_pending_prompt(aid, prompt):
         return None
 
-    rc = _spawn_and_run(ctx, aid, cmd, iid, is_continue=is_continue)
+    def run_once() -> int | None:
+        iid = uuid.uuid4().hex
+        ctx.env[INVOCATION_ID_VAR] = iid
+        return _spawn_and_run(ctx, aid, cmd, iid, is_continue=is_continue)
+
+    rc = _run_with_backend_retries(aid, run_once)
     if rc is None:
         return None
 
     return _drain_next(aid)
+
+
+def _backend_retry_delay(error: Meta | None, attempt: int) -> float | None:
+    """Return bounded backoff only for positively replay-safe backend failures.
+
+    Returns:
+        Delay in seconds, or ``None`` when replay is unsafe or exhausted.
+    """
+    if error is None or attempt >= BACKEND_RETRY_MAX_ATTEMPTS:
+        return None
+    if error.get("transient") is not True or error.get("automatic_retry_safe") is not True:
+        return None
+    return BACKEND_RETRY_BASE_SECONDS * float(2**attempt)
+
+
+def _run_with_backend_retries(aid: str, run_once: Callable[[], int | None]) -> int | None:
+    """Run one invocation with bounded retries when non-acceptance is proven.
+
+    Returns:
+        Final invocation return code, or ``None`` when the runner must stop.
+    """
+    attempt = 0
+    while True:
+        rc = run_once()
+        if rc is None or rc == 0:
+            return rc
+        meta = read_meta(aid)
+        error = _status_backend_error(meta) if meta is not None else None
+        delay = _backend_retry_delay(error, attempt)
+        if delay is None:
+            return rc
+        time.sleep(delay)
+        attempt += 1
 
 
 def _fail_invocation_closed(aid: str, error: str, *, exit_code: int | None = None) -> None:
@@ -2631,6 +2694,7 @@ def _record_running(
         m["finished_at"] = None
         m["exit_code"] = None
         m["exit_signal"] = None
+        m["backend_error"] = None
         m["intent"] = None
         m["active_runner"] = True
         m["unresolved_invocation"] = None
@@ -2654,15 +2718,59 @@ def _set_native_session(sid: str) -> Callable[[Meta], None]:
     return setter
 
 
-def _finalize_after(rc: int) -> Callable[[Meta], None]:
-    """Return a metadata mutation that records the result of an invocation.
-
-    Args:
-        rc: The invocation's return code.
+def _invocation_log_slice(log_path: Path, start: int) -> tuple[str, int] | None:
+    """Read the bounded log slice produced since ``start``.
 
     Returns:
-        The metadata mutation.
+        Decoded text plus original appended byte count, or ``None`` on read failure.
     """
+    try:
+        with log_path.open("rb") as fh:
+            end = fh.seek(0, os.SEEK_END)
+            begin = max(start, end - BACKEND_DIAGNOSTIC_MAX_BYTES)
+            fh.seek(begin)
+            data = fh.read(end - begin)
+    except OSError:
+        return None
+    return data.decode("utf-8", errors="replace"), max(0, end - start)
+
+
+def _classify_backend_failure(
+    log_path: Path, start: int, rc: int, *, is_continue: bool = False
+) -> Meta | None:
+    """Classify one invocation through the bounded backend-rule abstraction.
+
+    Returns:
+        Structured backend diagnostics for a recognized failure, otherwise ``None``.
+    """
+    if rc == 0:
+        return None
+    snapshot = _invocation_log_slice(log_path, start)
+    if snapshot is None:
+        return None
+    text, appended_bytes = snapshot
+    rule = next(
+        (candidate for candidate in BACKEND_FAILURE_RULES if candidate.marker in text), None
+    )
+    if rule is None:
+        return None
+    match = re.search(r'"ref"\s*:\s*"([^"\r\n]+)"', text)
+    return {
+        "classification": rule.classification,
+        "provider": rule.provider,
+        "model": AGENT_MODEL,
+        "request_boundary": "continuation" if is_continue else "fresh_session",
+        "reference": match.group(1) if match else None,
+        "transient": rule.transient,
+        "automatic_retry_safe": rule.automatic_retry_safe,
+        "fresh_session_useful": None if is_continue else False,
+        "backend_scope": "unknown",
+        "diagnostic_bytes": min(appended_bytes, BACKEND_DIAGNOSTIC_MAX_BYTES),
+    }
+
+
+def _finalize_after(rc: int, backend_error: Meta | None = None) -> Callable[[Meta], None]:
+    """Return a metadata mutation that records the result of an invocation."""
 
     def finalize(m: Meta) -> None:
         if m.get("state") != "running":
@@ -2683,6 +2791,7 @@ def _finalize_after(rc: int) -> Callable[[Meta], None]:
             state = "succeeded"
         else:
             state = "failed"
+        m["backend_error"] = backend_error if rc != 0 else None
         _finalize_terminal(m, rc, sig, state, None)
 
     return finalize
@@ -3990,6 +4099,20 @@ def _print_agent_table(entries: list[tuple[str, str, Meta]]) -> None:
         _out("  ".join(row[i].ljust(widths[i]) for i in range(6)))
 
 
+def _print_backend_status(meta: Meta) -> None:
+    """Print the sanitized backend failure and its recovery guidance."""
+    backend_error = _status_backend_error(meta)
+    if backend_error is None:
+        return
+    ref = backend_error.get("reference")
+    suffix = f" (ref {ref})" if isinstance(ref, str) and ref else ""
+    _out(f"backend:    {backend_error['classification']}{suffix}")
+    retry = "safe" if backend_error.get("automatic_retry_safe") is True else "unsafe"
+    fresh = backend_error.get("fresh_session_useful")
+    fresh_text = "no evidence it helps" if fresh is False else "unknown"
+    _out(f"recovery:   automatic retry {retry}; fresh session {fresh_text}")
+
+
 def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals]
     """Show detailed status of one agent.
 
@@ -4050,6 +4173,7 @@ def cmd_status(args: argparse.Namespace) -> int:  # ruff: ignore[too-many-locals
         _out("steer:      malformed persisted lifecycle intent")
     elif intent == "steer":
         _out("steer:      hard-preempting current invocation")
+    _print_backend_status(meta)
     _out(f"title:      {'<invalid>' if 'title' in error_fields else title or '-'}")
     if metadata_errors:
         _out(f"metadata:   malformed persisted summary metadata: {', '.join(metadata_errors)}")
@@ -4088,6 +4212,46 @@ def _status_steer_queue(meta: Meta) -> tuple[list[Meta] | None, str | None]:
     if queue is None:
         return None, "malformed persisted steer metadata"
     return queue, None
+
+
+def _status_backend_error(meta: Meta) -> Meta | None:
+    """Return a bounded schema-checked backend diagnostic for status output.
+
+    Returns:
+        A sanitized backend diagnostic mapping, or ``None`` when unavailable.
+    """
+    value = meta.get("backend_error")
+    if not isinstance(value, dict):
+        return None
+    classification = value.get("classification")
+    if (
+        not isinstance(classification, str)
+        or not classification
+        or len(classification) > BACKEND_CLASSIFICATION_MAX_CHARS
+    ):
+        return None
+    result: Meta = {"classification": classification}
+    for key in ("provider", "model", "request_boundary", "reference", "backend_scope"):
+        item = value.get(key)
+        if isinstance(item, str) and len(item) <= BACKEND_FIELD_MAX_CHARS:
+            result[key] = item
+        elif item is None:
+            result[key] = None
+    for key in ("transient", "automatic_retry_safe"):
+        item = value.get(key)
+        if isinstance(item, bool):
+            result[key] = item
+    fresh = value.get("fresh_session_useful")
+    if isinstance(fresh, bool) or fresh is None:
+        result["fresh_session_useful"] = fresh
+    size = value.get("diagnostic_bytes")
+    if (
+        isinstance(size, int)
+        and not isinstance(size, bool)
+        and 0 <= size <= BACKEND_DIAGNOSTIC_MAX_BYTES
+    ):
+        result["diagnostic_bytes"] = size
+    return result
 
 
 def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
@@ -4131,6 +4295,7 @@ def _status_json(aid: str, meta: Meta, state: str, *, alive: bool) -> Meta:
         "steer_metadata_error": steer_error,
         "model": AGENT_MODEL,
         "variant": _status_optional_string(meta, "variant", metadata_errors),
+        "backend_error": _status_backend_error(meta),
         "log": str(agent_dir(aid) / "output.log"),
     }
     if metadata_errors:
