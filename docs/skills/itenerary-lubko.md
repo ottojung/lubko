@@ -52,6 +52,15 @@ Scheduled/unattended Lubko work must not be merged directly into `main`. Complet
 - Once that release branch has been merged into `main`, stop using it and create a fresh release branch from the new `main` head.
 - A date/timestamp-based name such as `release/2026-08-15` is acceptable.
 
+A release branch is **permanently retired** once any release-promotion PR from that branch has been merged into `main`.
+
+- Retirement is historical and irreversible. Do not decide that a retired branch became active again merely because new commits were accidentally pushed to it after promotion.
+- Never add new scheduled work to a retired release branch.
+- Never open another `release/* -> main` PR from a retired release branch.
+- When choosing the active release branch, inspect merged release PR history as well as branch ancestry. A current branch head that is not contained in `main` is not sufficient evidence that the branch is active if that branch was already promoted earlier.
+- If work is accidentally committed or merged onto a retired release branch, stop using that branch, identify the unique work, move it onto the current active release branch, verify that the active release contains it, and close any stale promotion PR from the retired branch. Do not promote the retired branch a second time.
+- There should be at most one open release-promotion PR targeting `main`: the PR for the current active release branch. If multiple such PRs exist, prove which changes are already represented by the current active release, preserve any unique work there, and close the stale/redundant release PRs.
+
 ### Keep the release branch reconciled with `main`
 
 Whenever a scheduled invocation begins operating on the current release branch, first update `main` and merge it into the release branch:
