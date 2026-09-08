@@ -423,13 +423,43 @@ EXECUTION_ERROR_EXIT_CODE: Final = 127
 JOBS_SCHEMA: Final = "lubko"
 JOBS_TABLE: Final = "jobs"
 JOBS_COLUMN_TYPES: Final = (("id", "uuid"), ("payload", "text"))
+
+
+def _safe_payload_sql(column: str = "payload") -> str:
+    """Build the canonical total payload-to-JSON boundary for SQL expressions.
+
+    This is the single application-side boundary converting opaque ``payload
+    text`` into a safe nullable JSONB expression.  Every ambient-row worker
+    operation must derive its JSON expressions through this helper or an
+    explicitly reviewed equivalent, so that a newly added scan cannot
+    accidentally use raw ``payload::jsonb``.
+
+    Args:
+        column: The SQL column or table-qualified alias to cast, e.g.
+            ``payload``, ``job.payload``, or ``chunk.payload``.
+
+    Returns:
+        A SQL expression fragment producing safe nullable JSONB.
+    """
+    return f"((CASE WHEN {column} IS JSON THEN {column} END)::jsonb)"
+
+
+#: Canonical safe-payload JSONB expression for the default ``payload`` column.
+#: Use this constant (or :func:`_safe_payload_sql`) instead of hand-writing the
+#: ``CASE WHEN payload IS JSON`` pattern so that every ambient-row worker
+#: operation inherits the totalizing guard by construction.
+_SAFE_PAYLOAD_SQL: Final = _safe_payload_sql()
+
 #: SQL predicate selecting rows whose top-level ``server`` is exactly the
 #: daemon's configured identity as a JSON *string*. The ``jsonb_typeof`` guard
 #: makes text-coercion aliases impossible: a row with ``server: 123`` (a JSON
 #: number) can never match a daemon configured with the string ``"123"``,
 #: mirroring the parser's strict string typing. In row-selection predicates a
 #: missing key yields NULL and therefore never matches.
-SERVER_MATCH_SQL: Final = "jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'server') = 'string'\n    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'server' = "  # ruff: ignore[line-too-long]
+SERVER_MATCH_SQL: Final = (
+    f"jsonb_typeof({_SAFE_PAYLOAD_SQL}->'server') = 'string'\n"
+    f"    AND {_SAFE_PAYLOAD_SQL}->>'server' = "
+)
 UTC_ISO_TEXT_SQL: Final = "to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
 UTC_ISO_SQL: Final = f"to_jsonb({UTC_ISO_TEXT_SQL})"
 GC_FINISHED_AT_PATTERN: Final = (
@@ -444,10 +474,10 @@ GC_FINISHED_AT_PATTERN: Final = (
 CANCEL_REQUESTED_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 LEASE_EXPIRES_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 CANCEL_REQUESTED_SQL: Final = (
-    "(jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'cancel_requested_at') = 'string'\n"  # ruff: ignore[line-too-long]
-    "    AND (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'cancel_requested_at')\n"  # ruff: ignore[line-too-long]
+    f"(jsonb_typeof({_SAFE_PAYLOAD_SQL}->'state'->'cancel_requested_at') = 'string'\n"
+    f"    AND ({_SAFE_PAYLOAD_SQL}->'state'->>'cancel_requested_at')\n"
     "        ~ %(cancel_requested_at_pattern)s\n"
-    "    AND left(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'cancel_requested_at', 4) <> '0000')"  # ruff: ignore[line-too-long]
+    f"    AND left({_SAFE_PAYLOAD_SQL}->'state'->>'cancel_requested_at', 4) <> '0000')"
 )
 LEASE_EXPIRES_AT_SQL: Final = (
     "to_jsonb(to_char("
@@ -516,7 +546,8 @@ def _jsonb_set_chain(base: str, updates: list[tuple[str, str]]) -> str:
 
     Args:
         base: SQL expression producing the ``jsonb`` to start from, normally
-            ``(CASE WHEN payload IS JSON THEN payload END)::jsonb``.
+            :data:`_SAFE_PAYLOAD_SQL` or :func:`_safe_payload_sql` for an
+            aliased column.
         updates: ``(path, value)`` pairs, outermost last, where ``path`` is a
             comma-separated JSON path and ``value`` is a ``jsonb`` expression.
 
@@ -1706,9 +1737,9 @@ def publish_output(  # ruff: ignore[too-many-arguments] -- server and force comp
             "SELECT id\n"
             "FROM lubko.jobs\n"
             "WHERE id = %(job_id)s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+            "    AND " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "    AND (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'gc') IS DISTINCT FROM 'true'\n"  # ruff: ignore[line-too-long]
+            "    AND (" + _SAFE_PAYLOAD_SQL + "->'state'->>'gc') IS DISTINCT FROM 'true'\n"
             "FOR UPDATE\n",
             {"job_id": job.id, "server": server},
         )
@@ -2080,9 +2111,9 @@ def _output_update_sql() -> str:
     return (
         "UPDATE lubko.jobs\n"
         "SET payload = jsonb_set("
-        "jsonb_set((CASE WHEN payload IS JSON THEN payload END)::jsonb, '{output}', %(output)s::jsonb), "  # ruff: ignore[line-too-long]
+        "jsonb_set(" + _SAFE_PAYLOAD_SQL + ", '{output}', %(output)s::jsonb), "
         "'{state,updated_at}', " + UTC_ISO_SQL + ")::text\n"
-        "WHERE id = %(job_id)s AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"  # ruff: ignore[line-too-long]
+        "WHERE id = %(job_id)s AND " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
         "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
     )
 
@@ -2196,7 +2227,7 @@ def _persist_process(
         when zero rows matched (the caller must fail closed).
     """
     set_chain = _jsonb_set_chain(
-        "(CASE WHEN payload IS JSON THEN payload END)::jsonb",
+        _SAFE_PAYLOAD_SQL,
         [
             ("state,process_pid", "to_jsonb(%s::int)"),
             ("state,process_pgid", "to_jsonb(%s::int)"),
@@ -2213,9 +2244,9 @@ def _persist_process(
             "SET payload = " + set_chain + "::text\n"
             "WHERE id = %s\n"
             "    AND " + SERVER_MATCH_SQL + "%s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'worker_id' = %s\n"  # ruff: ignore[line-too-long]
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'worker_incarnation' = %s\n"  # ruff: ignore[line-too-long]
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'running'\n",  # ruff: ignore[line-too-long]
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'worker_id' = %s\n"
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'worker_incarnation' = %s\n"
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status' = 'running'\n",
             (
                 gated.proc.pid,
                 gated.pgid,
@@ -2365,13 +2396,15 @@ def _owned_running_groups(
     groups: list[tuple[int | None, int | None, str]] = []
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT id, ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'process_pgid',\n"  # ruff: ignore[line-too-long]
-            "       ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'process_start_time_ticks'\n"  # ruff: ignore[line-too-long]
+            "SELECT id, " + _safe_payload_sql("payload") + "->'state'->'process_pgid',\n"
+            "       " + _safe_payload_sql("payload") + "->'state'->'process_start_time_ticks'\n"
             "FROM lubko.jobs\n"
-            "WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'running'\n"  # ruff: ignore[line-too-long]
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'worker_incarnation' = %(inc)s\n"  # ruff: ignore[line-too-long]
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'process_pgid' IS NOT NULL\n",  # ruff: ignore[line-too-long]
+            "WHERE " + _safe_payload_sql("payload") + "->>'type' = 'command'\n"
+            "    AND " + _safe_payload_sql("payload") + "->'state'->>'status' = 'running'\n"
+            "    AND "
+            + _safe_payload_sql("payload")
+            + "->'state'->>'worker_incarnation' = %(inc)s\n"
+            "    AND " + _safe_payload_sql("payload") + "->'state'->>'process_pgid' IS NOT NULL\n",
             {"inc": incarnation},
         )
         for row in cursor.fetchall():
@@ -3377,14 +3410,14 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
         The claimed jobs and their payload text.
     """
     set_chain = _jsonb_set_chain(
-        "(CASE WHEN job.payload IS JSON THEN job.payload END)::jsonb",
+        _safe_payload_sql("job.payload"),
         [
             ("state,status", "to_jsonb('running'::text)"),
             (
                 "state,created_at",
                 (
                     "COALESCE("
-                    f"to_jsonb(((CASE WHEN job.payload IS JSON THEN job.payload END)::jsonb)->'state'->>'created_at'), "  # ruff: ignore[line-too-long]
+                    f"to_jsonb({_safe_payload_sql('job.payload')}->'state'->>'created_at'), "
                     f"{UTC_ISO_SQL})"
                 ),
             ),
@@ -3404,13 +3437,15 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
             "WITH next AS (\n"
             "    SELECT id\n"
             "    FROM lubko.jobs\n"
-            "    WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+            "    WHERE "
+            + _safe_payload_sql("payload")
+            + "->>'type' = 'command'\n"
             + version_fragment
             + "        AND "
             + SERVER_MATCH_SQL
             + "%(server)s\n"
-            "        AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'pending'\n"  # ruff: ignore[line-too-long]
-            "    ORDER BY ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'created_at', id\n"  # ruff: ignore[line-too-long]
+            "        AND " + _safe_payload_sql("payload") + "->'state'->>'status' = 'pending'\n"
+            "    ORDER BY " + _safe_payload_sql("payload") + "->'state'->>'created_at', id\n"
             "    FOR UPDATE SKIP LOCKED\n"
             "    LIMIT %(limit)s\n"
             ")\n"
@@ -3470,7 +3505,7 @@ def request_cancel(conn: JobsConnection, job_id: UUID, *, server: str) -> str:
         ValueError: If the job does not exist or belongs to another server.
     """
     pending_chain = _jsonb_set_chain(
-        "(CASE WHEN payload IS JSON THEN payload END)::jsonb",
+        _SAFE_PAYLOAD_SQL,
         [
             ("state,status", "to_jsonb('cancelled'::text)"),
             ("state,cancel_requested_at", UTC_ISO_SQL),
@@ -3493,8 +3528,8 @@ def request_cancel(conn: JobsConnection, job_id: UUID, *, server: str) -> str:
             "UPDATE lubko.jobs\n"
             "SET payload = " + pending_chain + "::text\n"
             "WHERE id = %(job_id)s AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'pending'\n"  # ruff: ignore[line-too-long]
-            "RETURNING ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status'\n",
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status' = 'pending'\n"
+            "RETURNING " + _SAFE_PAYLOAD_SQL + "->'state'->>'status'\n",
             {"job_id": job_id, "server": server},
         )
         row = cursor.fetchone()
@@ -3502,7 +3537,7 @@ def request_cancel(conn: JobsConnection, job_id: UUID, *, server: str) -> str:
             return str(row[0])
 
     running_chain = _jsonb_set_chain(
-        "(CASE WHEN payload IS JSON THEN payload END)::jsonb",
+        _SAFE_PAYLOAD_SQL,
         [
             ("state,cancel_requested_at", UTC_ISO_SQL),
             ("state,updated_at", UTC_ISO_SQL),
@@ -3513,8 +3548,8 @@ def request_cancel(conn: JobsConnection, job_id: UUID, *, server: str) -> str:
             "UPDATE lubko.jobs\n"
             "SET payload = " + running_chain + "::text\n"
             "WHERE id = %(job_id)s AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'running'\n"  # ruff: ignore[line-too-long]
-            "RETURNING ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status'\n",
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status' = 'running'\n"
+            "RETURNING " + _SAFE_PAYLOAD_SQL + "->'state'->>'status'\n",
             {"job_id": job_id, "server": server},
         )
         row = cursor.fetchone()
@@ -3523,7 +3558,11 @@ def request_cancel(conn: JobsConnection, job_id: UUID, *, server: str) -> str:
 
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'server', ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status'\n"  # ruff: ignore[line-too-long]
+            "SELECT "
+            + _SAFE_PAYLOAD_SQL
+            + "->>'server', "
+            + _SAFE_PAYLOAD_SQL
+            + "->'state'->>'status'\n"
             "FROM lubko.jobs WHERE id = %s",
             (job_id,),
         )
@@ -3561,7 +3600,7 @@ def bulk_refresh_leases(
         The IDs of the rows whose lease was refreshed.
     """
     set_chain = _jsonb_set_chain(
-        "(CASE WHEN payload IS JSON THEN payload END)::jsonb",
+        _SAFE_PAYLOAD_SQL,
         [
             ("state,lease_expires_at", LEASE_EXPIRES_AT_SQL),
             ("state,updated_at", UTC_ISO_SQL),
@@ -3571,11 +3610,13 @@ def bulk_refresh_leases(
         cursor.execute(
             "UPDATE lubko.jobs\n"
             "SET payload = " + set_chain + "::text\n"
-            "WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+            "WHERE " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'running'\n"  # ruff: ignore[line-too-long]
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"  # ruff: ignore[line-too-long]
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"  # ruff: ignore[line-too-long]
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status' = 'running'\n"
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'worker_id' = %(worker_id)s\n"
+            "    AND "
+            + _SAFE_PAYLOAD_SQL
+            + "->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"
             "    AND id = ANY(%(root_ids)s)\n"
             "RETURNING id\n",
             {
@@ -3646,12 +3687,14 @@ def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUI
         cursor.execute(
             "SELECT id\n"
             "FROM lubko.jobs\n"
-            "WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+            "WHERE " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'running'\n"  # ruff: ignore[line-too-long]
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status' = 'running'\n"
             "    AND " + CANCEL_REQUESTED_SQL + "\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'worker_id' = %(worker_id)s\n"  # ruff: ignore[line-too-long]
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"  # ruff: ignore[line-too-long]
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'worker_id' = %(worker_id)s\n"
+            "    AND "
+            + _SAFE_PAYLOAD_SQL
+            + "->'state'->>'worker_incarnation' = %(worker_incarnation)s\n"
             "LIMIT %(limit)s\n",
             {
                 "server": settings.server,
@@ -3682,13 +3725,17 @@ def _recovery_result_expression() -> str:
         "'exit_code', to_jsonb(NULL::int), "
         "'recovery_note', to_jsonb("
         "'lease expired at ' || COALESCE("
-        "((CASE WHEN job.payload IS JSON THEN job.payload END)::jsonb)->'state'->>'lease_expires_at', '<none>') || "  # ruff: ignore[line-too-long]
+        + _safe_payload_sql("job.payload")
+        + "->'state'->>'lease_expires_at', '<none>') || "
         "'; owning server ' || COALESCE("
-        "((CASE WHEN job.payload IS JSON THEN job.payload END)::jsonb)->>'server', '<unknown>') || "
+        + _safe_payload_sql("job.payload")
+        + "->>'server', '<unknown>') || "
         "'; owning worker ' || COALESCE("
-        "((CASE WHEN job.payload IS JSON THEN job.payload END)::jsonb)->'state'->>'worker_id', '<unknown>') || "  # ruff: ignore[line-too-long]
+        + _safe_payload_sql("job.payload")
+        + "->'state'->>'worker_id', '<unknown>') || "
         "' (incarnation ' || COALESCE("
-        "((CASE WHEN job.payload IS JSON THEN job.payload END)::jsonb)->'state'->>'worker_incarnation', '<unknown>') || "  # ruff: ignore[line-too-long]
+        + _safe_payload_sql("job.payload")
+        + "->'state'->>'worker_incarnation', '<unknown>') || "
         "') stopped heartbeating; job marked failed rather than re-executed'"
         ")"
         ")"
@@ -3720,7 +3767,7 @@ def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, st
         The ``(id, payload)`` pairs of the recovered jobs.
     """
     set_chain = _jsonb_set_chain(
-        "(CASE WHEN job.payload IS JSON THEN job.payload END)::jsonb",
+        _safe_payload_sql("job.payload"),
         [
             ("state,status", "to_jsonb('failed'::text)"),
             ("state,finished_at", UTC_ISO_SQL),
@@ -3734,15 +3781,22 @@ def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, st
             "WITH stale AS (\n"
             "    SELECT id\n"
             "    FROM lubko.jobs\n"
-            "    WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+            "    WHERE " + _safe_payload_sql("payload") + "->>'type' = 'command'\n"
             "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "        AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'running'\n"  # ruff: ignore[line-too-long]
-            "        AND jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'lease_expires_at') = 'string'\n"  # ruff: ignore[line-too-long]
-            "        AND (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'lease_expires_at') "  # ruff: ignore[line-too-long]
+            "        AND " + _safe_payload_sql("payload") + "->'state'->>'status' = 'running'\n"
+            "        AND jsonb_typeof("
+            + _safe_payload_sql("payload")
+            + "->'state'->'lease_expires_at') = 'string'\n"
+            "        AND (" + _safe_payload_sql("payload") + "->'state'->>'lease_expires_at')"
             "            ~ %(lease_expires_at_pattern)s\n"
-            "        AND left(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'lease_expires_at', 4) <> '0000'\n"  # ruff: ignore[line-too-long]
-            "        AND (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'lease_expires_at') < "  # ruff: ignore[line-too-long]
-             + UTC_ISO_TEXT_SQL + "\n"
+            "        AND left("
+            + _safe_payload_sql("payload")
+            + "->'state'->>'lease_expires_at', 4) <> '0000'\n"
+            "        AND ("
+            + _safe_payload_sql("payload")
+            + "->'state'->>'lease_expires_at') < "
+            + UTC_ISO_TEXT_SQL
+            + "\n"
             "    ORDER BY id\n"
             "    FOR UPDATE SKIP LOCKED\n"
             "    LIMIT %(limit)s\n"
@@ -3775,7 +3829,7 @@ def _read_job_status(conn: JobsConnection, job_id: UUID) -> str | None:
     """
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
-            "SELECT ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",  # ruff: ignore[line-too-long]
+            "SELECT " + _SAFE_PAYLOAD_SQL + "->'state'->>'status' FROM lubko.jobs WHERE id = %s",
             (job_id,),
         )
         row = cursor.fetchone()
@@ -3812,7 +3866,7 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
     # NULL, violating payload NOT NULL; jsonb_build_object turns SQL null into
     # JSON null and replaces/creates the result parent in one jsonb_set call.
     set_chain = _jsonb_set_chain(
-        "(CASE WHEN payload IS JSON THEN payload END)::jsonb",
+        _SAFE_PAYLOAD_SQL,
         [
             (
                 "state,status",
@@ -3850,10 +3904,10 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
         cursor.execute(
             "UPDATE lubko.jobs\n"
             "SET payload = " + set_chain + "::text\n"
-            "WHERE id = %(job_id)s AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"  # ruff: ignore[line-too-long]
+            "WHERE id = %(job_id)s AND " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'running'\n"  # ruff: ignore[line-too-long]
-            "RETURNING ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status'\n",
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status' = 'running'\n"
+            "RETURNING " + _SAFE_PAYLOAD_SQL + "->'state'->>'status'\n",
             {
                 "server": server,
                 "status": result.status,
@@ -3907,7 +3961,9 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str, *, server: 
                 "  jsonb_set(\n"
                 "    jsonb_set(\n"
                 "      jsonb_set(\n"
-                "        jsonb_set((CASE WHEN payload IS JSON THEN payload END)::jsonb, '{state,status}', to_jsonb('failed'::text)),\n"  # ruff: ignore[line-too-long]
+                "        jsonb_set("
+                + _SAFE_PAYLOAD_SQL
+                + ", '{state,status}', to_jsonb('failed'::text)),\n"
                 "        '{state,finished_at}', " + UTC_ISO_SQL + "\n"
                 "      ),\n"
                 "      '{state,updated_at}', " + UTC_ISO_SQL + "\n"
@@ -3916,9 +3972,9 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str, *, server: 
                 "  )\n"
                 ")::text\n"
                 "WHERE id = %(job_id)s\n"
-                "  AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+                "  AND " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
                 "  AND " + SERVER_MATCH_SQL + "%(server)s\n"
-                "  AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status'\n"
+                "  AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status'\n"
                 "      NOT IN ('succeeded','failed','cancelled')\n"
                 "RETURNING id\n",
                 {"job_id": job_id, "reason": safe_reason, "server": server},
@@ -3938,29 +3994,29 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str, *, server: 
     return True
 
 
-_REAP_UNSUPPORTED_TEMPLATE: Final = """\
-SELECT id, ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'v' AS version,
-       jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'v') AS version_type
+_REAP_UNSUPPORTED_TEMPLATE: Final = f"""\
+SELECT id, {_safe_payload_sql("payload")}->>'v' AS version,
+       jsonb_typeof({_safe_payload_sql("payload")}->'v') AS version_type
 FROM lubko.jobs
-WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'
-    AND jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'server') = 'string'
-    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'server' = %(server)s
-    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status' = 'pending'
+WHERE {_safe_payload_sql("payload")}->>'type' = 'command'
+    AND jsonb_typeof({_safe_payload_sql("payload")}->'server') = 'string'
+    AND {_safe_payload_sql("payload")}->>'server' = %(server)s
+    AND {_safe_payload_sql("payload")}->'state'->>'status' = 'pending'
     AND CASE
-        WHEN jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'v') = 'number'
-             AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'v' ~ '^-?[0-9]+$'
-        THEN left(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'v', 1) = '-'
-             OR length(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'v') < length(%(protocol_version)s::text)
+        WHEN jsonb_typeof({_safe_payload_sql("payload")}->'v') = 'number'
+             AND {_safe_payload_sql("payload")}->>'v' ~ '^-?[0-9]+$'
+        THEN left({_safe_payload_sql("payload")}->>'v', 1) = '-'
+             OR length({_safe_payload_sql("payload")}->>'v') < length(%(protocol_version)s::text)
              OR (
-                 length(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'v') = length(%(protocol_version)s::text)
-                 AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'v' < %(protocol_version)s::text
+                 length({_safe_payload_sql("payload")}->>'v') = length(%(protocol_version)s::text)
+                 AND {_safe_payload_sql("payload")}->>'v' < %(protocol_version)s::text
              )
         ELSE true
     END
-ORDER BY ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'created_at', id
+ORDER BY {_safe_payload_sql("payload")}->'state'->>'created_at', id
 LIMIT %(limit)s
 FOR UPDATE SKIP LOCKED
-"""  # ruff: ignore[line-too-long]
+"""
 
 
 def fail_unsupported_job(
@@ -3996,7 +4052,9 @@ def fail_unsupported_job(
                 "  jsonb_set(\n"
                 "    jsonb_set(\n"
                 "      jsonb_set(\n"
-                "        jsonb_set((CASE WHEN payload IS JSON THEN payload END)::jsonb, '{state,status}', to_jsonb('failed'::text)),\n"  # ruff: ignore[line-too-long]
+                "        jsonb_set("
+                + _SAFE_PAYLOAD_SQL
+                + ", '{state,status}', to_jsonb('failed'::text)),\n"
                 "        '{state,finished_at}', " + UTC_ISO_SQL + "\n"
                 "      ),\n"
                 "      '{state,updated_at}', " + UTC_ISO_SQL + "\n"
@@ -4005,9 +4063,9 @@ def fail_unsupported_job(
                 "  )\n"
                 ")::text\n"
                 "WHERE id = %(job_id)s\n"
-                "  AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+                "  AND " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
                 "  AND " + SERVER_MATCH_SQL + "%(server)s\n"
-                "  AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status'\n"
+                "  AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status'\n"
                 "      NOT IN ('succeeded','failed','cancelled')\n"
                 "RETURNING id\n",
                 {"job_id": job_id, "reason": safe_diagnostic, "server": server},
@@ -4115,7 +4173,7 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID, *, server: str) ->
     """
     with conn.transaction(), conn.cursor() as cursor:
         cursor.execute(
-            "SELECT ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'server'\nFROM lubko.jobs\nWHERE id = %(job_id)s\n",  # ruff: ignore[line-too-long]
+            "SELECT " + _SAFE_PAYLOAD_SQL + "->>'server'\nFROM lubko.jobs\nWHERE id = %(job_id)s\n",
             {"job_id": job_id},
         )
         row = cursor.fetchone()
@@ -4125,14 +4183,14 @@ def delete_job_and_chunks(conn: JobsConnection, job_id: UUID, *, server: str) ->
         cursor.execute(
             "DELETE FROM lubko.jobs\n"
             "WHERE id = %(job_id)s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+            "    AND " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n",
             {"job_id": job_id, "server": server},
         )
         cursor.execute(
             "DELETE FROM lubko.jobs\n"
-            "WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'output_chunk'\n"  # ruff: ignore[line-too-long]
-            "    AND lower(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'thread') = lower(%(thread)s)\n"  # ruff: ignore[line-too-long]
+            "WHERE " + _SAFE_PAYLOAD_SQL + "->>'type' = 'output_chunk'\n"
+            "    AND lower(" + _SAFE_PAYLOAD_SQL + "->>'thread') = lower(%(thread)s)\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n",
             {"thread": str(job_id), "server": server},
         )
@@ -4245,25 +4303,29 @@ def collect_transport(
             "    ) AS cutoff\n"
             ")\n"
             "UPDATE lubko.jobs\n"
-            "SET payload = jsonb_set((CASE WHEN payload IS JSON THEN payload END)::jsonb, '{state,gc}', to_jsonb(true))::text\n"  # ruff: ignore[line-too-long]
+            "SET payload = jsonb_set("
+            + _SAFE_PAYLOAD_SQL
+            + ", '{state,gc}', to_jsonb(true))::text\n"
             "WHERE id IN (\n"
             "    SELECT id\n"
             "    FROM lubko.jobs, gc_params\n"
-            "    WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+            "    WHERE " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
             "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "        AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status'\n"  # ruff: ignore[line-too-long]
+            "        AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status'\n"
             "            IN ('succeeded', 'failed', 'cancelled')\n"
-            "        AND jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'finished_at') = 'string'\n"  # ruff: ignore[line-too-long]
-            "        AND (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'finished_at')\n"  # ruff: ignore[line-too-long]
+            "        AND jsonb_typeof("
+            + _SAFE_PAYLOAD_SQL
+            + "->'state'->'finished_at') = 'string'\n"
+            "        AND (" + _SAFE_PAYLOAD_SQL + "->'state'->>'finished_at')\n"
             "            ~ %(gc_finished_at_pattern)s\n"
-            "        AND left(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'finished_at', 4) <> '0000'\n"  # ruff: ignore[line-too-long]
-            "        AND (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'finished_at') < gc_params.cutoff\n"  # ruff: ignore[line-too-long]
+            "        AND left(" + _SAFE_PAYLOAD_SQL + "->'state'->>'finished_at', 4) <> '0000'\n"
+            "        AND (" + _SAFE_PAYLOAD_SQL + "->'state'->>'finished_at') < gc_params.cutoff\n"
             "        AND (\n"
-            "            ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'gc' IS NULL\n"  # ruff: ignore[line-too-long]
-            "            OR ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'gc' = 'null'::jsonb\n"  # ruff: ignore[line-too-long]
-            "            OR ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'gc' = 'false'::jsonb\n"  # ruff: ignore[line-too-long]
+            "            " + _SAFE_PAYLOAD_SQL + "->'state'->'gc' IS NULL\n"
+            "            OR " + _SAFE_PAYLOAD_SQL + "->'state'->'gc' = 'null'::jsonb\n"
+            "            OR " + _SAFE_PAYLOAD_SQL + "->'state'->'gc' = 'false'::jsonb\n"
             "        )\n"
-            "    ORDER BY (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'finished_at'), id\n"  # ruff: ignore[line-too-long]
+            "    ORDER BY (" + _SAFE_PAYLOAD_SQL + "->'state'->>'finished_at'), id\n"
             "    FOR UPDATE SKIP LOCKED\n"
             "    LIMIT %(limit)s\n"
             ")\n"
@@ -4289,16 +4351,16 @@ def collect_transport(
             ")\n"
             "SELECT id\n"
             "FROM lubko.jobs, gc_params\n"
-            "WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'command'\n"
+            "WHERE " + _SAFE_PAYLOAD_SQL + "->>'type' = 'command'\n"
             "    AND " + SERVER_MATCH_SQL + "%(server)s\n"
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'status'\n"
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->>'status'\n"
             "        IN ('succeeded', 'failed', 'cancelled')\n"
-            "    AND jsonb_typeof(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'finished_at') = 'string'\n"  # ruff: ignore[line-too-long]
-            "    AND (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'finished_at')\n"  # ruff: ignore[line-too-long]
+            "    AND jsonb_typeof(" + _SAFE_PAYLOAD_SQL + "->'state'->'finished_at') = 'string'\n"
+            "    AND (" + _SAFE_PAYLOAD_SQL + "->'state'->>'finished_at')\n"
             "        ~ %(gc_finished_at_pattern)s\n"
-            "    AND left(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'finished_at', 4) <> '0000'\n"  # ruff: ignore[line-too-long]
-            "    AND (((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->>'finished_at') < gc_params.cutoff\n"  # ruff: ignore[line-too-long]
-            "    AND ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->'state'->'gc' = 'true'::jsonb\n"  # ruff: ignore[line-too-long]
+            "    AND left(" + _SAFE_PAYLOAD_SQL + "->'state'->>'finished_at', 4) <> '0000'\n"
+            "    AND (" + _SAFE_PAYLOAD_SQL + "->'state'->>'finished_at') < gc_params.cutoff\n"
+            "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->'gc' = 'true'::jsonb\n"
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
             "LIMIT %(limit)s\n",
@@ -4318,9 +4380,11 @@ def collect_transport(
                 "WHERE id IN (\n"
                 "    SELECT id\n"
                 "    FROM lubko.jobs\n"
-                "    WHERE ((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'type' = 'output_chunk'\n"  # ruff: ignore[line-too-long]
+                "    WHERE " + _safe_payload_sql("payload") + "->>'type' = 'output_chunk'\n"
                 "        AND " + SERVER_MATCH_SQL + "%(server)s\n"
-                "        AND lower(((CASE WHEN payload IS JSON THEN payload END)::jsonb)->>'thread') = lower(%(thread)s)\n"  # ruff: ignore[line-too-long]
+                "        AND lower("
+                + _safe_payload_sql("payload")
+                + "->>'thread') = lower(%(thread)s)\n"
                 "    FOR UPDATE SKIP LOCKED\n"
                 "    LIMIT %(limit)s\n"
                 ")\n",
@@ -4339,11 +4403,15 @@ def collect_transport(
                 "    AND NOT EXISTS (\n"
                 "        SELECT 1\n"
                 "        FROM lubko.jobs AS chunk\n"
-                "        WHERE (CASE WHEN chunk.payload IS JSON THEN chunk.payload END)::jsonb->>'type' = 'output_chunk'\n"  # ruff: ignore[line-too-long]
+                "        WHERE "
+                + _safe_payload_sql("chunk.payload")
+                + "->>'type' = 'output_chunk'\n"
                 "            AND "
                 + SERVER_MATCH_SQL.replace("payload", "chunk.payload")
                 + "%(server)s\n"
-                "            AND lower((CASE WHEN chunk.payload IS JSON THEN chunk.payload END)::jsonb->>'thread') = lower(%(thread)s)\n"  # ruff: ignore[line-too-long]
+                "            AND lower("
+                + _safe_payload_sql("chunk.payload")
+                + "->>'thread') = lower(%(thread)s)\n"
                 "    )\n",
                 {"job_id": root_id, "server": settings.server, "thread": str(root_id)},
             )
@@ -4359,15 +4427,17 @@ def collect_transport(
         cursor.execute(
             "SELECT chunk.id\n"
             "FROM lubko.jobs AS chunk\n"
-            "WHERE (CASE WHEN chunk.payload IS JSON THEN chunk.payload END)::jsonb->>'type' = 'output_chunk'\n"  # ruff: ignore[line-too-long]
-            "    AND jsonb_typeof((CASE WHEN chunk.payload IS JSON THEN chunk.payload END)::jsonb->'server') = 'string'\n"  # ruff: ignore[line-too-long]
-            "    AND (CASE WHEN chunk.payload IS JSON THEN chunk.payload END)::jsonb->>'server' = %(server)s\n"  # ruff: ignore[line-too-long]
+            "WHERE " + _safe_payload_sql("chunk.payload") + "->>'type' = 'output_chunk'\n"
+            "    AND jsonb_typeof("
+            + _safe_payload_sql("chunk.payload")
+            + "->'server') = 'string'\n"
+            "    AND " + _safe_payload_sql("chunk.payload") + "->>'server' = %(server)s\n"
             "    AND NOT EXISTS (\n"
             "        SELECT 1\n"
             "        FROM lubko.jobs AS root\n"
             "        WHERE lower(root.id::text) =\n"
-            "            lower((CASE WHEN chunk.payload IS JSON THEN chunk.payload END)::jsonb->>'thread')\n"  # ruff: ignore[line-too-long]
-            "            AND (CASE WHEN root.payload IS JSON THEN root.payload END)::jsonb->>'type' = 'command'\n"  # ruff: ignore[line-too-long]
+            "            lower(" + _safe_payload_sql("chunk.payload") + "->>'thread')\n"
+            "            AND " + _safe_payload_sql("root.payload") + "->>'type' = 'command'\n"
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
