@@ -3965,6 +3965,7 @@ def startup_contract_cmd(args: argparse.Namespace) -> int:
 
     * the recorded contract to exactly equal the code's current contract
       (missing/malformed/unsupported/mismatch all fail closed);
+    * the installed startup launcher to match the versioned generated source;
     * the installed startup definition to match the current contract exactly;
     * the required private state directories to exist with the exact safe mode;
     * the private config files to exist with no group/world access.

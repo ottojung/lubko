@@ -99,11 +99,8 @@ class StartupContract:
     """
 
     schema_version: int
-    init_markers: tuple[str, ...]
     init_command: tuple[str, ...]
-    supervisor_markers: tuple[str, ...]
     supervisor_command: tuple[str, ...]
-    worker_relationship: str
     required_state_dirs: tuple[str, ...]
     required_config_files: tuple[str, ...]
 
@@ -115,11 +112,8 @@ class StartupContract:
         """
         return {
             "schema_version": self.schema_version,
-            "init_markers": list(self.init_markers),
             "init_command": list(self.init_command),
-            "supervisor_markers": list(self.supervisor_markers),
             "supervisor_command": list(self.supervisor_command),
-            "worker_relationship": self.worker_relationship,
             "required_state_dirs": list(self.required_state_dirs),
             "required_config_files": list(self.required_config_files),
         }
@@ -129,7 +123,9 @@ class StartupContract:
         """Parse a stored contract strictly.
 
         Args:
-            data: Mapping produced by :meth:`to_dict`.
+            data: Mapping produced by :meth:`to_dict`. Legacy schema-v1 keys
+                (``init_markers``, ``supervisor_markers``,
+                ``worker_relationship``) are silently ignored.
 
         Returns:
             The parsed contract.
@@ -141,11 +137,7 @@ class StartupContract:
         if not isinstance(schema_version, int) or isinstance(schema_version, bool):
             msg = "startup contract is malformed"
             raise TypeError(msg)
-        init_markers = _require_str_tuple(data.get("init_markers"), "init_markers")
         init_command = _require_str_tuple(data.get("init_command"), "init_command")
-        supervisor_markers = _require_str_tuple(
-            data.get("supervisor_markers"), "supervisor_markers"
-        )
         supervisor_command = _require_str_tuple(
             data.get("supervisor_command"), "supervisor_command"
         )
@@ -155,17 +147,10 @@ class StartupContract:
         required_config_files = _require_str_tuple(
             data.get("required_config_files"), "required_config_files"
         )
-        worker_relationship = data.get("worker_relationship")
-        if not isinstance(worker_relationship, str):
-            msg = "startup contract is malformed"
-            raise TypeError(msg)
         return cls(
             schema_version=schema_version,
-            init_markers=init_markers,
             init_command=init_command,
-            supervisor_markers=supervisor_markers,
             supervisor_command=supervisor_command,
-            worker_relationship=worker_relationship,
             required_state_dirs=required_state_dirs,
             required_config_files=required_config_files,
         )
@@ -174,11 +159,8 @@ class StartupContract:
 #: The canonical supported startup contract shipped with the code.
 CURRENT_CONTRACT: Final = StartupContract(
     schema_version=CONTRACT_SCHEMA_VERSION,
-    init_markers=("tini-static", "tini"),
     init_command=("tini-static", "--"),
-    supervisor_markers=("lubko-supervisor", "lubko.supervisor"),
     supervisor_command=("lubko-supervisor",),
-    worker_relationship="direct-child",
     required_state_dirs=("supervisor", "worker", "deploy"),
     required_config_files=DEFAULT_CONFIG_FILES,
 )

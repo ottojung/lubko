@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pytest
@@ -67,7 +68,6 @@ def test_contract_round_trip_and_version_check(
     assert loaded is not None
     assert loaded == CURRENT_CONTRACT
     assert loaded.schema_version == CONTRACT_SCHEMA_VERSION
-    assert loaded.worker_relationship == "direct-child"
     (tmp_path / "startup-contract.json").write_text("{not json", encoding="utf-8")
     assert sc.read_contract() is None
 
@@ -78,9 +78,9 @@ def test_contract_version_mismatch_fails_closed(
     """An unsupported contract version fails closed on the strict reader."""
     monkeypatch.setattr(sc, "contract_path", lambda: tmp_path / "startup-contract.json")
     (tmp_path / "startup-contract.json").write_text(
-        '{"schema_version": 999, "init_markers": ["tini"], "init_command": ["tini-static", "--"], '
-        '"supervisor_markers": ["lubko-supervisor"], "supervisor_command": ["lubko-supervisor"], '
-        '"worker_relationship": "direct-child", "required_state_dirs": ["supervisor"]}',
+        '{"schema_version": 999, "init_command": ["tini-static", "--"], '
+        '"supervisor_command": ["lubko-supervisor"], '
+        '"required_state_dirs": ["supervisor"]}',
         encoding="utf-8",
     )
     with pytest.raises(StartupContractError, match="unsupported startup contract version 999"):
@@ -95,6 +95,27 @@ def test_contract_malformed_fails_closed(tmp_path: Path, monkeypatch: pytest.Mon
         sc.read_contract_strict()
 
 
+def test_contract_legacy_keys_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Legacy schema-v1 keys are silently ignored."""
+    monkeypatch.setattr(sc, "contract_path", lambda: tmp_path / "startup-contract.json")
+    config_files_json = json.dumps(list(CURRENT_CONTRACT.required_config_files))
+    (tmp_path / "startup-contract.json").write_text(
+        '{"schema_version": 1, '
+        '"init_markers": ["tini-static", "tini"], '
+        '"init_command": ["tini-static", "--"], '
+        '"supervisor_markers": ["lubko-supervisor", "lubko.supervisor"], '
+        '"supervisor_command": ["lubko-supervisor"], '
+        '"worker_relationship": "direct-child", '
+        '"required_state_dirs": ["supervisor", "worker", "deploy"], '
+        f'"required_config_files": {config_files_json}'
+        "}",
+        encoding="utf-8",
+    )
+    contract = sc.read_contract_strict()
+    assert contract is not None
+    assert contract == CURRENT_CONTRACT
+
+
 def test_contract_semantic_mismatch_is_distinct(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -102,12 +123,9 @@ def test_contract_semantic_mismatch_is_distinct(
     monkeypatch.setattr(sc, "contract_path", lambda: tmp_path / "startup-contract.json")
     divergent = StartupContract(
         schema_version=CONTRACT_SCHEMA_VERSION,
-        init_markers=CURRENT_CONTRACT.init_markers,
         init_command=CURRENT_CONTRACT.init_command,
-        supervisor_markers=CURRENT_CONTRACT.supervisor_markers,
         supervisor_command=CURRENT_CONTRACT.supervisor_command,
-        worker_relationship="not-direct-child",
-        required_state_dirs=CURRENT_CONTRACT.required_state_dirs,
+        required_state_dirs=("supervisor",),
         required_config_files=CURRENT_CONTRACT.required_config_files,
     )
     sc.write_contract(divergent)
@@ -197,8 +215,8 @@ def test_contract_is_frozen_and_current_matches_version() -> None:
     """The shipped contract is frozen and carries the current schema version."""
     assert isinstance(CURRENT_CONTRACT, StartupContract)
     assert CURRENT_CONTRACT.schema_version == CONTRACT_SCHEMA_VERSION
-    assert "tini-static" in CURRENT_CONTRACT.init_markers
-    assert "lubko-supervisor" in CURRENT_CONTRACT.supervisor_markers
+    assert "tini-static" in CURRENT_CONTRACT.init_command
+    assert "lubko-supervisor" in CURRENT_CONTRACT.supervisor_command
 
 
 # --- Status / startup-contract command tests (no topology) ---
