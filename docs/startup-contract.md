@@ -20,6 +20,8 @@ Every maintained entry point, including `lubko-supervisor`, resolves through the
 
 Candidate deployment state may select a provisional worker while it is valid, but it cannot invalidate the independently confirmed runtime. If mutable desired/mission state is unreadable, malformed, unsupported, truncated, or contradictory, the supervisor converges back to the usable runtime named by `cli/current`, unless exact live-consumer authority requires a temporary hold to preserve the one-consumer invariant.
 
+Supervisor-owned deployment missions also use a stable backward-readable schema-3 wire envelope while a candidate is unconfirmed. The compatibility `new_meta` field is only a non-process candidate descriptor: all PID/session/start-time/token/worker-identity fields are null, and real candidate process authority remains exclusively in the supervisor durable child state. Newer controllers may add fields that older trusted supervisors ignore, but they must not publish an envelope the already-running recovery supervisor cannot parse.
+
 ## Versioned artifacts
 
 `lubko-install` publishes repository-owned artifacts under `$XDG_STATE_HOME/lubko/deploy/`:
