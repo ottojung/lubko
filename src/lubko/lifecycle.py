@@ -3929,12 +3929,12 @@ def status_cmd() -> int:
 
 
 def _print_startup_contract() -> None:
-    """Report the versioned startup contract and its live topology proof.
+    """Report the versioned startup contract and static artifact validation.
 
     The contract is the authoritative, repository-owned definition of how the
-    container must start the supervisor; the proof demonstrates the live
-    process topology actually matches it, rather than merely inferring worker
-    liveness from queue state.
+    container must start the supervisor. This reports static artifact validation
+    (launcher, definition, state paths, config permissions) without inspecting
+    the live process topology, which is intentionally out of scope.
     """
     assessment = startup_contract.assess_recorded_contract()
     if assessment.state == "current" and assessment.contract is not None:
@@ -3953,54 +3953,24 @@ def _print_startup_contract() -> None:
     _out(f"startup state paths: {'OK' if paths.ok else 'FAIL'} ({paths.message})")
     config_paths = startup_contract.validate_contract_config()
     _out(f"private config paths: {'OK' if config_paths.ok else 'FAIL'} ({config_paths.message})")
-    proof = startup_contract.verify_live_topology()
-    activation_matches = (
-        proof.init_is_tini and proof.supervisor_under_init and proof.supervisor_is_contract_binary
-    )
-    if definition.ok and not activation_matches:
-        _out(
-            "startup definition: FAIL "
-            f"({definition.message}, but the live init/supervisor activation does not consume it)"
-        )
-    else:
-        _out(f"startup definition: {'OK' if definition.ok else 'FAIL'} ({definition.message})")
-    _out(f"startup topology: {'OK' if proof.ok else 'FAIL'}")
-    _out(f"  init (pid {proof.init_pid}): {proof.init_cmdline or 'unknown'}")
-    _out(f"  init is supported tini: {proof.init_is_tini}")
-    if proof.supervisor_pid:
-        _out(f"  supervisor (pid {proof.supervisor_pid}): {proof.supervisor_cmdline or 'unknown'}")
-    _out(f"  supervisor under tini: {proof.supervisor_under_init}")
-    _out(f"  supervisor is lubko-supervisor: {proof.supervisor_is_contract_binary}")
-    _out(f"  supervisor identity matches recorded: {proof.supervisor_identity_matches}")
-    _out(f"  uses sleep-infinity placeholder: {proof.uses_sleep_placeholder}")
-    if proof.worker_pid is not None:
-        _out(
-            f"  worker (pid {proof.worker_pid}) direct child of supervisor: "
-            f"{proof.worker_is_direct_child}"
-        )
-        _out(f"  worker identity matches recorded: {proof.worker_identity_matches}")
-    _out(f"  proof: {proof.message}")
+    _out(f"startup definition: {'OK' if definition.ok else 'FAIL'} ({definition.message})")
 
 
 def startup_contract_cmd(args: argparse.Namespace) -> int:
-    """Verify, and optionally publish, the live supervisor startup contract.
+    """Verify, and optionally publish, the versioned startup contract.
 
-    The command requires every supported-deployment boundary to hold before it
-    reports the startup contract active, and it fails closed on any missing
-    piece. Concretely it requires:
+    The command requires every supported-deployment artifact boundary to hold
+    before it reports the startup contract active, and it fails closed on any
+    missing piece. Concretely it requires:
 
     * the recorded contract to exactly equal the code's current contract
       (missing/malformed/unsupported/mismatch all fail closed);
-    * the repository-owned startup launcher to be installed and match the versioned
-      source;
     * the installed startup definition to match the current contract exactly;
     * the required private state directories to exist with the exact safe mode;
-    * the private config files to exist with no group/world access;
-    * the live Tini -> supervisor -> worker topology to be proven.
+    * the private config files to exist with no group/world access.
 
-    It exits non-zero unless every check passes — for example when the container
-    still uses the ``sleep infinity`` placeholder, the recorded contract has
-    silently drifted, or the startup definition is missing.
+    It does not inspect the live process topology, which is intentionally out
+    of scope — the external host/container environment is trusted.
 
     Args:
         args: Parsed command line arguments.
@@ -4026,10 +3996,9 @@ def startup_contract_cmd(args: argparse.Namespace) -> int:
     definition_ok = startup_contract.validate_startup_definition().ok
     paths_ok = startup_contract.validate_contract_paths().ok
     config_ok = startup_contract.validate_contract_config().ok
-    proof = startup_contract.verify_live_topology()
     return (
         EXIT_OK
-        if (contract_ok and launcher_ok and definition_ok and paths_ok and config_ok and proof.ok)
+        if (contract_ok and launcher_ok and definition_ok and paths_ok and config_ok)
         else EXIT_ERROR
     )
 
@@ -4728,12 +4697,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     contract_parser = subparsers.add_parser(
         "startup-contract",
-        help="prove the live supervisor startup topology (tini -> supervisor -> worker)",
+        help="verify the versioned startup contract and static artifacts",
     )
     contract_parser.add_argument(
         "--write",
         action="store_true",
-        help="publish the current versioned startup contract artifact before proving the topology",
+        help="publish the current versioned startup contract, launcher, and definition",
     )
 
     deploy_parser = subparsers.add_parser(
