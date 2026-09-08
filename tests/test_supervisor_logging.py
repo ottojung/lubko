@@ -66,6 +66,24 @@ def test_identical_persistent_failures_are_coalesced_and_recover(tmp_path: Path)
     assert len(contents) < 20_000
 
 
+def test_single_failure_then_success_logs_recovery(tmp_path: Path) -> None:
+    """A one-shot persistent diagnostic still has an explicit recovery transition."""
+    log = tmp_path / "supervisor.log"
+    handler = supervisor._BoundedSupervisorLogHandler(
+        log, max_bytes=1_000_000, backup_count=1, repeat_interval=100
+    )
+    logger = _logger(handler)
+    handler.begin_reconciliation_cycle()
+    _exception(logger, "corrupt durable state", "one failure")
+    handler.end_reconciliation_cycle()
+    handler.begin_reconciliation_cycle()
+    handler.end_reconciliation_cycle()
+    handler.close()
+    contents = log.read_text()
+    assert contents.count("Traceback (most recent call last)") == 1
+    assert "persistent supervisor diagnostic recovered after 0 suppressed repeats" in contents
+
+
 def test_changed_failure_gets_a_fresh_diagnostic(tmp_path: Path) -> None:
     """A materially changed failure retains a fresh full diagnostic."""
     log = tmp_path / "supervisor.log"

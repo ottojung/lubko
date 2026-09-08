@@ -188,12 +188,11 @@ class _BoundedSupervisorLogHandler(RotatingFileHandler):
         repeats = self._failure_repeats
         self._failure_key = None
         self._failure_repeats = 0
-        if repeats:
-            self._emit_compact(
-                logging.INFO,
-                "persistent supervisor diagnostic recovered after %d suppressed repeats",
-                (repeats,),
-            )
+        self._emit_compact(
+            logging.INFO,
+            "persistent supervisor diagnostic recovered after %d suppressed repeats",
+            (repeats,),
+        )
 
     def _emit_compact(self, level: int, message: str, args: tuple[object, ...]) -> None:
         record = logging.LogRecord(
