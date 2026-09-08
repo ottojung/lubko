@@ -211,6 +211,101 @@ class WorkerMeta:
         )
 
 
+def supervisor_candidate_wire_descriptor(commit: str, repo: str) -> dict[str, object]:
+    """Return the stable non-process candidate compatibility record.
+
+    Supervisor-owned candidate identity lives in supervisor state.  This
+    descriptor remains parseable by older rollback readers while deliberately
+    carrying no process authority.
+    """
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "state": STATE_STOPPED,
+        "pid": None,
+        "pgid": None,
+        "sid": None,
+        "start_time_ticks": None,
+        "token": None,
+        "repo": repo,
+        "git_commit": commit,
+        "worker_id": None,
+        "log_path": "",
+        "started_at": None,
+        "stopped_at": None,
+    }
+
+
+def _legacy_supervisor_candidate_placeholder(
+    data: dict[str, object], *, commit: str, repo: str
+) -> bool:
+    """Recognize exactly the identity-less sentinel emitted by older controllers.
+
+    Returns:
+        Whether the mapping is the historical supervisor-owned sentinel.
+    """
+    return data == {
+        "schema_version": SCHEMA_VERSION,
+        "state": STATE_RUNNING,
+        "pid": 0,
+        "pgid": 0,
+        "sid": 0,
+        "start_time_ticks": 0,
+        "token": None,
+        "repo": repo,
+        "git_commit": commit,
+        "worker_id": "",
+        "log_path": "",
+        "started_at": None,
+        "stopped_at": None,
+    }
+
+
+def parse_supervisor_candidate_meta(
+    replacement: object,
+    *,
+    supervisor_owned: object,
+    commit: object,
+    repo: object,
+) -> WorkerMeta | None:
+    """Parse rollback candidate metadata with exact supervisor compatibility.
+
+    Ordinary worker metadata remains strict.  Only explicit supervisor
+    ownership may omit candidate process identity, either through the current
+    stable descriptor or the exact historical zero-identity sentinel.
+
+    Returns:
+        Strict worker metadata, or ``None`` for exact supervisor-owned
+        non-process compatibility records.
+
+    Raises:
+        TypeError: If the candidate shape or ownership cannot be trusted.
+        ValueError: If ordinary worker metadata is outside its valid domain.
+    """
+    if replacement is None:
+        if supervisor_owned is not True:
+            raise TypeError
+        return None
+    if not isinstance(replacement, dict):
+        raise TypeError
+
+    context_is_exact = isinstance(commit, str) and isinstance(repo, str)
+    if context_is_exact and replacement == supervisor_candidate_wire_descriptor(commit, repo):
+        if supervisor_owned is not True:
+            raise TypeError
+        return None
+
+    try:
+        return WorkerMeta.from_dict(replacement)
+    except (TypeError, ValueError):
+        if (
+            supervisor_owned is not True
+            or not context_is_exact
+            or not _legacy_supervisor_candidate_placeholder(replacement, commit=commit, repo=repo)
+        ):
+            raise
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class ValidationReport:
     """Outcome of running the repository validation commands."""
@@ -2542,7 +2637,12 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
         msg = "rollback state is present but malformed; repair refuses to erase authority"
         raise _AdoptionError(msg)
     try:
-        new_meta = WorkerMeta.from_dict(data.get("new_meta") or {})
+        new_meta = parse_supervisor_candidate_meta(
+            data.get("new_meta"),
+            supervisor_owned=data.get("supervisor_owned"),
+            commit=data.get("commit"),
+            repo=data.get("repo"),
+        )
         previous_meta = WorkerMeta.from_dict(data.get("previous_meta") or {})
         deadline = _meta_optional_finite_float(data, "deadline")
         status = _required_rollback_status(data)
@@ -2552,10 +2652,15 @@ def _repair_rollback_state(recovery_worker_pid: int) -> None:
     if deadline is None:
         msg = "rollback state is present but malformed; repair refuses to erase authority"
         raise _AdoptionError(msg)
-    if status == STATE_PENDING and worker_alive(new_meta) and deadline > time.time():
+    if (
+        status == STATE_PENDING
+        and new_meta is not None
+        and worker_alive(new_meta)
+        and deadline > time.time()
+    ):
         msg = "another supervised deployment is still pending confirmation"
         raise _AdoptionError(msg)
-    if worker_alive(new_meta) and new_meta.pid != recovery_worker_pid:
+    if new_meta is not None and worker_alive(new_meta) and new_meta.pid != recovery_worker_pid:
         msg = (
             f"a live supervised candidate worker pid {new_meta.pid} exists; "
             "repair refuses to adopt a different process"
