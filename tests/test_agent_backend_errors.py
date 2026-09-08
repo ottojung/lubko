@@ -9,6 +9,8 @@ from lubko import agent
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 
 def test_classifies_backend_server_error_from_current_invocation(tmp_path: Path) -> None:
     """A recognized server error becomes bounded structured diagnostics."""
@@ -50,3 +52,78 @@ def test_success_clears_previous_backend_error() -> None:
     agent._finalize_after(0)(meta)
     assert meta["state"] == "succeeded"
     assert meta["backend_error"] is None
+
+
+def test_retryable_backend_failure_recovers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A positively replay-safe transient failure gets bounded retry."""
+    calls = 0
+    sleeps: list[float] = []
+    meta: agent.Meta = {
+        "backend_error": {
+            "classification": "fake_transient",
+            "transient": True,
+            "automatic_retry_safe": True,
+        }
+    }
+
+    def run_once() -> int:
+        nonlocal calls
+        calls += 1
+        return 1 if calls == 1 else 0
+
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+    monkeypatch.setattr("lubko.agent.time.sleep", sleeps.append)
+    assert agent._run_with_backend_retries("abc123", run_once) == 0
+    assert calls == 2
+    assert sleeps == [agent.BACKEND_RETRY_BASE_SECONDS]
+
+
+def test_retryable_backend_failure_exhausts_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Repeated replay-safe failures stop after the bounded retry budget."""
+    calls = 0
+    sleeps: list[float] = []
+    meta: agent.Meta = {
+        "backend_error": {
+            "classification": "fake_transient",
+            "transient": True,
+            "automatic_retry_safe": True,
+        }
+    }
+
+    def run_once() -> int:
+        nonlocal calls
+        calls += 1
+        return 1
+
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+    monkeypatch.setattr("lubko.agent.time.sleep", sleeps.append)
+    assert agent._run_with_backend_retries("abc123", run_once) == 1
+    assert calls == agent.BACKEND_RETRY_MAX_ATTEMPTS + 1
+    assert sleeps == [
+        agent.BACKEND_RETRY_BASE_SECONDS,
+        agent.BACKEND_RETRY_BASE_SECONDS * 2,
+    ]
+
+
+def test_ambiguous_backend_acceptance_is_never_replayed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Transient classification alone never authorizes duplicate work."""
+    calls = 0
+    meta: agent.Meta = {
+        "backend_error": {
+            "classification": "transient_backend_server_error",
+            "transient": True,
+            "automatic_retry_safe": False,
+        }
+    }
+
+    def run_once() -> int:
+        nonlocal calls
+        calls += 1
+        return 1
+
+    monkeypatch.setattr(agent, "read_meta", lambda _aid: meta)
+    monkeypatch.setattr(
+        "lubko.agent.time.sleep", lambda _delay: (_ for _ in ()).throw(AssertionError())
+    )
+    assert agent._run_with_backend_retries("abc123", run_once) == 1
+    assert calls == 1

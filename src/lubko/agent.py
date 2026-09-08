@@ -111,6 +111,8 @@ STATUS_TAIL_LINES: Final = 50
 BACKEND_DIAGNOSTIC_MAX_BYTES: Final = 16 * 1024
 BACKEND_CLASSIFICATION_MAX_CHARS: Final = 80
 BACKEND_FIELD_MAX_CHARS: Final = 200
+BACKEND_RETRY_MAX_ATTEMPTS: Final = 2
+BACKEND_RETRY_BASE_SECONDS: Final = 0.5
 FOLD_WIDTH: Final = 80
 DEFAULT_RETENTION_DAYS: Final = 14
 RUNNER_ARGV_LENGTH: Final = 3
@@ -2289,12 +2291,6 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     meta = read_meta(aid)
     if meta is None:
         return None
-    # A fresh, durable identity for exactly this invocation. It is stamped
-    # into the spawned process environment (inherited by the whole process
-    # tree) and recorded in metadata, so later signalling can prove
-    # invocation-exact membership even across PGID/PID recycling.
-    iid = uuid.uuid4().hex
-    ctx.env[INVOCATION_ID_VAR] = iid
     ctx.env["LUBKO_PROMPT"] = prompt
     cmd = build_agent_command(meta, prompt, is_continue=is_continue)
     if cmd is None:
@@ -2315,11 +2311,49 @@ def _run_invocation(ctx: _RunnerContext, prompt: str, *, is_continue: bool) -> s
     if not _claim_pending_prompt(aid, prompt):
         return None
 
-    rc = _spawn_and_run(ctx, aid, cmd, iid, is_continue=is_continue)
+    def run_once() -> int | None:
+        iid = uuid.uuid4().hex
+        ctx.env[INVOCATION_ID_VAR] = iid
+        return _spawn_and_run(ctx, aid, cmd, iid, is_continue=is_continue)
+
+    rc = _run_with_backend_retries(aid, run_once)
     if rc is None:
         return None
 
     return _drain_next(aid)
+
+
+def _backend_retry_delay(error: Meta | None, attempt: int) -> float | None:
+    """Return bounded backoff only for positively replay-safe backend failures.
+
+    Returns:
+        Delay in seconds, or ``None`` when replay is unsafe or exhausted.
+    """
+    if error is None or attempt >= BACKEND_RETRY_MAX_ATTEMPTS:
+        return None
+    if error.get("transient") is not True or error.get("automatic_retry_safe") is not True:
+        return None
+    return BACKEND_RETRY_BASE_SECONDS * float(2**attempt)
+
+
+def _run_with_backend_retries(aid: str, run_once: Callable[[], int | None]) -> int | None:
+    """Run one invocation with bounded retries when non-acceptance is proven.
+
+    Returns:
+        Final invocation return code, or ``None`` when the runner must stop.
+    """
+    attempt = 0
+    while True:
+        rc = run_once()
+        if rc is None or rc == 0:
+            return rc
+        meta = read_meta(aid)
+        error = _status_backend_error(meta) if meta is not None else None
+        delay = _backend_retry_delay(error, attempt)
+        if delay is None:
+            return rc
+        time.sleep(delay)
+        attempt += 1
 
 
 def _fail_invocation_closed(aid: str, error: str, *, exit_code: int | None = None) -> None:
