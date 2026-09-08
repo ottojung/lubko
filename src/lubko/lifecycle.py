@@ -3900,12 +3900,21 @@ def _print_startup_contract() -> None:
     launcher_state = "installed" if launcher_ok else "MISSING"
     _out(f"startup launcher ({startup_contract.STARTUP_LAUNCHER_NAME}): {launcher_state}")
     definition = startup_contract.validate_startup_definition()
-    _out(f"startup definition: {'OK' if definition.ok else 'FAIL'} ({definition.message})")
     paths = startup_contract.validate_contract_paths()
     _out(f"startup state paths: {'OK' if paths.ok else 'FAIL'} ({paths.message})")
     config_paths = startup_contract.validate_contract_config()
     _out(f"private config paths: {'OK' if config_paths.ok else 'FAIL'} ({config_paths.message})")
     proof = startup_contract.verify_live_topology()
+    activation_matches = (
+        proof.init_is_tini and proof.supervisor_under_init and proof.supervisor_is_contract_binary
+    )
+    if definition.ok and not activation_matches:
+        _out(
+            "startup definition: FAIL "
+            f"({definition.message}, but the live init/supervisor activation does not consume it)"
+        )
+    else:
+        _out(f"startup definition: {'OK' if definition.ok else 'FAIL'} ({definition.message})")
     _out(f"startup topology: {'OK' if proof.ok else 'FAIL'}")
     _out(f"  init (pid {proof.init_pid}): {proof.init_cmdline or 'unknown'}")
     _out(f"  init is supported tini: {proof.init_is_tini}")
