@@ -108,10 +108,3 @@ A selected issue is complete for scheduled orchestration only when:
 
 A `completed` status remains complete scheduled work even if the GitHub issue stays open while awaiting human promotion of the release branch.
 
-## Scheduled-task description
-
-The scheduled ChatGPT task description should be only:
-
-> Follow: <https://github.com/ottojung/lubko/blob/main/docs/skills/itenerary-lubko.md>
-
-Do not add a separate target-repository line and do not duplicate issue-selection, recovery, ownership, release-branch, merge, or Lubko-operation rules in the task description. Those rules belong in this itinerary and the documents it directs the orchestrator to study.
