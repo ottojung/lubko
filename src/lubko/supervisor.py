@@ -86,6 +86,11 @@ from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
 from lubko._exact_signal import process_ppid as _shared_process_ppid
+from lubko._supervisor_identity import (
+    capture_supervisor_runtime_commit,
+    contract_schema_version,
+    resolve_new_supervisor_executable,
+)
 from lubko.config import load_database_config
 from lubko.durable import DurabilityError, remove_durable
 from lubko.health import (
@@ -713,6 +718,7 @@ class SupervisorDaemon:
         self._bootstrap_hold_logged = False
         self._ownership_fd: int | None = None
         self._start_time_ticks: int = 0
+        self._runtime_commit: str | None = capture_supervisor_runtime_commit()
 
     def _write_state_authority_safe(self, state: SupervisorState) -> bool:
         """Publish a supervisor transition without erasing newer consumer authority.
@@ -769,6 +775,7 @@ class SupervisorDaemon:
         self._acquire_ownership()
         try:
             self._write_pidfile()
+            self._persist_runtime_commit()
             self._invalidate_stale_status()
             normalize_cross_boot_state()
             self._install_signal_handlers()
@@ -817,6 +824,7 @@ class SupervisorDaemon:
             )
             LOGGER.error("%s", self._message)
             return
+        self._maybe_exec_upgrade()
         action, commit = self._derive_action(state)
         if action != "hold" and self._apply_newer_desired(state, commit):
             return
@@ -3074,9 +3082,20 @@ class SupervisorDaemon:
         when this process exits — even under SIGKILL or a crash — a later
         supervisor can always take ownership afterwards.
 
+        When an inherited handoff fd is present (exec-based upgrade), the
+        adopted fd is validated and used directly instead of opening/acquiring
+        a second lock.  The handoff environment variables are cleared after
+        adoption so they are never consumed twice.
+
         Raises:
-            SystemExit: If another live supervisor holds the ownership lock.
+            SystemExit: If another live supervisor holds the ownership lock,
+                or if the inherited handoff fd cannot be validated.
         """
+        inherited_fd = self._try_adopt_inherited_lock()
+        if inherited_fd is not None:
+            self._ownership_fd = inherited_fd
+            LOGGER.info("supervisor ownership lock adopted via handoff (fd %d)", inherited_fd)
+            return
         try:
             acquired = acquire_supervisor_lock()
         except OSError:
@@ -3086,6 +3105,56 @@ class SupervisorDaemon:
             raise SystemExit(1) from None
         self._ownership_fd = acquired
         LOGGER.info("supervisor ownership lock acquired (fd %d)", acquired)
+
+    @staticmethod
+    def _try_adopt_inherited_lock() -> int | None:
+        """Try to adopt an inherited lock fd from an exec-based handoff.
+
+        Returns:
+            The validated adopted fd, or ``None`` when no handoff is in
+            progress (normal startup path).
+
+        Raises:
+            SystemExit: If handoff env vars are present but validation fails,
+                to prevent running without the ownership lock.
+        """
+        fd_str = os.environ.get(supervise.HANDOFF_FD_ENV)
+        if fd_str is None:
+            return None
+        try:
+            fd_number = int(fd_str)
+        except ValueError:
+            LOGGER.exception(
+                "malformed handoff fd environment variable %r; "
+                "refusing to start without validated ownership",
+                fd_str,
+            )
+            raise SystemExit(1) from None
+        expected_path = os.environ.get(supervise.HANDOFF_PATH_ENV)
+        if expected_path is None:
+            LOGGER.error(
+                "handoff fd present but handoff path is missing; "
+                "refusing to start without validated ownership"
+            )
+            raise SystemExit(1) from None
+        handoff_pid = os.environ.get(supervise.HANDOFF_PID_ENV, "?")
+        try:
+            adopted = supervise.adopt_supervisor_lock(fd_number, expected_path)
+        except OSError:
+            LOGGER.exception(
+                "handoff fd adoption failed (handed off by pid %s); "
+                "refusing to start without validated ownership",
+                handoff_pid,
+            )
+            raise SystemExit(1) from None
+        # Clear the handoff env vars so they are never consumed twice.
+        for var in (
+            supervise.HANDOFF_FD_ENV,
+            supervise.HANDOFF_PATH_ENV,
+            supervise.HANDOFF_PID_ENV,
+        ):
+            os.environ.pop(var, None)
+        return adopted
 
     def _release_ownership(self) -> None:
         """Release the process-level ownership lock held for the lifetime."""
@@ -3154,6 +3223,115 @@ class SupervisorDaemon:
         """
         with suppress(OSError):
             supervise.status_path().unlink(missing_ok=True)
+
+    def _persist_runtime_commit(self) -> None:
+        """Store the supervisor's own runtime commit durably in state.json.
+
+        This is called once at startup, after the ownership lock is acquired.
+        The value is captured from ``cli.current_commit()`` at startup time —
+        the only moment when it correctly names the code this process is
+        executing from.  After a later deployment changes ``cli/current``,
+        this stored value remains correct.
+
+        Uses the authority-preserving writer so that a concurrent manual
+        recovery's consumer-establishment decision cannot be accidentally
+        overwritten during startup.
+        """
+        state = read_state()
+        if state.supervisor_runtime_commit == self._runtime_commit:
+            return
+        write_state_preserving_authority(
+            replace(state, supervisor_runtime_commit=self._runtime_commit),
+            timeout_seconds=self.settings.lock_timeout_seconds,
+        )
+        LOGGER.info(
+            "recorded supervisor runtime commit %s (contract version %d)",
+            self._runtime_commit,
+            contract_schema_version(),
+        )
+
+    def _maybe_exec_upgrade(self) -> None:
+        """Exec into the confirmed supervisor runtime when it differs from ours.
+
+        After a deployment confirms a new commit, ``cli/current`` points to the
+        new code while this supervisor still executes from the old runtime.
+        When the confirmed commit (``cli/current_commit()``) differs from our
+        stored ``supervisor_runtime_commit``, this method resolves the new
+        supervisor executable through the exact confirmed commit's sealed
+        runtime (not the mutable ``cli/current`` symlink) and calls
+        ``os.execv()`` to replace this process in-place.
+
+        The ownership lock fd is made inheritable immediately before exec and
+        passed via environment variables.  The new supervisor's startup adopts
+        the inherited fd (validating path and flock ownership) instead of
+        opening/acquiring a second lock.  If exec fails, the fd is reverted to
+        non-inheritable and the old supervisor continues with its existing
+        authority.
+
+        ``os.execv`` atomically replaces the process image while preserving the
+        PID, the child process (the maintained worker), and — via the
+        inheritable fd — the ownership ``flock``.  If the exec fails (missing
+        runtime, permission error), the old supervisor continues its reconcile
+        loop unchanged.
+        """
+        state = read_state()
+        stored = state.supervisor_runtime_commit
+        if stored is None or not cli.is_valid_commit_name(stored):
+            return
+        confirmed = cli.current_commit()
+        if confirmed is None or confirmed == stored:
+            return
+        if not cli.is_valid_commit_name(confirmed):
+            return
+        target = resolve_new_supervisor_executable(confirmed)
+        if target is None:
+            self._message = (
+                f"supervisor runtime skew detected (ours={stored}, "
+                f"confirmed={confirmed}) but the new runtime is not usable; "
+                "continuing with the current runtime"
+            )
+            LOGGER.warning(
+                "supervisor runtime skew detected (ours=%s, confirmed=%s) "
+                "but the new runtime is not usable; continuing",
+                stored,
+                confirmed,
+            )
+            return
+        if self._ownership_fd is None:
+            LOGGER.error(
+                "cannot exec-upgrade without an ownership fd; continuing with the current runtime"
+            )
+            return
+        lock_path = str(supervise.supervisor_lock_path())
+        LOGGER.info(
+            "exec-based supervisor upgrade: %s -> %s (%s)",
+            stored,
+            confirmed,
+            target,
+        )
+        lifecycle.append_deploy_log(f"supervisor exec upgrade: {stored} -> {confirmed}")
+        # Make the lock fd inheritable so the exec'd process inherits it.
+        was_inheritable = os.get_inheritable(self._ownership_fd)
+        os.set_inheritable(self._ownership_fd, True)  # ruff: ignore[boolean-positional-value-in-call]
+        # Build the handoff environment for the successor.
+        handoff_env = {
+            **os.environ,
+            supervise.HANDOFF_FD_ENV: str(self._ownership_fd),
+            supervise.HANDOFF_PATH_ENV: lock_path,
+            supervise.HANDOFF_PID_ENV: str(os.getpid()),
+        }
+        try:
+            os.execve(target, [target], handoff_env)
+        except OSError:
+            # Revert inheritable flag and continue with old authority.
+            os.set_inheritable(self._ownership_fd, was_inheritable)
+            LOGGER.exception(
+                "exec-based supervisor upgrade failed; continuing with the current runtime"
+            )
+            self._message = (
+                f"exec-based supervisor upgrade to {confirmed} failed; "
+                "continuing with the current runtime"
+            )
 
     def _write_pidfile(self) -> None:
         """Record our exact identity, refusing to double-run a live daemon.
@@ -3229,6 +3407,8 @@ class SupervisorDaemon:
                 message=effective_message,
                 worker_health=worker_health,
                 holding=is_holding(state),
+                supervisor_runtime_commit=self._runtime_commit,
+                supervisor_runtime_contract_version=contract_schema_version(),
             )
         )
 

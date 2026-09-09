@@ -84,6 +84,7 @@ convention = "google"
 "src/lubko/supervisor.py" = [
     "blind-except",
     "raise-vanilla-args",
+    "start-process-with-no-shell",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
@@ -107,10 +108,17 @@ convention = "google"
     # Tests assert invariants of the worker's internal state machine (outage
     # convergence, deadline derivation), which are deliberately not public API.
     "assert",
+    "boolean-positional-value-in-call",
+    "docstring-missing-returns",
+    "import-outside-top-level",
     "magic-value-comparison",
+    "no-self-use",
     "private-member-access",
+    "pytest-raises-too-broad",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
+    "unused-function-argument",
+    "unused-method-argument",
 ]
 
 [tool.ruff.format]

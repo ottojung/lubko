@@ -41,6 +41,7 @@ import fcntl
 import json
 import math
 import os
+import resource
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
@@ -458,6 +459,13 @@ class SupervisorState:
     ready: bool
     next_readiness_at: float | None
     boot_id: str | None
+    #: The exact commit the supervisor daemon is executing from, captured once
+    #: at startup and never re-derived from ``cli/current_commit()``.  After
+    #: deployment B changes ``cli/current`` to B, this field still names A —
+    #: the actual code loaded by this supervisor process.  The reconcile loop
+    #: compares this against ``cli/current_commit()`` to detect when an
+    #: exec-based upgrade is needed.
+    supervisor_runtime_commit: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the daemon state for storage.
@@ -491,6 +499,11 @@ class SupervisorState:
             "ready": self.ready,
             "next_readiness_at": self.next_readiness_at,
             **({} if self.boot_id is None else {"boot_id": self.boot_id}),
+            **(
+                {}
+                if self.supervisor_runtime_commit is None
+                else {"supervisor_runtime_commit": self.supervisor_runtime_commit}
+            ),
         }
 
     @classmethod
@@ -571,6 +584,7 @@ class SupervisorState:
             ready=data.get("ready", False) is True,
             next_readiness_at=monotonic_timestamps[1][0],
             boot_id=boot_id,
+            supervisor_runtime_commit=_optional_string(data.get("supervisor_runtime_commit")),
         )
 
 
@@ -606,6 +620,15 @@ class SupervisorStatus:
     #: unresolved/spawning obligation).  Distinct from ``ready``: a held
     #: supervisor is alive but deliberately not serving a worker.
     holding: bool = False
+    #: The exact commit the supervisor daemon itself is executing from
+    #: (the confirmed ``cli/current`` runtime).  Separate from the worker
+    #: commit or the deployment commit: the supervisor's own immutable
+    #: runtime identity.
+    supervisor_runtime_commit: str | None = None
+    #: The startup contract schema version compiled into the running
+    #: supervisor daemon.  Used as a stability marker for cross-daemon
+    #: durable state transitions.
+    supervisor_runtime_contract_version: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -637,6 +660,8 @@ class SupervisorStatus:
             "message": self.message,
             "worker_health": self.worker_health,
             "holding": self.holding,
+            "supervisor_runtime_commit": self.supervisor_runtime_commit,
+            "supervisor_runtime_contract_version": self.supervisor_runtime_contract_version,
         }
 
     @classmethod
@@ -712,6 +737,12 @@ class SupervisorStatus:
             message=_parse_diagnostic_nullable_string(data, "message"),
             worker_health=worker_health,
             holding=_parse_diagnostic_bool(data, "holding"),
+            supervisor_runtime_commit=_parse_diagnostic_nullable_string(
+                data, "supervisor_runtime_commit"
+            ),
+            supervisor_runtime_contract_version=_parse_diagnostic_nullable_int(
+                data, "supervisor_runtime_contract_version"
+            ),
         )
 
 
@@ -776,6 +807,10 @@ class SupervisorDiagnostic:
     spawning_present: bool
     last_exit: LastExit | None
     message: str | None
+    #: The exact commit the supervisor daemon itself is executing from.
+    supervisor_runtime_commit: str | None = None
+    #: The startup contract schema version compiled into the running supervisor.
+    supervisor_runtime_contract_version: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the durable diagnostic for operators.
@@ -807,6 +842,8 @@ class SupervisorDiagnostic:
             if self.last_exit is None
             else {"returncode": self.last_exit.returncode, "at": self.last_exit.at},
             "message": self.message,
+            "supervisor_runtime_commit": self.supervisor_runtime_commit,
+            "supervisor_runtime_contract_version": self.supervisor_runtime_contract_version,
         }
 
     @classmethod
@@ -850,6 +887,12 @@ class SupervisorDiagnostic:
             spawning_present=_parse_diagnostic_bool(data, "spawning_present"),
             last_exit=_parse_last_exit(data),
             message=_parse_diagnostic_nullable_string(data, "message"),
+            supervisor_runtime_commit=_parse_diagnostic_nullable_string(
+                data, "supervisor_runtime_commit"
+            ),
+            supervisor_runtime_contract_version=_parse_diagnostic_nullable_int(
+                data, "supervisor_runtime_contract_version"
+            ),
         )
 
 
@@ -893,6 +936,8 @@ def derive_durable_diagnostic() -> SupervisorDiagnostic:
         spawning_present=state.spawning is not None,
         last_exit=state.last_exit,
         message=None,
+        supervisor_runtime_commit=state.supervisor_runtime_commit,
+        supervisor_runtime_contract_version=None,
     )
 
 
@@ -1089,6 +1134,81 @@ def acquire_supervisor_lock() -> int:
         os.close(fd)
         raise
     return fd
+
+
+# ---------------------------------------------------------------------------
+# Lock-adoption protocol for exec-based supervisor handoff
+# ---------------------------------------------------------------------------
+
+#: Environment variable carrying the inherited lock file descriptor number
+#: during an exec-based supervisor handoff.  Set immediately before
+#: ``os.execv`` and consumed exactly once at startup.
+HANDOFF_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_FD"
+#: Environment variable carrying the expected lock file path for validation
+#: during adoption.  The new supervisor verifies this matches the path it
+#: would open, preventing injection of an fd pointing at an unrelated file.
+HANDOFF_PATH_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PATH"
+#: Environment variable carrying the PID of the handing-off supervisor for
+#: diagnostic logging only (not security-critical).
+HANDOFF_PID_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PID"
+
+
+def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:
+    """Adopt an inherited lock file descriptor from a handing-off supervisor.
+
+    The fd was opened and flock-held by the previous supervisor, made
+    inheritable immediately before ``os.execv``, and passed via an
+    environment variable.  This function validates the inherited fd without
+    opening or flocking a second descriptor — the lock is already held on
+    the inherited fd.
+
+    Validation:
+    - ``fd_number`` must be a non-negative integer within the process's
+      open-fd limit (``resource.getrlimit(RLIMIT_NOFILE)``);
+    - the fd must refer to a real, open file (``os.fstat`` must succeed);
+    - the fd's path (``os.readlink(f"/proc/self/fd/{fd_number}")``) must
+      match ``expected_path`` exactly, preventing injection of an fd
+      pointing at an unrelated file;
+    - the ``fcntl.flock`` on the fd must not return ``EWOULDBLOCK`` (the
+      lock must be held — if another process somehow inherited and closed
+      it, the lock would be released).
+
+    Args:
+        fd_number: The inherited file descriptor number.
+        expected_path: The expected lock file path for validation.
+
+    Returns:
+        The validated, adopted file descriptor.
+
+    Raises:
+        OSError: If validation fails (fd not open, wrong path, lock not
+            held, or fd number out of range).  The caller must continue
+            with the old authority.
+    """
+    soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if fd_number < 0 or fd_number >= soft_limit:
+        msg = f"inherited handoff fd {fd_number} is outside the open-fd limit {soft_limit}"
+        raise OSError(msg)
+    try:
+        stat_result = os.fstat(fd_number)
+    except OSError as exc:
+        msg = f"inherited handoff fd {fd_number} is not open: {exc}"
+        raise OSError(msg) from exc
+    if not stat_result.st_mode:
+        msg = f"inherited handoff fd {fd_number} has invalid mode"
+        raise OSError(msg)
+    try:
+        actual_path = str(Path(f"/proc/self/fd/{fd_number}").readlink())
+    except OSError as exc:
+        msg = f"could not read path of inherited handoff fd {fd_number}: {exc}"
+        raise OSError(msg) from exc
+    if actual_path != expected_path:
+        msg = (
+            f"inherited handoff fd {fd_number} points to {actual_path!r}, "
+            f"expected {expected_path!r}"
+        )
+        raise OSError(msg)
+    return fd_number
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1423,7 @@ def write_state_preserving_authority(
                 unresolved_child=current.unresolved_child,
                 unresolved_hold_malformed=current.unresolved_hold_malformed,
                 ownership_hold_malformed=current.ownership_hold_malformed,
+                supervisor_runtime_commit=current.supervisor_runtime_commit,
             )
         )
 
@@ -1362,6 +1483,7 @@ def fresh_state() -> SupervisorState:
         ready=False,
         next_readiness_at=None,
         boot_id=None,
+        supervisor_runtime_commit=None,
     )
 
 
@@ -2254,6 +2376,33 @@ def _parse_diagnostic_nullable_float(data: dict[str, object], key: str) -> float
         msg = "supervisor diagnostic is malformed"
         raise ValueError(msg)
     return value
+
+
+def _parse_diagnostic_nullable_int(data: dict[str, object], key: str) -> int | None:
+    """Parse a nullable diagnostic integer without truthiness coercion.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The exact non-negative JSON integer, or ``None`` for absence or
+        explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not an integer or is a boolean.
+        ValueError: If a present integer is negative.
+    """
+    if key not in data or data[key] is None:
+        return None
+    raw = data[key]
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    if raw < 0:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return raw
 
 
 def _parse_diagnostic_string(
