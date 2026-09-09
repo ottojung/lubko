@@ -20,7 +20,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get -qq -y -o Dpkg::Options::=--force-confnew upgrade
 apt-get install -qq -y -o Dpkg::Options::=--force-confnew \
-    python uv git libpq clang make cmake
+    python uv git libpq rust clang make cmake
 
 printf '%s\n' '--- Installed versions ---'
 python --version
