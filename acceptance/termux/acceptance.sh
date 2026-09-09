@@ -55,6 +55,10 @@ pass "XDG config created"
 
 # -- 1. Frozen sync (real Termux uv, real lockfile) ------------------------
 
+# Termux native builds (maturin/ruff) require ANDROID_API_LEVEL.
+# Termux packages use API level 24 (see termux-packages TERMUX_PKG_API_LEVEL).
+export ANDROID_API_LEVEL=24
+
 printf '\n%s\n' '--- Frozen sync ---'
 cd "$REPO"
 if uv sync --frozen; then
