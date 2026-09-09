@@ -1733,8 +1733,15 @@ def _restore_previous_locked(state: RollbackState) -> bool:
             f"supervised rollback restored commit {state.previous_commit} "
             "but could not restore the maintained CLI pointer"
         )
-    _restore_pre_confirmation_artifacts()
-    _remove_pre_confirmation_artifacts()
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError):
+        bin_home = None
+    if bin_home is not None:
+        snapshot_restored = _restore_pre_confirmation_artifacts(bin_home)
+        startup_contract.cleanup_staging(bin_home)
+        if snapshot_restored:
+            _remove_pre_confirmation_artifacts()
     return True
 
 
@@ -1779,8 +1786,15 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
             f"supervised rollback restored commit {state.previous_commit} "
             "but could not restore the maintained CLI pointer"
         )
-    _restore_pre_confirmation_artifacts()
-    _remove_pre_confirmation_artifacts()
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError):
+        bin_home = None
+    if bin_home is not None:
+        snapshot_restored = _restore_pre_confirmation_artifacts(bin_home)
+        startup_contract.cleanup_staging(bin_home)
+        if snapshot_restored:
+            _remove_pre_confirmation_artifacts()
     return terminal
 
 
@@ -1793,14 +1807,17 @@ def _pre_confirmation_artifacts_path() -> Path:
     return state_root() / "deploy" / _PRE_CONFIRMATION_ARTIFACTS_NAME
 
 
-def _snapshot_pre_confirmation_artifacts() -> None:
+def _snapshot_pre_confirmation_artifacts(bin_home: Path) -> None:
     """Durably preserve the current startup artifacts before confirmation mutates them.
 
     The snapshot is best-effort: if the artifacts are absent (first install),
     no snapshot is written so rollback does not attempt to restore artifacts
     that never existed.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
     """
-    snapshot = startup_contract.snapshot_startup_artifacts()
+    snapshot = startup_contract.snapshot_startup_artifacts(bin_home)
     if not snapshot:
         return
     serializable: dict[str, object] = {k: list(v) for k, v in snapshot.items()}
@@ -1810,31 +1827,77 @@ def _snapshot_pre_confirmation_artifacts() -> None:
         append_deploy_log(f"warning: could not snapshot pre-confirmation startup artifacts: {exc}")
 
 
-def _restore_pre_confirmation_artifacts() -> None:
+def _restore_pre_confirmation_artifacts(bin_home: Path) -> bool:
     """Restore startup artifacts from the pre-confirmation snapshot during rollback.
 
-    If no snapshot exists (legacy mission or first-install scenario), rollback
-    does not touch the startup artifacts.
+    Returns ``True`` only when every recorded artifact (including launcher
+    executable mode) was restored successfully.  If no snapshot exists or
+    any restore step fails, returns ``False`` so the caller retains the
+    snapshot for later recovery.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Returns:
+        ``True`` when all artifacts were restored; ``False`` otherwise.
+    """
+    snapshot = _read_pre_confirmation_snapshot()
+    if snapshot is None:
+        return False
+    try:
+        startup_contract.restore_startup_artifacts(snapshot, bin_home)
+        append_deploy_log("startup artifacts restored from pre-confirmation snapshot")
+    except (DurabilityError, OSError) as exc:
+        append_deploy_log(f"warning: could not restore pre-confirmation startup artifacts: {exc}")
+        return False
+    return _verify_restored_launcher_mode(bin_home, had_launcher="launcher" in snapshot)
+
+
+def _read_pre_confirmation_snapshot() -> dict[str, bytes] | None:
+    """Read and decode the pre-confirmation snapshot.
+
+    Returns:
+        The decoded snapshot bytes, or ``None`` on any failure.
     """
     path = _pre_confirmation_artifacts_path()
     try:
         raw = path.read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
-        return
+        return None
     try:
         decoded = json.loads(raw)
     except ValueError:
-        return
+        return None
     if not isinstance(decoded, dict):
-        return
+        return None
     snapshot = {k: bytes(v) for k, v in decoded.items() if isinstance(v, list)}
-    if not snapshot:
-        return
+    return snapshot or None
+
+
+def _verify_restored_launcher_mode(bin_home: Path, *, had_launcher: bool) -> bool:
+    """Check the restored launcher has the required executable mode.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+        had_launcher: Whether the snapshot contained launcher bytes.
+
+    Returns:
+        ``True`` when mode is correct or launcher was not in snapshot.
+    """
+    if not had_launcher:
+        return True
+    launcher = bin_home / startup_contract.STARTUP_LAUNCHER_NAME
     try:
-        startup_contract.restore_startup_artifacts(snapshot)
-        append_deploy_log("startup artifacts restored from pre-confirmation snapshot")
-    except DurabilityError as exc:
-        append_deploy_log(f"warning: could not restore pre-confirmation startup artifacts: {exc}")
+        mode = launcher.stat().st_mode & 0o777
+    except OSError:
+        return False
+    if mode != startup_contract.STARTUP_LAUNCHER_MODE:
+        append_deploy_log(
+            f"warning: restored launcher has mode {oct(mode)}, "
+            f"expected {oct(startup_contract.STARTUP_LAUNCHER_MODE)}"
+        )
+        return False
+    return True
 
 
 def _remove_pre_confirmation_artifacts() -> None:
@@ -1844,18 +1907,44 @@ def _remove_pre_confirmation_artifacts() -> None:
         remove_durable(path)
 
 
-def _converge_startup_artifacts() -> None:
-    """Converge startup artifacts to match the current code contract, logging the result."""
+def _stage_candidate_startup_artifacts(commit: str) -> None:
+    """Run the candidate code's startup-contract staging to produce B's artifacts.
+
+    The candidate commit B's own ``lubko-deploy`` entry point is invoked
+    directly from B's sealed CLI environment so the staged bytes are generated
+    by B's loaded module, not by the current (A) runtime.  This preserves the
+    invariant that unconfirmed candidate artifacts never become startup
+    authority and that only B's code defines B's startup contract.
+
+    Args:
+        commit: Candidate commit hash whose CLI environment to use.
+
+    Raises:
+        DeployCtlError: If B's staging command fails.
+    """
+    cli_root = cli.cli_commit_dir(commit)
+    b_deploy_ctl = cli_root / ".venv" / "bin" / "lubko-deploy"
+    if not b_deploy_ctl.is_file():
+        msg = f"candidate CLI environment for {commit} is incomplete (lubko-deploy missing)"
+        raise DeployCtlError(msg)
     try:
-        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
-    except (OSError, ValueError) as exc:
-        append_deploy_log(f"startup artifact convergence skipped: cannot resolve bin home: {exc}")
-        return
-    error = startup_contract.converge_startup_artifacts(bin_home)
-    if error is not None:
-        append_deploy_log(f"startup artifact convergence failed: {error}")
-    else:
-        append_deploy_log("startup artifacts converged to current code contract")
+        result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
+            [str(b_deploy_ctl), "startup-contract", "--write-staged"],
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        msg = f"candidate startup-artifact staging timed out for {commit}"
+        raise DeployCtlError(msg) from exc
+    except OSError as exc:
+        msg = f"could not execute candidate startup-artifact staging: {exc}"
+        raise DeployCtlError(msg) from exc
+    if result.returncode != 0:
+        stderr = result.stderr.strip()[-HELPER_ERROR_MAX_CHARS:]
+        msg = f"candidate startup-artifact staging failed for {commit}: {stderr}"
+        raise DeployCtlError(msg)
 
 
 def _finalize_supervised_confirmation(
@@ -2785,17 +2874,100 @@ def _finalize_confirmation(
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
     """Confirm one exact pending deployment as a single idempotent primitive.
 
+    Candidate startup artifacts are staged *before* the terminal state write
+    by invoking the candidate code's own staging command.  This ensures B's
+    startup artifacts are generated by B's loaded module, never by the
+    old (A) runtime.  A durable manifest binds the staged bytes to the exact
+    commit with content hashes.  Activation happens *after* the terminal
+    state write so that unconfirmed candidates never become startup authority.
+
+    A synchronous promotion failure after terminalization surfaces as
+    non-success to the caller: the durable confirmed state and staged
+    recovery data are preserved, but the response is ``ok: false`` until
+    promotion succeeds.  The ``STATUS_CONFIRMED`` fast path retries
+    idempotent promotion and fails closed if artifacts still don't match.
+
+    Exception discipline: once ``_finalize_confirmation`` has made B
+    durable-confirmed, no exception path deletes B's staged manifest or
+    A's recovery snapshot unless promotion completed.  Pre-terminalization
+    failures clean up staging and snapshot; post-terminalization failures
+    retain everything for supervisor retry.
+
     Returns:
         Protocol response for the confirmed deployment.
+
+    Raises:
+        DeployCtlError: If staging or terminalization fails.
     """
     state = _confirmation_state(request)
     if state.status == STATUS_CONFIRMED:
-        return _confirmation_response(state)
-    _snapshot_pre_confirmation_artifacts()
-    _authorize_confirmation(state)
-    expected_generation = _prepare_confirmation_candidate(state, options)
-    state = _finalize_confirmation(state, expected_generation)
-    _converge_startup_artifacts()
+        return _confirmed_idempotent_response(state)
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        msg = f"cannot confirm: startup artifact snapshot failed: {exc}"
+        raise DeployCtlError(msg) from exc
+    _snapshot_pre_confirmation_artifacts(bin_home)
+    try:
+        _authorize_confirmation(state)
+        expected_generation = _prepare_confirmation_candidate(state, options)
+        _stage_candidate_startup_artifacts(state.commit)
+        startup_contract.write_staging_manifest(state.commit, bin_home)
+        state = _finalize_confirmation(state, expected_generation)
+    except BaseException:
+        startup_contract.cleanup_staging(bin_home)
+        _remove_pre_confirmation_artifacts()
+        raise
+    # B is now durable-confirmed.  From this point, no exception may delete
+    # the manifest or snapshot unless promotion completed successfully.
+    promotion_error = startup_contract.promote_staged_artifacts(
+        state.commit, state.commit, bin_home
+    )
+    if promotion_error is not None:
+        msg = f"startup artifact promotion failed: {promotion_error}"
+        append_deploy_log(msg)
+        return {"type": "confirm", "ok": False, "commit": state.commit, "error": msg}
+    _remove_pre_confirmation_artifacts()
+    return _confirmation_response(state)
+
+
+def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
+    """Handle the STATUS_CONFIRMED fast path with idempotent promotion.
+
+    When confirmation is retried for an already-terminal mission, the
+    startup artifacts may still be stale from a prior crash between
+    terminalization and promotion.  This function retries idempotent
+    promotion using the retained manifest and staged bytes.  It only
+    returns ``ok: true`` once artifacts actually match the confirmed commit.
+
+    Fails closed if bin_home cannot be resolved: returning success without
+    verifying artifacts would be a false positive.
+
+    Args:
+        state: Terminal confirmed mission state.
+
+    Returns:
+        Protocol response — success only when artifacts match.
+    """
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        return {
+            "type": "confirm",
+            "ok": False,
+            "commit": state.commit,
+            "error": f"startup artifact promotion incomplete: cannot resolve bin home: {exc}",
+        }
+    promotion_error = startup_contract.promote_staged_artifacts(
+        state.commit, state.commit, bin_home
+    )
+    if promotion_error is not None:
+        return {
+            "type": "confirm",
+            "ok": False,
+            "commit": state.commit,
+            "error": f"startup artifact promotion incomplete: {promotion_error}",
+        }
     _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 

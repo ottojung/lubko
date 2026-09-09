@@ -1013,25 +1013,24 @@ class SupervisorDaemon:
         LOGGER.info("cold migration converged deployment authority to commit %s", desired.commit)
 
     def _converge_startup_artifacts(self) -> None:
-        """Idempotently converge startup artifacts to match the current code contract.
+        """Validate startup artifacts without writing from the supervisor's own code.
 
-        Runs on every reconcile tick after the worker is ensured so that a
-        crash at any point leaves either the old coherent artifacts or retries
-        the same convergence on the next tick.  This closes the gap where a
-        confirmed deployment left startup artifacts stale relative to the
-        running code version.
+        The supervisor runtime may outlive the confirmed commit, so generating
+        artifacts from its own loaded ``CURRENT_CONTRACT`` would revert
+        confirmed artifacts to the supervisor's older code version.  This
+        validation-only check ensures the on-disk artifacts match the
+        confirmed contract and logs a warning on mismatch so the operator
+        can re-run the deployctl confirmation path to repair them.
         """
         try:
             bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
         except (OSError, ValueError) as exc:
-            self._message = f"startup artifact convergence skipped: {exc}"
+            self._message = f"startup artifact validation skipped: {exc}"
             return
-        error = startup_contract.converge_startup_artifacts(bin_home)
+        error = startup_contract.validate_startup_artifacts(bin_home)
         if error is not None:
-            self._message = f"startup artifact convergence failed: {error}"
-            LOGGER.warning("startup artifact convergence failed: %s", error)
-        else:
-            LOGGER.debug("startup artifacts converged to current code contract")
+            self._message = f"startup artifacts stale: {error}"
+            LOGGER.warning("startup artifacts stale: %s", error)
 
     def _record_mission_progress(self, commit: str) -> None:
         """Advance the applied generation once a mission candidate is running.

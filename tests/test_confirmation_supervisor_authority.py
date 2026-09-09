@@ -164,6 +164,11 @@ def test_confirmation_fails_closed_if_supervisor_disappears_after_preparation(
     )
     monkeypatch.setattr(dc, "_write_state", writes.append)
     monkeypatch.setattr(cli, "set_current", pointer_updates.append)
+    monkeypatch.setattr(dc, "_stage_candidate_startup_artifacts", lambda _c: None)
+    monkeypatch.setattr(dc, "_snapshot_pre_confirmation_artifacts", lambda _b: None)
+    monkeypatch.setattr(dc.startup_contract, "write_staging_manifest", lambda _c, _b: None)
+    monkeypatch.setattr(dc.startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None)
+    monkeypatch.setattr(dc, "_remove_pre_confirmation_artifacts", lambda: None)
 
     with pytest.raises(dc.DeployCtlError, match="live supervisor"):
         dc._confirm_locked({"type": "confirm", "commit": COMMIT}, _options())
@@ -199,6 +204,11 @@ def test_explicit_legacy_confirmation_ignores_live_supervisor(
     monkeypatch.setattr(cli, "set_current", lambda _commit: None)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
     monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
+    monkeypatch.setattr(dc, "_stage_candidate_startup_artifacts", lambda _c: None)
+    monkeypatch.setattr(dc, "_snapshot_pre_confirmation_artifacts", lambda _b: None)
+    monkeypatch.setattr(dc.startup_contract, "write_staging_manifest", lambda _c, _b: None)
+    monkeypatch.setattr(dc.startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None)
+    monkeypatch.setattr(dc, "_remove_pre_confirmation_artifacts", lambda: None)
 
     dc._confirm_locked({"type": "confirm", "commit": COMMIT}, _options())
 

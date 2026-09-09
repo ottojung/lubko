@@ -4073,12 +4073,27 @@ def startup_contract_cmd(args: argparse.Namespace) -> int:
     It does not inspect the live process topology, which is intentionally out
     of scope — the external host/container environment is trusted.
 
+    ``--write-staged`` writes artifacts to staging paths instead of active
+    paths.  This is used by the confirmation controller to have the candidate
+    code (B) generate its own startup artifacts without touching the active
+    startup authority, which must only change at the confirmation boundary.
+
     Args:
         args: Parsed command line arguments.
 
     Returns:
         A process exit code.
     """
+    if getattr(args, "write_staged", False):
+        error = startup_contract.stage_startup_artifacts(_resolve_bin_home())
+        if error is not None:
+            _err(error)
+            return EXIT_ERROR
+        _out(
+            f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION}, "
+            f"launcher, and startup definition staged"
+        )
+        return EXIT_OK
     if getattr(args, "write", False):
         startup_contract.write_contract()
         startup_contract.write_startup_launcher(_resolve_bin_home())
@@ -4804,6 +4819,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--write",
         action="store_true",
         help="publish the current versioned startup contract, launcher, and definition",
+    )
+    contract_parser.add_argument(
+        "--write-staged",
+        action="store_true",
+        help="stage startup artifacts without activating them (for confirmation controller)",
     )
 
     deploy_parser = subparsers.add_parser(

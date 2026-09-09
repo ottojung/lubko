@@ -1082,6 +1082,18 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(cli, "set_current", lambda _c: None)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _c: None)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
+    monkeypatch.setattr(deployctl, "_stage_candidate_startup_artifacts", lambda _c: None)
+    monkeypatch.setattr(deployctl, "_snapshot_pre_confirmation_artifacts", lambda _b: None)
+    monkeypatch.setattr(
+        deployctl.startup_contract, "write_staging_manifest", lambda _c, _b: None
+    )
+    monkeypatch.setattr(
+        deployctl.startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None
+    )
+    monkeypatch.setattr(deployctl, "_remove_pre_confirmation_artifacts", lambda: None)
+    monkeypatch.setattr(
+        lifecycle, "_resolve_bin_home", lambda: Path("/nonexistent")
+    )
     written: list[deployctl.RollbackState] = []
     monkeypatch.setattr(deployctl, "_write_state", written.append)
     response = deployctl._confirm_locked(
