@@ -5,6 +5,7 @@ set -eu
 
 REPO=/src/lubko
 BIN_HOME="${XDG_BIN_HOME:-${HOME}/.local/bin}"
+STATE_ROOT="${XDG_STATE_HOME:-${HOME}/.local/state}/lubko"
 FAILED=0
 
 pass() { printf '  OK  %s\n' "$1"; }
@@ -29,18 +30,41 @@ for entry in lubko-agent lubko-worker lubko-supervisor lubko-deploy \
   pass "$entry"
 done
 
-# -- 2. CLI current symlink -------------------------------------------------
+# -- 2. Execute installed launchers from an unrelated working directory ------
 
-printf '\n--- CLI current symlink ---\n'
-CURRENT="${XDG_STATE_HOME:-${HOME}/.local/state}/lubko/cli/current"
+printf '\n--- Installed launcher execution (from /tmp) ---\n'
+export PATH="${BIN_HOME}:${PATH}"
+cd /tmp
+
+if lubko-install --repo "${REPO}" --dry-run >/dev/null 2>&1; then
+  pass "lubko-install --dry-run"
+else
+  fail "lubko-install --dry-run"
+fi
+
+if lubko-agent --help >/dev/null 2>&1; then
+  pass "lubko-agent --help"
+else
+  fail "lubko-agent --help"
+fi
+
+# -- 3. cli/current points to exact source HEAD ----------------------------
+
+printf '\n--- cli/current points to source HEAD ---\n'
+CURRENT="${STATE_ROOT}/cli/current"
 if [ ! -L "$CURRENT" ]; then
   fail "cli/current is not a symlink"
 else
   TARGET="$(readlink "$CURRENT")"
-  pass "cli/current -> $TARGET"
+  HEAD="$(git -C "${REPO}" rev-parse HEAD)"
+  if [ "$TARGET" = "$HEAD" ]; then
+    pass "cli/current == ${HEAD}"
+  else
+    fail "cli/current is ${TARGET}, expected ${HEAD}"
+  fi
 fi
 
-# -- 3. Canonical pytest budget check (hard 10 s, no softening) -------------
+# -- 4. Canonical pytest budget check (hard 10 s, no softening) -------------
 
 printf '\n--- Canonical pytest budget check ---\n'
 cd "$REPO"
