@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates git python3 python3-venv && \
+        ca-certificates git python3 python3-venv libpq5 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.10.12 /uv /uvx /bin/
