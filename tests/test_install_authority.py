@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from lubko import cli, deployctl, install, lifecycle, supervise, toolchain
+from lubko import cli, deployctl, install, lifecycle, startup_contract, supervise, toolchain
 from lubko.state import rollback_state_path
 
 if TYPE_CHECKING:
@@ -582,3 +582,41 @@ def test_validation_steps_sync_frozen_dev_extra() -> None:
     """Deployment validation syncs with --frozen --extra dev for dev tools."""
     sync_step = lifecycle.VALIDATION_STEPS[0]
     assert sync_step == ("sync", "--frozen", "--extra", "dev")
+
+
+def test_launcher_source_resolves_shell_from_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launcher shebang uses the actual sh found on PATH, not /bin/sh."""
+    fake_sh = tmp_path / "sh"
+    fake_sh.write_text("", encoding="utf-8")
+    fake_sh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    source = cli.launcher_source("lubko-agent")
+    assert source.startswith(f"#!{fake_sh}\n")
+
+
+def test_launcher_source_fails_without_sh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing sh on PATH raises CliError, never silently emits /bin/sh."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(cli.CliError, match="sh not found"):
+        cli.launcher_source("lubko-agent")
+
+
+def test_startup_launcher_resolves_shell_from_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup launcher shebang uses the actual sh found on PATH."""
+    fake_sh = tmp_path / "sh"
+    fake_sh.write_text("", encoding="utf-8")
+    fake_sh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    content = startup_contract.generate_startup_launcher_content()
+    assert content.startswith(f"#!{fake_sh}\n")
+
+
+def test_startup_launcher_fails_without_sh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing sh on PATH raises StartupContractError, never /bin/sh."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(startup_contract.StartupContractError, match="sh not found"):
+        startup_contract.generate_startup_launcher_content()
