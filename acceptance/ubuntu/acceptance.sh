@@ -15,7 +15,7 @@ printf '=== Lubko Ubuntu acceptance ===\n\n'
 
 # -- 1. Installed launcher existence and executability ----------------------
 
-printf '--- Installed launchers ---\n'
+printf '%s\n' '--- Installed launchers ---'
 for entry in lubko-agent lubko-worker lubko-supervisor lubko-deploy \
              lubko-deploy-ctl lubko-install my-lubko-agent lubko-startup; do
   path="${BIN_HOME}/${entry}"
@@ -32,7 +32,7 @@ done
 
 # -- 2. Execute installed launchers from an unrelated working directory ------
 
-printf '\n--- Installed launcher execution (from /tmp) ---\n'
+printf '\n%s\n' '--- Installed launcher execution (from /tmp) ---'
 export PATH="${BIN_HOME}:${PATH}"
 cd /tmp
 
@@ -50,7 +50,7 @@ fi
 
 # -- 3. cli/current points to exact source HEAD ----------------------------
 
-printf '\n--- cli/current points to source HEAD ---\n'
+printf '\n%s\n' '--- cli/current points to source HEAD ---'
 CURRENT="${STATE_ROOT}/cli/current"
 if [ ! -L "$CURRENT" ]; then
   fail "cli/current is not a symlink"
@@ -66,7 +66,7 @@ fi
 
 # -- 4. Canonical pytest budget check (hard 10 s, no softening) -------------
 
-printf '\n--- Canonical pytest budget check ---\n'
+printf '\n%s\n' '--- Canonical pytest budget check ---'
 cd "$REPO"
 if uv run python scripts/check_test_budget.py; then
   pass "pytest within 10 s budget"
