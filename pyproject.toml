@@ -20,7 +20,7 @@ lubko-agent = "lubko.agent:main"
 my-lubko-agent = "lubko.agent:main"
 lubko-install = "lubko.install:main"
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "mypy",
     "pytest",

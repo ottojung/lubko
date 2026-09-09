@@ -5,6 +5,7 @@
 - Keep Ruff configured with `select = ["ALL"]` and preview lint rules enabled.
 - Keep mypy in strict mode.
 - Do not add lint or type-check ignores unless a concrete library/interface limitation requires one.
+- Development setup: `uv sync --frozen --extra dev`
 - Before committing, run:
   - `uv run ruff format --check .`
   - `uv run ruff check .`

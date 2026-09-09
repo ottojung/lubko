@@ -42,7 +42,7 @@ rule, so merges are blocked rather than silently allowed.
 
 The `test` job runs, in order, the same checks developers run locally:
 
-- `uv sync --frozen` — frozen dependency lock.
+- `uv sync --frozen --extra dev` — frozen dependency lock (runtime + development).
 - `uv run ruff format --check .` — formatting.
 - `uv run ruff check .` — linting (Ruff `ALL`, preview).
 - `uv run mypy .` — strict type checking.

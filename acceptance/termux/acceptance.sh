@@ -1,6 +1,13 @@
 #!/bin/sh
 # Acceptance validation for a fresh Lubko installation on Termux ARM64.
 # Runs inside the termux/termux-docker:aarch64 container as the system user.
+#
+# Phase 1 (runtime): provision only runtime prerequisites, plain frozen
+#   sync, real lubko-install, launcher/current checks — proves the product
+#   installs and runs on Termux without any compiler toolchain.
+#
+# Phase 2 (dev/test): provision build tools, set ANDROID_API_LEVEL, frozen
+#   sync with --extra dev, then the canonical pytest budget checker.
 set -eu
 
 REPO=/workspace
@@ -13,20 +20,9 @@ fail() { printf '  FAIL %s\n' "$1"; FAILED=1; }
 
 printf '=== Lubko Termux ARM64 acceptance ===\n\n'
 
-# -- 0. Provision: Termux packages (as system user, no root) ----------------
+# -- Shared environment -----------------------------------------------------
 
-printf '%s\n' '--- Termux package install ---'
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get -qq -y -o Dpkg::Options::=--force-confnew upgrade
-apt-get install -qq -y -o Dpkg::Options::=--force-confnew \
-    python uv git libpq rust clang make cmake
-
-printf '%s\n' '--- Installed versions ---'
-python --version
-uv --version
-git --version
-printf 'libpq: %s\n' "$(ls "${PREFIX}/lib/libpq.so"* 2>/dev/null | head -1 || echo 'not found')"
 
 # libtermux-exec-ld-preload.so ships with the termux-docker image itself;
 # fail loudly if the image ever stops providing it.
@@ -53,21 +49,31 @@ printf 'server=acceptance-test\n' \
 chmod 600 "${HOME}/.config/lubko/worker.conf"
 pass "XDG config created"
 
-# -- 1. Frozen sync (real Termux uv, real lockfile) ------------------------
+# ===========================================================================
+# PHASE 1 — Runtime installation (no compiler toolchain)
+# ===========================================================================
 
-# Termux native builds (maturin/ruff) require ANDROID_API_LEVEL.
-# Termux packages use API level 24 (see termux-packages TERMUX_PKG_API_LEVEL).
-export ANDROID_API_LEVEL=24
+printf '\n--- PHASE 1: Runtime installation ---\n\n'
 
-printf '\n%s\n' '--- Frozen sync ---'
+printf '%s\n' '--- Runtime package install ---'
+apt-get update -qq
+apt-get -qq -y -o Dpkg::Options::=--force-confnew upgrade
+apt-get install -qq -y -o Dpkg::Options::=--force-confnew \
+    python uv git libpq
+
+printf '%s\n' '--- Runtime versions ---'
+python --version
+uv --version
+git --version
+printf 'libpq: %s\n' "$(ls "${PREFIX}/lib/libpq.so"* 2>/dev/null | head -1 || echo 'not found')"
+
+printf '\n%s\n' '--- Frozen sync (runtime only) ---'
 cd "$REPO"
 if uv sync --frozen; then
-  pass "uv sync --frozen"
+  pass "uv sync --frozen (runtime)"
 else
-  fail "uv sync --frozen"
+  fail "uv sync --frozen (runtime)"
 fi
-
-# -- 2. lubko-install (real installation) ----------------------------------
 
 printf '\n%s\n' '--- lubko-install ---'
 export PATH="${BIN_HOME}:${PATH}"
@@ -76,8 +82,6 @@ if uv run lubko-install --repo "$REPO"; then
 else
   fail "lubko-install"
 fi
-
-# -- 3. Installed launcher existence and executability ----------------------
 
 printf '\n%s\n' '--- Installed launchers ---'
 for entry in lubko-agent lubko-worker lubko-supervisor lubko-deploy \
@@ -94,8 +98,6 @@ for entry in lubko-agent lubko-worker lubko-supervisor lubko-deploy \
   pass "$entry"
 done
 
-# -- 4. Execute installed launchers from outside checkout -------------------
-
 printf '\n%s\n' '--- Installed launcher execution (outside checkout) ---'
 cd "$LUBKO_OUTSIDE"
 
@@ -111,8 +113,6 @@ else
   fail "lubko-agent --help"
 fi
 
-# -- 5. cli/current points to exact source HEAD ----------------------------
-
 printf '\n%s\n' '--- cli/current points to source HEAD ---'
 CURRENT="${STATE_ROOT}/cli/current"
 if [ ! -L "$CURRENT" ]; then
@@ -127,10 +127,31 @@ else
   fi
 fi
 
-# -- 6. Canonical pytest budget check (hard 10 s) --------------------------
+# ===========================================================================
+# PHASE 2 — Development/test environment
+# ===========================================================================
+
+printf '\n--- PHASE 2: Development/test environment ---\n\n'
+
+printf '%s\n' '--- Dev package install ---'
+apt-get install -qq -y -o Dpkg::Options::=--force-confnew \
+    rust clang make cmake
+
+# Termux native builds (maturin/ruff) require ANDROID_API_LEVEL.
+# Termux packages use API level 24 (see termux-packages TERMUX_PKG_API_LEVEL).
+export ANDROID_API_LEVEL=24
+
+printf '\n%s\n' '--- Frozen sync (with dev extras) ---'
+cd "$REPO"
+if uv sync --frozen --extra dev; then
+  pass "uv sync --frozen --extra dev"
+else
+  fail "uv sync --frozen --extra dev"
+fi
+
+# -- Canonical pytest budget check (hard 10 s) ------------------------------
 
 printf '\n%s\n' '--- Canonical pytest budget check ---'
-cd "$REPO"
 if uv run python scripts/check_test_budget.py; then
   pass "pytest within 10 s budget"
 else

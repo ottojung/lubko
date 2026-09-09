@@ -603,7 +603,7 @@ def _sync_venv(uv_path: str, root: Path, timeout_seconds: float) -> None:
     env.setdefault("UV_HTTP_TIMEOUT", UV_HTTP_TIMEOUT)
     try:
         proc = subprocess.run(
-            [uv_path, "sync", "--project", str(root)],
+            [uv_path, "sync", "--frozen", "--project", str(root)],
             cwd=root,
             env=env,
             capture_output=True,

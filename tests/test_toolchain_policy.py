@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -40,3 +41,19 @@ def test_runtime_has_no_exact_uv_patch_authority() -> None:
     assert "uv --version" not in source
     doc = _read(TOOLCHAIN_DOC)
     assert "not a production runtime protocol" in doc
+
+
+def test_dev_deps_in_optional_not_dependency_groups() -> None:
+    """Dev tools are optional-dependencies, not dependency-groups.
+
+    Plain ``uv sync --frozen`` must install runtime-only.  Development
+    tools (pytest, mypy, ruff) must require an explicit ``--extra dev``.
+    """
+    data = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    dep_groups = data.get("dependency-groups", {})
+    assert "dev" not in dep_groups, (
+        "dependency-groups.dev must not exist; use project.optional-dependencies.dev"
+    )
+    opt_deps = data.get("project", {}).get("optional-dependencies", {})
+    dev_deps = set(opt_deps.get("dev", []))
+    assert dev_deps == {"mypy", "pytest", "ruff"}

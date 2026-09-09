@@ -563,3 +563,22 @@ def test_current_runtime_never_rebuilds_tampered_writable_tree(
     with pytest.raises(cli.CliError, match="refusing to rebuild confirmed CLI environment"):
         cli.build_cli_root(repo, head, "uv", 60.0)
     assert marker.read_text(encoding="utf-8") == "tampered\n"
+
+
+def test_sync_venv_uses_frozen_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_sync_venv passes --frozen to uv so installed runtimes are immutable."""
+    captured_argv: list[str] = []
+
+    def capture_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured_argv.extend(args)
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(subprocess, "run", capture_run)
+    cli._sync_venv("/usr/bin/uv", tmp_path, 60.0)
+    assert captured_argv == ["/usr/bin/uv", "sync", "--frozen", "--project", str(tmp_path)]
+
+
+def test_validation_steps_sync_frozen_dev_extra() -> None:
+    """Deployment validation syncs with --frozen --extra dev for dev tools."""
+    sync_step = lifecycle.VALIDATION_STEPS[0]
+    assert sync_step == ("sync", "--frozen", "--extra", "dev")

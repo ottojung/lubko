@@ -24,5 +24,7 @@ RUN mkdir -p /root/.config/lubko && \
 
 RUN uv run lubko-install --repo /src/lubko
 
+RUN uv sync --frozen --extra dev
+
 COPY acceptance/ubuntu/acceptance.sh /usr/local/bin/acceptance.sh
 RUN chmod +x /usr/local/bin/acceptance.sh

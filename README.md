@@ -38,7 +38,7 @@ by a GitHub ruleset; see [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) for the
 change-integrity contract.
 
 ```sh
-uv sync
+uv sync --frozen --extra dev
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy .

@@ -111,7 +111,7 @@ SESSION_WAIT_INTERVAL_SECONDS: Final = 0.01
 UV_HTTP_TIMEOUT: Final = "30"
 
 VALIDATION_STEPS: Final = (
-    ("sync",),
+    ("sync", "--frozen", "--extra", "dev"),
     ("run", "ruff", "format", "--check", "."),
     ("run", "ruff", "check", "."),
     ("run", "mypy", "."),

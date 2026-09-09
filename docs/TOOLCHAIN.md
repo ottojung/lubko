@@ -2,7 +2,7 @@
 
 ## Reproducible validation
 
-Canonical CI validates CPython 3.12 and one explicit `uv` version. `uv.lock` is committed, and validation/install synchronization uses `uv sync --frozen` so dependency resolution never changes silently.
+Canonical CI validates CPython 3.12 and one explicit `uv` version. `uv.lock` is committed, and validation/install synchronization uses `uv sync --frozen --extra dev` so dependency resolution never changes silently. Plain `uv sync --frozen` installs only runtime dependencies and is used by the installed CLI environment.
 
 The supported runtime and package policy is CPython >=3.12. Termux acceptance validates the current Termux Python (currently 3.14).
 
