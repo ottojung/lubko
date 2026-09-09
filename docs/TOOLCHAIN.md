@@ -2,7 +2,7 @@
 
 ## Reproducible validation
 
-CI uses one reviewed CPython 3.12 series and one explicit `uv` version. `uv.lock` is committed, and validation/install synchronization uses `uv sync --frozen` so dependency resolution never changes silently.
+CI uses one reviewed CPython 3.12+ series and one explicit `uv` version. `uv.lock` is committed, and validation/install synchronization uses `uv sync --frozen` so dependency resolution never changes silently.
 
 The exact CI `uv` pin is a build-validation choice, not a production runtime protocol.
 

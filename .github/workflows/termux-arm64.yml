@@ -1,0 +1,61 @@
+name: Termux ARM64
+
+on:
+  push:
+    branches:
+      - main
+      - "release/*"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  termux-install:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: termux/termux-docker:aarch64
+      options: --entrypoint sh
+    steps:
+      - name: Install Termux packages
+        run: |
+          apt update
+          apt install -y python git libpq clang make cmake
+      - name: Install uv
+        run: |
+          python -m ensurepip
+          pip install "uv==0.10.12"
+      - uses: actions/checkout@v7
+        with:
+          path: lubko
+      - name: Record commit
+        id: commit
+        run: echo "sha=$(git -C lubko rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Frozen sync
+        run: uv sync --frozen
+        working-directory: lubko
+      - name: Install lubko
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv run lubko-install --repo "$(pwd)"
+        working-directory: lubko
+      - name: Installed CLI resolves outside checkout
+        run: |
+          cd /tmp
+          export PATH="$HOME/.local/bin:$PATH"
+          lubko-install --dry-run --repo "$(pwd)/lubko"
+      - name: Active commit matches checkout
+        run: |
+          cd /tmp
+          export PATH="$HOME/.local/bin:$PATH"
+          CURRENT=$(cat "$XDG_STATE_HOME/lubko/cli/current" 2>/dev/null || echo "")
+          EXPECTED="${{ steps.commit.outputs.sha }}"
+          if [ "$CURRENT" != "$EXPECTED" ]; then
+            echo "FAIL: cli/current=$CURRENT expected=$EXPECTED"
+            exit 1
+          fi
+          echo "OK: cli/current=$CURRENT"
+      - name: Tests (with 10 s budget)
+        run: |
+          uv run python scripts/check_test_budget.py
+        working-directory: lubko
