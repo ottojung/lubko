@@ -1,6 +1,6 @@
 #!/bin/sh
 # Acceptance validation for a fresh Lubko installation on Termux ARM64.
-# Runs inside the termux/termux-docker:aarch64 container after build.
+# Runs inside the termux/termux-docker:aarch64 container as the system user.
 set -eu
 
 REPO=/workspace
@@ -13,17 +13,20 @@ fail() { printf '  FAIL %s\n' "$1"; FAILED=1; }
 
 printf '=== Lubko Termux ARM64 acceptance ===\n\n'
 
-# -- 0. Provision: Termux packages and XDG config --------------------------
+# -- 0. Provision: Termux packages (as system user, no root) ----------------
 
-printf '%s\n' '--- Termux packages ---'
-for pkg in python uv git libpq libtermux-exec; do
-  if command -v "$pkg" >/dev/null 2>&1 || \
-     [ -f "/data/data/com.termux/files/usr/bin/$pkg" ]; then
-    pass "$pkg installed"
-  else
-    fail "$pkg not found"
-  fi
-done
+printf '%s\n' '--- Termux package install ---'
+pkg update -y
+pkg install -y python uv git libpq libtermux-exec clang make cmake
+
+printf '%s\n' '--- Installed versions ---'
+python --version
+uv --version
+git --version
+printf 'libpq: %s\n' "$(ls "${PREFIX}/lib/libpq.so"* 2>/dev/null | head -1 || echo 'not found')"
+printf 'libtermux-exec: %s\n' "$(ls "${PREFIX}/lib/libtermux-exec"* 2>/dev/null | head -1 || echo 'not found')"
+
+export LD_PRELOAD="${PREFIX}/lib/libtermux-exec-ld-preload.so"
 
 printf '\n%s\n' '--- Private XDG config ---'
 mkdir -p "${HOME}/.config/lubko"
