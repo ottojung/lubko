@@ -29,7 +29,10 @@ For the default branch (`main`, `~DEFAULT_BRANCH` in the ruleset condition):
 4. **One test-suite command.** The governance rule does not introduce a second
    test command. The `test` job additionally gates frozen-sync, formatting,
    lint, and strict types, but `uv run pytest` remains the single, complete test
-   suite command — the same command developers run locally.
+   suite command — the same command developers run locally. Installation and
+   environment acceptance checks are separate; they may run in CI but are not
+   part of the canonical pytest suite and are not subject to its ten-second
+   budget.
 
 This is deliberately fail-closed: if the required `test` check cannot be found
 on a commit (because the job was renamed or removed), no commit can satisfy the
@@ -43,7 +46,9 @@ The `test` job runs, in order, the same checks developers run locally:
 - `uv run ruff format --check .` — formatting.
 - `uv run ruff check .` — linting (Ruff `ALL`, preview).
 - `uv run mypy .` — strict type checking.
-- `uv run pytest` — the complete test suite.
+- `uv run pytest` — the complete test suite (must finish in under ten seconds of wall-clock time once the environment is installed; see AGENTS.md testing requirements).
+
+Installation, environment provisioning, dependency installation, image construction, and similar acceptance checks are outside the pytest budget and may take longer. They are not part of the canonical `uv run pytest` suite.
 
 ## Why the PR path
 
@@ -121,7 +126,8 @@ discipline until the ruleset is restored.
    Administrators and bots cannot override the contract through a normal path.
 4. **Same test command.** The release branch uses the identical canonical
    validation pipeline as `main`: frozen sync, formatting, lint, strict types,
-   and the complete test suite.
+   and the complete test suite. The ten-second budget applies to pytest execution
+   only; installation and environment checks are exempt.
 5. **Branch creation is not blocked.** The required ruleset must be created with
    `do_not_enforce_on_create: true`. A new release branch can be created from
    `main` without passing CI first or requiring a PR; once the branch exists,
