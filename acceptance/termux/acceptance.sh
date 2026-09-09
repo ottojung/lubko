@@ -16,17 +16,26 @@ printf '=== Lubko Termux ARM64 acceptance ===\n\n'
 # -- 0. Provision: Termux packages (as system user, no root) ----------------
 
 printf '%s\n' '--- Termux package install ---'
-pkg update -y
-pkg install -y python uv git libpq libtermux-exec clang make cmake
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -qq -y -o Dpkg::Options::=--force-confnew \
+    python uv git libpq clang make cmake
 
 printf '%s\n' '--- Installed versions ---'
 python --version
 uv --version
 git --version
 printf 'libpq: %s\n' "$(ls "${PREFIX}/lib/libpq.so"* 2>/dev/null | head -1 || echo 'not found')"
-printf 'libtermux-exec: %s\n' "$(ls "${PREFIX}/lib/libtermux-exec"* 2>/dev/null | head -1 || echo 'not found')"
 
-export LD_PRELOAD="${PREFIX}/lib/libtermux-exec-ld-preload.so"
+# libtermux-exec-ld-preload.so ships with the termux-docker image itself;
+# fail loudly if the image ever stops providing it.
+LD_PRELOAD_LIB="${PREFIX}/lib/libtermux-exec-ld-preload.so"
+if [ ! -f "$LD_PRELOAD_LIB" ]; then
+  fail "required library $LD_PRELOAD_LIB not found in image"
+  exit 1
+fi
+pass "libtermux-exec-ld-preload.so present"
+export LD_PRELOAD="$LD_PRELOAD_LIB"
 
 printf '\n%s\n' '--- Private XDG config ---'
 mkdir -p "${HOME}/.config/lubko"
