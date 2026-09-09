@@ -81,7 +81,7 @@ from typing import TYPE_CHECKING, Final, override
 
 import psycopg
 
-from lubko import cli, deployctl, lifecycle, lifecycle_state, supervise
+from lubko import cli, deployctl, lifecycle, lifecycle_state, startup_contract, supervise
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
@@ -848,6 +848,7 @@ class SupervisorDaemon:
         self._record_mission_progress(commit)
         self._probe_readiness(now)
         self._complete_cold_migration()
+        self._converge_startup_artifacts()
 
     def _apply_newer_desired(
         self,
@@ -1010,6 +1011,27 @@ class SupervisorDaemon:
             f"cold migration complete: deployment authority converged to commit {desired.commit}"
         )
         LOGGER.info("cold migration converged deployment authority to commit %s", desired.commit)
+
+    def _converge_startup_artifacts(self) -> None:
+        """Idempotently converge startup artifacts to match the current code contract.
+
+        Runs on every reconcile tick after the worker is ensured so that a
+        crash at any point leaves either the old coherent artifacts or retries
+        the same convergence on the next tick.  This closes the gap where a
+        confirmed deployment left startup artifacts stale relative to the
+        running code version.
+        """
+        try:
+            bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+        except (OSError, ValueError) as exc:
+            self._message = f"startup artifact convergence skipped: {exc}"
+            return
+        error = startup_contract.converge_startup_artifacts(bin_home)
+        if error is not None:
+            self._message = f"startup artifact convergence failed: {error}"
+            LOGGER.warning("startup artifact convergence failed: %s", error)
+        else:
+            LOGGER.debug("startup artifacts converged to current code contract")
 
     def _record_mission_progress(self, commit: str) -> None:
         """Advance the applied generation once a mission candidate is running.

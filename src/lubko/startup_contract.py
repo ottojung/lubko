@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -631,6 +632,129 @@ def install_and_validate_startup_definition(bin_home: Path) -> str | None:
     if not paths.ok:
         return f"required startup state directories are not satisfied: {paths.message}"
     return None
+
+
+def converge_startup_artifacts(bin_home: Path) -> str | None:
+    """Idempotently write all startup artifacts to match the current code contract.
+
+    Writes the startup contract, launcher, and definition atomically using
+    crash-durable primitives, then validates each artifact. This is the single
+    convergence point called by both the confirmation path and the supervisor
+    recovery loop so that a crash at any point leaves either the old coherent
+    artifacts or retries the same convergence on the next tick.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Returns:
+        ``None`` on success, or an error message on failure.
+    """
+    error: str | None = None
+    if error is None:
+        error = _write_contract_safe()
+    if error is None:
+        error = _write_launcher_safe(bin_home)
+    if error is None:
+        error = _write_definition_safe()
+    if error is None:
+        create_contract_state_dirs()
+    if error is None:
+        error = _check_contract_current()
+    return error
+
+
+def _write_contract_safe() -> str | None:
+    """Write the startup contract, returning an error message or None.
+
+    Returns:
+        ``None`` on success, or an error message on failure.
+    """
+    try:
+        write_contract()
+    except (DurabilityError, OSError) as exc:
+        return f"could not write the startup contract: {exc}"
+    return None
+
+
+def _write_launcher_safe(bin_home: Path) -> str | None:
+    """Write and validate the startup launcher, returning an error message or None.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Returns:
+        ``None`` on success, or an error message on failure.
+    """
+    try:
+        write_startup_launcher(bin_home)
+    except OSError as exc:
+        return f"could not write the startup launcher: {exc}"
+    if not validate_startup_launcher(bin_home):
+        return "startup launcher is missing or has drifted after converge"
+    return None
+
+
+def _write_definition_safe() -> str | None:
+    """Write and validate the startup definition, returning an error message or None.
+
+    Returns:
+        ``None`` on success, or an error message on failure.
+    """
+    try:
+        write_startup_definition()
+    except (DurabilityError, OSError) as exc:
+        return f"could not write the startup definition: {exc}"
+    definition = validate_startup_definition()
+    if not definition.ok:
+        return f"startup definition is not satisfied: {definition.message}"
+    return None
+
+
+def _check_contract_current() -> str | None:
+    """Check the recorded contract matches the current code contract.
+
+    Returns:
+        ``None`` when current, or an error message on mismatch.
+    """
+    assessment = assess_recorded_contract()
+    if assessment.state != "current":
+        return f"startup contract is not current after converge: {assessment.message}"
+    return None
+
+
+def snapshot_startup_artifacts() -> dict[str, bytes]:
+    """Snapshot the raw bytes of all startup artifacts for rollback preservation.
+
+    Returns:
+        A mapping from artifact name to raw bytes. Missing artifacts are
+        recorded as absent (empty mapping key).
+    """
+    snapshot: dict[str, bytes] = {}
+    contract = contract_path()
+    if contract.is_file():
+        with suppress(OSError):
+            snapshot["contract"] = contract.read_bytes()
+    definition = startup_definition_path()
+    if definition.is_file():
+        with suppress(OSError):
+            snapshot["definition"] = definition.read_bytes()
+    return snapshot
+
+
+def restore_startup_artifacts(snapshot: dict[str, bytes]) -> None:
+    """Restore startup artifacts from a pre-confirmation snapshot.
+
+    Each artifact present in the snapshot is durably written back to its
+    original path. Missing artifacts in the snapshot leave the on-disk
+    artifact untouched so a pre-existing artifact is never silently dropped.
+
+    Args:
+        snapshot: Artifact bytes from :func:`snapshot_startup_artifacts`.
+    """
+    if "contract" in snapshot:
+        write_json_durable(contract_path(), json.loads(snapshot["contract"]))
+    if "definition" in snapshot:
+        write_json_durable(startup_definition_path(), json.loads(snapshot["definition"]))
 
 
 def _require_str_tuple(value: object, field: str) -> tuple[str, ...]:

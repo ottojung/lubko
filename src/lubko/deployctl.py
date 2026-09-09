@@ -29,9 +29,9 @@ from uuid import UUID
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, lifecycle_state, supervise
+from lubko import cli, lifecycle, lifecycle_state, startup_contract, supervise
 from lubko.config import load_database_config
-from lubko.durable import DurabilityError, write_json_durable
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.lifecycle import (
     SCHEMA_VERSION,
     STATE_RUNNING,
@@ -55,7 +55,7 @@ from lubko.lifecycle import (
     worker_log_path,
     write_meta,
 )
-from lubko.state import rollback_state_path
+from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import JOB_ID_ENV
 
@@ -92,6 +92,11 @@ HANDOFF_POLL_SECONDS: Final = 0.1
 HANDOFF_RESPONSE_MAX_BYTES: Final = 1048576
 HELPER_ERROR_MAX_CHARS: Final = 8000
 HANDOFF_DURABLE_WAIT_SECONDS: Final = 60.0
+
+#: Durable file that preserves the pre-confirmation startup artifacts so
+#: rollback can restore them exactly.  Written before confirmation mutates
+#: the artifacts and removed after confirmation succeeds.
+_PRE_CONFIRMATION_ARTIFACTS_NAME: Final = "pre-confirmation-startup-artifacts.json"
 
 GATED_SHIM_SOURCE: Final = """
 import os
@@ -1728,6 +1733,8 @@ def _restore_previous_locked(state: RollbackState) -> bool:
             f"supervised rollback restored commit {state.previous_commit} "
             "but could not restore the maintained CLI pointer"
         )
+    _restore_pre_confirmation_artifacts()
+    _remove_pre_confirmation_artifacts()
     return True
 
 
@@ -1772,7 +1779,83 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
             f"supervised rollback restored commit {state.previous_commit} "
             "but could not restore the maintained CLI pointer"
         )
+    _restore_pre_confirmation_artifacts()
+    _remove_pre_confirmation_artifacts()
     return terminal
+
+
+def _pre_confirmation_artifacts_path() -> Path:
+    """Return the durable path for the pre-confirmation startup-artifact snapshot.
+
+    Returns:
+        The snapshot path under the deploy state directory.
+    """
+    return state_root() / "deploy" / _PRE_CONFIRMATION_ARTIFACTS_NAME
+
+
+def _snapshot_pre_confirmation_artifacts() -> None:
+    """Durably preserve the current startup artifacts before confirmation mutates them.
+
+    The snapshot is best-effort: if the artifacts are absent (first install),
+    no snapshot is written so rollback does not attempt to restore artifacts
+    that never existed.
+    """
+    snapshot = startup_contract.snapshot_startup_artifacts()
+    if not snapshot:
+        return
+    serializable: dict[str, object] = {k: list(v) for k, v in snapshot.items()}
+    try:
+        write_json_durable(_pre_confirmation_artifacts_path(), serializable)
+    except DurabilityError as exc:
+        append_deploy_log(f"warning: could not snapshot pre-confirmation startup artifacts: {exc}")
+
+
+def _restore_pre_confirmation_artifacts() -> None:
+    """Restore startup artifacts from the pre-confirmation snapshot during rollback.
+
+    If no snapshot exists (legacy mission or first-install scenario), rollback
+    does not touch the startup artifacts.
+    """
+    path = _pre_confirmation_artifacts_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return
+    if not isinstance(decoded, dict):
+        return
+    snapshot = {k: bytes(v) for k, v in decoded.items() if isinstance(v, list)}
+    if not snapshot:
+        return
+    try:
+        startup_contract.restore_startup_artifacts(snapshot)
+        append_deploy_log("startup artifacts restored from pre-confirmation snapshot")
+    except DurabilityError as exc:
+        append_deploy_log(f"warning: could not restore pre-confirmation startup artifacts: {exc}")
+
+
+def _remove_pre_confirmation_artifacts() -> None:
+    """Remove the pre-confirmation startup-artifact snapshot after successful confirmation."""
+    path = _pre_confirmation_artifacts_path()
+    with suppress(DurabilityError, FileNotFoundError, OSError):
+        remove_durable(path)
+
+
+def _converge_startup_artifacts() -> None:
+    """Converge startup artifacts to match the current code contract, logging the result."""
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        append_deploy_log(f"startup artifact convergence skipped: cannot resolve bin home: {exc}")
+        return
+    error = startup_contract.converge_startup_artifacts(bin_home)
+    if error is not None:
+        append_deploy_log(f"startup artifact convergence failed: {error}")
+    else:
+        append_deploy_log("startup artifacts converged to current code contract")
 
 
 def _finalize_supervised_confirmation(
@@ -2708,9 +2791,12 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     state = _confirmation_state(request)
     if state.status == STATUS_CONFIRMED:
         return _confirmation_response(state)
+    _snapshot_pre_confirmation_artifacts()
     _authorize_confirmation(state)
     expected_generation = _prepare_confirmation_candidate(state, options)
     state = _finalize_confirmation(state, expected_generation)
+    _converge_startup_artifacts()
+    _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 
 
