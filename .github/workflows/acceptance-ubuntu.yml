@@ -1,0 +1,21 @@
+name: Acceptance – Ubuntu install
+
+on:
+  push:
+    branches:
+      - main
+      - "release/*"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build acceptance image
+        run: docker build -f acceptance/ubuntu/Dockerfile -t lubko-acceptance .
+      - name: Run acceptance
+        run: docker run --rm lubko-acceptance acceptance.sh
