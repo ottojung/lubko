@@ -18,6 +18,7 @@ printf '=== Lubko Termux ARM64 acceptance ===\n\n'
 printf '%s\n' '--- Termux package install ---'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+apt-get -qq -y -o Dpkg::Options::=--force-confnew upgrade
 apt-get install -qq -y -o Dpkg::Options::=--force-confnew \
     python uv git libpq clang make cmake
 
@@ -36,6 +37,11 @@ if [ ! -f "$LD_PRELOAD_LIB" ]; then
 fi
 pass "libtermux-exec-ld-preload.so present"
 export LD_PRELOAD="$LD_PRELOAD_LIB"
+
+# Termux lacks conventional /tmp; create a private outside-workspace dir.
+LUBKO_OUTSIDE="${TMPDIR:-${HOME}/.cache/lubko-acceptance-tmp}"
+mkdir -p "$LUBKO_OUTSIDE"
+pass "outside-workspace dir $LUBKO_OUTSIDE"
 
 printf '\n%s\n' '--- Private XDG config ---'
 mkdir -p "${HOME}/.config/lubko"
@@ -71,7 +77,7 @@ fi
 
 printf '\n%s\n' '--- Installed launchers ---'
 for entry in lubko-agent lubko-worker lubko-supervisor lubko-deploy \
-             lubko-deploy-ctl lubko-install my-lubko-agent; do
+             lubko-deploy-ctl lubko-install my-lubko-agent lubko-startup; do
   path="${BIN_HOME}/${entry}"
   if [ ! -f "$path" ]; then
     fail "$entry: missing"
@@ -84,10 +90,10 @@ for entry in lubko-agent lubko-worker lubko-supervisor lubko-deploy \
   pass "$entry"
 done
 
-# -- 4. Execute installed launchers from /tmp (outside checkout) -----------
+# -- 4. Execute installed launchers from outside checkout -------------------
 
-printf '\n%s\n' '--- Installed launcher execution (from /tmp) ---'
-cd /tmp
+printf '\n%s\n' '--- Installed launcher execution (outside checkout) ---'
+cd "$LUBKO_OUTSIDE"
 
 if lubko-install --repo "$REPO" --dry-run >/dev/null 2>&1; then
   pass "lubko-install --dry-run"
