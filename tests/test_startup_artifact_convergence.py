@@ -10,17 +10,19 @@ from __future__ import annotations
 
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from lubko import cli, lifecycle, supervise
+from lubko import cli, lifecycle, supervise, supervisor
 from lubko import deployctl as dc
 from lubko import startup_contract as sc
 from lubko import state as _state_mod
 from lubko.deployctl import STATUS_CONFIRMED, RollbackState
 from lubko.durable import DurabilityError
+from lubko.lifecycle import SCHEMA_VERSION, STATE_RUNNING, WorkerMeta
 from lubko.startup_contract import (
     CONTRACT_SCHEMA_VERSION,
     CURRENT_CONTRACT,
@@ -651,3 +653,188 @@ def test_snapshot_write_failure_prevents_terminalization(
         dc._confirm_locked({"type": "confirm", "commit": "b" * 40}, _confirm_opts())
 
     assert current_state.status == dc.STATUS_PENDING
+
+
+# ---------------------------------------------------------------------------
+# Supervisor maintained recovery: genuine reconciliation path
+# ---------------------------------------------------------------------------
+
+
+def _make_confirmed_mission(commit: str) -> RollbackState:
+    """Build a minimal confirmed rollback state for testing.
+
+    Returns:
+        A RollbackState with STATUS_CONFIRMED for the given commit.
+    """
+    previous_meta = WorkerMeta(
+        schema_version=SCHEMA_VERSION,
+        state=STATE_RUNNING,
+        pid=1,
+        pgid=1,
+        sid=1,
+        start_time_ticks=10,
+        token="a" * 32,
+        repo="/repo",
+        git_commit="a" * 40,
+        worker_id="w",
+        log_path="/l",
+        started_at=1.0,
+        stopped_at=None,
+    )
+    return RollbackState(
+        schema_version=4,
+        generation=1,
+        status=STATUS_CONFIRMED,
+        commit=commit,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=previous_meta,
+        new_meta=None,
+        supervisor_owned=True,
+    )
+
+
+def test_supervisor_reconcile_promotes_b_when_b_confirmed_and_staging_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Strongest crash boundary: durable B confirmed, active artifacts still wholly A.
+
+    B manifest/staging retained.  One Supervisor reconcile call must promote B
+    without explicit confirm retry.  The supervisor must NOT gate on
+    validate_startup_artifacts (which would see A as current and skip).
+    Recovery is driven by durable authority only: STATUS_CONFIRMED + manifest
+    bound to mission.commit.
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    # Write A artifacts (simulating old supervisor A's code)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    assert sc.assess_recorded_contract().state == "current"
+
+    # Stage B artifacts with manifest bound to commit-B
+    commit_b = "b" * 40
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest(commit_b, bin_home)
+    assert sc.read_staging_manifest() is not None
+
+    # Overwrite active artifacts with stale A versions to simulate the crash boundary
+    _write_stale_contract(sc.contract_path())
+    _write_stale_definition(sc.startup_definition_path())
+    assert sc.assess_recorded_contract().state == "mismatch"
+
+    # Write durable confirmed mission for commit-B
+    mission = _make_confirmed_mission(commit_b)
+    dc._write_state(mission)
+
+    # Set up SupervisorDaemon — do NOT mock _converge_startup_artifacts
+    desired_ns = SimpleNamespace(commit=commit_b, generation=2, restart=False)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: desired_ns,
+    )
+    monkeypatch.setattr(cli, "current_commit", lambda: commit_b)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: False)
+    applied_state = replace(supervise.SupervisorState.from_dict({}), applied_generation=2)
+    monkeypatch.setattr(supervisor, "read_state", lambda: applied_state)
+    monkeypatch.setattr(daemon, "_ensure_worker", lambda _c: None)
+    monkeypatch.setattr(daemon, "_maybe_reset_backoff", lambda _s, _n: None)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _c: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _n: None)
+    monkeypatch.setattr(daemon, "_complete_cold_migration", lambda: None)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    daemon.reconcile(0.0)
+
+    # B artifacts must have been promoted — A artifacts overwritten
+    assert sc.assess_recorded_contract().state == "current"
+    # Manifest cleaned up after successful promotion
+    assert sc.read_staging_manifest() is None
+
+
+def test_supervisor_reconcile_skips_when_no_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No manifest: supervisor does not mutate artifacts or infer B staleness."""
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    assert sc.assess_recorded_contract().state == "current"
+
+    commit_b = "b" * 40
+    mission = _make_confirmed_mission(commit_b)
+    dc._write_state(mission)
+
+    desired_ns = SimpleNamespace(commit=commit_b, generation=2, restart=False)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: desired_ns,
+    )
+    monkeypatch.setattr(cli, "current_commit", lambda: commit_b)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: False)
+    applied_state = replace(supervise.SupervisorState.from_dict({}), applied_generation=2)
+    monkeypatch.setattr(supervisor, "read_state", lambda: applied_state)
+    monkeypatch.setattr(daemon, "_ensure_worker", lambda _c: None)
+    monkeypatch.setattr(daemon, "_maybe_reset_backoff", lambda _s, _n: None)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _c: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _n: None)
+    monkeypatch.setattr(daemon, "_complete_cold_migration", lambda: None)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    daemon.reconcile(0.0)
+
+    # Active artifacts unchanged — no manifest means no promotion
+    assert sc.assess_recorded_contract().state == "current"
+
+
+def test_supervisor_reconcile_skips_wrong_commit_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrong-commit manifest: supervisor does not mutate artifacts."""
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+
+    commit_b = "b" * 40
+    # Stage with wrong commit (commit-C ≠ mission commit-B)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest("c" * 40, bin_home)
+
+    mission = _make_confirmed_mission(commit_b)
+    dc._write_state(mission)
+
+    desired_ns = SimpleNamespace(commit=commit_b, generation=2, restart=False)
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: desired_ns,
+    )
+    monkeypatch.setattr(cli, "current_commit", lambda: commit_b)
+    monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: False)
+    applied_state = replace(supervise.SupervisorState.from_dict({}), applied_generation=2)
+    monkeypatch.setattr(supervisor, "read_state", lambda: applied_state)
+    monkeypatch.setattr(daemon, "_ensure_worker", lambda _c: None)
+    monkeypatch.setattr(daemon, "_maybe_reset_backoff", lambda _s, _n: None)
+    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _c: None)
+    monkeypatch.setattr(daemon, "_probe_readiness", lambda _n: None)
+    monkeypatch.setattr(daemon, "_complete_cold_migration", lambda: None)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    daemon.reconcile(0.0)
+
+    # Active artifacts unchanged — wrong-commit manifest was not promoted
+    assert sc.assess_recorded_contract().state == "current"
+    # Staging manifest still present (promotion rejected, not cleaned up)
+    assert sc.read_staging_manifest() is not None
