@@ -1985,6 +1985,30 @@ def _remove_confirmation_receipt() -> None:
         remove_durable(_confirmation_receipt_path())
 
 
+def _finalize_post_promotion(commit: str, manifest: dict[str, object], bin_home: Path) -> None:
+    """Write the durable content-authority receipt and clean up staging.
+
+    This must be called AFTER promotion succeeds and BEFORE returning
+    success to the caller.  The receipt write is durable so a crash after
+    this point leaves a recoverable state.  Staging cleanup happens only
+    after the receipt is durably written.
+
+    Args:
+        commit: The confirmed commit whose artifacts were promoted.
+        manifest: The staging manifest used for promotion.
+        bin_home: Directory containing the launcher scripts.
+
+    Raises:
+        DeployCtlError: If the receipt cannot be durably written.
+    """
+    try:
+        _write_confirmation_receipt(commit, manifest)
+    except OSError as exc:
+        msg = "could not write startup confirmation receipt"
+        raise DeployCtlError(msg) from exc
+    startup_contract.cleanup_staging(bin_home)
+
+
 def _stage_candidate_startup_artifacts(commit: str) -> None:
     """Run the candidate code's startup-contract staging to produce B's artifacts.
 
@@ -3087,7 +3111,7 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
             startup_contract.cleanup_staging(bin_home)
             _remove_pre_confirmation_artifacts()
         raise
-    # Read manifest before promotion (promotion removes it on success).
+    # Read manifest before promotion (promotion retains it for crash safety).
     manifest = startup_contract.read_staging_manifest()
     promotion_error = startup_contract.promote_staged_artifacts(
         state.commit, state.commit, bin_home
@@ -3096,9 +3120,14 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
         msg = f"startup artifact promotion failed: {promotion_error}"
         append_deploy_log(msg)
         return {"type": "confirm", "ok": False, "commit": state.commit, "error": msg}
-    # Write receipt from the manifest for future repeat-confirm verification.
+    # Finalize: write receipt then clean staging.
     if manifest is not None:
-        _write_confirmation_receipt(state.commit, manifest)
+        try:
+            _finalize_post_promotion(state.commit, manifest, bin_home)
+        except DeployCtlError as exc:
+            msg = f"startup artifact confirmation receipt could not be written: {exc}"
+            append_deploy_log(msg)
+            return {"type": "confirm", "ok": False, "commit": state.commit, "error": msg}
     _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 
@@ -3143,7 +3172,7 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
             return _confirmation_response(state)
         # Active artifacts drifted despite receipt — try repair via manifest.
     # No receipt, wrong-commit receipt, or drift — attempt promotion.
-    # Read manifest before promotion (promotion removes it on success).
+    # Read manifest before promotion (promotion retains it for crash safety).
     manifest = startup_contract.read_staging_manifest()
     promotion_error = startup_contract.promote_staged_artifacts(
         state.commit, state.commit, bin_home
@@ -3155,7 +3184,7 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
             "commit": state.commit,
             "error": f"startup artifact promotion incomplete: {promotion_error}",
         }
-    # Promotion succeeded — verify and write receipt from the manifest.
+    # Promotion succeeded — finalize: write receipt then clean staging.
     if manifest is not None:
         verify_error = startup_contract.verify_active_artifacts_match(manifest, bin_home)
         if verify_error is not None:
@@ -3165,7 +3194,15 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
                 "commit": state.commit,
                 "error": f"startup artifact verification failed after promotion: {verify_error}",
             }
-        _write_confirmation_receipt(state.commit, manifest)
+        try:
+            _finalize_post_promotion(state.commit, manifest, bin_home)
+        except DeployCtlError as exc:
+            return {
+                "type": "confirm",
+                "ok": False,
+                "commit": state.commit,
+                "error": f"startup artifact confirmation receipt could not be written: {exc}",
+            }
     _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 

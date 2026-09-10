@@ -932,7 +932,11 @@ def promote_staged_artifacts(commit: str, confirmed_commit: str, bin_home: Path)
     3. Staged bytes hash against the manifest.
     4. Each active destination is durably written and verified.
     5. Launcher executable mode is verified.
-    6. Staging is removed only after the full set verifies.
+
+    Staging files and manifest are intentionally retained after promotion
+    so that a post-promotion crash cannot leave durable STATUS_CONFIRMED
+    with neither staging manifest nor receipt.  The caller must explicitly
+    clean up staging after durably writing a content-authority receipt.
 
     A crash between any subset of artifact writes leaves either the old
     coherent artifacts or a partial state that the next promotion tick
@@ -969,9 +973,6 @@ def promote_staged_artifacts(commit: str, confirmed_commit: str, bin_home: Path)
         error = _promote_launcher(manifest, bin_home)
     if error is None:
         error = _verify_active_artifacts(manifest, bin_home)
-    if error is None:
-        cleanup_staging(bin_home)
-        _remove_staging_manifest()
     return error
 
 

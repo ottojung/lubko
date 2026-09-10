@@ -173,6 +173,9 @@ def test_promote_all_three_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert sc.assess_recorded_contract().state == "current"
     assert sc.validate_startup_launcher(bin_home) is True
     assert sc.validate_startup_definition().ok is True
+    # Manifest retained after promotion (caller cleans up after receipt)
+    assert sc.read_staging_manifest() is not None
+    sc.cleanup_staging(bin_home)
     assert not _manifest_path(tmp_path).is_file()
 
 
@@ -755,8 +758,8 @@ def test_supervisor_reconcile_promotes_b_when_b_confirmed_and_staging_retained(
 
     # B artifacts must have been promoted — A artifacts overwritten
     assert sc.assess_recorded_contract().state == "current"
-    # Manifest cleaned up after successful promotion
-    assert sc.read_staging_manifest() is None
+    # Manifest retained after promotion (deployctl cleans up after receipt)
+    assert sc.read_staging_manifest() is not None
 
 
 def test_supervisor_reconcile_skips_when_no_manifest(
@@ -1099,6 +1102,74 @@ def test_repeat_confirm_repair_via_staging_manifest(
     assert response["ok"] is True
     assert sc.assess_recorded_contract().state == "current"
     # Receipt updated to commit-B
+    receipt = dc._read_confirmation_receipt()
+    assert receipt is not None
+    assert receipt.get("commit") == commit_b
+
+
+# ---------------------------------------------------------------------------
+# Crash-safety: receipt-write failure after promotion
+# ---------------------------------------------------------------------------
+
+
+def test_receipt_write_failure_after_promotion_retains_staging_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If receipt write fails after successful promotion, staging is retained.
+
+    This prevents the crash-safety hole: STATUS_CONFIRMED with neither
+    staging manifest nor receipt would leave repeat confirm unable to
+    prove or repair startup artifacts.
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest("b" * 40, bin_home)
+
+    commit_b = "b" * 40
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_CONFIRMED,
+        commit=commit_b,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": "a" * 40})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+    monkeypatch.setattr(dc, "_confirmation_state", lambda _r: current_state)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    # Make receipt write fail (simulate crash during receipt durability)
+    original_receipt_write = dc._write_confirmation_receipt
+
+    def _fail_receipt_write(_commit: str, _manifest: dict[str, object]) -> None:
+        msg = "disk full"
+        raise OSError(msg)
+
+    monkeypatch.setattr(dc, "_write_confirmation_receipt", _fail_receipt_write)
+
+    # First confirm: promotion succeeds, receipt write fails → staging retained
+    response = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response["ok"] is False
+    # Staging manifest retained (not cleaned up because receipt write failed)
+    assert sc.read_staging_manifest() is not None
+    # No receipt written
+    assert dc._read_confirmation_receipt() is None
+
+    # Restore the real receipt write function, retry confirm → succeeds
+    monkeypatch.setattr(dc, "_write_confirmation_receipt", original_receipt_write)
+    response2 = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response2["ok"] is True
+    assert sc.read_staging_manifest() is None
     receipt = dc._read_confirmation_receipt()
     assert receipt is not None
     assert receipt.get("commit") == commit_b
