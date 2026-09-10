@@ -198,17 +198,18 @@ def test_newer_mission_resumes_normal_reconciliation(isolated: Path) -> None:
     assert dc._cli_target_commit(dc.read_rollback_state()) == NEWER
 
 
-@pytest.mark.parametrize("malformed", [1, "true", None, {}, []])
-def test_present_non_boolean_migration_flag_fails_closed(malformed: object) -> None:
+def test_present_non_boolean_migration_flag_fails_closed() -> None:
     """A present ``migration`` value must be a real JSON boolean or fail closed."""
-    payload: dict[str, object] = {
-        "schema_version": 1,
-        "generation": 1,
-        "commit": OLD,
-        "migration": malformed,
-    }
-    with pytest.raises((TypeError, ValueError), match="malformed"):
-        supervise.SupervisorDesired.from_dict(payload)
+    malformed_values: tuple[object, ...] = (1, "true", None, {}, [])
+    for malformed in malformed_values:
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "generation": 1,
+            "commit": OLD,
+            "migration": malformed,
+        }
+        with pytest.raises((TypeError, ValueError), match="malformed"):
+            supervise.SupervisorDesired.from_dict(payload)
 
 
 def test_absent_migration_flag_remains_backward_compatible_false() -> None:

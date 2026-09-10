@@ -159,13 +159,13 @@ def test_metadata_rejects_malformed_present_scalars(field: str, bad_value: objec
         WorkerMeta.from_dict(data)
 
 
-@pytest.mark.parametrize("bad_state", ["", "pending", "unmanaged", "definitely-not-a-worker-state"])
-def test_metadata_rejects_unsupported_present_state(bad_state: str) -> None:
+def test_metadata_rejects_unsupported_present_state() -> None:
     """Type-correct but unsupported lifecycle states remain malformed authority."""
-    data = meta().to_dict()
-    data["state"] = bad_state
-    with pytest.raises(ValueError, match=r"unsupported worker metadata state"):
-        WorkerMeta.from_dict(data)
+    for bad_state in ("", "pending", "unmanaged", "definitely-not-a-worker-state"):
+        data = meta().to_dict()
+        data["state"] = bad_state
+        with pytest.raises(ValueError, match=r"unsupported worker metadata state"):
+            WorkerMeta.from_dict(data)
 
 
 def test_metadata_preserves_absent_state_compatibility() -> None:

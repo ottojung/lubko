@@ -634,16 +634,17 @@ def test_unsupported_state_enum_enters_durable_hold(field: str, raw: object) -> 
     assert state.ownership_hold_malformed is True
 
 
-@pytest.mark.parametrize("raw", [123, True, 1.5, [], {}])
-def test_present_malformed_commit_enters_durable_hold(raw: object) -> None:
+def test_present_malformed_commit_enters_durable_hold() -> None:
     """Malformed present commit cannot silently degrade to ordinary absence."""
-    data = supervise.fresh_state().to_dict()
-    data["commit"] = raw
+    malformed: tuple[object, ...] = (123, True, 1.5, [], {})
+    for raw in malformed:
+        data = supervise.fresh_state().to_dict()
+        data["commit"] = raw
 
-    state = supervise.SupervisorState.from_dict(data)
+        state = supervise.SupervisorState.from_dict(data)
 
-    assert state.commit is None
-    assert state.ownership_hold_malformed is True
+        assert state.commit is None
+        assert state.ownership_hold_malformed is True
 
 
 def test_state_string_absence_and_commit_null_remain_compatible() -> None:

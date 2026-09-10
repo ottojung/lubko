@@ -11,10 +11,10 @@ from lubko import agent
 BAD_STATES: list[object] = [None, "", "other", True, 0, 1.5, [], {}]
 
 
-@pytest.mark.parametrize("state", ["reserved", "claimed"])
-def test_reservation_state_accepts_only_canonical_lifecycle_values(state: str) -> None:
+def test_reservation_state_accepts_only_canonical_lifecycle_values() -> None:
     """Only exact canonical state strings carry lifecycle authority."""
-    assert agent._runner_reservation_state({"state": state}) == state
+    for state in ("reserved", "claimed"):
+        assert agent._runner_reservation_state({"state": state}) == state
 
 
 def test_reservation_state_distinguishes_genuine_absence() -> None:

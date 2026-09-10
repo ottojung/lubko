@@ -39,27 +39,29 @@ def test_probe_claim_state_rejects_malformed_process_pid(process_pid: object) ->
     )
 
 
-@pytest.mark.parametrize("worker_id", [1, True, None, [], {}])
-def test_probe_claim_state_rejects_malformed_worker_id(worker_id: object) -> None:
+def test_probe_claim_state_rejects_malformed_worker_id() -> None:
     """Malformed persisted worker IDs never become adoption authority."""
-    assert (
-        lifecycle._parse_probe_claim_state({
-            "status": "running",
-            "worker_id": worker_id,
-            "process_pid": 4242,
-        })
-        is None
-    )
+    bad_ids: tuple[object, ...] = (1, True, None, [], {})
+    for worker_id in bad_ids:
+        assert (
+            lifecycle._parse_probe_claim_state({
+                "status": "running",
+                "worker_id": worker_id,
+                "process_pid": 4242,
+            })
+            is None
+        )
 
 
-@pytest.mark.parametrize("status", [1, True, None, [], {}])
-def test_probe_claim_state_rejects_malformed_status(status: object) -> None:
+def test_probe_claim_state_rejects_malformed_status() -> None:
     """Malformed persisted statuses never become adoption authority."""
-    assert (
-        lifecycle._parse_probe_claim_state({
-            "status": status,
-            "worker_id": "worker-a",
-            "process_pid": 4242,
-        })
-        is None
-    )
+    bad_statuses: tuple[object, ...] = (1, True, None, [], {})
+    for status in bad_statuses:
+        assert (
+            lifecycle._parse_probe_claim_state({
+                "status": status,
+                "worker_id": "worker-a",
+                "process_pid": 4242,
+            })
+            is None
+        )

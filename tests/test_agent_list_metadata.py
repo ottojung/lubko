@@ -115,13 +115,13 @@ def test_one_malformed_entry_does_not_hide_healthy_entry(
     assert bad_json["title"] is None
 
 
-@pytest.mark.parametrize("field", ["last_activity_at", "finished_at"])
-def test_list_valid_activity_and_completion_timestamps_are_preserved(field: str) -> None:
+def test_list_valid_activity_and_completion_timestamps_are_preserved() -> None:
     """Canonical list timestamps survive the persisted-metadata boundary."""
-    meta: agent.Meta = {field: 12.5}
-    entry = agent._entry_json("abc", "idle", meta)
-    assert entry[field] == pytest.approx(12.5)
-    assert "metadata_errors" not in entry
+    for field in ("last_activity_at", "finished_at"):
+        meta: agent.Meta = {field: 12.5}
+        entry = agent._entry_json("abc", "idle", meta)
+        assert entry[field] == pytest.approx(12.5)
+        assert "metadata_errors" not in entry
 
 
 def test_list_malformed_activity_and_completion_timestamps_are_diagnostic() -> None:

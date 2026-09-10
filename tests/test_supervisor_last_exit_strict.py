@@ -35,11 +35,12 @@ def test_healthy_status_serialization_is_unchanged() -> None:
     assert status.to_dict()["last_exit"] == {"returncode": 0, "at": 42.25}
 
 
-@pytest.mark.parametrize("returncode", ["7", 7.0, True, False, [], {}, "", "bad"])
-def test_malformed_returncode_is_rejected(returncode: object) -> None:
+def test_malformed_returncode_is_rejected() -> None:
     """Malformed return codes never coerce to canonical integers."""
-    for parsed in _parse_all({"last_exit": {"returncode": returncode, "at": 12.5}}):
-        assert parsed.last_exit is None
+    bad_returncodes: tuple[object, ...] = ("7", 7.0, True, False, [], {}, "", "bad")
+    for returncode in bad_returncodes:
+        for parsed in _parse_all({"last_exit": {"returncode": returncode, "at": 12.5}}):
+            assert parsed.last_exit is None
 
 
 @pytest.mark.parametrize(
