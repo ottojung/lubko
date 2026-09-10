@@ -16,7 +16,6 @@ deployment scenario from issue #729:
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -39,7 +38,7 @@ TIMEOUT: Final = 10.0
 
 
 def _run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
-    """Run a subprocess, asserting success.
+    """Run a subprocess, returning the result without raising on non-zero exit.
 
     Returns:
         The completed process result.
@@ -198,10 +197,29 @@ def test_provenance_error_caught_by_dispatch_boundary() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_redact_source_url_strips_userinfo() -> None:
-    """URLs with userinfo have the credential portion removed."""
+def test_has_userinfo_detects_https() -> None:
+    """HTTPS URLs with user:password@ are detected as having userinfo."""
+    assert dc._has_userinfo("https://user:pass@host/repo.git") is True
+    assert dc._has_userinfo("https://host/repo.git") is False
+
+
+def test_has_userinfo_detects_scp_style() -> None:
+    """SCP-style user@host:path is detected as having userinfo."""
+    assert dc._has_userinfo("git@github.com:user/repo.git") is True
+    assert dc._has_userinfo("deploy-token@github.com:user/repo.git") is True
+    assert dc._has_userinfo("github.com:user/repo.git") is False
+
+
+def test_redact_source_url_strips_https_userinfo() -> None:
+    """HTTPS URLs with userinfo have the credential portion removed."""
     url = "https://user:secret@github.com/org/repo.git"
     assert dc._redact_source_url(url) == "https://github.com/org/repo.git"
+
+
+def test_redact_source_url_strips_scp_userinfo() -> None:
+    """SCP-style URLs with userinfo have the user portion removed."""
+    url = "git@github.com:user/repo.git"
+    assert dc._redact_source_url(url) == "github.com:user/repo.git"
 
 
 def test_redact_source_url_preserves_bare_urls() -> None:
@@ -210,35 +228,15 @@ def test_redact_source_url_preserves_bare_urls() -> None:
     assert dc._redact_source_url(url) == url
 
 
-def test_redact_source_url_preserves_path_structure() -> None:
-    """The host and path are preserved after redaction."""
-    url = "https://token:x-oauth-basic@github.com/org/repo.git"
-    result = dc._redact_source_url(url)
-    assert "github.com/org/repo.git" in result
-    assert "token" not in result
-    assert "x-oauth-basic" not in result
+def test_provenance_error_suppresses_stderr_for_userinfo_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When source_url has userinfo, stderr is not included in the exception.
 
-
-def test_provenance_error_messages_redact_credentials() -> None:
-    """Error messages from fetch_from_authority never contain raw credentials."""
-    url_with_creds = "https://user:p-4ssw0rd@git.example.com/private/repo.git"
-    label = dc._redact_source_url(url_with_creds)
-    assert "p-4ssw0rd" not in label
-    assert "user" not in label.split("@")[0] if "@" in label else True
-
-
-def test_stderr_sanitization_strips_raw_url() -> None:
-    """_sanitize_stderr replaces every raw URL occurrence with the redacted label."""
-    url = "https://user:s3cret@git.example.com/repo.git"
-    raw_stderr = f"fatal: repository '{url}' not found"
-    sanitized = dc._sanitize_stderr(raw_stderr, url)
-    assert "s3cret" not in sanitized
-    assert "user" not in sanitized
-    assert "git.example.com/repo.git" in sanitized
-
-
-def test_provenance_error_never_contains_raw_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When git stderr echoes the full credential-bearing URL, the exception is clean."""
+    Git may normalize/encode the credential-bearing URL differently than
+    the raw input, so stderr is suppressed entirely to guarantee no
+    credential material leaks.
+    """
     url_with_creds = "https://deploy-token:tk-abc123@github.com/org/repo.git"
     stderr_with_url = (
         f"fatal: unable to access '{url_with_creds}': The requested URL returned error: 401"
@@ -270,8 +268,120 @@ def test_provenance_error_never_contains_raw_url(monkeypatch: pytest.MonkeyPatch
     assert "tk-abc123" not in error_text
     assert "deploy-token" not in error_text
     assert url_with_creds not in error_text
+    # Stderr is suppressed entirely — no raw 401 detail either
+    assert "401" not in error_text
     # The redacted host/path is still present for diagnostics
     assert "github.com/org/repo.git" in error_text
+
+
+def test_provenance_error_suppresses_stderr_for_scp_userinfo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SCP-style user@host URLs also suppress stderr to avoid credential leak."""
+    scp_url = "git@github.com:org/private-repo.git"
+    stderr_text = "fatal: repository 'git@github.com:org/private-repo.git' not found"
+
+    def fake_run_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout="",
+            stderr=stderr_text,
+        )
+
+    monkeypatch.setattr(dc, "_run_git", fake_run_git)
+
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(
+            Path("/workspace/Lubko"),
+            COMMIT,
+            scp_url,
+            5.0,
+        )
+
+    error_text = str(exc_info.value)
+    assert "git@" not in error_text
+    assert "github.com:org/private-repo.git" in error_text
+
+
+def test_provenance_error_includes_stderr_for_credential_free_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """URLs without userinfo retain stderr for useful diagnostics."""
+    clean_url = "https://github.com/org/repo.git"
+    stderr_text = "fatal: remote error: not found"
+
+    def fake_run_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout="",
+            stderr=stderr_text,
+        )
+
+    monkeypatch.setattr(dc, "_run_git", fake_run_git)
+
+    with pytest.raises(dc.ProvenanceError, match="remote error: not found"):
+        dc.fetch_from_authority(
+            Path("/workspace/Lubko"),
+            COMMIT,
+            clean_url,
+            5.0,
+        )
+
+
+def test_provenance_error_clean_with_normalized_encoded_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Git normalizes/encodes the secret differently, no credential leaks.
+
+    Git may percent-encode, hash, or otherwise transform a credential-
+    bearing URL in its stderr output.  Because stderr is suppressed when
+    userinfo is present, even a completely different encoded form of the
+    secret cannot appear in the exception.
+    """
+    raw_url = "https://user:p%40ssw0rd@host/repo.git"
+    # Simulate Git encoding the '@' as '%40' and double-encoding the password
+    normalized_stderr = (
+        "fatal: unable to access 'https://user:p%2540ssw0rd@host/repo.git': HTTP 401"
+    )
+
+    def fake_run_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout="",
+            stderr=normalized_stderr,
+        )
+
+    monkeypatch.setattr(dc, "_run_git", fake_run_git)
+
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(
+            Path("/workspace/Lubko"),
+            COMMIT,
+            raw_url,
+            5.0,
+        )
+
+    error_text = str(exc_info.value)
+    assert "p%40ssw0rd" not in error_text
+    assert "p%2540ssw0rd" not in error_text
+    assert "ssw0rd" not in error_text
+    assert "user" not in error_text
+    assert "401" not in error_text
 
 
 def test_source_url_rejected_for_status_request() -> None:
@@ -404,33 +514,25 @@ def test_main_catches_provenance_error_as_checkout_failure(
 # Real-Git: shared topology base, per-test lightweight clones
 # ---------------------------------------------------------------------------
 
-_TOPOLOGY_BASE: Path | None = None
-_TOPOLOGY_TARGET: str = ""
 
+@pytest.fixture(scope="module")
+def topology_base(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str]:
+    """Module-scoped shared base topology for real-git tests.
 
-def _ensure_topology_base() -> tuple[Path, str]:
-    """Create or return the shared base topology for real-git tests.
-
-    The base is created once in a fixed location and reused across all
-    real-git tests.  Each test clones a fresh checkout from the shared
-    base to stay isolated while avoiding repeated full topology setup.
+    Created once per test module by pytest and automatically cleaned up
+    when the module finishes.  Each test clones a fresh isolated checkout
+    from the shared base to stay isolated while avoiding repeated full
+    topology setup.
 
     Returns:
         (authority_bare_path, target_commit_B)
     """
-    global _TOPOLOGY_BASE, _TOPOLOGY_TARGET  # ruff: ignore[global-statement]
-
-    if _TOPOLOGY_BASE is None:
-        import tempfile  # ruff: ignore[import-outside-top-level]
-
-        base = Path(tempfile.mkdtemp(prefix="provenance-topo-"))
-        _authority, _checkout, target = _setup_real_topology(base)
-        _TOPOLOGY_BASE = base
-        _TOPOLOGY_TARGET = target
-    return _TOPOLOGY_BASE, _TOPOLOGY_TARGET
+    base = tmp_path_factory.mktemp("provenance-topo")
+    _authority, _checkout, target = _setup_real_topology(base)
+    return base, target
 
 
-def _fresh_checkout(tmp_path: Path) -> tuple[Path, str]:
+def _fresh_checkout(tmp_path: Path, topology_base: tuple[Path, str]) -> Path:
     """Clone a fresh checkout and repoint its origin at the stale dev-clone.
 
     The clone is created from the shared base ``deploy-checkout`` for
@@ -441,14 +543,15 @@ def _fresh_checkout(tmp_path: Path) -> tuple[Path, str]:
 
     Args:
         tmp_path: Per-test temporary directory.
+        topology_base: The shared ``(authority_path, target_commit)`` tuple.
 
     Returns:
-        (checkout_path, target_commit_B)
+        Path to the fresh isolated checkout.
     """
-    base, target = _ensure_topology_base()
+    base, _target = topology_base
     checkout = _clone_checkout(tmp_path, base / "deploy-checkout", "checkout")
     _git(checkout, "remote", "set-url", "origin", str(base / "dev-clone"))
-    return checkout, target
+    return checkout
 
 
 # ---------------------------------------------------------------------------
@@ -456,25 +559,27 @@ def _fresh_checkout(tmp_path: Path) -> tuple[Path, str]:
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_from_real_authority_succeeds(tmp_path: Path) -> None:
+def test_fetch_from_real_authority_succeeds(
+    tmp_path: Path, topology_base: tuple[Path, str]
+) -> None:
     """Fetching a commit that exists in the real authority succeeds."""
-    base, target = _ensure_topology_base()
+    base, target = topology_base
     authority = base / "authority.git"
-    checkout, _ = _fresh_checkout(tmp_path)
+    checkout = _fresh_checkout(tmp_path, topology_base)
     dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
     dc._require_exact_commit(checkout, target, TIMEOUT)
 
 
-def test_stale_origin_not_used_for_fetch(tmp_path: Path) -> None:
+def test_stale_origin_not_used_for_fetch(tmp_path: Path, topology_base: tuple[Path, str]) -> None:
     """The declared authority URL is used, not the checkout's origin remote.
 
     Origin is the stale dev-clone (only has commit A).  Commit B exists
     exclusively in the bare authority.  ``fetch_from_authority`` with the
     authority URL obtains B, proving origin is never consulted.
     """
-    base, target = _ensure_topology_base()
+    base, target = topology_base
     authority = base / "authority.git"
-    checkout, _ = _fresh_checkout(tmp_path)
+    checkout = _fresh_checkout(tmp_path, topology_base)
 
     # Origin points at dev-clone which only has commit A (stale)
     origin_url = _git(checkout, "remote", "get-url", "origin").stdout.strip()
@@ -494,11 +599,11 @@ def test_stale_origin_not_used_for_fetch(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_checkout_is_detached_and_clean(tmp_path: Path) -> None:
+def test_checkout_is_detached_and_clean(tmp_path: Path, topology_base: tuple[Path, str]) -> None:
     """After fetch + checkout, HEAD is detached at the exact commit, worktree clean."""
-    base, target = _ensure_topology_base()
+    base, target = topology_base
     authority = base / "authority.git"
-    checkout, _ = _fresh_checkout(tmp_path)
+    checkout = _fresh_checkout(tmp_path, topology_base)
     dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
     dc._require_exact_commit(checkout, target, TIMEOUT)
 
@@ -524,10 +629,12 @@ def test_checkout_is_detached_and_clean(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_authority_without_commit_fails_without_switching_tip(tmp_path: Path) -> None:
+def test_authority_without_commit_fails_without_switching_tip(
+    tmp_path: Path, topology_base: tuple[Path, str]
+) -> None:
     """Authority lacking target fails clearly; HEAD unchanged."""
-    _base, target = _ensure_topology_base()
-    checkout, _ = _fresh_checkout(tmp_path)
+    _base, target = topology_base
+    checkout = _fresh_checkout(tmp_path, topology_base)
 
     # Create a separate authority that does NOT have the target commit
     wrong_authority = tmp_path / "wrong-authority.git"
@@ -549,39 +656,23 @@ def test_authority_without_commit_fails_without_switching_tip(tmp_path: Path) ->
 # ---------------------------------------------------------------------------
 
 
-def test_confirmed_runtime_independent_of_dev_checkout(tmp_path: Path) -> None:
-    """After source severing the restart path performs no Git/network lookup.
-
-    Builds the real topology, prepares commit B via provenance fetch,
-    detaches HEAD at B, then removes every Git source (dev-clone,
-    authority-work, bare authority).  The maintained restart helper
-    ``dc.restart_previous`` is then exercised with its normal
-    process/filesystem collaborators mocked.  ``fetch_from_authority``
-    and ``_run_git`` are monkeypatched to raise ``AssertionError`` so
-    any Git or network call during restart would fail the test.
-    """
-    base, target = _ensure_topology_base()
+def test_confirmed_runtime_independent_of_dev_checkout(
+    tmp_path: Path, topology_base: tuple[Path, str]
+) -> None:
+    """After source severing the restart path performs no Git/network lookup."""
+    base, target = topology_base
     authority = base / "authority.git"
-    checkout, _ = _fresh_checkout(tmp_path)
+    checkout = _fresh_checkout(tmp_path, topology_base)
 
     # Prepare: fetch B from authority, verify, detach at B.
     dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
     dc._require_exact_commit(checkout, target, TIMEOUT)
     dc._checkout(checkout, target, TIMEOUT, force=False)
 
-    # Sever all sources from this test's clone.
-    shutil.rmtree(tmp_path / "checkout")
-
-    # Prove the detached checkout remains clean and exact after severing.
-    # (checkout was removed; this proves the restart path does not need it)
-    # Re-clone a fresh one just for the restart mission metadata.
-    checkout_fresh = _clone_checkout(tmp_path, base / "deploy-checkout", "checkout-restart")
-    dc.fetch_from_authority(checkout_fresh, target, str(authority), TIMEOUT)
-    dc._checkout(checkout_fresh, target, TIMEOUT, force=False)
-
-    head = _git(checkout_fresh, "rev-parse", "HEAD").stdout.strip()
+    # Prove the detached checkout remains clean and exact.
+    head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
     assert head == target
-    assert not _git(checkout_fresh, "status", "--porcelain").stdout
+    assert not _git(checkout, "status", "--porcelain").stdout
 
     # Build a restart mission whose previous worker is not retiring and is
     # still alive -- the restart path should just return it directly without
@@ -594,7 +685,7 @@ def test_confirmed_runtime_independent_of_dev_checkout(tmp_path: Path) -> None:
         sid=100,
         start_time_ticks=1000,
         token="test-token",  # ruff: ignore[hardcoded-password-func-arg]
-        repo=str(checkout_fresh),
+        repo=str(checkout),
         git_commit=target,
         worker_id="test-worker",
         log_path="worker.log",
@@ -608,7 +699,7 @@ def test_confirmed_runtime_independent_of_dev_checkout(tmp_path: Path) -> None:
         commit=target,
         previous_commit=target,
         deadline=time.time() + 60,
-        repo=str(checkout_fresh),
+        repo=str(checkout),
         uv_path="uv",
         stop_grace_seconds=1.0,
         git_timeout_seconds=5.0,

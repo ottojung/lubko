@@ -919,12 +919,38 @@ def _require_clean_checkout(repo: Path, timeout: float) -> None:
         raise DeployCtlError(msg)
 
 
+def _has_userinfo(source_url: str) -> bool:
+    """Return whether the source URL contains credential-bearing userinfo.
+
+    Detects both ``scheme://user:password@host/path`` and SCP-style
+    ``user@host:path`` forms.  Whenuserinfo is present, raw Git stderr
+    must never be appended to error messages because Git may normalize or
+    encode the credentials differently than the raw input string.
+
+    Args:
+        source_url: The raw source authority URL.
+
+    Returns:
+        ``True`` when the URL carries credential material.
+    """
+    if "@" not in source_url:
+        return False
+    scheme_end = source_url.find("://")
+    if scheme_end != -1:
+        # scheme://user:pass@host — userinfo follows "://"
+        return "@" in source_url[scheme_end + 3 :]
+    # SCP-style user@host:path — first component before ':' contains '@'
+    colon_pos = source_url.find(":")
+    prefix = source_url if colon_pos == -1 else source_url[:colon_pos]
+    return "@" in prefix
+
+
 def _redact_source_url(source_url: str) -> str:
     """Return a redacted display label for a source URL, hiding credentials.
 
-    URLs may contain ``user:password@`` userinfo used for private
-    repositories.  The redacted label preserves the host/path structure
-    useful for diagnostics while stripping any credential material.
+    Handles both ``scheme://user:password@host/path`` and SCP-style
+    ``user@host:path`` forms.  The redacted label preserves the host/path
+    structure useful for diagnostics while stripping any credential material.
 
     Args:
         source_url: The raw source authority URL.
@@ -935,35 +961,18 @@ def _redact_source_url(source_url: str) -> str:
     if "@" not in source_url:
         return source_url
     scheme_end = source_url.find("://")
-    if scheme_end == -1:
-        return source_url
-    authority_start = scheme_end + 3
-    at_pos = source_url.find("@", authority_start)
+    if scheme_end != -1:
+        # scheme://user:pass@host/path → scheme://host/path
+        authority_start = scheme_end + 3
+        at_pos = source_url.find("@", authority_start)
+        if at_pos == -1:
+            return source_url
+        return source_url[:authority_start] + source_url[at_pos + 1 :]
+    # SCP-style user@host:path → host:path
+    at_pos = source_url.find("@")
     if at_pos == -1:
         return source_url
-    return source_url[:authority_start] + source_url[at_pos + 1 :]
-
-
-def _sanitize_stderr(stderr: str, source_url: str) -> str:
-    """Remove every occurrence of the raw source URL from git stderr.
-
-    Git may echo the full URL (including ``user:password@`` userinfo) back
-    in its diagnostic output.  The exact raw URL is stripped so credentials
-    never leak into ``ProvenanceError`` messages, durable logs, or queued
-    JSON responses.  The redacted label is substituted so the diagnostic
-    remains useful.
-
-    Args:
-        stderr: Raw git stderr text.
-        source_url: The raw source authority URL that may appear.
-
-    Returns:
-        Sanitized text with credentials removed.
-    """
-    if not stderr or source_url not in stderr:
-        return stderr
-    label = _redact_source_url(source_url)
-    return stderr.replace(source_url, label)
+    return source_url[at_pos + 1 :]
 
 
 def fetch_from_authority(
@@ -995,8 +1004,10 @@ def fetch_from_authority(
         msg = f"could not fetch commit {commit} from source authority {label!r}: {exc}"
         raise ProvenanceError(msg) from exc
     if proc.returncode != 0:
-        stderr = _sanitize_stderr((proc.stderr or "").strip(), source_url)
-        detail = f": {stderr}" if stderr else ""
+        if _has_userinfo(source_url):
+            detail = ""
+        else:
+            detail = f": {(proc.stderr or '').strip()}" if proc.stderr else ""
         msg = (
             f"source authority {label!r} does not contain commit {commit}{detail}; "
             "the commit was not fetched from the declared authority"
