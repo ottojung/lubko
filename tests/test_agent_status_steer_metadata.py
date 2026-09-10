@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from lubko import agent
 
 
@@ -36,20 +34,17 @@ def test_status_json_fails_closed_on_malformed_steer_queue() -> None:
         assert status["steer_metadata_error"] == "malformed persisted steer metadata"
 
 
-@pytest.mark.parametrize(
-    "queue",
-    [
+def test_status_json_fails_closed_on_malformed_steer_item() -> None:
+    """Malformed queued items never reach rendering assumptions."""
+    for queue in [
         [1],
         [{"seq": 1, "prompt": 7, "queued_at": 1.0}],
         [{"seq": 1, "prompt": "ok", "queued_at": None}],
-    ],
-)
-def test_status_json_fails_closed_on_malformed_steer_item(queue: object) -> None:
-    """Malformed queued items never reach rendering assumptions."""
-    status = _status({"steer_seq": 1, "steer_queue": queue})
-    assert status["steers_pending"] is None
-    assert status["next_steer"] is None
-    assert status["steer_metadata_error"] == "malformed persisted steer metadata"
+    ]:
+        status = _status({"steer_seq": 1, "steer_queue": queue})
+        assert status["steers_pending"] is None
+        assert status["next_steer"] is None
+        assert status["steer_metadata_error"] == "malformed persisted steer metadata"
 
 
 def test_status_json_fails_closed_on_malformed_steer_sequence() -> None:

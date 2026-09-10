@@ -112,27 +112,22 @@ def test_historical_supervisor_placeholder_repair_is_safe_and_idempotent(
     assert not rollback_state_path().exists()
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
+def test_historical_placeholder_requires_exact_supervisor_authority() -> None:
+    """A sentinel is compatible only inside its exact supervisor-owned envelope."""
+    for field, value in [
         ("supervisor_owned", False),
         ("commit", "c" * 40),
         ("repo", "/other"),
-    ],
-)
-def test_historical_placeholder_requires_exact_supervisor_authority(
-    field: str, value: object
-) -> None:
-    """A sentinel is compatible only inside its exact supervisor-owned envelope."""
-    data = _legacy_supervised_rollback()
-    data[field] = value
-    _write(data)
-    before = rollback_state_path().read_text(encoding="utf-8")
+    ]:
+        data = _legacy_supervised_rollback()
+        data[field] = value
+        _write(data)
+        before = rollback_state_path().read_text(encoding="utf-8")
 
-    with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
-        lifecycle._repair_rollback_state(222)
+        with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
+            lifecycle._repair_rollback_state(222)
 
-    assert rollback_state_path().read_text(encoding="utf-8") == before
+        assert rollback_state_path().read_text(encoding="utf-8") == before
 
 
 def test_near_miss_historical_placeholder_remains_untrusted() -> None:
@@ -218,9 +213,9 @@ def test_unsupported_nested_worker_state_blocks_repair() -> None:
         assert rollback_state_path().read_text(encoding="utf-8") == before
 
 
-@pytest.mark.parametrize(
-    "deadline",
-    [
+def test_malformed_rollback_deadline_blocks_repair() -> None:
+    """Malformed rollback deadlines remain durable and block repair."""
+    for deadline in [
         _MISSING,
         None,
         False,
@@ -230,46 +225,40 @@ def test_unsupported_nested_worker_state_blocks_repair() -> None:
         float("inf"),
         [],
         {},
-    ],
-)
-def test_malformed_rollback_deadline_blocks_repair(deadline: object) -> None:
-    """Malformed rollback deadlines remain durable and block repair."""
-    data: dict[str, object] = {
-        "status": lifecycle.STATE_PENDING,
-        "new_meta": _stopped_meta(),
-        "previous_meta": _stopped_meta(),
-    }
-    if deadline is not _MISSING:
-        data["deadline"] = deadline
-    _write(data)
-    before = rollback_state_path().read_text(encoding="utf-8")
+    ]:
+        data: dict[str, object] = {
+            "status": lifecycle.STATE_PENDING,
+            "new_meta": _stopped_meta(),
+            "previous_meta": _stopped_meta(),
+        }
+        if deadline is not _MISSING:
+            data["deadline"] = deadline
+        _write(data)
+        before = rollback_state_path().read_text(encoding="utf-8")
 
-    with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
-        lifecycle._repair_rollback_state(222)
+        with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
+            lifecycle._repair_rollback_state(222)
 
-    assert rollback_state_path().read_text(encoding="utf-8") == before
+        assert rollback_state_path().read_text(encoding="utf-8") == before
 
 
-@pytest.mark.parametrize(
-    "status",
-    [_MISSING, None, False, 1, "", "unknown", [], {}],
-)
-def test_malformed_rollback_status_blocks_repair(status: object) -> None:
+def test_malformed_rollback_status_blocks_repair() -> None:
     """Malformed rollback lifecycle state remains durable and blocks repair."""
-    data: dict[str, object] = {
-        "deadline": 0.0,
-        "new_meta": _stopped_meta(),
-        "previous_meta": _stopped_meta(),
-    }
-    if status is not _MISSING:
-        data["status"] = status
-    _write(data)
-    before = rollback_state_path().read_text(encoding="utf-8")
+    for status in [_MISSING, None, False, 1, "", "unknown", [], {}]:
+        data: dict[str, object] = {
+            "deadline": 0.0,
+            "new_meta": _stopped_meta(),
+            "previous_meta": _stopped_meta(),
+        }
+        if status is not _MISSING:
+            data["status"] = status
+        _write(data)
+        before = rollback_state_path().read_text(encoding="utf-8")
 
-    with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
-        lifecycle._repair_rollback_state(222)
+        with pytest.raises(lifecycle._AdoptionError, match="present but malformed"):
+            lifecycle._repair_rollback_state(222)
 
-    assert rollback_state_path().read_text(encoding="utf-8") == before
+        assert rollback_state_path().read_text(encoding="utf-8") == before
 
 
 @pytest.mark.parametrize(

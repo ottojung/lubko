@@ -12,10 +12,10 @@ from lubko import agent
 BAD_MODES: list[object] = [None, "", "resume", 123, True, 1.5, [], {}]
 
 
-@pytest.mark.parametrize("bad", BAD_MODES)
-def test_runner_reservation_mode_rejects_malformed_values(bad: object) -> None:
+def test_runner_reservation_mode_rejects_malformed_values() -> None:
     """Only exact canonical native-session modes carry reservation authority."""
-    assert agent._runner_reservation_mode({"mode": bad}) is None
+    for bad in BAD_MODES:
+        assert agent._runner_reservation_mode({"mode": bad}) is None
 
 
 def test_runner_reservation_mode_rejects_missing_value() -> None:

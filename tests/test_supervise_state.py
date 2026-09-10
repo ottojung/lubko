@@ -617,21 +617,18 @@ def test_present_malformed_state_enum_enters_durable_hold() -> None:
             assert state.ownership_hold_malformed is True
 
 
-@pytest.mark.parametrize(
-    ("field", "raw"),
-    [
+def test_unsupported_state_enum_enters_durable_hold() -> None:
+    """Unsupported mode/intent strings fail closed instead of becoming defaults."""
+    for field, raw in [
         ("mode", "unsupported"),
         ("intent", "unsupported"),
-    ],
-)
-def test_unsupported_state_enum_enters_durable_hold(field: str, raw: object) -> None:
-    """Unsupported mode/intent strings fail closed instead of becoming defaults."""
-    data = supervise.fresh_state().to_dict()
-    data[field] = raw
+    ]:
+        data = supervise.fresh_state().to_dict()
+        data[field] = raw
 
-    state = supervise.SupervisorState.from_dict(data)
+        state = supervise.SupervisorState.from_dict(data)
 
-    assert state.ownership_hold_malformed is True
+        assert state.ownership_hold_malformed is True
 
 
 def test_present_malformed_commit_enters_durable_hold() -> None:

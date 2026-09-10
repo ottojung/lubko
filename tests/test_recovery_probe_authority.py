@@ -1,7 +1,5 @@
 """Strict recovery-probe claim authority parsing."""
 
-import pytest
-
 from lubko import lifecycle
 
 
@@ -23,20 +21,17 @@ def test_probe_claim_state_allows_process_pid_absence_before_publication() -> No
     )
 
 
-@pytest.mark.parametrize(
-    "process_pid",
-    ["4242", 4242.0, 4242.9, True, False, 0, -1, None, [], {}],
-)
-def test_probe_claim_state_rejects_malformed_process_pid(process_pid: object) -> None:
+def test_probe_claim_state_rejects_malformed_process_pid() -> None:
     """Malformed persisted PIDs never become adoption authority."""
-    assert (
-        lifecycle._parse_probe_claim_state({
-            "status": "running",
-            "worker_id": "worker-a",
-            "process_pid": process_pid,
-        })
-        is None
-    )
+    for process_pid in ["4242", 4242.0, 4242.9, True, False, 0, -1, None, [], {}]:
+        assert (
+            lifecycle._parse_probe_claim_state({
+                "status": "running",
+                "worker_id": "worker-a",
+                "process_pid": process_pid,
+            })
+            is None
+        )
 
 
 def test_probe_claim_state_rejects_malformed_worker_id() -> None:

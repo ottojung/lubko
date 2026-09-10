@@ -22,10 +22,10 @@ def test_reservation_state_distinguishes_genuine_absence() -> None:
     assert agent._runner_reservation_state(None) == "absent"
 
 
-@pytest.mark.parametrize("bad", BAD_STATES)
-def test_reservation_state_rejects_malformed_present_values(bad: object) -> None:
+def test_reservation_state_rejects_malformed_present_values() -> None:
     """Present malformed discriminators are never normalized."""
-    assert agent._runner_reservation_state({"state": bad}) == "malformed"
+    for bad in BAD_STATES:
+        assert agent._runner_reservation_state({"state": bad}) == "malformed"
 
 
 def test_reservation_state_rejects_missing_discriminator() -> None:

@@ -58,16 +58,13 @@ def rollback_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [(True, True), (False, False), (dc._ABSENT, False)],
-)
-def test_absent_and_boolean_previous_retiring_parse(*, value: object, expected: bool) -> None:
+def test_absent_and_boolean_previous_retiring_parse() -> None:
     """Absent parses as false; only literal JSON booleans are stored."""
-    payload = (
-        rollback_payload() if value is dc._ABSENT else rollback_payload(previous_retiring=value)
-    )
-    assert dc.RollbackState.from_dict(payload).previous_retiring is expected
+    for value, expected in [(True, True), (False, False), (dc._ABSENT, False)]:
+        payload = (
+            rollback_payload() if value is dc._ABSENT else rollback_payload(previous_retiring=value)
+        )
+        assert dc.RollbackState.from_dict(payload).previous_retiring is expected
 
 
 def test_present_non_boolean_previous_retiring_fails_closed() -> None:
@@ -116,9 +113,9 @@ def test_malformed_previous_retiring_never_reuses_live_worker(
         dc._read_state()
 
 
-@pytest.mark.parametrize(
-    ("field", "malformed"),
-    [
+def test_present_malformed_authority_scalar_fails_closed() -> None:
+    """Present authority fields keep their exact JSON type and shape."""
+    for field, malformed in [
         ("schema_version", "2"),
         ("schema_version", 2.0),
         ("schema_version", True),
@@ -142,12 +139,9 @@ def test_malformed_previous_retiring_never_reuses_live_worker(
         ("git_timeout_seconds", 0),
         ("git_timeout_seconds", -1),
         ("supervisor_owned", "true"),
-    ],
-)
-def test_present_malformed_authority_scalar_fails_closed(field: str, malformed: object) -> None:
-    """Present authority fields keep their exact JSON type and shape."""
-    with pytest.raises(dc.DeployCtlError):
-        dc.RollbackState.from_dict(rollback_payload(**{field: malformed}))
+    ]:
+        with pytest.raises(dc.DeployCtlError):
+            dc.RollbackState.from_dict(rollback_payload(**{field: malformed}))
 
 
 def test_finite_json_numbers_remain_accepted() -> None:

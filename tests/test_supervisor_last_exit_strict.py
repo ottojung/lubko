@@ -2,8 +2,6 @@
 
 from typing import Protocol
 
-import pytest
-
 from lubko import supervise
 
 
@@ -43,14 +41,11 @@ def test_malformed_returncode_is_rejected() -> None:
             assert parsed.last_exit is None
 
 
-@pytest.mark.parametrize(
-    "at",
-    ["12.5", True, False, [], {}, "", float("nan"), float("inf"), float("-inf"), -1.0],
-)
-def test_malformed_timestamp_is_rejected(at: object) -> None:
+def test_malformed_timestamp_is_rejected() -> None:
     """Malformed or out-of-domain timestamps never become exit history."""
-    for parsed in _parse_all({"last_exit": {"returncode": 1, "at": at}}):
-        assert parsed.last_exit is None
+    for at in ["12.5", True, False, [], {}, "", float("nan"), float("inf"), float("-inf"), -1.0]:
+        for parsed in _parse_all({"last_exit": {"returncode": 1, "at": at}}):
+            assert parsed.last_exit is None
 
 
 def test_falsey_malformed_values_do_not_default() -> None:
