@@ -181,60 +181,61 @@ def test_old_supervisor_continues_after_failed_exec(
 ) -> None:
     """A failed os.execve preserves lock ownership and records the failure.
 
-    The daemon holds a real supervisor lock fd, _maybe_exec_upgrade()
-    reaches a patched os.execve that raises OSError, and the test asserts:
-    - execve was attempted,
-    - the fd remains open/owned,
-    - its inheritable flag is restored,
-    - a competitor cannot acquire the lock,
-    - a failure diagnostic/message is recorded.
+    The daemon holds a real supervisor lock fd (non-inheritable, the normal
+    state), _maybe_exec_upgrade() reaches a patched os.execve that raises
+    OSError, and the test asserts: execve was attempted, the fd remains
+    open/owned, its inheritable flag is restored to False, a competitor
+    cannot acquire the lock, and a failure diagnostic/message is recorded.
     """
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
-    os.set_inheritable(owner_fd, True)
+    try:
+        assert os.get_inheritable(owner_fd) is False
 
-    monkeypatch.setenv("XDG_STATE_HOME", str(lock_path.parent.parent))
-    daemon = SupervisorDaemon(Settings())
-    daemon._ownership_fd = owner_fd
+        monkeypatch.setenv("XDG_STATE_HOME", str(lock_path.parent.parent))
+        daemon = SupervisorDaemon(Settings())
+        daemon._ownership_fd = owner_fd
 
-    state_path = supervise.state_path()
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(
-        json.dumps({
-            **supervise.fresh_state().to_dict(),
-            "supervisor_runtime_commit": "a" * 40,
-        }),
-        encoding="utf-8",
-    )
+        state_path = supervise.state_path()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps({
+                **supervise.fresh_state().to_dict(),
+                "supervisor_runtime_commit": "a" * 40,
+            }),
+            encoding="utf-8",
+        )
 
-    monkeypatch.setattr("lubko.cli.current_commit", lambda: "b" * 40)
-    monkeypatch.setattr(
-        "lubko.supervisor.resolve_new_supervisor_executable",
-        lambda _commit: "/nonexistent/supervisor",
-    )
+        monkeypatch.setattr("lubko.cli.current_commit", lambda: "b" * 40)
+        monkeypatch.setattr(
+            "lubko.supervisor.resolve_new_supervisor_executable",
+            lambda _commit: "/nonexistent/supervisor",
+        )
 
-    execve_called: list[object] = []
+        execve_called: list[object] = []
 
-    exec_failed = "exec failed"
+        exec_failed = "exec failed"
 
-    def _fake_execve(_path: str, _argv: list[str], _env: dict[str, str]) -> None:
-        execve_called.append(True)
-        raise OSError(exec_failed)
+        def _fake_execve(_path: str, _argv: list[str], _env: dict[str, str]) -> None:
+            execve_called.append(True)
+            raise OSError(exec_failed)
 
-    monkeypatch.setattr("lubko.supervisor.os.execve", _fake_execve)
+        monkeypatch.setattr("lubko.supervisor.os.execve", _fake_execve)
 
-    daemon._maybe_exec_upgrade()
+        daemon._maybe_exec_upgrade()
 
-    assert len(execve_called) == 1
+        assert len(execve_called) == 1
 
-    assert os.get_inheritable(owner_fd) is True
+        assert os.get_inheritable(owner_fd) is False
 
-    with pytest.raises(OSError, match="Resource temporarily unavailable"):
-        _acquire_and_hold(lock_path)
+        with pytest.raises(OSError, match="Resource temporarily unavailable"):
+            _acquire_and_hold(lock_path)
 
-    assert daemon._ownership_fd == owner_fd
+        assert daemon._ownership_fd == owner_fd
 
-    assert "exec-based supervisor upgrade" in daemon._message  # type: ignore[operator]
+        assert "exec-based supervisor upgrade" in daemon._message  # type: ignore[operator]
+    finally:
+        os.close(owner_fd)
 
 
 def test_fresh_state_has_no_runtime_commit() -> None:
@@ -307,7 +308,7 @@ def test_gc_preserves_supervisor_runtime_commit(lock_dir: Path) -> None:
 
 
 def test_runtime_commit_persisted_through_startup_path(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
+    lock_dir: Path,
 ) -> None:
     """Prove _persist_runtime_commit() stores the captured commit from fresh state.
 

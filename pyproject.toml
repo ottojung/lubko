@@ -98,6 +98,15 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
+"tests/test_supervisor_lock_adoption.py" = [
+    # lock_dir is a pytest fixture whose setup side-effect is required but
+    # never referenced directly; os.set_inheritable positional booleans and
+    # lazy intra-test imports match patterns established across the suite.
+    "boolean-positional-value-in-call",
+    "docstring-missing-returns",
+    "import-outside-top-level",
+    "unused-function-argument",
+]
 "scripts/check_test_budget.py" = [
     # This script intentionally invokes `uv run pytest` as an unshelled subprocess
     # to measure its real wall-clock duration.  shell=True would change process-group
@@ -109,17 +118,10 @@ convention = "google"
     # Tests assert invariants of the worker's internal state machine (outage
     # convergence, deadline derivation), which are deliberately not public API.
     "assert",
-    "boolean-positional-value-in-call",
-    "docstring-missing-returns",
-    "import-outside-top-level",
     "magic-value-comparison",
-    "no-self-use",
     "private-member-access",
-    "pytest-raises-too-broad",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
-    "unused-function-argument",
-    "unused-method-argument",
 ]
 
 [tool.ruff.format]
