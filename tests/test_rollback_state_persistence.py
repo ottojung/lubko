@@ -191,7 +191,7 @@ def _establish_pending_supervisor_authority(
 
 
 def test_supervised_prepare_state_stays_readable_through_status_and_confirmation(  # ruff: ignore[too-many-statements]
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Prepared supervisor state round-trips before and after child publication."""
     previous = _meta(OLD, 1)
@@ -273,10 +273,14 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _line: None)
     monkeypatch.setattr(deployctl, "_stage_candidate_startup_artifacts", lambda _c: None)
-    monkeypatch.setattr(deployctl, "_snapshot_pre_confirmation_artifacts", lambda _b: None)
     monkeypatch.setattr(startup_contract, "write_staging_manifest", lambda _c, _b: None)
     monkeypatch.setattr(startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None)
     monkeypatch.setattr(deployctl, "_remove_pre_confirmation_artifacts", lambda: None)
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir(exist_ok=True)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: real_bin)
+    (tmp_path / "deploy").mkdir(exist_ok=True)
+    monkeypatch.setattr(deployctl, "state_root", lambda: tmp_path)
 
     response = deployctl._confirm_locked({"type": "confirm", "commit": NEW}, _options())
     assert response["confirmed"] is True
