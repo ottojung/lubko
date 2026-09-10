@@ -12,7 +12,6 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from dataclasses import replace
 from typing import TYPE_CHECKING, Final
 
 import pytest
@@ -180,14 +179,23 @@ def test_injected_fd_wrong_path_fails_closed(
 def test_old_supervisor_continues_after_failed_exec(
     lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed os.execve does not release the lock or change authority."""
+    """A failed os.execve preserves lock ownership and records the failure.
+
+    The daemon holds a real supervisor lock fd, _maybe_exec_upgrade()
+    reaches a patched os.execve that raises OSError, and the test asserts:
+    - execve was attempted,
+    - the fd remains open/owned,
+    - its inheritable flag is restored,
+    - a competitor cannot acquire the lock,
+    - a failure diagnostic/message is recorded.
+    """
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
-    os.close(owner_fd)
+    os.set_inheritable(owner_fd, True)
 
     monkeypatch.setenv("XDG_STATE_HOME", str(lock_path.parent.parent))
     daemon = SupervisorDaemon(Settings())
-    daemon._ownership_fd = None
+    daemon._ownership_fd = owner_fd
 
     state_path = supervise.state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,12 +212,29 @@ def test_old_supervisor_continues_after_failed_exec(
         "lubko.supervisor.resolve_new_supervisor_executable",
         lambda _commit: "/nonexistent/supervisor",
     )
-    monkeypatch.setattr(
-        "lubko.supervisor.os.execve",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("exec failed")),
-    )
+
+    execve_called: list[object] = []
+
+    exec_failed = "exec failed"
+
+    def _fake_execve(_path: str, _argv: list[str], _env: dict[str, str]) -> None:
+        execve_called.append(True)
+        raise OSError(exec_failed)
+
+    monkeypatch.setattr("lubko.supervisor.os.execve", _fake_execve)
 
     daemon._maybe_exec_upgrade()
+
+    assert len(execve_called) == 1
+
+    assert os.get_inheritable(owner_fd) is True
+
+    with pytest.raises(OSError, match="Resource temporarily unavailable"):
+        _acquire_and_hold(lock_path)
+
+    assert daemon._ownership_fd == owner_fd
+
+    assert "exec-based supervisor upgrade" in daemon._message  # type: ignore[operator]
 
 
 def test_fresh_state_has_no_runtime_commit() -> None:
@@ -284,43 +309,42 @@ def test_gc_preserves_supervisor_runtime_commit(lock_dir: Path) -> None:
 def test_runtime_commit_persisted_through_startup_path(
     lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Prove the actual startup persistence path stores the runtime commit.
+    """Prove _persist_runtime_commit() stores the captured commit from fresh state.
 
     Regression: write_state_preserving_authority() was unconditionally
     preserving current.supervisor_runtime_commit (always None on first
     startup), discarding the caller's new value.  This blocked runtime
     identity persistence, skew detection, and the GC root.
 
-    This test proves the full path:
+    This test exercises the actual SupervisorDaemon._persist_runtime_commit()
+    method from fresh state with a captured runtime commit and proves the
+    durable field is written:
     1. State starts without supervisor_runtime_commit (fresh install).
-    2. _persist_runtime_commit() writes the captured commit.
+    2. A daemon with a known _runtime_commit calls _persist_runtime_commit().
     3. The stored commit survives a read round-trip.
-    4. Skew detection can act on the stored value.
+    4. A subsequent _persist_runtime_commit() with the same value is a no-op.
+    5. Skew detection can act on the stored value.
     """
     state_path = supervise.state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    # Write a fresh state without supervisor_runtime_commit.
     state_path.write_text(
         json.dumps(supervise.fresh_state().to_dict()),
         encoding="utf-8",
     )
 
-    # Verify the field is absent.
     loaded = supervise.read_state()
     assert loaded.supervisor_runtime_commit is None
 
-    # Simulate what _persist_runtime_commit does: write with the new value
-    # through write_state_preserving_authority.
     commit_a = "a" * 40
-    supervise.write_state_preserving_authority(
-        replace(loaded, supervisor_runtime_commit=commit_a),
-        timeout_seconds=5.0,
-    )
+    daemon = SupervisorDaemon(Settings())
+    daemon._runtime_commit = commit_a
 
-    # Verify the field is now stored.
+    daemon._persist_runtime_commit()
+
     reloaded = supervise.read_state()
     assert reloaded.supervisor_runtime_commit == commit_a
 
-    # Prove skew detection can act: if cli.current_commit() returns a
-    # different commit, the stored value and the current value differ.
+    daemon._persist_runtime_commit()
+    assert supervise.read_state().supervisor_runtime_commit == commit_a
+
     assert commit_a != "b" * 40
