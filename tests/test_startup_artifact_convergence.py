@@ -838,3 +838,147 @@ def test_supervisor_reconcile_skips_wrong_commit_manifest(
     assert sc.assess_recorded_contract().state == "current"
     # Staging manifest still present (promotion rejected, not cleaned up)
     assert sc.read_staging_manifest() is not None
+
+
+# ---------------------------------------------------------------------------
+# Repeat confirm idempotency via durable receipt
+# ---------------------------------------------------------------------------
+
+
+def test_repeat_confirm_after_successful_promotion_returns_ok_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeat confirm of a fully-promoted deployment returns ok:true.
+
+    After the first confirm succeeds, the staging manifest is removed.
+    A second confirm must still return ok:true by checking the durable
+    confirmation receipt rather than failing on missing manifest.
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest("b" * 40, bin_home)
+
+    commit_b = "b" * 40
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_CONFIRMED,
+        commit=commit_b,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": "a" * 40})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+
+    monkeypatch.setattr(dc, "_confirmation_state", lambda _r: current_state)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    # First confirm: promotion succeeds, receipt written
+    response = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response["ok"] is True
+    assert sc.read_staging_manifest() is None
+    assert dc._read_confirmation_receipt() == commit_b
+
+    # Second confirm: receipt found, returns ok:true without staging
+    response2 = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response2["ok"] is True
+    assert response2["confirmed"] is True
+
+
+def test_repeat_confirm_wrong_commit_receipt_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Receipt for a different commit does not grant success."""
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+
+    # Write receipt for a different commit
+    dc._write_confirmation_receipt("x" * 40)
+
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_CONFIRMED,
+        commit="b" * 40,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": "a" * 40})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+    monkeypatch.setattr(dc, "_confirmation_state", lambda _r: current_state)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    response = dc._confirm_locked({"type": "confirm", "commit": "b" * 40}, _confirm_opts())
+    assert response["ok"] is False
+
+
+def test_corrupt_confirmation_receipt_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Corrupt receipt is treated as absent — does not grant false success."""
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+
+    # Write corrupt receipt
+    dc._confirmation_receipt_path().write_text("not json", encoding="utf-8")
+
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_CONFIRMED,
+        commit="b" * 40,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": "a" * 40})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+    monkeypatch.setattr(dc, "_confirmation_state", lambda _r: current_state)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    # Corrupt receipt treated as absent — confirm proceeds but promotion
+    # fails (no staging manifest), so ok:false
+    response = dc._confirm_locked({"type": "confirm", "commit": "b" * 40}, _confirm_opts())
+    assert response["ok"] is False
+
+
+def test_rollback_removes_confirmation_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rollback removes the confirmation receipt so stale receipts don't persist."""
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+
+    # Write a receipt
+    dc._write_confirmation_receipt("b" * 40)
+    assert dc._read_confirmation_receipt() == "b" * 40
+
+    # Simulate rollback by calling the receipt removal
+    dc._remove_confirmation_receipt()
+    assert dc._read_confirmation_receipt() is None

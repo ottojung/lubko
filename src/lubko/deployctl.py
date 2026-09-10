@@ -97,6 +97,7 @@ HANDOFF_DURABLE_WAIT_SECONDS: Final = 60.0
 #: rollback can restore them exactly.  Written before confirmation mutates
 #: the artifacts and removed after confirmation succeeds.
 _PRE_CONFIRMATION_ARTIFACTS_NAME: Final = "pre-confirmation-startup-artifacts.json"
+_CONFIRMATION_RECEIPT_NAME: Final = "startup-confirmation-receipt.json"
 _MAX_BYTE_VALUE: Final = 255
 
 GATED_SHIM_SOURCE: Final = """
@@ -1743,6 +1744,7 @@ def _restore_previous_locked(state: RollbackState) -> bool:
         startup_contract.cleanup_staging(bin_home)
         if snapshot_restored:
             _remove_pre_confirmation_artifacts()
+    _remove_confirmation_receipt()
     return True
 
 
@@ -1796,6 +1798,7 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
         startup_contract.cleanup_staging(bin_home)
         if snapshot_restored:
             _remove_pre_confirmation_artifacts()
+    _remove_confirmation_receipt()
     return terminal
 
 
@@ -1922,6 +1925,49 @@ def _remove_pre_confirmation_artifacts() -> None:
     path = _pre_confirmation_artifacts_path()
     with suppress(DurabilityError, FileNotFoundError, OSError):
         remove_durable(path)
+
+
+def _confirmation_receipt_path() -> Path:
+    """Return the durable path for the startup confirmation receipt."""
+    return state_root() / "deploy" / _CONFIRMATION_RECEIPT_NAME
+
+
+def _write_confirmation_receipt(commit: str) -> None:
+    """Durably record that startup artifacts were promoted for this commit.
+
+    Args:
+        commit: The exact commit whose startup artifacts were promoted.
+    """
+    write_json_durable(_confirmation_receipt_path(), {"commit": commit})
+
+
+def _read_confirmation_receipt() -> str | None:
+    """Read the durable confirmation receipt, treating corruption as absent.
+
+    Returns:
+        The confirmed commit from the receipt, or ``None`` if absent/corrupt.
+    """
+    path = _confirmation_receipt_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    commit = decoded.get("commit")
+    if not isinstance(commit, str):
+        return None
+    return commit
+
+
+def _remove_confirmation_receipt() -> None:
+    """Remove the confirmation receipt during rollback."""
+    with suppress(DurabilityError, FileNotFoundError, OSError):
+        remove_durable(_confirmation_receipt_path())
 
 
 def _stage_candidate_startup_artifacts(commit: str) -> None:
@@ -3043,8 +3089,12 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
     When confirmation is retried for an already-terminal mission, the
     startup artifacts may still be stale from a prior crash between
     terminalization and promotion.  This function retries idempotent
-    promotion using the retained manifest and staged bytes.  It only
-    returns ``ok: true`` once artifacts actually match the confirmed commit.
+    promotion using the retained manifest and staged bytes.
+
+    A durable confirmation receipt records the confirmed commit after
+    successful promotion.  On repeat confirm, if the receipt matches the
+    mission commit, active artifacts are already promoted and success is
+    returned immediately without needing the staging manifest.
 
     Fails closed if bin_home cannot be resolved: returning success without
     verifying artifacts would be a false positive.
@@ -3064,6 +3114,12 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
             "commit": state.commit,
             "error": f"startup artifact promotion incomplete: cannot resolve bin home: {exc}",
         }
+    # Check durable receipt: if already successfully promoted for this
+    # commit, return success immediately without needing staging manifest.
+    receipt_commit = _read_confirmation_receipt()
+    if receipt_commit == state.commit:
+        return _confirmation_response(state)
+    # No receipt or receipt for different commit — attempt promotion.
     promotion_error = startup_contract.promote_staged_artifacts(
         state.commit, state.commit, bin_home
     )
@@ -3074,6 +3130,7 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
             "commit": state.commit,
             "error": f"startup artifact promotion incomplete: {promotion_error}",
         }
+    _write_confirmation_receipt(state.commit)
     _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 
