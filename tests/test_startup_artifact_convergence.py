@@ -9,24 +9,23 @@ is never promoted.  Rollback retains the snapshot until all artifacts are restor
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from lubko import cli, lifecycle, supervise
 from lubko import deployctl as dc
-from lubko import lifecycle
 from lubko import startup_contract as sc
 from lubko import state as _state_mod
 from lubko.deployctl import STATUS_CONFIRMED, RollbackState
+from lubko.durable import DurabilityError
 from lubko.startup_contract import (
     CONTRACT_SCHEMA_VERSION,
     CURRENT_CONTRACT,
     STARTUP_DEFINITION_SCHEMA_VERSION,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -264,9 +263,8 @@ def test_rollback_restores_all_artifacts(tmp_path: Path, monkeypatch: pytest.Mon
     sc.write_startup_definition()
     sc.write_startup_launcher(bin_home)
     snapshot = sc.snapshot_startup_artifacts(bin_home)
-    serializable = {k: list(v) for k, v in snapshot.items()}
     snapshot_path = tmp_path / "deploy" / "pre-confirmation-startup-artifacts.json"
-    snapshot_path.write_text(json.dumps(serializable), encoding="utf-8")
+    snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
     _write_stale_contract(sc.contract_path())
     _write_stale_definition(sc.startup_definition_path())
     restored = dc._restore_pre_confirmation_artifacts(bin_home)
@@ -339,38 +337,317 @@ def test_supervisor_promotes_staged_bytes_without_synthesizing(
     assert sc.assess_recorded_contract().state == "current"
 
 
+# ---------------------------------------------------------------------------
+# Post-terminalization exception retains recovery data
+# ---------------------------------------------------------------------------
+
+
+def _confirm_opts() -> dc.Options:
+    return dc.Options(
+        repo=Path("/repo"),
+        uv_path="uv",
+        confirm_window_seconds=120.0,
+        stop_grace_seconds=5.0,
+        postgres_timeout_seconds=5.0,
+        lock_timeout_seconds=30.0,
+        validation_timeout_seconds=1200.0,
+        git_timeout_seconds=10.0,
+        cli_timeout_seconds=30.0,
+    )
+
+
 def test_post_terminalization_exception_retains_recovery_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After durable terminal confirmation, an exception retains staging + snapshot.
+    """Invoke _confirm_locked; cause durable STATUS_CONFIRMED then raise.
 
-    If _finalize_confirmation succeeds (B is durable-confirmed) but a later
-    step (e.g., promotion) raises, the staging manifest and pre-confirmation
-    snapshot must be retained so the supervisor or a retry can complete
-    promotion idempotently.
+    Proves that after _finalize_supervised_confirmation durably writes
+    STATUS_CONFIRMED, a later exception (e.g. cli.gc_cli_roots) retains
+    the staging manifest and pre-confirmation snapshot.  Retry via the
+    STATUS_CONFIRMED fast path then proves convergence.
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    # Write current A artifacts and take a snapshot
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    snapshot = sc.snapshot_startup_artifacts(bin_home)
+    snap_path = tmp_path / "deploy" / "pre-confirmation-startup-artifacts.json"
+    snap_path.write_text(json.dumps(snapshot), encoding="utf-8")
+    # Stage real B artifacts
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest("b" * 40, bin_home)
+    manifest_path = _manifest_path(tmp_path)
+    assert manifest_path.is_file(), "manifest must exist before confirmation"
+
+    # Mutable current_state: _confirmation_state and read_rollback_state return it;
+    # _write_state transitions it.
+    commit_b = "b" * 40
+    commit_a = "a" * 40
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_PENDING,
+        commit=commit_b,
+        previous_commit=commit_a,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": commit_a})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+
+    def _get_state(_req: object) -> dc.RollbackState:
+        return current_state
+
+    def _write_mutable(s: dc.RollbackState) -> None:
+        nonlocal current_state
+        current_state = s
+
+    def _read_state() -> dc.RollbackState | None:
+        return current_state
+
+    monkeypatch.setattr(dc, "_confirmation_state", _get_state)
+    monkeypatch.setattr(dc, "_authorize_confirmation", lambda _s: None)
+    monkeypatch.setattr(dc, "_prepare_confirmation_candidate", lambda _s, _o: 1)
+    # Staging already done manually; skip the B-CLI subprocess call
+    monkeypatch.setattr(dc, "_stage_candidate_startup_artifacts", lambda _c: None)
+    monkeypatch.setattr(dc, "_write_state", _write_mutable)
+    monkeypatch.setattr(dc, "read_rollback_state", _read_state)
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=commit_b, generation=1),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            applied_generation=1,
+            commit=commit_b,
+            ready=True,
+            holding=False,
+            child=SimpleNamespace(marker="child"),
+        ),
+    )
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(dc, "_supervised_terminalization_authority_matches", lambda *_a: True)
+    monkeypatch.setattr(cli, "set_current", lambda _c: None)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+    # cli.gc_cli_roots raises AFTER _write_state(terminal) has durably written
+    monkeypatch.setattr(cli, "gc_cli_roots", lambda _c: (_ for _ in ()).throw(OSError("boom")))
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _l: None)
+
+    # First call: terminalization succeeds, then gc_cli_roots raises
+    with pytest.raises(OSError, match="boom"):
+        dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+
+    # The mutable state was transitioned to STATUS_CONFIRMED by _write_state
+    assert current_state.status == dc.STATUS_CONFIRMED
+    # Recovery data retained: manifest + snapshot survive the exception
+    assert manifest_path.is_file(), "manifest must survive post-terminalization exception"
+    assert snap_path.is_file(), "snapshot must survive post-terminalization exception"
+
+    # Disable the fault: gc_cli_roots now succeeds
+    monkeypatch.setattr(cli, "gc_cli_roots", lambda _c: None)
+
+    # Second call: STATUS_CONFIRMED fast path retries idempotent promotion
+    response = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response["ok"] is True
+    assert response["confirmed"] is True
+    # Snapshot cleaned up after successful convergence
+    assert not snap_path.is_file(), "snapshot removed after successful convergence"
+
+
+# ---------------------------------------------------------------------------
+# First-install rollback: absence restored
+# ---------------------------------------------------------------------------
+
+
+def test_first_install_rollback_removes_artifacts_that_were_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On first install, snapshot records absence; rollback removes B's artifacts."""
+    bin_home = _setup(monkeypatch, tmp_path)
+    assert not sc.contract_path().is_file()
+    # Snapshot BEFORE artifacts exist — records absence as None
+    snapshot = sc.snapshot_startup_artifacts(bin_home)
+    assert snapshot["contract"] is None
+    assert snapshot["definition"] is None
+    assert snapshot["launcher"] is None
+    # B installs its artifacts
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    assert sc.assess_recorded_contract().state == "current"
+    # Rollback restores absence — durably removes B's artifacts
+    sc.restore_startup_artifacts(snapshot, bin_home)
+    assert not sc.contract_path().is_file(), "contract removed on rollback to absence"
+    assert not sc.startup_definition_path().is_file(), "definition removed on rollback to absence"
+    assert not (bin_home / sc.STARTUP_LAUNCHER_NAME).is_file(), (
+        "launcher removed on rollback to absence"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Malformed snapshot bytes parsing
+# ---------------------------------------------------------------------------
+
+
+def test_read_pre_confirmation_snapshot_rejects_malformed_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot with invalid values is rejected."""
+    _setup(monkeypatch, tmp_path)
+    snap_path = tmp_path / "deploy" / "pre-confirmation-startup-artifacts.json"
+    # Out-of-range byte value
+    snap_path.write_text(
+        json.dumps({"contract": [0, 300], "definition": None, "launcher": None}),
+        encoding="utf-8",
+    )
+    assert dc._read_pre_confirmation_snapshot() is None
+    # Non-integer values
+    snap_path.write_text(
+        json.dumps({"contract": ["not", "integers"], "definition": None, "launcher": None}),
+        encoding="utf-8",
+    )
+    assert dc._read_pre_confirmation_snapshot() is None
+    # Boolean values (which are ints in Python)
+    snap_path.write_text(
+        json.dumps({"contract": [True, False], "definition": None, "launcher": None}),
+        encoding="utf-8",
+    )
+    assert dc._read_pre_confirmation_snapshot() is None
+    # Valid snapshot with None (absent) and list (present)
+    snap_path.write_text(
+        json.dumps({"contract": [0, 1, 2], "definition": None, "launcher": [4, 5]}),
+        encoding="utf-8",
+    )
+    result = dc._read_pre_confirmation_snapshot()
+    assert result is not None
+    assert result["contract"] == [0, 1, 2]
+    assert result["definition"] is None
+    assert result["launcher"] == [4, 5]
+
+
+def test_read_pre_confirmation_snapshot_rejects_missing_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot missing a required key is malformed."""
+    _setup(monkeypatch, tmp_path)
+    snap_path = tmp_path / "deploy" / "pre-confirmation-startup-artifacts.json"
+    # Missing 'launcher' key
+    snap_path.write_text(
+        json.dumps({"contract": [0], "definition": None}),
+        encoding="utf-8",
+    )
+    assert dc._read_pre_confirmation_snapshot() is None
+    # Empty dict
+    snap_path.write_text(json.dumps({}), encoding="utf-8")
+    assert dc._read_pre_confirmation_snapshot() is None
+
+
+def test_read_pre_confirmation_snapshot_rejects_unknown_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot with an unknown key is malformed."""
+    _setup(monkeypatch, tmp_path)
+    snap_path = tmp_path / "deploy" / "pre-confirmation-startup-artifacts.json"
+    # Extra unknown key
+    snap_path.write_text(
+        json.dumps({
+            "contract": [0],
+            "definition": None,
+            "launcher": None,
+            "extra_key": [1, 2],
+        }),
+        encoding="utf-8",
+    )
+    assert dc._read_pre_confirmation_snapshot() is None
+
+
+def test_snapshot_propagates_read_error_on_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If an existing artifact cannot be read, OSError propagates."""
+    bin_home = _setup(monkeypatch, tmp_path)
+    # Create a contract file that exists on disk
+    good_contract = sc.contract_path()
+    good_contract.write_bytes(b"content")
+    # Monkeypatch Path.read_bytes to fail only for the contract path
+    original_read = Path.read_bytes
+
+    def _selective_read(self: Path) -> bytes:
+        if self == good_contract:
+            msg = "Permission denied"
+            raise OSError(msg)
+        return original_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _selective_read)
+    with pytest.raises(OSError, match="Permission denied"):
+        sc.snapshot_startup_artifacts(bin_home)
+    # Contract still exists — was not silently deleted
+    assert good_contract.is_file()
+
+
+# ---------------------------------------------------------------------------
+# Snapshot write failure prevents terminalization
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_write_failure_prevents_terminalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Snapshot write failure prevents terminalization.
+
+    If the pre-confirmation snapshot cannot be durably recorded, confirmation
+    fails before terminalization so the mission remains pending.
     """
     bin_home = _setup(monkeypatch, tmp_path)
     sc.write_contract()
     sc.write_startup_definition()
     sc.write_startup_launcher(bin_home)
-    # Write a pre-confirmation snapshot (simulates A's artifacts)
-    snapshot = sc.snapshot_startup_artifacts(bin_home)
-    serializable = {k: list(v) for k, v in snapshot.items()}
-    snapshot_path = tmp_path / "deploy" / "pre-confirmation-startup-artifacts.json"
-    snapshot_path.write_text(json.dumps(serializable), encoding="utf-8")
-    # Stage B artifacts + manifest
     sc.stage_startup_artifacts(bin_home)
-    sc.write_staging_manifest("commit-B", bin_home)
-    manifest_path = _manifest_path(tmp_path)
-    assert manifest_path.is_file()
-    # Simulate: B is durable-confirmed but promotion raises
-    error = sc.promote_staged_artifacts("commit-X", "commit-X", bin_home)
-    # Stale manifest (commit-X != commit-B) causes promotion to fail
-    assert error is not None
-    # Recovery data retained: manifest and snapshot still present
-    assert manifest_path.is_file(), "staging manifest was deleted after promotion failure"
-    assert snapshot_path.is_file(), "pre-confirmation snapshot was deleted after promotion failure"
-    # Idempotent retry with correct commit succeeds
-    error = sc.promote_staged_artifacts("commit-B", "commit-B", bin_home)
-    assert error is None
-    assert sc.assess_recorded_contract().state == "current"
+    sc.write_staging_manifest("b" * 40, bin_home)
+
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_PENDING,
+        commit="b" * 40,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": "a" * 40})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+
+    def _get_state(_req: object) -> dc.RollbackState:
+        return current_state
+
+    def _fail_snapshot(_b: Path) -> None:
+        msg = "disk full"
+        raise DurabilityError(msg)
+
+    monkeypatch.setattr(dc, "_confirmation_state", _get_state)
+    monkeypatch.setattr(dc, "_snapshot_pre_confirmation_artifacts", _fail_snapshot)
+    monkeypatch.setattr(dc, "_stage_candidate_startup_artifacts", lambda _c: None)
+    monkeypatch.setattr(dc, "_prepare_confirmation_candidate", lambda _s, _o: 1)
+    monkeypatch.setattr(dc, "_authorize_confirmation", lambda _s: None)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _l: None)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    with pytest.raises(dc.DeployCtlError, match="snapshot"):
+        dc._confirm_locked({"type": "confirm", "commit": "b" * 40}, _confirm_opts())
+
+    assert current_state.status == dc.STATUS_PENDING

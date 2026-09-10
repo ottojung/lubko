@@ -1212,56 +1212,84 @@ def cleanup_staging_retain_manifest(bin_home: Path) -> None:
             path.unlink()
 
 
-def snapshot_startup_artifacts(bin_home: Path) -> dict[str, bytes]:
-    """Snapshot the raw bytes of all startup artifacts for rollback preservation.
+def snapshot_startup_artifacts(bin_home: Path) -> dict[str, list[int] | None]:
+    """Snapshot the startup artifacts for rollback preservation.
 
     Captures the startup contract, definition, and launcher so that rollback
-    can restore them exactly.  The launcher is addressed by ``bin_home`` rather
-    than by ``state_root`` because it lives in the bin directory.
+    can restore them exactly.  All three keys are always present: ``None``
+    means the artifact did not exist at snapshot time; a list of integers
+    (0..255) means the artifact existed with those bytes.
+
+    If a file exists but cannot be read, :class:`OSError` is propagated so
+    confirmation fails before terminalization — rollback must never silently
+    delete a pre-existing unreadable artifact.
 
     Args:
         bin_home: Directory containing the launcher scripts.
 
     Returns:
-        A mapping from artifact name to raw bytes. Missing artifacts are
-        recorded as absent (not present in the mapping).
+        A mapping from artifact name to byte list or ``None`` for absence.
     """
-    snapshot: dict[str, bytes] = {}
+    snapshot: dict[str, list[int] | None] = {}
     contract = contract_path()
     if contract.is_file():
-        with suppress(OSError):
-            snapshot["contract"] = contract.read_bytes()
+        snapshot["contract"] = list(contract.read_bytes())
+    else:
+        snapshot["contract"] = None
     definition = startup_definition_path()
     if definition.is_file():
-        with suppress(OSError):
-            snapshot["definition"] = definition.read_bytes()
+        snapshot["definition"] = list(definition.read_bytes())
+    else:
+        snapshot["definition"] = None
     launcher = bin_home / STARTUP_LAUNCHER_NAME
     if launcher.is_file():
-        with suppress(OSError):
-            snapshot["launcher"] = launcher.read_bytes()
+        snapshot["launcher"] = list(launcher.read_bytes())
+    else:
+        snapshot["launcher"] = None
     return snapshot
 
 
-def restore_startup_artifacts(snapshot: dict[str, bytes], bin_home: Path) -> None:
+def restore_startup_artifacts(snapshot: dict[str, list[int] | None], bin_home: Path) -> None:
     """Restore startup artifacts from a pre-confirmation snapshot.
 
     Each artifact present in the snapshot is durably written back to its
-    original path. Missing artifacts in the snapshot leave the on-disk
-    artifact untouched so a pre-existing artifact is never silently dropped.
+    original path.  ``None`` means the artifact was absent at snapshot time,
+    so the on-disk file is durably removed (unlink + fsync parent).
 
     Args:
-        snapshot: Artifact bytes from :func:`snapshot_startup_artifacts`.
+        snapshot: Artifact data from :func:`snapshot_startup_artifacts`.
         bin_home: Directory containing the launcher scripts.
     """
-    if "contract" in snapshot:
-        write_json_durable(contract_path(), json.loads(snapshot["contract"]))
-    if "definition" in snapshot:
-        write_json_durable(startup_definition_path(), json.loads(snapshot["definition"]))
-    if "launcher" in snapshot:
-        target = bin_home / STARTUP_LAUNCHER_NAME
-        write_bytes_durable(target, snapshot["launcher"])
+    contract_data = snapshot.get("contract")
+    if contract_data is not None:
+        write_json_durable(contract_path(), json.loads(bytes(contract_data)))
+    else:
+        _durable_unlink(contract_path())
+    definition_data = snapshot.get("definition")
+    if definition_data is not None:
+        write_json_durable(startup_definition_path(), json.loads(bytes(definition_data)))
+    else:
+        _durable_unlink(startup_definition_path())
+    launcher_data = snapshot.get("launcher")
+    target = bin_home / STARTUP_LAUNCHER_NAME
+    if launcher_data is not None:
+        write_bytes_durable(target, bytes(launcher_data))
         Path(target).chmod(STARTUP_LAUNCHER_MODE)
         fsync_directory(bin_home)
+    else:
+        _durable_unlink(target)
+
+
+def _durable_unlink(path: Path) -> None:
+    """Durably remove a file and fsync its parent directory.
+
+    Args:
+        path: File to remove.
+    """
+    if not path.exists():
+        return
+    path.unlink()
+    fsync_directory(path.parent)
 
 
 def _require_str_tuple(value: object, field: str) -> tuple[str, ...]:

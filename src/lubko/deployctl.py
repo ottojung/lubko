@@ -97,6 +97,7 @@ HANDOFF_DURABLE_WAIT_SECONDS: Final = 60.0
 #: rollback can restore them exactly.  Written before confirmation mutates
 #: the artifacts and removed after confirmation succeeds.
 _PRE_CONFIRMATION_ARTIFACTS_NAME: Final = "pre-confirmation-startup-artifacts.json"
+_MAX_BYTE_VALUE: Final = 255
 
 GATED_SHIM_SOURCE: Final = """
 import os
@@ -1810,21 +1811,15 @@ def _pre_confirmation_artifacts_path() -> Path:
 def _snapshot_pre_confirmation_artifacts(bin_home: Path) -> None:
     """Durably preserve the current startup artifacts before confirmation mutates them.
 
-    The snapshot is best-effort: if the artifacts are absent (first install),
-    no snapshot is written so rollback does not attempt to restore artifacts
-    that never existed.
+    The snapshot always records all three artifact keys: ``None`` for absent
+    artifacts, or a list of integers (0..255) for present artifacts.
 
     Args:
         bin_home: Directory containing the launcher scripts.
     """
-    snapshot = startup_contract.snapshot_startup_artifacts(bin_home)
-    if not snapshot:
-        return
-    serializable: dict[str, object] = {k: list(v) for k, v in snapshot.items()}
-    try:
-        write_json_durable(_pre_confirmation_artifacts_path(), serializable)
-    except DurabilityError as exc:
-        append_deploy_log(f"warning: could not snapshot pre-confirmation startup artifacts: {exc}")
+    raw = startup_contract.snapshot_startup_artifacts(bin_home)
+    snapshot = dict[str, object](raw.items())
+    write_json_durable(_pre_confirmation_artifacts_path(), snapshot)
 
 
 def _restore_pre_confirmation_artifacts(bin_home: Path) -> bool:
@@ -1850,14 +1845,23 @@ def _restore_pre_confirmation_artifacts(bin_home: Path) -> bool:
     except (DurabilityError, OSError) as exc:
         append_deploy_log(f"warning: could not restore pre-confirmation startup artifacts: {exc}")
         return False
-    return _verify_restored_launcher_mode(bin_home, had_launcher="launcher" in snapshot)
+    return _verify_restored_launcher_mode(
+        bin_home, had_launcher=snapshot.get("launcher") is not None
+    )
 
 
-def _read_pre_confirmation_snapshot() -> dict[str, bytes] | None:
+_SNAPSHOT_KNOWN_KEYS: Final = frozenset({"contract", "definition", "launcher"})
+
+
+def _read_pre_confirmation_snapshot() -> dict[str, list[int] | None] | None:
     """Read and decode the pre-confirmation snapshot.
 
+    Requires exactly the three known artifact keys (contract, definition,
+    launcher) with no missing or unknown keys.  Missing or extra keys are
+    treated as malformed so rollback never interprets them as absence.
+
     Returns:
-        The decoded snapshot bytes, or ``None`` on any failure.
+        The decoded snapshot, or ``None`` on any failure.
     """
     path = _pre_confirmation_artifacts_path()
     try:
@@ -1870,8 +1874,21 @@ def _read_pre_confirmation_snapshot() -> dict[str, bytes] | None:
         return None
     if not isinstance(decoded, dict):
         return None
-    snapshot = {k: bytes(v) for k, v in decoded.items() if isinstance(v, list)}
-    return snapshot or None
+    if set(decoded.keys()) != _SNAPSHOT_KNOWN_KEYS:
+        return None
+    snapshot: dict[str, list[int] | None] = {}
+    for key in _SNAPSHOT_KNOWN_KEYS:
+        value = decoded[key]
+        if value is None:
+            snapshot[key] = None
+        elif isinstance(value, list) and all(
+            isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _MAX_BYTE_VALUE
+            for v in value
+        ):
+            snapshot[key] = value
+        else:
+            return None
+    return snapshot
 
 
 def _verify_restored_launcher_mode(bin_home: Path, *, had_launcher: bool) -> bool:
@@ -2871,6 +2888,99 @@ def _finalize_confirmation(
     return terminal
 
 
+def _pre_terminalize(state: RollbackState, options: Options) -> int | None:
+    """Execute pre-terminalization steps and return the settled generation.
+
+    Authorizes the confirmation, prepares the candidate, stages B's startup
+    artifacts, and writes the staging manifest.
+
+    Args:
+        state: Pending mission.
+        options: Deployment options.
+
+    Returns:
+        The settled supervisor generation for ``_finalize_confirmation``,
+        or ``None`` for legacy ownership.
+
+    Raises:
+        DeployCtlError: If any pre-terminalization step fails.
+    """
+    _authorize_confirmation(state)
+    expected_generation = _prepare_confirmation_candidate(state, options)
+    _stage_candidate_startup_artifacts(state.commit)
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        msg = f"cannot confirm: startup artifact manifest write failed: {exc}"
+        raise DeployCtlError(msg) from exc
+    startup_contract.write_staging_manifest(state.commit, bin_home)
+    return expected_generation
+
+
+def _resolve_bin_home_or_fail() -> Path:
+    """Resolve the bin home path.
+
+    Returns:
+        The resolved bin home path.
+
+    Raises:
+        DeployCtlError: If the path cannot be resolved.
+    """
+    try:
+        return lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        msg = f"cannot confirm: startup artifact snapshot failed: {exc}"
+        raise DeployCtlError(msg) from exc
+
+
+def _write_snapshot_or_fail(bin_home: Path) -> None:
+    """Write the pre-confirmation snapshot.
+
+    Converts both :class:`DurabilityError` (from durable write) and
+    :class:`OSError` (from reading existing artifacts) into a clear
+    :class:`DeployCtlError` so confirmation fails before terminalization.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Raises:
+        DeployCtlError: If the snapshot cannot be recorded.
+    """
+    try:
+        _snapshot_pre_confirmation_artifacts(bin_home)
+    except (DurabilityError, OSError) as exc:
+        msg = "cannot confirm: pre-confirmation startup artifact snapshot could not be recorded"
+        raise DeployCtlError(msg) from exc
+
+
+def _durable_mission_matches(state: RollbackState) -> bool:
+    """Check if the durable mission state confirms the same commit.
+
+    Used after a post-terminalization exception to decide whether the durable
+    terminal write happened despite the exception.  Only STATUS_CONFIRMED
+    with the same commit and compatible ownership is checked — the generation
+    is deliberately ignored because ``_finalize_supervised_confirmation``
+    may write a *different* generation when a newer desired generation
+    supersedes the mission before the terminal lock is acquired.  In that
+    case the confirmed deployment is still valid and recovery data must be
+    retained.
+
+    Returns:
+        ``True`` when the durable state is STATUS_CONFIRMED with the same
+        commit and compatible ownership as ``state``.
+    """
+    try:
+        durable = read_rollback_state()
+    except DeployCtlError:
+        return False
+    return (
+        durable is not None
+        and durable.status == STATUS_CONFIRMED
+        and durable.commit == state.commit
+        and durable.supervisor_owned == state.supervisor_owned
+    )
+
+
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
     """Confirm one exact pending deployment as a single idempotent primitive.
 
@@ -2887,43 +2997,35 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     promotion succeeds.  The ``STATUS_CONFIRMED`` fast path retries
     idempotent promotion and fails closed if artifacts still don't match.
 
-    Exception discipline: pre-terminalization failures (staging,
-    authorization, prepare candidate) clean up staging and snapshot.
-    Once ``_finalize_confirmation`` returns, B is durable-confirmed; no
-    subsequent exception path may delete staging manifest or snapshot.
-    Post-terminalization exceptions leave recovery data intact so the
-    supervisor or a retry of ``_confirm_locked`` can complete promotion.
+    Exception discipline: after any exception, the durable mission state is
+    re-read to decide whether terminalization may have happened.  If the
+    durable state is still pending, staging + snapshot are cleaned up (B was
+    never confirmed).  If the durable state is terminal (STATUS_CONFIRMED),
+    staging + snapshot are retained for supervisor or retry promotion — the
+    durable terminal write precedes all potentially-raising post-write work
+    (CLI activation, GC, logging) so a crash/exception after that write must
+    not discard recovery data.
 
     Returns:
         Protocol response for the confirmed deployment.
-
-    Raises:
-        DeployCtlError: If staging or terminalization fails.
     """
     state = _confirmation_state(request)
     if state.status == STATUS_CONFIRMED:
         return _confirmed_idempotent_response(state)
+    bin_home = _resolve_bin_home_or_fail()
+    _write_snapshot_or_fail(bin_home)
+    terminalized = False
     try:
-        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
-    except (OSError, ValueError) as exc:
-        msg = f"cannot confirm: startup artifact snapshot failed: {exc}"
-        raise DeployCtlError(msg) from exc
-    _snapshot_pre_confirmation_artifacts(bin_home)
-    # Pre-terminalization: if anything fails here, clean up staging + snapshot
-    # because B has not been confirmed yet.
-    try:
-        _authorize_confirmation(state)
-        expected_generation = _prepare_confirmation_candidate(state, options)
-        _stage_candidate_startup_artifacts(state.commit)
-        startup_contract.write_staging_manifest(state.commit, bin_home)
+        expected_generation = _pre_terminalize(state, options)
         state = _finalize_confirmation(state, expected_generation)
+        terminalized = True
     except BaseException:
-        startup_contract.cleanup_staging(bin_home)
-        _remove_pre_confirmation_artifacts()
+        if not terminalized and _durable_mission_matches(state):
+            terminalized = True
+        if not terminalized:
+            startup_contract.cleanup_staging(bin_home)
+            _remove_pre_confirmation_artifacts()
         raise
-    # Post-terminalization: B is durable-confirmed.  No exception path may
-    # delete staging manifest or snapshot.  Promotion may fail; that is
-    # surfaced as ok:false, not as an exception that triggers cleanup.
     promotion_error = startup_contract.promote_staged_artifacts(
         state.commit, state.commit, bin_home
     )
