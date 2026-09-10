@@ -12,8 +12,8 @@ For the default branch `main`:
 
 1. **Use pull requests.** Ordinary development changes reach `main` through a pull request so the diff, review, and integration evidence are visible before merge.
 2. **Canonical CI must pass on current integration.** The single canonical check is the `test` job in `.github/workflows/ci.yml`. Before merge, the pull request must include the current base-branch state and the canonical check must succeed on that current integration.
-3. **No procedural bypass.** The ability of a user, bot, API client, or repository host to perform some update does not authorize bypassing this version-controlled workflow. Exceptions require an explicit user instruction for the particular operation; they are not inferred from repository-hosting capabilities or settings.
-4. **One test-suite command.** The `test` job gates frozen sync, formatting, lint, strict types, and the complete pytest suite. `uv run pytest` remains the single complete test-suite command developers run locally. Installation and environment acceptance checks are separate and are not part of the pytest wall-clock budget.
+3. **No procedural bypass.** Development operators and orchestrators follow this version-controlled workflow regardless of what the repository host would permit. Do not infer an exception from repository permissions, capabilities, or settings.
+4. **One test-suite command.** The `test` job gates frozen sync, formatting, lint, strict types, and the complete pytest suite. `uv run pytest` remains the single complete test-suite command developers run locally. Installation and environment acceptance checks are separate; they may run in CI but are not part of the canonical pytest suite and are not subject to its ten-second budget.
 
 ## What the canonical check covers
 
@@ -21,9 +21,9 @@ The `test` job runs, in order, the same checks developers run locally:
 
 - `uv sync --frozen --extra dev` — frozen dependency lock (runtime + development).
 - `uv run ruff format --check .` — formatting.
-- `uv run ruff check .` — linting.
+- `uv run ruff check .` — linting (Ruff `ALL`, preview).
 - `uv run mypy .` — strict type checking.
-- `uv run pytest` — the complete test suite (subject to the testing requirements in `AGENTS.md`).
+- `uv run pytest` — the complete test suite (must finish in under ten seconds of wall-clock time once the environment is installed; see `AGENTS.md` testing requirements).
 
 Installation, environment provisioning, dependency installation, image construction, and similar acceptance checks are outside the pytest budget and may take longer. They are not part of the canonical `uv run pytest` suite.
 
