@@ -33,9 +33,10 @@ completion, stop or clean them up.
 
 Lubko requires CPython 3.12 or later and pins a single `uv` version; see
 [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) for the supported toolchain and the
-explicit upgrade procedure. How a change becomes the tip of `main` is governed
-by a GitHub ruleset; see [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md) for the
-change-integrity contract.
+explicit upgrade procedure. The version-controlled change-integrity workflow
+for `main` and release branches is defined in
+[`docs/GOVERNANCE.md`](docs/GOVERNANCE.md); repository-hosting configuration is
+outside development scope.
 
 ```sh
 uv sync --frozen --extra dev
