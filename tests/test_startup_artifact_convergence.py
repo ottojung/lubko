@@ -21,7 +21,11 @@ from lubko import deployctl as dc
 from lubko import startup_contract as sc
 from lubko import state as _state_mod
 from lubko.deployctl import STATUS_CONFIRMED, RollbackState
-from lubko.durable import DurabilityError
+from lubko.durable import (
+    FSYNC_STAGE_DIR,
+    DurabilityError,
+    set_one_shot_fsync_failure_injector,
+)
 from lubko.lifecycle import SCHEMA_VERSION, STATE_RUNNING, WorkerMeta
 from lubko.startup_contract import (
     CONTRACT_SCHEMA_VERSION,
@@ -1170,6 +1174,70 @@ def test_receipt_write_failure_after_promotion_retains_staging_for_retry(
     response2 = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
     assert response2["ok"] is True
     assert sc.read_staging_manifest() is None
+    receipt = dc._read_confirmation_receipt()
+    assert receipt is not None
+    assert receipt.get("commit") == commit_b
+
+
+def test_receipt_durability_failure_retains_staging_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real DurabilityError (fsync failure) during receipt write retains staging.
+
+    Uses the durable module's fault injector to simulate a real storage
+    confirmation failure.  Proves: promotion succeeds; receipt durability
+    fails; confirm returns controlled ok:false; staging manifest remains;
+    receipt is not accepted as durable; clearing the fault and retrying
+    succeeds, writes/verifies receipt, then cleans staging.
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest("b" * 40, bin_home)
+
+    commit_b = "b" * 40
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_CONFIRMED,
+        commit=commit_b,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": "a" * 40})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+    monkeypatch.setattr(dc, "_confirmation_state", lambda _r: current_state)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    # Install one-shot fsync failure injector on the deploy directory
+    # (the directory fsync fires on the parent of the receipt file)
+    deploy_dir = dc._confirmation_receipt_path().parent
+    set_one_shot_fsync_failure_injector(stage=FSYNC_STAGE_DIR, path=deploy_dir)
+
+    # First confirm: promotion succeeds, receipt durability fails → staging retained
+    response = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response["ok"] is False
+    assert "receipt" in str(response.get("error", ""))
+    # Staging manifest retained
+    assert sc.read_staging_manifest() is not None
+    # Receipt file was NOT durably written (injector cleared after firing)
+    assert not dc._confirmation_receipt_path().is_file()
+
+    # Second confirm: fault cleared, retry succeeds
+    response2 = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response2["ok"] is True
+    assert response2["confirmed"] is True
+    # Staging cleaned up after successful receipt
+    assert sc.read_staging_manifest() is None
+    # Receipt durably written and verified
     receipt = dc._read_confirmation_receipt()
     assert receipt is not None
     assert receipt.get("commit") == commit_b

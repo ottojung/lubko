@@ -2003,7 +2003,7 @@ def _finalize_post_promotion(commit: str, manifest: dict[str, object], bin_home:
     """
     try:
         _write_confirmation_receipt(commit, manifest)
-    except OSError as exc:
+    except (DurabilityError, OSError) as exc:
         msg = "could not write startup confirmation receipt"
         raise DeployCtlError(msg) from exc
     startup_contract.cleanup_staging(bin_home)
