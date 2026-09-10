@@ -2887,11 +2887,12 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
     promotion succeeds.  The ``STATUS_CONFIRMED`` fast path retries
     idempotent promotion and fails closed if artifacts still don't match.
 
-    Exception discipline: once ``_finalize_confirmation`` has made B
-    durable-confirmed, no exception path deletes B's staged manifest or
-    A's recovery snapshot unless promotion completed.  Pre-terminalization
-    failures clean up staging and snapshot; post-terminalization failures
-    retain everything for supervisor retry.
+    Exception discipline: pre-terminalization failures (staging,
+    authorization, prepare candidate) clean up staging and snapshot.
+    Once ``_finalize_confirmation`` returns, B is durable-confirmed; no
+    subsequent exception path may delete staging manifest or snapshot.
+    Post-terminalization exceptions leave recovery data intact so the
+    supervisor or a retry of ``_confirm_locked`` can complete promotion.
 
     Returns:
         Protocol response for the confirmed deployment.
@@ -2908,6 +2909,8 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
         msg = f"cannot confirm: startup artifact snapshot failed: {exc}"
         raise DeployCtlError(msg) from exc
     _snapshot_pre_confirmation_artifacts(bin_home)
+    # Pre-terminalization: if anything fails here, clean up staging + snapshot
+    # because B has not been confirmed yet.
     try:
         _authorize_confirmation(state)
         expected_generation = _prepare_confirmation_candidate(state, options)
@@ -2918,8 +2921,9 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
         startup_contract.cleanup_staging(bin_home)
         _remove_pre_confirmation_artifacts()
         raise
-    # B is now durable-confirmed.  From this point, no exception may delete
-    # the manifest or snapshot unless promotion completed successfully.
+    # Post-terminalization: B is durable-confirmed.  No exception path may
+    # delete staging manifest or snapshot.  Promotion may fail; that is
+    # surfaced as ok:false, not as an exception that triggers cleanup.
     promotion_error = startup_contract.promote_staged_artifacts(
         state.commit, state.commit, bin_home
     )

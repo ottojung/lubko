@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from lubko import cli, deployctl, lifecycle, supervise
+from lubko import cli, deployctl, lifecycle, startup_contract, supervise
 
 OLD = "1" * 40
 NEW = "2" * 40
@@ -190,7 +190,7 @@ def _establish_pending_supervisor_authority(
     )
 
 
-def test_supervised_prepare_state_stays_readable_through_status_and_confirmation(
+def test_supervised_prepare_state_stays_readable_through_status_and_confirmation(  # ruff: ignore[too-many-statements]
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Prepared supervisor state round-trips before and after child publication."""
@@ -274,8 +274,8 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _line: None)
     monkeypatch.setattr(deployctl, "_stage_candidate_startup_artifacts", lambda _c: None)
     monkeypatch.setattr(deployctl, "_snapshot_pre_confirmation_artifacts", lambda _b: None)
-    monkeypatch.setattr(deployctl.startup_contract, "write_staging_manifest", lambda _c, _b: None)
-    monkeypatch.setattr(deployctl.startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None)
+    monkeypatch.setattr(startup_contract, "write_staging_manifest", lambda _c, _b: None)
+    monkeypatch.setattr(startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None)
     monkeypatch.setattr(deployctl, "_remove_pre_confirmation_artifacts", lambda: None)
 
     response = deployctl._confirm_locked({"type": "confirm", "commit": NEW}, _options())

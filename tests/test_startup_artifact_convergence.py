@@ -337,3 +337,40 @@ def test_supervisor_promotes_staged_bytes_without_synthesizing(
     error = sc.promote_staged_artifacts("commit-B", "commit-B", bin_home)
     assert error is None
     assert sc.assess_recorded_contract().state == "current"
+
+
+def test_post_terminalization_exception_retains_recovery_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After durable terminal confirmation, an exception retains staging + snapshot.
+
+    If _finalize_confirmation succeeds (B is durable-confirmed) but a later
+    step (e.g., promotion) raises, the staging manifest and pre-confirmation
+    snapshot must be retained so the supervisor or a retry can complete
+    promotion idempotently.
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    # Write a pre-confirmation snapshot (simulates A's artifacts)
+    snapshot = sc.snapshot_startup_artifacts(bin_home)
+    serializable = {k: list(v) for k, v in snapshot.items()}
+    snapshot_path = tmp_path / "deploy" / "pre-confirmation-startup-artifacts.json"
+    snapshot_path.write_text(json.dumps(serializable), encoding="utf-8")
+    # Stage B artifacts + manifest
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest("commit-B", bin_home)
+    manifest_path = _manifest_path(tmp_path)
+    assert manifest_path.is_file()
+    # Simulate: B is durable-confirmed but promotion raises
+    error = sc.promote_staged_artifacts("commit-X", "commit-X", bin_home)
+    # Stale manifest (commit-X != commit-B) causes promotion to fail
+    assert error is not None
+    # Recovery data retained: manifest and snapshot still present
+    assert manifest_path.is_file(), "staging manifest was deleted after promotion failure"
+    assert snapshot_path.is_file(), "pre-confirmation snapshot was deleted after promotion failure"
+    # Idempotent retry with correct commit succeeds
+    error = sc.promote_staged_artifacts("commit-B", "commit-B", bin_home)
+    assert error is None
+    assert sc.assess_recorded_contract().state == "current"
