@@ -170,41 +170,39 @@ print(f'SHA256 OK: {got}')
 
 printf '%s\n' '--- Extract and install to PATH ---'
 python3 -c "
-import tarfile, sys, os, stat
+import tarfile, sys, os, stat, shutil
 tarball = sys.argv[1]
-dest_dir = sys.argv[2]
-os.makedirs(dest_dir, exist_ok=True)
+dest = sys.argv[2]
+os.makedirs(dest, exist_ok=True)
 with tarfile.open(tarball, 'r:gz') as tf:
-    members = tf.getnames()
-    if len(members) != 1 or not members[0].endswith('/opencode'):
-        print(f'FAIL: unexpected tarball contents: {members}')
+    members = tf.getmembers()
+    if len(members) != 1 or members[0].name != 'opencode':
+        names = [m.name for m in members]
+        print(f'FAIL: expected single member named opencode, got {names}')
         sys.exit(1)
-    # Strip any leading directory component
-    basename = os.path.basename(members[0])
-    tf.extract(members[0], dest_dir, filter='data')
-    src = os.path.join(dest_dir, members[0])
-    dst = os.path.join(dest_dir, basename)
-    if src != dst:
-        os.replace(src, dst)
+    if not members[0].isfile():
+        print(f'FAIL: opencode member is not a regular file (type={members[0].type})')
+        sys.exit(1)
+    src = tf.extractfile(members[0])
+    if src is None:
+        print('FAIL: could not extract opencode member')
+        sys.exit(1)
+    dst = os.path.join(dest, 'opencode')
+    with open(dst, 'wb') as out:
+        shutil.copyfileobj(src, out)
     os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     print(f'Installed to {dst}')
 " "$OPENCODE_TARBALL" "${BIN_HOME}"
 
-printf '%s\n' '--- OpenCode ELF header check ---'
-file "${BIN_HOME}/opencode" || true
-
 printf '%s\n' '--- OpenCode version check ---'
-if "${BIN_HOME}/opencode" version 2>&1 | grep -q "${OPENCODE_VERSION}"; then
+OPENCODE_OUTPUT=$("${BIN_HOME}/opencode" version 2>&1) || {
+  fail "opencode version exited non-zero"
+  OPENCODE_OUTPUT=""
+}
+if printf '%s' "$OPENCODE_OUTPUT" | grep -qF "${OPENCODE_VERSION}"; then
   pass "opencode version reports ${OPENCODE_VERSION}"
 else
-  fail "opencode version did not report ${OPENCODE_VERSION}"
-fi
-
-printf '%s\n' '--- OpenCode exit code check ---'
-if "${BIN_HOME}/opencode" version >/dev/null 2>&1; then
-  pass "opencode exits successfully"
-else
-  fail "opencode did not exit successfully"
+  fail "opencode version did not report ${OPENCODE_VERSION}: ${OPENCODE_OUTPUT}"
 fi
 
 # ===========================================================================
