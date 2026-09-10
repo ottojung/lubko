@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import lubko.deployctl as dc
-from lubko import cli, lifecycle, lifecycle_state, supervise
+from lubko import cli, lifecycle, lifecycle_state, startup_contract, supervise
 
 COMMIT = "2" * 40
 PREVIOUS_COMMIT = "1" * 40
@@ -145,7 +145,7 @@ def test_explicit_legacy_confirmation_can_terminalize_without_supervisor(
 
 
 def test_confirmation_fails_closed_if_supervisor_disappears_after_preparation(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A live preparation observation cannot authorize later legacy fallback."""
     state = _pending_state(supervisor_owned=True)
@@ -164,6 +164,15 @@ def test_confirmation_fails_closed_if_supervisor_disappears_after_preparation(
     )
     monkeypatch.setattr(dc, "_write_state", writes.append)
     monkeypatch.setattr(cli, "set_current", pointer_updates.append)
+    monkeypatch.setattr(dc, "_stage_candidate_startup_artifacts", lambda _c: None)
+    monkeypatch.setattr(startup_contract, "write_staging_manifest", lambda _c, _b: None)
+    monkeypatch.setattr(startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None)
+    monkeypatch.setattr(dc, "_remove_pre_confirmation_artifacts", lambda: None)
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir(exist_ok=True)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: real_bin)
+    (tmp_path / "deploy").mkdir(exist_ok=True)
+    monkeypatch.setattr(dc, "state_root", lambda: tmp_path)
 
     with pytest.raises(dc.DeployCtlError, match="live supervisor"):
         dc._confirm_locked({"type": "confirm", "commit": COMMIT}, _options())
@@ -175,7 +184,7 @@ def test_confirmation_fails_closed_if_supervisor_disappears_after_preparation(
 
 
 def test_explicit_legacy_confirmation_ignores_live_supervisor(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Durable legacy authority selects direct confirmation despite a supervisor."""
     state = _pending_state(supervisor_owned=False)
@@ -199,6 +208,15 @@ def test_explicit_legacy_confirmation_ignores_live_supervisor(
     monkeypatch.setattr(cli, "set_current", lambda _commit: None)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
     monkeypatch.setattr(dc, "append_deploy_log", lambda _message: None)
+    monkeypatch.setattr(dc, "_stage_candidate_startup_artifacts", lambda _c: None)
+    monkeypatch.setattr(startup_contract, "write_staging_manifest", lambda _c, _b: None)
+    monkeypatch.setattr(startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None)
+    monkeypatch.setattr(dc, "_remove_pre_confirmation_artifacts", lambda: None)
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir(exist_ok=True)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: real_bin)
+    (tmp_path / "deploy").mkdir(exist_ok=True)
+    monkeypatch.setattr(dc, "state_root", lambda: tmp_path)
 
     dc._confirm_locked({"type": "confirm", "commit": COMMIT}, _options())
 

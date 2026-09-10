@@ -31,7 +31,15 @@ if TYPE_CHECKING:
 
 import pytest
 
-from lubko import cli, deployctl, lifecycle, lifecycle_state, supervise, supervisor
+from lubko import (
+    cli,
+    deployctl,
+    lifecycle,
+    lifecycle_state,
+    startup_contract,
+    supervise,
+    supervisor,
+)
 from lubko.lifecycle_state import (
     INVARIANT_CRASH_CONVERGES_TO_ONE_OR_ZERO,
     INVARIANT_GENERATION_MONOTONIC,
@@ -1041,7 +1049,7 @@ def test_confirm_gate_refuses_malformed_authority(
     assert recorded.status == deployctl.STATUS_PENDING
 
 
-def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """_confirm_locked proceeds when the authority permits the transition."""
     mission = _make_mission(deployctl.STATUS_PENDING)
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
@@ -1082,6 +1090,15 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(cli, "set_current", lambda _c: None)
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _c: None)
     monkeypatch.setattr(deployctl, "append_deploy_log", lambda _l: None)
+    monkeypatch.setattr(deployctl, "_stage_candidate_startup_artifacts", lambda _c: None)
+    monkeypatch.setattr(startup_contract, "write_staging_manifest", lambda _c, _b: None)
+    monkeypatch.setattr(startup_contract, "promote_staged_artifacts", lambda _c, _cc, _b: None)
+    monkeypatch.setattr(deployctl, "_remove_pre_confirmation_artifacts", lambda: None)
+    real_bin = tmp_path / "bin"
+    real_bin.mkdir(exist_ok=True)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: real_bin)
+    (tmp_path / "deploy").mkdir(exist_ok=True)
+    monkeypatch.setattr(deployctl, "state_root", lambda: tmp_path)
     written: list[deployctl.RollbackState] = []
     monkeypatch.setattr(deployctl, "_write_state", written.append)
     response = deployctl._confirm_locked(

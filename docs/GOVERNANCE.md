@@ -1,42 +1,19 @@
 # Repository governance contract
 
-This document is the change-integrity contract for `main` and active `release/*`
-branches. It is the source of truth for how a commit becomes the tip of `main`
-or of an active release branch; every other place that describes branch
-protection must stay consistent with it.
+This document is the version-controlled change-integrity contract for `main` and active `release/*` branches. It defines the development workflow operators and orchestrators must follow.
 
-Lubko validates one canonical pipeline. That pipeline is the only thing that
-may authorize `main` to advance, and it is enforced by a GitHub ruleset, not by
-convention or by CI merely reporting a failure after `main` has already moved.
+Repository-hosting configuration is deliberately outside this contract. Development must not create, modify, require, audit, or treat as acceptance criteria GitHub rulesets, branch protection, required-status-check settings, merge-policy settings, repository permissions, GitHub Actions repository settings, or other out-of-band Git/GitHub configuration. See `docs/intent-records/repository-configuration-out-of-scope.md`.
 
-## The contract
+External repository configuration may exist and may independently reinforce this workflow, but Lubko development must neither depend on nor inspect it for correctness or completion.
 
-For the default branch (`main`, `~DEFAULT_BRANCH` in the ruleset condition):
+## `main` integrity contract
 
-1. **No direct pushes.** Every change reaches `main` through a pull request.
-   The ruleset's `pull_request` rule blocks updates that are not made via a
-   merged PR.
-2. **Canonical CI must pass on an up-to-date integration.** The single
-   canonical check, the `test` job in `.github/workflows/ci.yml`, must complete
-   successfully, and the pull request's integration must be up to date with the
-   base branch before merge. The ruleset's `required_status_checks` rule (with
-   strict policy enabled) blocks a merge unless a passing `test` check exists on
-   an integration that includes the latest base-branch state.
-3. **No silent bypass.** The ruleset has no bypass actors. Administrators and
-   bots cannot override the contract through a normal path. The only way around
-   it is the explicit emergency procedure below, which is itself a visible,
-   reviewed ruleset change.
-4. **One test-suite command.** The governance rule does not introduce a second
-   test command. The `test` job additionally gates frozen-sync, formatting,
-   lint, and strict types, but `uv run pytest` remains the single, complete test
-   suite command — the same command developers run locally. Installation and
-   environment acceptance checks are separate; they may run in CI but are not
-   part of the canonical pytest suite and are not subject to its ten-second
-   budget.
+For the default branch `main`:
 
-This is deliberately fail-closed: if the required `test` check cannot be found
-on a commit (because the job was renamed or removed), no commit can satisfy the
-rule, so merges are blocked rather than silently allowed.
+1. **Use pull requests.** Ordinary development changes reach `main` through a pull request so the diff, review, and integration evidence are visible before merge.
+2. **Canonical CI must pass on current integration.** The single canonical check is the `test` job in `.github/workflows/ci.yml`. Before merge, the pull request must include the current base-branch state and the canonical check must succeed on that current integration.
+3. **No procedural bypass.** Development operators and orchestrators follow this version-controlled workflow regardless of what the repository host would permit. Do not infer an exception from repository permissions, capabilities, or settings.
+4. **One test-suite command.** The `test` job gates frozen sync, formatting, lint, strict types, and the complete pytest suite. `uv run pytest` remains the single complete test-suite command developers run locally. Installation and environment acceptance checks are separate; they may run in CI but are not part of the canonical pytest suite and are not subject to its ten-second budget.
 
 ## What the canonical check covers
 
@@ -46,111 +23,30 @@ The `test` job runs, in order, the same checks developers run locally:
 - `uv run ruff format --check .` — formatting.
 - `uv run ruff check .` — linting (Ruff `ALL`, preview).
 - `uv run mypy .` — strict type checking.
-- `uv run pytest` — the complete test suite (must finish in under ten seconds of wall-clock time once the environment is installed; see AGENTS.md testing requirements).
+- `uv run pytest` — the complete test suite (must finish in under ten seconds of wall-clock time once the environment is installed; see `AGENTS.md` testing requirements).
 
 Installation, environment provisioning, dependency installation, image construction, and similar acceptance checks are outside the pytest budget and may take longer. They are not part of the canonical `uv run pytest` suite.
 
 ## Why the PR path
 
-The contract requires a pull request rather than permitting unrestricted direct
-pushes. A pull request is the only supported update path that guarantees the
-canonical CI runs on the integration and that the result is visible before the
-merge. With strict status-check policy, the integration must also be up to date
-with the base branch, so a PR whose base advanced after its last green check
-cannot merge until CI passes again on current state. Direct pushes would let
-`main` move before CI reports, which is exactly the gap this contract closes.
-Reliability, not convenience, drives the choice.
+A pull request is the canonical review and integration surface. It lets the orchestrator inspect the exact diff through the GitHub plugin, makes CI evidence visible before integration, and provides a durable record of review and merge decisions.
 
-Note that GitHub may create a fresh merge or squash commit when the PR is
-merged; the literal final commit SHA is not necessarily the commit that CI
-executed. The enforced invariant is therefore that the PR/integration was up to
-date with the base branch and that canonical CI passed on it before merge — not
-that the merged commit's exact SHA itself ran CI.
+The workflow must establish that the integration being accepted includes the current base branch and has passing canonical verification. Do not substitute assumptions about branch protection or other repository-hosting configuration for that verification.
 
-## Required check name is part of the contract
+GitHub may create a fresh merge or squash commit when a PR is merged, so the literal final commit SHA need not be the exact SHA on which CI ran. The invariant is that the reviewed integration included current base state and passed the canonical check before merge.
 
-The rule references the check by the literal name `test`. Renaming the job in
-`.github/workflows/ci.yml` is a governance change: it must be paired with an
-update to the ruleset's `required_status_checks` entry, or enforcement will
-break fail-closed. Do not rename the job casually.
+## Canonical check name
 
-## Emergency procedure
-
-The contract may be suspended only through an explicit, visible ruleset edit,
-never through a hidden override:
-
-1. Set the `main1` ruleset enforcement to `disabled` (or temporarily remove the
-   `required_status_checks` / `pull_request` rules) via the repository ruleset
-   API or settings UI.
-2. Make the urgent change through whatever path the suspension permits.
-3. Immediately restore the `main1` ruleset to `active` with the full rule set
-   before `main` is next advanced through any non-emergency change.
-
-The suspension and its reversal must each be their own auditable change. The
-contract is never bypassed silently; a bypass is always a deliberate,
-recoverable ruleset modification.
-
-## Where it lives
-
-The enforcement is configured in the active `main1` repository ruleset
-(target `branch`, default-branch ref condition). It carries the rules
-`deletion`, `non_fast_forward`, `pull_request`, and `required_status_checks`.
+The canonical CI job is named `test`. Renaming it is a version-controlled governance change and must update any repository documentation or tooling that refers to that name. It does not require or imply any out-of-band repository-setting change as part of Lubko development.
 
 # Release-branch integrity contract
 
-This section extends the change-integrity contract to active `release/*`
-branches. The same class of protection that guards `main` must also guard the
-branches where release integration occurs.
+Scheduled Lubko development integrates through the active `release/*` branch as described by `docs/skills/itenerary-lubko.md`. The release branch follows the same version-controlled integrity policy as `main`.
 
-## The contract
+1. **Use pull requests for advancement.** After an active release branch has been created from `main`, subsequent changes reach it through pull requests.
+2. **Canonical CI must pass on current integration.** The same `test` job must succeed on an integration that includes the current release-branch state before an issue PR is merged.
+3. **Use the same validation pipeline.** Release integration uses frozen sync, formatting, lint, strict types, and the complete pytest suite described above.
+4. **Branch creation is the bootstrap step.** If no active release branch exists, it may be created directly from current `main`; after creation, advancement follows the PR + canonical-verification path.
+5. **Do not depend on hosting configuration.** Never inspect, create, require, or wait for a ruleset, branch-protection rule, repository permission, required-check setting, or other external GitHub configuration in order to start, continue, or complete release work.
 
-For branches matching `release/*`, the policy requires `release1` repository
-ruleset enforcement with `pull_request`, `required_status_checks`, `deletion`,
-and `non_fast_forward` rules (strict status-check policy, no bypass actors).
-Operators must verify that a matching live `release1` ruleset exists before
-treating release-branch protections as repository-enforced; if the ruleset is
-missing or disabled, the policy still applies but enforcement depends on
-discipline until the ruleset is restored.
-
-1. **No direct pushes.** Every change reaches a release branch through a pull
-   request. When the `release1` ruleset is active, its `pull_request` rule
-   blocks updates that are not made via a merged PR. The policy prohibits direct
-   pushes regardless of ruleset state.
-2. **Canonical CI must pass on an up-to-date integration.** The same `test` job
-   in `.github/workflows/ci.yml` that gates `main` must complete successfully
-   on the release-branch integration. When the ruleset is active, its
-   `required_status_checks` rule (with strict policy enabled) blocks a merge
-   unless a passing `test` check exists on an integration that includes the
-   latest base-branch state.
-3. **No silent bypass.** When the ruleset is active, it has no bypass actors.
-   Administrators and bots cannot override the contract through a normal path.
-4. **Same test command.** The release branch uses the identical canonical
-   validation pipeline as `main`: frozen sync, formatting, lint, strict types,
-   and the complete test suite. The ten-second budget applies to pytest execution
-   only; installation and environment checks are exempt.
-5. **Branch creation is not blocked.** The required ruleset must be created with
-   `do_not_enforce_on_create: true`. A new release branch can be created from
-   `main` without passing CI first or requiring a PR; once the branch exists,
-   all subsequent advancement requires the PR + CI path.
-
-## Why a separate ruleset
-
-A dedicated `release1` ruleset (rather than extending `main1`) keeps the
-release-branch contract auditable as its own ruleset. The required ruleset
-targets the `release/*` ref pattern for all active release branches, and
-`do_not_enforce_on_create` preserves the branch-creation bootstrap path without
-creating a loophole for subsequent unvalidated advancement.
-
-## Required check name
-
-The required ruleset references the same `test` check name as the `main1`
-ruleset. Renaming the job in `.github/workflows/ci.yml` is a governance change
-that must be paired with an update to both `main1` and `release1` rulesets.
-
-## Where it lives
-
-The required enforcement is a `release1` repository ruleset (target `branch`,
-ref pattern `release/*`). It must carry the rules `deletion`,
-`non_fast_forward`, `pull_request`, and `required_status_checks` (strict, with
-`do_not_enforce_on_create: true`). Operators must confirm this ruleset is live
-(active) for release-branch protections to be repository-enforced.
+These requirements are development procedure expressed in version-controlled repository contents. They remain applicable regardless of what repository-hosting configuration happens to exist outside the repository.
