@@ -5,14 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from lubko import agent
+# Explicit submodule import required: strict mypy rejects `from lubko import agent`
+# because the package __init__ does not re-export the submodule.
+import lubko.agent as agent  # ruff: ignore[manual-from-import]
 
 
-@pytest.mark.parametrize("bad", [123, True, 1.5, [], {}, ""])
-def test_pending_prompt_rejects_malformed_present_values(bad: object) -> None:
+def test_pending_prompt_rejects_malformed_present_values() -> None:
     """Reject malformed present durable prompt values."""
-    with pytest.raises(agent.MalformedPendingPromptMetadataError):
-        agent._pending_prompt({"pending_prompt": bad})
+    for bad in [123, True, 1.5, [], {}, ""]:
+        with pytest.raises(agent.MalformedPendingPromptMetadataError):
+            agent._pending_prompt({"pending_prompt": bad})
 
 
 def test_pending_prompt_preserves_none_absence_and_nonempty_string() -> None:
@@ -95,14 +97,14 @@ def test_locked_transition_rejects_malformed_before_mutation(
     assert meta == before
 
 
-@pytest.mark.parametrize("bad", [123, True, 1.5, [], {}, ""])
-def test_clear_pending_rejects_malformed_before_mutation(bad: object) -> None:
+def test_clear_pending_rejects_malformed_before_mutation() -> None:
     """Exact-claim clearing cannot normalize malformed durable prompt state."""
-    meta: agent.Meta = {"pending_prompt": bad}
-    before = copy.deepcopy(meta)
-    with pytest.raises(agent.MalformedPendingPromptMetadataError):
-        agent._clear_pending(meta, "work")
-    assert meta == before
+    for bad in [123, True, 1.5, [], {}, ""]:
+        meta: agent.Meta = {"pending_prompt": bad}
+        before = copy.deepcopy(meta)
+        with pytest.raises(agent.MalformedPendingPromptMetadataError):
+            agent._clear_pending(meta, "work")
+        assert meta == before
 
 
 @pytest.mark.parametrize("bad", [123, True, 1.5, [], {}, ""])
