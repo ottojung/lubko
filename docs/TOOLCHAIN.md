@@ -2,7 +2,13 @@
 
 ## Reproducible validation
 
-CI uses one reviewed CPython 3.12 series and one explicit `uv` version. `uv.lock` is committed, and validation/install synchronization uses `uv sync --frozen` so dependency resolution never changes silently.
+Canonical CI validates CPython 3.12 and one explicit `uv` version. `uv.lock` is committed. Default/runtime installation uses plain `uv sync --frozen`; development and repository validation use `uv sync --frozen --extra dev` so dependency resolution never changes silently.
+
+The supported runtime and package policy is CPython >=3.12. Termux acceptance validates the current Termux Python (currently 3.14).
+
+### psycopg platform split
+
+On non-Android platforms, Lubko depends on `psycopg[binary]` which ships its own bundled libpq. On Android/Termux, `psycopg[binary]` wheels are unavailable, so the dependency resolves to plain `psycopg` and native `libpq` is an explicit Termux package prerequisite.
 
 The exact CI `uv` pin is a build-validation choice, not a production runtime protocol.
 

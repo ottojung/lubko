@@ -18,12 +18,10 @@ import argparse
 import codecs
 import contextlib
 import copy
-import ctypes
 import fcntl
 import json
 import math
 import os
-import platform
 import re
 import shutil
 import signal
@@ -38,6 +36,7 @@ from itertools import starmap
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Final, cast
 
+from lubko._exact_signal import open_pidfd as _exact_open_pidfd
 from lubko._exact_signal import pidfd_send_signal
 from lubko._exact_signal import proc_cpu_seconds as _shared_proc_cpu_seconds
 from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
@@ -81,24 +80,6 @@ HEX_DIGITS: Final = frozenset("0123456789abcdef")
 # recycles a process-group ID into a newer invocation of the same agent.
 INVOCATION_ID_VAR: Final = "LUBKO_INVOCATION_ID"
 INVOCATION_ID_HEX_LENGTH: Final = 32
-
-# ``SYS_pidfd_open`` uses the unified syscall number 434 on every architecture
-# with a shared generic syscall table (x86_64, aarch64, riscv64, arm32, ppc64,
-# s390x, loongarch). Architectures with private numbering (alpha, mips,
-# parisc, sparc) are absent: there pinning is unsupported and signalling
-# fails closed.
-_PIDFD_OPEN_SYSCALL_NR: Final[dict[str, int]] = {
-    "x86_64": 434,
-    "aarch64": 434,
-    "armv7l": 434,
-    "armv8l": 434,
-    "riscv64": 434,
-    "ppc64": 434,
-    "ppc64le": 434,
-    "s390x": 434,
-    "loongarch64": 434,
-}
-_LIBC_CACHE: Final[dict[str, ctypes.CDLL]] = {}
 
 # Exit codes.
 EXIT_OK: Final = 0
@@ -527,11 +508,11 @@ def open_pidfd(pid: int) -> int | None:
     sequences race-free: identity verified through the pin refers to exactly
     the process that is later signalled.
 
-    Prefers ``os.pidfd_open``; falls back to a narrowly encapsulated raw
-    ``SYS_pidfd_open`` syscall via ``ctypes`` on architectures with the
-    unified syscall number. Returns ``None`` when the process is gone
-    (``ESRCH``) or when the platform cannot pin PIDs at all, in which case
-    callers must fail closed rather than signal an unpinned target.
+    Delegates to the shared ``_exact_signal.open_pidfd`` which handles both
+    glibc and Bionic portably via raw syscalls.  Returns ``None`` when the
+    process is gone (``ESRCH``) or when the platform cannot pin PIDs at all,
+    in which case callers must fail closed rather than signal an unpinned
+    target.
 
     Args:
         pid: Process ID to pin.
@@ -539,34 +520,10 @@ def open_pidfd(pid: int) -> int | None:
     Returns:
         A pidfd file descriptor, or ``None``.
     """
-    pidfd_open = getattr(os, "pidfd_open", None)
-    if pidfd_open is not None:
-        try:
-            return int(pidfd_open(int(pid)))
-        except OSError:
-            return None
-    nr = _PIDFD_OPEN_SYSCALL_NR.get(platform.machine())
-    libc = _load_libc()
-    if nr is None or libc is None:
+    try:
+        return _exact_open_pidfd(int(pid))
+    except OSError:
         return None
-    result = libc.syscall(ctypes.c_long(nr), ctypes.c_int(pid), ctypes.c_uint(0))
-    return int(result) if result >= 0 else None
-
-
-def _load_libc() -> ctypes.CDLL | None:
-    """Return a cached handle to the C library, or ``None``.
-
-    Returns:
-        The ``ctypes`` C library handle, or ``None`` when unavailable.
-    """
-    if "libc" not in _LIBC_CACHE:
-        try:
-            libc = ctypes.CDLL(None, use_errno=True)
-            libc.syscall.restype = ctypes.c_long
-        except OSError:
-            return None
-        _LIBC_CACHE["libc"] = libc
-    return _LIBC_CACHE["libc"]
 
 
 def signal_identity_checked(
