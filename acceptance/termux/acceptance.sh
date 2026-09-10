@@ -143,20 +143,20 @@ OPENCODE_SHA256="0856401391dca752313e32ef3a20f977700d9544d83605ab813c277190354c8
 OPENCODE_TARBALL="${LUBKO_OUTSIDE}/opencode-android-arm64.tar.gz"
 
 printf '%s\n' '--- Download pinned OpenCode artifact ---'
-python3 -c "
-import urllib.request, sys
-url = sys.argv[1]
-dest = sys.argv[2]
+python -c "
+import urllib.request
+url = '${OPENCODE_URL}'
+dest = '${OPENCODE_TARBALL}'
 print(f'Downloading {url} ...')
 urllib.request.urlretrieve(url, dest)
 print(f'Downloaded to {dest}')
-" "$OPENCODE_URL" "$OPENCODE_TARBALL"
+"
 
 printf '%s\n' '--- Verify SHA256 ---'
-python3 -c "
-import hashlib, sys
-path = sys.argv[1]
-expected = sys.argv[2]
+python -c "
+import hashlib
+path = '${OPENCODE_TARBALL}'
+expected = '${OPENCODE_SHA256}'
 h = hashlib.sha256()
 with open(path, 'rb') as f:
     for chunk in iter(lambda: f.read(65536), b''):
@@ -164,45 +164,53 @@ with open(path, 'rb') as f:
 got = h.hexdigest()
 if got != expected:
     print(f'FAIL: SHA256 mismatch: expected {expected}, got {got}')
-    sys.exit(1)
+    raise SystemExit(1)
 print(f'SHA256 OK: {got}')
-" "$OPENCODE_TARBALL" "$OPENCODE_SHA256"
+"
 
 printf '%s\n' '--- Extract and install to PATH ---'
-python3 -c "
-import tarfile, sys, os, stat, shutil
-tarball = sys.argv[1]
-dest = sys.argv[2]
+python -c "
+import tarfile, os, stat, shutil
+tarball = '${OPENCODE_TARBALL}'
+dest = '${BIN_HOME}'
 os.makedirs(dest, exist_ok=True)
 with tarfile.open(tarball, 'r:gz') as tf:
     members = tf.getmembers()
     if len(members) != 1 or members[0].name != 'opencode':
         names = [m.name for m in members]
         print(f'FAIL: expected single member named opencode, got {names}')
-        sys.exit(1)
+        raise SystemExit(1)
     if not members[0].isfile():
         print(f'FAIL: opencode member is not a regular file (type={members[0].type})')
-        sys.exit(1)
+        raise SystemExit(1)
     src = tf.extractfile(members[0])
     if src is None:
         print('FAIL: could not extract opencode member')
-        sys.exit(1)
+        raise SystemExit(1)
     dst = os.path.join(dest, 'opencode')
     with open(dst, 'wb') as out:
         shutil.copyfileobj(src, out)
     os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     print(f'Installed to {dst}')
-" "$OPENCODE_TARBALL" "${BIN_HOME}"
+"
 
-printf '%s\n' '--- OpenCode version check ---'
-OPENCODE_OUTPUT=$("${BIN_HOME}/opencode" version 2>&1) || {
-  fail "opencode version exited non-zero"
-  OPENCODE_OUTPUT=""
-}
-if printf '%s' "$OPENCODE_OUTPUT" | grep -qF "${OPENCODE_VERSION}"; then
-  pass "opencode version reports ${OPENCODE_VERSION}"
+printf '%s\n' '--- OpenCode version output check ---'
+OPENCODE_OUTPUT=$("${BIN_HOME}/opencode" version 2>&1)
+OPENCODE_EXIT=$?
+OPENCODE_TRIMMED=$(printf '%s' "$OPENCODE_OUTPUT")
+if [ "$OPENCODE_EXIT" -ne 0 ]; then
+  fail "opencode version exited ${OPENCODE_EXIT}"
+elif [ "$OPENCODE_TRIMMED" != "${OPENCODE_VERSION}" ]; then
+  fail "opencode version output '${OPENCODE_TRIMMED}' != expected '${OPENCODE_VERSION}'"
 else
-  fail "opencode version did not report ${OPENCODE_VERSION}: ${OPENCODE_OUTPUT}"
+  pass "opencode version == ${OPENCODE_VERSION}"
+fi
+
+printf '%s\n' '--- OpenCode exit code check ---'
+if "${BIN_HOME}/opencode" version >/dev/null 2>&1; then
+  pass "opencode exits 0"
+else
+  fail "opencode did not exit 0"
 fi
 
 # ===========================================================================
