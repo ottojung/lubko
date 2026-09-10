@@ -51,6 +51,7 @@ def test_reconcile_restores_confirmed_on_malformed_desired(
     monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
     monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
     monkeypatch.setattr(daemon, "_complete_cold_migration", lambda: None)
+    monkeypatch.setattr(daemon, "_converge_startup_artifacts", lambda: None)
 
     daemon.reconcile(0.0)
 

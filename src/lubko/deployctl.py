@@ -29,9 +29,9 @@ from uuid import UUID
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, lifecycle_state, supervise
+from lubko import cli, lifecycle, lifecycle_state, startup_contract, supervise
 from lubko.config import load_database_config
-from lubko.durable import DurabilityError, write_json_durable
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.lifecycle import (
     SCHEMA_VERSION,
     STATE_RUNNING,
@@ -55,7 +55,7 @@ from lubko.lifecycle import (
     worker_log_path,
     write_meta,
 )
-from lubko.state import rollback_state_path
+from lubko.state import rollback_state_path, state_root
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import JOB_ID_ENV
 
@@ -92,6 +92,13 @@ HANDOFF_POLL_SECONDS: Final = 0.1
 HANDOFF_RESPONSE_MAX_BYTES: Final = 1048576
 HELPER_ERROR_MAX_CHARS: Final = 8000
 HANDOFF_DURABLE_WAIT_SECONDS: Final = 60.0
+
+#: Durable file that preserves the pre-confirmation startup artifacts so
+#: rollback can restore them exactly.  Written before confirmation mutates
+#: the artifacts and removed after confirmation succeeds.
+_PRE_CONFIRMATION_ARTIFACTS_NAME: Final = "pre-confirmation-startup-artifacts.json"
+_CONFIRMATION_RECEIPT_NAME: Final = "startup-confirmation-receipt.json"
+_MAX_BYTE_VALUE: Final = 255
 
 GATED_SHIM_SOURCE: Final = """
 import os
@@ -1728,6 +1735,16 @@ def _restore_previous_locked(state: RollbackState) -> bool:
             f"supervised rollback restored commit {state.previous_commit} "
             "but could not restore the maintained CLI pointer"
         )
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError):
+        bin_home = None
+    if bin_home is not None:
+        snapshot_restored = _restore_pre_confirmation_artifacts(bin_home)
+        startup_contract.cleanup_staging(bin_home)
+        if snapshot_restored:
+            _remove_pre_confirmation_artifacts()
+    _remove_confirmation_receipt()
     return True
 
 
@@ -1772,7 +1789,264 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
             f"supervised rollback restored commit {state.previous_commit} "
             "but could not restore the maintained CLI pointer"
         )
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError):
+        bin_home = None
+    if bin_home is not None:
+        snapshot_restored = _restore_pre_confirmation_artifacts(bin_home)
+        startup_contract.cleanup_staging(bin_home)
+        if snapshot_restored:
+            _remove_pre_confirmation_artifacts()
+    _remove_confirmation_receipt()
     return terminal
+
+
+def _pre_confirmation_artifacts_path() -> Path:
+    """Return the durable path for the pre-confirmation startup-artifact snapshot.
+
+    Returns:
+        The snapshot path under the deploy state directory.
+    """
+    return state_root() / "deploy" / _PRE_CONFIRMATION_ARTIFACTS_NAME
+
+
+def _snapshot_pre_confirmation_artifacts(bin_home: Path) -> None:
+    """Durably preserve the current startup artifacts before confirmation mutates them.
+
+    The snapshot always records all three artifact keys: ``None`` for absent
+    artifacts, or a list of integers (0..255) for present artifacts.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+    """
+    raw = startup_contract.snapshot_startup_artifacts(bin_home)
+    snapshot = dict[str, object](raw.items())
+    write_json_durable(_pre_confirmation_artifacts_path(), snapshot)
+
+
+def _restore_pre_confirmation_artifacts(bin_home: Path) -> bool:
+    """Restore startup artifacts from the pre-confirmation snapshot during rollback.
+
+    Returns ``True`` only when every recorded artifact (including launcher
+    executable mode) was restored successfully.  If no snapshot exists or
+    any restore step fails, returns ``False`` so the caller retains the
+    snapshot for later recovery.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Returns:
+        ``True`` when all artifacts were restored; ``False`` otherwise.
+    """
+    snapshot = _read_pre_confirmation_snapshot()
+    if snapshot is None:
+        return False
+    try:
+        startup_contract.restore_startup_artifacts(snapshot, bin_home)
+        append_deploy_log("startup artifacts restored from pre-confirmation snapshot")
+    except (DurabilityError, OSError) as exc:
+        append_deploy_log(f"warning: could not restore pre-confirmation startup artifacts: {exc}")
+        return False
+    return _verify_restored_launcher_mode(
+        bin_home, had_launcher=snapshot.get("launcher") is not None
+    )
+
+
+_SNAPSHOT_KNOWN_KEYS: Final = frozenset({"contract", "definition", "launcher"})
+
+
+def _read_pre_confirmation_snapshot() -> dict[str, list[int] | None] | None:
+    """Read and decode the pre-confirmation snapshot.
+
+    Requires exactly the three known artifact keys (contract, definition,
+    launcher) with no missing or unknown keys.  Missing or extra keys are
+    treated as malformed so rollback never interprets them as absence.
+
+    Returns:
+        The decoded snapshot, or ``None`` on any failure.
+    """
+    path = _pre_confirmation_artifacts_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if set(decoded.keys()) != _SNAPSHOT_KNOWN_KEYS:
+        return None
+    snapshot: dict[str, list[int] | None] = {}
+    for key in _SNAPSHOT_KNOWN_KEYS:
+        value = decoded[key]
+        if value is None:
+            snapshot[key] = None
+        elif isinstance(value, list) and all(
+            isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _MAX_BYTE_VALUE
+            for v in value
+        ):
+            snapshot[key] = value
+        else:
+            return None
+    return snapshot
+
+
+def _verify_restored_launcher_mode(bin_home: Path, *, had_launcher: bool) -> bool:
+    """Check the restored launcher has the required executable mode.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+        had_launcher: Whether the snapshot contained launcher bytes.
+
+    Returns:
+        ``True`` when mode is correct or launcher was not in snapshot.
+    """
+    if not had_launcher:
+        return True
+    launcher = bin_home / startup_contract.STARTUP_LAUNCHER_NAME
+    try:
+        mode = launcher.stat().st_mode & 0o777
+    except OSError:
+        return False
+    if mode != startup_contract.STARTUP_LAUNCHER_MODE:
+        append_deploy_log(
+            f"warning: restored launcher has mode {oct(mode)}, "
+            f"expected {oct(startup_contract.STARTUP_LAUNCHER_MODE)}"
+        )
+        return False
+    return True
+
+
+def _remove_pre_confirmation_artifacts() -> None:
+    """Remove the pre-confirmation startup-artifact snapshot after successful confirmation."""
+    path = _pre_confirmation_artifacts_path()
+    with suppress(DurabilityError, FileNotFoundError, OSError):
+        remove_durable(path)
+
+
+def _confirmation_receipt_path() -> Path:
+    """Return the durable path for the startup confirmation receipt."""
+    return state_root() / "deploy" / _CONFIRMATION_RECEIPT_NAME
+
+
+def _write_confirmation_receipt(commit: str, manifest: dict[str, object]) -> None:
+    """Durably record the content authority for promoted startup artifacts.
+
+    Stores the commit plus all hash/size fields from the successful staging
+    manifest so that repeat confirm can verify active artifacts against this
+    durable authority without re-reading the (now-deleted) staging manifest.
+
+    Args:
+        commit: The exact commit whose startup artifacts were promoted.
+        manifest: The staging manifest that was used for promotion.
+    """
+    receipt: dict[str, object] = {"commit": commit}
+    for key in (
+        "contract_hash",
+        "contract_size",
+        "definition_hash",
+        "definition_size",
+        "launcher_hash",
+        "launcher_size",
+    ):
+        receipt[key] = manifest.get(key)
+    write_json_durable(_confirmation_receipt_path(), receipt)
+
+
+def _read_confirmation_receipt() -> dict[str, object] | None:
+    """Read the durable confirmation receipt, treating corruption as absent.
+
+    Returns:
+        The receipt dict, or ``None`` if absent/corrupt.
+    """
+    path = _confirmation_receipt_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    commit = decoded.get("commit")
+    if not isinstance(commit, str):
+        return None
+    return decoded
+
+
+def _remove_confirmation_receipt() -> None:
+    """Remove the confirmation receipt during rollback."""
+    with suppress(DurabilityError, FileNotFoundError, OSError):
+        remove_durable(_confirmation_receipt_path())
+
+
+def _finalize_post_promotion(commit: str, manifest: dict[str, object], bin_home: Path) -> None:
+    """Write the durable content-authority receipt and clean up staging.
+
+    This must be called AFTER promotion succeeds and BEFORE returning
+    success to the caller.  The receipt write is durable so a crash after
+    this point leaves a recoverable state.  Staging cleanup happens only
+    after the receipt is durably written.
+
+    Args:
+        commit: The confirmed commit whose artifacts were promoted.
+        manifest: The staging manifest used for promotion.
+        bin_home: Directory containing the launcher scripts.
+
+    Raises:
+        DeployCtlError: If the receipt cannot be durably written.
+    """
+    try:
+        _write_confirmation_receipt(commit, manifest)
+    except (DurabilityError, OSError) as exc:
+        msg = "could not write startup confirmation receipt"
+        raise DeployCtlError(msg) from exc
+    startup_contract.cleanup_staging(bin_home)
+
+
+def _stage_candidate_startup_artifacts(commit: str) -> None:
+    """Run the candidate code's startup-contract staging to produce B's artifacts.
+
+    The candidate commit B's own ``lubko-deploy`` entry point is invoked
+    directly from B's sealed CLI environment so the staged bytes are generated
+    by B's loaded module, not by the current (A) runtime.  This preserves the
+    invariant that unconfirmed candidate artifacts never become startup
+    authority and that only B's code defines B's startup contract.
+
+    Args:
+        commit: Candidate commit hash whose CLI environment to use.
+
+    Raises:
+        DeployCtlError: If B's staging command fails.
+    """
+    cli_root = cli.cli_commit_dir(commit)
+    b_deploy_ctl = cli_root / ".venv" / "bin" / "lubko-deploy"
+    if not b_deploy_ctl.is_file():
+        msg = f"candidate CLI environment for {commit} is incomplete (lubko-deploy missing)"
+        raise DeployCtlError(msg)
+    try:
+        result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
+            [str(b_deploy_ctl), "startup-contract", "--write-staged"],
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        msg = f"candidate startup-artifact staging timed out for {commit}"
+        raise DeployCtlError(msg) from exc
+    except OSError as exc:
+        msg = f"could not execute candidate startup-artifact staging: {exc}"
+        raise DeployCtlError(msg) from exc
+    if result.returncode != 0:
+        stderr = result.stderr.strip()[-HELPER_ERROR_MAX_CHARS:]
+        msg = f"candidate startup-artifact staging failed for {commit}: {stderr}"
+        raise DeployCtlError(msg)
 
 
 def _finalize_supervised_confirmation(
@@ -2699,18 +2973,237 @@ def _finalize_confirmation(
     return terminal
 
 
+def _pre_terminalize(state: RollbackState, options: Options) -> int | None:
+    """Execute pre-terminalization steps and return the settled generation.
+
+    Authorizes the confirmation, prepares the candidate, stages B's startup
+    artifacts, and writes the staging manifest.
+
+    Args:
+        state: Pending mission.
+        options: Deployment options.
+
+    Returns:
+        The settled supervisor generation for ``_finalize_confirmation``,
+        or ``None`` for legacy ownership.
+
+    Raises:
+        DeployCtlError: If any pre-terminalization step fails.
+    """
+    _authorize_confirmation(state)
+    expected_generation = _prepare_confirmation_candidate(state, options)
+    _stage_candidate_startup_artifacts(state.commit)
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        msg = f"cannot confirm: startup artifact manifest write failed: {exc}"
+        raise DeployCtlError(msg) from exc
+    startup_contract.write_staging_manifest(state.commit, bin_home)
+    return expected_generation
+
+
+def _resolve_bin_home_or_fail() -> Path:
+    """Resolve the bin home path.
+
+    Returns:
+        The resolved bin home path.
+
+    Raises:
+        DeployCtlError: If the path cannot be resolved.
+    """
+    try:
+        return lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        msg = f"cannot confirm: startup artifact snapshot failed: {exc}"
+        raise DeployCtlError(msg) from exc
+
+
+def _write_snapshot_or_fail(bin_home: Path) -> None:
+    """Write the pre-confirmation snapshot.
+
+    Converts both :class:`DurabilityError` (from durable write) and
+    :class:`OSError` (from reading existing artifacts) into a clear
+    :class:`DeployCtlError` so confirmation fails before terminalization.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Raises:
+        DeployCtlError: If the snapshot cannot be recorded.
+    """
+    try:
+        _snapshot_pre_confirmation_artifacts(bin_home)
+    except (DurabilityError, OSError) as exc:
+        msg = "cannot confirm: pre-confirmation startup artifact snapshot could not be recorded"
+        raise DeployCtlError(msg) from exc
+
+
+def _durable_mission_matches(state: RollbackState) -> bool:
+    """Check if the durable mission state confirms the same commit.
+
+    Used after a post-terminalization exception to decide whether the durable
+    terminal write happened despite the exception.  Only STATUS_CONFIRMED
+    with the same commit and compatible ownership is checked — the generation
+    is deliberately ignored because ``_finalize_supervised_confirmation``
+    may write a *different* generation when a newer desired generation
+    supersedes the mission before the terminal lock is acquired.  In that
+    case the confirmed deployment is still valid and recovery data must be
+    retained.
+
+    Returns:
+        ``True`` when the durable state is STATUS_CONFIRMED with the same
+        commit and compatible ownership as ``state``.
+    """
+    try:
+        durable = read_rollback_state()
+    except DeployCtlError:
+        return False
+    return (
+        durable is not None
+        and durable.status == STATUS_CONFIRMED
+        and durable.commit == state.commit
+        and durable.supervisor_owned == state.supervisor_owned
+    )
+
+
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
     """Confirm one exact pending deployment as a single idempotent primitive.
+
+    Candidate startup artifacts are staged *before* the terminal state write
+    by invoking the candidate code's own staging command.  This ensures B's
+    startup artifacts are generated by B's loaded module, never by the
+    old (A) runtime.  A durable manifest binds the staged bytes to the exact
+    commit with content hashes.  Activation happens *after* the terminal
+    state write so that unconfirmed candidates never become startup authority.
+
+    A synchronous promotion failure after terminalization surfaces as
+    non-success to the caller: the durable confirmed state and staged
+    recovery data are preserved, but the response is ``ok: false`` until
+    promotion succeeds.  The ``STATUS_CONFIRMED`` fast path retries
+    idempotent promotion and fails closed if artifacts still don't match.
+
+    Exception discipline: after any exception, the durable mission state is
+    re-read to decide whether terminalization may have happened.  If the
+    durable state is still pending, staging + snapshot are cleaned up (B was
+    never confirmed).  If the durable state is terminal (STATUS_CONFIRMED),
+    staging + snapshot are retained for supervisor or retry promotion — the
+    durable terminal write precedes all potentially-raising post-write work
+    (CLI activation, GC, logging) so a crash/exception after that write must
+    not discard recovery data.
 
     Returns:
         Protocol response for the confirmed deployment.
     """
     state = _confirmation_state(request)
     if state.status == STATUS_CONFIRMED:
-        return _confirmation_response(state)
-    _authorize_confirmation(state)
-    expected_generation = _prepare_confirmation_candidate(state, options)
-    state = _finalize_confirmation(state, expected_generation)
+        return _confirmed_idempotent_response(state)
+    bin_home = _resolve_bin_home_or_fail()
+    _write_snapshot_or_fail(bin_home)
+    terminalized = False
+    try:
+        expected_generation = _pre_terminalize(state, options)
+        state = _finalize_confirmation(state, expected_generation)
+        terminalized = True
+    except BaseException:
+        if not terminalized and _durable_mission_matches(state):
+            terminalized = True
+        if not terminalized:
+            startup_contract.cleanup_staging(bin_home)
+            _remove_pre_confirmation_artifacts()
+        raise
+    # Read manifest before promotion (promotion retains it for crash safety).
+    manifest = startup_contract.read_staging_manifest()
+    promotion_error = startup_contract.promote_staged_artifacts(
+        state.commit, state.commit, bin_home
+    )
+    if promotion_error is not None:
+        msg = f"startup artifact promotion failed: {promotion_error}"
+        append_deploy_log(msg)
+        return {"type": "confirm", "ok": False, "commit": state.commit, "error": msg}
+    # Finalize: write receipt then clean staging.
+    if manifest is not None:
+        try:
+            _finalize_post_promotion(state.commit, manifest, bin_home)
+        except DeployCtlError as exc:
+            msg = f"startup artifact confirmation receipt could not be written: {exc}"
+            append_deploy_log(msg)
+            return {"type": "confirm", "ok": False, "commit": state.commit, "error": msg}
+    _remove_pre_confirmation_artifacts()
+    return _confirmation_response(state)
+
+
+def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
+    """Handle the STATUS_CONFIRMED fast path with idempotent promotion.
+
+    When confirmation is retried for an already-terminal mission, the
+    startup artifacts may still be stale from a prior crash between
+    terminalization and promotion.  This function retries idempotent
+    promotion using the retained manifest and staged bytes.
+
+    A durable confirmation receipt records the content authority (commit
+    plus hashes/sizes) after successful promotion.  On repeat confirm,
+    the receipt is checked first and active artifacts are verified against
+    it.  If active bytes have drifted or the receipt is corrupt/wrong-commit,
+    a retained valid staging manifest can repair them.
+
+    Fails closed if bin_home cannot be resolved: returning success without
+    verifying artifacts would be a false positive.
+
+    Args:
+        state: Terminal confirmed mission state.
+
+    Returns:
+        Protocol response — success only when artifacts match.
+    """
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        return {
+            "type": "confirm",
+            "ok": False,
+            "commit": state.commit,
+            "error": f"startup artifact promotion incomplete: cannot resolve bin home: {exc}",
+        }
+    # Check durable receipt: verify active artifacts against content authority.
+    receipt = _read_confirmation_receipt()
+    if receipt is not None and receipt.get("commit") == state.commit:
+        error = startup_contract.verify_active_artifacts_match(receipt, bin_home)
+        if error is None:
+            return _confirmation_response(state)
+        # Active artifacts drifted despite receipt — try repair via manifest.
+    # No receipt, wrong-commit receipt, or drift — attempt promotion.
+    # Read manifest before promotion (promotion retains it for crash safety).
+    manifest = startup_contract.read_staging_manifest()
+    promotion_error = startup_contract.promote_staged_artifacts(
+        state.commit, state.commit, bin_home
+    )
+    if promotion_error is not None:
+        return {
+            "type": "confirm",
+            "ok": False,
+            "commit": state.commit,
+            "error": f"startup artifact promotion incomplete: {promotion_error}",
+        }
+    # Promotion succeeded — finalize: write receipt then clean staging.
+    if manifest is not None:
+        verify_error = startup_contract.verify_active_artifacts_match(manifest, bin_home)
+        if verify_error is not None:
+            return {
+                "type": "confirm",
+                "ok": False,
+                "commit": state.commit,
+                "error": f"startup artifact verification failed after promotion: {verify_error}",
+            }
+        try:
+            _finalize_post_promotion(state.commit, manifest, bin_home)
+        except DeployCtlError as exc:
+            return {
+                "type": "confirm",
+                "ok": False,
+                "commit": state.commit,
+                "error": f"startup artifact confirmation receipt could not be written: {exc}",
+            }
+    _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 
 
