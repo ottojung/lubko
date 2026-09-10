@@ -195,15 +195,22 @@ with tarfile.open(tarball, 'r:gz') as tf:
 "
 
 printf '%s\n' '--- OpenCode version check ---'
-OPENCODE_OUTPUT=$("${BIN_HOME}/opencode" version 2>&1)
-OPENCODE_EXIT=$?
-OPENCODE_TRIMMED=$(printf '%s' "$OPENCODE_OUTPUT")
-if [ "$OPENCODE_EXIT" -ne 0 ]; then
-  fail "opencode version exited ${OPENCODE_EXIT}"
-elif [ "$OPENCODE_TRIMMED" != "${OPENCODE_VERSION}" ]; then
-  fail "opencode version output '${OPENCODE_TRIMMED}' != expected '${OPENCODE_VERSION}'"
+if OPENCODE_OUTPUT=$("${BIN_HOME}/opencode" --version 2>&1); then
+  OPENCODE_TRIMMED=$(printf '%s' "$OPENCODE_OUTPUT")
+  if [ "$OPENCODE_TRIMMED" = "${OPENCODE_VERSION}" ]; then
+    pass "opencode --version == ${OPENCODE_VERSION}"
+  else
+    fail "opencode --version output '${OPENCODE_TRIMMED}' != expected '${OPENCODE_VERSION}'"
+  fi
 else
-  pass "opencode version == ${OPENCODE_VERSION}"
+  fail "opencode --version exited non-zero"
+fi
+
+printf '%s\n' '--- OpenCode credential-free smoke ---'
+if "${BIN_HOME}/opencode" run --help >/dev/null 2>&1; then
+  pass "opencode run --help"
+else
+  fail "opencode run --help"
 fi
 
 # ===========================================================================
