@@ -27,13 +27,13 @@ def test_status_json_preserves_canonical_steer_queue_output() -> None:
     assert queued["steer_metadata_error"] is None
 
 
-@pytest.mark.parametrize("value", [0, 1, False, True, {}, "", "oops"])
-def test_status_json_fails_closed_on_malformed_steer_queue(value: object) -> None:
+def test_status_json_fails_closed_on_malformed_steer_queue() -> None:
     """Malformed queue containers surface an explicit diagnostic."""
-    status = _status({"steer_seq": 0, "steer_queue": value})
-    assert status["steers_pending"] is None
-    assert status["next_steer"] is None
-    assert status["steer_metadata_error"] == "malformed persisted steer metadata"
+    for value in [0, 1, False, True, {}, "", "oops"]:
+        status = _status({"steer_seq": 0, "steer_queue": value})
+        assert status["steers_pending"] is None
+        assert status["next_steer"] is None
+        assert status["steer_metadata_error"] == "malformed persisted steer metadata"
 
 
 @pytest.mark.parametrize(

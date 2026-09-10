@@ -70,11 +70,11 @@ def test_absent_and_boolean_previous_retiring_parse(*, value: object, expected: 
     assert dc.RollbackState.from_dict(payload).previous_retiring is expected
 
 
-@pytest.mark.parametrize("malformed", [None, 1, 0, "true", "", {}, [], [True]])
-def test_present_non_boolean_previous_retiring_fails_closed(malformed: object) -> None:
+def test_present_non_boolean_previous_retiring_fails_closed() -> None:
     """A present non-boolean ``previous_retiring`` (including null) is malformed."""
-    with pytest.raises(dc.DeployCtlError):
-        dc.RollbackState.from_dict(rollback_payload(previous_retiring=malformed))
+    for malformed in [None, 1, 0, "true", "", {}, [], [True]]:  # type: ignore[var-annotated]
+        with pytest.raises(dc.DeployCtlError):
+            dc.RollbackState.from_dict(rollback_payload(previous_retiring=malformed))
 
 
 def test_present_null_previous_retiring_is_malformed_unlike_absent(
@@ -150,12 +150,12 @@ def test_present_malformed_authority_scalar_fails_closed(field: str, malformed: 
         dc.RollbackState.from_dict(rollback_payload(**{field: malformed}))
 
 
-@pytest.mark.parametrize("field", ["deadline", "stop_grace_seconds", "git_timeout_seconds"])
-@pytest.mark.parametrize("value", [1, 1.25])
-def test_finite_json_numbers_remain_accepted(field: str, value: float) -> None:
+def test_finite_json_numbers_remain_accepted() -> None:
     """Finite positive JSON integers and floats remain valid for durable numeric fields."""
-    parsed = dc.RollbackState.from_dict(rollback_payload(**{field: value}))
-    assert getattr(parsed, field) == pytest.approx(value)
+    for field in ["deadline", "stop_grace_seconds", "git_timeout_seconds"]:
+        for value in [1, 1.25]:
+            parsed = dc.RollbackState.from_dict(rollback_payload(**{field: value}))
+            assert getattr(parsed, field) == pytest.approx(value)
 
 
 def test_zero_deadline_remains_valid() -> None:

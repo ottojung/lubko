@@ -124,16 +124,14 @@ def test_list_valid_activity_and_completion_timestamps_are_preserved(field: str)
     assert "metadata_errors" not in entry
 
 
-@pytest.mark.parametrize("field", ["last_activity_at", "finished_at"])
-@pytest.mark.parametrize("value", ["1", False, float("nan"), float("inf"), -1, {}, []])
-def test_list_malformed_activity_and_completion_timestamps_are_diagnostic(
-    field: str, value: object
-) -> None:
+def test_list_malformed_activity_and_completion_timestamps_are_diagnostic() -> None:
     """Malformed list timestamps are sanitized instead of copied verbatim."""
-    meta: agent.Meta = {field: value}
-    entry = agent._entry_json("abc", "idle", meta)
-    assert entry[field] is None
-    assert entry["metadata_errors"] == [field]
+    for field in ["last_activity_at", "finished_at"]:
+        for value in ["1", False, float("nan"), float("inf"), -1, {}, []]:
+            meta: agent.Meta = {field: value}
+            entry = agent._entry_json("abc", "idle", meta)
+            assert entry[field] is None
+            assert entry["metadata_errors"] == [field]
 
 
 def test_list_timestamp_validation_matches_status() -> None:
