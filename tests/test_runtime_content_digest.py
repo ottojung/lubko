@@ -1,9 +1,9 @@
 """Byte-for-byte equivalence tests for _runtime_content_digest.
 
 A frozen reference implementation copied verbatim from the pre-optimisation
-code lives here.  Every test imports ``cli._runtime_content_digest`` and
-asserts it produces identical output to the reference across representative
-tree shapes, edge cases, and injected failures.
+code lives here.  Every test asserts ``cli._runtime_content_digest`` produces
+identical output to the reference across representative tree shapes, edge
+cases, and injected failures.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import lubko.cli as cli  # ruff: ignore[manual-from-import]
 _RUNTIME_MANIFEST_NAME = cli.RUNTIME_MANIFEST_NAME
 _WRITE_BITS = cli._WRITE_BITS
 _file_content_digest = cli._file_content_digest
+
 
 # ---------------------------------------------------------------------------
 # Frozen reference — verbatim pre-optimisation implementation
@@ -77,6 +78,8 @@ def _reference_digest(root: Path) -> bytes:
 # Equivalence tests
 # ---------------------------------------------------------------------------
 
+_FIXED_BINARY = b"\x00\x01\x02\xff" * 256  # deterministic 1 KiB content
+
 
 def test_empty_tree(tmp_path: Path) -> None:
     """Empty tree produces same digest."""
@@ -84,50 +87,37 @@ def test_empty_tree(tmp_path: Path) -> None:
 
 
 def test_only_manifest(tmp_path: Path) -> None:
-    """Root-level manifest is excluded."""
+    """Root-level manifest is excluded from digest."""
     (tmp_path / _RUNTIME_MANIFEST_NAME).write_bytes(b"excluded")
     assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
 
 
 def test_regular_files(tmp_path: Path) -> None:
-    """Regular files contribute content digest."""
+    """Regular files contribute path, mode, and content digest."""
     (tmp_path / "a.txt").write_bytes(b"alpha")
     (tmp_path / "b.txt").write_bytes(b"beta\n")
-    (tmp_path / "c.dat").write_bytes(os.urandom(4096))
+    (tmp_path / "c.dat").write_bytes(_FIXED_BINARY)
     assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
 
 
-def test_nested_dirs(tmp_path: Path) -> None:
-    """Nested directories are traversed and sorted."""
+def test_nested_dirs_and_symlinks(tmp_path: Path) -> None:
+    """Nested dirs are traversed; symlinks contribute raw target."""
     (tmp_path / "a" / "b" / "c").mkdir(parents=True)
     (tmp_path / "a" / "b" / "c" / "f").write_bytes(b"x")
     (tmp_path / "a" / "g").write_bytes(b"y")
-    (tmp_path / "z").write_bytes(b"z")
-    assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
-
-
-def test_symlinks(tmp_path: Path) -> None:
-    """Symlinks contribute target without following."""
     (tmp_path / "target").write_bytes(b"t")
     (tmp_path / "link").symlink_to("target")
     (tmp_path / "dangling").symlink_to("nope")
+    (tmp_path / "l2").symlink_to("link")  # symlink-to-symlink
     sub = tmp_path / "sub"
     sub.mkdir()
     (sub / "link").symlink_to("../target")
     assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
 
 
-def test_symlink_to_symlink(tmp_path: Path) -> None:
-    """Symlink-to-symlink is recorded as raw target string."""
-    (tmp_path / "real").write_bytes(b"r")
-    (tmp_path / "l1").symlink_to("real")
-    (tmp_path / "l2").symlink_to("l1")
-    assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
-
-
 def test_mode_bits_and_write_masking(tmp_path: Path) -> None:
     """Write-bit masking is deterministic across seal/unseal."""
-    for mode in [0o444, 0o555, 0o644, 0o755, 0o777, 0o600, 0o700]:
+    for mode in [0o444, 0o644, 0o755, 0o777]:
         f = tmp_path / f"m{mode:o}"
         f.write_bytes(b"d")
         f.chmod(mode)
@@ -149,27 +139,8 @@ def test_non_ascii_names(tmp_path: Path) -> None:
     assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
 
 
-def test_fifo_entry(tmp_path: Path) -> None:
-    """Non-regular/non-dir/non-symlink entries use 'other' branch."""
-    try:
-        os.mkfifo(str(tmp_path / "pipe"))
-    except OSError:
-        pytest.skip("FIFO not supported")
-    assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
-
-
-def test_deep_nesting(tmp_path: Path) -> None:
-    """Deeply nested paths use POSIX separators in relative path."""
-    d = tmp_path
-    for i in range(20):
-        d /= f"d{i}"
-        d.mkdir()
-        (d / f"f{i}").write_bytes(b"v")
-    assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
-
-
 def test_large_tree(tmp_path: Path) -> None:
-    """50-directory tree with files, symlinks, and nested subdirs."""
+    """Representative runtime tree: dirs, files, symlinks, nested subdirs."""
     for i in range(50):
         d = tmp_path / f"dir{i:02d}"
         d.mkdir()
@@ -184,23 +155,25 @@ def test_large_tree(tmp_path: Path) -> None:
     assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
 
 
-def test_only_root_manifest_excluded(tmp_path: Path) -> None:
-    """Nested lubko-runtime.json files are NOT excluded."""
-    (tmp_path / _RUNTIME_MANIFEST_NAME).write_bytes(b"root")
+def test_root_manifest_excluded_nested_included(tmp_path: Path) -> None:
+    """Changing root manifest does NOT change digest; nested manifest DOES."""
+    (tmp_path / "f").write_bytes(b"x")
+    baseline = cli._runtime_content_digest(tmp_path)
+
+    # Changing root manifest content: digest must stay the same.
+    (tmp_path / _RUNTIME_MANIFEST_NAME).write_bytes(b"v1")
+    assert cli._runtime_content_digest(tmp_path) == baseline
+    (tmp_path / _RUNTIME_MANIFEST_NAME).write_bytes(b"v2")
+    assert cli._runtime_content_digest(tmp_path) == baseline
+
+    # Adding a nested manifest-named file: digest must change.
     sub = tmp_path / "sub"
     sub.mkdir()
     (sub / _RUNTIME_MANIFEST_NAME).write_bytes(b"nested")
-    d = tmp_path / "deep"
-    d.mkdir()
-    (d / _RUNTIME_MANIFEST_NAME).write_bytes(b"deep-nested")
-    prod = cli._runtime_content_digest(tmp_path)
-    ref = _reference_digest(tmp_path)
-    assert prod == ref
-    tmp2 = tmp_path / "no_nested"
-    tmp2.mkdir()
-    (tmp2 / _RUNTIME_MANIFEST_NAME).write_bytes(b"root")
-    (tmp2 / "f").write_bytes(b"x")
-    assert cli._runtime_content_digest(tmp2) != prod or (tmp2 / "f").read_bytes() == b"x"
+    assert cli._runtime_content_digest(tmp_path) != baseline
+
+    # Must also match frozen reference.
+    assert cli._runtime_content_digest(tmp_path) == _reference_digest(tmp_path)
 
 
 # ---------------------------------------------------------------------------

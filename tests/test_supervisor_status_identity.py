@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path  # ruff: ignore[typing-only-standard-library-import]
 
 import pytest
@@ -71,6 +72,17 @@ def test_reused_pid_between_proof_and_cmdline_is_stale(
 
     monkeypatch.setattr(supervise, "_open_supervisor_pidfd", fake_open_pidfd)
     monkeypatch.setattr(supervise, "_pidfd_send_signal", fake_send_gone)
+    # Eliminate real sleep and CPU-spin: advance the fake clock past the
+    # deadline on the first monotonic() call so the poll loop runs once.
+    call_count = 0
+
+    def _fake_monotonic() -> float:
+        nonlocal call_count
+        call_count += 1
+        return 0.0 if call_count == 1 else 1.0
+
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    monkeypatch.setattr(time, "monotonic", _fake_monotonic)
 
     assert supervise.read_status() is None
     assert supervise.wait_until_ready(7, timeout_seconds=0.05) is False
