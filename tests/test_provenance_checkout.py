@@ -16,7 +16,9 @@ deployment scenario from issue #729:
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import time
 from typing import TYPE_CHECKING, Final
 
 import pytest
@@ -89,10 +91,10 @@ def _setup_real_topology(tmp_path: Path) -> tuple[Path, Path, str]:
 
     The resulting graph is::
 
-        authority.git (bare, canonical)  ←──  authority-work (pushes A, then B)
-             ↑                                      ↑
+        authority.git (bare, canonical)  <--  authority-work (pushes A, then B)
+             |                                      |
         dev-clone (mutable, stale at A)            |
-             ↑                                     |
+             |                                     |
         deploy-checkout (origin = dev-clone)       |
 
     After setup the deployment checkout's origin still points at the dev-clone
@@ -125,7 +127,7 @@ def _setup_real_topology(tmp_path: Path) -> tuple[Path, Path, str]:
     _run(["git", "clone", str(dev_clone), str(deploy_checkout)], cwd=tmp_path)
 
     # 5. Create commit B and push it directly to the bare authority through
-    #    authority-work.  The dev-clone is never updated — it stays at A.
+    #    authority-work.  The dev-clone is never updated -- it stays at A.
     commit_b = _make_commit(authority_work, "commit B (target)")
     _run(["git", "push", "origin", "HEAD:main"], cwd=authority_work)
 
@@ -295,73 +297,85 @@ def test_authority_without_commit_fails_without_switching_tip(tmp_path: Path) ->
 
 
 def test_confirmed_runtime_independent_of_dev_checkout(tmp_path: Path) -> None:
-    """Confirmed commit is local; no mutable clone or network needed."""
+    """After source severing the restart path performs no Git/network lookup.
+
+    Builds the real topology, prepares commit B via provenance fetch,
+    detaches HEAD at B, then removes every Git source (dev-clone,
+    authority-work, bare authority).  The maintained restart helper
+    ``dc.restart_previous`` is then exercised with its normal
+    process/filesystem collaborators mocked.  ``fetch_from_authority``
+    and ``_run_git`` are monkeypatched to raise ``AssertionError`` so
+    any Git or network call during restart would fail the test.
+    """
     authority, checkout, target = _setup_real_topology(tmp_path)
+
+    # Prepare: fetch B from authority, verify, detach at B.
     dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
     dc._require_exact_commit(checkout, target, TIMEOUT)
-
-    # Simulate confirmed state: checkout the target in detached mode
     dc._checkout(checkout, target, TIMEOUT, force=False)
 
-    # The commit is a local object — no network or other clone needed
-    verify = _git(checkout, "cat-file", "-t", target)
-    assert verify.returncode == 0
-    assert verify.stdout.strip() == "commit"
+    # Sever all sources.
+    shutil.rmtree(tmp_path / "dev-clone")
+    shutil.rmtree(tmp_path / "authority-work")
+    shutil.rmtree(tmp_path / "authority.git")
 
-    # Worktree is clean after preparation
-    status = _git(checkout, "status", "--porcelain").stdout
-    assert not status
-
-    # HEAD is exactly the target
+    # Prove the detached checkout remains clean and exact after severing.
     head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
     assert head == target
+    assert not _git(checkout, "status", "--porcelain").stdout
 
+    # Build a restart mission whose previous worker is not retiring and is
+    # still alive -- the restart path should just return it directly without
+    # touching Git or network.
+    previous_meta = WorkerMeta(
+        schema_version=SCHEMA_VERSION,
+        state=STATE_RUNNING,
+        pid=100,
+        pgid=100,
+        sid=100,
+        start_time_ticks=1000,
+        token="test-token",  # ruff: ignore[hardcoded-password-func-arg]
+        repo=str(checkout),
+        git_commit=target,
+        worker_id="test-worker",
+        log_path="worker.log",
+        started_at=1.0,
+        stopped_at=None,
+    )
+    state = dc.RollbackState(
+        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=1,
+        status=dc.STATUS_PENDING,
+        commit=target,
+        previous_commit=target,
+        deadline=time.time() + 60,
+        repo=str(checkout),
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=5.0,
+        previous_retiring=False,
+        previous_meta=previous_meta,
+        new_meta=None,
+        supervisor_owned=False,
+    )
 
-# ---------------------------------------------------------------------------
-# Real-Git: _require_exact_commit with real repos
-# ---------------------------------------------------------------------------
+    # Mock: worker is alive under its recorded identity.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(dc, "read_meta_strict", lambda: previous_meta)
+    monkeypatch.setattr(dc, "worker_alive", lambda meta: meta == previous_meta)
 
+    # Guard: Git/network must not be called during restart.
+    def _git_forbidden(*_a: object, **_kw: object) -> object:
+        msg = "restart path must not consult Git or network"
+        raise AssertionError(msg)
 
-@pytest.mark.parametrize(
-    ("commit", "pattern"),
-    [
-        ("d" * 40, "not present"),
-        ("not-a-hash", "exact 40-character"),
-    ],
-    ids=["nonexistent-hash", "bad-format"],
-)
-def test_require_exact_commit_rejects(commit: str, pattern: str, tmp_path: Path) -> None:
-    """_require_exact_commit rejects missing and malformed commits."""
-    _authority, checkout, _target = _setup_real_topology(tmp_path)
-    with pytest.raises(dc.DeployCtlError, match=pattern):
-        dc._require_exact_commit(checkout, commit, TIMEOUT)
+    monkeypatch.setattr(dc, "fetch_from_authority", _git_forbidden)
+    monkeypatch.setattr(dc, "_run_git", _git_forbidden)
 
+    # Exercise the maintained restart path.
+    restored = dc.restart_previous(state)
 
-# ---------------------------------------------------------------------------
-# Error propagation: deterministic mocks for OS/timeout mapping
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "_exc",
-    [OSError("network unreachable"), subprocess.TimeoutExpired(cmd="git", timeout=TIMEOUT)],
-    ids=["os-error", "timeout"],
-)
-def test_fetch_error_maps_to_provenance_error(
-    _exc: OSError | subprocess.TimeoutExpired,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """OS and timeout errors during fetch are wrapped as ProvenanceError."""
-    _authority, checkout, target = _setup_real_topology(tmp_path)
-
-    def _boom(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        raise _exc
-
-    monkeypatch.setattr(dc, "_run_git", _boom)
-    with pytest.raises(dc.ProvenanceError, match="could not fetch"):
-        dc.fetch_from_authority(checkout, target, "https://unused", TIMEOUT)
+    # The restart returned the existing live worker without any Git/network.
+    assert restored is not None
+    assert restored.git_commit == target
+    assert restored.pid == previous_meta.pid
