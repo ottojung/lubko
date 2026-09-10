@@ -13,6 +13,7 @@ from typing import Final
 
 import pytest
 
+from lubko import cli as lc_cli
 from lubko import deployctl as dc
 from lubko import lifecycle, lifecycle_state
 
@@ -526,3 +527,239 @@ def test_source_url_persisted_in_rollback_state() -> None:
     assert state.source_url == SOURCE_URL
     raw = state.to_dict()
     assert raw["source_url"] == SOURCE_URL
+
+
+# ---------------------------------------------------------------------------
+# End-to-end lifecycle deploy path: --source-url forwarded to provenance check
+# ---------------------------------------------------------------------------
+
+
+def test_lifecycle_deploy_forwards_source_url_to_provenance_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """lubko-deploy deploy --source-url forwards the URL to fetch_from_authority.
+
+    This is the blocking regression: source_url was parsed into DeployOptions
+    but never reaching the deployctl provenance check.  The lifecycle
+    _validate_and_prepare path must call fetch_from_authority with the exact
+    declared URL when source_url is set.
+    """
+    fetch_calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
+
+    def fake_run_validation(*_args: object) -> object:
+        class R:
+            ok = True
+            detail = ""
+
+        return R()
+
+    monkeypatch.setattr(lifecycle, "run_validation", fake_run_validation)
+
+    # git_commit returns a deterministic HEAD
+    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: COMMIT)
+
+    def fake_fetch_authority(
+        _repo: Path,
+        commit: str,
+        source_url: str,
+        _timeout: float,
+    ) -> None:
+        fetch_calls.append((commit, source_url))
+
+    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_authority)
+    monkeypatch.setattr(lc_cli, "build_cli_root", lambda *_a: None)
+
+    options = lifecycle.DeployOptions(
+        repo=Path("/workspace/Lubko"),
+        uv_path="uv",
+        bootstrap=False,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=1.0,
+        source_url=SOURCE_URL,
+    )
+
+    commit = lifecycle._validate_and_prepare(options)
+
+    # The exact source URL was forwarded exactly once
+    assert fetch_calls == [(COMMIT, SOURCE_URL)]
+    assert commit == COMMIT
+
+
+def test_lifecycle_deploy_skips_provenance_when_no_source_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When --source-url is absent, no provenance fetch occurs."""
+    fetch_calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
+
+    def fake_run_validation(*_args: object) -> object:
+        class R:
+            ok = True
+            detail = ""
+
+        return R()
+
+    monkeypatch.setattr(lifecycle, "run_validation", fake_run_validation)
+    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: COMMIT)
+
+    def fake_fetch_authority(
+        _repo: Path,
+        commit: str,
+        source_url: str,
+        _timeout: float,
+    ) -> None:
+        fetch_calls.append((commit, source_url))
+
+    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_authority)
+    monkeypatch.setattr(lc_cli, "build_cli_root", lambda *_a: None)
+
+    options = lifecycle.DeployOptions(
+        repo=Path("/workspace/Lubko"),
+        uv_path="uv",
+        bootstrap=False,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=1.0,
+    )
+
+    commit = lifecycle._validate_and_prepare(options)
+
+    assert fetch_calls == []
+    assert commit == COMMIT
+
+
+def test_lifecycle_deploy_provenance_failure_aborts_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provenance failure in _validate_and_prepare aborts without touching the worker."""
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
+
+    def fake_run_validation(*_args: object) -> object:
+        class R:
+            ok = True
+            detail = ""
+
+        return R()
+
+    monkeypatch.setattr(lifecycle, "run_validation", fake_run_validation)
+    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: COMMIT)
+
+    def fake_fetch_authority(
+        _repo: Path,
+        _commit: str,
+        _source_url: str,
+        _timeout: float,
+    ) -> None:
+        msg = "source does not have the commit"
+        raise dc.ProvenanceError(msg)
+
+    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_authority)
+    build_calls: list[str] = []
+
+    def fake_build_cli_root(*_args: object) -> None:
+        build_calls.append("called")
+
+    monkeypatch.setattr(lc_cli, "build_cli_root", fake_build_cli_root)
+
+    options = lifecycle.DeployOptions(
+        repo=Path("/workspace/Lubko"),
+        uv_path="uv",
+        bootstrap=False,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=1.0,
+        source_url=SOURCE_URL,
+    )
+
+    with pytest.raises(lifecycle.DeployAbortedError):
+        lifecycle._validate_and_prepare(options)
+
+    # CLI environment was never built after provenance failure
+    assert build_calls == []
+
+
+def test_lifecycle_deploy_source_url_backward_compatible() -> None:
+    """DeployOptions without source_url defaults to None and skips provenance."""
+    options = lifecycle.DeployOptions(
+        repo=Path(),
+        uv_path="uv",
+        bootstrap=False,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=1.0,
+    )
+
+    assert options.source_url is None
+
+
+# ---------------------------------------------------------------------------
+# Handoff serialization: source_url in queue-deploy helper
+# ---------------------------------------------------------------------------
+
+
+def test_queue_deploy_helper_forwards_source_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The queue-deploy helper path calls _validate_and_prepare which uses source_url."""
+    fetch_calls: list[tuple[str, str]] = []
+    prepared_commits: list[str] = []
+
+    # Mock the validation chain
+    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
+
+    def fake_run_validation(*_args: object) -> object:
+        class R:
+            ok = True
+            detail = ""
+
+        return R()
+
+    monkeypatch.setattr(lifecycle, "run_validation", fake_run_validation)
+    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: COMMIT)
+
+    def fake_fetch_authority(
+        _repo: Path,
+        commit: str,
+        source_url: str,
+        _timeout: float,
+    ) -> None:
+        fetch_calls.append((commit, source_url))
+
+    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_authority)
+    monkeypatch.setattr(lc_cli, "build_cli_root", lambda *_a: None)
+
+    options = lifecycle.DeployOptions(
+        repo=Path("/workspace/Lubko"),
+        uv_path="uv",
+        bootstrap=False,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=1.0,
+        source_url=SOURCE_URL,
+    )
+
+    # Both manual and queue paths call _validate_and_prepare
+    commit = lifecycle._validate_and_prepare(options)
+    prepared_commits.append(commit)
+
+    assert fetch_calls == [(COMMIT, SOURCE_URL)]
+    assert prepared_commits == [COMMIT]
