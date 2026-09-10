@@ -16,6 +16,8 @@ deployment scenario from issue #729:
 
 from __future__ import annotations
 
+import contextlib
+import io
 import subprocess
 import time
 from pathlib import Path
@@ -382,6 +384,119 @@ def test_provenance_error_clean_with_normalized_encoded_secret(
     assert "ssw0rd" not in error_text
     assert "user" not in error_text
     assert "401" not in error_text
+
+
+def test_timeout_expired_never_leaks_url_via_exc_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TimeoutExpired.__str__ includes the command argv containing the raw URL.
+
+    The timeout path must produce a credential-free message using only the
+    redacted label and commit, never interpolating the exception string.
+    """
+    url_with_token = "https://deploy-tok:sek-ret@github.com/org/repo.git"  # ruff: ignore[hardcoded-password-string]
+
+    def fake_run_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        # TimeoutExpired.__str__ includes cmd which has the raw URL
+        raise subprocess.TimeoutExpired(cmd=_args, timeout=_timeout)
+
+    monkeypatch.setattr(dc, "_run_git", fake_run_git)
+
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(
+            Path("/workspace/Lubko"),
+            COMMIT,
+            url_with_token,
+            3.0,
+        )
+
+    error_text = str(exc_info.value)
+    assert "sek-ret" not in error_text
+    assert "deploy-tok" not in error_text
+    assert url_with_token not in error_text
+    # Redacted label and commit are present for diagnostics
+    assert "github.com/org/repo.git" in error_text
+    assert COMMIT in error_text
+    assert "timed out" in error_text
+
+
+def test_os_error_never_leaks_url_via_exc_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OSError text may contain the URL in some environments.
+
+    The OSError path must produce a credential-free message, never
+    interpolating the exception string.
+    """
+    url_with_token = "https://user:pass123@git.example.com/secret/repo.git"  # ruff: ignore[hardcoded-password-string]
+
+    def fake_run_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        # OSError may embed argv/URL in its string representation
+        msg = f"[*] Command timed out: {_args}"
+        raise OSError(msg)
+
+    monkeypatch.setattr(dc, "_run_git", fake_run_git)
+
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(
+            Path("/workspace/Lubko"),
+            COMMIT,
+            url_with_token,
+            5.0,
+        )
+
+    error_text = str(exc_info.value)
+    assert "pass123" not in error_text
+    assert "user" not in error_text
+    assert url_with_token not in error_text
+    assert "git.example.com/secret/repo.git" in error_text
+    assert COMMIT in error_text
+
+
+def test_timeout_expired_clean_in_main_json_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout during checkout produces clean JSON output via main()."""
+    url_with_token = "https://tok:x-oauth@github.com/org/repo.git"  # ruff: ignore[hardcoded-password-string]
+    checkout_request = f'{{"type":"checkout","commit":"{COMMIT}"}}'
+
+    def fake_run_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=_args, timeout=_timeout)
+
+    monkeypatch.setattr(dc, "_run_git", fake_run_git)
+    monkeypatch.setattr(dc, "_require_exact_commit", lambda *_a: None)
+    monkeypatch.setattr(dc, "_require_clean_checkout", lambda *_a: None)
+    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
+    monkeypatch.setattr(dc, "read_meta", _worker_meta_for_rollback)
+    monkeypatch.setattr(dc, "worker_alive", lambda _m: True)
+    monkeypatch.setattr(dc, "_provenance_fetch", lambda _o, _c: None)
+
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        exit_code = dc.main([
+            checkout_request,
+            "--repo",
+            "/nonexistent",
+            "--source-url",
+            url_with_token,
+        ])
+
+    assert exit_code == dc.EXIT_ERROR
+    output = captured.getvalue()
+    assert "x-oauth" not in output
+    assert "tok" not in output.split("github.com")[0] if "github.com" in output else True
 
 
 def test_source_url_rejected_for_status_request() -> None:

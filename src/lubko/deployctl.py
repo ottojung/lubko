@@ -1000,8 +1000,15 @@ def fetch_from_authority(
     label = _redact_source_url(source_url)
     try:
         proc = _run_git(repo, ("fetch", "--depth=1", source_url, commit), timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        msg = f"could not fetch commit {commit} from source authority {label!r}: {exc}"
+    except subprocess.TimeoutExpired:
+        msg = f"fetching commit {commit} from source authority {label!r} timed out after {timeout}s"
+        raise ProvenanceError(msg) from None
+    except OSError as exc:
+        errno_part = f" (errno {exc.errno})" if getattr(exc, "errno", None) else ""
+        msg = (
+            f"could not execute git fetch from source authority "
+            f"{label!r} for commit {commit}{errno_part}"
+        )
         raise ProvenanceError(msg) from exc
     if proc.returncode != 0:
         if _has_userinfo(source_url):
