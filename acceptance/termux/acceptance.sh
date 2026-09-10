@@ -154,7 +154,7 @@ print(f'Downloaded to {dest}')
 
 printf '%s\n' '--- Verify SHA256 ---'
 python -c "
-import hashlib
+import hashlib, sys
 path = '${OPENCODE_TARBALL}'
 expected = '${OPENCODE_SHA256}'
 h = hashlib.sha256()
@@ -164,13 +164,13 @@ with open(path, 'rb') as f:
 got = h.hexdigest()
 if got != expected:
     print(f'FAIL: SHA256 mismatch: expected {expected}, got {got}')
-    raise SystemExit(1)
+    sys.exit(1)
 print(f'SHA256 OK: {got}')
 "
 
 printf '%s\n' '--- Extract and install to PATH ---'
 python -c "
-import tarfile, os, stat, shutil
+import tarfile, os, stat, shutil, sys
 tarball = '${OPENCODE_TARBALL}'
 dest = '${BIN_HOME}'
 os.makedirs(dest, exist_ok=True)
@@ -179,14 +179,14 @@ with tarfile.open(tarball, 'r:gz') as tf:
     if len(members) != 1 or members[0].name != 'opencode':
         names = [m.name for m in members]
         print(f'FAIL: expected single member named opencode, got {names}')
-        raise SystemExit(1)
+        sys.exit(1)
     if not members[0].isfile():
         print(f'FAIL: opencode member is not a regular file (type={members[0].type})')
-        raise SystemExit(1)
+        sys.exit(1)
     src = tf.extractfile(members[0])
     if src is None:
         print('FAIL: could not extract opencode member')
-        raise SystemExit(1)
+        sys.exit(1)
     dst = os.path.join(dest, 'opencode')
     with open(dst, 'wb') as out:
         shutil.copyfileobj(src, out)
@@ -194,7 +194,7 @@ with tarfile.open(tarball, 'r:gz') as tf:
     print(f'Installed to {dst}')
 "
 
-printf '%s\n' '--- OpenCode version output check ---'
+printf '%s\n' '--- OpenCode version check ---'
 OPENCODE_OUTPUT=$("${BIN_HOME}/opencode" version 2>&1)
 OPENCODE_EXIT=$?
 OPENCODE_TRIMMED=$(printf '%s' "$OPENCODE_OUTPUT")
@@ -204,13 +204,6 @@ elif [ "$OPENCODE_TRIMMED" != "${OPENCODE_VERSION}" ]; then
   fail "opencode version output '${OPENCODE_TRIMMED}' != expected '${OPENCODE_VERSION}'"
 else
   pass "opencode version == ${OPENCODE_VERSION}"
-fi
-
-printf '%s\n' '--- OpenCode exit code check ---'
-if "${BIN_HOME}/opencode" version >/dev/null 2>&1; then
-  pass "opencode exits 0"
-else
-  fail "opencode did not exit 0"
 fi
 
 # ===========================================================================
