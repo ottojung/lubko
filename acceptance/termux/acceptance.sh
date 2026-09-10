@@ -6,6 +6,10 @@
 #   sync, real lubko-install, launcher/current checks — proves the product
 #   installs and runs on Termux without any compiler toolchain.
 #
+# Phase 1b (opencode): download the pinned native ARM64 OpenCode artifact,
+#   verify SHA256, install to PATH, prove version and clean exit.  This is
+#   an agent-backend dependency kept separate from Lubko runtime prerequisites.
+#
 # Phase 2 (dev/test): provision build tools, set ANDROID_API_LEVEL, frozen
 #   sync with --extra dev, then the canonical pytest budget checker.
 set -eu
@@ -125,6 +129,82 @@ else
   else
     fail "cli/current is ${TARGET}, expected ${HEAD}"
   fi
+fi
+
+# ===========================================================================
+# PHASE 1b — OpenCode native ARM64 artifact (agent backend, not Lubko runtime)
+# ===========================================================================
+
+printf '\n--- PHASE 1b: OpenCode native ARM64 artifact ---\n\n'
+
+OPENCODE_VERSION="1.18.30"
+OPENCODE_URL="https://github.com/wallentx/opencode-termux/releases/download/v${OPENCODE_VERSION}-termux/opencode-android-arm64.tar.gz"
+OPENCODE_SHA256="0856401391dca752313e32ef3a20f977700d9544d83605ab813c277190354c84"
+OPENCODE_TARBALL="${LUBKO_OUTSIDE}/opencode-android-arm64.tar.gz"
+
+printf '%s\n' '--- Download pinned OpenCode artifact ---'
+python3 -c "
+import urllib.request, sys
+url = sys.argv[1]
+dest = sys.argv[2]
+print(f'Downloading {url} ...')
+urllib.request.urlretrieve(url, dest)
+print(f'Downloaded to {dest}')
+" "$OPENCODE_URL" "$OPENCODE_TARBALL"
+
+printf '%s\n' '--- Verify SHA256 ---'
+python3 -c "
+import hashlib, sys
+path = sys.argv[1]
+expected = sys.argv[2]
+h = hashlib.sha256()
+with open(path, 'rb') as f:
+    for chunk in iter(lambda: f.read(65536), b''):
+        h.update(chunk)
+got = h.hexdigest()
+if got != expected:
+    print(f'FAIL: SHA256 mismatch: expected {expected}, got {got}')
+    sys.exit(1)
+print(f'SHA256 OK: {got}')
+" "$OPENCODE_TARBALL" "$OPENCODE_SHA256"
+
+printf '%s\n' '--- Extract and install to PATH ---'
+python3 -c "
+import tarfile, sys, os, stat
+tarball = sys.argv[1]
+dest_dir = sys.argv[2]
+os.makedirs(dest_dir, exist_ok=True)
+with tarfile.open(tarball, 'r:gz') as tf:
+    members = tf.getnames()
+    if len(members) != 1 or not members[0].endswith('/opencode'):
+        print(f'FAIL: unexpected tarball contents: {members}')
+        sys.exit(1)
+    # Strip any leading directory component
+    basename = os.path.basename(members[0])
+    tf.extract(members[0], dest_dir, filter='data')
+    src = os.path.join(dest_dir, members[0])
+    dst = os.path.join(dest_dir, basename)
+    if src != dst:
+        os.replace(src, dst)
+    os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    print(f'Installed to {dst}')
+" "$OPENCODE_TARBALL" "${BIN_HOME}"
+
+printf '%s\n' '--- OpenCode ELF header check ---'
+file "${BIN_HOME}/opencode" || true
+
+printf '%s\n' '--- OpenCode version check ---'
+if "${BIN_HOME}/opencode" version 2>&1 | grep -q "${OPENCODE_VERSION}"; then
+  pass "opencode version reports ${OPENCODE_VERSION}"
+else
+  fail "opencode version did not report ${OPENCODE_VERSION}"
+fi
+
+printf '%s\n' '--- OpenCode exit code check ---'
+if "${BIN_HOME}/opencode" version >/dev/null 2>&1; then
+  pass "opencode exits successfully"
+else
+  fail "opencode did not exit successfully"
 fi
 
 # ===========================================================================
