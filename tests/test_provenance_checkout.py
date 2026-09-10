@@ -422,6 +422,8 @@ def test_timeout_expired_never_leaks_url_via_exc_string(
     assert "github.com/org/repo.git" in error_text
     assert COMMIT in error_text
     assert "timed out" in error_text
+    # No chained exception carrying raw URL
+    assert exc_info.value.__cause__ is None
 
 
 def test_os_error_never_leaks_url_via_exc_string(
@@ -459,6 +461,8 @@ def test_os_error_never_leaks_url_via_exc_string(
     assert url_with_token not in error_text
     assert "git.example.com/secret/repo.git" in error_text
     assert COMMIT in error_text
+    # No chained exception carrying raw URL
+    assert exc_info.value.__cause__ is None
 
 
 def test_timeout_expired_clean_in_main_json_output(

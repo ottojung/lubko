@@ -923,7 +923,7 @@ def _has_userinfo(source_url: str) -> bool:
     """Return whether the source URL contains credential-bearing userinfo.
 
     Detects both ``scheme://user:password@host/path`` and SCP-style
-    ``user@host:path`` forms.  Whenuserinfo is present, raw Git stderr
+    ``user@host:path`` forms.  When userinfo is present, raw Git stderr
     must never be appended to error messages because Git may normalize or
     encode the credentials differently than the raw input string.
 
@@ -1009,7 +1009,7 @@ def fetch_from_authority(
             f"could not execute git fetch from source authority "
             f"{label!r} for commit {commit}{errno_part}"
         )
-        raise ProvenanceError(msg) from exc
+        raise ProvenanceError(msg) from None
     if proc.returncode != 0:
         if _has_userinfo(source_url):
             detail = ""
