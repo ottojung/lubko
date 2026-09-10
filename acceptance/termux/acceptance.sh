@@ -141,6 +141,7 @@ OPENCODE_VERSION="1.18.30"
 OPENCODE_URL="https://github.com/wallentx/opencode-termux/releases/download/v${OPENCODE_VERSION}-termux/opencode-android-arm64.tar.gz"
 OPENCODE_SHA256="0856401391dca752313e32ef3a20f977700d9544d83605ab813c277190354c84"
 OPENCODE_TARBALL="${LUBKO_OUTSIDE}/opencode-android-arm64.tar.gz"
+OPENCODE_VERSION_OUTPUT="${OPENCODE_VERSION}-termux"
 
 printf '%s\n' '--- Download pinned OpenCode artifact ---'
 python -c "
@@ -197,10 +198,10 @@ with tarfile.open(tarball, 'r:gz') as tf:
 printf '%s\n' '--- OpenCode version check ---'
 if OPENCODE_OUTPUT=$("${BIN_HOME}/opencode" --version 2>&1); then
   OPENCODE_TRIMMED=$(printf '%s' "$OPENCODE_OUTPUT")
-  if [ "$OPENCODE_TRIMMED" = "${OPENCODE_VERSION}" ]; then
-    pass "opencode --version == ${OPENCODE_VERSION}"
+  if [ "$OPENCODE_TRIMMED" = "${OPENCODE_VERSION_OUTPUT}" ]; then
+    pass "opencode --version == ${OPENCODE_VERSION_OUTPUT}"
   else
-    fail "opencode --version output '${OPENCODE_TRIMMED}' != expected '${OPENCODE_VERSION}'"
+    fail "opencode --version output '${OPENCODE_TRIMMED}' != expected '${OPENCODE_VERSION_OUTPUT}'"
   fi
 else
   fail "opencode --version exited non-zero"
