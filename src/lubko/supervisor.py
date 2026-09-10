@@ -3264,10 +3264,9 @@ class SupervisorDaemon:
         The ownership lock fd is made inheritable immediately before exec and
         passed via environment variables.  The new supervisor's startup adopts
         the inherited fd (validating the fd is open and its path matches)
-        instead of
-        opening/acquiring a second lock.  If exec fails, the fd is reverted to
-        non-inheritable and the old supervisor continues with its existing
-        authority.
+        instead of opening/acquiring a second lock.  If exec fails, the fd is
+        reverted to non-inheritable and the old supervisor continues with its
+        existing authority.
 
         ``os.execv`` atomically replaces the process image while preserving the
         PID, the child process (the maintained worker), and — via the

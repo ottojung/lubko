@@ -1187,7 +1187,6 @@ def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:
     Raises:
         OSError: If validation fails (fd not open, wrong path, or fd number
             out of range).  The caller must continue with the old authority.
-            with the old authority.
     """
     soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     if fd_number < 0 or fd_number >= soft_limit:
