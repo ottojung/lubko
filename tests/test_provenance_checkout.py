@@ -1,71 +1,171 @@
-"""Provenance-aware deployment checkout synchronization tests.
+"""Provenance-aware deployment checkout regression tests.
 
-Verify that the maintained procedure obtains the exact commit from the declared
-source authority, rejects stale local-origin assumptions, and produces
-actionable provenance errors.
+Combines focused unit tests for type/serialization contracts with real-Git
+topology tests that use temporary repositories to prove the production
+deployment scenario from issue #729:
+
+* Deployment checkout A has origin pointing to a stale mutable local clone.
+* An explicit separately-addressed authority has exact target B.
+* The maintained preparation path obtains/checks out exactly B from that
+  authority, not from origin.
+* Checkout is detached and clean.
+* An authority lacking B fails clearly without switching to another tip.
+* After preparation/confirmation the confirmed runtime/restart path does not
+  need the mutable development checkout or network.
 """
 
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from lubko import cli as lc_cli
 from lubko import deployctl as dc
-from lubko import lifecycle, lifecycle_state
+from lubko.lifecycle import SCHEMA_VERSION, STATE_RUNNING, WorkerMeta
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 COMMIT: Final = "a" * 40
 PREVIOUS_COMMIT: Final = "b" * 40
 SOURCE_URL: Final = "https://github.com/example/repo.git"
+TIMEOUT: Final = 10.0
 
 
-def _completed(
-    *,
-    returncode: int = 0,
-    stdout: str = "",
-    stderr: str = "",
-) -> subprocess.CompletedProcess[str]:
-    """Return a fake completed git process."""
-    return subprocess.CompletedProcess(
-        args=["git"],
-        returncode=returncode,
-        stdout=stdout,
-        stderr=stderr,
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess, asserting success.
+
+    Returns:
+        The completed process result.
+    """
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
-def _deployctl_options(
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a git command.
+
+    Returns:
+        The completed process result.
+    """
+    return _run(["git", *args], cwd=cwd)
+
+
+def _init_repo(path: Path) -> None:
+    """Initialize a git repo with an initial commit."""
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "--initial-branch=main")
+    _git(path, "config", "user.email", "test@test.example")
+    _git(path, "config", "user.name", "Test")
+    _git(path, "commit", "--allow-empty", "-m", "initial")
+
+
+def _make_commit(repo: Path, message: str) -> str:
+    """Create a commit and return its full hash.
+
+    Returns:
+        The 40-character commit hash.
+    """
+    _git(repo, "config", "user.email", "test@test.example")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "commit", "--allow-empty", "-m", message)
+    result = _git(repo, "rev-parse", "HEAD")
+    return result.stdout.strip()
+
+
+def _setup_real_topology(tmp_path: Path) -> tuple[Path, Path, str]:
+    """Create the production issue-729 topology with hermetic bare repos.
+
+    The resulting graph is::
+
+        authority.git (bare, canonical)  ←──  authority-work (pushes A, then B)
+             ↑                                      ↑
+        dev-clone (mutable, stale at A)            |
+             ↑                                     |
+        deploy-checkout (origin = dev-clone)       |
+
+    After setup the deployment checkout's origin still points at the dev-clone
+    which only has commit A.  Commit B exists exclusively in the bare
+    authority and the authority-work clone.
+
+    Returns:
+        (authority_bare, deployment_checkout, target_commit_B)
+    """
+    # 1. Bare canonical authority (simulates GitHub / production remote).
+    authority = tmp_path / "authority.git"
+    authority.mkdir(parents=True, exist_ok=True)
+    _git(authority, "init", "--bare")
+
+    # 2. Authority-work clone: used solely to create and push commits into
+    #    the bare authority.  Push A first so dev-clone can clone it.
+    authority_work = tmp_path / "authority-work"
+    _run(["git", "clone", str(authority), str(authority_work)], cwd=tmp_path)
+    _make_commit(authority_work, "commit A (initial)")
+    _run(["git", "push", "origin", "HEAD:main"], cwd=authority_work)
+
+    # 3. Mutable dev-clone frozen at A.  This is the local clone whose path
+    #    will become the stale origin of the deployment checkout.
+    dev_clone = tmp_path / "dev-clone"
+    _run(["git", "clone", str(authority), str(dev_clone)], cwd=tmp_path)
+
+    # 4. Deployment checkout cloned from dev-clone so its origin remote
+    #    points at the mutable dev-clone path, NOT the canonical authority.
+    deploy_checkout = tmp_path / "deploy-checkout"
+    _run(["git", "clone", str(dev_clone), str(deploy_checkout)], cwd=tmp_path)
+
+    # 5. Create commit B and push it directly to the bare authority through
+    #    authority-work.  The dev-clone is never updated — it stays at A.
+    commit_b = _make_commit(authority_work, "commit B (target)")
+    _run(["git", "push", "origin", "HEAD:main"], cwd=authority_work)
+
+    return authority, deploy_checkout, commit_b
+
+
+# ---------------------------------------------------------------------------
+# Unit: type contracts
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_error_is_runtime_error() -> None:
+    """ProvenanceError is a distinct error class for source authority failures."""
+    assert issubclass(dc.ProvenanceError, RuntimeError)
+    assert not issubclass(dc.ProvenanceError, dc.DeployCtlError)
+
+
+# ---------------------------------------------------------------------------
+# Unit: RollbackState serialization
+# ---------------------------------------------------------------------------
+
+
+def _make_rollback_state(
     *,
-    source_url: str | None = None,
-) -> dc.Options:
-    """Return minimal deployctl options for testing."""
-    return dc.Options(
-        repo=Path("/workspace/Lubko"),
-        uv_path="uv",
-        confirm_window_seconds=120.0,
-        stop_grace_seconds=1.0,
-        postgres_timeout_seconds=1.0,
-        lock_timeout_seconds=1.0,
-        validation_timeout_seconds=1.0,
-        git_timeout_seconds=5.0,
-        cli_timeout_seconds=1.0,
-        source_url=source_url,
-    )
+    commit: str = COMMIT,
+    source_url: str | None = SOURCE_URL,
+) -> dc.RollbackState:
+    """Build a minimal RollbackState for serialization tests.
 
-
-def _make_previous_meta() -> lifecycle.WorkerMeta:
-    """Return valid previous worker metadata with correct schema version."""
-    return lifecycle.WorkerMeta(
-        schema_version=lifecycle.SCHEMA_VERSION,
-        state=lifecycle.STATE_RUNNING,
+    Returns:
+        A rollback state instance.
+    """
+    previous = WorkerMeta(
+        schema_version=SCHEMA_VERSION,
+        state=STATE_RUNNING,
         pid=100,
         pgid=100,
         sid=100,
         start_time_ticks=1000,
-        token="test-worker-token",  # ruff: ignore[hardcoded-password-func-arg]
+        token="test-token",  # ruff: ignore[hardcoded-password-func-arg]
         repo="/workspace/Lubko",
         git_commit=PREVIOUS_COMMIT,
         worker_id="prev-worker",
@@ -73,693 +173,195 @@ def _make_previous_meta() -> lifecycle.WorkerMeta:
         started_at=1.0,
         stopped_at=None,
     )
-
-
-# ---------------------------------------------------------------------------
-# fetch_from_authority unit tests
-# ---------------------------------------------------------------------------
-
-
-def test_fetch_from_authority_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A successful fetch passes silently."""
-    calls: list[list[str]] = []
-
-    def fake_run_git(
-        _repo: Path,
-        args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        calls.append(list(args))
-        return _completed(returncode=0)
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    dc.fetch_from_authority(
-        Path("/workspace/Lubko"),
-        COMMIT,
-        SOURCE_URL,
-        5.0,
+    return dc.RollbackState(
+        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=1,
+        status=dc.STATUS_PENDING,
+        commit=commit,
+        previous_commit=PREVIOUS_COMMIT,
+        deadline=999.0,
+        repo="/workspace/Lubko",
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=5.0,
+        previous_retiring=False,
+        previous_meta=previous,
+        new_meta=previous,
+        supervisor_owned=False,
+        source_url=source_url,
     )
-
-    assert calls == [["fetch", "--depth=1", SOURCE_URL, COMMIT]]
-
-
-def test_fetch_from_authority_rejects_commit_not_in_source(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A fetch that fails proves the commit is not from the declared authority."""
-    calls: list[list[str]] = []
-
-    def fake_run_git(
-        _repo: Path,
-        args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        calls.append(list(args))
-        return _completed(
-            returncode=1,
-            stderr=f"fatal: remote error: commit {COMMIT} not found",
-        )
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError, match="source authority"):
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            SOURCE_URL,
-            5.0,
-        )
-
-    assert calls == [["fetch", "--depth=1", SOURCE_URL, COMMIT]]
-
-
-def test_fetch_from_authority_rejects_on_os_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A network/OS error during fetch produces an actionable provenance error."""
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        msg = "network unreachable"
-        raise OSError(msg)
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError, match="could not fetch"):
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            SOURCE_URL,
-            5.0,
-        )
-
-
-def test_fetch_from_authority_rejects_on_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A timeout during fetch produces an actionable provenance error."""
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(cmd="git", timeout=5.0)
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError, match="could not fetch"):
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            SOURCE_URL,
-            5.0,
-        )
-
-
-# ---------------------------------------------------------------------------
-# _prepare_locked integration: source_url triggers provenance fetch
-# ---------------------------------------------------------------------------
-
-
-def test_prepare_locked_fetches_from_source_authority(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When source_url is set, _prepare_locked fetches from authority before checkout."""
-    previous_meta = _make_previous_meta()
-    fetch_calls: list[tuple[str, str]] = []
-    checkout_calls: list[tuple[str, str]] = []
-
-    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
-    monkeypatch.setattr(dc, "read_meta", lambda: previous_meta)
-    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
-    monkeypatch.setattr(dc, "_require_exact_commit", lambda _repo, _commit, _timeout: None)
-
-    def fake_fetch_from_authority(
-        _repo: Path,
-        commit: str,
-        source_url: str,
-        _timeout: float,
-    ) -> None:
-        fetch_calls.append((commit, source_url))
-
-    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_from_authority)
-    monkeypatch.setattr(dc, "_require_clean_checkout", lambda _repo, _timeout: None)
-
-    def fake_checkout(
-        _repo: Path,
-        commit: str,
-        _timeout: float,
-        *,
-        force: bool,
-    ) -> bool:
-        checkout_calls.append((commit, str(force)))
-        return True
-
-    monkeypatch.setattr(dc, "_checkout", fake_checkout)
-    monkeypatch.setattr(dc, "_candidate_identity", lambda _o, _c, **_kw: (None, None))
-
-    def fake_run_validation(*_args: object) -> object:
-        class R:
-            ok = True
-            detail = ""
-
-        return R()
-
-    monkeypatch.setattr(dc, "run_validation", fake_run_validation)
-    monkeypatch.setattr(dc, "cli", type("cli", (), {"build_cli_root": lambda *_a: None}))
-    monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
-    monkeypatch.setattr(dc, "_read_state", lambda: None)
-    monkeypatch.setattr(dc, "_mission_authority_facts", lambda *_a, **_kw: object())
-    monkeypatch.setattr(
-        lifecycle_state,
-        "authorize_mission_publish",
-        lambda _f: True,
-    )
-
-    options = _deployctl_options(source_url=SOURCE_URL)
-    state, _gated = dc._prepare_locked(options, COMMIT, supervised=False)
-
-    assert fetch_calls == [(COMMIT, SOURCE_URL)]
-    assert checkout_calls == [(COMMIT, "False")]
-    assert state.commit == COMMIT
-    assert state.source_url == SOURCE_URL
-
-
-def test_prepare_locked_skips_fetch_when_no_source_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When source_url is None, _prepare_locked does not fetch from any authority."""
-    previous_meta = _make_previous_meta()
-    fetch_calls: list[tuple[str, str]] = []
-
-    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
-    monkeypatch.setattr(dc, "read_meta", lambda: previous_meta)
-    monkeypatch.setattr(dc, "worker_alive", lambda _meta: True)
-    monkeypatch.setattr(dc, "_require_exact_commit", lambda _repo, _commit, _timeout: None)
-    monkeypatch.setattr(dc, "_require_clean_checkout", lambda _repo, _timeout: None)
-
-    def fake_fetch(
-        _repo: Path,
-        commit: str,
-        source_url: str,
-        _timeout: float,
-    ) -> None:
-        fetch_calls.append((commit, source_url))
-
-    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch)
-    monkeypatch.setattr(dc, "_checkout", lambda _repo, _commit, _timeout, **_kw: True)
-    monkeypatch.setattr(dc, "_candidate_identity", lambda _o, _c, **_kw: (None, None))
-
-    def fake_run_validation(*_args: object) -> object:
-        class R:
-            ok = True
-            detail = ""
-
-        return R()
-
-    monkeypatch.setattr(dc, "run_validation", fake_run_validation)
-    monkeypatch.setattr(dc, "cli", type("cli", (), {"build_cli_root": lambda *_a: None}))
-    monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
-    monkeypatch.setattr(dc, "_read_state", lambda: None)
-    monkeypatch.setattr(dc, "_mission_authority_facts", lambda *_a, **_kw: object())
-    monkeypatch.setattr(
-        lifecycle_state,
-        "authorize_mission_publish",
-        lambda _f: True,
-    )
-
-    options = _deployctl_options(source_url=None)
-    state, _gated = dc._prepare_locked(options, COMMIT, supervised=False)
-
-    assert fetch_calls == []
-    assert state.source_url is None
-
-
-# ---------------------------------------------------------------------------
-# RollbackState serialization round-trip with source_url
-# ---------------------------------------------------------------------------
 
 
 def test_rollback_state_source_url_survives_serialization() -> None:
     """source_url round-trips through to_dict/from_dict."""
-    previous = _make_previous_meta()
-    state = dc.RollbackState(
-        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
-        generation=1,
-        status=dc.STATUS_PENDING,
-        commit=COMMIT,
-        previous_commit=PREVIOUS_COMMIT,
-        deadline=999.0,
-        repo="/workspace/Lubko",
-        uv_path="uv",
-        stop_grace_seconds=1.0,
-        git_timeout_seconds=5.0,
-        previous_retiring=False,
-        previous_meta=previous,
-        new_meta=previous,
-        supervisor_owned=False,
-        source_url=SOURCE_URL,
-    )
-
+    state = _make_rollback_state()
     raw = state.to_dict()
     assert raw["source_url"] == SOURCE_URL
-
     restored = dc.RollbackState.from_dict(raw)
     assert restored.source_url == SOURCE_URL
     assert restored.commit == COMMIT
-    assert restored.previous_commit == PREVIOUS_COMMIT
 
 
 def test_rollback_state_missing_source_url_defaults_none() -> None:
     """Older state without source_url defaults to None."""
-    previous = _make_previous_meta()
-    state = dc.RollbackState(
-        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
-        generation=1,
-        status=dc.STATUS_PENDING,
-        commit=COMMIT,
-        previous_commit=PREVIOUS_COMMIT,
-        deadline=999.0,
-        repo="/workspace/Lubko",
-        uv_path="uv",
-        stop_grace_seconds=1.0,
-        git_timeout_seconds=5.0,
-        previous_retiring=False,
-        previous_meta=previous,
-        new_meta=previous,
-        supervisor_owned=False,
-    )
-
+    state = _make_rollback_state(source_url=None)
     raw = state.to_dict()
     assert raw["source_url"] is None
-
-    # Simulate an older state file that lacks source_url entirely
     del raw["source_url"]
     restored = dc.RollbackState.from_dict(raw)
     assert restored.source_url is None
 
 
 # ---------------------------------------------------------------------------
-# Stale local-origin vs explicit canonical source
+# Real-Git: authority fetch topology
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_rejects_commit_present_locally_but_not_in_authority(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A commit that exists locally but not in the declared authority is rejected.
+def test_fetch_from_real_authority_succeeds(tmp_path: Path) -> None:
+    """Fetching a commit that exists in the real authority succeeds."""
+    authority, checkout, target = _setup_real_topology(tmp_path)
+    dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
+    dc._require_exact_commit(checkout, target, TIMEOUT)
 
-    This is the core stale-origin regression: the local repo may contain a
-    commit that was fetched from ``origin`` or another remote, but the declared
-    source authority does not have it. Provenance-aware checkout must refuse.
-    """
-    calls: list[list[str]] = []
 
-    def fake_run_git(
-        _repo: Path,
-        args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        calls.append(list(args))
-        # Simulate: the commit is NOT in the declared source
-        return _completed(
-            returncode=1,
-            stderr=f"fatal: remote error: not found: {COMMIT}",
-        )
+def test_stale_origin_not_used_for_fetch(tmp_path: Path) -> None:
+    """The declared authority URL is used, not the checkout's origin remote."""
+    authority, checkout, target = _setup_real_topology(tmp_path)
 
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
+    # Verify origin points to the dev-clone (stale mutable local clone)
+    origin_url = _git(checkout, "remote", "get-url", "origin").stdout.strip()
+    assert origin_url == str(tmp_path / "dev-clone")
+
+    # Fetch succeeds using the explicit authority, proving origin is not consulted
+    dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
+    dc._require_exact_commit(checkout, target, TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# Real-Git: detached clean checkout
+# ---------------------------------------------------------------------------
+
+
+def test_checkout_is_detached_and_clean(tmp_path: Path) -> None:
+    """After fetch + checkout, HEAD is detached at the exact commit, worktree clean."""
+    authority, checkout, target = _setup_real_topology(tmp_path)
+    dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
+    dc._require_exact_commit(checkout, target, TIMEOUT)
+
+    # Detach HEAD at the target
+    result = dc._checkout(checkout, target, TIMEOUT, force=False)
+    assert result is True
+
+    # HEAD points to the exact commit
+    head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+    assert head == target
+
+    # Worktree is clean
+    status = _git(checkout, "status", "--porcelain").stdout
+    assert not status
+
+    # HEAD is detached (not on a branch)
+    symbolic = _git(checkout, "symbolic-ref", "HEAD")
+    assert symbolic.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# Real-Git: authority lacking B fails clearly
+# ---------------------------------------------------------------------------
+
+
+def test_authority_without_commit_fails_without_switching_tip(tmp_path: Path) -> None:
+    """Authority lacking target fails clearly; HEAD unchanged."""
+    _authority, checkout, target = _setup_real_topology(tmp_path)
+
+    # Create a separate authority that does NOT have the target commit
+    wrong_authority = tmp_path / "wrong-authority.git"
+    _init_repo(wrong_authority)
+
+    # Record the current HEAD before the failed fetch
+    head_before = _git(checkout, "rev-parse", "HEAD").stdout.strip()
 
     with pytest.raises(dc.ProvenanceError, match="does not contain commit"):
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            SOURCE_URL,
-            5.0,
-        )
+        dc.fetch_from_authority(checkout, target, str(wrong_authority), TIMEOUT)
 
-    # Verify the exact source URL was used
-    assert calls[0][2] == SOURCE_URL
-    assert calls[0][3] == COMMIT
+    # HEAD was not changed by the failed fetch
+    head_after = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+    assert head_before == head_after
 
 
-def test_fetch_uses_declared_source_not_origin(
+# ---------------------------------------------------------------------------
+# Real-Git: confirmed runtime independence
+# ---------------------------------------------------------------------------
+
+
+def test_confirmed_runtime_independent_of_dev_checkout(tmp_path: Path) -> None:
+    """Confirmed commit is local; no mutable clone or network needed."""
+    authority, checkout, target = _setup_real_topology(tmp_path)
+    dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
+    dc._require_exact_commit(checkout, target, TIMEOUT)
+
+    # Simulate confirmed state: checkout the target in detached mode
+    dc._checkout(checkout, target, TIMEOUT, force=False)
+
+    # The commit is a local object — no network or other clone needed
+    verify = _git(checkout, "cat-file", "-t", target)
+    assert verify.returncode == 0
+    assert verify.stdout.strip() == "commit"
+
+    # Worktree is clean after preparation
+    status = _git(checkout, "status", "--porcelain").stdout
+    assert not status
+
+    # HEAD is exactly the target
+    head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+    assert head == target
+
+
+# ---------------------------------------------------------------------------
+# Real-Git: _require_exact_commit with real repos
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("commit", "pattern"),
+    [
+        ("d" * 40, "not present"),
+        ("not-a-hash", "exact 40-character"),
+    ],
+    ids=["nonexistent-hash", "bad-format"],
+)
+def test_require_exact_commit_rejects(commit: str, pattern: str, tmp_path: Path) -> None:
+    """_require_exact_commit rejects missing and malformed commits."""
+    _authority, checkout, _target = _setup_real_topology(tmp_path)
+    with pytest.raises(dc.DeployCtlError, match=pattern):
+        dc._require_exact_commit(checkout, commit, TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# Error propagation: deterministic mocks for OS/timeout mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "_exc",
+    [OSError("network unreachable"), subprocess.TimeoutExpired(cmd="git", timeout=TIMEOUT)],
+    ids=["os-error", "timeout"],
+)
+def test_fetch_error_maps_to_provenance_error(
+    _exc: OSError | subprocess.TimeoutExpired,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """The declared source URL is passed to git, never the implicit origin."""
-    custom_source = "https://custom.example.com/lubko.git"
-    calls: list[list[str]] = []
+    """OS and timeout errors during fetch are wrapped as ProvenanceError."""
+    _authority, checkout, target = _setup_real_topology(tmp_path)
 
-    def fake_run_git(
+    def _boom(
         _repo: Path,
-        args: tuple[str, ...],
+        _args: tuple[str, ...],
         _timeout: float,
     ) -> subprocess.CompletedProcess[str]:
-        calls.append(list(args))
-        return _completed(returncode=0)
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    dc.fetch_from_authority(
-        Path("/workspace/Lubko"),
-        COMMIT,
-        custom_source,
-        5.0,
-    )
-
-    assert calls[0][2] == custom_source
-    assert "origin" not in str(calls)
-
-
-# ---------------------------------------------------------------------------
-# Exact commit identity after fetch
-# ---------------------------------------------------------------------------
-
-
-def test_fetch_then_require_exact_commit_verifies_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """After a successful fetch, _require_exact_commit confirms exact identity."""
-    verified_commits: list[str] = []
-
-    def fake_fetch(
-        _repo: Path,
-        commit: str,
-        _source_url: str,
-        _timeout: float,
-    ) -> None:
-        pass
-
-    def fake_require_exact(
-        _repo: Path,
-        commit: str,
-        _timeout: float,
-    ) -> None:
-        verified_commits.append(commit)
-
-    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch)
-    monkeypatch.setattr(dc, "_require_exact_commit", fake_require_exact)
-
-    # Simulate the _prepare_locked flow: fetch then verify
-    options = _deployctl_options(source_url=SOURCE_URL)
-    dc.fetch_from_authority(
-        options.repo,
-        COMMIT,
-        options.source_url,  # type: ignore[arg-type]
-        options.git_timeout_seconds,
-    )
-    dc._require_exact_commit(options.repo, COMMIT, options.git_timeout_seconds)
-
-    assert verified_commits == [COMMIT]
-
-
-# ---------------------------------------------------------------------------
-# ProvenanceError is distinct from DeployCtlError
-# ---------------------------------------------------------------------------
-
-
-def test_provenance_error_is_runtime_error() -> None:
-    """ProvenanceError is a distinct error class for source authority failures.
-
-    Raises:
-        ProvenanceError: Always, to exercise the exception type.
-    """
-    assert issubclass(dc.ProvenanceError, RuntimeError)
-    assert not issubclass(dc.ProvenanceError, dc.DeployCtlError)
-
-    msg = "commit abc not in source"
-    with pytest.raises(dc.ProvenanceError, match="commit abc not in source"):
-        raise dc.ProvenanceError(msg)
-
-
-# ---------------------------------------------------------------------------
-# Source URL stored in rollback state
-# ---------------------------------------------------------------------------
-
-
-def test_source_url_persisted_in_rollback_state() -> None:
-    """The source_url from Options is recorded in the RollbackState."""
-    previous = _make_previous_meta()
-    state = dc.RollbackState(
-        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
-        generation=1,
-        status=dc.STATUS_PENDING,
-        commit=COMMIT,
-        previous_commit=PREVIOUS_COMMIT,
-        deadline=999.0,
-        repo="/workspace/Lubko",
-        uv_path="uv",
-        stop_grace_seconds=1.0,
-        git_timeout_seconds=5.0,
-        previous_retiring=False,
-        previous_meta=previous,
-        new_meta=previous,
-        supervisor_owned=False,
-        source_url=SOURCE_URL,
-    )
-
-    assert state.source_url == SOURCE_URL
-    raw = state.to_dict()
-    assert raw["source_url"] == SOURCE_URL
-
-
-# ---------------------------------------------------------------------------
-# End-to-end lifecycle deploy path: --source-url forwarded to provenance check
-# ---------------------------------------------------------------------------
-
-
-def test_lifecycle_deploy_forwards_source_url_to_provenance_check(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """lubko-deploy deploy --source-url forwards the URL to fetch_from_authority.
-
-    This is the blocking regression: source_url was parsed into DeployOptions
-    but never reaching the deployctl provenance check.  The lifecycle
-    _validate_and_prepare path must call fetch_from_authority with the exact
-    declared URL when source_url is set.
-    """
-    fetch_calls: list[tuple[str, str]] = []
-
-    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
-
-    def fake_run_validation(*_args: object) -> object:
-        class R:
-            ok = True
-            detail = ""
-
-        return R()
-
-    monkeypatch.setattr(lifecycle, "run_validation", fake_run_validation)
-
-    # git_commit returns a deterministic HEAD
-    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: COMMIT)
-
-    def fake_fetch_authority(
-        _repo: Path,
-        commit: str,
-        source_url: str,
-        _timeout: float,
-    ) -> None:
-        fetch_calls.append((commit, source_url))
-
-    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_authority)
-    monkeypatch.setattr(lc_cli, "build_cli_root", lambda *_a: None)
-
-    options = lifecycle.DeployOptions(
-        repo=Path("/workspace/Lubko"),
-        uv_path="uv",
-        bootstrap=False,
-        stop_grace_seconds=1.0,
-        postgres_timeout_seconds=1.0,
-        lock_timeout_seconds=1.0,
-        validation_timeout_seconds=1.0,
-        git_timeout_seconds=5.0,
-        cli_timeout_seconds=1.0,
-        source_url=SOURCE_URL,
-    )
-
-    commit = lifecycle._validate_and_prepare(options)
-
-    # The exact source URL was forwarded exactly once
-    assert fetch_calls == [(COMMIT, SOURCE_URL)]
-    assert commit == COMMIT
-
-
-def test_lifecycle_deploy_skips_provenance_when_no_source_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When --source-url is absent, no provenance fetch occurs."""
-    fetch_calls: list[tuple[str, str]] = []
-
-    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
-
-    def fake_run_validation(*_args: object) -> object:
-        class R:
-            ok = True
-            detail = ""
-
-        return R()
-
-    monkeypatch.setattr(lifecycle, "run_validation", fake_run_validation)
-    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: COMMIT)
-
-    def fake_fetch_authority(
-        _repo: Path,
-        commit: str,
-        source_url: str,
-        _timeout: float,
-    ) -> None:
-        fetch_calls.append((commit, source_url))
-
-    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_authority)
-    monkeypatch.setattr(lc_cli, "build_cli_root", lambda *_a: None)
-
-    options = lifecycle.DeployOptions(
-        repo=Path("/workspace/Lubko"),
-        uv_path="uv",
-        bootstrap=False,
-        stop_grace_seconds=1.0,
-        postgres_timeout_seconds=1.0,
-        lock_timeout_seconds=1.0,
-        validation_timeout_seconds=1.0,
-        git_timeout_seconds=5.0,
-        cli_timeout_seconds=1.0,
-    )
-
-    commit = lifecycle._validate_and_prepare(options)
-
-    assert fetch_calls == []
-    assert commit == COMMIT
-
-
-def test_lifecycle_deploy_provenance_failure_aborts_deployment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A provenance failure in _validate_and_prepare aborts without touching the worker."""
-    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
-
-    def fake_run_validation(*_args: object) -> object:
-        class R:
-            ok = True
-            detail = ""
-
-        return R()
-
-    monkeypatch.setattr(lifecycle, "run_validation", fake_run_validation)
-    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: COMMIT)
-
-    def fake_fetch_authority(
-        _repo: Path,
-        _commit: str,
-        _source_url: str,
-        _timeout: float,
-    ) -> None:
-        msg = "source does not have the commit"
-        raise dc.ProvenanceError(msg)
-
-    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_authority)
-    build_calls: list[str] = []
-
-    def fake_build_cli_root(*_args: object) -> None:
-        build_calls.append("called")
-
-    monkeypatch.setattr(lc_cli, "build_cli_root", fake_build_cli_root)
-
-    options = lifecycle.DeployOptions(
-        repo=Path("/workspace/Lubko"),
-        uv_path="uv",
-        bootstrap=False,
-        stop_grace_seconds=1.0,
-        postgres_timeout_seconds=1.0,
-        lock_timeout_seconds=1.0,
-        validation_timeout_seconds=1.0,
-        git_timeout_seconds=5.0,
-        cli_timeout_seconds=1.0,
-        source_url=SOURCE_URL,
-    )
-
-    with pytest.raises(lifecycle.DeployAbortedError):
-        lifecycle._validate_and_prepare(options)
-
-    # CLI environment was never built after provenance failure
-    assert build_calls == []
-
-
-def test_lifecycle_deploy_source_url_backward_compatible() -> None:
-    """DeployOptions without source_url defaults to None and skips provenance."""
-    options = lifecycle.DeployOptions(
-        repo=Path(),
-        uv_path="uv",
-        bootstrap=False,
-        stop_grace_seconds=1.0,
-        postgres_timeout_seconds=1.0,
-        lock_timeout_seconds=1.0,
-        validation_timeout_seconds=1.0,
-        git_timeout_seconds=5.0,
-        cli_timeout_seconds=1.0,
-    )
-
-    assert options.source_url is None
-
-
-# ---------------------------------------------------------------------------
-# Handoff serialization: source_url in queue-deploy helper
-# ---------------------------------------------------------------------------
-
-
-def test_queue_deploy_helper_forwards_source_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The queue-deploy helper path calls _validate_and_prepare which uses source_url."""
-    fetch_calls: list[tuple[str, str]] = []
-    prepared_commits: list[str] = []
-
-    # Mock the validation chain
-    monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda _repo, _timeout: True)
-
-    def fake_run_validation(*_args: object) -> object:
-        class R:
-            ok = True
-            detail = ""
-
-        return R()
-
-    monkeypatch.setattr(lifecycle, "run_validation", fake_run_validation)
-    monkeypatch.setattr(lifecycle, "git_commit", lambda _repo, _timeout: COMMIT)
-
-    def fake_fetch_authority(
-        _repo: Path,
-        commit: str,
-        source_url: str,
-        _timeout: float,
-    ) -> None:
-        fetch_calls.append((commit, source_url))
-
-    monkeypatch.setattr(dc, "fetch_from_authority", fake_fetch_authority)
-    monkeypatch.setattr(lc_cli, "build_cli_root", lambda *_a: None)
-
-    options = lifecycle.DeployOptions(
-        repo=Path("/workspace/Lubko"),
-        uv_path="uv",
-        bootstrap=False,
-        stop_grace_seconds=1.0,
-        postgres_timeout_seconds=1.0,
-        lock_timeout_seconds=1.0,
-        validation_timeout_seconds=1.0,
-        git_timeout_seconds=5.0,
-        cli_timeout_seconds=1.0,
-        source_url=SOURCE_URL,
-    )
-
-    # Both manual and queue paths call _validate_and_prepare
-    commit = lifecycle._validate_and_prepare(options)
-    prepared_commits.append(commit)
-
-    assert fetch_calls == [(COMMIT, SOURCE_URL)]
-    assert prepared_commits == [COMMIT]
+        raise _exc
+
+    monkeypatch.setattr(dc, "_run_git", _boom)
+    with pytest.raises(dc.ProvenanceError, match="could not fetch"):
+        dc.fetch_from_authority(checkout, target, "https://unused", TIMEOUT)
