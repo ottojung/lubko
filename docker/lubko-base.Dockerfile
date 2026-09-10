@@ -8,4 +8,4 @@ ENV USER="lubko"
 ENV HOME="/home/lubko"
 
 WORKDIR /workspace
-USER ${USER}
+USER 65532:65532
