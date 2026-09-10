@@ -1,0 +1,21 @@
+name: Acceptance – Termux ARM64
+
+on:
+  push:
+    branches:
+      - main
+      - "release/*"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  termux-install:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build acceptance image
+        run: docker build -f acceptance/termux/Dockerfile -t lubko-acceptance-termux .
+      - name: Run acceptance
+        run: docker run --rm --security-opt seccomp=unconfined lubko-acceptance-termux

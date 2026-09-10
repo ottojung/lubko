@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import platform
 import signal
 from pathlib import Path
 from typing import Final
@@ -32,9 +33,61 @@ STAT_UTIME_FIELD_INDEX: Final = 11
 STAT_STIME_FIELD_INDEX: Final = 12
 STAT_STARTTIME_FIELD_INDEX: Final = 19
 
+# Unified generic syscall table — same number on every architecture with
+# shared syscall numbering (x86_64, aarch64, riscv64, arm32, ppc64, s390x,
+# loongarch).  Architectures with private numbering (alpha, mips, parisc,
+# sparc) are absent: there pinning is unsupported and signalling fails closed.
+_PIDFD_OPEN_SYSCALL_NR: Final[dict[str, int]] = {
+    "x86_64": 434,
+    "aarch64": 434,
+    "armv7l": 434,
+    "armv8l": 434,
+    "riscv64": 434,
+    "ppc64": 434,
+    "ppc64le": 434,
+    "s390x": 434,
+    "loongarch64": 434,
+}
+_PIDFD_SEND_SIGNAL_SYSCALL_NR: Final[dict[str, int]] = {
+    "x86_64": 424,
+    "aarch64": 424,
+    "armv7l": 424,
+    "armv8l": 424,
+    "riscv64": 424,
+    "ppc64": 424,
+    "ppc64le": 424,
+    "s390x": 424,
+    "loongarch64": 424,
+}
+_LIBC_CACHE: Final[dict[str, ctypes.CDLL]] = {}
+
+
+def _load_libc() -> ctypes.CDLL | None:
+    """Return a cached handle to the C library, or ``None``.
+
+    Uses ``ctypes.CDLL(None)`` which resolves the default C library for
+    the current process — works on both glibc (Linux) and Bionic (Android).
+
+    Returns:
+        The ``ctypes`` C library handle, or ``None`` when unavailable.
+    """
+    if "libc" not in _LIBC_CACHE:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.syscall.restype = ctypes.c_long
+        except OSError:
+            return None
+        _LIBC_CACHE["libc"] = libc
+    return _LIBC_CACHE["libc"]
+
 
 def open_pidfd(pid: int) -> int:
     """Open a pidfd pinning ``pid`` against kernel struct-pid release.
+
+    Prefers ``os.pidfd_open`` when available; otherwise issues the raw
+    ``SYS_pidfd_open`` syscall via ``libc.syscall()`` on architectures with
+    the unified generic syscall number.  Works on both glibc and Bionic
+    because ``syscall()`` is exported by both C libraries.
 
     Args:
         pid: Process id to pin.
@@ -45,11 +98,14 @@ def open_pidfd(pid: int) -> int:
     Raises:
         OSError: If the process is gone or the pin fails.
     """
-    if hasattr(os, "pidfd_open"):
-        return int(os.pidfd_open(pid))
-    _LIBC.pidfd_open.argtypes = (ctypes.c_int, ctypes.c_uint)
-    _LIBC.pidfd_open.restype = ctypes.c_int
-    fd = _LIBC.pidfd_open(pid, 0)
+    pidfd_open_fn = getattr(os, "pidfd_open", None)
+    if pidfd_open_fn is not None:
+        return int(pidfd_open_fn(pid))
+    nr = _PIDFD_OPEN_SYSCALL_NR.get(platform.machine())
+    libc = _load_libc()
+    if nr is None or libc is None:
+        raise OSError(0, "pidfd_open unsupported on this platform")
+    fd = libc.syscall(ctypes.c_long(nr), ctypes.c_int(pid), ctypes.c_uint(0))
     if fd < 0:
         raise OSError(ctypes.get_errno(), "pidfd_open failed")
     return int(fd)
@@ -58,6 +114,10 @@ def open_pidfd(pid: int) -> int:
 def pidfd_send_signal(pidfd: int, sig: int) -> None:
     """Deliver ``sig`` to exactly the process pinned by ``pidfd``.
 
+    Prefers ``signal.pidfd_send_signal`` when available; otherwise issues
+    the raw ``SYS_pidfd_send_signal`` syscall via ``libc.syscall()``.
+    Works on both glibc and Bionic.
+
     Args:
         pidfd: Pinned process file descriptor.
         sig: Signal number to deliver.
@@ -65,17 +125,22 @@ def pidfd_send_signal(pidfd: int, sig: int) -> None:
     Raises:
         OSError: If delivery fails (for example the process already exited).
     """
-    if hasattr(signal, "pidfd_send_signal"):
-        signal.pidfd_send_signal(pidfd, sig)
+    send_signal_fn = getattr(signal, "pidfd_send_signal", None)
+    if send_signal_fn is not None:
+        send_signal_fn(pidfd, sig)
         return
-    _LIBC.pidfd_send_signal.argtypes = (
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_uint,
+    nr = _PIDFD_SEND_SIGNAL_SYSCALL_NR.get(platform.machine())
+    libc = _load_libc()
+    if nr is None or libc is None:
+        raise OSError(0, "pidfd_send_signal unsupported on this platform")
+    result = libc.syscall(
+        ctypes.c_long(nr),
+        ctypes.c_int(pidfd),
+        ctypes.c_int(sig),
+        ctypes.c_void_p(None),
+        ctypes.c_uint(0),
     )
-    _LIBC.pidfd_send_signal.restype = ctypes.c_int
-    if _LIBC.pidfd_send_signal(pidfd, sig, None, 0) != 0:
+    if result != 0:
         raise OSError(ctypes.get_errno(), "pidfd_send_signal failed")
 
 
@@ -270,6 +335,3 @@ def process_pgrp(pid: int) -> int | None:
         return int(fields[STAT_PGRP_FIELD_INDEX])
     except ValueError:
         return None
-
-
-_LIBC = ctypes.CDLL(None, use_errno=True)
