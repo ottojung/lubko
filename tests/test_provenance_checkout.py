@@ -19,15 +19,13 @@ from __future__ import annotations
 import shutil
 import subprocess
 import time
-from typing import TYPE_CHECKING, Final
+from pathlib import Path
+from typing import Final
 
 import pytest
 
 from lubko import deployctl as dc
 from lubko.lifecycle import SCHEMA_VERSION, STATE_RUNNING, WorkerMeta
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 COMMIT: Final = "a" * 40
 PREVIOUS_COMMIT: Final = "b" * 40
@@ -134,33 +132,25 @@ def _setup_real_topology(tmp_path: Path) -> tuple[Path, Path, str]:
     return authority, deploy_checkout, commit_b
 
 
-# ---------------------------------------------------------------------------
-# Unit: type contracts
-# ---------------------------------------------------------------------------
+def _clone_checkout(tmp_path: Path, source: Path, name: str) -> Path:
+    """Clone a fresh deploy-checkout from source for test isolation.
 
-
-def test_provenance_error_is_runtime_error() -> None:
-    """ProvenanceError is a distinct error class for source authority failures."""
-    assert issubclass(dc.ProvenanceError, RuntimeError)
-    assert not issubclass(dc.ProvenanceError, dc.DeployCtlError)
-
-
-# ---------------------------------------------------------------------------
-# Unit: RollbackState serialization
-# ---------------------------------------------------------------------------
-
-
-def _make_rollback_state(
-    *,
-    commit: str = COMMIT,
-    source_url: str | None = SOURCE_URL,
-) -> dc.RollbackState:
-    """Build a minimal RollbackState for serialization tests.
+    Args:
+        tmp_path: Parent directory for the clone.
+        source: Path to clone from.
+        name: Directory name for the clone.
 
     Returns:
-        A rollback state instance.
+        Path to the fresh clone.
     """
-    previous = WorkerMeta(
+    dest = tmp_path / name
+    _run(["git", "clone", str(source), str(dest)], cwd=tmp_path)
+    return dest
+
+
+def _worker_meta_for_rollback() -> WorkerMeta:
+    """Return valid worker metadata for rollback state construction."""
+    return WorkerMeta(
         schema_version=SCHEMA_VERSION,
         state=STATE_RUNNING,
         pid=100,
@@ -175,11 +165,169 @@ def _make_rollback_state(
         started_at=1.0,
         stopped_at=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Unit: type contracts
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_error_is_deployctl_error_subtype() -> None:
+    """ProvenanceError is a DeployCtlError subtype so existing error boundaries catch it."""
+    assert issubclass(dc.ProvenanceError, dc.DeployCtlError)
+    assert issubclass(dc.ProvenanceError, RuntimeError)
+
+
+def test_provenance_error_caught_by_dispatch_boundary() -> None:
+    """ProvenanceError is caught by the same boundary as DeployCtlError.
+
+    Raises:
+        ProvenanceError: Always, to exercise the catch boundary.
+    """
+    caught: list[str] = []
+    try:
+        msg = "authority missing commit"
+        raise dc.ProvenanceError(msg)
+    except dc.DeployCtlError as exc:
+        caught.append(str(exc))
+    assert caught == ["authority missing commit"]
+
+
+# ---------------------------------------------------------------------------
+# Unit: credential redaction
+# ---------------------------------------------------------------------------
+
+
+def test_redact_source_url_strips_userinfo() -> None:
+    """URLs with userinfo have the credential portion removed."""
+    url = "https://user:secret@github.com/org/repo.git"
+    assert dc._redact_source_url(url) == "https://github.com/org/repo.git"
+
+
+def test_redact_source_url_preserves_bare_urls() -> None:
+    """URLs without userinfo are returned unchanged."""
+    url = "https://github.com/org/repo.git"
+    assert dc._redact_source_url(url) == url
+
+
+def test_redact_source_url_preserves_path_structure() -> None:
+    """The host and path are preserved after redaction."""
+    url = "https://token:x-oauth-basic@github.com/org/repo.git"
+    result = dc._redact_source_url(url)
+    assert "github.com/org/repo.git" in result
+    assert "token" not in result
+    assert "x-oauth-basic" not in result
+
+
+def test_provenance_error_messages_redact_credentials() -> None:
+    """Error messages from fetch_from_authority never contain raw credentials."""
+    url_with_creds = "https://user:p-4ssw0rd@git.example.com/private/repo.git"
+    label = dc._redact_source_url(url_with_creds)
+    assert "p-4ssw0rd" not in label
+    assert "user" not in label.split("@")[0] if "@" in label else True
+
+
+def test_stderr_sanitization_strips_raw_url() -> None:
+    """_sanitize_stderr replaces every raw URL occurrence with the redacted label."""
+    url = "https://user:s3cret@git.example.com/repo.git"
+    raw_stderr = f"fatal: repository '{url}' not found"
+    sanitized = dc._sanitize_stderr(raw_stderr, url)
+    assert "s3cret" not in sanitized
+    assert "user" not in sanitized
+    assert "git.example.com/repo.git" in sanitized
+
+
+def test_provenance_error_never_contains_raw_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When git stderr echoes the full credential-bearing URL, the exception is clean."""
+    url_with_creds = "https://deploy-token:tk-abc123@github.com/org/repo.git"
+    stderr_with_url = (
+        f"fatal: unable to access '{url_with_creds}': The requested URL returned error: 401"
+    )
+
+    def fake_run_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["git"],
+            returncode=128,
+            stdout="",
+            stderr=stderr_with_url,
+        )
+
+    monkeypatch.setattr(dc, "_run_git", fake_run_git)
+
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(
+            Path("/workspace/Lubko"),
+            COMMIT,
+            url_with_creds,
+            5.0,
+        )
+
+    error_text = str(exc_info.value)
+    assert "tk-abc123" not in error_text
+    assert "deploy-token" not in error_text
+    assert url_with_creds not in error_text
+    # The redacted host/path is still present for diagnostics
+    assert "github.com/org/repo.git" in error_text
+
+
+def test_source_url_rejected_for_status_request() -> None:
+    """--source-url on a status request fails, not silently ignored."""
+    request = dc.parse_request('{"type": "status"}')
+    options = dc.Options(
+        repo=Path("/workspace/Lubko"),
+        uv_path="uv",
+        confirm_window_seconds=120.0,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=1.0,
+        source_url="https://example.com/repo.git",
+    )
+    with pytest.raises(dc.DeployCtlError, match="--source-url is only supported for checkout"):
+        dc._dispatch(options, request)
+
+
+def test_source_url_rejected_for_confirm_request() -> None:
+    """--source-url on a confirm request fails, not silently ignored."""
+    request = dc.parse_request(f'{{"type":"confirm","commit":"{COMMIT}"}}')
+    options = dc.Options(
+        repo=Path("/workspace/Lubko"),
+        uv_path="uv",
+        confirm_window_seconds=120.0,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=1.0,
+        source_url="https://example.com/repo.git",
+    )
+    with pytest.raises(dc.DeployCtlError, match="--source-url is only supported for checkout"):
+        dc._dispatch(options, request)
+
+
+# ---------------------------------------------------------------------------
+# Unit: RollbackState serialization
+# ---------------------------------------------------------------------------
+
+
+def _make_rollback_state() -> dc.RollbackState:
+    """Build a minimal RollbackState for serialization tests.
+
+    Returns:
+        A rollback state instance.
+    """
     return dc.RollbackState(
         schema_version=dc.ROLLBACK_SCHEMA_VERSION,
         generation=1,
         status=dc.STATUS_PENDING,
-        commit=commit,
+        commit=COMMIT,
         previous_commit=PREVIOUS_COMMIT,
         deadline=999.0,
         repo="/workspace/Lubko",
@@ -187,31 +335,120 @@ def _make_rollback_state(
         stop_grace_seconds=1.0,
         git_timeout_seconds=5.0,
         previous_retiring=False,
-        previous_meta=previous,
-        new_meta=previous,
+        previous_meta=_worker_meta_for_rollback(),
+        new_meta=_worker_meta_for_rollback(),
         supervisor_owned=False,
-        source_url=source_url,
     )
 
 
-def test_rollback_state_source_url_survives_serialization() -> None:
-    """source_url round-trips through to_dict/from_dict."""
+def test_rollback_state_does_not_persist_source_url() -> None:
+    """source_url is transient preparation input and must not appear in rollback state."""
     state = _make_rollback_state()
     raw = state.to_dict()
-    assert raw["source_url"] == SOURCE_URL
-    restored = dc.RollbackState.from_dict(raw)
-    assert restored.source_url == SOURCE_URL
-    assert restored.commit == COMMIT
+    assert "source_url" not in raw
+    assert not hasattr(state, "source_url")
 
 
-def test_rollback_state_missing_source_url_defaults_none() -> None:
-    """Older state without source_url defaults to None."""
-    state = _make_rollback_state(source_url=None)
+def test_rollback_state_round_trip_without_source_url() -> None:
+    """RollbackState round-trips through to_dict/from_dict without source_url."""
+    state = _make_rollback_state()
     raw = state.to_dict()
-    assert raw["source_url"] is None
-    del raw["source_url"]
     restored = dc.RollbackState.from_dict(raw)
-    assert restored.source_url is None
+    assert restored.commit == COMMIT
+    assert restored.previous_commit == PREVIOUS_COMMIT
+
+
+# ---------------------------------------------------------------------------
+# Unit: main/dispatch boundary catches ProvenanceError
+# ---------------------------------------------------------------------------
+
+
+def test_main_catches_provenance_error_as_checkout_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ProvenanceError raised during checkout is caught and produces a structured error response."""
+    checkout_request = f'{{"type":"checkout","commit":"{COMMIT}"}}'
+
+    def _always_provenance(*_a: object, **_kw: object) -> None:
+        msg = "source authority missing commit"
+        raise dc.ProvenanceError(msg)
+
+    monkeypatch.setattr(dc, "fetch_from_authority", _always_provenance)
+    monkeypatch.setattr(dc, "_require_exact_commit", lambda *_a: None)
+    monkeypatch.setattr(dc, "_require_clean_checkout", lambda *_a: None)
+    monkeypatch.setattr(dc, "_checkout", lambda *_a, **_kw: True)
+    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
+    monkeypatch.setattr(dc, "read_meta", _worker_meta_for_rollback)
+    monkeypatch.setattr(dc, "worker_alive", lambda _m: True)
+    monkeypatch.setattr(dc, "_provenance_fetch", lambda _o, _c: None)
+    monkeypatch.setattr(
+        dc, "run_validation", lambda *_a: type("R", (), {"ok": True, "detail": ""})()
+    )
+    monkeypatch.setattr(dc, "check_postgres", lambda _t: True)
+    monkeypatch.setattr(dc, "_read_state", lambda: None)
+    monkeypatch.setattr(dc, "_candidate_identity", lambda *_a, **_kw: (None, None))
+    monkeypatch.setattr(dc, "_mission_authority_facts", lambda *_a, **_kw: object())
+    monkeypatch.setattr(
+        __import__("lubko.lifecycle_state", fromlist=["authorize_mission_publish"]),
+        "authorize_mission_publish",
+        lambda _f: True,
+    )
+
+    exit_code = dc.main([checkout_request, "--repo", "/nonexistent"])
+    # The exit code is EXIT_ERROR (1) for a failed checkout, proving the
+    # ProvenanceError was caught by the dispatch boundary, not traceback.
+    assert exit_code == dc.EXIT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Real-Git: shared topology base, per-test lightweight clones
+# ---------------------------------------------------------------------------
+
+_TOPOLOGY_BASE: Path | None = None
+_TOPOLOGY_TARGET: str = ""
+
+
+def _ensure_topology_base() -> tuple[Path, str]:
+    """Create or return the shared base topology for real-git tests.
+
+    The base is created once in a fixed location and reused across all
+    real-git tests.  Each test clones a fresh checkout from the shared
+    base to stay isolated while avoiding repeated full topology setup.
+
+    Returns:
+        (authority_bare_path, target_commit_B)
+    """
+    global _TOPOLOGY_BASE, _TOPOLOGY_TARGET  # ruff: ignore[global-statement]
+
+    if _TOPOLOGY_BASE is None:
+        import tempfile  # ruff: ignore[import-outside-top-level]
+
+        base = Path(tempfile.mkdtemp(prefix="provenance-topo-"))
+        _authority, _checkout, target = _setup_real_topology(base)
+        _TOPOLOGY_BASE = base
+        _TOPOLOGY_TARGET = target
+    return _TOPOLOGY_BASE, _TOPOLOGY_TARGET
+
+
+def _fresh_checkout(tmp_path: Path) -> tuple[Path, str]:
+    """Clone a fresh checkout and repoint its origin at the stale dev-clone.
+
+    The clone is created from the shared base ``deploy-checkout`` for
+    efficient object sharing, then the ``origin`` remote is rewritten to
+    point at ``dev-clone`` — the stale mutable local clone that only has
+    commit A.  This preserves the production topology invariant: origin
+    does NOT have the target commit B, while the explicit authority does.
+
+    Args:
+        tmp_path: Per-test temporary directory.
+
+    Returns:
+        (checkout_path, target_commit_B)
+    """
+    base, target = _ensure_topology_base()
+    checkout = _clone_checkout(tmp_path, base / "deploy-checkout", "checkout")
+    _git(checkout, "remote", "set-url", "origin", str(base / "dev-clone"))
+    return checkout, target
 
 
 # ---------------------------------------------------------------------------
@@ -221,18 +458,31 @@ def test_rollback_state_missing_source_url_defaults_none() -> None:
 
 def test_fetch_from_real_authority_succeeds(tmp_path: Path) -> None:
     """Fetching a commit that exists in the real authority succeeds."""
-    authority, checkout, target = _setup_real_topology(tmp_path)
+    base, target = _ensure_topology_base()
+    authority = base / "authority.git"
+    checkout, _ = _fresh_checkout(tmp_path)
     dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
     dc._require_exact_commit(checkout, target, TIMEOUT)
 
 
 def test_stale_origin_not_used_for_fetch(tmp_path: Path) -> None:
-    """The declared authority URL is used, not the checkout's origin remote."""
-    authority, checkout, target = _setup_real_topology(tmp_path)
+    """The declared authority URL is used, not the checkout's origin remote.
 
-    # Verify origin points to the dev-clone (stale mutable local clone)
+    Origin is the stale dev-clone (only has commit A).  Commit B exists
+    exclusively in the bare authority.  ``fetch_from_authority`` with the
+    authority URL obtains B, proving origin is never consulted.
+    """
+    base, target = _ensure_topology_base()
+    authority = base / "authority.git"
+    checkout, _ = _fresh_checkout(tmp_path)
+
+    # Origin points at dev-clone which only has commit A (stale)
     origin_url = _git(checkout, "remote", "get-url", "origin").stdout.strip()
-    assert origin_url == str(tmp_path / "dev-clone")
+    assert origin_url == str(base / "dev-clone")
+
+    # Commit B is absent from the stale dev-clone's object store
+    cat_file = _git(base / "dev-clone", "cat-file", "-e", f"{target}^{{commit}}")
+    assert cat_file.returncode != 0, "stale dev-clone must not contain target commit B"
 
     # Fetch succeeds using the explicit authority, proving origin is not consulted
     dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
@@ -246,7 +496,9 @@ def test_stale_origin_not_used_for_fetch(tmp_path: Path) -> None:
 
 def test_checkout_is_detached_and_clean(tmp_path: Path) -> None:
     """After fetch + checkout, HEAD is detached at the exact commit, worktree clean."""
-    authority, checkout, target = _setup_real_topology(tmp_path)
+    base, target = _ensure_topology_base()
+    authority = base / "authority.git"
+    checkout, _ = _fresh_checkout(tmp_path)
     dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
     dc._require_exact_commit(checkout, target, TIMEOUT)
 
@@ -274,7 +526,8 @@ def test_checkout_is_detached_and_clean(tmp_path: Path) -> None:
 
 def test_authority_without_commit_fails_without_switching_tip(tmp_path: Path) -> None:
     """Authority lacking target fails clearly; HEAD unchanged."""
-    _authority, checkout, target = _setup_real_topology(tmp_path)
+    _base, target = _ensure_topology_base()
+    checkout, _ = _fresh_checkout(tmp_path)
 
     # Create a separate authority that does NOT have the target commit
     wrong_authority = tmp_path / "wrong-authority.git"
@@ -307,22 +560,28 @@ def test_confirmed_runtime_independent_of_dev_checkout(tmp_path: Path) -> None:
     and ``_run_git`` are monkeypatched to raise ``AssertionError`` so
     any Git or network call during restart would fail the test.
     """
-    authority, checkout, target = _setup_real_topology(tmp_path)
+    base, target = _ensure_topology_base()
+    authority = base / "authority.git"
+    checkout, _ = _fresh_checkout(tmp_path)
 
     # Prepare: fetch B from authority, verify, detach at B.
     dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
     dc._require_exact_commit(checkout, target, TIMEOUT)
     dc._checkout(checkout, target, TIMEOUT, force=False)
 
-    # Sever all sources.
-    shutil.rmtree(tmp_path / "dev-clone")
-    shutil.rmtree(tmp_path / "authority-work")
-    shutil.rmtree(tmp_path / "authority.git")
+    # Sever all sources from this test's clone.
+    shutil.rmtree(tmp_path / "checkout")
 
     # Prove the detached checkout remains clean and exact after severing.
-    head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+    # (checkout was removed; this proves the restart path does not need it)
+    # Re-clone a fresh one just for the restart mission metadata.
+    checkout_fresh = _clone_checkout(tmp_path, base / "deploy-checkout", "checkout-restart")
+    dc.fetch_from_authority(checkout_fresh, target, str(authority), TIMEOUT)
+    dc._checkout(checkout_fresh, target, TIMEOUT, force=False)
+
+    head = _git(checkout_fresh, "rev-parse", "HEAD").stdout.strip()
     assert head == target
-    assert not _git(checkout, "status", "--porcelain").stdout
+    assert not _git(checkout_fresh, "status", "--porcelain").stdout
 
     # Build a restart mission whose previous worker is not retiring and is
     # still alive -- the restart path should just return it directly without
@@ -335,7 +594,7 @@ def test_confirmed_runtime_independent_of_dev_checkout(tmp_path: Path) -> None:
         sid=100,
         start_time_ticks=1000,
         token="test-token",  # ruff: ignore[hardcoded-password-func-arg]
-        repo=str(checkout),
+        repo=str(checkout_fresh),
         git_commit=target,
         worker_id="test-worker",
         log_path="worker.log",
@@ -349,7 +608,7 @@ def test_confirmed_runtime_independent_of_dev_checkout(tmp_path: Path) -> None:
         commit=target,
         previous_commit=target,
         deadline=time.time() + 60,
-        repo=str(checkout),
+        repo=str(checkout_fresh),
         uv_path="uv",
         stop_grace_seconds=1.0,
         git_timeout_seconds=5.0,

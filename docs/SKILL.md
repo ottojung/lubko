@@ -1068,7 +1068,7 @@ When the user asks to upgrade or redeploy the Lubko worker, use the deterministi
 
 ```sh
 lubko-deploy status
-lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N] [--source-url URL]
+lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
 lubko-deploy restart
 lubko-deploy migrate --commit <sha> [--repo DIR] [--uv PATH]
 lubko-deploy recover [--repo DIR] [--uv PATH] [--probe-timeout N]
@@ -1076,6 +1076,14 @@ lubko-deploy repair --repo DIR --recovery-worker-pid PID [--uv PATH] [--probe-ti
 lubko-deploy log [--lines N]
 lubko-supervisor --status
 ```
+
+For version-changing deployments with provenance-aware source authority, use `lubko-deploy-ctl`:
+
+```sh
+lubko-deploy-ctl '<json-request>' [--repo DIR] [--uv PATH] [--source-url URL]
+```
+
+The `--source-url` argument declares the authoritative Git remote. When set, the checkout fetches the exact commit from that authority before checking it out detached, making the deployment source deterministic and provenance-aware.
 
 The maintained worker is owned by an external supervisor (`lubko-supervisor`,
 the container's main process, replacing the former `sleep infinity` child of

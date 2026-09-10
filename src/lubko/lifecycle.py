@@ -338,7 +338,6 @@ class DeployOptions:
     cli_timeout_seconds: float
     probe_timeout_seconds: float = DEFAULT_REPAIR_PROBE_TIMEOUT_SECONDS
     direct_spawn: bool = False
-    source_url: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -2113,45 +2112,8 @@ def _verify_replacement(new_meta: WorkerMeta, options: DeployOptions) -> bool:
     return True
 
 
-def _verify_source_provenance(options: DeployOptions, commit: str) -> None:
-    """Verify the exact commit is obtainable from the declared source authority.
-
-    The fetch from the declared authority proves the commit originates from the
-    expected source rather than relying on whatever local git state or
-    ``origin`` remote happened to exist. A failure raises an actionable abort
-    so the deployment is never silently sourced from an unverified origin.
-
-    Args:
-        options: Deployment inputs (must have ``source_url`` set).
-        commit: Exact commit to verify against the declared source.
-
-    Raises:
-        DeployAbortedError: If the commit cannot be fetched from the declared source.
-    """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
-        deployctl,
-    )
-
-    try:
-        deployctl.fetch_from_authority(
-            options.repo,
-            commit,
-            options.source_url,  # type: ignore[arg-type]
-            options.git_timeout_seconds,
-        )
-    except deployctl.ProvenanceError as exc:
-        _err(str(exc))
-        _err("the commit was not fetched from the declared source authority")
-        raise DeployAbortedError from exc
-
-
 def _validate_and_prepare(options: DeployOptions) -> str:
     """Validate a checkout and prepare its maintained CLI environment.
-
-    When ``source_url`` is declared, the current HEAD commit is fetched from
-    the declared source authority and then re-verified present locally, so the
-    deployed commit is provenance-traced to the exact declared authority rather
-    than relying on whatever local state or ``origin`` remote happened to exist.
 
     Args:
         options: Deployment inputs.
@@ -2178,12 +2140,6 @@ def _validate_and_prepare(options: DeployOptions) -> str:
     if commit is None:
         _err("could not read the git commit of the deployment checkout")
         raise DeployAbortedError from None
-    if options.source_url is not None:
-        _verify_source_provenance(options, commit)
-        commit = git_commit(options.repo, options.git_timeout_seconds)
-        if commit is None:
-            _err("could not re-read the git commit after provenance fetch")
-            raise DeployAbortedError from None
     if not _prepare_maintained_cli(options, commit):
         raise DeployAbortedError from None
     return commit
@@ -4764,7 +4720,6 @@ def deploy_cmd(args: argparse.Namespace) -> int:
         validation_timeout_seconds=args.validation_timeout,
         git_timeout_seconds=args.git_timeout,
         cli_timeout_seconds=args.cli_timeout,
-        source_url=getattr(args, "source_url", None),
     )
     return deploy(options)
 
@@ -4906,11 +4861,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_CLI_TIMEOUT_SECONDS,
         help="maintained CLI environment build timeout in seconds (default: 600)",
-    )
-    deploy_parser.add_argument(
-        "--source-url",
-        default=None,
-        help="authoritative Git remote URL for provenance-checked checkout",
     )
 
     subparsers.add_parser(

@@ -112,7 +112,7 @@ class DeployCtlError(RuntimeError):
     """Raised when a supervised deployment cannot proceed safely."""
 
 
-class ProvenanceError(RuntimeError):
+class ProvenanceError(DeployCtlError):
     """Raised when a commit cannot be obtained from the declared source authority."""
 
 
@@ -152,7 +152,6 @@ class RollbackState:
     supervisor_owned: bool | None = None
     previous_restart_meta: WorkerMeta | None = None
     previous_restart_released: bool = False
-    source_url: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize durable rollback state.
@@ -188,7 +187,6 @@ class RollbackState:
                 None if self.previous_restart_meta is None else self.previous_restart_meta.to_dict()
             ),
             "previous_restart_released": self.previous_restart_released,
-            "source_url": self.source_url,
         }
         return result
 
@@ -277,7 +275,6 @@ class RollbackState:
             supervisor_owned=supervisor_owned,
             previous_restart_meta=restart_meta,
             previous_restart_released=restart_released,
-            source_url=_optional_json_string(data.get("source_url")),
         )
 
 
@@ -922,6 +919,53 @@ def _require_clean_checkout(repo: Path, timeout: float) -> None:
         raise DeployCtlError(msg)
 
 
+def _redact_source_url(source_url: str) -> str:
+    """Return a redacted display label for a source URL, hiding credentials.
+
+    URLs may contain ``user:password@`` userinfo used for private
+    repositories.  The redacted label preserves the host/path structure
+    useful for diagnostics while stripping any credential material.
+
+    Args:
+        source_url: The raw source authority URL.
+
+    Returns:
+        A credential-free display string.
+    """
+    if "@" not in source_url:
+        return source_url
+    scheme_end = source_url.find("://")
+    if scheme_end == -1:
+        return source_url
+    authority_start = scheme_end + 3
+    at_pos = source_url.find("@", authority_start)
+    if at_pos == -1:
+        return source_url
+    return source_url[:authority_start] + source_url[at_pos + 1 :]
+
+
+def _sanitize_stderr(stderr: str, source_url: str) -> str:
+    """Remove every occurrence of the raw source URL from git stderr.
+
+    Git may echo the full URL (including ``user:password@`` userinfo) back
+    in its diagnostic output.  The exact raw URL is stripped so credentials
+    never leak into ``ProvenanceError`` messages, durable logs, or queued
+    JSON responses.  The redacted label is substituted so the diagnostic
+    remains useful.
+
+    Args:
+        stderr: Raw git stderr text.
+        source_url: The raw source authority URL that may appear.
+
+    Returns:
+        Sanitized text with credentials removed.
+    """
+    if not stderr or source_url not in stderr:
+        return stderr
+    label = _redact_source_url(source_url)
+    return stderr.replace(source_url, label)
+
+
 def fetch_from_authority(
     repo: Path,
     commit: str,
@@ -944,16 +988,17 @@ def fetch_from_authority(
     Raises:
         ProvenanceError: If the fetch from the declared source fails.
     """
+    label = _redact_source_url(source_url)
     try:
         proc = _run_git(repo, ("fetch", "--depth=1", source_url, commit), timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        msg = f"could not fetch commit {commit} from source authority {source_url!r}: {exc}"
+        msg = f"could not fetch commit {commit} from source authority {label!r}: {exc}"
         raise ProvenanceError(msg) from exc
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
+        stderr = _sanitize_stderr((proc.stderr or "").strip(), source_url)
         detail = f": {stderr}" if stderr else ""
         msg = (
-            f"source authority {source_url!r} does not contain commit {commit}{detail}; "
+            f"source authority {label!r} does not contain commit {commit}{detail}; "
             "the commit was not fetched from the declared authority"
         )
         raise ProvenanceError(msg)
@@ -2275,7 +2320,6 @@ def _prepare_locked(
         previous_meta=previous,
         new_meta=new_meta,
         supervisor_owned=supervised,
-        source_url=options.source_url,
     )
     if not supervised:
         _publish_legacy_mission(state, gated, options.lock_timeout_seconds)
@@ -2873,9 +2917,12 @@ def _dispatch(options: Options, request: dict[str, object]) -> dict[str, object]
         Protocol response.
 
     Raises:
-        DeployCtlError: For unknown request types.
+        DeployCtlError: For unknown request types or invalid option combinations.
     """
     request_type = request.get("type")
+    if options.source_url is not None and request_type != "checkout":
+        msg = "--source-url is only supported for checkout requests"
+        raise DeployCtlError(msg)
     if request_type == "checkout":
         return _handle_checkout(options, request)
     if request_type == "confirm":
