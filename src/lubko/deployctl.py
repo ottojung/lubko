@@ -1932,20 +1932,35 @@ def _confirmation_receipt_path() -> Path:
     return state_root() / "deploy" / _CONFIRMATION_RECEIPT_NAME
 
 
-def _write_confirmation_receipt(commit: str) -> None:
-    """Durably record that startup artifacts were promoted for this commit.
+def _write_confirmation_receipt(commit: str, manifest: dict[str, object]) -> None:
+    """Durably record the content authority for promoted startup artifacts.
+
+    Stores the commit plus all hash/size fields from the successful staging
+    manifest so that repeat confirm can verify active artifacts against this
+    durable authority without re-reading the (now-deleted) staging manifest.
 
     Args:
         commit: The exact commit whose startup artifacts were promoted.
+        manifest: The staging manifest that was used for promotion.
     """
-    write_json_durable(_confirmation_receipt_path(), {"commit": commit})
+    receipt: dict[str, object] = {"commit": commit}
+    for key in (
+        "contract_hash",
+        "contract_size",
+        "definition_hash",
+        "definition_size",
+        "launcher_hash",
+        "launcher_size",
+    ):
+        receipt[key] = manifest.get(key)
+    write_json_durable(_confirmation_receipt_path(), receipt)
 
 
-def _read_confirmation_receipt() -> str | None:
+def _read_confirmation_receipt() -> dict[str, object] | None:
     """Read the durable confirmation receipt, treating corruption as absent.
 
     Returns:
-        The confirmed commit from the receipt, or ``None`` if absent/corrupt.
+        The receipt dict, or ``None`` if absent/corrupt.
     """
     path = _confirmation_receipt_path()
     try:
@@ -1961,7 +1976,7 @@ def _read_confirmation_receipt() -> str | None:
     commit = decoded.get("commit")
     if not isinstance(commit, str):
         return None
-    return commit
+    return decoded
 
 
 def _remove_confirmation_receipt() -> None:
@@ -3072,6 +3087,8 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
             startup_contract.cleanup_staging(bin_home)
             _remove_pre_confirmation_artifacts()
         raise
+    # Read manifest before promotion (promotion removes it on success).
+    manifest = startup_contract.read_staging_manifest()
     promotion_error = startup_contract.promote_staged_artifacts(
         state.commit, state.commit, bin_home
     )
@@ -3079,6 +3096,9 @@ def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, o
         msg = f"startup artifact promotion failed: {promotion_error}"
         append_deploy_log(msg)
         return {"type": "confirm", "ok": False, "commit": state.commit, "error": msg}
+    # Write receipt from the manifest for future repeat-confirm verification.
+    if manifest is not None:
+        _write_confirmation_receipt(state.commit, manifest)
     _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 
@@ -3091,10 +3111,11 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
     terminalization and promotion.  This function retries idempotent
     promotion using the retained manifest and staged bytes.
 
-    A durable confirmation receipt records the confirmed commit after
-    successful promotion.  On repeat confirm, if the receipt matches the
-    mission commit, active artifacts are already promoted and success is
-    returned immediately without needing the staging manifest.
+    A durable confirmation receipt records the content authority (commit
+    plus hashes/sizes) after successful promotion.  On repeat confirm,
+    the receipt is checked first and active artifacts are verified against
+    it.  If active bytes have drifted or the receipt is corrupt/wrong-commit,
+    a retained valid staging manifest can repair them.
 
     Fails closed if bin_home cannot be resolved: returning success without
     verifying artifacts would be a false positive.
@@ -3114,12 +3135,16 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
             "commit": state.commit,
             "error": f"startup artifact promotion incomplete: cannot resolve bin home: {exc}",
         }
-    # Check durable receipt: if already successfully promoted for this
-    # commit, return success immediately without needing staging manifest.
-    receipt_commit = _read_confirmation_receipt()
-    if receipt_commit == state.commit:
-        return _confirmation_response(state)
-    # No receipt or receipt for different commit — attempt promotion.
+    # Check durable receipt: verify active artifacts against content authority.
+    receipt = _read_confirmation_receipt()
+    if receipt is not None and receipt.get("commit") == state.commit:
+        error = startup_contract.verify_active_artifacts_match(receipt, bin_home)
+        if error is None:
+            return _confirmation_response(state)
+        # Active artifacts drifted despite receipt — try repair via manifest.
+    # No receipt, wrong-commit receipt, or drift — attempt promotion.
+    # Read manifest before promotion (promotion removes it on success).
+    manifest = startup_contract.read_staging_manifest()
     promotion_error = startup_contract.promote_staged_artifacts(
         state.commit, state.commit, bin_home
     )
@@ -3130,7 +3155,17 @@ def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
             "commit": state.commit,
             "error": f"startup artifact promotion incomplete: {promotion_error}",
         }
-    _write_confirmation_receipt(state.commit)
+    # Promotion succeeded — verify and write receipt from the manifest.
+    if manifest is not None:
+        verify_error = startup_contract.verify_active_artifacts_match(manifest, bin_home)
+        if verify_error is not None:
+            return {
+                "type": "confirm",
+                "ok": False,
+                "commit": state.commit,
+                "error": f"startup artifact verification failed after promotion: {verify_error}",
+            }
+        _write_confirmation_receipt(state.commit, manifest)
     _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 

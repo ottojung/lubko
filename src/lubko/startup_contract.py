@@ -1186,6 +1186,24 @@ def _verify_active_artifacts(manifest: dict[str, object], bin_home: Path) -> str
     return f"active artifacts verification failed: {', '.join(failed)}"
 
 
+def verify_active_artifacts_match(authority: dict[str, object], bin_home: Path) -> str | None:
+    """Verify active artifacts match a durable content authority dict.
+
+    The authority dict has the same structure as a staging manifest
+    (commit, hashes, sizes) and is used by both the confirmation receipt
+    and the staging manifest.  This function does NOT derive expected
+    artifacts from the current runtime's ``CURRENT_CONTRACT``.
+
+    Args:
+        authority: Dict with contract/definition/launcher hash+size fields.
+        bin_home: Directory containing the launcher scripts.
+
+    Returns:
+        ``None`` when all active artifacts match, or a descriptive error.
+    """
+    return _verify_active_artifacts(authority, bin_home)
+
+
 def _remove_staging_manifest() -> None:
     """Best-effort remove the staging manifest."""
     with suppress(FileNotFoundError, OSError):

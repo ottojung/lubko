@@ -886,9 +886,11 @@ def test_repeat_confirm_after_successful_promotion_returns_ok_true(
     response = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
     assert response["ok"] is True
     assert sc.read_staging_manifest() is None
-    assert dc._read_confirmation_receipt() == commit_b
+    receipt = dc._read_confirmation_receipt()
+    assert receipt is not None
+    assert receipt.get("commit") == commit_b
 
-    # Second confirm: receipt found, returns ok:true without staging
+    # Second confirm: receipt found, active artifacts verified, returns ok:true
     response2 = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
     assert response2["ok"] is True
     assert response2["confirmed"] is True
@@ -904,7 +906,7 @@ def test_repeat_confirm_wrong_commit_receipt_is_fail_closed(
     sc.write_startup_launcher(bin_home)
 
     # Write receipt for a different commit
-    dc._write_confirmation_receipt("x" * 40)
+    dc._write_confirmation_receipt("x" * 40, {"commit": "x" * 40})
 
     current_state = dc.RollbackState(
         schema_version=4,
@@ -975,10 +977,128 @@ def test_rollback_removes_confirmation_receipt(
     sc.write_startup_definition()
     sc.write_startup_launcher(bin_home)
 
-    # Write a receipt
-    dc._write_confirmation_receipt("b" * 40)
-    assert dc._read_confirmation_receipt() == "b" * 40
+    # Write a receipt with content authority
+    dc._write_confirmation_receipt("b" * 40, {"commit": "b" * 40})
+    assert dc._read_confirmation_receipt() is not None
 
     # Simulate rollback by calling the receipt removal
     dc._remove_confirmation_receipt()
     assert dc._read_confirmation_receipt() is None
+
+
+def test_repeat_confirm_drift_returns_ok_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After receipt creation, if active artifacts drift, repeat confirm returns ok:false.
+
+    Receipt commit matches but artifacts drifted — no staging manifest to
+    repair with, so promotion fails.
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest("b" * 40, bin_home)
+
+    commit_b = "b" * 40
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_CONFIRMED,
+        commit=commit_b,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": "a" * 40})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+    monkeypatch.setattr(dc, "_confirmation_state", lambda _r: current_state)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    # First confirm: promotion succeeds, receipt written
+    response = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response["ok"] is True
+    assert sc.read_staging_manifest() is None
+
+    # Simulate artifact drift: overwrite contract with different content
+    # (same schema version but different init_command to get "mismatch" not "corrupt")
+    sc.contract_path().write_text(
+        json.dumps({
+            "schema_version": CONTRACT_SCHEMA_VERSION,
+            "init_command": ["drifted"],
+            "supervisor_command": list(CURRENT_CONTRACT.supervisor_command),
+            "required_state_dirs": list(CURRENT_CONTRACT.required_state_dirs),
+            "required_config_files": list(CURRENT_CONTRACT.required_config_files),
+        }),
+        encoding="utf-8",
+    )
+    assert sc.assess_recorded_contract().state == "mismatch"
+
+    # Repeat confirm: receipt matches but artifacts drifted, no manifest to repair → ok:false
+    response2 = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response2["ok"] is False
+
+
+def test_repeat_confirm_repair_via_staging_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When receipt is stale but valid staging manifest exists, promotion repairs.
+
+    Artifacts and repeat confirm succeeds.
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest("b" * 40, bin_home)
+
+    commit_b = "b" * 40
+    current_state = dc.RollbackState(
+        schema_version=4,
+        generation=1,
+        status=dc.STATUS_CONFIRMED,
+        commit=commit_b,
+        previous_commit="a" * 40,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=5.0,
+        git_timeout_seconds=10.0,
+        previous_retiring=False,
+        previous_meta=type("M", (), {"to_dict": lambda _s: {}, "commit": "a" * 40})(),
+        new_meta=None,
+        supervisor_owned=True,
+    )
+    monkeypatch.setattr(dc, "_confirmation_state", lambda _r: current_state)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+
+    # Write receipt for wrong commit (simulating stale receipt)
+    dc._write_confirmation_receipt("x" * 40, {"commit": "x" * 40})
+
+    # Artifact drift
+    sc.contract_path().write_text(
+        json.dumps({
+            "schema_version": CONTRACT_SCHEMA_VERSION,
+            "init_command": ["drifted"],
+            "supervisor_command": list(CURRENT_CONTRACT.supervisor_command),
+            "required_state_dirs": list(CURRENT_CONTRACT.required_state_dirs),
+            "required_config_files": list(CURRENT_CONTRACT.required_config_files),
+        }),
+        encoding="utf-8",
+    )
+
+    # Repeat confirm: wrong-commit receipt, drift → repair via manifest
+    response = dc._confirm_locked({"type": "confirm", "commit": commit_b}, _confirm_opts())
+    assert response["ok"] is True
+    assert sc.assess_recorded_contract().state == "current"
+    # Receipt updated to commit-B
+    receipt = dc._read_confirmation_receipt()
+    assert receipt is not None
+    assert receipt.get("commit") == commit_b
