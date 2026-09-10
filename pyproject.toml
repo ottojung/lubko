@@ -5,9 +5,10 @@ description = "Execute queued development jobs directly inside the Lubko contain
 readme = "README.md"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-requires-python = "==3.12.*"
+requires-python = ">=3.12"
 dependencies = [
-    "psycopg[binary]>=3.2,<4",
+    "psycopg[binary]>=3.2,<4; sys_platform != 'android'",
+    "psycopg>=3.2,<4; sys_platform == 'android'",
 ]
 
 [project.scripts]
@@ -19,7 +20,7 @@ lubko-agent = "lubko.agent:main"
 my-lubko-agent = "lubko.agent:main"
 lubko-install = "lubko.install:main"
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "mypy",
     "pytest",
