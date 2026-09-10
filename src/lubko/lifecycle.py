@@ -114,7 +114,7 @@ UV_HTTP_TIMEOUT: Final = "30"
 READINESS_SENTINEL: Final = "lubko-readiness-sentinel"
 
 VALIDATION_STEPS: Final = (
-    ("sync",),
+    ("sync", "--frozen", "--extra", "dev"),
     ("run", "ruff", "format", "--check", "."),
     ("run", "ruff", "check", "."),
     ("run", "mypy", "."),
@@ -897,11 +897,11 @@ def _run_capture(
 
 
 def run_validation(repo: Path, uv_path: str, timeout_seconds: float) -> ValidationReport:
-    """Run ``uv sync`` and the repository-required validation commands.
+    """Run ``uv sync --frozen --extra dev`` and the repository-required validation commands.
 
-    Runs ``uv sync`` followed by ``ruff format --check``, ``ruff check``,
-    ``mypy``, and ``pytest`` exactly as the repository requires, with a bounded
-    timeout per command and a bounded network timeout for ``uv sync``.
+    Runs ``uv sync --frozen --extra dev`` followed by ``ruff format --check``,
+    ``ruff check``, ``mypy``, and ``pytest`` exactly as the repository requires,
+    with a bounded timeout per command and a bounded network timeout for ``uv sync``.
 
     Args:
         repo: Repository checkout to validate.

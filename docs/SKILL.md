@@ -1086,7 +1086,7 @@ unexpected exit, with bounded backoff and no manual intervention. A normal
 running; only the one-time `--bootstrap` path and the explicit emergency
 `recover`/`repair` commands start workers without it.
 
-`deploy` first validates the checkout by running `uv sync` and the repository-required checks (`ruff format --check`, `ruff check`, `mypy`, `pytest`). If validation fails, deployment is refused and the current worker is left untouched. Only a passing checkout is deployed.
+`deploy` first validates the checkout by running `uv sync --frozen --extra dev` and the repository-required checks (`ruff format --check`, `ruff check`, `mypy`, `pytest`). If validation fails, deployment is refused and the current worker is left untouched. Only a passing checkout is deployed. The deployed immutable CLI/runtime materialization uses plain `uv sync --frozen` (runtime-only, no dev extras).
 
 Deployment behavior:
 

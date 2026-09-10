@@ -1,9 +1,11 @@
 version = 1
 revision = 3
-requires-python = "==3.12.*"
+requires-python = ">=3.12"
 resolution-markers = [
-    "python_full_version >= '3.15'",
-    "python_full_version < '3.15'",
+    "python_full_version >= '3.15' and sys_platform != 'android'",
+    "python_full_version >= '3.15' and sys_platform == 'android'",
+    "python_full_version < '3.15' and sys_platform != 'android'",
+    "python_full_version < '3.15' and sys_platform == 'android'",
 ]
 
 [[package]]
@@ -194,10 +196,11 @@ name = "lubko"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "psycopg", extra = ["binary"] },
+    { name = "psycopg" },
+    { name = "psycopg", extra = ["binary"], marker = "sys_platform != 'android'" },
 ]
 
-[package.dev-dependencies]
+[package.optional-dependencies]
 dev = [
     { name = "mypy" },
     { name = "pytest" },
@@ -205,14 +208,14 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" }]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "ruff" },
+requires-dist = [
+    { name = "mypy", marker = "extra == 'dev'" },
+    { name = "psycopg", marker = "sys_platform == 'android'", specifier = ">=3.2,<4" },
+    { name = "psycopg", extras = ["binary"], marker = "sys_platform != 'android'", specifier = ">=3.2,<4" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "ruff", marker = "extra == 'dev'" },
 ]
+provides-extras = ["dev"]
 
 [[package]]
 name = "mypy"
@@ -310,7 +313,7 @@ wheels = [
 
 [package.optional-dependencies]
 binary = [
-    { name = "psycopg-binary", marker = "implementation_name != 'pypy'" },
+    { name = "psycopg-binary", marker = "implementation_name != 'pypy' and sys_platform != 'android'" },
 ]
 
 [[package]]
