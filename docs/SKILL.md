@@ -1068,7 +1068,7 @@ When the user asks to upgrade or redeploy the Lubko worker, use the deterministi
 
 ```sh
 lubko-deploy status
-lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N]
+lubko-deploy deploy [--bootstrap] [--repo DIR] [--uv PATH] [--grace-seconds N] [--source-url URL]
 lubko-deploy restart
 lubko-deploy migrate --commit <sha> [--repo DIR] [--uv PATH]
 lubko-deploy recover [--repo DIR] [--uv PATH] [--probe-timeout N]
@@ -1161,10 +1161,12 @@ exec lubko-supervisor
 
 After a fresh install has established the first desired commit and the supervisor owns the maintained worker, use `lubko-deploy-ctl` for version-changing self-deployments; see [`docs/issue21-deploy-protocol.md`](issue21-deploy-protocol.md).
 
+The maintained checkout procedure is deterministic and provenance-aware: given an exact reviewed commit and a declared source authority URL (`--source-url`), the procedure fetches that commit from the authoritative remote, verifies it is present locally, and checks it out detached. The source authority replaces implicit reliance on `origin` or any mutable local branch state, making the deployment source checkout reproducible and auditable.
+
 The normal supervised sequence is:
 
 ```text
-checkout exact commit
+checkout exact commit (from declared source authority)
     -> provisional candidate + armed rollback watchdog
 confirm exact commit
     -> exact candidate is queue-ready + terminal confirmation

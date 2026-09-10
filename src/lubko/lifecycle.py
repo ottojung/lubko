@@ -335,6 +335,7 @@ class DeployOptions:
     cli_timeout_seconds: float
     probe_timeout_seconds: float = DEFAULT_REPAIR_PROBE_TIMEOUT_SECONDS
     direct_spawn: bool = False
+    source_url: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -4620,6 +4621,7 @@ def deploy_cmd(args: argparse.Namespace) -> int:
         validation_timeout_seconds=args.validation_timeout,
         git_timeout_seconds=args.git_timeout,
         cli_timeout_seconds=args.cli_timeout,
+        source_url=getattr(args, "source_url", None),
     )
     return deploy(options)
 
@@ -4761,6 +4763,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_CLI_TIMEOUT_SECONDS,
         help="maintained CLI environment build timeout in seconds (default: 600)",
+    )
+    deploy_parser.add_argument(
+        "--source-url",
+        default=None,
+        help="authoritative Git remote URL for provenance-checked checkout",
     )
 
     subparsers.add_parser(
