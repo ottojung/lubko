@@ -1166,12 +1166,16 @@ def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:
     - ``fd_number`` must be a non-negative integer within the process's
       open-fd limit (``resource.getrlimit(RLIMIT_NOFILE)``);
     - the fd must refer to a real, open file (``os.fstat`` must succeed);
-    - the fd's path (``os.readlink(f"/proc/self/fd/{fd_number}")``) must
-      match ``expected_path`` exactly, preventing injection of an fd
-      pointing at an unrelated file;
-    - the ``fcntl.flock`` on the fd must not return ``EWOULDBLOCK`` (the
-      lock must be held — if another process somehow inherited and closed
-      it, the lock would be released).
+    - the fd's path (``Path(f"/proc/self/fd/{fd_number}").readlink()``)
+      must match ``expected_path`` exactly, preventing injection of an fd
+      pointing at an unrelated file.
+
+    The flock state itself cannot be reliably validated after exec: the
+    kernel does not expose which process holds an advisory flock, and a
+    non-blocking ``flock(LOCK_NB)`` on an unlocked fd succeeds (it acquires
+    the lock).  The security boundary is therefore the environment variable
+    chain: only the old supervisor (which holds the lock) sets these env
+    vars immediately before exec.
 
     Args:
         fd_number: The inherited file descriptor number.
@@ -1181,8 +1185,8 @@ def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:
         The validated, adopted file descriptor.
 
     Raises:
-        OSError: If validation fails (fd not open, wrong path, lock not
-            held, or fd number out of range).  The caller must continue
+        OSError: If validation fails (fd not open, wrong path, or fd number
+            out of range).  The caller must continue with the old authority.
             with the old authority.
     """
     soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -1423,7 +1427,6 @@ def write_state_preserving_authority(
                 unresolved_child=current.unresolved_child,
                 unresolved_hold_malformed=current.unresolved_hold_malformed,
                 ownership_hold_malformed=current.ownership_hold_malformed,
-                supervisor_runtime_commit=current.supervisor_runtime_commit,
             )
         )
 

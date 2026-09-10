@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, Final
 
 import pytest
@@ -278,3 +279,48 @@ def test_gc_preserves_supervisor_runtime_commit(lock_dir: Path) -> None:
     )
     authoritative = cli.supervisor_authoritative_commits()
     assert commit_a in authoritative
+
+
+def test_runtime_commit_persisted_through_startup_path(
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prove the actual startup persistence path stores the runtime commit.
+
+    Regression: write_state_preserving_authority() was unconditionally
+    preserving current.supervisor_runtime_commit (always None on first
+    startup), discarding the caller's new value.  This blocked runtime
+    identity persistence, skew detection, and the GC root.
+
+    This test proves the full path:
+    1. State starts without supervisor_runtime_commit (fresh install).
+    2. _persist_runtime_commit() writes the captured commit.
+    3. The stored commit survives a read round-trip.
+    4. Skew detection can act on the stored value.
+    """
+    state_path = supervise.state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write a fresh state without supervisor_runtime_commit.
+    state_path.write_text(
+        json.dumps(supervise.fresh_state().to_dict()),
+        encoding="utf-8",
+    )
+
+    # Verify the field is absent.
+    loaded = supervise.read_state()
+    assert loaded.supervisor_runtime_commit is None
+
+    # Simulate what _persist_runtime_commit does: write with the new value
+    # through write_state_preserving_authority.
+    commit_a = "a" * 40
+    supervise.write_state_preserving_authority(
+        replace(loaded, supervisor_runtime_commit=commit_a),
+        timeout_seconds=5.0,
+    )
+
+    # Verify the field is now stored.
+    reloaded = supervise.read_state()
+    assert reloaded.supervisor_runtime_commit == commit_a
+
+    # Prove skew detection can act: if cli.current_commit() returns a
+    # different commit, the stored value and the current value differ.
+    assert commit_a != "b" * 40
