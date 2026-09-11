@@ -9,6 +9,7 @@ These tests prove:
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -40,6 +41,17 @@ def _acquire_and_hold(lock_path: Path) -> int:
     return fd
 
 
+def _assert_flock_blocked(lock_path: Path) -> None:
+    """Assert that a non-blocking flock raises EAGAIN or EWOULDBLOCK.
+
+    Linux glibc reports ``Resource temporarily unavailable``; Android/Termux
+    reports ``Try again``.  Checking the errno number is portable.
+    """
+    with pytest.raises(OSError) as exc_info:  # ruff: ignore[pytest-raises-too-broad]
+        _acquire_and_hold(lock_path)
+    assert exc_info.value.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
+
+
 def test_same_lock_held_through_adoption(lock_dir: Path) -> None:
     """Adopting an inherited fd keeps the same flock held."""
     lock_path = supervise.supervisor_lock_path()
@@ -48,8 +60,7 @@ def test_same_lock_held_through_adoption(lock_dir: Path) -> None:
     try:
         adopted_fd = supervise.adopt_supervisor_lock(owner_fd, str(lock_path))
         assert adopted_fd == owner_fd
-        with pytest.raises(OSError, match="Resource temporarily unavailable"):
-            _acquire_and_hold(lock_path)
+        _assert_flock_blocked(lock_path)
     finally:
         os.set_inheritable(owner_fd, False)
         os.close(owner_fd)
@@ -93,8 +104,7 @@ def test_competitor_blocked_while_owner_holds(lock_dir: Path) -> None:
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
     try:
-        with pytest.raises(OSError, match="Resource temporarily unavailable"):
-            _acquire_and_hold(lock_path)
+        _assert_flock_blocked(lock_path)
     finally:
         os.close(owner_fd)
 
@@ -105,12 +115,10 @@ def test_competitor_blocked_during_adoption(lock_dir: Path) -> None:
     owner_fd = _acquire_and_hold(lock_path)
     os.set_inheritable(owner_fd, True)
     try:
-        with pytest.raises(OSError, match="Resource temporarily unavailable"):
-            _acquire_and_hold(lock_path)
+        _assert_flock_blocked(lock_path)
         adopted = supervise.adopt_supervisor_lock(owner_fd, str(lock_path))
         assert adopted == owner_fd
-        with pytest.raises(OSError, match="Resource temporarily unavailable"):
-            _acquire_and_hold(lock_path)
+        _assert_flock_blocked(lock_path)
     finally:
         os.set_inheritable(owner_fd, False)
         os.close(owner_fd)
@@ -218,8 +226,7 @@ def test_old_supervisor_continues_after_failed_handoff(
 
         assert os.get_inheritable(owner_fd) is False
 
-        with pytest.raises(OSError, match="Resource temporarily unavailable"):
-            _acquire_and_hold(lock_path)
+        _assert_flock_blocked(lock_path)
 
         assert daemon._ownership_fd == owner_fd
 
@@ -460,8 +467,7 @@ def test_b_failure_before_transfer_leaves_a_authoritative(
     daemon._maybe_handoff_to_new_supervisor()
     assert daemon._handoff_completed is False
     assert daemon._ownership_fd == owner_fd
-    with pytest.raises(OSError, match="Resource temporarily unavailable"):
-        _acquire_and_hold(supervise.supervisor_lock_path())
+    _assert_flock_blocked(supervise.supervisor_lock_path())
     assert "did not complete" in daemon._message  # type: ignore[operator]
 
 
@@ -499,8 +505,7 @@ def test_successor_startup_failure_before_ready_recovers_to_a(
     daemon._maybe_handoff_to_new_supervisor()
     assert daemon._handoff_completed is False
     assert daemon._ownership_fd == owner_fd
-    with pytest.raises(OSError, match="Resource temporarily unavailable"):
-        _acquire_and_hold(supervise.supervisor_lock_path())
+    _assert_flock_blocked(supervise.supervisor_lock_path())
     assert "did not complete" in daemon._message  # type: ignore[operator]
 
 
@@ -608,7 +613,6 @@ def test_ready_timeout_prevents_wedge(lock_dir: Path, monkeypatch: pytest.Monkey
     assert daemon._handoff_completed is False
     assert daemon._ownership_fd == owner_fd
 
-    with pytest.raises(OSError, match="Resource temporarily unavailable"):
-        _acquire_and_hold(supervise.supervisor_lock_path())
+    _assert_flock_blocked(supervise.supervisor_lock_path())
 
     assert "did not complete" in daemon._message  # type: ignore[operator]
