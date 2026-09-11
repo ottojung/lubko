@@ -119,6 +119,10 @@ class DeployCtlError(RuntimeError):
     """Raised when a supervised deployment cannot proceed safely."""
 
 
+class ProvenanceError(DeployCtlError):
+    """Raised when a commit cannot be obtained from the declared source authority."""
+
+
 @dataclass(frozen=True, slots=True)
 class Options:
     """Runtime inputs shared by supervised-deployment operations."""
@@ -132,6 +136,7 @@ class Options:
     validation_timeout_seconds: float
     git_timeout_seconds: float
     cli_timeout_seconds: float
+    source_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -919,6 +924,109 @@ def _require_clean_checkout(repo: Path, timeout: float) -> None:
     if proc.stdout:
         msg = "deployment checkout is dirty; commit or discard changes first"
         raise DeployCtlError(msg)
+
+
+def _has_userinfo(source_url: str) -> bool:
+    """Return whether the source URL contains credential-bearing userinfo.
+
+    Detects both ``scheme://user:password@host/path`` and SCP-style
+    ``user@host:path`` forms.  When userinfo is present, raw Git stderr
+    must never be appended to error messages because Git may normalize or
+    encode the credentials differently than the raw input string.
+
+    Args:
+        source_url: The raw source authority URL.
+
+    Returns:
+        ``True`` when the URL carries credential material.
+    """
+    if "@" not in source_url:
+        return False
+    scheme_end = source_url.find("://")
+    if scheme_end != -1:
+        # scheme://user:pass@host — userinfo follows "://"
+        return "@" in source_url[scheme_end + 3 :]
+    # SCP-style user@host:path — first component before ':' contains '@'
+    colon_pos = source_url.find(":")
+    prefix = source_url if colon_pos == -1 else source_url[:colon_pos]
+    return "@" in prefix
+
+
+def _redact_source_url(source_url: str) -> str:
+    """Return a redacted display label for a source URL, hiding credentials.
+
+    Handles both ``scheme://user:password@host/path`` and SCP-style
+    ``user@host:path`` forms.  The redacted label preserves the host/path
+    structure useful for diagnostics while stripping any credential material.
+
+    Args:
+        source_url: The raw source authority URL.
+
+    Returns:
+        A credential-free display string.
+    """
+    if "@" not in source_url:
+        return source_url
+    scheme_end = source_url.find("://")
+    if scheme_end != -1:
+        # scheme://user:pass@host/path → scheme://host/path
+        authority_start = scheme_end + 3
+        at_pos = source_url.find("@", authority_start)
+        if at_pos == -1:
+            return source_url
+        return source_url[:authority_start] + source_url[at_pos + 1 :]
+    # SCP-style user@host:path → host:path
+    at_pos = source_url.find("@")
+    if at_pos == -1:
+        return source_url
+    return source_url[at_pos + 1 :]
+
+
+def fetch_from_authority(
+    repo: Path,
+    commit: str,
+    source_url: str,
+    timeout: float,
+) -> None:
+    """Fetch the exact commit from the declared source authority.
+
+    Proves the commit originates from the explicit authority rather than
+    relying on whatever local state or ``origin`` remote happened to exist.
+    After a successful fetch, ``_require_exact_commit`` confirms the commit
+    is present in the local object store.
+
+    Args:
+        repo: Repository checkout.
+        commit: Exact commit to fetch.
+        source_url: The authoritative remote URL to fetch from.
+        timeout: Git timeout.
+
+    Raises:
+        ProvenanceError: If the fetch from the declared source fails.
+    """
+    label = _redact_source_url(source_url)
+    try:
+        proc = _run_git(repo, ("fetch", "--depth=1", source_url, commit), timeout)
+    except subprocess.TimeoutExpired:
+        msg = f"fetching commit {commit} from source authority {label!r} timed out after {timeout}s"
+        raise ProvenanceError(msg) from None
+    except OSError as exc:
+        errno_part = f" (errno {exc.errno})" if getattr(exc, "errno", None) else ""
+        msg = (
+            f"could not execute git fetch from source authority "
+            f"{label!r} for commit {commit}{errno_part}"
+        )
+        raise ProvenanceError(msg) from None
+    if proc.returncode != 0:
+        if _has_userinfo(source_url):
+            detail = ""
+        else:
+            detail = f": {(proc.stderr or '').strip()}" if proc.stderr else ""
+        msg = (
+            f"source authority {label!r} does not contain commit {commit}{detail}; "
+            "the commit was not fetched from the declared authority"
+        )
+        raise ProvenanceError(msg)
 
 
 def _checkout(repo: Path, commit: str, timeout: float, *, force: bool) -> bool:
@@ -2394,6 +2502,23 @@ def _mission_authority_facts(
     )
 
 
+def _provenance_fetch(options: Options, commit: str) -> None:
+    """Fetch the exact commit from the declared source authority when set.
+
+    When ``source_url`` is ``None``, this is a no-op: the commit is assumed
+    to already be present from prior provenance-preserving operations. When
+    set, the commit is fetched from the declared authority and then verified
+    present locally.
+
+    Args:
+        options: Deployment options.
+        commit: Exact candidate commit.
+    """
+    if options.source_url is not None:
+        fetch_from_authority(options.repo, commit, options.source_url, options.git_timeout_seconds)
+        _require_exact_commit(options.repo, commit, options.git_timeout_seconds)
+
+
 def _prepare_locked(
     options: Options,
     commit: str,
@@ -2435,6 +2560,7 @@ def _prepare_locked(
     if commit == previous_commit:
         msg = "candidate commit is already the maintained worker commit"
         raise DeployCtlError(msg)
+    _provenance_fetch(options, commit)
     _require_clean_checkout(options.repo, options.git_timeout_seconds)
     if not _checkout(options.repo, commit, options.git_timeout_seconds, force=False):
         msg = f"could not check out candidate commit {commit}"
@@ -3302,9 +3428,12 @@ def _dispatch(options: Options, request: dict[str, object]) -> dict[str, object]
         Protocol response.
 
     Raises:
-        DeployCtlError: For unknown request types.
+        DeployCtlError: For unknown request types or invalid option combinations.
     """
     request_type = request.get("type")
+    if options.source_url is not None and request_type != "checkout":
+        msg = "--source-url is only supported for checkout requests"
+        raise DeployCtlError(msg)
     if request_type == "checkout":
         return _handle_checkout(options, request)
     if request_type == "confirm":
@@ -3376,6 +3505,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--git-timeout", type=float, default=DEFAULT_GIT_TIMEOUT_SECONDS)
     parser.add_argument("--cli-timeout", type=float, default=DEFAULT_CLI_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--source-url",
+        default=None,
+        help="authoritative Git remote URL for provenance-checked checkout",
+    )
     return parser
 
 
@@ -3457,6 +3591,7 @@ def _build_options(args: argparse.Namespace) -> Options:
         validation_timeout_seconds=args.validation_timeout,
         git_timeout_seconds=args.git_timeout,
         cli_timeout_seconds=args.cli_timeout,
+        source_url=getattr(args, "source_url", None),
     )
     if options.confirm_window_seconds <= 0:
         msg = "confirmation window must be positive"
