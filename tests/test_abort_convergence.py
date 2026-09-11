@@ -17,6 +17,7 @@ import pathlib
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import types
 from typing import TYPE_CHECKING
@@ -29,6 +30,88 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 SLEEP_BIN: str = shutil.which("sleep") or "/bin/sleep"
+
+_READY_SCRIPT = "import os,sys;os.write(int(sys.argv[1]),b'\\n');sys.stdin.read()"
+
+
+def _spawn_ready_child(
+    *,
+    aid: str | None = None,
+    iid: str | None = None,
+    start_new_session: bool = True,
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Spawn a child that signals readiness through an inherited pipe fd.
+
+    The parent creates a pipe and passes the **write** end into the child via
+    ``pass_fds``.  After exec and runtime initialization the child writes one
+    byte to that inherited fd and blocks on stdin.  The parent then unblocks,
+    closes both ends of the pipe, and positively reads the child's identity
+    from ``/proc`` once — no polling, no sleep.
+
+    When *aid* is ``None`` no ``LUBKO_AGENT_ID`` or invocation markers are
+    injected — the child inherits a clean inherited environment.  When *aid*
+    is given, the corresponding marker (and optionally *iid*) is set so that
+    ``send_signal_group`` verification can succeed.
+
+    ``start_new_session`` defaults to ``True`` so the child is its own session
+    leader (``pid == pgid``), the common test requirement.
+
+    Returns:
+        A ``(proc, read_fd)`` pair.  The caller **must** call
+        ``_await_ready(proc, read_fd)`` to perform the handshake and retrieve
+        the confirmed start ticks.  Failing to do so leaks the read fd and
+        leaves the child un-reaped.
+    """
+    env = dict(os.environ)
+    if aid is not None:
+        env["LUBKO_AGENT_ID"] = aid
+    if iid is not None:
+        env[agent.INVOCATION_ID_VAR] = iid
+    rd, wr = os.pipe()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _READY_SCRIPT, str(wr)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=start_new_session,
+            close_fds=True,
+            pass_fds=(wr,),
+            env=env,
+        )
+    except BaseException:
+        os.close(rd)
+        os.close(wr)
+        raise
+    os.close(wr)
+    return proc, rd
+
+
+def _await_ready(proc: subprocess.Popen[bytes], rd: int) -> int:
+    """Complete the pipe handshake and return the child's confirmed start ticks.
+
+    Blocks until the child writes its single readiness byte, then closes both
+    pipe fds and reads the process's start ticks from ``/proc`` **once**.  If
+    the child never signals (e.g. it crashed before writing) the test fails
+    immediately — there is no retry loop.
+
+    Args:
+        proc: The ``Popen`` child whose readiness we are waiting for.
+        rd: The read end of the readiness pipe.
+
+    Returns:
+        The confirmed start-time ticks from ``/proc``.
+    """
+    try:
+        data = os.read(rd, 1)
+    finally:
+        os.close(rd)
+    if not data:
+        pytest.fail(f"child process {proc.pid} exited before signalling readiness")
+    ticks = agent.proc_start_ticks(proc.pid)
+    if ticks is None:
+        pytest.fail(f"process {proc.pid} signalled readiness but is not observable in /proc")
+    return ticks
 
 
 @pytest.fixture(autouse=True)
@@ -324,70 +407,27 @@ def test_send_signal_group_fails_closed_without_invocation_identity(
     agent.send_signal_group(meta, signal.SIGKILL)
 
 
-def _observable_ticks(pid: int) -> int:
-    """Return the process's start ticks once positively observable in /proc.
-
-    ``Popen`` returns before fork+exec completes, so identity data may not be
-    readable yet; exact signalling must fail closed in that window and tests
-    must wait for bounded observability instead of racing it.
-
-    Args:
-        pid: The freshly spawned process ID.
-
-    Fails the test when the process never became observable.
-
-    Returns:
-        The observed start time in clock ticks.
-    """
-    deadline = time.time() + 5
-    while True:
-        ticks = agent.proc_start_ticks(pid)
-        if ticks is not None:
-            return ticks
-        if time.time() > deadline:
-            pytest.fail(f"process {pid} never became observable")
-        time.sleep(0.01)
-
-
 class _MarkedProcess:
-    """A real test-owned process carrying one exact agent marker."""
+    """A real test-owned process carrying one exact agent marker.
+
+    Uses the pipe-handshake helper so the child is positively observable in
+    ``/proc`` before the constructor returns — no polling, no sleep.
+    """
 
     def __init__(self, aid: str, iid: str | None = None) -> None:
-        env = dict(os.environ)
-        env["LUBKO_AGENT_ID"] = aid
         self.iid = iid
-        if iid is not None:
-            env[agent.INVOCATION_ID_VAR] = iid
-        self.proc = subprocess.Popen(
-            [SLEEP_BIN, "300"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-            env=env,
-        )
-        # Bounded readiness barrier: Popen returns before fork+exec completes,
-        # so start ticks, environment markers, and session identity are not
-        # yet observable. Exact signalling must fail closed in that window;
-        # tests therefore wait until every recorded identity datum is
-        # positively observable through /proc before exposing the process.
-        deadline = time.time() + 5
-        while True:
-            ticks = agent.proc_start_ticks(self.pid)
-            ready = (
-                ticks is not None
-                and agent.env_has_marker(self.pid, aid)
-                and (iid is None or agent.env_has_invocation(self.pid, iid))
-                and os.getpgid(self.pid) == self.pid
-            )
-            if ready:
-                self.start_ticks = ticks
-                break
-            if time.time() > deadline:
-                failure = TimeoutError(f"marked process {self.pid} never became observable")
-                raise failure
-            time.sleep(0.01)
+        self.proc, rd = _spawn_ready_child(aid=aid, iid=iid)
+        self.start_ticks = _await_ready(self.proc, rd)
+        pid = self.proc.pid
+        if not agent.env_has_marker(pid, aid):
+            self.kill_and_reap()
+            pytest.fail(f"process {pid} missing LUBKO_AGENT_ID={aid!r}")
+        if iid is not None and not agent.env_has_invocation(pid, iid):
+            self.kill_and_reap()
+            pytest.fail(f"process {pid} missing invocation_id={iid!r}")
+        if os.getpgid(pid) != pid:
+            self.kill_and_reap()
+            pytest.fail(f"process {pid} pgid={os.getpgid(pid)} != pid")
 
     @property
     def pid(self) -> int:
@@ -661,16 +701,9 @@ def test_unrecorded_invocation_live_child_keeps_blocking_hold(
     monkeypatch.setattr(agent, "ABORT_REAP_SECONDS", 0.0)
     monkeypatch.setattr(os, "killpg", lambda *_a: pytest.fail("bare killpg fired"))
 
-    proc = subprocess.Popen(
-        [SLEEP_BIN, "300"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    proc, rd = _spawn_ready_child()
     try:
-        start = _observable_ticks(proc.pid)
+        start = _await_ready(proc, rd)
         agent._kill_unrecorded_invocation(aid, proc, start, iid)
 
         assert agent.pid_alive(proc.pid), "child must survive (fail-closed, no signal)"
@@ -852,19 +885,12 @@ def test_delete_honors_unresolved_child_until_exactly_proven_gone(
     seed["delete_pending"] = True
     agent.write_meta(aid, seed)
 
-    proc = subprocess.Popen(
-        [SLEEP_BIN, "300"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    proc, rd = _spawn_ready_child()
     try:
         marker = {
             "pid": proc.pid,
             "pgid": proc.pid,
-            "start_time": _observable_ticks(proc.pid),
+            "start_time": _await_ready(proc, rd),
             "invocation_id": iid,
         }
         seed["unresolved_invocation"] = marker
@@ -927,16 +953,9 @@ def test_spawn_gate_refusal_durably_records_child_before_any_cleanup(
     seed["stop_reason"] = "kill"
     agent.write_meta(aid, seed)
 
-    proc = subprocess.Popen(
-        [SLEEP_BIN, "300"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    proc, rd = _spawn_ready_child()
     try:
-        start = _observable_ticks(proc.pid)
+        start = _await_ready(proc, rd)
         blocked: dict[str, bool] = {}
         update_meta = agent.update_meta
         update_meta(aid, agent._record_running(proc, start, iid, blocked))
