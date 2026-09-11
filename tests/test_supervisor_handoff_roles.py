@@ -7,6 +7,8 @@ Proves:
   before _write_status, sleep, or _shutdown.
 - A retires its pidfile before sending TRANSFER.
 - Failed TRANSFER restores A's pidfile.
+- READY failure/timeout/EOF closes all pipe fds and reaps B.
+- retire_supervisor_pid() failure closes all pipe fds and reaps B.
 """
 
 from __future__ import annotations
@@ -14,11 +16,16 @@ from __future__ import annotations
 import json
 import os
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 import pytest
 
 from lubko import supervise
-from lubko.supervisor import Settings, SupervisorDaemon
+from lubko.supervisor import (
+    Settings,
+    SupervisorDaemon,
+    _HandoffPipes,  # ruff: ignore[import-private-name]
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -217,10 +224,10 @@ def test_a_retires_pidfile_before_transfer(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr("lubko.supervisor.os.close", _safe_close)
 
     transfer_r, transfer_w = os.pipe()
+    pipes = _HandoffPipes(ready_r=-1, transfer_r=transfer_r, transfer_w=transfer_w)
     daemon._send_handoff_transfer(
         process=__import__("subprocess").Popen(["true"]),
-        transfer_w=transfer_w,
-        transfer_r=transfer_r,
+        pipes=pipes,
         confirmed="b" * 40,
         ownership_fd=-1,
     )
@@ -265,13 +272,111 @@ def test_failed_transfer_restores_pidfile(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr("lubko.supervisor.os.close", _safe_close)
 
     transfer_r, transfer_w = os.pipe()
+    pipes = _HandoffPipes(ready_r=-1, transfer_r=transfer_r, transfer_w=transfer_w)
     daemon._send_handoff_transfer(
         process=__import__("subprocess").Popen(["true"]),
-        transfer_w=transfer_w,
-        transfer_r=transfer_r,
+        pipes=pipes,
         confirmed="b" * 40,
         ownership_fd=-1,
     )
 
     assert restored_pid, "pidfile should be restored after failed TRANSFER"
     assert restored_pid[0] == (os.getpid(), 12345)
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_ready_failure_closes_all_pipes_and_reaps_b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """READY failure/timeout/EOF closes all pipe fds and reaps B.
+
+    Regression: before this fix, _await_handoff_ready leaked transfer_r
+    and transfer_w on abort, and did not close them when B was already
+    spawned.
+    """
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = -1
+
+    closed_fds: list[int] = []
+
+    original_close = os.close
+
+    def _track_close(fd: int) -> None:
+        closed_fds.append(fd)
+        if fd >= 0:
+            original_close(fd)
+
+    process = MagicMock()
+    process.wait.return_value = 0
+
+    monkeypatch.setattr("lubko.supervisor.os.close", _track_close)
+    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
+
+    ready_r, ready_w = os.pipe()
+    os.close(ready_w)
+    transfer_r, transfer_w = os.pipe()
+    pipes = _HandoffPipes(ready_r=ready_r, transfer_r=transfer_r, transfer_w=transfer_w)
+
+    result = daemon._await_handoff_ready(
+        process=process,
+        pipes=pipes,
+        confirmed="b" * 40,
+        ownership_fd=-1,
+    )
+
+    assert result is False
+    process.kill.assert_called_once()
+    process.wait.assert_called_once()
+    assert transfer_r in closed_fds, "transfer_r should be closed"
+    assert transfer_w in closed_fds, "transfer_w should be closed"
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_retire_pidfile_failure_closes_all_pipes_and_reaps_b(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """retire_supervisor_pid() failure closes all pipe fds and reaps B.
+
+    Regression: before this fix, _send_handoff_transfer leaked transfer_r,
+    transfer_w, and left B stuck when retire_supervisor_pid() failed.
+    """
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = -1
+
+    closed_fds: list[int] = []
+
+    original_close = os.close
+
+    def _track_close(fd: int) -> None:
+        closed_fds.append(fd)
+        if fd >= 0:
+            original_close(fd)
+
+    process = MagicMock()
+    process.wait.return_value = 0
+
+    msg = "pidfile mismatch"
+
+    def _fail_retire() -> tuple[int, int]:
+        raise supervise.PidfileIdentityMismatchError(msg)
+
+    monkeypatch.setattr("lubko.supervise.retire_supervisor_pid", _fail_retire)
+    monkeypatch.setattr("lubko.supervisor.os.close", _track_close)
+    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
+
+    transfer_r, transfer_w = os.pipe()
+    pipes = _HandoffPipes(ready_r=-1, transfer_r=transfer_r, transfer_w=transfer_w)
+
+    daemon._send_handoff_transfer(
+        process=process,
+        pipes=pipes,
+        confirmed="b" * 40,
+        ownership_fd=-1,
+    )
+
+    process.kill.assert_called_once()
+    process.wait.assert_called_once()
+    assert transfer_r in closed_fds, "transfer_r should be closed"
+    assert transfer_w in closed_fds, "transfer_w should be closed"

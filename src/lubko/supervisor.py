@@ -150,6 +150,15 @@ class _HandoffTarget(NamedTuple):
     stored: str
 
 
+@dataclass(frozen=True, slots=True)
+class _HandoffPipes:
+    """Pipe file descriptors for the two-phase handoff protocol."""
+
+    ready_r: int
+    transfer_r: int
+    transfer_w: int
+
+
 class _BoundedSupervisorLogHandler(RotatingFileHandler):
     """Bound and coalesce the supervisor's durable diagnostic log."""
 
@@ -3357,16 +3366,14 @@ class SupervisorDaemon:
         ownership_fd = self._ownership_fd
         if ownership_fd is None:
             return
-        ready_r, transfer_r, transfer_w, process = self._spawn_handoff_successor(
+        pipes, process = self._spawn_handoff_successor(
             handoff.target, handoff.confirmed, handoff.stored, ownership_fd
         )
         if process is None:
             return
-        if not self._await_handoff_ready(process, ready_r, handoff.confirmed, ownership_fd):
+        if not self._await_handoff_ready(process, pipes, handoff.confirmed, ownership_fd):
             return
-        self._send_handoff_transfer(
-            process, transfer_w, transfer_r, handoff.confirmed, ownership_fd
-        )
+        self._send_handoff_transfer(process, pipes, handoff.confirmed, ownership_fd)
 
     def _resolve_handoff_target(self) -> _HandoffTarget | None:
         """Resolve the handoff target executable and validate preconditions.
@@ -3411,13 +3418,14 @@ class SupervisorDaemon:
         confirmed: str,
         stored: str,
         ownership_fd: int,
-    ) -> tuple[int, int, int, subprocess.Popen[bytes] | None]:
+    ) -> tuple[_HandoffPipes, subprocess.Popen[bytes] | None]:
         """Spawn the successor process in handoff mode with pipe fds.
 
         Returns:
-            A ``(ready_r, transfer_r, transfer_w, process)`` tuple.
+            A ``(_HandoffPipes, process)`` tuple.
             ``process`` is ``None`` when the spawn failed; callers should
-            return early.
+            return early.  The ``_HandoffPipes`` fields are still valid
+            fds that must be closed by the caller on abort.
         """
         lock_path = str(supervise.supervisor_lock_path())
         LOGGER.info(
@@ -3459,19 +3467,21 @@ class SupervisorDaemon:
                 f"supervisor handoff to {confirmed} failed to spawn; "
                 "continuing with the current runtime"
             )
-            return ready_r, transfer_r, transfer_w, None
+            return _HandoffPipes(
+                ready_r=ready_r, transfer_r=transfer_r, transfer_w=transfer_w
+            ), None
         with suppress(OSError):
             os.set_inheritable(ready_w, False)  # ruff: ignore[boolean-positional-value-in-call]
         with suppress(OSError):
             os.set_inheritable(transfer_r, False)  # ruff: ignore[boolean-positional-value-in-call]
         with suppress(OSError):
             os.close(ready_w)
-        return ready_r, transfer_r, transfer_w, process
+        return _HandoffPipes(ready_r=ready_r, transfer_r=transfer_r, transfer_w=transfer_w), process
 
     def _await_handoff_ready(
         self,
         process: subprocess.Popen[bytes],
-        ready_r: int,
+        pipes: _HandoffPipes,
         confirmed: str,
         ownership_fd: int,
     ) -> bool:
@@ -3479,7 +3489,7 @@ class SupervisorDaemon:
 
         Args:
             process: The spawned successor process.
-            ready_r: Read end of the readiness pipe.
+            pipes: Pipe file descriptors for the handoff protocol.
             confirmed: The target commit (for diagnostics).
             ownership_fd: The ownership lock file descriptor.
 
@@ -3495,22 +3505,26 @@ class SupervisorDaemon:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                readyfds, _, _ = select.select([ready_r], [], [], remaining)
+                readyfds, _, _ = select.select([pipes.ready_r], [], [], remaining)
                 if not readyfds:
                     break
-                chunk = os.read(ready_r, 1)
+                chunk = os.read(pipes.ready_r, 1)
                 if not chunk:
                     break
                 buf += chunk
             ready = buf.strip() == b"R"
         except OSError:
             pass
-        os.close(ready_r)
+        os.close(pipes.ready_r)
         if not ready:
             with suppress(OSError):
                 process.kill()
             with suppress(Exception):
                 process.wait(timeout=5.0)
+            with suppress(OSError):
+                os.close(pipes.transfer_r)
+            with suppress(OSError):
+                os.close(pipes.transfer_w)
             os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
             LOGGER.warning(
                 "supervisor handoff to %s did not complete; continuing with the current runtime",
@@ -3526,8 +3540,7 @@ class SupervisorDaemon:
     def _send_handoff_transfer(
         self,
         process: subprocess.Popen[bytes],
-        transfer_w: int,
-        transfer_r: int,
+        pipes: _HandoffPipes,
         confirmed: str,
         ownership_fd: int,
     ) -> None:
@@ -3539,8 +3552,7 @@ class SupervisorDaemon:
 
         Args:
             process: The spawned successor process.
-            transfer_w: Write end of the transfer pipe.
-            transfer_r: Read end of the transfer pipe.
+            pipes: Pipe file descriptors for the handoff protocol.
             confirmed: The target commit (for diagnostics).
             ownership_fd: The ownership lock file descriptor.
         """
@@ -3549,14 +3561,25 @@ class SupervisorDaemon:
         try:
             retired_pid, retired_ticks = supervise.retire_supervisor_pid()
         except supervise.PidfileIdentityMismatchError:
+            with suppress(OSError):
+                process.kill()
+            with suppress(Exception):
+                process.wait(timeout=5.0)
+            with suppress(OSError):
+                os.close(pipes.transfer_r)
+            with suppress(OSError):
+                os.close(pipes.transfer_w)
+            os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
             LOGGER.warning("handoff pidfile retirement failed; continuing with the current runtime")
             return
         try:
-            os.write(transfer_w, b"T\n")
+            os.write(pipes.transfer_w, b"T\n")
         except OSError:
             supervise.restore_supervisor_pid(retired_pid, retired_ticks)
             with suppress(OSError):
-                os.close(transfer_r)
+                os.close(pipes.transfer_r)
+            with suppress(OSError):
+                os.close(pipes.transfer_w)
             with suppress(OSError):
                 process.kill()
             with suppress(Exception):
@@ -3572,8 +3595,8 @@ class SupervisorDaemon:
             )
             return
         with suppress(OSError):
-            os.close(transfer_r)
-        os.close(transfer_w)
+            os.close(pipes.transfer_r)
+        os.close(pipes.transfer_w)
         os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
         os.close(ownership_fd)
         self._ownership_fd = None
