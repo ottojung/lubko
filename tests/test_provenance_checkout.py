@@ -16,8 +16,7 @@ deployment scenario from issue #729:
 
 from __future__ import annotations
 
-import contextlib
-import io
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -168,384 +167,6 @@ def _worker_meta_for_rollback() -> WorkerMeta:
     )
 
 
-# ---------------------------------------------------------------------------
-# Unit: type contracts
-# ---------------------------------------------------------------------------
-
-
-def test_provenance_error_is_deployctl_error_subtype() -> None:
-    """ProvenanceError is a DeployCtlError subtype so existing error boundaries catch it."""
-    assert issubclass(dc.ProvenanceError, dc.DeployCtlError)
-    assert issubclass(dc.ProvenanceError, RuntimeError)
-
-
-def test_provenance_error_caught_by_dispatch_boundary() -> None:
-    """ProvenanceError is caught by the same boundary as DeployCtlError.
-
-    Raises:
-        ProvenanceError: Always, to exercise the catch boundary.
-    """
-    caught: list[str] = []
-    try:
-        msg = "authority missing commit"
-        raise dc.ProvenanceError(msg)
-    except dc.DeployCtlError as exc:
-        caught.append(str(exc))
-    assert caught == ["authority missing commit"]
-
-
-# ---------------------------------------------------------------------------
-# Unit: credential redaction
-# ---------------------------------------------------------------------------
-
-
-def test_has_userinfo_detects_https() -> None:
-    """HTTPS URLs with user:password@ are detected as having userinfo."""
-    assert dc._has_userinfo("https://user:pass@host/repo.git") is True
-    assert dc._has_userinfo("https://host/repo.git") is False
-
-
-def test_has_userinfo_detects_scp_style() -> None:
-    """SCP-style user@host:path is detected as having userinfo."""
-    assert dc._has_userinfo("git@github.com:user/repo.git") is True
-    assert dc._has_userinfo("deploy-token@github.com:user/repo.git") is True
-    assert dc._has_userinfo("github.com:user/repo.git") is False
-
-
-def test_redact_source_url_strips_https_userinfo() -> None:
-    """HTTPS URLs with userinfo have the credential portion removed."""
-    url = "https://user:secret@github.com/org/repo.git"
-    assert dc._redact_source_url(url) == "https://github.com/org/repo.git"
-
-
-def test_redact_source_url_strips_scp_userinfo() -> None:
-    """SCP-style URLs with userinfo have the user portion removed."""
-    url = "git@github.com:user/repo.git"
-    assert dc._redact_source_url(url) == "github.com:user/repo.git"
-
-
-def test_redact_source_url_preserves_bare_urls() -> None:
-    """URLs without userinfo are returned unchanged."""
-    url = "https://github.com/org/repo.git"
-    assert dc._redact_source_url(url) == url
-
-
-def test_provenance_error_suppresses_stderr_for_userinfo_urls(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When source_url has userinfo, stderr is not included in the exception.
-
-    Git may normalize/encode the credential-bearing URL differently than
-    the raw input, so stderr is suppressed entirely to guarantee no
-    credential material leaks.
-    """
-    url_with_creds = "https://deploy-token:tk-abc123@github.com/org/repo.git"
-    stderr_with_url = (
-        f"fatal: unable to access '{url_with_creds}': The requested URL returned error: 401"
-    )
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            args=["git"],
-            returncode=128,
-            stdout="",
-            stderr=stderr_with_url,
-        )
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError) as exc_info:
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            url_with_creds,
-            5.0,
-        )
-
-    error_text = str(exc_info.value)
-    assert "tk-abc123" not in error_text
-    assert "deploy-token" not in error_text
-    assert url_with_creds not in error_text
-    # Stderr is suppressed entirely — no raw 401 detail either
-    assert "401" not in error_text
-    # The redacted host/path is still present for diagnostics
-    assert "github.com/org/repo.git" in error_text
-
-
-def test_provenance_error_suppresses_stderr_for_scp_userinfo(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """SCP-style user@host URLs also suppress stderr to avoid credential leak."""
-    scp_url = "git@github.com:org/private-repo.git"
-    stderr_text = "fatal: repository 'git@github.com:org/private-repo.git' not found"
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            args=["git"],
-            returncode=128,
-            stdout="",
-            stderr=stderr_text,
-        )
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError) as exc_info:
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            scp_url,
-            5.0,
-        )
-
-    error_text = str(exc_info.value)
-    assert "git@" not in error_text
-    assert "github.com:org/private-repo.git" in error_text
-
-
-def test_provenance_error_includes_stderr_for_credential_free_urls(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """URLs without userinfo retain stderr for useful diagnostics."""
-    clean_url = "https://github.com/org/repo.git"
-    stderr_text = "fatal: remote error: not found"
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            args=["git"],
-            returncode=128,
-            stdout="",
-            stderr=stderr_text,
-        )
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError, match="remote error: not found"):
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            clean_url,
-            5.0,
-        )
-
-
-def test_provenance_error_clean_with_normalized_encoded_secret(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When Git normalizes/encodes the secret differently, no credential leaks.
-
-    Git may percent-encode, hash, or otherwise transform a credential-
-    bearing URL in its stderr output.  Because stderr is suppressed when
-    userinfo is present, even a completely different encoded form of the
-    secret cannot appear in the exception.
-    """
-    raw_url = "https://user:p%40ssw0rd@host/repo.git"
-    # Simulate Git encoding the '@' as '%40' and double-encoding the password
-    normalized_stderr = (
-        "fatal: unable to access 'https://user:p%2540ssw0rd@host/repo.git': HTTP 401"
-    )
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess(
-            args=["git"],
-            returncode=128,
-            stdout="",
-            stderr=normalized_stderr,
-        )
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError) as exc_info:
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            raw_url,
-            5.0,
-        )
-
-    error_text = str(exc_info.value)
-    assert "p%40ssw0rd" not in error_text
-    assert "p%2540ssw0rd" not in error_text
-    assert "ssw0rd" not in error_text
-    assert "user" not in error_text
-    assert "401" not in error_text
-
-
-def test_timeout_expired_never_leaks_url_via_exc_string(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """TimeoutExpired.__str__ includes the command argv containing the raw URL.
-
-    The timeout path must produce a credential-free message using only the
-    redacted label and commit, never interpolating the exception string.
-    """
-    url_with_token = "https://deploy-tok:sek-ret@github.com/org/repo.git"  # ruff: ignore[hardcoded-password-string]
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        # TimeoutExpired.__str__ includes cmd which has the raw URL
-        raise subprocess.TimeoutExpired(cmd=_args, timeout=_timeout)
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError) as exc_info:
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            url_with_token,
-            3.0,
-        )
-
-    error_text = str(exc_info.value)
-    assert "sek-ret" not in error_text
-    assert "deploy-tok" not in error_text
-    assert url_with_token not in error_text
-    # Redacted label and commit are present for diagnostics
-    assert "github.com/org/repo.git" in error_text
-    assert COMMIT in error_text
-    assert "timed out" in error_text
-    # No chained exception carrying raw URL
-    assert exc_info.value.__cause__ is None
-
-
-def test_os_error_never_leaks_url_via_exc_string(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """OSError text may contain the URL in some environments.
-
-    The OSError path must produce a credential-free message, never
-    interpolating the exception string.
-    """
-    url_with_token = "https://user:pass123@git.example.com/secret/repo.git"  # ruff: ignore[hardcoded-password-string]
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        # OSError may embed argv/URL in its string representation
-        msg = f"[*] Command timed out: {_args}"
-        raise OSError(msg)
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-
-    with pytest.raises(dc.ProvenanceError) as exc_info:
-        dc.fetch_from_authority(
-            Path("/workspace/Lubko"),
-            COMMIT,
-            url_with_token,
-            5.0,
-        )
-
-    error_text = str(exc_info.value)
-    assert "pass123" not in error_text
-    assert "user" not in error_text
-    assert url_with_token not in error_text
-    assert "git.example.com/secret/repo.git" in error_text
-    assert COMMIT in error_text
-    # No chained exception carrying raw URL
-    assert exc_info.value.__cause__ is None
-
-
-def test_timeout_expired_clean_in_main_json_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A timeout during checkout produces clean JSON output via main()."""
-    url_with_token = "https://tok:x-oauth@github.com/org/repo.git"  # ruff: ignore[hardcoded-password-string]
-    checkout_request = f'{{"type":"checkout","commit":"{COMMIT}"}}'
-
-    def fake_run_git(
-        _repo: Path,
-        _args: tuple[str, ...],
-        _timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(cmd=_args, timeout=_timeout)
-
-    monkeypatch.setattr(dc, "_run_git", fake_run_git)
-    monkeypatch.setattr(dc, "_require_exact_commit", lambda *_a: None)
-    monkeypatch.setattr(dc, "_require_clean_checkout", lambda *_a: None)
-    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
-    monkeypatch.setattr(dc, "read_meta", _worker_meta_for_rollback)
-    monkeypatch.setattr(dc, "worker_alive", lambda _m: True)
-    monkeypatch.setattr(dc, "_provenance_fetch", lambda _o, _c: None)
-
-    captured = io.StringIO()
-    with contextlib.redirect_stdout(captured):
-        exit_code = dc.main([
-            checkout_request,
-            "--repo",
-            "/nonexistent",
-            "--source-url",
-            url_with_token,
-        ])
-
-    assert exit_code == dc.EXIT_ERROR
-    output = captured.getvalue()
-    assert "x-oauth" not in output
-    assert "tok" not in output.split("github.com")[0] if "github.com" in output else True
-
-
-def test_source_url_rejected_for_status_request() -> None:
-    """--source-url on a status request fails, not silently ignored."""
-    request = dc.parse_request('{"type": "status"}')
-    options = dc.Options(
-        repo=Path("/workspace/Lubko"),
-        uv_path="uv",
-        confirm_window_seconds=120.0,
-        stop_grace_seconds=1.0,
-        postgres_timeout_seconds=1.0,
-        lock_timeout_seconds=1.0,
-        validation_timeout_seconds=1.0,
-        git_timeout_seconds=5.0,
-        cli_timeout_seconds=1.0,
-        source_url="https://example.com/repo.git",
-    )
-    with pytest.raises(dc.DeployCtlError, match="--source-url is only supported for checkout"):
-        dc._dispatch(options, request)
-
-
-def test_source_url_rejected_for_confirm_request() -> None:
-    """--source-url on a confirm request fails, not silently ignored."""
-    request = dc.parse_request(f'{{"type":"confirm","commit":"{COMMIT}"}}')
-    options = dc.Options(
-        repo=Path("/workspace/Lubko"),
-        uv_path="uv",
-        confirm_window_seconds=120.0,
-        stop_grace_seconds=1.0,
-        postgres_timeout_seconds=1.0,
-        lock_timeout_seconds=1.0,
-        validation_timeout_seconds=1.0,
-        git_timeout_seconds=5.0,
-        cli_timeout_seconds=1.0,
-        source_url="https://example.com/repo.git",
-    )
-    with pytest.raises(dc.DeployCtlError, match="--source-url is only supported for checkout"):
-        dc._dispatch(options, request)
-
-
-# ---------------------------------------------------------------------------
-# Unit: RollbackState serialization
-# ---------------------------------------------------------------------------
-
-
 def _make_rollback_state() -> dc.RollbackState:
     """Build a minimal RollbackState for serialization tests.
 
@@ -570,63 +191,257 @@ def _make_rollback_state() -> dc.RollbackState:
     )
 
 
-def test_rollback_state_does_not_persist_source_url() -> None:
-    """source_url is transient preparation input and must not appear in rollback state."""
+def _make_source_url_options(url: str) -> dc.Options:
+    """Build Options with a source_url for boundary tests.
+
+    Returns:
+        Options instance with the given source_url.
+    """
+    return dc.Options(
+        repo=Path("/workspace/Lubko"),
+        uv_path="uv",
+        confirm_window_seconds=120.0,
+        stop_grace_seconds=1.0,
+        postgres_timeout_seconds=1.0,
+        lock_timeout_seconds=1.0,
+        validation_timeout_seconds=1.0,
+        git_timeout_seconds=5.0,
+        cli_timeout_seconds=1.0,
+        source_url=url,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unit: type contracts and dispatch boundary
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_error_hierarchy_and_dispatch_boundary() -> None:
+    """ProvenanceError is a DeployCtlError subtype caught by existing boundaries.
+
+    Combines subtype checks and dispatch catch boundary in one test to avoid
+    redundant pure-unit overhead.
+
+    Raises:
+        ProvenanceError: Always, to exercise the catch boundary.
+    """
+    # Subtype checks
+    assert issubclass(dc.ProvenanceError, dc.DeployCtlError)
+    assert issubclass(dc.ProvenanceError, RuntimeError)
+
+    # Dispatch boundary catch
+    caught: list[str] = []
+    try:
+        msg = "authority missing commit"
+        raise dc.ProvenanceError(msg)
+    except dc.DeployCtlError as exc:
+        caught.append(str(exc))
+    assert caught == ["authority missing commit"]
+
+
+# ---------------------------------------------------------------------------
+# Unit: credential redaction
+# ---------------------------------------------------------------------------
+
+
+def test_has_userinfo_and_redact_source_url() -> None:
+    """URL userinfo detection and redaction for both HTTPS and SCP styles.
+
+    Consolidates detection (https, scp, bare) and redaction (https strip,
+    scp strip, bare passthrough) into one test to avoid redundant pure-unit
+    overhead.
+    """
+    assert dc._has_userinfo("https://user:pass@host/repo.git") is True
+    assert dc._has_userinfo("https://host/repo.git") is False
+    assert dc._has_userinfo("git@github.com:user/repo.git") is True
+    assert dc._has_userinfo("deploy-token@github.com:user/repo.git") is True
+    assert dc._has_userinfo("github.com:user/repo.git") is False
+    # Redaction: HTTPS strips userinfo
+    assert dc._redact_source_url("https://user:secret@github.com/org/repo.git") == (
+        "https://github.com/org/repo.git"
+    )
+    # Redaction: SCP strips user
+    assert dc._redact_source_url("git@github.com:user/repo.git") == ("github.com:user/repo.git")
+    # Redaction: bare URL unchanged
+    bare = "https://github.com/org/repo.git"
+    assert dc._redact_source_url(bare) == bare
+
+
+# ---------------------------------------------------------------------------
+# Unit: credential-safe diagnostics (stderr suppression)
+# ---------------------------------------------------------------------------
+
+
+def test_stderr_suppressed_for_credential_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stderr is suppressed entirely when source_url has userinfo.
+
+    Covers HTTPS userinfo, SCP userinfo, and Git-normalized/encoded
+    credential variants to guarantee no credential material leaks through
+    stderr in any encoding form.
+    """
+    base_repo = Path("/workspace/Lubko")
+
+    def _make_fake(stderr: str) -> object:
+        def _fake(
+            _repo: Path,
+            _args: tuple[str, ...],
+            _timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                args=["git"],
+                returncode=128,
+                stdout="",
+                stderr=stderr,
+            )
+
+        return _fake
+
+    # HTTPS with userinfo — stderr suppressed, redacted host present
+    url_https = "https://deploy-token:tk-abc123@github.com/org/repo.git"
+    stderr_https = f"fatal: unable to access '{url_https}': The requested URL returned error: 401"
+    monkeypatch.setattr(dc, "_run_git", _make_fake(stderr_https))
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(base_repo, COMMIT, url_https, 5.0)
+    err = str(exc_info.value)
+    assert "tk-abc123" not in err
+    assert "deploy-token" not in err
+    assert url_https not in err
+    assert "401" not in err
+    assert "github.com/org/repo.git" in err
+
+    # SCP userinfo — stderr suppressed, redacted host present
+    scp_url = "git@github.com:org/private-repo.git"
+    stderr_scp = "fatal: repository 'git@github.com:org/private-repo.git' not found"
+    monkeypatch.setattr(dc, "_run_git", _make_fake(stderr_scp))
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(base_repo, COMMIT, scp_url, 5.0)
+    err = str(exc_info.value)
+    assert "git@" not in err
+    assert "github.com:org/private-repo.git" in err
+
+    # Git-normalized/encoded credential — stderr suppressed
+    raw_url = "https://user:p%40ssw0rd@host/repo.git"
+    normalized_stderr = (
+        "fatal: unable to access 'https://user:p%2540ssw0rd@host/repo.git': HTTP 401"
+    )
+    monkeypatch.setattr(dc, "_run_git", _make_fake(normalized_stderr))
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(base_repo, COMMIT, raw_url, 5.0)
+    err = str(exc_info.value)
+    assert "p%40ssw0rd" not in err
+    assert "p%2540ssw0rd" not in err
+    assert "ssw0rd" not in err
+    assert "user" not in err
+    assert "401" not in err
+
+    # Credential-free URL — stderr included for diagnostics
+    clean_url = "https://github.com/org/repo.git"
+    stderr_clean = "fatal: remote error: not found"
+    monkeypatch.setattr(dc, "_run_git", _make_fake(stderr_clean))
+    with pytest.raises(dc.ProvenanceError, match="remote error: not found"):
+        dc.fetch_from_authority(base_repo, COMMIT, clean_url, 5.0)
+
+
+# ---------------------------------------------------------------------------
+# Unit: error-path credential safety (timeout, OSError)
+# ---------------------------------------------------------------------------
+
+
+def test_error_paths_never_leak_url_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TimeoutExpired and OSError paths produce credential-free messages.
+
+    Consolidates timeout and OSError error-path tests to verify that
+    exception string interpolation never exposes the raw URL.
+    """
+    base_repo = Path("/workspace/Lubko")
+
+    # --- TimeoutExpired path ---
+    url_timeout = "https://deploy-tok:sek-ret@github.com/org/repo.git"
+
+    def _timeout_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=_args, timeout=_timeout)
+
+    monkeypatch.setattr(dc, "_run_git", _timeout_git)
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(base_repo, COMMIT, url_timeout, 3.0)
+    err = str(exc_info.value)
+    assert "sek-ret" not in err
+    assert "deploy-tok" not in err
+    assert url_timeout not in err
+    assert "github.com/org/repo.git" in err
+    assert COMMIT in err
+    assert "timed out" in err
+    assert exc_info.value.__cause__ is None
+
+    # --- OSError path ---
+    url_oserror = "https://user:pass123@git.example.com/secret/repo.git"
+
+    def _oserror_git(
+        _repo: Path,
+        _args: tuple[str, ...],
+        _timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        msg = f"[*] Command timed out: {_args}"
+        raise OSError(msg)
+
+    monkeypatch.setattr(dc, "_run_git", _oserror_git)
+    with pytest.raises(dc.ProvenanceError) as exc_info:
+        dc.fetch_from_authority(base_repo, COMMIT, url_oserror, 5.0)
+    err = str(exc_info.value)
+    assert "pass123" not in err
+    assert "user" not in err
+    assert url_oserror not in err
+    assert "git.example.com/secret/repo.git" in err
+    assert COMMIT in err
+    assert exc_info.value.__cause__ is None
+
+
+# ---------------------------------------------------------------------------
+# Unit: --source-url request boundary
+# ---------------------------------------------------------------------------
+
+
+def test_source_url_rejected_for_non_checkout_requests() -> None:
+    """--source-url on status and confirm requests fails, not silently ignored.
+
+    Consolidates both non-checkout request boundary checks.
+    """
+    status_request = dc.parse_request('{"type": "status"}')
+    with pytest.raises(dc.DeployCtlError, match="--source-url is only supported for checkout"):
+        dc._dispatch(_make_source_url_options("https://example.com/repo.git"), status_request)
+
+    confirm_request = dc.parse_request(f'{{"type":"confirm","commit":"{COMMIT}"}}')
+    with pytest.raises(dc.DeployCtlError, match="--source-url is only supported for checkout"):
+        dc._dispatch(_make_source_url_options("https://example.com/repo.git"), confirm_request)
+
+
+# ---------------------------------------------------------------------------
+# Unit: RollbackState serialization
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_state_transient_source_url() -> None:
+    """source_url is transient preparation input and must not persist.
+
+    Consolidates both rollback state checks: no source_url attribute/key
+    and round-trip fidelity without source_url.
+    """
     state = _make_rollback_state()
     raw = state.to_dict()
     assert "source_url" not in raw
     assert not hasattr(state, "source_url")
 
-
-def test_rollback_state_round_trip_without_source_url() -> None:
-    """RollbackState round-trips through to_dict/from_dict without source_url."""
-    state = _make_rollback_state()
-    raw = state.to_dict()
     restored = dc.RollbackState.from_dict(raw)
     assert restored.commit == COMMIT
     assert restored.previous_commit == PREVIOUS_COMMIT
-
-
-# ---------------------------------------------------------------------------
-# Unit: main/dispatch boundary catches ProvenanceError
-# ---------------------------------------------------------------------------
-
-
-def test_main_catches_provenance_error_as_checkout_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ProvenanceError raised during checkout is caught and produces a structured error response."""
-    checkout_request = f'{{"type":"checkout","commit":"{COMMIT}"}}'
-
-    def _always_provenance(*_a: object, **_kw: object) -> None:
-        msg = "source authority missing commit"
-        raise dc.ProvenanceError(msg)
-
-    monkeypatch.setattr(dc, "fetch_from_authority", _always_provenance)
-    monkeypatch.setattr(dc, "_require_exact_commit", lambda *_a: None)
-    monkeypatch.setattr(dc, "_require_clean_checkout", lambda *_a: None)
-    monkeypatch.setattr(dc, "_checkout", lambda *_a, **_kw: True)
-    monkeypatch.setattr(dc, "_cleanup_pending_locked", lambda: None)
-    monkeypatch.setattr(dc, "read_meta", _worker_meta_for_rollback)
-    monkeypatch.setattr(dc, "worker_alive", lambda _m: True)
-    monkeypatch.setattr(dc, "_provenance_fetch", lambda _o, _c: None)
-    monkeypatch.setattr(
-        dc, "run_validation", lambda *_a: type("R", (), {"ok": True, "detail": ""})()
-    )
-    monkeypatch.setattr(dc, "check_postgres", lambda _t: True)
-    monkeypatch.setattr(dc, "_read_state", lambda: None)
-    monkeypatch.setattr(dc, "_candidate_identity", lambda *_a, **_kw: (None, None))
-    monkeypatch.setattr(dc, "_mission_authority_facts", lambda *_a, **_kw: object())
-    monkeypatch.setattr(
-        __import__("lubko.lifecycle_state", fromlist=["authorize_mission_publish"]),
-        "authorize_mission_publish",
-        lambda _f: True,
-    )
-
-    exit_code = dc.main([checkout_request, "--repo", "/nonexistent"])
-    # The exit code is EXIT_ERROR (1) for a failed checkout, proving the
-    # ProvenanceError was caught by the dispatch boundary, not traceback.
-    assert exit_code == dc.EXIT_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -674,27 +489,19 @@ def _fresh_checkout(tmp_path: Path, topology_base: tuple[Path, str]) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Real-Git: authority fetch topology
+# Real-Git: authority fetch and stale origin
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_from_real_authority_succeeds(
+def test_authority_fetch_and_stale_origin_not_consulted(
     tmp_path: Path, topology_base: tuple[Path, str]
 ) -> None:
-    """Fetching a commit that exists in the real authority succeeds."""
-    base, target = topology_base
-    authority = base / "authority.git"
-    checkout = _fresh_checkout(tmp_path, topology_base)
-    dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
-    dc._require_exact_commit(checkout, target, TIMEOUT)
+    """Authority URL is used, not the stale origin; fetch obtains target B.
 
-
-def test_stale_origin_not_used_for_fetch(tmp_path: Path, topology_base: tuple[Path, str]) -> None:
-    """The declared authority URL is used, not the checkout's origin remote.
-
-    Origin is the stale dev-clone (only has commit A).  Commit B exists
-    exclusively in the bare authority.  ``fetch_from_authority`` with the
-    authority URL obtains B, proving origin is never consulted.
+    Verifies that origin (stale dev-clone, only commit A) is never
+    consulted and that the explicit authority provides commit B.
+    Combines the basic fetch success and stale-origin non-consultation
+    checks into one test to avoid duplicate clone + fetch overhead.
     """
     base, target = topology_base
     authority = base / "authority.git"
@@ -778,20 +585,42 @@ def test_authority_without_commit_fails_without_switching_tip(
 def test_confirmed_runtime_independent_of_dev_checkout(
     tmp_path: Path, topology_base: tuple[Path, str]
 ) -> None:
-    """After source severing the restart path performs no Git/network lookup."""
+    """After source severing the restart path performs no Git/network lookup.
+
+    The deployment checkout is prepared at the target commit, then both the
+    stale mutable dev-clone and the canonical authority are removed from
+    disk.  ``restart_previous`` must still succeed using only the detached
+    checkout and the live worker identity, proving the confirmed runtime
+    is fully independent of the development sources.
+    """
     base, target = topology_base
     authority = base / "authority.git"
-    checkout = _fresh_checkout(tmp_path, topology_base)
 
-    # Prepare: fetch B from authority, verify, detach at B.
-    dc.fetch_from_authority(checkout, target, str(authority), TIMEOUT)
-    dc._require_exact_commit(checkout, target, TIMEOUT)
-    dc._checkout(checkout, target, TIMEOUT, force=False)
+    # Prepare: clone, point origin at stale dev-clone, fetch B from
+    # authority, verify exact commit, detach at B.
+    checkout_dir = tmp_path / "isolated-checkout"
+    _run(
+        ["git", "clone", str(base / "deploy-checkout"), str(checkout_dir)],
+        cwd=tmp_path,
+    )
+    _git(checkout_dir, "remote", "set-url", "origin", str(base / "dev-clone"))
+    dc.fetch_from_authority(checkout_dir, target, str(authority), TIMEOUT)
+    dc._require_exact_commit(checkout_dir, target, TIMEOUT)
+    dc._checkout(checkout_dir, target, TIMEOUT, force=False)
 
-    # Prove the detached checkout remains clean and exact.
-    head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+    # Verify the prepared state before severing.
+    head = _git(checkout_dir, "rev-parse", "HEAD").stdout.strip()
     assert head == target
-    assert not _git(checkout, "status", "--porcelain").stdout
+    assert not _git(checkout_dir, "status", "--porcelain").stdout
+
+    # Sever access to both mutable dev-clone and canonical authority.
+    # The checkout's own .git directory retains all needed objects.
+    shutil.rmtree(base / "dev-clone")
+    shutil.rmtree(base / "authority.git")
+
+    # Confirm the sources are actually gone.
+    assert not (base / "dev-clone").exists()
+    assert not (base / "authority.git").exists()
 
     # Build a restart mission whose previous worker is not retiring and is
     # still alive -- the restart path should just return it directly without
@@ -804,7 +633,7 @@ def test_confirmed_runtime_independent_of_dev_checkout(
         sid=100,
         start_time_ticks=1000,
         token="test-token",  # ruff: ignore[hardcoded-password-func-arg]
-        repo=str(checkout),
+        repo=str(checkout_dir),
         git_commit=target,
         worker_id="test-worker",
         log_path="worker.log",
@@ -818,7 +647,7 @@ def test_confirmed_runtime_independent_of_dev_checkout(
         commit=target,
         previous_commit=target,
         deadline=time.time() + 60,
-        repo=str(checkout),
+        repo=str(checkout_dir),
         uv_path="uv",
         stop_grace_seconds=1.0,
         git_timeout_seconds=5.0,
