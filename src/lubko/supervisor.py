@@ -82,7 +82,7 @@ from typing import TYPE_CHECKING, Final, NamedTuple, override
 
 import psycopg
 
-from lubko import cli, deployctl, lifecycle, lifecycle_state, supervise
+from lubko import cli, deployctl, lifecycle, lifecycle_state, startup_contract, supervise
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
@@ -881,6 +881,7 @@ class SupervisorDaemon:
         self._record_mission_progress(commit)
         self._probe_readiness(now)
         self._complete_cold_migration()
+        self._converge_startup_artifacts()
 
     def _apply_newer_desired(
         self,
@@ -1041,6 +1042,48 @@ class SupervisorDaemon:
             f"cold migration complete: deployment authority converged to commit {desired.commit}"
         )
         LOGGER.info("cold migration converged deployment authority to commit %s", desired.commit)
+
+    def _converge_startup_artifacts(self) -> None:
+        """Promote pre-staged startup artifacts for the durable confirmed commit.
+
+        The supervisor runtime may outlive the confirmed commit, so generating
+        artifacts from its own loaded ``CURRENT_CONTRACT`` would revert
+        confirmed artifacts to the supervisor's older code version.  The
+        recovery decision is driven entirely by durable recovery authority:
+        the confirmed mission plus the staging manifest/snapshot state.  If
+        ``STATUS_CONFIRMED`` has a retained manifest bound exactly to
+        ``mission.commit``, opaque staged bytes are promoted regardless of
+        what the old supervisor contract validation would say about the
+        active artifacts.  ``promote_staged_artifacts`` already idempotently
+        skips correct destinations and verifies manifest hashes.
+
+        If there is no recovery manifest or the manifest commit does not
+        match the durable confirmed commit, promotion is not attempted and
+        no artifacts are mutated — the old A contract validation is never
+        used as evidence that B is stale.
+        """
+        try:
+            bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+        except (OSError, ValueError) as exc:
+            self._message = f"startup artifact convergence skipped: {exc}"
+            return
+        try:
+            mission = deployctl.read_rollback_state()
+        except deployctl.DeployCtlError:
+            return
+        if mission is None or mission.status != deployctl.STATUS_CONFIRMED:
+            return
+        promotion_error = startup_contract.promote_staged_artifacts(
+            mission.commit, mission.commit, bin_home
+        )
+        if promotion_error is not None:
+            LOGGER.debug(
+                "startup artifact promotion skipped for %s: %s",
+                mission.commit,
+                promotion_error,
+            )
+        else:
+            LOGGER.info("startup artifacts converged to confirmed commit %s", mission.commit)
 
     def _record_mission_progress(self, commit: str) -> None:
         """Advance the applied generation once a mission candidate is running.

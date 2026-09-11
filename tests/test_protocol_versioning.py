@@ -99,13 +99,13 @@ def test_chunk_parser_accepts_v4_and_rejects_future_version() -> None:
         parse_chunk_payload(chunk)
 
 
-@pytest.mark.parametrize("version", ["4", 4.5, True, None])
-def test_parser_rejects_non_integer_version(version: object) -> None:
+def test_parser_rejects_non_integer_version() -> None:
     """Malformed version values are never coerced into v4."""
-    raw = build_payload(server="s", cwd="/srv", process=["echo"])
-    raw["v"] = version
-    with pytest.raises(ProtocolError, match="integer"):
-        parse_payload(raw)
+    for version in ("4", 4.5, True, None):
+        raw = build_payload(server="s", cwd="/srv", process=["echo"])
+        raw["v"] = version
+        with pytest.raises(ProtocolError, match="integer"):
+            parse_payload(raw)
 
 
 def test_parser_rejects_missing_version() -> None:

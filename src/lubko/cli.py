@@ -354,41 +354,47 @@ def _runtime_content_digest(root: Path) -> bytes:
     Returns:
         The raw SHA-256 digest bytes over the canonical tree encoding.
     """
-    entries: list[tuple[str, Path, os.stat_result]] = []
+    root_s = os.fspath(root)
+    entries: list[tuple[str, str, os.stat_result]] = []
 
-    def collect(directory: Path) -> None:
+    def _collect(directory: str, prefix: str) -> None:
         with os.scandir(directory) as iterator:
             for entry in iterator:
-                path = Path(entry.path)
-                rel = path.relative_to(root).as_posix()
-                if rel == RUNTIME_MANIFEST_NAME:
+                name = entry.name
+                if not prefix and name == RUNTIME_MANIFEST_NAME:
                     continue
-                info = path.lstat()
-                entries.append((rel, path, info))
+                rel = f"{prefix}{name}" if not prefix else f"{prefix}/{name}"
+                # Pure-string hot path: avoid Path overhead in digest loop.
+                full = os.path.join(directory, name)  # ruff: ignore[os-path-join]
+                info = os.lstat(full)
+                entries.append((rel, full, info))
                 if stat.S_ISDIR(info.st_mode):
-                    collect(path)
+                    _collect(full, rel)
 
-    collect(root)
+    _collect(root_s, "")
+    entries.sort(key=itemgetter(0))
     hasher = hashlib.sha256()
 
     def update(data: bytes) -> None:
         hasher.update(len(data).to_bytes(8, "big"))
         hasher.update(data)
 
-    for rel, path, info in sorted(entries, key=itemgetter(0)):
+    for rel, full, info in entries:
         update(rel.encode("utf-8"))
         if stat.S_ISREG(info.st_mode):
             update(b"f")
             update((info.st_mode & ~_WRITE_BITS & 0o777).to_bytes(2, "big"))
-            update(_file_content_digest(path))
+            update(_file_content_digest(Path(full)))
         elif stat.S_ISLNK(info.st_mode):
             update(b"l")
-            update(os.fspath(path.readlink()).encode("utf-8"))
+            # Pure-string hot path: avoid Path overhead in digest loop.
+            update(os.fspath(os.readlink(full)).encode("utf-8"))  # ruff: ignore[os-readlink]
         elif stat.S_ISDIR(info.st_mode):
             update(b"d")
         else:
             update(b"o")
             update((info.st_mode & ~_WRITE_BITS & 0o777).to_bytes(2, "big"))
+
     return hasher.digest()
 
 

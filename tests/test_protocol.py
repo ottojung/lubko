@@ -110,16 +110,13 @@ def test_rejects_relative_cwd_on_parse() -> None:
             parse_payload(raw)
 
 
-@pytest.mark.parametrize(
-    "process",
-    [[], ["echo", ""], "echo", [1, 2], None],
-)
-def test_rejects_invalid_process(process: object) -> None:
+def test_rejects_invalid_process() -> None:
     """The process field must be a non-empty array of non-empty strings."""
-    raw = command_payload()
-    raw["request"] = {"cwd": "/srv/jobs", "process": process}
-    with pytest.raises(ProtocolError):
-        parse_payload(raw)
+    for process in [[], ["echo", ""], "echo", [1, 2], None]:
+        raw = command_payload()
+        raw["request"] = {"cwd": "/srv/jobs", "process": process}
+        with pytest.raises(ProtocolError):
+            parse_payload(raw)
 
 
 def test_rejects_legacy_command_fields() -> None:

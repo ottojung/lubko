@@ -1077,6 +1077,14 @@ lubko-deploy log [--lines N]
 lubko-supervisor --status
 ```
 
+For version-changing deployments with provenance-aware source authority, use `lubko-deploy-ctl`:
+
+```sh
+lubko-deploy-ctl '<json-request>' [--repo DIR] [--uv PATH] [--source-url URL]
+```
+
+The `--source-url` argument declares the authoritative Git remote. When set, the checkout fetches the exact commit from that authority before checking it out detached, making the deployment source deterministic and provenance-aware.
+
 The maintained worker is owned by an external supervisor (`lubko-supervisor`,
 the container's main process, replacing the former `sleep infinity` child of
 Tini). `deploy` hands the exact confirmed commit to the supervisor, which owns
@@ -1161,10 +1169,12 @@ exec lubko-supervisor
 
 After a fresh install has established the first desired commit and the supervisor owns the maintained worker, use `lubko-deploy-ctl` for version-changing self-deployments; see [`docs/issue21-deploy-protocol.md`](issue21-deploy-protocol.md).
 
+The maintained checkout procedure is deterministic and provenance-aware: given an exact reviewed commit and a declared source authority URL (`--source-url`), the procedure fetches that commit from the authoritative remote, verifies it is present locally, and checks it out detached. The source authority replaces implicit reliance on `origin` or any mutable local branch state, making the deployment source checkout reproducible and auditable.
+
 The normal supervised sequence is:
 
 ```text
-checkout exact commit
+checkout exact commit (from declared source authority)
     -> provisional candidate + armed rollback watchdog
 confirm exact commit
     -> exact candidate is queue-ready + terminal confirmation

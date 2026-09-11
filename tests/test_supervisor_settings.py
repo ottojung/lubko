@@ -20,12 +20,12 @@ TIMING_FIELDS = (
 )
 
 
-@pytest.mark.parametrize("field_name", TIMING_FIELDS)
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_settings_reject_non_finite_timing_values(field_name: str, value: float) -> None:
+def test_settings_reject_non_finite_timing_values() -> None:
     """Reject every non-finite value for every timing field."""
-    with pytest.raises(ValueError, match="must be finite"):
-        replace(supervisor.Settings(), **{field_name: value})
+    for field_name in TIMING_FIELDS:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="must be finite"):
+                replace(supervisor.Settings(), **{field_name: value})
 
 
 @pytest.mark.parametrize("spelling", ["nan", "inf", "-inf"])
@@ -39,12 +39,12 @@ def test_settings_from_environment_rejects_non_finite_timing(
         supervisor.Settings.from_environment()
 
 
-@pytest.mark.parametrize("field_name", ["postgres_timeout_seconds", "lock_timeout_seconds"])
-@pytest.mark.parametrize("value", [0.0, -1.0])
-def test_settings_reject_non_positive_database_timeouts(field_name: str, value: float) -> None:
+def test_settings_reject_non_positive_database_timeouts() -> None:
     """Reject zero and negative database timeout values."""
-    with pytest.raises(ValueError, match="database timeout settings must be positive"):
-        replace(supervisor.Settings(), **{field_name: value})
+    for field_name in ("postgres_timeout_seconds", "lock_timeout_seconds"):
+        for value in (0.0, -1.0):
+            with pytest.raises(ValueError, match="database timeout settings must be positive"):
+                replace(supervisor.Settings(), **{field_name: value})
 
 
 def test_settings_accept_valid_finite_timing_values() -> None:

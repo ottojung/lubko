@@ -31,19 +31,19 @@ def intent_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
-@pytest.mark.parametrize(("restart", "expected"), [(None, False), (True, True), (False, False)])
-def test_missing_and_boolean_restart_values_parse(restart: object, expected: object) -> None:
+def test_missing_and_boolean_restart_values_parse() -> None:
     """Missing parses as false; only literal JSON booleans are accepted."""
-    payload = intent_payload() if restart is None else intent_payload(restart=restart)
-    desired = supervise.SupervisorDesired.from_dict(payload)
-    assert desired.restart is expected
+    for restart, expected in [(None, False), (True, True), (False, False)]:
+        payload = intent_payload() if restart is None else intent_payload(restart=restart)
+        desired = supervise.SupervisorDesired.from_dict(payload)
+        assert desired.restart is expected
 
 
-@pytest.mark.parametrize("malformed", [None, 1, 0, "true", "", {}, [], [True]])
-def test_present_non_boolean_restart_fails_closed(malformed: object) -> None:
+def test_present_non_boolean_restart_fails_closed() -> None:
     """A present non-boolean ``restart`` (including null) enters malformed handling."""
-    with pytest.raises((TypeError, ValueError), match="malformed"):
-        supervise.SupervisorDesired.from_dict(intent_payload(restart=malformed))
+    for malformed in [None, 1, 0, "true", "", {}, [], [True]]:  # type: ignore[var-annotated]
+        with pytest.raises((TypeError, ValueError), match="malformed"):
+            supervise.SupervisorDesired.from_dict(intent_payload(restart=malformed))
 
 
 def test_present_null_restart_is_malformed_unlike_absent_restart() -> None:
