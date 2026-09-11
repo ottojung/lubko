@@ -995,7 +995,13 @@ class ConsumerLockTimeoutError(Exception):
     """The consumer-establishment lock could not be acquired in time."""
 
 
+class GenerationLockTimeoutError(Exception):
+    """The generation lock could not be acquired in time."""
+
+
 CONSUMER_LOCK_POLL_SECONDS = 0.05
+GENERATION_LOCK_POLL_SECONDS = 0.05
+DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 @contextmanager
@@ -1071,7 +1077,9 @@ def clear_migration_flag(generation: int) -> bool:
 
 
 @contextmanager
-def generation_lock() -> Iterator[None]:
+def generation_lock(
+    timeout_seconds: float = DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
     """Serialize generation allocation and desired-intent writes.
 
     The generation space is shared by the supervisor applied state, the
@@ -1080,13 +1088,28 @@ def generation_lock() -> Iterator[None]:
     never observe or reuse an equal, reordered, or already-applied generation.
     Lock ordering is always deployment lock first, then this generation lock.
 
+    Args:
+        timeout_seconds: Maximum seconds to wait for the lock.
+
     Yields:
         Nothing while the lock is held.
+
+    Raises:
+        GenerationLockTimeoutError: If the lock cannot be acquired in time.
     """
     path = supervisor_dir() / ".generation.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    msg = "timed out waiting for the generation lock"
+                    raise GenerationLockTimeoutError(msg) from None
+                time.sleep(GENERATION_LOCK_POLL_SECONDS)
         try:
             yield
         finally:
