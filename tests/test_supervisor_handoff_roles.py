@@ -5,11 +5,14 @@ Proves:
 - B (successor) writes durable state only after successful protocol.
 - A (old) returns from run() after reconcile when _handoff_completed,
   before _write_status, sleep, or _shutdown.
+- A retires its pidfile before sending TRANSFER.
+- Failed TRANSFER restores A's pidfile.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -173,3 +176,102 @@ def test_a_handoff_completed_returns_before_status_sleep_shutdown(
     assert "shutdown" not in calls
     assert "sleep" not in calls
     assert calls.count("write_status") <= 1
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_a_retires_pidfile_before_transfer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A retires its own pidfile before sending TRANSFER.
+
+    Regression: before this fix, A's pidfile survived until A exited, so B's
+    _write_pidfile() could see A's live pid and raise SystemExit.
+    """
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = -1
+
+    pidfile_removed: list[bool] = []
+
+    def _fake_retire() -> tuple[int, int]:
+        pidfile_removed.append(True)
+        return os.getpid(), 12345
+
+    monkeypatch.setattr("lubko.supervise.retire_supervisor_pid", _fake_retire)
+    monkeypatch.setattr(
+        "lubko.supervise.restore_supervisor_pid",
+        lambda _pid, _ticks: None,
+    )
+    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
+
+    original_close = os.close
+    original_write = os.write
+
+    def _safe_close(fd: int) -> None:
+        if fd >= 0:
+            original_close(fd)
+
+    def _track_transfer_write(fd: int, data: bytes) -> int:
+        assert pidfile_removed, "pidfile should be retired before TRANSFER write"
+        return original_write(fd, data)
+
+    monkeypatch.setattr("lubko.supervisor.os.write", _track_transfer_write)
+    monkeypatch.setattr("lubko.supervisor.os.close", _safe_close)
+
+    transfer_r, transfer_w = os.pipe()
+    daemon._send_handoff_transfer(
+        process=__import__("subprocess").Popen(["true"]),
+        transfer_w=transfer_w,
+        transfer_r=transfer_r,
+        confirmed="b" * 40,
+        ownership_fd=-1,
+    )
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_failed_transfer_restores_pidfile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Failed TRANSFER write restores A's pidfile.
+
+    Regression: before this fix, a failed TRANSFER left A without a pidfile,
+    making A undiscoverable by CLIs.
+    """
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = -1
+
+    restored_pid: list[tuple[int, int]] = []
+
+    def _fake_retire() -> tuple[int, int]:
+        return os.getpid(), 12345
+
+    def _fake_restore(pid: int, ticks: int) -> None:
+        restored_pid.append((pid, ticks))
+
+    monkeypatch.setattr("lubko.supervise.retire_supervisor_pid", _fake_retire)
+    monkeypatch.setattr("lubko.supervise.restore_supervisor_pid", _fake_restore)
+
+    msg = "transfer pipe broken"
+
+    def _fail_transfer_write(_fd: int, _data: bytes) -> int:
+        raise OSError(msg)
+
+    monkeypatch.setattr("lubko.supervisor.os.write", _fail_transfer_write)
+    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
+
+    original_close = os.close
+
+    def _safe_close(fd: int) -> None:
+        if fd >= 0:
+            original_close(fd)
+
+    monkeypatch.setattr("lubko.supervisor.os.close", _safe_close)
+
+    transfer_r, transfer_w = os.pipe()
+    daemon._send_handoff_transfer(
+        process=__import__("subprocess").Popen(["true"]),
+        transfer_w=transfer_w,
+        transfer_r=transfer_r,
+        confirmed="b" * 40,
+        ownership_fd=-1,
+    )
+
+    assert restored_pid, "pidfile should be restored after failed TRANSFER"
+    assert restored_pid[0] == (os.getpid(), 12345)

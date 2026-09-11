@@ -52,7 +52,7 @@ from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
-from lubko.durable import write_json_durable
+from lubko.durable import remove_durable, write_json_durable
 from lubko.health import validate_incarnation_token
 from lubko.state import rollback_state_path, state_root
 
@@ -1654,6 +1654,55 @@ def read_supervisor_pid() -> tuple[int, int] | None:
     if schema_version != SCHEMA_VERSION or pid is None or pid <= 0 or ticks is None:
         raise MalformedSupervisorIdentityError
     return pid, ticks
+
+
+class PidfileIdentityMismatchError(Exception):
+    """The recorded pidfile identity does not match the expected caller."""
+
+
+def retire_supervisor_pid() -> tuple[int, int]:
+    """Remove the supervisor pidfile only if it names the calling process.
+
+    Called by A before sending TRANSFER: the pidfile is removed while A still
+    holds the flock so B never sees A's pid and rejects it as a live daemon.
+
+    Returns:
+        The ``(pid, start_time_ticks)`` that were removed, for potential
+        restoration if the transfer fails.
+
+    Raises:
+        PidfileIdentityMismatchError: If the pidfile is absent, malformed,
+            or names a different process (fail closed — never delete another
+            authority's identity).
+    """
+    recorded = read_supervisor_pid()
+    if recorded is None:
+        msg = "pidfile is absent; cannot retire"
+        raise PidfileIdentityMismatchError(msg)
+    pid, ticks = recorded
+    my_pid = os.getpid()
+    my_ticks = _shared_proc_start_ticks(my_pid) or 0
+    if pid != my_pid or ticks != my_ticks:
+        msg = (
+            f"pidfile names pid={pid} ticks={ticks} but caller is "
+            f"pid={my_pid} ticks={my_ticks}; refusing to retire"
+        )
+        raise PidfileIdentityMismatchError(msg)
+    remove_durable(supervisor_pid_path())
+    return pid, ticks
+
+
+def restore_supervisor_pid(pid: int, start_time_ticks: int) -> None:
+    """Restore a previously retired supervisor pidfile.
+
+    Called by A when the TRANSFER write fails: the exact identity that was
+    removed is written back so A remains discoverable by CLIs.
+
+    Args:
+        pid: The daemon's process ID.
+        start_time_ticks: The daemon's start time in clock ticks.
+    """
+    write_supervisor_pid(pid, start_time_ticks)
 
 
 # ---------------------------------------------------------------------------

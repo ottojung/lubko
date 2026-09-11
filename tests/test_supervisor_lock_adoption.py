@@ -366,6 +366,15 @@ def _setup_handoff_state(
         "lubko.supervisor.resolve_new_supervisor_executable",
         lambda _commit: "/nonexistent/supervisor",
     )
+    # Patch retire_supervisor_pid to succeed (no real pidfile in test)
+    monkeypatch.setattr(
+        "lubko.supervise.retire_supervisor_pid",
+        lambda: (os.getpid(), 12345),
+    )
+    monkeypatch.setattr(
+        "lubko.supervise.restore_supervisor_pid",
+        lambda _pid, _ticks: None,
+    )
     return daemon, owner_fd
 
 
