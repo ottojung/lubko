@@ -37,13 +37,14 @@ def test_build_agent_command_preserves_valid_persisted_cwd() -> None:
     assert command[command.index("--dir") + 1] == cwd
 
 
-@pytest.mark.parametrize("cwd", ["", 0, False, None, [], "relative", "./relative", "../relative"])
-def test_build_agent_command_rejects_malformed_persisted_cwd(cwd: object) -> None:
+def test_build_agent_command_rejects_malformed_persisted_cwd() -> None:
     """Reject malformed durable cwd values instead of normalizing them."""
-    meta: agent.Meta = {"id": "aaaaaaaa", "cwd": cwd}
+    bad_cwds: tuple[object, ...] = ("", 0, False, None, [], "relative", "./relative", "../relative")
+    for cwd in bad_cwds:
+        meta: agent.Meta = {"id": "aaaaaaaa", "cwd": cwd}
 
-    with pytest.raises(ValueError, match="managed-agent cwd is malformed"):
-        agent.build_agent_command(meta, "do work", is_continue=False)
+        with pytest.raises(ValueError, match="managed-agent cwd is malformed"):
+            agent.build_agent_command(meta, "do work", is_continue=False)
 
 
 def test_runner_malformed_cwd_fails_before_spawn_and_aborts_cleanly(

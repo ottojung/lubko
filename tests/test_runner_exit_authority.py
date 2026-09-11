@@ -237,26 +237,22 @@ def test_runner_liveness_rejects_malformed_persisted_start_time(
     assert opened == []
 
 
-@pytest.mark.parametrize("bad_pid", [4242.9, "4242", True, 0])
-def test_recorded_leader_state_keeps_malformed_present_pid_ambiguous(
-    bad_pid: object,
-) -> None:
+def test_recorded_leader_state_keeps_malformed_present_pid_ambiguous() -> None:
     """Malformed persisted leader identity must never become a proven-dead PID."""
-    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
-    meta.update({"pid": bad_pid, "start_time": 111})
+    for bad_pid in (4242.9, "4242", True, 0):
+        meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+        meta.update({"pid": bad_pid, "start_time": 111})
 
-    assert agent._recorded_leader_state(meta) == "ambiguous"
+        assert agent._recorded_leader_state(meta) == "ambiguous"
 
 
-@pytest.mark.parametrize("bad_ticks", [111.0, "111", True, -1])
-def test_recorded_leader_state_keeps_malformed_start_ticks_ambiguous(
-    bad_ticks: object,
-) -> None:
+def test_recorded_leader_state_keeps_malformed_start_ticks_ambiguous() -> None:
     """Malformed persisted ticks keep stop/convergence fail closed."""
-    meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
-    meta.update({"pid": 4242, "start_time": bad_ticks})
+    for bad_ticks in (111.0, "111", True, -1):
+        meta = agent.idle_meta("aaaaaaaa", str(os.environ["XDG_STATE_HOME"]), None)
+        meta.update({"pid": 4242, "start_time": bad_ticks})
 
-    assert agent._recorded_leader_state(meta) == "ambiguous"
+        assert agent._recorded_leader_state(meta) == "ambiguous"
 
 
 def test_invocation_liveness_stays_bound_to_pinned_identity(

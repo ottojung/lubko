@@ -38,6 +38,12 @@ def fake_uv_sync(_uv_path: str, root: Path, _timeout_seconds: float) -> None:
         script.chmod(0o755)
 
 
+def fake_extract_archive(
+    _repo: Path, _commit: str, _destination: Path, _timeout_seconds: float
+) -> None:
+    """Skip real ``git archive``/``tar`` extraction; ``fake_uv_sync`` populates the tree."""
+
+
 def git(*args: str, cwd: Path) -> str:
     """Run one git command and return its trimmed stdout.
 
@@ -163,6 +169,7 @@ def test_gc_preserves_current_desired_and_applied_runtimes(
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
     second = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     for commit in (first, second):
         cli.build_cli_root(repo, commit, "uv", 60.0)
     cli.set_current(first)
@@ -211,6 +218,7 @@ def test_fresh_install_establishes_supervisor_desired_commit(
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
 
     code = install.main(["--repo", str(repo)])
@@ -234,6 +242,7 @@ def test_same_commit_install_preserves_existing_desired_intent(
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     existing = supervise.SupervisorDesired(
         schema_version=supervise.SCHEMA_VERSION,
@@ -268,6 +277,7 @@ def test_install_fails_closed_on_untrusted_supervised_mission(
     """Malformed mission authority is never treated as absent or stale history."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     mission_path = rollback_state_path()
     mission_path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,6 +300,7 @@ def test_install_does_not_outrank_active_supervised_mission(
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     desired = supervise.SupervisorDesired(
         schema_version=supervise.SCHEMA_VERSION,
@@ -323,6 +334,7 @@ def test_install_preserves_pending_migration_cli_hold(
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     cli.build_cli_root(repo, first, "uv", 60.0)
     cli.set_current(first)
@@ -353,6 +365,7 @@ def test_install_fails_closed_on_untrusted_desired_intent(
     """A malformed durable desired file is never treated as fresh absence."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     supervise.desired_path().parent.mkdir(parents=True, exist_ok=True)
     supervise.desired_path().write_text("{not-json\\n", encoding="utf-8")
@@ -372,6 +385,7 @@ def test_install_refuses_version_change_over_desired_worker(
     """Installing a different commit than the desired worker fails closed."""
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     write_desired_commit(first, repo)
 
@@ -392,6 +406,7 @@ def test_same_commit_install_keeps_worker_runtime_startable(
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     cli.build_cli_root(repo, head, "uv", 60.0)
     cli.set_current(head)
@@ -413,6 +428,7 @@ def test_same_commit_install_succeeds_and_gcs_stale_roots(
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     cli.build_cli_root(repo, first, "uv", 60.0)
     cli.build_cli_root(repo, head, "uv", 60.0)
@@ -436,6 +452,7 @@ def test_legacy_supervisor_runtime_file_is_inert(
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     legacy = supervise.supervisor_dir() / "supervisor-runtime"
     legacy.parent.mkdir(parents=True, exist_ok=True)
@@ -456,6 +473,7 @@ def test_dry_run_rejects_stale_launcher_until_install_repairs_it(
     """Startup verification rejects an old supervisor launcher before it can run."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     bin_dir = installable_bin(monkeypatch, tmp_path)
     assert install.main(["--repo", str(repo)]) == install.EXIT_OK
     capsys.readouterr()
@@ -483,6 +501,7 @@ def test_install_rechecks_authority_under_deploy_lock(
     """
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
     real_lock = lifecycle.deploy_lock
 
@@ -509,6 +528,7 @@ def test_install_fails_closed_when_deploy_lock_is_busy(
     """A deployment-lock timeout makes the installer refuse without mutating CLIs."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     bin_dir = installable_bin(monkeypatch, tmp_path)
 
     @contextmanager
@@ -534,6 +554,7 @@ def test_current_runtime_reseals_writable_content_identical_tree(
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     cli.build_cli_root(repo, head, "uv", 60.0)
     cli.set_current(head)
 
@@ -551,6 +572,7 @@ def test_current_runtime_never_rebuilds_tampered_writable_tree(
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
     head = head_commit(repo)
     monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     cli.build_cli_root(repo, head, "uv", 60.0)
     cli.set_current(head)
 
