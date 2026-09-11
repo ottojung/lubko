@@ -122,9 +122,9 @@ def test_pinned_signal_fails_closed_when_send_binding_is_unavailable(
     assert closed == [92]
 
 
-@pytest.mark.parametrize(
-    ("field", "bad_value"),
-    [
+def test_metadata_rejects_malformed_present_scalars() -> None:
+    """Present malformed scalars never become maintained-worker authority."""
+    for field, bad_value in [
         ("schema_version", "1"),
         ("schema_version", 1.0),
         ("schema_version", True),
@@ -147,25 +147,22 @@ def test_pinned_signal_fails_closed_when_send_binding_is_unavailable(
         ("git_commit", 1),
         ("worker_id", 1),
         ("log_path", 1),
-    ],
-)
-def test_metadata_rejects_malformed_present_scalars(field: str, bad_value: object) -> None:
-    """Present malformed scalars never become maintained-worker authority."""
-    data = meta().to_dict()
-    data[field] = bad_value
-    with pytest.raises(
-        (TypeError, ValueError), match=r"worker metadata|unsupported worker metadata"
-    ):
-        WorkerMeta.from_dict(data)
+    ]:
+        data = meta().to_dict()
+        data[field] = bad_value
+        with pytest.raises(
+            (TypeError, ValueError), match=r"worker metadata|unsupported worker metadata"
+        ):
+            WorkerMeta.from_dict(data)
 
 
-@pytest.mark.parametrize("bad_state", ["", "pending", "unmanaged", "definitely-not-a-worker-state"])
-def test_metadata_rejects_unsupported_present_state(bad_state: str) -> None:
+def test_metadata_rejects_unsupported_present_state() -> None:
     """Type-correct but unsupported lifecycle states remain malformed authority."""
-    data = meta().to_dict()
-    data["state"] = bad_state
-    with pytest.raises(ValueError, match=r"unsupported worker metadata state"):
-        WorkerMeta.from_dict(data)
+    for bad_state in ("", "pending", "unmanaged", "definitely-not-a-worker-state"):
+        data = meta().to_dict()
+        data["state"] = bad_state
+        with pytest.raises(ValueError, match=r"unsupported worker metadata state"):
+            WorkerMeta.from_dict(data)
 
 
 def test_metadata_preserves_absent_state_compatibility() -> None:

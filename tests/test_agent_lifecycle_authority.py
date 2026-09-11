@@ -60,13 +60,10 @@ def test_derive_state_fails_closed_on_malformed_launch_timestamp(
     assert derive_state(meta) == "unknown"
 
 
-@pytest.mark.parametrize(
-    "malformed",
-    [False, 0, 0.0, "", [], {}, ["corrupt"], "bogus", 1, True],
-)
-def test_derive_state_fails_closed_on_malformed_lifecycle_state(malformed: object) -> None:
+def test_derive_state_fails_closed_on_malformed_lifecycle_state() -> None:
     """Malformed present lifecycle state never becomes idle/running/terminal authority."""
-    assert derive_state({"id": "a1", "state": malformed}) == "unknown"
+    for malformed in [False, 0, 0.0, "", [], {}, ["corrupt"], "bogus", 1, True]:
+        assert derive_state({"id": "a1", "state": malformed}) == "unknown"
 
 
 def _idle_transition_meta(state: object) -> dict[str, object]:
@@ -109,10 +106,10 @@ def test_missing_lifecycle_state_retains_legacy_idle_semantics() -> None:
     assert derive_state({"id": "a1"}) == "idle"
 
 
-@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, 1, "yes", [1], None])
-def test_delete_tombstone_rejects_malformed_present_values(malformed: object) -> None:
+def test_delete_tombstone_rejects_malformed_present_values() -> None:
     """Only literal booleans carry durable deletion authority."""
-    assert agent._delete_pending_flag({"delete_pending": malformed}) is None
+    for malformed in [0, 0.0, "", [], {}, 1, "yes", [1], None]:
+        assert agent._delete_pending_flag({"delete_pending": malformed}) is None
 
 
 def test_delete_tombstone_preserves_boolean_and_legacy_absence_semantics() -> None:
@@ -196,26 +193,26 @@ def test_delete_transitions_do_not_normalize_malformed_tombstones(
     assert meta["delete_pending"] == malformed
 
 
-@pytest.mark.parametrize("malformed", [0, "", 1, "yes"])
-def test_malformed_delete_tombstone_blocks_invocation_tracking(malformed: object) -> None:
+def test_malformed_delete_tombstone_blocks_invocation_tracking() -> None:
     """A spawned child is unresolved, never running authority, under malformed tombstones."""
+    for malformed in [0, "", 1, "yes"]:
 
-    class ProcessStub:
-        pid = 4242
+        class ProcessStub:
+            pid = 4242
 
-    blocked: dict[str, bool] = {}
-    mutate = agent._record_running(cast("Any", ProcessStub()), 77, "inv-1", blocked)
-    meta: agent.Meta = {"id": "aaaaaaaa", "delete_pending": malformed}
-    mutate(meta)
+        blocked: dict[str, bool] = {}
+        mutate = agent._record_running(cast("Any", ProcessStub()), 77, "inv-1", blocked)
+        meta: agent.Meta = {"id": "aaaaaaaa", "delete_pending": malformed}
+        mutate(meta)
 
-    assert blocked == {"stopped": True}
-    assert "pid" not in meta
-    assert meta["unresolved_invocation"] == {
-        "pid": 4242,
-        "pgid": 4242,
-        "start_time": 77,
-        "invocation_id": "inv-1",
-    }
+        assert blocked == {"stopped": True}
+        assert "pid" not in meta
+        assert meta["unresolved_invocation"] == {
+            "pid": 4242,
+            "pgid": 4242,
+            "start_time": 77,
+            "invocation_id": "inv-1",
+        }
 
 
 def test_forced_delete_rechecks_after_signalling_before_convergence(
@@ -300,11 +297,11 @@ def test_stale_running_fails_closed_on_malformed_present_pid(
         assert agent._wait_for_first_output("a1", tmp_path / "missing") is True
 
 
-@pytest.mark.parametrize("value", [None, "steer", "stop", "kill"])
-def test_persisted_lifecycle_control_accepts_canonical_values(value: str | None) -> None:
+def test_persisted_lifecycle_control_accepts_canonical_values() -> None:
     """Canonical optional lifecycle control remains valid durable authority."""
-    assert agent._persisted_intent({"intent": value}) == (value, False)
-    assert agent._persisted_stop_reason({"stop_reason": value}) == (value, False)
+    for value in [None, "steer", "stop", "kill"]:
+        assert agent._persisted_intent({"intent": value}) == (value, False)
+        assert agent._persisted_stop_reason({"stop_reason": value}) == (value, False)
 
 
 def test_persisted_lifecycle_control_preserves_genuine_absence() -> None:
@@ -313,11 +310,11 @@ def test_persisted_lifecycle_control_preserves_genuine_absence() -> None:
     assert agent._persisted_stop_reason({}) == (None, False)
 
 
-@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, True, False, "bogus"])
-def test_persisted_lifecycle_control_rejects_malformed_presence(malformed: object) -> None:
+def test_persisted_lifecycle_control_rejects_malformed_presence() -> None:
     """Only canonical strings can carry durable lifecycle-control authority."""
-    assert agent._persisted_intent({"intent": malformed}) == (None, True)
-    assert agent._persisted_stop_reason({"stop_reason": malformed}) == (None, True)
+    for malformed in [0, 0.0, "", [], {}, True, False, "bogus"]:
+        assert agent._persisted_intent({"intent": malformed}) == (None, True)
+        assert agent._persisted_stop_reason({"stop_reason": malformed}) == (None, True)
 
 
 @pytest.mark.parametrize("field", ["intent", "stop_reason"])
@@ -347,18 +344,18 @@ def test_malformed_lifecycle_control_blocks_pending_prompt_claim(
     assert meta[field] == malformed
 
 
-@pytest.mark.parametrize("field", ["intent", "stop_reason"])
-@pytest.mark.parametrize("malformed", ["bogus", 1, [], {}])
-def test_malformed_lifecycle_control_blocks_new_invocation(field: str, malformed: object) -> None:
+def test_malformed_lifecycle_control_blocks_new_invocation() -> None:
     """Fresh invocation reservation fails closed on malformed control authority."""
-    meta = agent.idle_meta("aaaaaaaa", ".", None)
-    meta[field] = malformed
-    decision: dict[str, object] = {}
+    for field in ["intent", "stop_reason"]:
+        for malformed in ["bogus", 1, [], {}]:
+            meta = agent.idle_meta("aaaaaaaa", ".", None)
+            meta[field] = malformed
+            decision: dict[str, object] = {}
 
-    agent._decide_invocation(meta, decision, prompt="P", steer=False)
+            agent._decide_invocation(meta, decision, prompt="P", steer=False)
 
-    assert decision == {"action": "busy"}
-    assert meta[field] == malformed
+            assert decision == {"action": "busy"}
+            assert meta[field] == malformed
 
 
 @pytest.mark.parametrize("field", ["intent", "stop_reason"])

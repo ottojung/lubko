@@ -290,15 +290,13 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
     assert terminal.new_meta is None
 
 
-@pytest.mark.parametrize("supervisor_owned", [False, None])
-def test_missing_candidate_identity_requires_explicit_supervisor_ownership(
-    supervisor_owned: object,
-) -> None:
+def test_missing_candidate_identity_requires_explicit_supervisor_ownership() -> None:
     """Legacy or unknown ownership cannot omit the candidate process identity."""
-    payload = _supervised_mission().to_dict()
-    payload["supervisor_owned"] = supervisor_owned
-    with pytest.raises(deployctl.DeployCtlError, match="malformed"):
-        deployctl.RollbackState.from_dict(payload)
+    for supervisor_owned in (False, None):
+        payload = _supervised_mission().to_dict()
+        payload["supervisor_owned"] = supervisor_owned
+        with pytest.raises(deployctl.DeployCtlError, match="malformed"):
+            deployctl.RollbackState.from_dict(payload)
 
 
 def test_exact_identityless_supervisor_sentinel_normalizes_to_absent_identity() -> None:

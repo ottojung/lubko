@@ -11,10 +11,10 @@ from lubko import agent
 BAD_STATES: list[object] = [None, "", "other", True, 0, 1.5, [], {}]
 
 
-@pytest.mark.parametrize("state", ["reserved", "claimed"])
-def test_reservation_state_accepts_only_canonical_lifecycle_values(state: str) -> None:
+def test_reservation_state_accepts_only_canonical_lifecycle_values() -> None:
     """Only exact canonical state strings carry lifecycle authority."""
-    assert agent._runner_reservation_state({"state": state}) == state
+    for state in ("reserved", "claimed"):
+        assert agent._runner_reservation_state({"state": state}) == state
 
 
 def test_reservation_state_distinguishes_genuine_absence() -> None:
@@ -22,10 +22,10 @@ def test_reservation_state_distinguishes_genuine_absence() -> None:
     assert agent._runner_reservation_state(None) == "absent"
 
 
-@pytest.mark.parametrize("bad", BAD_STATES)
-def test_reservation_state_rejects_malformed_present_values(bad: object) -> None:
+def test_reservation_state_rejects_malformed_present_values() -> None:
     """Present malformed discriminators are never normalized."""
-    assert agent._runner_reservation_state({"state": bad}) == "malformed"
+    for bad in BAD_STATES:
+        assert agent._runner_reservation_state({"state": bad}) == "malformed"
 
 
 def test_reservation_state_rejects_missing_discriminator() -> None:

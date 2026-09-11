@@ -33,9 +33,9 @@ def test_status_json_preserves_canonical_summary_metadata() -> None:
     assert "metadata_errors" not in status
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "status_field"),
-    [
+def test_status_json_sanitizes_malformed_summary_metadata() -> None:
+    """Malformed summary values are sanitized and reported."""
+    for field, value, status_field in [
         ("created_at", [], "created_at"),
         ("started_at", "2", "started_at"),
         ("started_at", float("nan"), "started_at"),
@@ -44,24 +44,19 @@ def test_status_json_preserves_canonical_summary_metadata() -> None:
         ("prompt_count", False, "prompts"),
         ("cwd", 0, "cwd"),
         ("title", {}, "title"),
-    ],
-)
-def test_status_json_sanitizes_malformed_summary_metadata(
-    field: str, value: object, status_field: str
-) -> None:
-    """Malformed summary values are sanitized and reported."""
-    meta: agent.Meta = {
-        "created_at": 1.0,
-        "started_at": 2.0,
-        "finished_at": 3.0,
-        "prompt_count": 1,
-        "cwd": "/ok",
-        "title": "ok",
-    }
-    meta[field] = value
-    status = _status(meta)
-    assert status[status_field] is None
-    assert status["metadata_errors"] == [field]
+    ]:
+        meta: agent.Meta = {
+            "created_at": 1.0,
+            "started_at": 2.0,
+            "finished_at": 3.0,
+            "prompt_count": 1,
+            "cwd": "/ok",
+            "title": "ok",
+        }
+        meta[field] = value
+        status = _status(meta)
+        assert status[status_field] is None
+        assert status["metadata_errors"] == [field]
 
 
 def test_status_text_diagnoses_malformed_summary_without_crashing(
@@ -116,9 +111,9 @@ def test_status_json_preserves_canonical_status_only_metadata() -> None:
     assert "metadata_errors" not in status
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
+def test_status_json_sanitizes_malformed_status_only_metadata() -> None:
+    """Malformed status-only scalars are sanitized and reported."""
+    for field, value in [
         ("native_session_id", 123),
         ("native_session_id", ""),
         ("pid", "1"),
@@ -139,24 +134,21 @@ def test_status_json_preserves_canonical_status_only_metadata() -> None:
         ("exit_signal", 0),
         ("variant", {"x": 1}),
         ("variant", ""),
-    ],
-)
-def test_status_json_sanitizes_malformed_status_only_metadata(field: str, value: object) -> None:
-    """Malformed status-only scalars are sanitized and reported."""
-    meta: agent.Meta = {
-        "native_session_id": "ses_abc",
-        "pid": 10,
-        "pgid": 11,
-        "runner_pid": 12,
-        "last_activity_at": 13.5,
-        "exit_code": 7,
-        "exit_signal": 9,
-        "variant": "low",
-    }
-    meta[field] = value
-    status = _status(meta)
-    assert status[field] is None
-    assert status["metadata_errors"] == [field]
+    ]:
+        meta: agent.Meta = {
+            "native_session_id": "ses_abc",
+            "pid": 10,
+            "pgid": 11,
+            "runner_pid": 12,
+            "last_activity_at": 13.5,
+            "exit_code": 7,
+            "exit_signal": 9,
+            "variant": "low",
+        }
+        meta[field] = value
+        status = _status(meta)
+        assert status[field] is None
+        assert status["metadata_errors"] == [field]
 
 
 def test_status_text_diagnoses_malformed_exit_code(
