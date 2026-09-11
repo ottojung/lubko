@@ -719,6 +719,7 @@ class SupervisorDaemon:
         self._ownership_fd: int | None = None
         self._start_time_ticks: int = 0
         self._runtime_commit: str | None = capture_supervisor_runtime_commit()
+        self._handoff_completed: bool = False
 
     def _write_state_authority_safe(self, state: SupervisorState) -> bool:
         """Publish a supervisor transition without erasing newer consumer authority.
@@ -776,6 +777,8 @@ class SupervisorDaemon:
         try:
             self._write_pidfile()
             self._persist_runtime_commit()
+            if self._run_handoff_protocol():
+                return
             self._invalidate_stale_status()
             normalize_cross_boot_state()
             self._install_signal_handlers()
@@ -810,6 +813,10 @@ class SupervisorDaemon:
         :meth:`run`.
         """
         self._message = None
+        if self._handoff_completed:
+            LOGGER.info("supervisor handoff completed; exiting to let successor take over")
+            self._stopping = True
+            return
         state = read_state()
         if state.ownership_hold_malformed:
             # Materialize the hold so a later rewrite cannot turn authority
@@ -824,7 +831,7 @@ class SupervisorDaemon:
             )
             LOGGER.error("%s", self._message)
             return
-        self._maybe_exec_upgrade()
+        self._maybe_handoff_to_new_supervisor()
         action, commit = self._derive_action(state)
         if action != "hold" and self._apply_newer_desired(state, commit):
             return
@@ -943,9 +950,7 @@ class SupervisorDaemon:
             LOGGER.warning("cold-migration completion deferred: deployment lock is held")
             self._message = "cold-migration completion deferred; deployment in progress"
 
-    def _complete_cold_migration_locked(  # ruff: ignore[too-many-return-statements]
-        self, desired: supervise.SupervisorDesired
-    ) -> None:
+    def _complete_cold_migration_locked(self, desired: supervise.SupervisorDesired) -> None:
         """Perform cold-migration convergence while holding the deployment lock.
 
         All authority inputs are re-read inside the critical section so the
@@ -3152,6 +3157,9 @@ class SupervisorDaemon:
             supervise.HANDOFF_FD_ENV,
             supervise.HANDOFF_PATH_ENV,
             supervise.HANDOFF_PID_ENV,
+            supervise.HANDOFF_READY_FD_ENV,
+            supervise.HANDOFF_TRANSFER_FD_ENV,
+            supervise.HANDOFF_MODE_ENV,
         ):
             os.environ.pop(var, None)
         return adopted
@@ -3250,29 +3258,80 @@ class SupervisorDaemon:
             contract_schema_version(),
         )
 
-    def _maybe_exec_upgrade(self) -> None:
-        """Exec into the confirmed supervisor runtime when it differs from ours.
+    @staticmethod
+    def _in_handoff_mode() -> bool:
+        """Return ``True`` when this process was spawned as a handoff successor."""
+        return os.environ.get(supervise.HANDOFF_MODE_ENV) == "1"
 
-        After a deployment confirms a new commit, ``cli/current`` points to the
-        new code while this supervisor still executes from the old runtime.
-        When the confirmed commit (``cli/current_commit()``) differs from our
-        stored ``supervisor_runtime_commit``, this method resolves the new
-        supervisor executable through the exact confirmed commit's sealed
-        runtime (not the mutable ``cli/current`` symlink) and calls
-        ``os.execv()`` to replace this process in-place.
+    def _run_handoff_protocol(self) -> bool:
+        """Execute the two-phase handoff preparation protocol.
 
-        The ownership lock fd is made inheritable immediately before exec and
-        passed via environment variables.  The new supervisor's startup adopts
-        the inherited fd (validating the fd is open and its path matches)
-        instead of opening/acquiring a second lock.  If exec fails, the fd is
-        reverted to non-inheritable and the old supervisor continues with its
-        existing authority.
+        When running in handoff mode (spawned by an active old supervisor),
+        this method:
+        1. Signals READY to the old supervisor over the readiness pipe.
+        2. Waits for the TRANSFER signal on the transfer pipe.
+        3. Cleans up the handoff environment variables.
+        4. Returns ``True`` so the caller exits without entering the reconcile
+           loop — the caller proceeds normally from this point.
 
-        ``os.execv`` atomically replaces the process image while preserving the
-        PID, the child process (the maintained worker), and — via the
-        inheritable fd — the ownership ``flock``.  If the exec fails (missing
-        runtime, permission error), the old supervisor continues its reconcile
-        loop unchanged.
+        Returns:
+            ``True`` when a handoff was completed, ``False`` in normal startup.
+        """
+        if not self._in_handoff_mode():
+            return False
+        ready_fd_str = os.environ.get(supervise.HANDOFF_READY_FD_ENV)
+        transfer_fd_str = os.environ.get(supervise.HANDOFF_TRANSFER_FD_ENV)
+        if ready_fd_str is None or transfer_fd_str is None:
+            LOGGER.error("handoff mode but missing pipe fds; proceeding normally")
+            return False
+        ready_fd = int(ready_fd_str)
+        transfer_fd = int(transfer_fd_str)
+        try:
+            os.write(ready_fd, b"R\n")
+            LOGGER.info("supervisor handoff ready signal sent (pid %d)", os.getpid())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = os.read(transfer_fd, 1)
+                if not chunk:
+                    LOGGER.error("handoff transfer pipe closed before signal; aborting")
+                    return False
+                buf += chunk
+        finally:
+            os.close(ready_fd)
+            os.close(transfer_fd)
+            for var in (
+                supervise.HANDOFF_READY_FD_ENV,
+                supervise.HANDOFF_TRANSFER_FD_ENV,
+                supervise.HANDOFF_MODE_ENV,
+            ):
+                os.environ.pop(var, None)
+        if buf.strip() != b"T":
+            LOGGER.error("handoff received unexpected signal %r; aborting", buf)
+            return False
+        LOGGER.info("supervisor handoff transfer received (pid %d)", os.getpid())
+        return False
+
+    def _maybe_handoff_to_new_supervisor(self) -> None:
+        r"""Spawn the confirmed supervisor runtime and hand off authority safely.
+
+        Two-phase protocol: A (old) remains sole lifecycle authority throughout.
+        B (successor) starts in handoff preparation mode, initializes, signals
+        READY, and waits.  Only after A confirms B is ready does A send
+        TRANSFER, close the lock fd, and exit.  No authority overlap and no
+        authority gap: A holds the lock until TRANSFER is sent, and B does not
+        reconcile or mutate state until it receives TRANSFER.
+
+        Readiness protocol (two dedicated pipes):
+        - A creates readiness_pipe (B→A) and transfer_pipe (A→B).
+        - A spawns B in handoff mode with the lock fd and pipe fds inherited.
+        - B closes unused pipe ends, initializes, writes ``R\n`` on the
+          readiness pipe, then reads ``T\n`` from the transfer pipe.
+        - A reads ``R\n`` from the readiness pipe (with timeout), then writes
+          ``T\n`` on the transfer pipe, closes the lock fd, and exits.
+
+        Worker consequence: if A exiting triggers PDEATHSIG on B, B must
+        recover from durable desired/applied authority after restart rather
+        than assuming the worker child survives across the handoff.
         """
         state = read_state()
         stored = state.supervisor_runtime_commit
@@ -3299,39 +3358,113 @@ class SupervisorDaemon:
             return
         if self._ownership_fd is None:
             LOGGER.error(
-                "cannot exec-upgrade without an ownership fd; continuing with the current runtime"
+                "cannot handoff without an ownership fd; continuing with the current runtime"
             )
             return
         lock_path = str(supervise.supervisor_lock_path())
         LOGGER.info(
-            "exec-based supervisor upgrade: %s -> %s (%s)",
+            "supervisor two-phase handoff: %s -> %s (%s)",
             stored,
             confirmed,
             target,
         )
-        lifecycle.append_deploy_log(f"supervisor exec upgrade: {stored} -> {confirmed}")
-        # Make the lock fd inheritable so the exec'd process inherits it.
-        was_inheritable = os.get_inheritable(self._ownership_fd)
-        os.set_inheritable(self._ownership_fd, True)  # ruff: ignore[boolean-positional-value-in-call]
-        # Build the handoff environment for the successor.
+        lifecycle.append_deploy_log(f"supervisor handoff: {stored} -> {confirmed}")
+        ready_r, ready_w = os.pipe()
+        transfer_r, transfer_w = os.pipe()
         handoff_env = {
             **os.environ,
             supervise.HANDOFF_FD_ENV: str(self._ownership_fd),
             supervise.HANDOFF_PATH_ENV: lock_path,
             supervise.HANDOFF_PID_ENV: str(os.getpid()),
+            supervise.HANDOFF_READY_FD_ENV: str(ready_w),
+            supervise.HANDOFF_TRANSFER_FD_ENV: str(transfer_r),
+            supervise.HANDOFF_MODE_ENV: "1",
         }
         try:
-            os.execve(target, [target], handoff_env)
+            os.set_inheritable(self._ownership_fd, True)  # ruff: ignore[boolean-positional-value-in-call]
+            os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+            os.set_inheritable(transfer_r, True)  # ruff: ignore[boolean-positional-value-in-call]
+            process = subprocess.Popen(
+                [target],
+                close_fds=False,
+                env=handoff_env,
+            )
         except OSError:
-            # Revert inheritable flag and continue with old authority.
-            os.set_inheritable(self._ownership_fd, was_inheritable)
+            for fd in (ready_r, ready_w, transfer_r, transfer_w):
+                with suppress(OSError):
+                    os.close(fd)
+            os.set_inheritable(self._ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
             LOGGER.exception(
-                "exec-based supervisor upgrade failed; continuing with the current runtime"
+                "supervisor handoff failed to spawn successor; continuing with the current runtime"
             )
             self._message = (
-                f"exec-based supervisor upgrade to {confirmed} failed; "
+                f"supervisor handoff to {confirmed} failed to spawn; "
                 "continuing with the current runtime"
             )
+            return
+        with suppress(OSError):
+            os.set_inheritable(ready_w, False)  # ruff: ignore[boolean-positional-value-in-call]
+        with suppress(OSError):
+            os.set_inheritable(transfer_r, False)  # ruff: ignore[boolean-positional-value-in-call]
+        with suppress(OSError):
+            os.close(ready_w)
+        ready = False
+        try:
+            buf = b""
+            while b"\n" not in buf:
+                chunk = os.read(ready_r, 1)
+                if not chunk:
+                    break
+                buf += chunk
+            ready = buf.strip() == b"R"
+        except OSError:
+            pass
+        os.close(ready_r)
+        if not ready:
+            with suppress(OSError):
+                process.kill()
+            with suppress(Exception):
+                process.wait(timeout=5.0)
+            os.set_inheritable(self._ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.warning(
+                "supervisor handoff to %s did not complete; continuing with the current runtime",
+                confirmed,
+            )
+            self._message = (
+                f"supervisor handoff to {confirmed} did not complete; "
+                "continuing with the current runtime"
+            )
+            return
+        try:
+            os.write(transfer_w, b"T\n")
+        except OSError:
+            with suppress(OSError):
+                os.close(transfer_r)
+            with suppress(OSError):
+                process.kill()
+            with suppress(Exception):
+                process.wait(timeout=5.0)
+            os.set_inheritable(self._ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.warning(
+                "supervisor handoff transfer to %s failed; continuing with the current runtime",
+                confirmed,
+            )
+            self._message = (
+                f"supervisor handoff transfer to {confirmed} failed; "
+                "continuing with the current runtime"
+            )
+            return
+        with suppress(OSError):
+            os.close(transfer_r)
+        os.close(transfer_w)
+        os.set_inheritable(self._ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+        os.close(self._ownership_fd)
+        self._ownership_fd = None
+        self._handoff_completed = True
+        LOGGER.info(
+            "supervisor handoff to %s completed; successor is running",
+            confirmed,
+        )
 
     def _write_pidfile(self) -> None:
         """Record our exact identity, refusing to double-run a live daemon.

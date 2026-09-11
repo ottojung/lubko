@@ -1151,6 +1151,18 @@ HANDOFF_PATH_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PATH"
 #: Environment variable carrying the PID of the handing-off supervisor for
 #: diagnostic logging only (not security-critical).
 HANDOFF_PID_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PID"
+#: Environment variable carrying the readiness pipe read-end fd number.
+#: The successor writes ``R\\n`` to this pipe after initializing, and the
+#: old supervisor reads from it to confirm the successor is ready.
+HANDOFF_READY_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_READY_FD"
+#: Environment variable carrying the transfer pipe write-end fd number.
+#: The old supervisor writes ``T\\n`` to this pipe to authorize the
+#: successor to become the active lifecycle authority.
+HANDOFF_TRANSFER_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_TRANSFER_FD"
+#: Environment variable signalling that the successor must run in handoff
+#: preparation mode: initialize, signal readiness, wait for transfer, then
+#: enter the normal reconcile loop.  Absent in normal startup.
+HANDOFF_MODE_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_MODE"
 
 
 def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:

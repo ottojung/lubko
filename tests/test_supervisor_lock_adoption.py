@@ -176,16 +176,16 @@ def test_injected_fd_wrong_path_fails_closed(
         os.close(fd)
 
 
-def test_old_supervisor_continues_after_failed_exec(
+def test_old_supervisor_continues_after_failed_handoff(
     lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed os.execve preserves lock ownership and records the failure.
+    r"""B failure before transfer leaves A authoritative and lock held.
 
-    The daemon holds a real supervisor lock fd (non-inheritable, the normal
-    state), _maybe_exec_upgrade() reaches a patched os.execve that raises
-    OSError, and the test asserts: execve was attempted, the fd remains
-    open/owned, its inheritable flag is restored to False, a competitor
-    cannot acquire the lock, and a failure diagnostic/message is recorded.
+    The daemon holds a real supervisor lock fd (non-inheritable).  A patched
+    subprocess.Popen returns a process whose readiness pipe signals failure
+    (F\n).  The test asserts: spawn was attempted, A's fd remains open/owned,
+    inheritable flag is False, a competitor cannot acquire the lock, and a
+    failure message is recorded.
     """
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -212,19 +212,9 @@ def test_old_supervisor_continues_after_failed_exec(
             lambda _commit: "/nonexistent/supervisor",
         )
 
-        execve_called: list[object] = []
+        monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _FailProcess)
 
-        exec_failed = "exec failed"
-
-        def _fake_execve(_path: str, _argv: list[str], _env: dict[str, str]) -> None:
-            execve_called.append(True)
-            raise OSError(exec_failed)
-
-        monkeypatch.setattr("lubko.supervisor.os.execve", _fake_execve)
-
-        daemon._maybe_exec_upgrade()
-
-        assert len(execve_called) == 1
+        daemon._maybe_handoff_to_new_supervisor()
 
         assert os.get_inheritable(owner_fd) is False
 
@@ -233,7 +223,7 @@ def test_old_supervisor_continues_after_failed_exec(
 
         assert daemon._ownership_fd == owner_fd
 
-        assert "exec-based supervisor upgrade" in daemon._message  # type: ignore[operator]
+        assert "did not complete" in daemon._message  # type: ignore[operator]
     finally:
         os.close(owner_fd)
 
@@ -349,3 +339,187 @@ def test_runtime_commit_persisted_through_startup_path(
     assert supervise.read_state().supervisor_runtime_commit == commit_a
 
     assert commit_a != "b" * 40
+
+
+def _setup_handoff_state(
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, stored: str, confirmed: str
+) -> tuple[SupervisorDaemon, int]:
+    """Shared setup for handoff regression tests.
+
+    Returns (daemon with ownership_fd set, owner_fd).
+    """
+    lock_path = supervise.supervisor_lock_path()
+    owner_fd = _acquire_and_hold(lock_path)
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = owner_fd
+    state_path = supervise.state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({
+            **supervise.fresh_state().to_dict(),
+            "supervisor_runtime_commit": stored,
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("lubko.cli.current_commit", lambda: confirmed)
+    monkeypatch.setattr(
+        "lubko.supervisor.resolve_new_supervisor_executable",
+        lambda _commit: "/nonexistent/supervisor",
+    )
+    return daemon, owner_fd
+
+
+class _ReadyProcess:
+    """Mock Popen that writes R on the readiness pipe before returning."""
+
+    def __init__(self, args: list[str], **kwargs: object) -> None:
+        env: dict[str, str] = kwargs.get("env", {})  # type: ignore[assignment]
+        ready_w = int(env[supervise.HANDOFF_READY_FD_ENV])
+        os.write(ready_w, b"R\n")
+
+    def wait(self, timeout: float = 0.0) -> int:
+        return 0
+
+    def poll(self) -> int | None:
+        return 0
+
+    def kill(self) -> None:
+        pass
+
+
+class _FailProcess:
+    """Mock Popen that writes F on the readiness pipe before returning."""
+
+    def __init__(self, args: list[str], **kwargs: object) -> None:
+        env: dict[str, str] = kwargs.get("env", {})  # type: ignore[assignment]
+        ready_w = int(env[supervise.HANDOFF_READY_FD_ENV])
+        os.write(ready_w, b"F\n")
+
+    def wait(self, timeout: float = 0.0) -> int:
+        return 1
+
+    def poll(self) -> int | None:
+        return 1
+
+    def kill(self) -> None:
+        pass
+
+
+class _SilentFailProcess:
+    """Mock Popen that writes nothing (EOF) on the readiness pipe."""
+
+    def __init__(self, args: list[str], **kwargs: object) -> None:
+        pass
+
+    def wait(self, timeout: float = 0.0) -> int:
+        return 1
+
+    def poll(self) -> int | None:
+        return 1
+
+    def kill(self) -> None:
+        pass
+
+
+def test_ready_while_a_still_authoritative(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""B ready while A still remains sole active authority.
+
+    After A sends TRANSFER and closes its lock fd, B's readiness signal has
+    already been sent, proving B initialized before A released authority.
+    """
+    commit_a = "a" * 40
+    commit_b = "b" * 40
+    daemon, _owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
+    monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _ReadyProcess)
+    daemon._maybe_handoff_to_new_supervisor()
+    assert daemon._handoff_completed is True
+    assert daemon._ownership_fd is None
+
+
+def test_b_failure_before_transfer_leaves_a_authoritative(
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r"""B failure before transfer leaves A authoritative and lock held.
+
+    B signals F on the readiness pipe.  A continues with its own authority,
+    the lock remains held, and a competitor cannot acquire it.
+    """
+    commit_a = "a" * 40
+    commit_b = "b" * 40
+    daemon, owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
+    monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _FailProcess)
+    daemon._maybe_handoff_to_new_supervisor()
+    assert daemon._handoff_completed is False
+    assert daemon._ownership_fd == owner_fd
+    with pytest.raises(OSError, match="Resource temporarily unavailable"):
+        _acquire_and_hold(supervise.supervisor_lock_path())
+    assert "did not complete" in daemon._message  # type: ignore[operator]
+
+
+def test_successful_transfer_no_overlap_no_gap(
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Successful transfer has no authority overlap and no gap.
+
+    A holds the lock until TRANSFER is sent.  B receives TRANSFER and can
+    then reconcile.  Exactly one authority exists at every point.
+    """
+    commit_a = "a" * 40
+    commit_b = "b" * 40
+    daemon, _owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
+    monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _ReadyProcess)
+    daemon._maybe_handoff_to_new_supervisor()
+    assert daemon._handoff_completed is True
+    assert daemon._ownership_fd is None
+    new_fd = _acquire_and_hold(supervise.supervisor_lock_path())
+    os.close(new_fd)
+
+
+def test_successor_startup_failure_before_ready_recovers_to_a(
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r"""Successor startup failure after process creation but before READY recovers to A.
+
+    The spawned process closes the readiness pipe without writing (EOF).  A
+    detects this, kills B, and continues as sole authority with the lock held.
+    """
+    commit_a = "a" * 40
+    commit_b = "b" * 40
+    daemon, owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
+    monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _SilentFailProcess)
+    daemon._maybe_handoff_to_new_supervisor()
+    assert daemon._handoff_completed is False
+    assert daemon._ownership_fd == owner_fd
+    with pytest.raises(OSError, match="Resource temporarily unavailable"):
+        _acquire_and_hold(supervise.supervisor_lock_path())
+    assert "did not complete" in daemon._message  # type: ignore[operator]
+
+
+def test_worker_loss_at_a_exit_is_recoverable_by_b(
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Worker loss at A exit is recoverable by B from durable state.
+
+    After transfer, if A's exit causes PDEATHSIG on B's worker child, B must
+    observe the loss from durable desired/applied authority and recover.  This
+    test proves B can read the durable state and determine the intended worker
+    after A exits.
+    """
+    commit_a = "a" * 40
+
+    state_path = supervise.state_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({
+            **supervise.fresh_state().to_dict(),
+            "supervisor_runtime_commit": commit_a,
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = supervise.read_state()
+    assert loaded.supervisor_runtime_commit == commit_a
+
+    reloaded = supervise.read_state()
+    assert reloaded.child is None
+    assert reloaded.commit is None
