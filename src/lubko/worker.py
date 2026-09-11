@@ -91,9 +91,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast, override
 from uuid import uuid4
 
-import psycopg
-from psycopg.rows import tuple_row
-
 from lubko._exact_signal import open_pidfd as _shared_open_pidfd
 from lubko._exact_signal import pidfd_send_signal as _shared_pidfd_send_signal
 from lubko._exact_signal import process_pgrp as _shared_process_pgrp
@@ -135,12 +132,11 @@ if TYPE_CHECKING:
     from collections.abc import Collection, Iterable
     from uuid import UUID
 
+    import psycopg
     from psycopg.abc import RV, PQGen
 
     from lubko.config import DatabaseConfig
 
-    JobsConnection = psycopg.Connection[tuple[Any, ...]]
-else:
     JobsConnection = psycopg.Connection[tuple[Any, ...]]
 
 
@@ -223,8 +219,13 @@ def _drive_under_deadline(
         sel.modify(fileno, state)
 
 
-class DeadlineConnection(psycopg.Connection[tuple[Any, ...]]):
-    """A supervisor connection whose operations obey a hard client deadline.
+_DeadlineConnectionCls: type | None = None
+
+
+def _get_deadline_connection_cls() -> type[psycopg.Connection[tuple[Any, ...]]]:
+    """Return the DeadlineConnection class, creating and caching it on first call.
+
+    A supervisor connection whose operations obey a hard client deadline.
 
     Every cursor execution drives its libpq generator through :meth:`wait`,
     which enforces the absolute monotonic ``operation_deadline`` currently
@@ -238,39 +239,48 @@ class DeadlineConnection(psycopg.Connection[tuple[Any, ...]]):
     (capped by the configured ``db_operation_timeout_seconds``), so even an
     operation that starts late in a lease cycle cannot outlive the margin.
     """
+    global _DeadlineConnectionCls  # ruff: ignore[global-statement]
+    if _DeadlineConnectionCls is None:
+        import psycopg  # ruff: ignore[import-outside-top-level]
 
-    #: Absolute monotonic deadline for the current operation, installed by the
-    #: supervisor before each database turn. The presence of this class
-    #: attribute is the deadline capability marker checked by
-    #: :func:`install_operation_deadline`.
-    operation_deadline: float = 0.0
+        class DeadlineConnection(psycopg.Connection[tuple[Any, ...]]):
+            """A supervisor connection whose operations obey a hard client deadline."""
 
-    @override
-    def wait(self, gen: PQGen[RV], interval: float = 0.1) -> RV:
-        """Drive ``gen`` under the currently installed operation deadline.
+            #: Absolute monotonic deadline for the current operation, installed by the
+            #: supervisor before each database turn. The presence of this class
+            #: attribute is the deadline capability marker checked by
+            #: :func:`install_operation_deadline`.
+            operation_deadline: float = 0.0
 
-        Args:
-            gen: The nonblocking libpq generator to drive.
-            interval: Unused compatibility parameter from psycopg's interface;
-                waiting is bounded solely by the absolute deadline.
+            @override
+            def wait(self, gen: PQGen[RV], interval: float = 0.1) -> RV:
+                """Drive ``gen`` under the currently installed operation deadline.
 
-        Returns:
-            Whatever the generator returns on completion.
+                Args:
+                    gen: The nonblocking libpq generator to drive.
+                    interval: Unused compatibility parameter from psycopg's interface;
+                        waiting is bounded solely by the absolute deadline.
 
-        Raises:
-            TimeoutError: The hard client deadline passed; the libpq
-                connection is failed closed first.
-        """
-        try:
-            return wait_with_deadline(gen, self.pgconn.socket, self.operation_deadline)
-        except TimeoutError:
-            # The only timeout source inside ``wait_with_deadline`` is the
-            # application-owned hard client deadline; failing the connection
-            # closed on it is fail-safe by construction.
-            LOGGER.exception("database operation breached its client deadline")
-            with suppress(Exception):
-                self.pgconn.finish()
-            raise
+                Returns:
+                    Whatever the generator returns on completion.
+
+                Raises:
+                    TimeoutError: The hard client deadline passed; the libpq
+                        connection is failed closed first.
+                """
+                try:
+                    return wait_with_deadline(gen, self.pgconn.socket, self.operation_deadline)
+                except TimeoutError:
+                    # The only timeout source inside ``wait_with_deadline`` is the
+                    # application-owned hard client deadline; failing the connection
+                    # closed on it is fail-safe by construction.
+                    LOGGER.exception("database operation breached its client deadline")
+                    with suppress(Exception):
+                        self.pgconn.finish()
+                    raise
+
+        _DeadlineConnectionCls = DeadlineConnection
+    return _DeadlineConnectionCls
 
 
 def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None) -> bool:
@@ -299,6 +309,8 @@ def _is_connectivity_error_check(exc: psycopg.Error, conn: JobsConnection | None
     Returns:
         ``True`` when the error indicates a lost/unusable connection.
     """
+    import psycopg  # ruff: ignore[import-outside-top-level]
+
     sqlstate = exc.sqlstate
     if sqlstate is not None and sqlstate.startswith("08"):
         return True
@@ -2394,6 +2406,8 @@ def _owned_running_groups(
         likewise mean missing or malformed exact-start identity.
     """
     groups: list[tuple[int | None, int | None, str]] = []
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT id, " + _safe_payload_sql("payload") + "->'state'->'process_pgid',\n"
@@ -3432,6 +3446,8 @@ def claim_jobs(conn: JobsConnection, settings: Settings, limit: int) -> list[Cla
         ],
     )
     version_fragment, version_params = claim_version_predicate()
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "WITH next AS (\n"
@@ -3504,6 +3520,8 @@ def request_cancel(conn: JobsConnection, job_id: UUID, *, server: str) -> str:
     Raises:
         ValueError: If the job does not exist or belongs to another server.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     pending_chain = _jsonb_set_chain(
         _SAFE_PAYLOAD_SQL,
         [
@@ -3599,6 +3617,8 @@ def bulk_refresh_leases(
     Returns:
         The IDs of the rows whose lease was refreshed.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     set_chain = _jsonb_set_chain(
         _SAFE_PAYLOAD_SQL,
         [
@@ -3683,6 +3703,8 @@ def discover_cancellations(conn: JobsConnection, settings: Settings) -> list[UUI
     Returns:
         The IDs of owned running jobs with ``state.cancel_requested_at`` set.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT id\n"
@@ -3766,6 +3788,8 @@ def recover_stale_jobs(conn: JobsConnection, server: str) -> list[tuple[UUID, st
     Returns:
         The ``(id, payload)`` pairs of the recovered jobs.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     set_chain = _jsonb_set_chain(
         _safe_payload_sql("job.payload"),
         [
@@ -3827,6 +3851,8 @@ def _read_job_status(conn: JobsConnection, job_id: UUID) -> str | None:
         The current job status, or ``None`` when the root row no longer
         exists (it was deleted concurrently during finalization).
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT " + _SAFE_PAYLOAD_SQL + "->'state'->>'status' FROM lubko.jobs WHERE id = %s",
@@ -3861,6 +3887,8 @@ def finish_job(conn: JobsConnection, job_id: UUID, result: JobResult, *, server:
         that still exists in another (for example lease-recovered terminal)
         state yields that observed status instead.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     # The whole result object is assembled atomically with jsonb_build_object.
     # A bare to_jsonb(NULL) inside jsonb_set would make the whole update SQL
     # NULL, violating payload NOT NULL; jsonb_build_object turns SQL null into
@@ -3952,6 +3980,9 @@ def _quarantine_job(conn: JobsConnection, job_id: UUID, reason: str, *, server: 
     Raises:
         psycopg.Error: When the error is a connectivity issue.
     """
+    import psycopg  # ruff: ignore[import-outside-top-level]
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     safe_reason = reason.replace("\x00", "\ufffd")
     try:
         with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
@@ -4043,6 +4074,9 @@ def fail_unsupported_job(
     Raises:
         psycopg.Error: When the error is a connectivity issue.
     """
+    import psycopg  # ruff: ignore[import-outside-top-level]
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     safe_diagnostic = diagnostic.replace("\x00", "\ufffd")
     try:
         with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
@@ -4100,6 +4134,8 @@ def reap_unsupported_jobs(conn: JobsConnection, settings: Settings, limit: int) 
     Returns:
         The identifiers of the jobs failed closed this pass.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     reaped: list[UUID] = []
     params = {
         "server": settings.server,
@@ -4283,6 +4319,8 @@ def collect_transport(
         A ``(roots_marked, chunks_deleted, orphans_deleted, gc_batch_bound_hit)``
         tuple.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     limit = settings.gc_batch_limit
     roots_marked: list[UUID] = []
     roots_deleted = 0
@@ -4474,6 +4512,8 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
         SchemaInvariantError: If the table does not have exactly ``id`` and
             ``payload`` as its only columns, with ``payload`` of type ``text``.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     # The read runs inside its own top-level transaction so it commits cleanly
     # before the processing loop. Without it the default implicit transaction
     # stays open and every later conn.transaction() block becomes a savepoint,
@@ -4583,8 +4623,10 @@ class Supervisor:
         * Non-connectivity errors are unexpected at this level and indicate
           a global programming or schema fault.  The supervisor logs the
           real exception/SQLSTATE and stops, deferring recovery to the
-          external process supervisor's crash-loop backoff.
+            external process supervisor's crash-loop backoff.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         self._connect()
         self._publish_health(force=True)
         while not self._stopping:
@@ -5100,6 +5142,8 @@ class Supervisor:
             psycopg.Error: When the error is a connectivity issue.
             OSError: When a spool trim/rewrite failure must quarantine the job.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         conn = self.conn
         if conn is None:
             return
@@ -5232,6 +5276,8 @@ class Supervisor:
         Raises:
             psycopg.Error: When a database error is a connectivity issue.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         try:
             self.finalize_completed_job_bounded(job)
         except psycopg.Error as exc:
@@ -5263,6 +5309,8 @@ class Supervisor:
             psycopg.Error: When the error is a connectivity issue during the
                 terminal finalization write.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         job.spool_evicted = True
         request_stop(job, STOP_REASON_SPOOL)
         if not (job.completed and not _owned_group_alive(job)):
@@ -5389,6 +5437,8 @@ class Supervisor:
             psycopg.Error: When a database error is a connectivity issue.
             OSError: When a local capture/file error escapes publication.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         try:
             published = publish_output(
                 conn, job, list(OUTPUT_STREAMS), now, server=self.settings.server, force=True
@@ -5612,6 +5662,8 @@ class Supervisor:
         are swallowed here: the regular tick/outage path owns reconnects, and a
         missed refresh never falsely extends a lease.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         with suppress(psycopg.Error):
             self._refresh_leases()
 
@@ -5736,6 +5788,8 @@ class Supervisor:
         Raises:
             psycopg.Error: When the error is a connectivity issue.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         conn = self.conn
         if conn is None:
             return False
@@ -5998,6 +6052,8 @@ class Supervisor:
             psycopg.Error: When persisting the identity fails with a
                 connectivity error (raised only after exact-group convergence).
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         start_ticks = proc_start_ticks(gated.proc.pid)
         if start_ticks is not None and start_ticks > 0:
             try:
@@ -6128,6 +6184,8 @@ class Supervisor:
         Raises:
             psycopg.Error: When the error is a connectivity issue.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         conn = self.conn
         if conn is None:
             return
@@ -6348,8 +6406,11 @@ class Supervisor:
             SchemaInvariantError: If the transport table violates the two-column
                 invariant.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+        from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
         try:
-            conn = DeadlineConnection.connect(
+            conn = _get_deadline_connection_cls().connect(
                 self.database.conninfo(),
                 connect_timeout=max(1, min(5, int(self.settings.db_operation_timeout_seconds))),
                 row_factory=tuple_row,
@@ -6359,7 +6420,7 @@ class Supervisor:
             )
             # The invariant-verification queries below are established
             # operations too: bound them by the same hard client deadline.
-            conn.operation_deadline = time.monotonic() + self.settings.db_operation_timeout_seconds
+            conn.operation_deadline = time.monotonic() + self.settings.db_operation_timeout_seconds  # type: ignore[attr-defined]
         except psycopg.Error:
             LOGGER.exception("database connection failed")
             self.conn = None
@@ -6575,6 +6636,8 @@ class Supervisor:
             retain_groups: Exact group ids that failed post-SIGKILL proof;
                 their jobs are retained instead of finalized.
         """
+        import psycopg  # ruff: ignore[import-outside-top-level]
+
         if self.conn is None:
             return
         retained_ids = set(retain_groups or [])

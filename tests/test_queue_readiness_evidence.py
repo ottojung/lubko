@@ -15,7 +15,6 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-import psycopg
 import pytest
 
 from lubko import lifecycle
@@ -199,6 +198,8 @@ def test_config_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_connect_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
     """Connection failure must not prove readiness."""
+    import psycopg  # ruff: ignore[import-outside-top-level]
+
     monkeypatch.setattr(
         lifecycle,
         "load_database_config",
@@ -214,6 +215,8 @@ def test_connect_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_insert_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
     """Probe insert failure must not prove readiness."""
+    import psycopg  # ruff: ignore[import-outside-top-level]
+
     monkeypatch.setattr(
         lifecycle,
         "load_database_config",

@@ -3,7 +3,6 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-import psycopg
 import pytest
 
 from lubko import lifecycle
@@ -42,6 +41,8 @@ def test_consumer_probe_config_failure_is_unknown(monkeypatch: pytest.MonkeyPatc
 
 def test_consumer_probe_connect_failure_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     """Connection failure must not prove that no consumer exists."""
+    import psycopg  # ruff: ignore[import-outside-top-level]
+
     database = SimpleNamespace(conninfo=lambda: "postgresql://unused")
     message = "database unavailable"
 
@@ -58,6 +59,8 @@ def test_consumer_probe_connect_failure_is_unknown(monkeypatch: pytest.MonkeyPat
 
 def test_consumer_probe_insert_failure_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     """Probe insertion failure must remain an unknown authority result."""
+    import psycopg  # ruff: ignore[import-outside-top-level]
+
     database = SimpleNamespace(conninfo=lambda: "postgresql://unused")
     connection = SimpleNamespace(autocommit=False, close=lambda: None)
 

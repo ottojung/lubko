@@ -7,7 +7,6 @@ import os
 import uuid
 from typing import TYPE_CHECKING, cast
 
-import psycopg
 import pytest
 
 from lubko import worker
@@ -134,6 +133,8 @@ def test_cleanup_failure_preserves_connectivity_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cleanup failure cannot mask the database connectivity exception."""
+    import psycopg  # ruff: ignore[import-outside-top-level]
+
     gated, proc = _gated(tmp_path)
     supervisor = _supervisor()
     monkeypatch.setattr(worker, "proc_start_ticks", lambda _pid: 123)

@@ -80,8 +80,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple, override
 
-import psycopg
-
 from lubko import cli, deployctl, lifecycle, lifecycle_state, startup_contract, supervise
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
@@ -594,6 +592,8 @@ def recover_owned_groups(incarnation: str) -> None:
     if not incarnation:
         return
     lifecycle_state.failpoint("db_recovery")
+    import psycopg  # ruff: ignore[import-outside-top-level]
+
     try:
         database = load_database_config()
     except (OSError, ValueError) as exc:

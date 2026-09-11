@@ -25,7 +25,6 @@ import dataclasses
 import uuid
 from typing import TYPE_CHECKING, cast
 
-import psycopg
 import pytest
 
 from lubko import worker as worker_mod
@@ -199,6 +198,8 @@ def test_shutdown_finalizes_locally_when_db_connectivity_lost(
     Both owned groups still converge locally, the connection is discarded, the
     final health is honest, and every not-yet-finalized row stays recoverable.
     """
+    import psycopg  # ruff: ignore[import-outside-top-level]
+
     supervisor = _build_supervisor(tmp_path)
     jobs = _seed_jobs(supervisor, tmp_path, count=2)
     monkeypatch.setattr(supervisor, "_drain_active_groups", lambda: True)

@@ -38,9 +38,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
-import psycopg
-from psycopg.rows import tuple_row
-
 from lubko import (
     _exact_signal,
     cli,
@@ -999,6 +996,9 @@ def check_postgres(timeout_seconds: float) -> bool:
     Returns:
         ``True`` when a trivial query succeeds.
     """
+    import psycopg  # ruff: ignore[import-outside-top-level]
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     try:
         config = load_database_config()
     except (OSError, ValueError):
@@ -2854,6 +2854,8 @@ def _read_probe_sentinel(conn: JobsConnection, probe_id: UUID) -> bool:
     Returns:
         ``True`` when the sentinel string is present in the published stdout.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     with conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT (payload::jsonb)->'output'->'stdout'->>'tail' FROM lubko.jobs WHERE id = %s",
@@ -2900,6 +2902,8 @@ def _wait_for_probe_claim(
         a claim whose process was not spawned by the recovery worker, or a
         claim whose payload never produced positive execution evidence.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
@@ -2946,6 +2950,8 @@ def _wait_for_probe_terminal(
         probe_id: Probe job identifier.
         timeout_seconds: Maximum seconds to wait.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
@@ -3017,6 +3023,9 @@ def _verify_queue_roundtrip(
     Returns:
         ``True`` only when the exact worker consumed the probe.
     """
+    import psycopg  # ruff: ignore[import-outside-top-level]
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     try:
         database = load_database_config()
     except (OSError, ValueError):
@@ -3466,6 +3475,8 @@ def _wait_for_any_claim(
     Returns:
         ``True`` when any worker claims the probe while it runs.
     """
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
@@ -3499,6 +3510,9 @@ def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool | None:
     Returns:
         ``True`` when some worker claimed the probe.
     """
+    import psycopg  # ruff: ignore[import-outside-top-level]
+    from psycopg.rows import tuple_row  # ruff: ignore[import-outside-top-level]
+
     try:
         database = load_database_config()
     except (OSError, ValueError):

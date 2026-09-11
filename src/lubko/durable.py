@@ -238,6 +238,14 @@ def make_directory_durable(directory: Path) -> None:
     root: by induction the whole chain is durable because every writer fsyncs
     its own direct parent.
 
+    When the entire hierarchy already exists, no fsync is performed here: the
+    caller's subsequent ``fsync_directory`` of the destination directory handles
+    the file-entry durability, and the parent directory's own entry was made
+    durable by the ``for``-loop ``_fsync_directory`` on the call that first
+    created each level.  This avoids a redundant per-write parent-directory
+    fsync that provides no additional crash-safety guarantee for the caller's
+    own entries.
+
     Args:
         directory: Directory that must exist durably.
 
@@ -267,11 +275,6 @@ def make_directory_durable(directory: Path) -> None:
         # we just created: a concurrent first writer may not yet have fsynced
         # this parent, so establish the durability ourselves.
         _fsync_directory(first_existing.parent)
-    else:
-        # The directory already existed; still anchor its entry in its parent
-        # so a concurrent creator that has not yet fsynced the parent cannot
-        # cause it to be lost.
-        _fsync_directory(directory.parent)
 
 
 def temporary_path(destination: Path) -> Path:

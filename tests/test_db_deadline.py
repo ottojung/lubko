@@ -332,7 +332,7 @@ def test_connect_selects_the_production_deadline_connection(
     # Bind the recording double into the module globals without tripping the
     # lazy ``__getattr__`` loader: setattr would resolve the real driver-bound
     # class just to check for its existence.
-    monkeypatch.setitem(vars(worker), "DeadlineConnection", _CapableConn)
+    monkeypatch.setitem(vars(worker), "_DeadlineConnectionCls", _CapableConn)
     # Wiring-only: skip durable health publication side effects.
     monkeypatch.setattr(supervisor, "_publish_health_force", lambda: None)
     monkeypatch.setattr(supervisor, "_publish_health", lambda **_kwargs: None)

@@ -14,7 +14,6 @@ import os
 from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import uuid4
 
-import psycopg
 import pytest
 
 from lubko import worker
@@ -257,6 +256,7 @@ def test_connectivity_errors_still_propagate_from_finalization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only exact-job loss is contained; connectivity still enters outage."""
+    import psycopg  # ruff: ignore[import-outside-top-level]
 
     def raise_connectivity(*_a: object, **_k: object) -> None:
         message = "connection exception"
