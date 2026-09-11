@@ -1,4 +1,4 @@
-"""Supervisor runtime identity: captured once, exec-activated.
+"""Supervisor runtime identity: captured once, used for spawn-based handoff.
 
 Every ``lubko-supervisor`` daemon resolves its own code through ``cli/current``
 at startup time.  After deployment B, ``cli/current`` points to B while the
@@ -12,45 +12,37 @@ as ``supervisor_runtime_commit``.  The reconcile loop compares the stored
 runtime commit against the current ``cli/current`` to detect when the
 supervisor's own runtime is outdated.
 
-Activation (exec-based upgrade)
-------------------------------
+Activation (spawn-based two-phase handoff)
+------------------------------------------
 
 When the reconcile loop detects that ``cli.current_commit()`` differs from the
-stored ``supervisor_runtime_commit``, the daemon resolves the path to the new
-supervisor executable through ``cli/cli_entry_executable(commit,
-"lubko-supervisor")`` and calls ``os.execv()``.  ``os.execv`` atomically
-replaces the process image while preserving:
-
-- the **PID** (worker ``PR_SET_PDEATHSIG`` and parentage remain valid);
-- the **open lock file descriptor** (the ownership ``flock`` is never
-  released, so no second daemon can start during the handoff);
-- the **child process** (the maintained worker is still a live child of the
-  same PID).
-
-If ``os.execv`` raises ``OSError`` (missing runtime, permission error), the old
-supervisor continues its reconcile loop unchanged: the exec either fully
-replaces the process or raises without any partial effect.
+stored ``supervisor_runtime_commit``, the old supervisor A spawns the new
+supervisor B as a child process using ``subprocess.Popen`` with the inherited
+lock file descriptor and two dedicated pipes (readiness B→A, transfer A→B).
+B starts in handoff preparation mode, initializes, signals READY, and waits.
+Only after A confirms B is ready does A send TRANSFER, close the lock fd, and
+exit cleanly.
 
 Crash boundaries
 ----------------
 
 - **Before trigger**: The supervisor runs A's code, holds the lock, owns the
   worker.  State.json records ``supervisor_runtime_commit=A``.
-- **During preparation**: The supervisor resolves B's executable path.  No
-  state mutation occurs; no lock release.
-- **Exec success**: ``os.execv`` atomically replaces the process with B's
-  code.  B inherits the lock fd, the PID, and the child.  B reads state.json,
-  sees the worker is alive, continues reconciliation.
-- **Exec failure** (``OSError``): The old supervisor catches the exception,
-  logs an error, and continues its reconcile loop with backoff.  No state
-  mutation, no lock release.  The old supervisor remains authoritative.
-- **Successor startup failure**: If B's code crashes during startup (before
-  acquiring the lock — impossible since the lock fd is inherited, but if B
-  somehow fails), the kernel would kill the process and release the lock.  Tini
-  restarts a fresh supervisor, which resolves ``cli/current`` (now B) and
-  starts normally.
+- **Spawn success, B ready**: B signals READY on the readiness pipe.  A
+  confirms B has initialized.  No state mutation yet; A remains authoritative.
+- **TRANSFER**: A writes TRANSFER on the transfer pipe, closes its lock fd,
+  and exits.  B receives TRANSFER and enters normal startup.  No authority
+  overlap and no authority gap.
+- **Spawn failure** (``OSError``): The old supervisor catches the exception,
+  logs an error, and continues its reconcile loop.  No state mutation, no
+  lock release.  The old supervisor remains authoritative.
+- **B failure before READY**: If B crashes during import/startup before
+  signalling READY, A detects EOF/timeout, kills B, and continues with its
+  own authority.
+- **B failure after READY but before TRANSFER**: A detects the pipe closure,
+  kills B, and continues.  A still holds the lock and remains authoritative.
 - **Recovery from previous confirmed runtime**: If B's runtime is missing or
-  corrupt, the exec path resolution returns ``None`` and the old supervisor
+  corrupt, the path resolution returns ``None`` and the old supervisor
   continues running A's code.  The operator must fix the runtime before the
   upgrade can proceed.
 
@@ -59,9 +51,9 @@ Garbage collection
 
 ``cli.supervisor_authoritative_commits()`` includes the stored
 ``supervisor_runtime_commit`` so the old runtime A is never garbage-collected
-while the supervisor is still executing from it.  After a successful exec into
-B, the new supervisor's ``supervisor_runtime_commit`` is B, and A is no longer
-authoritative — GC may collect it.
+while the supervisor is still executing from it.  After a successful transfer
+to B, the new supervisor's ``supervisor_runtime_commit`` is B, and A is no
+longer authoritative — GC may collect it.
 """
 
 from __future__ import annotations
@@ -93,7 +85,7 @@ def capture_supervisor_runtime_commit() -> str | None:
 def resolve_new_supervisor_executable(commit: str) -> str | None:
     """Resolve the path to the supervisor executable for a different commit.
 
-    This is used to detect whether an exec-based upgrade is possible.  The
+    This is used to detect whether a spawn-based handoff is possible.  The
     path resolution goes through the sealed per-commit runtime, never through
     a mutable working tree.
 

@@ -776,10 +776,10 @@ class SupervisorDaemon:
         LOGGER.info("lubko supervisor starting (pid %d)", os.getpid())
         self._acquire_ownership()
         try:
+            if self._in_handoff_mode() and not self._run_handoff_protocol():
+                return
             self._write_pidfile()
             self._persist_runtime_commit()
-            if self._run_handoff_protocol():
-                return
             self._invalidate_stale_status()
             normalize_cross_boot_state()
             self._install_signal_handlers()
@@ -795,6 +795,8 @@ class SupervisorDaemon:
                 finally:
                     for handler in diagnostic_handlers:
                         handler.end_reconciliation_cycle()
+                if self._handoff_completed:
+                    return
                 self._write_status()
                 time.sleep(self.settings.poll_interval_seconds)
             self._shutdown()
@@ -815,8 +817,6 @@ class SupervisorDaemon:
         """
         self._message = None
         if self._handoff_completed:
-            LOGGER.info("supervisor handoff completed; exiting to let successor take over")
-            self._stopping = True
             return
         state = read_state()
         if state.ownership_hold_malformed:
@@ -3088,10 +3088,12 @@ class SupervisorDaemon:
         when this process exits — even under SIGKILL or a crash — a later
         supervisor can always take ownership afterwards.
 
-        When an inherited handoff fd is present (exec-based upgrade), the
-        adopted fd is validated and used directly instead of opening/acquiring
-        a second lock.  The handoff environment variables are cleared after
-        adoption so they are never consumed twice.
+        When an inherited handoff fd is present (spawn-based two-phase
+        handoff), the adopted fd is validated and used directly instead of
+        opening/acquiring a second lock.  The lock-adoption environment
+        variables are cleared after adoption so they are never consumed
+        twice; the handoff protocol env vars are preserved until
+        :meth:`_run_handoff_protocol` completes.
 
         Raises:
             SystemExit: If another live supervisor holds the ownership lock,
@@ -3114,7 +3116,7 @@ class SupervisorDaemon:
 
     @staticmethod
     def _try_adopt_inherited_lock() -> int | None:
-        """Try to adopt an inherited lock fd from an exec-based handoff.
+        """Try to adopt an inherited lock fd from a two-phase handoff.
 
         Returns:
             The validated adopted fd, or ``None`` when no handoff is in
@@ -3271,11 +3273,12 @@ class SupervisorDaemon:
         1. Signals READY to the old supervisor over the readiness pipe.
         2. Waits for the TRANSFER signal on the transfer pipe.
         3. Cleans up the handoff environment variables.
-        4. Returns ``True`` so the caller exits without entering the reconcile
-           loop — the caller proceeds normally from this point.
 
         Returns:
-            ``True`` when a handoff was completed, ``False`` in normal startup.
+            ``True`` when transfer was received (caller should continue to
+            normal startup).  ``False`` when not in handoff mode, on
+            failure/EOF, or on unexpected signal (caller should exit without
+            claiming authority).
         """
         if not self._in_handoff_mode():
             return False
@@ -3309,7 +3312,7 @@ class SupervisorDaemon:
             LOGGER.error("handoff received unexpected signal %r; aborting", buf)
             return False
         LOGGER.info("supervisor handoff transfer received (pid %d)", os.getpid())
-        return False
+        return True
 
     def _maybe_handoff_to_new_supervisor(self) -> None:
         r"""Spawn the confirmed supervisor runtime and hand off authority safely.

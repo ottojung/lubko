@@ -463,8 +463,8 @@ class SupervisorState:
     #: at startup and never re-derived from ``cli/current_commit()``.  After
     #: deployment B changes ``cli/current`` to B, this field still names A —
     #: the actual code loaded by this supervisor process.  The reconcile loop
-    #: compares this against ``cli/current_commit()`` to detect when an
-    #: exec-based upgrade is needed.
+    #: compares this against ``cli/current_commit()`` to detect when a
+    #: spawned two-phase handoff is needed.
     supervisor_runtime_commit: str | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -1137,12 +1137,12 @@ def acquire_supervisor_lock() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Lock-adoption protocol for exec-based supervisor handoff
+# Lock-adoption protocol for spawned two-phase supervisor handoff
 # ---------------------------------------------------------------------------
 
 #: Environment variable carrying the inherited lock file descriptor number
-#: during an exec-based supervisor handoff.  Set immediately before
-#: ``os.execv`` and consumed exactly once at startup.
+#: during a spawned two-phase supervisor handoff.  Set immediately before
+#: ``subprocess.Popen`` and consumed exactly once at startup.
 HANDOFF_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_FD"
 #: Environment variable carrying the expected lock file path for validation
 #: during adoption.  The new supervisor verifies this matches the path it
@@ -1169,10 +1169,10 @@ def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:
     """Adopt an inherited lock file descriptor from a handing-off supervisor.
 
     The fd was opened and flock-held by the previous supervisor, made
-    inheritable immediately before ``os.execv``, and passed via an
-    environment variable.  This function validates the inherited fd without
-    opening or flocking a second descriptor — the lock is already held on
-    the inherited fd.
+    inheritable by the spawning parent, and passed via an environment
+    variable.  This function validates the inherited fd without opening or
+    flocking a second descriptor — the lock is already held on the inherited
+    fd.
 
     Validation:
     - ``fd_number`` must be a non-negative integer within the process's
@@ -1182,12 +1182,12 @@ def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:
       must match ``expected_path`` exactly, preventing injection of an fd
       pointing at an unrelated file.
 
-    The flock state itself cannot be reliably validated after exec: the
+    The flock state itself cannot be reliably validated after spawn: the
     kernel does not expose which process holds an advisory flock, and a
     non-blocking ``flock(LOCK_NB)`` on an unlocked fd succeeds (it acquires
     the lock).  The security boundary is therefore the environment variable
     chain: only the old supervisor (which holds the lock) sets these env
-    vars immediately before exec.
+    vars immediately before spawning the successor.
 
     Args:
         fd_number: The inherited file descriptor number.
