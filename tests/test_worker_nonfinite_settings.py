@@ -20,9 +20,9 @@ def settings() -> Settings:
     )
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
+def test_settings_reject_nonfinite_timing(settings: Settings) -> None:
+    """Reject every non-finite timing value before worker startup."""
+    for field in (
         "poll_interval_seconds",
         "process_poll_interval_seconds",
         "cancel_grace_seconds",
@@ -35,13 +35,10 @@ def settings() -> Settings:
         "db_operation_timeout_seconds",
         "gc_retention_seconds",
         "gc_interval_seconds",
-    ],
-)
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_settings_reject_nonfinite_timing(settings: Settings, field: str, value: float) -> None:
-    """Reject every non-finite timing value before worker startup."""
-    with pytest.raises(ValueError, match=f"{field} must be finite"):
-        replace(settings, **cast("dict[str, Any]", {field: value}))
+    ):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match=f"{field} must be finite"):
+                replace(settings, **cast("dict[str, Any]", {field: value}))
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])

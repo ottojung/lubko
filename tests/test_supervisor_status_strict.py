@@ -39,9 +39,9 @@ def test_canonical_supervisor_status_round_trips() -> None:
     assert supervise.SupervisorStatus.from_dict(status.to_dict()) == status
 
 
-@pytest.mark.parametrize(
-    ("key", "value"),
-    [
+def test_malformed_supervisor_status_scalars_are_rejected() -> None:
+    """Present malformed values cannot become canonical-looking status."""
+    for key, value in [
         ("schema_version", "1"),
         ("schema_version", True),
         ("supervisor_pid", "4242"),
@@ -70,15 +70,12 @@ def test_canonical_supervisor_status_round_trips() -> None:
         ("mission", []),
         ("message", False),
         ("worker_health", []),
-    ],
-)
-def test_malformed_supervisor_status_scalars_are_rejected(key: str, value: object) -> None:
-    """Present malformed values cannot become canonical-looking status."""
-    data = _status().to_dict()
-    data[key] = value
+    ]:
+        data = _status().to_dict()
+        data[key] = value
 
-    with pytest.raises((TypeError, ValueError)):
-        supervise.SupervisorStatus.from_dict(data)
+        with pytest.raises((TypeError, ValueError)):
+            supervise.SupervisorStatus.from_dict(data)
 
 
 def test_malformed_status_child_is_not_erased_as_absence() -> None:

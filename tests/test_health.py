@@ -70,49 +70,43 @@ def _from_dict_or_none(data: dict[str, object]) -> WorkerHealth | None:
         return None
 
 
-@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
-@pytest.mark.parametrize(
-    "field",
-    [
-        "published_at",
-        "started_at",
-        "lease_safety_margin_seconds",
-        "db_operation_deadline_seconds",
-    ],
-)
-def test_persisted_non_finite_required_timestamps_fail_closed(bad: float, field: str) -> None:
+def test_persisted_non_finite_required_timestamps_fail_closed() -> None:
     """NaN/Infinity required timestamps never parse into durable state."""
-    data = json.loads(json.dumps(_snapshot().to_dict()))
-    data[field] = bad
-    with pytest.raises(ValueError, match=field):
-        WorkerHealth.from_dict(data)
-    assert _from_dict_or_none(data) is None
+    for bad in [math.nan, math.inf, -math.inf]:
+        for field in [
+            "published_at",
+            "started_at",
+            "lease_safety_margin_seconds",
+            "db_operation_deadline_seconds",
+        ]:
+            data = json.loads(json.dumps(_snapshot().to_dict()))
+            data[field] = bad
+            with pytest.raises(ValueError, match=field):
+                WorkerHealth.from_dict(data)
+            assert _from_dict_or_none(data) is None
 
 
-@pytest.mark.parametrize(
-    ("field", "bad"),
-    [
+def test_persisted_optional_timestamps_reject_non_finite() -> None:
+    """Optional timestamp fields reject non-finite values when present."""
+    for field, bad in [
         ("db_connected_at", math.nan),
         ("db_error_at", math.inf),
         ("oldest_active_job_age_seconds", -math.inf),
         ("min_lease_safety_remaining_seconds", math.nan),
         ("db_last_activity_at", math.inf),
-    ],
-)
-def test_persisted_optional_timestamps_reject_non_finite(field: str, bad: float) -> None:
-    """Optional timestamp fields reject non-finite values when present."""
-    data = json.loads(json.dumps(_snapshot().to_dict()))
-    data[field] = bad
-    with pytest.raises(ValueError, match="finite"):
-        WorkerHealth.from_dict(data)
+    ]:
+        data = json.loads(json.dumps(_snapshot().to_dict()))
+        data[field] = bad
+        with pytest.raises(ValueError, match="finite"):
+            WorkerHealth.from_dict(data)
 
 
-@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
-def test_directly_constructed_non_finite_published_at_never_live(bad: float) -> None:
+def test_directly_constructed_non_finite_published_at_never_live() -> None:
     """interpret_worker_health fails closed on non-finite published_at."""
-    effective = interpret_worker_health(_snapshot(published_at=bad), max_staleness_seconds=0.0)
-    assert effective.live is False
-    assert effective.stale is True
+    for bad in [math.nan, math.inf, -math.inf]:
+        effective = interpret_worker_health(_snapshot(published_at=bad), max_staleness_seconds=0.0)
+        assert effective.live is False
+        assert effective.stale is True
 
 
 def test_zero_staleness_cannot_be_bypassed_by_nan() -> None:
@@ -138,22 +132,19 @@ def test_future_published_at_cannot_bypass_staleness() -> None:
     assert "future" in effective.reason
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
+def test_missing_required_finite_health_fields_fail_closed() -> None:
+    """Required finite health metrics cannot manufacture zero from absence."""
+    for field in [
         "started_at",
         "published_at",
         "lease_safety_margin_seconds",
         "db_operation_deadline_seconds",
-    ],
-)
-def test_missing_required_finite_health_fields_fail_closed(field: str) -> None:
-    """Required finite health metrics cannot manufacture zero from absence."""
-    data = _snapshot().to_dict()
-    del data[field]
-    with pytest.raises(ValueError, match=field):
-        WorkerHealth.from_dict(data)
-    assert _from_dict_or_none(data) is None
+    ]:
+        data = _snapshot().to_dict()
+        del data[field]
+        with pytest.raises(ValueError, match=field):
+            WorkerHealth.from_dict(data)
+        assert _from_dict_or_none(data) is None
 
 
 def test_missing_or_empty_worker_id_fails_closed(tmp_path: Path) -> None:
@@ -182,9 +173,9 @@ def test_missing_db_deadline_cannot_bypass_strictly_positive_domain() -> None:
             WorkerHealth.from_dict(data)
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
+def test_negative_wall_clock_timestamps_fail_closed() -> None:
+    """Persisted wall-clock timestamps stay inside the writer domain."""
+    for field in [
         "started_at",
         "published_at",
         "db_connected_at",
@@ -194,28 +185,25 @@ def test_missing_db_deadline_cannot_bypass_strictly_positive_domain() -> None:
         "last_cancellation_scan_at",
         "last_recovery_at",
         "last_gc_at",
-    ],
-)
-def test_negative_wall_clock_timestamps_fail_closed(field: str) -> None:
-    """Persisted wall-clock timestamps stay inside the writer domain."""
-    data = _snapshot().to_dict()
-    data[field] = -1.0
-    with pytest.raises(ValueError, match=field):
-        WorkerHealth.from_dict(data)
-    assert _from_dict_or_none(data) is None
+    ]:
+        data = _snapshot().to_dict()
+        data[field] = -1.0
+        with pytest.raises(ValueError, match=field):
+            WorkerHealth.from_dict(data)
+        assert _from_dict_or_none(data) is None
 
 
-@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
-def test_health_serialization_never_emits_non_finite_values(bad: float) -> None:
+def test_health_serialization_never_emits_non_finite_values() -> None:
     """Serialized health/status payloads stay strict-JSON-safe."""
-    payload = worker_health_payload(_snapshot(published_at=bad), max_staleness_seconds=10.0)
-    assert payload is not None
-    text = json.dumps(payload, allow_nan=False)
-    assert "NaN" not in text
-    assert "Infinity" not in text
-    dumped = json.dumps(_snapshot(published_at=bad).to_dict(), allow_nan=False)
-    assert "NaN" not in dumped
-    assert "Infinity" not in dumped
+    for bad in [math.nan, math.inf, -math.inf]:
+        payload = worker_health_payload(_snapshot(published_at=bad), max_staleness_seconds=10.0)
+        assert payload is not None
+        text = json.dumps(payload, allow_nan=False)
+        assert "NaN" not in text
+        assert "Infinity" not in text
+        dumped = json.dumps(_snapshot(published_at=bad).to_dict(), allow_nan=False)
+        assert "NaN" not in dumped
+        assert "Infinity" not in dumped
 
 
 def test_pidfd_pinned_health_rejects_disappearance_after_identity_proof(
@@ -346,9 +334,9 @@ def test_health_rejects_malformed_bounded_job_identity() -> None:
         WorkerHealth.from_dict(payload)
 
 
-@pytest.mark.parametrize(
-    ("field", "bad"),
-    [
+def test_present_scalar_fields_require_their_json_schema_types() -> None:
+    """Present scalar fields are never normalized from malformed JSON types."""
+    for field, bad in [
         ("schema_version", "2"),
         ("worker_id", 7),
         ("worker_incarnation", ["inc"]),
@@ -360,15 +348,12 @@ def test_health_rejects_malformed_bounded_job_identity() -> None:
         ("db_connected_at", "1000.0"),
         ("active_jobs", "1"),
         ("active_jobs", 1.0),
-    ],
-)
-def test_present_scalar_fields_require_their_json_schema_types(field: str, bad: object) -> None:
-    """Present scalar fields are never normalized from malformed JSON types."""
-    data = json.loads(json.dumps(_snapshot().to_dict()))
-    data[field] = bad
-    with pytest.raises((TypeError, ValueError)):
-        WorkerHealth.from_dict(data)
-    assert _from_dict_or_none(data) is None
+    ]:
+        data = json.loads(json.dumps(_snapshot().to_dict()))
+        data[field] = bad
+        with pytest.raises((TypeError, ValueError)):
+            WorkerHealth.from_dict(data)
+        assert _from_dict_or_none(data) is None
 
 
 def test_malformed_identity_file_is_not_usable_health(tmp_path: Path) -> None:
@@ -463,9 +448,9 @@ def test_unknown_observability_version_fails_closed() -> None:
         WorkerHealth.from_dict(payload)
 
 
-@pytest.mark.parametrize(
-    ("field", "bad"),
-    [
+def test_process_identity_fields_require_exact_json_integers() -> None:
+    """Persisted process identity never gains authority through numeric coercion."""
+    for field, bad in [
         ("schema_version", "2"),
         ("schema_version", 2.0),
         ("schema_version", True),
@@ -477,15 +462,12 @@ def test_unknown_observability_version_fails_closed() -> None:
         ("start_time_ticks", 100.0),
         ("start_time_ticks", True),
         ("start_time_ticks", 0),
-    ],
-)
-def test_process_identity_fields_require_exact_json_integers(field: str, bad: object) -> None:
-    """Persisted process identity never gains authority through numeric coercion."""
-    data = json.loads(json.dumps(_snapshot().to_dict()))
-    data[field] = bad
-    with pytest.raises((TypeError, ValueError), match=field):
-        WorkerHealth.from_dict(data)
-    assert _from_dict_or_none(data) is None
+    ]:
+        data = json.loads(json.dumps(_snapshot().to_dict()))
+        data[field] = bad
+        with pytest.raises((TypeError, ValueError), match=field):
+            WorkerHealth.from_dict(data)
+        assert _from_dict_or_none(data) is None
 
 
 @pytest.mark.parametrize("bad_schema", ["bogus", [], {}, 2.0, "2"])
@@ -516,9 +498,9 @@ def test_fractional_pid_cannot_be_truncated_into_live_health() -> None:
     assert _from_dict_or_none(data) is None
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
+def test_persisted_worker_health_counts_reject_negative_values() -> None:
+    """Counts and sizes outside their writer domain fail closed."""
+    for field in [
         "active_jobs",
         "stopping_jobs",
         "completed_jobs",
@@ -526,50 +508,41 @@ def test_fractional_pid_cannot_be_truncated_into_live_health() -> None:
         "capture_streams_open",
         "spool_held_bytes",
         "last_scan_batch_size",
-    ],
-)
-def test_persisted_worker_health_counts_reject_negative_values(field: str) -> None:
-    """Counts and sizes outside their writer domain fail closed."""
-    data = _snapshot().to_dict()
-    data[field] = -1
-    with pytest.raises(ValueError, match=field):
-        WorkerHealth.from_dict(data)
-    assert _from_dict_or_none(data) is None
+    ]:
+        data = _snapshot().to_dict()
+        data[field] = -1
+        with pytest.raises(ValueError, match=field):
+            WorkerHealth.from_dict(data)
+        assert _from_dict_or_none(data) is None
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
+def test_persisted_worker_health_batch_limits_must_be_positive() -> None:
+    """Configured batch limits retain the positive runtime contract."""
+    for field in [
         "scan_batch_limit",
         "gc_batch_limit",
         "cancellation_batch_limit",
         "recovery_batch_limit",
-    ],
-)
-@pytest.mark.parametrize("bad", [0, -1])
-def test_persisted_worker_health_batch_limits_must_be_positive(field: str, bad: int) -> None:
-    """Configured batch limits retain the positive runtime contract."""
-    data = _snapshot().to_dict()
-    data[field] = bad
-    with pytest.raises(ValueError, match=field):
-        WorkerHealth.from_dict(data)
+    ]:
+        for bad in [0, -1]:
+            data = _snapshot().to_dict()
+            data[field] = bad
+            with pytest.raises(ValueError, match=field):
+                WorkerHealth.from_dict(data)
 
 
-@pytest.mark.parametrize(
-    ("field", "bad"),
-    [
+def test_persisted_worker_health_durations_enforce_runtime_domains() -> None:
+    """Elapsed/configured durations reject semantically impossible values."""
+    for field, bad in [
         ("oldest_active_job_age_seconds", -0.1),
         ("lease_safety_margin_seconds", -0.1),
         ("db_operation_deadline_seconds", 0.0),
         ("db_operation_deadline_seconds", -0.1),
-    ],
-)
-def test_persisted_worker_health_durations_enforce_runtime_domains(field: str, bad: float) -> None:
-    """Elapsed/configured durations reject semantically impossible values."""
-    data = _snapshot().to_dict()
-    data[field] = bad
-    with pytest.raises(ValueError, match=field):
-        WorkerHealth.from_dict(data)
+    ]:
+        data = _snapshot().to_dict()
+        data[field] = bad
+        with pytest.raises(ValueError, match=field):
+            WorkerHealth.from_dict(data)
 
 
 def test_negative_lease_safety_remaining_is_intentionally_preserved() -> None:
@@ -595,26 +568,23 @@ def test_canonical_worker_health_round_trips() -> None:
     assert WorkerHealth.from_dict(snapshot.to_dict()) == snapshot
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
+def test_required_batch_limits_reject_absence() -> None:
+    """Required positive configuration cannot disappear into an invalid zero."""
+    for field in [
         "scan_batch_limit",
         "gc_batch_limit",
         "cancellation_batch_limit",
         "recovery_batch_limit",
-    ],
-)
-def test_required_batch_limits_reject_absence(field: str) -> None:
-    """Required positive configuration cannot disappear into an invalid zero."""
-    data = _snapshot().to_dict()
-    del data[field]
-    with pytest.raises(TypeError, match=field):
-        WorkerHealth.from_dict(data)
+    ]:
+        data = _snapshot().to_dict()
+        del data[field]
+        with pytest.raises(TypeError, match=field):
+            WorkerHealth.from_dict(data)
 
 
-@pytest.mark.parametrize(
-    "field",
-    [
+def test_legacy_optional_counts_default_absence_to_zero() -> None:
+    """Backward-compatible count fields deliberately retain zero-on-absence semantics."""
+    for field in [
         "active_jobs",
         "stopping_jobs",
         "completed_jobs",
@@ -622,14 +592,11 @@ def test_required_batch_limits_reject_absence(field: str) -> None:
         "capture_streams_open",
         "spool_held_bytes",
         "last_scan_batch_size",
-    ],
-)
-def test_legacy_optional_counts_default_absence_to_zero(field: str) -> None:
-    """Backward-compatible count fields deliberately retain zero-on-absence semantics."""
-    data = _snapshot().to_dict()
-    del data[field]
-    parsed = WorkerHealth.from_dict(data)
-    assert getattr(parsed, field) == 0
+    ]:
+        data = _snapshot().to_dict()
+        del data[field]
+        parsed = WorkerHealth.from_dict(data)
+        assert getattr(parsed, field) == 0
 
 
 @pytest.mark.parametrize(
@@ -652,13 +619,13 @@ def test_health_file_reader_rejects_missing_required_batch_limit(
     assert health_module._read_health_file(path) is None
 
 
-@pytest.mark.parametrize("token", ["", "bad token", "a/b", ".", "..", "bad.token"])
-def test_persisted_health_rejects_invalid_incarnation_tokens(token: str) -> None:
+def test_persisted_health_rejects_invalid_incarnation_tokens() -> None:
     """Incarnation strings outside the artifact-safe domain are unusable health."""
-    data = _snapshot().to_dict()
-    data["worker_incarnation"] = token
-    with pytest.raises(ValueError, match="incarnation token"):
-        WorkerHealth.from_dict(data)
+    for token in ["", "bad token", "a/b", ".", "..", "bad.token"]:
+        data = _snapshot().to_dict()
+        data["worker_incarnation"] = token
+        with pytest.raises(ValueError, match="incarnation token"):
+            WorkerHealth.from_dict(data)
 
 
 def test_health_reader_rejects_invalid_incarnation_before_path_construction(

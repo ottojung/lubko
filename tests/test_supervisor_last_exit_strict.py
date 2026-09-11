@@ -2,8 +2,6 @@
 
 from typing import Protocol
 
-import pytest
-
 from lubko import supervise
 
 
@@ -35,21 +33,19 @@ def test_healthy_status_serialization_is_unchanged() -> None:
     assert status.to_dict()["last_exit"] == {"returncode": 0, "at": 42.25}
 
 
-@pytest.mark.parametrize("returncode", ["7", 7.0, True, False, [], {}, "", "bad"])
-def test_malformed_returncode_is_rejected(returncode: object) -> None:
+def test_malformed_returncode_is_rejected() -> None:
     """Malformed return codes never coerce to canonical integers."""
-    for parsed in _parse_all({"last_exit": {"returncode": returncode, "at": 12.5}}):
-        assert parsed.last_exit is None
+    bad_returncodes: tuple[object, ...] = ("7", 7.0, True, False, [], {}, "", "bad")
+    for returncode in bad_returncodes:
+        for parsed in _parse_all({"last_exit": {"returncode": returncode, "at": 12.5}}):
+            assert parsed.last_exit is None
 
 
-@pytest.mark.parametrize(
-    "at",
-    ["12.5", True, False, [], {}, "", float("nan"), float("inf"), float("-inf"), -1.0],
-)
-def test_malformed_timestamp_is_rejected(at: object) -> None:
+def test_malformed_timestamp_is_rejected() -> None:
     """Malformed or out-of-domain timestamps never become exit history."""
-    for parsed in _parse_all({"last_exit": {"returncode": 1, "at": at}}):
-        assert parsed.last_exit is None
+    for at in ["12.5", True, False, [], {}, "", float("nan"), float("inf"), float("-inf"), -1.0]:
+        for parsed in _parse_all({"last_exit": {"returncode": 1, "at": at}}):
+            assert parsed.last_exit is None
 
 
 def test_falsey_malformed_values_do_not_default() -> None:
