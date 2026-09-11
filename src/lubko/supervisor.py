@@ -108,6 +108,7 @@ from lubko.supervise import (
     MODE_RUN,
     SCHEMA_VERSION,
     ConsumerLockTimeoutError,
+    GenerationLockTimeoutError,
     LastExit,
     MalformedSupervisorIdentityError,
     SpawningObligation,
@@ -968,6 +969,9 @@ class SupervisorDaemon:
         except lifecycle.LockTimeoutError:
             LOGGER.warning("cold-migration completion deferred: deployment lock is held")
             self._message = "cold-migration completion deferred; deployment in progress"
+        except GenerationLockTimeoutError:
+            LOGGER.warning("cold-migration completion deferred: generation lock timed out")
+            self._message = "cold-migration completion deferred; generation lock timed out"
 
     def _complete_cold_migration_locked(self, desired: supervise.SupervisorDesired) -> None:
         """Perform cold-migration convergence while holding the deployment lock.

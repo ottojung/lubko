@@ -56,6 +56,7 @@ from lubko.lifecycle import (
     write_meta,
 )
 from lubko.state import rollback_state_path, state_root
+from lubko.supervise import GenerationLockTimeoutError
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import JOB_ID_ENV
 
@@ -550,11 +551,15 @@ def next_mission_generation() -> int:
             or malformed; allocation must fail closed rather than silently
             outrank an untrustworthy open mission.
     """
-    with supervise.generation_lock():
-        try:
-            return supervise.next_generation()
-        except supervise.MissionAuthorityError as exc:
-            raise DeployCtlError(str(exc)) from exc
+    try:
+        with supervise.generation_lock():
+            try:
+                return supervise.next_generation()
+            except supervise.MissionAuthorityError as exc:
+                raise DeployCtlError(str(exc)) from exc
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock during mission generation allocation"
+        raise DeployCtlError(msg) from exc
 
 
 def _supervised_mission_active(state: RollbackState) -> bool:
@@ -1856,6 +1861,38 @@ def _restore_previous_locked(state: RollbackState) -> bool:
     return True
 
 
+def _rollback_locked_body(state: RollbackState, expected_generation: int) -> RollbackState:
+    """Perform the rollback while the generation lock is held.
+
+    Args:
+        state: Current rollback state.
+        expected_generation: Expected mission generation.
+
+    Returns:
+        The terminal rolled-back state.
+
+    Raises:
+        DeployCtlError: On authority conflict or unreadable state.
+    """
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError as exc:
+        msg = "cannot roll back while supervisor desired authority is unreadable"
+        raise DeployCtlError(msg) from exc
+    status = supervise.read_status()
+    if not _supervised_terminalization_authority_matches(
+        state.previous_commit, expected_generation, desired, status
+    ):
+        msg = (
+            "the supervisor readiness proof was superseded before rollback; "
+            "deployment remains pending"
+        )
+        raise DeployCtlError(msg)
+    terminal = replace(state, status=STATUS_ROLLED_BACK)
+    _write_state(terminal)
+    return terminal
+
+
 def _finalize_supervised_rollback(state: RollbackState, expected_generation: int) -> RollbackState:
     """Durably archive only a still-current queue-ready rollback target.
 
@@ -1872,23 +1909,12 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
         DeployCtlError: If the queue-readiness proof was superseded or cannot
             be bound to the current durable supervisor generation.
     """
-    with supervise.generation_lock():
-        try:
-            desired = supervise.read_desired_strict()
-        except supervise.DesiredIntentError as exc:
-            msg = "cannot roll back while supervisor desired authority is unreadable"
-            raise DeployCtlError(msg) from exc
-        status = supervise.read_status()
-        if not _supervised_terminalization_authority_matches(
-            state.previous_commit, expected_generation, desired, status
-        ):
-            msg = (
-                "the supervisor readiness proof was superseded before rollback; "
-                "deployment remains pending"
-            )
-            raise DeployCtlError(msg)
-        terminal = replace(state, status=STATUS_ROLLED_BACK)
-        _write_state(terminal)
+    try:
+        with supervise.generation_lock():
+            terminal = _rollback_locked_body(state, expected_generation)
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock during supervised rollback"
+        raise DeployCtlError(msg) from exc
     cli.remove_cli_root(state.commit)
     if cli.reconcile_pointer(state.previous_commit):
         append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
@@ -2157,6 +2183,38 @@ def _stage_candidate_startup_artifacts(commit: str) -> None:
         raise DeployCtlError(msg)
 
 
+def _confirmation_locked_body(state: RollbackState, expected_generation: int) -> RollbackState:
+    """Perform the confirmation while the generation lock is held.
+
+    Args:
+        state: Current rollback state.
+        expected_generation: Expected mission generation.
+
+    Returns:
+        The terminal confirmed state.
+
+    Raises:
+        DeployCtlError: On authority conflict or unreadable state.
+    """
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError as exc:
+        msg = "cannot confirm while supervisor desired authority is unreadable"
+        raise DeployCtlError(msg) from exc
+    status = supervise.read_status()
+    if not _supervised_terminalization_authority_matches(
+        state.commit, expected_generation, desired, status
+    ):
+        msg = (
+            "the supervisor readiness proof was superseded before confirmation; "
+            "deployment remains pending"
+        )
+        raise DeployCtlError(msg)
+    terminal = replace(state, status=STATUS_CONFIRMED)
+    _write_state(terminal)
+    return terminal
+
+
 def _finalize_supervised_confirmation(
     state: RollbackState, expected_generation: int
 ) -> RollbackState:
@@ -2174,23 +2232,12 @@ def _finalize_supervised_confirmation(
         DeployCtlError: If the queue-readiness proof was superseded or cannot
             be bound to the current durable supervisor generation.
     """
-    with supervise.generation_lock():
-        try:
-            desired = supervise.read_desired_strict()
-        except supervise.DesiredIntentError as exc:
-            msg = "cannot confirm while supervisor desired authority is unreadable"
-            raise DeployCtlError(msg) from exc
-        status = supervise.read_status()
-        if not _supervised_terminalization_authority_matches(
-            state.commit, expected_generation, desired, status
-        ):
-            msg = (
-                "the supervisor readiness proof was superseded before confirmation; "
-                "deployment remains pending"
-            )
-            raise DeployCtlError(msg)
-        terminal = replace(state, status=STATUS_CONFIRMED)
-        _write_state(terminal)
+    try:
+        with supervise.generation_lock():
+            terminal = _confirmation_locked_body(state, expected_generation)
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock during supervised confirmation"
+        raise DeployCtlError(msg) from exc
     try:
         cli.set_current(state.commit)
     except cli.CliError as exc:

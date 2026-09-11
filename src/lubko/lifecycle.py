@@ -61,6 +61,7 @@ from lubko.config import (
 )
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.state import rollback_state_path, state_root
+from lubko.supervise import GenerationLockTimeoutError
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import (
     DEFAULT_CANCEL_GRACE_SECONDS,
@@ -1963,31 +1964,46 @@ def _finish_queue_deploy(
     _restore_after_handoff_failure(options, commit, previous)
 
 
+def _candidate_convergence_locked(commit: str) -> bool:
+    """Check convergence while the generation lock is held.
+
+    Args:
+        commit: Exact candidate commit.
+
+    Returns:
+        Whether the authority converges on a live candidate.
+    """
+    try:
+        desired = supervise.read_desired_strict()
+    except supervise.DesiredIntentError:
+        return False
+    status = supervise.read_status()
+    if desired is None or status is None:
+        return False
+    child = status.child
+    converged = lifecycle_state.authorize_supervisor_convergence(
+        lifecycle_state.SupervisorConvergenceFacts(
+            target_commit=commit,
+            minimum_generation=status.applied_generation,
+            desired_commit=desired.commit,
+            desired_generation=desired.generation,
+            applied_commit=status.commit,
+            applied_generation=status.applied_generation,
+            ready=status.ready,
+            holding=status.holding,
+            live_child=child is not None and supervise.child_alive(child),
+        )
+    )
+    return converged and cli.current_commit() == commit
+
+
 def _queue_deploy_candidate_converged(commit: str) -> bool:
     """Return whether current authority still converges on a live candidate."""
-    with supervise.generation_lock():
-        try:
-            desired = supervise.read_desired_strict()
-        except supervise.DesiredIntentError:
-            return False
-        status = supervise.read_status()
-        if desired is None or status is None:
-            return False
-        child = status.child
-        converged = lifecycle_state.authorize_supervisor_convergence(
-            lifecycle_state.SupervisorConvergenceFacts(
-                target_commit=commit,
-                minimum_generation=status.applied_generation,
-                desired_commit=desired.commit,
-                desired_generation=desired.generation,
-                applied_commit=status.commit,
-                applied_generation=status.applied_generation,
-                ready=status.ready,
-                holding=status.holding,
-                live_child=child is not None and supervise.child_alive(child),
-            )
-        )
-        return converged and cli.current_commit() == commit
+    try:
+        with supervise.generation_lock():
+            return _candidate_convergence_locked(commit)
+    except GenerationLockTimeoutError:
+        return False
 
 
 def _queue_deploy_restore_converged(commit: str, minimum_generation: int) -> bool:
@@ -2075,10 +2091,16 @@ def _restore_after_handoff_failure(
     )
     reconciled = False
     if restored:
-        with supervise.generation_lock():
-            reconciled = _queue_deploy_restore_converged(
-                previous.git_commit, settle
-            ) and cli.reconcile_pointer(previous.git_commit)
+        try:
+            with supervise.generation_lock():
+                reconciled = _queue_deploy_restore_converged(
+                    previous.git_commit, settle
+                ) and cli.reconcile_pointer(previous.git_commit)
+        except GenerationLockTimeoutError:
+            append_deploy_log(
+                "queue deploy failed after durable success and the generation lock timed out "
+                "during restore reconciliation"
+            )
     if reconciled:
         append_deploy_log(
             "queue deploy failed after durable success; supervisor restored previous commit "
@@ -4587,6 +4609,9 @@ def migrate_cmd(args: argparse.Namespace) -> int:
             return _migrate_locked(commit, args.repo, uv_path)
     except LockTimeoutError:
         _err("another deployment is running; refusing to race")
+        return EXIT_ERROR
+    except GenerationLockTimeoutError:
+        _err("timed out waiting for the generation lock during migration")
         return EXIT_ERROR
 
 
