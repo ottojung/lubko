@@ -1489,48 +1489,45 @@ def test_publish_gate_allows_when_no_pending_mission(
     assert state.status == deployctl.STATUS_PENDING
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
+def test_rollback_terminalization_rejects_superseded_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rollback remains pending when current supervisor authority supersedes its proof."""
+    cases = [
         (None, 1, 0, True, False),
         (None, 1, 1, True, False),
         (None, 1, 1, False, True),
         ("d" * 40, 1, 1, True, False),
-    ],
-)
-def test_rollback_terminalization_rejects_superseded_readiness(
-    monkeypatch: pytest.MonkeyPatch,
-    case: tuple[str | None, int, int, bool, bool],
-) -> None:
-    """Rollback remains pending when current supervisor authority supersedes its proof."""
-    desired_commit, desired_delta, applied_delta, ready, holding = case
-    mission = _make_mission(deployctl.STATUS_PENDING)
-    desired_generation = mission.generation + desired_delta
-    applied_generation = mission.generation + applied_delta
-    commit = mission.previous_commit if desired_commit is None else desired_commit
-    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
-    monkeypatch.setattr(
-        supervise,
-        "read_desired_strict",
-        lambda: SimpleNamespace(commit=commit, generation=desired_generation),
-    )
-    monkeypatch.setattr(
-        supervise,
-        "read_status",
-        lambda: SimpleNamespace(
-            applied_generation=applied_generation,
-            commit=commit,
-            ready=ready,
-            holding=holding,
-        ),
-    )
-    written = MagicMock()
-    monkeypatch.setattr(deployctl, "_write_state", written)
+    ]
+    for case in cases:
+        desired_commit, desired_delta, applied_delta, ready, holding = case
+        mission = _make_mission(deployctl.STATUS_PENDING)
+        desired_generation = mission.generation + desired_delta
+        applied_generation = mission.generation + applied_delta
+        commit = mission.previous_commit if desired_commit is None else desired_commit
+        monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+        monkeypatch.setattr(
+            supervise,
+            "read_desired_strict",
+            lambda _c=commit, _g=desired_generation: SimpleNamespace(commit=_c, generation=_g),
+        )
+        monkeypatch.setattr(
+            supervise,
+            "read_status",
+            lambda _ag=applied_generation, _c=commit, _r=ready, _h=holding: SimpleNamespace(
+                applied_generation=_ag,
+                commit=_c,
+                ready=_r,
+                holding=_h,
+            ),
+        )
+        written = MagicMock()
+        monkeypatch.setattr(deployctl, "_write_state", written)
 
-    with pytest.raises(deployctl.DeployCtlError, match="superseded before rollback"):
-        deployctl._finalize_supervised_rollback(mission, mission.generation)
+        with pytest.raises(deployctl.DeployCtlError, match="superseded before rollback"):
+            deployctl._finalize_supervised_rollback(mission, mission.generation)
 
-    written.assert_not_called()
+        written.assert_not_called()
 
 
 def test_confirmation_rejects_newer_unapplied_different_commit(

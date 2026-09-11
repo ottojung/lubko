@@ -1089,9 +1089,11 @@ def test_unresolved_cleanup_clears_only_canonical_exact_identity(
     assert meta["unresolved_invocation"] is None
 
 
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
+def test_malformed_unresolved_identity_stays_blocking_and_unclearable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed present unresolved authority remains ambiguous and durable."""
+    cases = [
         ("pid", 424242.0),
         ("pid", "424242"),
         ("pid", True),
@@ -1109,27 +1111,23 @@ def test_unresolved_cleanup_clears_only_canonical_exact_identity(
         ("invocation_id", 123),
         ("invocation_id", "6BB0EACD5381F7B7429C8F897ABFD347"),
         ("invocation_id", "not-hex"),
-    ],
-)
-def test_malformed_unresolved_identity_stays_blocking_and_unclearable(
+    ]
+    for field, value in cases:
+        meta, marker = _unresolved_marker_for(525252)
+        marker[field] = value
+        monkeypatch.setattr(agent, "update_meta", lambda _aid, mutate, _m=meta: mutate(_m))
+
+        assert agent._unresolved_child_state(meta) == "ambiguous"
+        agent._clear_unresolved("aaaaaaaa", 424242, 1, "6bb0eacd5381f7b7429c8f897abfd347")
+
+        assert meta["unresolved_invocation"] is marker
+
+
+def test_malformed_unresolved_record_shape_stays_blocking_and_unclearable(
     monkeypatch: pytest.MonkeyPatch,
-    field: str,
-    value: object,
 ) -> None:
-    """Malformed present unresolved authority remains ambiguous and durable."""
-    meta, marker = _unresolved_marker_for(525252)
-    marker[field] = value
-    monkeypatch.setattr(agent, "update_meta", lambda _aid, mutate: mutate(meta))
-
-    assert agent._unresolved_child_state(meta) == "ambiguous"
-    agent._clear_unresolved("aaaaaaaa", 424242, 1, "6bb0eacd5381f7b7429c8f897abfd347")
-
-    assert meta["unresolved_invocation"] is marker
-
-
-@pytest.mark.parametrize(
-    "record",
-    [
+    """Malformed present unresolved records cannot lose blocking authority."""
+    records: list[object] = [
         [],
         "malformed",
         {"pid": 424242, "pgid": 525252, "start_time": 1},
@@ -1139,43 +1137,36 @@ def test_malformed_unresolved_identity_stays_blocking_and_unclearable(
             "start_time": 1,
             "invocation_id": None,
         },
-    ],
-)
-def test_malformed_unresolved_record_shape_stays_blocking_and_unclearable(
-    monkeypatch: pytest.MonkeyPatch,
-    record: object,
-) -> None:
-    """Malformed present unresolved records cannot lose blocking authority."""
-    meta: agent.Meta = {
-        "id": "aaaaaaaa",
-        "state": "stopped",
-        "unresolved_invocation": record,
-    }
-    monkeypatch.setattr(agent, "update_meta", lambda _aid, mutate: mutate(meta))
+    ]
+    for record in records:
+        meta: agent.Meta = {
+            "id": "aaaaaaaa",
+            "state": "stopped",
+            "unresolved_invocation": record,
+        }
+        monkeypatch.setattr(agent, "update_meta", lambda _aid, mutate, _m=meta: mutate(_m))
 
-    assert agent._unresolved_child_state(meta) == "ambiguous"
-    agent._clear_unresolved("aaaaaaaa", 424242, 1, "6bb0eacd5381f7b7429c8f897abfd347")
+        assert agent._unresolved_child_state(meta) == "ambiguous"
+        agent._clear_unresolved("aaaaaaaa", 424242, 1, "6bb0eacd5381f7b7429c8f897abfd347")
 
-    assert meta["unresolved_invocation"] is record
+        assert meta["unresolved_invocation"] is record
 
 
-@pytest.mark.parametrize(
-    "bad_id",
-    [123, True, "", "AAAAAAAA", "not-hex", None],
-)
 def test_unresolved_group_malformed_agent_id_stays_ambiguous_before_scan(
-    monkeypatch: pytest.MonkeyPatch, bad_id: object
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed parent agent identity cannot prove an unresolved group gone."""
-    meta, _ = _unresolved_marker_for(525252)
-    meta["id"] = bad_id
-    monkeypatch.setattr(agent, "_unresolved_leader_state", lambda _rec: None)
-    monkeypatch.setattr(
-        agent,
-        "_proven_invocation_members",
-        lambda *_args: pytest.fail("malformed agent id reached unresolved member scan"),
-    )
-    assert agent._unresolved_child_state(meta) == "ambiguous"
+    bad_ids: list[object] = [123, True, "", "AAAAAAAA", "not-hex", None]
+    for bad_id in bad_ids:
+        meta, _ = _unresolved_marker_for(525252)
+        meta["id"] = bad_id
+        monkeypatch.setattr(agent, "_unresolved_leader_state", lambda _rec: None)
+        monkeypatch.setattr(
+            agent,
+            "_proven_invocation_members",
+            lambda *_args: pytest.fail("malformed agent id reached unresolved member scan"),
+        )
+        assert agent._unresolved_child_state(meta) == "ambiguous"
 
 
 def test_unresolved_scan_proc_enumeration_failure_stays_blocked(

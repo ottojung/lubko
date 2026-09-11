@@ -44,20 +44,20 @@ def test_derive_state_allows_only_genuine_pid_absence_launch_grace(
         assert derive_state(_running_meta(pid=malformed)) == "unknown"
 
 
-@pytest.mark.parametrize("field", ["started_at", "created_at"])
-@pytest.mark.parametrize("malformed", [False, "", [], {}, float("inf"), float("nan")])
 def test_derive_state_fails_closed_on_malformed_launch_timestamp(
     monkeypatch: pytest.MonkeyPatch,
-    field: str,
-    malformed: object,
 ) -> None:
     """Malformed present launch timestamps fail closed."""
     monkeypatch.setattr(time, "time", lambda: 120.0)
-    meta = _running_meta(pid=None)
-    if field == "created_at":
-        meta["started_at"] = None
-    meta[field] = malformed
-    assert derive_state(meta) == "unknown"
+    fields = ["started_at", "created_at"]
+    malformeds: list[object] = [False, "", [], {}, float("inf"), float("nan")]
+    for field in fields:
+        for malformed in malformeds:
+            meta = _running_meta(pid=None)
+            if field == "created_at":
+                meta["started_at"] = None
+            meta[field] = malformed
+            assert derive_state(meta) == "unknown"
 
 
 def test_derive_state_fails_closed_on_malformed_lifecycle_state() -> None:
@@ -81,24 +81,25 @@ def _idle_transition_meta(state: object) -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("malformed", [False, 0, "", [], {}, ["corrupt"], "bogus"])
 def test_locked_transition_does_not_repair_malformed_state_into_runner_authority(
-    monkeypatch: pytest.MonkeyPatch, malformed: object
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed lifecycle state blocks prompt acceptance without mutating durable state."""
-    meta = _idle_transition_meta(malformed)
-    before = dict(meta)
-    decision: dict[str, object] = {}
+    malformeds: list[object] = [False, 0, "", [], {}, ["corrupt"], "bogus"]
     monkeypatch.setattr(agent, "is_alive", lambda _m: False)
     monkeypatch.setattr(agent, "runner_alive", lambda _m: False)
     monkeypatch.setattr(agent, "reservation_in_flight", lambda _m: False)
+    for malformed in malformeds:
+        meta = _idle_transition_meta(malformed)
+        before = dict(meta)
+        decision: dict[str, object] = {}
 
-    with pytest.raises(agent.MalformedLifecycleStateError):
-        agent._apply_locked_transition(meta, decision, prompt="P", steer=False, mode="new")
+        with pytest.raises(agent.MalformedLifecycleStateError):
+            agent._apply_locked_transition(meta, decision, prompt="P", steer=False, mode="new")
 
-    assert decision == {}
-    assert meta == before
-    assert meta["runner_reservation"] is None
+        assert decision == {}
+        assert meta == before
+        assert meta["runner_reservation"] is None
 
 
 def test_missing_lifecycle_state_retains_legacy_idle_semantics() -> None:
@@ -119,44 +120,46 @@ def test_delete_tombstone_preserves_boolean_and_legacy_absence_semantics() -> No
     assert agent._delete_pending_flag({}) is False
 
 
-@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, 1, "yes", [1], None])
 def test_malformed_delete_tombstone_blocks_prompt_claim(
-    monkeypatch: pytest.MonkeyPatch, malformed: object
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed deletion metadata cannot authorize prompt execution."""
-    meta: agent.Meta = {
-        "id": "aaaaaaaa",
-        "state": "running",
-        "active_runner": True,
-        "pending_prompt": "P",
-        "delete_pending": malformed,
-    }
+    malformeds: list[object] = [0, 0.0, "", [], {}, 1, "yes", [1], None]
+    for malformed in malformeds:
+        meta: agent.Meta = {
+            "id": "aaaaaaaa",
+            "state": "running",
+            "active_runner": True,
+            "pending_prompt": "P",
+            "delete_pending": malformed,
+        }
 
-    def update(_aid: str, mutate: object) -> None:
-        assert callable(mutate)
-        mutate(meta)
+        def update(_aid: str, mutate: object, _m: agent.Meta = meta) -> None:
+            assert callable(mutate)
+            mutate(_m)
 
-    monkeypatch.setattr(agent, "update_meta", update)
-    assert agent._claim_pending_prompt("aaaaaaaa", "P") is False
-    assert meta["pending_prompt"] == "P"
-    assert meta["delete_pending"] == malformed
+        monkeypatch.setattr(agent, "update_meta", update)
+        assert agent._claim_pending_prompt("aaaaaaaa", "P") is False
+        assert meta["pending_prompt"] == "P"
+        assert meta["delete_pending"] == malformed
 
 
-@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, 1, "yes", [1], None])
 def test_malformed_delete_tombstone_cannot_establish_convergence(
-    monkeypatch: pytest.MonkeyPatch, malformed: object
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Deletion convergence requires a canonical true tombstone."""
-    meta: agent.Meta = {
-        "id": "aaaaaaaa",
-        "delete_pending": malformed,
-        "active_runner": False,
-    }
+    malformeds: list[object] = [0, 0.0, "", [], {}, 1, "yes", [1], None]
     monkeypatch.setattr(agent, "runner_alive", lambda _meta: False)
     monkeypatch.setattr(agent, "group_alive", lambda _meta: False)
     monkeypatch.setattr(agent, "reservation_in_flight", lambda _meta: False)
     monkeypatch.setattr(agent, "_unresolved_child_state", lambda _meta: "gone")
-    assert agent._delete_converged(meta) is False
+    for malformed in malformeds:
+        meta: agent.Meta = {
+            "id": "aaaaaaaa",
+            "delete_pending": malformed,
+            "active_runner": False,
+        }
+        assert agent._delete_converged(meta) is False
 
 
 def test_canonical_delete_tombstone_can_converge_when_execution_is_gone(
@@ -175,22 +178,23 @@ def test_canonical_delete_tombstone_can_converge_when_execution_is_gone(
     assert agent._delete_converged(meta) is True
 
 
-@pytest.mark.parametrize("malformed", [0, 0.0, "", [], {}, 1, "yes", [1], None])
 def test_delete_transitions_do_not_normalize_malformed_tombstones(
-    monkeypatch: pytest.MonkeyPatch, malformed: object
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Begin/abort deletion preserve malformed authority for explicit repair."""
-    meta: agent.Meta = {"id": "aaaaaaaa", "delete_pending": malformed}
+    malformeds: list[object] = [0, 0.0, "", [], {}, 1, "yes", [1], None]
+    for malformed in malformeds:
+        meta: agent.Meta = {"id": "aaaaaaaa", "delete_pending": malformed}
 
-    def update(_aid: str, mutate: object) -> None:
-        assert callable(mutate)
-        mutate(meta)
+        def update(_aid: str, mutate: object, _m: agent.Meta = meta) -> None:
+            assert callable(mutate)
+            mutate(_m)
 
-    monkeypatch.setattr(agent, "update_meta", update)
-    assert agent._begin_delete("aaaaaaaa", force=True) is None
-    assert meta["delete_pending"] == malformed
-    agent._abort_delete("aaaaaaaa")
-    assert meta["delete_pending"] == malformed
+        monkeypatch.setattr(agent, "update_meta", update)
+        assert agent._begin_delete("aaaaaaaa", force=True) is None
+        assert meta["delete_pending"] == malformed
+        agent._abort_delete("aaaaaaaa")
+        assert meta["delete_pending"] == malformed
 
 
 def test_malformed_delete_tombstone_blocks_invocation_tracking() -> None:
@@ -237,17 +241,15 @@ def test_forced_delete_rechecks_after_signalling_before_convergence(
     assert signals == [meta, meta]
 
 
-@pytest.mark.parametrize(
-    "finished_at",
-    [False, "", [], {}, -1, float("inf"), float("nan")],
-)
 def test_dead_running_state_requires_canonical_completion_timestamp(
-    monkeypatch: pytest.MonkeyPatch, finished_at: object
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed completion timestamps cannot preserve running authority."""
-    meta = _running_meta(pid=123, finished_at=finished_at)
+    malformeds: list[object] = [False, "", [], {}, -1, float("inf"), float("nan")]
     monkeypatch.setattr("lubko.agent.is_alive", lambda _value: False)
-    assert derive_state(meta) == "unknown"
+    for finished_at in malformeds:
+        meta = _running_meta(pid=123, finished_at=finished_at)
+        assert derive_state(meta) == "unknown"
 
 
 def test_dead_running_state_preserves_valid_completion_timestamp(
@@ -317,31 +319,33 @@ def test_persisted_lifecycle_control_rejects_malformed_presence() -> None:
         assert agent._persisted_stop_reason({"stop_reason": malformed}) == (None, True)
 
 
-@pytest.mark.parametrize("field", ["intent", "stop_reason"])
-@pytest.mark.parametrize("malformed", ["bogus", 1, [], {}])
 def test_malformed_lifecycle_control_blocks_pending_prompt_claim(
-    monkeypatch: pytest.MonkeyPatch, field: str, malformed: object
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed durable control cannot authorize accepted prompt execution."""
-    meta: agent.Meta = {
-        "id": "aaaaaaaa",
-        "state": "running",
-        "active_runner": True,
-        "pending_prompt": "P",
-        "delete_pending": False,
-        "intent": None,
-        "stop_reason": None,
-        field: malformed,
-    }
+    fields = ["intent", "stop_reason"]
+    malformeds: list[object] = ["bogus", 1, [], {}]
+    for field in fields:
+        for malformed in malformeds:
+            meta: agent.Meta = {
+                "id": "aaaaaaaa",
+                "state": "running",
+                "active_runner": True,
+                "pending_prompt": "P",
+                "delete_pending": False,
+                "intent": None,
+                "stop_reason": None,
+                field: malformed,
+            }
 
-    def update(_aid: str, mutate: object) -> None:
-        assert callable(mutate)
-        mutate(meta)
+            def update(_aid: str, mutate: object, _m: agent.Meta = meta) -> None:
+                assert callable(mutate)
+                mutate(_m)
 
-    monkeypatch.setattr(agent, "update_meta", update)
-    assert agent._claim_pending_prompt("aaaaaaaa", "P") is False
-    assert meta["pending_prompt"] == "P"
-    assert meta[field] == malformed
+            monkeypatch.setattr(agent, "update_meta", update)
+            assert agent._claim_pending_prompt("aaaaaaaa", "P") is False
+            assert meta["pending_prompt"] == "P"
+            assert meta[field] == malformed
 
 
 def test_malformed_lifecycle_control_blocks_new_invocation() -> None:
@@ -358,31 +362,33 @@ def test_malformed_lifecycle_control_blocks_new_invocation() -> None:
             assert meta[field] == malformed
 
 
-@pytest.mark.parametrize("field", ["intent", "stop_reason"])
-@pytest.mark.parametrize("malformed", ["bogus", 1, [], {}])
 def test_malformed_lifecycle_control_stops_runner_drain(
-    monkeypatch: pytest.MonkeyPatch, field: str, malformed: object
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Malformed lifecycle control cannot be bypassed by queued-work drain."""
-    meta: agent.Meta = {
-        "id": "aaaaaaaa",
-        "state": "succeeded",
-        "active_runner": True,
-        "intent": None,
-        "stop_reason": None,
-        "steer_queue": [],
-        "steer_seq": 0,
-        field: malformed,
-    }
+    fields = ["intent", "stop_reason"]
+    malformeds: list[object] = ["bogus", 1, [], {}]
+    for field in fields:
+        for malformed in malformeds:
+            meta: agent.Meta = {
+                "id": "aaaaaaaa",
+                "state": "succeeded",
+                "active_runner": True,
+                "intent": None,
+                "stop_reason": None,
+                "steer_queue": [],
+                "steer_seq": 0,
+                field: malformed,
+            }
 
-    def update(_aid: str, mutate: object) -> None:
-        assert callable(mutate)
-        mutate(meta)
+            def update(_aid: str, mutate: object, _m: agent.Meta = meta) -> None:
+                assert callable(mutate)
+                mutate(_m)
 
-    monkeypatch.setattr(agent, "update_meta", update)
-    assert agent._drain_next("aaaaaaaa") is None
-    assert meta["active_runner"] is False
-    assert meta[field] == malformed
+            monkeypatch.setattr(agent, "update_meta", update)
+            assert agent._drain_next("aaaaaaaa") is None
+            assert meta["active_runner"] is False
+            assert meta[field] == malformed
 
 
 def test_canonical_steer_control_does_not_create_a_stop_like_hold() -> None:
@@ -393,24 +399,22 @@ def test_canonical_steer_control_does_not_create_a_stop_like_hold() -> None:
     assert agent._stop_like_or_malformed({"stop_reason": "kill"}) is True
 
 
-@pytest.mark.parametrize(
-    ("started_at", "expected"),
-    [
+def test_derive_state_launch_grace_requires_non_future_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only non-future launch timestamps receive the bounded no-PID grace."""
+    monkeypatch.setattr(time, "time", lambda: 120.0)
+    cases = [
         (120.0, "running"),
         (119.0, "running"),
         (120.0 - agent.PID_START_WINDOW_SECONDS, "unknown"),
         (121.0, "unknown"),
         (10_000.0, "unknown"),
-    ],
-)
-def test_derive_state_launch_grace_requires_non_future_timestamp(
-    monkeypatch: pytest.MonkeyPatch, started_at: float, expected: str
-) -> None:
-    """Only non-future launch timestamps receive the bounded no-PID grace."""
-    monkeypatch.setattr(time, "time", lambda: 120.0)
-    meta = _running_meta(pid=None)
-    meta["started_at"] = started_at
-    assert derive_state(meta) == expected
+    ]
+    for started_at, expected in cases:
+        meta = _running_meta(pid=None)
+        meta["started_at"] = started_at
+        assert derive_state(meta) == expected
 
 
 def test_derive_state_created_at_fallback_rejects_future_timestamp(
