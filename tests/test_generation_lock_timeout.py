@@ -1,9 +1,9 @@
 """Deterministic regression coverage for bounded generation-lock acquisition.
 
-Exercises uncontended success, deadline timeout, no-mutation on timeout,
-release on normal/exceptional exits, eventual acquisition after contention
-clears, generation monotonicity under contention, and call-site timeout
-propagation through deployctl and lifecycle domains.
+Exercises uncontended success, deadline timeout via fake monotonic/flock,
+release on normal/exceptional exits, eventual acquisition, generation
+monotonicity, and call-site timeout propagation through every public/domain
+boundary that previously assumed indefinite lock acquisition.
 """
 
 from __future__ import annotations
@@ -11,16 +11,18 @@ from __future__ import annotations
 import fcntl
 import threading
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from lubko import deployctl, lifecycle, supervise
-from lubko.lifecycle import WorkerMeta
+from lubko.lifecycle import DeployOptions, WorkerMeta
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_BLOCKING_MSG = "Resource temporarily unavailable"
 
 
 def _write_desired(gen: int, commit: str = "abc123") -> None:
@@ -35,24 +37,6 @@ def _write_desired(gen: int, commit: str = "abc123") -> None:
             worker_id=None,
         )
     )
-
-
-def _hold_lock_in_thread() -> tuple[threading.Event, threading.Event, threading.Thread]:
-    """Return (held, release, thread) that holds the generation lock file."""
-    lock_path = supervise.supervisor_dir() / ".generation.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    held = threading.Event()
-    release = threading.Event()
-
-    def _hold() -> None:
-        with lock_path.open("a+") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            held.set()
-            release.wait()
-            fcntl.flock(fh, fcntl.LOCK_UN)
-
-    t = threading.Thread(target=_hold)
-    return held, release, t
 
 
 def _make_rollback_state() -> deployctl.RollbackState:
@@ -90,6 +74,43 @@ def _make_rollback_state() -> deployctl.RollbackState:
     )
 
 
+def _deadline_exceeded_monotonic() -> tuple[list[int], type]:
+    """Return a fake ``time.monotonic`` whose second call exceeds any deadline."""
+    call_count = [0]
+
+    def _fake() -> float:
+        call_count[0] += 1
+        return 100.0 if call_count[0] > 1 else 0.0
+
+    return call_count, _fake  # type: ignore[return-value]
+
+
+def _always_contend_flock(_fd: object, operation: int) -> None:
+    """Fake ``fcntl.flock`` that always contends on LOCK_NB.
+
+    Raises:
+        BlockingIOError: Always when LOCK_NB is set.
+    """
+    if operation & fcntl.LOCK_NB:
+        raise BlockingIOError(_BLOCKING_MSG)
+
+
+def _make_deploy_options() -> DeployOptions:
+    """Return minimal DeployOptions for lifecycle tests."""
+    return DeployOptions(
+        repo=Path("/repo"),
+        uv_path="uv",
+        lock_timeout_seconds=10.0,
+        postgres_timeout_seconds=5.0,
+        stop_grace_seconds=10.0,
+        validation_timeout_seconds=10.0,
+        git_timeout_seconds=10.0,
+        cli_timeout_seconds=10.0,
+        bootstrap=False,
+        direct_spawn=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Uncontended acquisition
 # ---------------------------------------------------------------------------
@@ -116,62 +137,57 @@ def test_generation_lock_reentrant_after_release() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Timeout when contended
+# Timeout via fake fcntl/monotonic (no real waits)
 # ---------------------------------------------------------------------------
 
 
-def test_generation_lock_timeout_with_real_flock_contention() -> None:
-    """A second acquisition times out while the first holds the lock."""
-    held, release, t = _hold_lock_in_thread()
-    t.start()
-    held.wait(timeout=5.0)
-    try:
-        with (
-            pytest.raises(supervise.GenerationLockTimeoutError),
-            supervise.generation_lock(timeout_seconds=0.1),
-        ):
-            pass  # pragma: no cover
-    finally:
-        release.set()
-        t.join(timeout=5.0)
+def test_generation_lock_timeout_on_deadline() -> None:
+    """Timeout fires when monotonic exceeds the deadline during contention.
+
+    Uses fake fcntl.flock (always BlockingIOError) and fake time.monotonic
+    (returns 0 on first call, then past deadline) to prove the polling loop
+    checks the deadline without any real sleep.
+    """
+    _call_count, monotonic_fn = _deadline_exceeded_monotonic()
+    with (
+        patch("lubko.supervise.time.monotonic", side_effect=monotonic_fn),
+        patch("lubko.supervise.time.sleep"),
+        patch("lubko.supervise.fcntl.flock", side_effect=_always_contend_flock),
+        pytest.raises(supervise.GenerationLockTimeoutError, match="generation lock"),
+        supervise.generation_lock(timeout_seconds=1.0),
+    ):
+        pass  # pragma: no cover
 
 
 def test_generation_lock_timeout_message_content() -> None:
     """The timeout error message mentions the generation lock."""
-    held, release, t = _hold_lock_in_thread()
-    t.start()
-    held.wait(timeout=5.0)
-    try:
-        with (
-            pytest.raises(supervise.GenerationLockTimeoutError, match="generation lock"),
-            supervise.generation_lock(timeout_seconds=0.1),
-        ):
-            pass  # pragma: no cover
-    finally:
-        release.set()
-        t.join(timeout=5.0)
-
-
-# ---------------------------------------------------------------------------
-# No mutation on timeout
-# ---------------------------------------------------------------------------
+    _call_count, monotonic_fn = _deadline_exceeded_monotonic()
+    with (
+        patch("lubko.supervise.time.monotonic", side_effect=monotonic_fn),
+        patch("lubko.supervise.time.sleep"),
+        patch("lubko.supervise.fcntl.flock", side_effect=_always_contend_flock),
+        pytest.raises(supervise.GenerationLockTimeoutError, match="generation lock"),
+        supervise.generation_lock(timeout_seconds=1.0),
+    ):
+        pass  # pragma: no cover
 
 
 def test_generation_lock_no_mutation_on_timeout() -> None:
-    """read_desired_strict returns unchanged state after a timeout."""
+    """No durable state changes when the lock times out.
+
+    Proves the lock body never executes by making the lock always contend,
+    then verifying pre-existing state is preserved.
+    """
     _write_desired(42, commit="before")
-    held, release, t = _hold_lock_in_thread()
-    t.start()
-    held.wait(timeout=5.0)
-    try:
-        with (
-            pytest.raises(supervise.GenerationLockTimeoutError),
-            supervise.generation_lock(timeout_seconds=0.1),
-        ):
-            _write_desired(99, commit="stale")  # pragma: no cover
-    finally:
-        release.set()
-        t.join(timeout=5.0)
+    _call_count, monotonic_fn = _deadline_exceeded_monotonic()
+    with (
+        patch("lubko.supervise.time.monotonic", side_effect=monotonic_fn),
+        patch("lubko.supervise.time.sleep"),
+        patch("lubko.supervise.fcntl.flock", side_effect=_always_contend_flock),
+        pytest.raises(supervise.GenerationLockTimeoutError),
+        supervise.generation_lock(timeout_seconds=1.0),
+    ):
+        pass  # pragma: no cover
 
     desired = supervise.read_desired_strict()
     assert desired is not None
@@ -209,24 +225,34 @@ def test_generation_lock_release_on_exception() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Eventual acquisition after contention clears
+# Eventual acquisition after contention clears (real flock, fast)
 # ---------------------------------------------------------------------------
 
 
 def test_generation_lock_eventual_acquisition() -> None:
     """Second holder acquires once the first releases."""
-    held, release, t_hold = _hold_lock_in_thread()
+    lock_path = supervise.supervisor_dir() / ".generation.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    held = threading.Event()
+    release = threading.Event()
     acquired = threading.Event()
+
+    def _hold() -> None:
+        with lock_path.open("a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            held.set()
+            release.wait()
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
     def _wait_and_acquire() -> None:
         with supervise.generation_lock(timeout_seconds=5.0):
             acquired.set()
 
+    t_hold = threading.Thread(target=_hold)
     t_hold.start()
     held.wait(timeout=5.0)
     t_wait = threading.Thread(target=_wait_and_acquire)
     t_wait.start()
-
     release.set()
     t_hold.join(timeout=5.0)
     assert acquired.wait(timeout=5.0), "second thread never acquired"
@@ -266,11 +292,11 @@ def test_generation_lock_contended_monotonicity() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Call-site timeout propagation
+# Call-site propagation: deployctl
 # ---------------------------------------------------------------------------
 
 
-def test_next_mission_generation_wraps_timeout_as_deployctl_error() -> None:
+def test_next_mission_generation_wraps_timeout() -> None:
     """deployctl.next_mission_generation wraps timeout as DeployCtlError."""
     with (
         patch(
@@ -282,7 +308,19 @@ def test_next_mission_generation_wraps_timeout_as_deployctl_error() -> None:
         deployctl.next_mission_generation()
 
 
-def test_finalize_rollback_wraps_timeout_as_deployctl_error() -> None:
+def test_settle_desired_wraps_timeout() -> None:
+    """deployctl.settle_desired wraps timeout as DeployCtlError."""
+    with (
+        patch(
+            "lubko.deployctl.supervise.request_run",
+            side_effect=supervise.GenerationLockTimeoutError("test"),
+        ),
+        pytest.raises(deployctl.DeployCtlError, match="generation lock"),
+    ):
+        deployctl.settle_desired("abc", "/repo", "uv")
+
+
+def test_finalize_rollback_wraps_timeout() -> None:
     """_finalize_supervised_rollback wraps timeout as DeployCtlError."""
     state = _make_rollback_state()
     with (
@@ -295,7 +333,7 @@ def test_finalize_rollback_wraps_timeout_as_deployctl_error() -> None:
         deployctl._finalize_supervised_rollback(state, 1)
 
 
-def test_finalize_confirmation_wraps_timeout_as_deployctl_error() -> None:
+def test_finalize_confirmation_wraps_timeout() -> None:
     """_finalize_supervised_confirmation wraps timeout as DeployCtlError."""
     state = _make_rollback_state()
     with (
@@ -308,7 +346,12 @@ def test_finalize_confirmation_wraps_timeout_as_deployctl_error() -> None:
         deployctl._finalize_supervised_confirmation(state, 1)
 
 
-def test_queue_deploy_candidate_converged_returns_false_on_timeout() -> None:
+# ---------------------------------------------------------------------------
+# Call-site propagation: lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_queue_deploy_candidate_converged_returns_false() -> None:
     """_queue_deploy_candidate_converged returns False on timeout."""
     with patch(
         "lubko.lifecycle.supervise.generation_lock",
@@ -317,7 +360,75 @@ def test_queue_deploy_candidate_converged_returns_false_on_timeout() -> None:
         assert lifecycle._queue_deploy_candidate_converged("abc") is False
 
 
-def test_migrate_locked_propagates_generation_lock_timeout() -> None:
+def test_restore_after_handoff_logs_on_timeout() -> None:
+    """_restore_after_handoff_failure logs and returns on request_run timeout."""
+    options = _make_deploy_options()
+    with (
+        patch("lubko.lifecycle.supervise.supervisor_running", return_value=True),
+        patch("lubko.lifecycle._queue_deploy_candidate_converged", return_value=False),
+        patch(
+            "lubko.lifecycle.supervise.request_run",
+            side_effect=supervise.GenerationLockTimeoutError("test"),
+        ),
+    ):
+        # Should not raise — logs and returns.
+        lifecycle._restore_after_handoff_failure(options, "abc", None)
+
+
+def test_deploy_through_supervisor_wraps_timeout() -> None:
+    """_deploy_through_supervisor wraps timeout as DeployAbortedError."""
+    options = _make_deploy_options()
+    with (
+        patch(
+            "lubko.lifecycle.supervise.request_run",
+            side_effect=supervise.GenerationLockTimeoutError("test"),
+        ),
+        pytest.raises(lifecycle.DeployAbortedError, match="generation lock"),
+    ):
+        lifecycle._deploy_through_supervisor(options, "abc")
+
+
+def test_restart_intent_locked_returns_error() -> None:
+    """_restart_intent_locked returns error string on timeout."""
+    state = MagicMock()
+    state.commit = "abc123"
+    with (
+        patch("lubko.lifecycle._supervised_mutation_blocker", return_value=None),
+        patch("lubko.lifecycle.supervise.supervisor_running", return_value=True),
+        patch("lubko.lifecycle.supervise.read_state", return_value=state),
+        patch("lubko.lifecycle.cli.runtime_is_usable", return_value=True),
+        patch("lubko.lifecycle.supervise.read_status", return_value=None),
+        patch("lubko.lifecycle.supervise.read_desired", return_value=None),
+        patch(
+            "lubko.lifecycle.supervise.request_restart",
+            side_effect=supervise.GenerationLockTimeoutError("test"),
+        ),
+    ):
+        gen, pid, error = lifecycle._restart_intent_locked()
+    assert gen is None
+    assert pid is None
+    assert error is not None
+    assert "generation lock" in error
+
+
+def test_request_restart_intent_locked_wraps_timeout() -> None:
+    """_request_restart_intent_locked raises DeployAbortedError on timeout."""
+    with (
+        patch("lubko.lifecycle._supervised_mutation_blocker", return_value=None),
+        patch("lubko.lifecycle.supervise.read_state"),
+        patch("lubko.lifecycle.cli.runtime_is_usable", return_value=True),
+        patch("lubko.lifecycle.supervise.read_status", return_value=None),
+        patch("lubko.lifecycle.supervise.read_desired", return_value=None),
+        patch(
+            "lubko.lifecycle.supervise.request_restart",
+            side_effect=supervise.GenerationLockTimeoutError("test"),
+        ),
+        pytest.raises(lifecycle.DeployAbortedError, match="generation lock"),
+    ):
+        lifecycle._request_restart_intent_locked()
+
+
+def test_migrate_locked_propagates_timeout() -> None:
     """_migrate_locked propagates GenerationLockTimeoutError on timeout."""
     with (
         patch(

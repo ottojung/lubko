@@ -2076,7 +2076,7 @@ def _restore_after_handoff_failure(
             uv_path=options.uv_path,
             worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
         )
-    except OSError as exc:
+    except (OSError, GenerationLockTimeoutError) as exc:
         append_deploy_log(
             f"queue deploy failed after durable success and restoring the previous commit "
             f"errored: {exc}"
@@ -2250,12 +2250,16 @@ def _deploy_through_supervisor(options: DeployOptions, commit: str) -> WorkerMet
     """
     worker_id = os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
     _out("requesting the external supervisor to start the worker ...")
-    generation = supervise.request_run(
-        commit,
-        repo=str(options.repo),
-        uv_path=options.uv_path,
-        worker_id=worker_id,
-    )
+    try:
+        generation = supervise.request_run(
+            commit,
+            repo=str(options.repo),
+            uv_path=options.uv_path,
+            worker_id=worker_id,
+        )
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock to request worker start"
+        raise DeployAbortedError(msg) from exc
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         _err("the external supervisor did not apply the requested worker start")
         raise DeployAbortedError
@@ -2503,12 +2507,16 @@ def _complete_deploy_handoff(
     elif options.bootstrap or options.direct_spawn:
         new_meta = _deploy_direct(options, previous, state, commit)
         log_file = worker_log_path(new_meta.token)
-        supervise.request_run(
-            commit,
-            repo=str(options.repo),
-            uv_path=options.uv_path,
-            worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-        )
+        try:
+            supervise.request_run(
+                commit,
+                repo=str(options.repo),
+                uv_path=options.uv_path,
+                worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+            )
+        except GenerationLockTimeoutError as exc:
+            msg = "timed out waiting for the generation lock to record deploy intent"
+            raise DeployAbortedError(msg) from exc
         _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     else:
         _err(
@@ -4220,16 +4228,19 @@ def _restart_intent_locked() -> tuple[int | None, int | None, str | None]:
     )
     _out(f"requesting a supervised restart of confirmed commit {commit} ...")
     desired = supervise.read_desired()
-    generation = supervise.request_restart(
-        commit,
-        repo=desired.repo if desired is not None else "",
-        uv_path=desired.uv_path if desired is not None else "",
-        worker_id=(
-            desired.worker_id
-            if desired is not None
-            else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
-        ),
-    )
+    try:
+        generation = supervise.request_restart(
+            commit,
+            repo=desired.repo if desired is not None else "",
+            uv_path=desired.uv_path if desired is not None else "",
+            worker_id=(
+                desired.worker_id
+                if desired is not None
+                else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
+            ),
+        )
+    except GenerationLockTimeoutError:
+        return None, None, "timed out waiting for the generation lock to request restart"
     return generation, previous_pid, None
 
 
@@ -4515,16 +4526,20 @@ def _request_restart_intent_locked() -> tuple[int, int | None]:
         previous.child.pid if previous is not None and previous.child is not None else None
     )
     desired = supervise.read_desired()
-    generation = supervise.request_restart(
-        commit,
-        repo=desired.repo if desired is not None else "",
-        uv_path=desired.uv_path if desired is not None else "",
-        worker_id=(
-            desired.worker_id
-            if desired is not None
-            else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
-        ),
-    )
+    try:
+        generation = supervise.request_restart(
+            commit,
+            repo=desired.repo if desired is not None else "",
+            uv_path=desired.uv_path if desired is not None else "",
+            worker_id=(
+                desired.worker_id
+                if desired is not None
+                else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
+            ),
+        )
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock to request restart"
+        raise DeployAbortedError(msg) from exc
     return generation, previous_pid
 
 

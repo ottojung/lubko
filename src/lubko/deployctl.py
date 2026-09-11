@@ -790,12 +790,16 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
         # migration by publishing a newer ordinary settlement generation.
         generation = desired.generation
     else:
-        generation = supervise.request_run(
-            commit,
-            repo=repo,
-            uv_path=uv_path,
-            worker_id=worker_id,
-        )
+        try:
+            generation = supervise.request_run(
+                commit,
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id,
+            )
+        except GenerationLockTimeoutError as exc:
+            msg = "timed out waiting for the generation lock during settlement"
+            raise DeployCtlError(msg) from exc
     lifecycle_state.failpoint(lifecycle_state.FAILPOINT_MISSION_CONFIRM)
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         msg = "the external supervisor did not apply the requested target"
