@@ -523,3 +523,83 @@ def test_worker_loss_at_a_exit_is_recoverable_by_b(
     reloaded = supervise.read_state()
     assert reloaded.child is None
     assert reloaded.commit is None
+
+
+def test_handoff_env_preserved_through_adopt(
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Handoff protocol env vars survive _try_adopt_inherited_lock.
+
+    Regression: _try_adopt_inherited_lock() cleared HANDOFF_MODE_ENV
+    before _run_handoff_protocol() could read it, so B never entered
+    the READY/TRANSFER protocol and could reconcile while A was still
+    waiting for READY.
+    """
+    lock_path = supervise.supervisor_lock_path()
+    owner_fd = _acquire_and_hold(lock_path)
+    try:
+        os.set_inheritable(owner_fd, True)
+        monkeypatch.setenv(supervise.HANDOFF_FD_ENV, str(owner_fd))
+        monkeypatch.setenv(supervise.HANDOFF_PATH_ENV, str(lock_path))
+        monkeypatch.setenv(supervise.HANDOFF_PID_ENV, "1")
+        monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, "99")
+        monkeypatch.setenv(supervise.HANDOFF_TRANSFER_FD_ENV, "98")
+        monkeypatch.setenv(supervise.HANDOFF_MODE_ENV, "1")
+
+        daemon = SupervisorDaemon(Settings())
+        fd = daemon._try_adopt_inherited_lock()
+
+        assert fd == owner_fd
+
+        assert os.environ.get(supervise.HANDOFF_READY_FD_ENV) == "99"
+        assert os.environ.get(supervise.HANDOFF_TRANSFER_FD_ENV) == "98"
+        assert os.environ.get(supervise.HANDOFF_MODE_ENV) == "1"
+
+        assert os.environ.get(supervise.HANDOFF_FD_ENV) is None
+        assert os.environ.get(supervise.HANDOFF_PATH_ENV) is None
+        assert os.environ.get(supervise.HANDOFF_PID_ENV) is None
+    finally:
+        os.set_inheritable(owner_fd, False)
+        os.close(owner_fd)
+
+
+def test_ready_timeout_prevents_wedge(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bounded wait prevents a stuck B from wedging A.
+
+    If B never sends READY (pipe stays open but no data), A's
+    select-based timeout fires and A continues with its own authority.
+    """
+    commit_a = "a" * 40
+    commit_b = "b" * 40
+    daemon, owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
+
+    class _StuckProcess:
+        """Mock Popen that holds the readiness pipe open without writing."""
+
+        def __init__(self, args: list[str], **kwargs: object) -> None:
+            pass
+
+        def wait(self, timeout: float = 0.0) -> int:
+            return 1
+
+        def poll(self) -> int | None:
+            return None
+
+        def kill(self) -> None:
+            pass
+
+    monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _StuckProcess)
+    monkeypatch.setattr(
+        "lubko.supervisor.select.select",
+        lambda _r, _w, _x, _timeout: ([], [], []),
+    )
+
+    daemon._maybe_handoff_to_new_supervisor()
+
+    assert daemon._handoff_completed is False
+    assert daemon._ownership_fd == owner_fd
+
+    with pytest.raises(OSError, match="Resource temporarily unavailable"):
+        _acquire_and_hold(supervise.supervisor_lock_path())
+
+    assert "did not complete" in daemon._message  # type: ignore[operator]

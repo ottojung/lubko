@@ -90,6 +90,7 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
     "too-many-branches",
+    "too-many-locals",
     "too-many-return-statements",
     "too-many-statements",
     "too-many-statements-in-try-clause",

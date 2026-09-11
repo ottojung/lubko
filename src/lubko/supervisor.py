@@ -68,6 +68,7 @@ import logging
 import math
 import os
 import secrets
+import select
 import signal
 import socket
 import subprocess
@@ -3152,14 +3153,13 @@ class SupervisorDaemon:
                 handoff_pid,
             )
             raise SystemExit(1) from None
-        # Clear the handoff env vars so they are never consumed twice.
+        # Clear the lock-adoption env vars so they are never consumed twice.
+        # Preserve handoff protocol env vars (READY_FD, TRANSFER_FD, MODE)
+        # until _run_handoff_protocol() completes/aborts the protocol.
         for var in (
             supervise.HANDOFF_FD_ENV,
             supervise.HANDOFF_PATH_ENV,
             supervise.HANDOFF_PID_ENV,
-            supervise.HANDOFF_READY_FD_ENV,
-            supervise.HANDOFF_TRANSFER_FD_ENV,
-            supervise.HANDOFF_MODE_ENV,
         ):
             os.environ.pop(var, None)
         return adopted
@@ -3409,9 +3409,16 @@ class SupervisorDaemon:
         with suppress(OSError):
             os.close(ready_w)
         ready = False
+        deadline = time.monotonic() + self.settings.lock_timeout_seconds
         try:
             buf = b""
             while b"\n" not in buf:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readyfds, _, _ = select.select([ready_r], [], [], remaining)
+                if not readyfds:
+                    break
                 chunk = os.read(ready_r, 1)
                 if not chunk:
                     break
