@@ -41,8 +41,8 @@ from lubko._exact_signal import pidfd_send_signal
 from lubko._exact_signal import proc_cpu_seconds as _shared_proc_cpu_seconds
 from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko._exact_signal import process_state_char as _shared_process_state_char
+from lubko._process_group import group_has_members
 from lubko.durable import write_text_durable
-from lubko.worker import group_has_members
 
 if TYPE_CHECKING:
     from collections.abc import Callable

@@ -96,7 +96,7 @@ from psycopg.rows import tuple_row
 
 from lubko._exact_signal import open_pidfd as _shared_open_pidfd
 from lubko._exact_signal import pidfd_send_signal as _shared_pidfd_send_signal
-from lubko._exact_signal import process_pgrp as _shared_process_pgrp
+from lubko._process_group import _process_pgrp, group_has_members
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import (
     load_database_config,
@@ -2258,46 +2258,6 @@ def _persist_process(
             ),
         )
         return cursor.rowcount == 1
-
-
-def _process_pgrp(pid: int) -> int | None:
-    """Return the exact process group of a running process.
-
-    Args:
-        pid: Process ID to inspect.
-
-    Returns:
-        The process group ID, or ``None`` if the process is dead or unknown.
-    """
-    return _shared_process_pgrp(pid)
-
-
-def group_has_members(pgid: int) -> bool:
-    """Return whether any live process still belongs to the exact process group.
-
-    Uses the process table under ``/proc`` when available so membership is
-    matched by exact process group, never by process name. Falls back to
-    querying the kernel directly otherwise.
-
-    Args:
-        pgid: Process group identifier to inspect.
-
-    Returns:
-        ``True`` when at least one running process still belongs to the group.
-    """
-    proc_dir = Path("/proc")
-    if proc_dir.is_dir():
-        for entry in proc_dir.iterdir():
-            if not entry.name.isdigit():
-                continue
-            if _process_pgrp(int(entry.name)) == pgid:
-                return True
-        return False
-    try:
-        os.getpgid(pgid)
-    except ProcessLookupError:
-        return False
-    return True
 
 
 def drain_sentinel_dir() -> Path:
