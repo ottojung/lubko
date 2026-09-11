@@ -41,6 +41,7 @@ import fcntl
 import json
 import math
 import os
+import resource
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
@@ -51,7 +52,7 @@ from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
-from lubko.durable import write_json_durable
+from lubko.durable import remove_durable, write_json_durable
 from lubko.health import validate_incarnation_token
 from lubko.state import rollback_state_path, state_root
 
@@ -458,6 +459,13 @@ class SupervisorState:
     ready: bool
     next_readiness_at: float | None
     boot_id: str | None
+    #: The exact commit the supervisor daemon is executing from, captured once
+    #: at startup and never re-derived from ``cli/current_commit()``.  After
+    #: deployment B changes ``cli/current`` to B, this field still names A —
+    #: the actual code loaded by this supervisor process.  The reconcile loop
+    #: compares this against ``cli/current_commit()`` to detect when a
+    #: spawned two-phase handoff is needed.
+    supervisor_runtime_commit: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the daemon state for storage.
@@ -491,6 +499,11 @@ class SupervisorState:
             "ready": self.ready,
             "next_readiness_at": self.next_readiness_at,
             **({} if self.boot_id is None else {"boot_id": self.boot_id}),
+            **(
+                {}
+                if self.supervisor_runtime_commit is None
+                else {"supervisor_runtime_commit": self.supervisor_runtime_commit}
+            ),
         }
 
     @classmethod
@@ -571,6 +584,7 @@ class SupervisorState:
             ready=data.get("ready", False) is True,
             next_readiness_at=monotonic_timestamps[1][0],
             boot_id=boot_id,
+            supervisor_runtime_commit=_optional_string(data.get("supervisor_runtime_commit")),
         )
 
 
@@ -606,6 +620,15 @@ class SupervisorStatus:
     #: unresolved/spawning obligation).  Distinct from ``ready``: a held
     #: supervisor is alive but deliberately not serving a worker.
     holding: bool = False
+    #: The exact commit the supervisor daemon itself is executing from
+    #: (the confirmed ``cli/current`` runtime).  Separate from the worker
+    #: commit or the deployment commit: the supervisor's own immutable
+    #: runtime identity.
+    supervisor_runtime_commit: str | None = None
+    #: The startup contract schema version compiled into the running
+    #: supervisor daemon.  Used as a stability marker for cross-daemon
+    #: durable state transitions.
+    supervisor_runtime_contract_version: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -637,6 +660,8 @@ class SupervisorStatus:
             "message": self.message,
             "worker_health": self.worker_health,
             "holding": self.holding,
+            "supervisor_runtime_commit": self.supervisor_runtime_commit,
+            "supervisor_runtime_contract_version": self.supervisor_runtime_contract_version,
         }
 
     @classmethod
@@ -712,6 +737,12 @@ class SupervisorStatus:
             message=_parse_diagnostic_nullable_string(data, "message"),
             worker_health=worker_health,
             holding=_parse_diagnostic_bool(data, "holding"),
+            supervisor_runtime_commit=_parse_diagnostic_nullable_string(
+                data, "supervisor_runtime_commit"
+            ),
+            supervisor_runtime_contract_version=_parse_diagnostic_nullable_int(
+                data, "supervisor_runtime_contract_version"
+            ),
         )
 
 
@@ -776,6 +807,10 @@ class SupervisorDiagnostic:
     spawning_present: bool
     last_exit: LastExit | None
     message: str | None
+    #: The exact commit the supervisor daemon itself is executing from.
+    supervisor_runtime_commit: str | None = None
+    #: The startup contract schema version compiled into the running supervisor.
+    supervisor_runtime_contract_version: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the durable diagnostic for operators.
@@ -807,6 +842,8 @@ class SupervisorDiagnostic:
             if self.last_exit is None
             else {"returncode": self.last_exit.returncode, "at": self.last_exit.at},
             "message": self.message,
+            "supervisor_runtime_commit": self.supervisor_runtime_commit,
+            "supervisor_runtime_contract_version": self.supervisor_runtime_contract_version,
         }
 
     @classmethod
@@ -850,6 +887,12 @@ class SupervisorDiagnostic:
             spawning_present=_parse_diagnostic_bool(data, "spawning_present"),
             last_exit=_parse_last_exit(data),
             message=_parse_diagnostic_nullable_string(data, "message"),
+            supervisor_runtime_commit=_parse_diagnostic_nullable_string(
+                data, "supervisor_runtime_commit"
+            ),
+            supervisor_runtime_contract_version=_parse_diagnostic_nullable_int(
+                data, "supervisor_runtime_contract_version"
+            ),
         )
 
 
@@ -893,6 +936,8 @@ def derive_durable_diagnostic() -> SupervisorDiagnostic:
         spawning_present=state.spawning is not None,
         last_exit=state.last_exit,
         message=None,
+        supervisor_runtime_commit=state.supervisor_runtime_commit,
+        supervisor_runtime_contract_version=None,
     )
 
 
@@ -950,7 +995,13 @@ class ConsumerLockTimeoutError(Exception):
     """The consumer-establishment lock could not be acquired in time."""
 
 
+class GenerationLockTimeoutError(Exception):
+    """The generation lock could not be acquired in time."""
+
+
 CONSUMER_LOCK_POLL_SECONDS = 0.05
+GENERATION_LOCK_POLL_SECONDS = 0.05
+DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS = 30.0
 
 
 @contextmanager
@@ -1026,7 +1077,9 @@ def clear_migration_flag(generation: int) -> bool:
 
 
 @contextmanager
-def generation_lock() -> Iterator[None]:
+def generation_lock(
+    timeout_seconds: float = DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
     """Serialize generation allocation and desired-intent writes.
 
     The generation space is shared by the supervisor applied state, the
@@ -1035,13 +1088,28 @@ def generation_lock() -> Iterator[None]:
     never observe or reuse an equal, reordered, or already-applied generation.
     Lock ordering is always deployment lock first, then this generation lock.
 
+    Args:
+        timeout_seconds: Maximum seconds to wait for the lock.
+
     Yields:
         Nothing while the lock is held.
+
+    Raises:
+        GenerationLockTimeoutError: If the lock cannot be acquired in time.
     """
     path = supervisor_dir() / ".generation.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    msg = "timed out waiting for the generation lock"
+                    raise GenerationLockTimeoutError(msg) from None
+                time.sleep(GENERATION_LOCK_POLL_SECONDS)
         try:
             yield
         finally:
@@ -1089,6 +1157,96 @@ def acquire_supervisor_lock() -> int:
         os.close(fd)
         raise
     return fd
+
+
+# ---------------------------------------------------------------------------
+# Lock-adoption protocol for spawned two-phase supervisor handoff
+# ---------------------------------------------------------------------------
+
+#: Environment variable carrying the inherited lock file descriptor number
+#: during a spawned two-phase supervisor handoff.  Set immediately before
+#: ``subprocess.Popen`` and consumed exactly once at startup.
+HANDOFF_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_FD"
+#: Environment variable carrying the expected lock file path for validation
+#: during adoption.  The new supervisor verifies this matches the path it
+#: would open, preventing injection of an fd pointing at an unrelated file.
+HANDOFF_PATH_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PATH"
+#: Environment variable carrying the PID of the handing-off supervisor for
+#: diagnostic logging only (not security-critical).
+HANDOFF_PID_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PID"
+#: Environment variable carrying the readiness pipe read-end fd number.
+#: The successor writes ``R\\n`` to this pipe after initializing, and the
+#: old supervisor reads from it to confirm the successor is ready.
+HANDOFF_READY_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_READY_FD"
+#: Environment variable carrying the transfer pipe write-end fd number.
+#: The old supervisor writes ``T\\n`` to this pipe to authorize the
+#: successor to become the active lifecycle authority.
+HANDOFF_TRANSFER_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_TRANSFER_FD"
+#: Environment variable signalling that the successor must run in handoff
+#: preparation mode: initialize, signal readiness, wait for transfer, then
+#: enter the normal reconcile loop.  Absent in normal startup.
+HANDOFF_MODE_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_MODE"
+
+
+def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:
+    """Adopt an inherited lock file descriptor from a handing-off supervisor.
+
+    The fd was opened and flock-held by the previous supervisor, made
+    inheritable by the spawning parent, and passed via an environment
+    variable.  This function validates the inherited fd without opening or
+    flocking a second descriptor — the lock is already held on the inherited
+    fd.
+
+    Validation:
+    - ``fd_number`` must be a non-negative integer within the process's
+      open-fd limit (``resource.getrlimit(RLIMIT_NOFILE)``);
+    - the fd must refer to a real, open file (``os.fstat`` must succeed);
+    - the fd's path (``Path(f"/proc/self/fd/{fd_number}").readlink()``)
+      must match ``expected_path`` exactly, preventing injection of an fd
+      pointing at an unrelated file.
+
+    The flock state itself cannot be reliably validated after spawn: the
+    kernel does not expose which process holds an advisory flock, and a
+    non-blocking ``flock(LOCK_NB)`` on an unlocked fd succeeds (it acquires
+    the lock).  The security boundary is therefore the environment variable
+    chain: only the old supervisor (which holds the lock) sets these env
+    vars immediately before spawning the successor.
+
+    Args:
+        fd_number: The inherited file descriptor number.
+        expected_path: The expected lock file path for validation.
+
+    Returns:
+        The validated, adopted file descriptor.
+
+    Raises:
+        OSError: If validation fails (fd not open, wrong path, or fd number
+            out of range).  The caller must continue with the old authority.
+    """
+    soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if fd_number < 0 or fd_number >= soft_limit:
+        msg = f"inherited handoff fd {fd_number} is outside the open-fd limit {soft_limit}"
+        raise OSError(msg)
+    try:
+        stat_result = os.fstat(fd_number)
+    except OSError as exc:
+        msg = f"inherited handoff fd {fd_number} is not open: {exc}"
+        raise OSError(msg) from exc
+    if not stat_result.st_mode:
+        msg = f"inherited handoff fd {fd_number} has invalid mode"
+        raise OSError(msg)
+    try:
+        actual_path = str(Path(f"/proc/self/fd/{fd_number}").readlink())
+    except OSError as exc:
+        msg = f"could not read path of inherited handoff fd {fd_number}: {exc}"
+        raise OSError(msg) from exc
+    if actual_path != expected_path:
+        msg = (
+            f"inherited handoff fd {fd_number} points to {actual_path!r}, "
+            f"expected {expected_path!r}"
+        )
+        raise OSError(msg)
+    return fd_number
 
 
 # ---------------------------------------------------------------------------
@@ -1362,6 +1520,7 @@ def fresh_state() -> SupervisorState:
         ready=False,
         next_readiness_at=None,
         boot_id=None,
+        supervisor_runtime_commit=None,
     )
 
 
@@ -1518,6 +1677,55 @@ def read_supervisor_pid() -> tuple[int, int] | None:
     if schema_version != SCHEMA_VERSION or pid is None or pid <= 0 or ticks is None:
         raise MalformedSupervisorIdentityError
     return pid, ticks
+
+
+class PidfileIdentityMismatchError(Exception):
+    """The recorded pidfile identity does not match the expected caller."""
+
+
+def retire_supervisor_pid() -> tuple[int, int]:
+    """Remove the supervisor pidfile only if it names the calling process.
+
+    Called by A before sending TRANSFER: the pidfile is removed while A still
+    holds the flock so B never sees A's pid and rejects it as a live daemon.
+
+    Returns:
+        The ``(pid, start_time_ticks)`` that were removed, for potential
+        restoration if the transfer fails.
+
+    Raises:
+        PidfileIdentityMismatchError: If the pidfile is absent, malformed,
+            or names a different process (fail closed — never delete another
+            authority's identity).
+    """
+    recorded = read_supervisor_pid()
+    if recorded is None:
+        msg = "pidfile is absent; cannot retire"
+        raise PidfileIdentityMismatchError(msg)
+    pid, ticks = recorded
+    my_pid = os.getpid()
+    my_ticks = _shared_proc_start_ticks(my_pid) or 0
+    if pid != my_pid or ticks != my_ticks:
+        msg = (
+            f"pidfile names pid={pid} ticks={ticks} but caller is "
+            f"pid={my_pid} ticks={my_ticks}; refusing to retire"
+        )
+        raise PidfileIdentityMismatchError(msg)
+    remove_durable(supervisor_pid_path())
+    return pid, ticks
+
+
+def restore_supervisor_pid(pid: int, start_time_ticks: int) -> None:
+    """Restore a previously retired supervisor pidfile.
+
+    Called by A when the TRANSFER write fails: the exact identity that was
+    removed is written back so A remains discoverable by CLIs.
+
+    Args:
+        pid: The daemon's process ID.
+        start_time_ticks: The daemon's start time in clock ticks.
+    """
+    write_supervisor_pid(pid, start_time_ticks)
 
 
 # ---------------------------------------------------------------------------
@@ -2254,6 +2462,33 @@ def _parse_diagnostic_nullable_float(data: dict[str, object], key: str) -> float
         msg = "supervisor diagnostic is malformed"
         raise ValueError(msg)
     return value
+
+
+def _parse_diagnostic_nullable_int(data: dict[str, object], key: str) -> int | None:
+    """Parse a nullable diagnostic integer without truthiness coercion.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        The exact non-negative JSON integer, or ``None`` for absence or
+        explicit null.
+
+    Raises:
+        TypeError: If a present non-null value is not an integer or is a boolean.
+        ValueError: If a present integer is negative.
+    """
+    if key not in data or data[key] is None:
+        return None
+    raw = data[key]
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    if raw < 0:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return raw
 
 
 def _parse_diagnostic_string(
