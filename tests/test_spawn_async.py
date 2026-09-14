@@ -711,9 +711,9 @@ class _RacingExecutor(_SpawnExecutor):
     """
 
     def __init__(self, **kw: object) -> None:
-        super().__init__(**kw)  # type: ignore[arg-type]
         self._claim_pause = threading.Event()
         self._claim_resume = threading.Event()
+        super().__init__(**kw)  # type: ignore[arg-type]
 
     @override
     def _worker_loop(self) -> None:
