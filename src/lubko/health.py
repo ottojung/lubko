@@ -1336,11 +1336,19 @@ def worker_health_payload(
         A JSON-serialisable mapping, or ``None`` when absent.
     """
     effective = interpret_worker_health(snapshot, max_staleness_seconds=max_staleness_seconds)
+    overall_reason = effective.reason
+    if effective.operational.ready:
+        pass
+    elif effective.live:
+        overall_reason = effective.operational.reason
+    else:
+        overall_reason = effective.reason
     return {
         "snapshot": effective.snapshot.to_dict() if effective.snapshot is not None else None,
         "live": effective.live,
         "stale": effective.stale,
-        "reason": effective.reason,
+        "liveness_reason": effective.reason,
+        "overall_reason": overall_reason,
         "operational": effective.operational.to_dict(),
     }
 

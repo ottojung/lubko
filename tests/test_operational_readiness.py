@@ -431,13 +431,39 @@ def test_liveness_reason_never_mentions_operational() -> None:
 # ------------------------------------------------------------------
 
 
-def test_payload_includes_operational() -> None:
-    """worker_health_payload includes operational readiness in output."""
-    payload = worker_health_payload(_snapshot(cancellation_scan_overdue=True))
+def test_payload_includes_liveness_and_overall_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """worker_health_payload has liveness_reason and overall_reason."""
+    _monkey_liveness(monkeypatch)
+    payload = worker_health_payload(_live_snapshot())
     assert payload is not None
+    assert "liveness_reason" in payload
+    assert "overall_reason" in payload
     assert "operational" in payload
-    assert payload["operational"]["ready"] is False
-    assert payload["operational"]["cancellation_scan_overdue"] is True
+    assert payload["liveness_reason"] == "ok"
+    assert payload["overall_reason"] == "ok"
+
+
+def test_degraded_payload_exposes_unqualified_reason_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Degraded operational status cannot produce overall_reason='ok'."""
+    _monkey_liveness(monkeypatch)
+    payload = worker_health_payload(_live_snapshot(cancellation_scan_overdue=True))
+    assert payload is not None
+    assert payload["overall_reason"] != "ok"
+    assert "cancellation" in payload["overall_reason"]
+    # liveness_reason is still ok because the process is live
+    assert payload["liveness_reason"] == "ok"
+
+
+def test_dead_snapshot_degraded_payload() -> None:
+    """Stale/dead snapshot => overall_reason is the liveness failure, not 'ok'."""
+    payload = worker_health_payload(_snapshot(published_at=0.0))
+    assert payload is not None
+    assert payload["overall_reason"] != "ok"
+    assert payload["liveness_reason"] != "ok"
 
 
 def test_operational_readiness_round_trips() -> None:
