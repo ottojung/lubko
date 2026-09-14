@@ -2,7 +2,7 @@
 
 The worker supervisor must never synchronously call ``spawn_job``/``subprocess.Popen``
 in the tick loop because that seam can block forever.  Each spawn attempt runs in
-its own daemon thread; the main loop polls completed attempts each tick, enforces a
+a bounded daemon pool; the main loop polls completed futures each tick, enforces a
 bounded start deadline, and fails the DB row on timeout.  One permanently blocked
 start must never consume the only start lane: later queue work must still progress.
 """
@@ -17,11 +17,13 @@ from uuid import uuid4
 
 from lubko.config import DatabaseConfig
 from lubko.worker import (
+    NUM_START_LANES,
     ActiveJob,
     OutputStream,
     Settings,
     Supervisor,
-    _SpawnResult,
+    _spawn_result_from_tuple,
+    _SpawnFuture,
     _StartAttempt,
 )
 
@@ -31,9 +33,8 @@ if TYPE_CHECKING:
 
     import pytest
 
-    from lubko.worker import JobsConnection
+    from lubko.worker import JobsConnection, _SpawnTuple
 
-_COMMIT = "a" * 40
 _ANON_DIR = "/var/empty"
 
 
@@ -106,17 +107,15 @@ class _BlockingSpawn:
     """Callable that blocks its caller forever until released.
 
     Used to simulate ``spawn_job``/``subprocess.Popen`` blocking forever in
-    a daemon thread.  When released, returns a valid spawn tuple so the
-    reaper thread can abort/reap it.
+    a daemon worker thread.  When released, returns a valid spawn tuple so the
+    callback can abort/reap it.
     """
 
     def __init__(self) -> None:
         self._gate = threading.Event()
         self._start_count = 0
 
-    def __call__(
-        self, *_args: object, **_kwargs: object
-    ) -> tuple[MagicMock, MagicMock, MagicMock, int, int, int, int]:
+    def __call__(self, *_args: object, **_kwargs: object) -> _SpawnTuple:
         self._start_count += 1
         self._gate.wait()
         fake_proc = MagicMock()
@@ -139,10 +138,21 @@ class _BlockingSpawn:
         return self._start_count
 
 
+def _completed_future(result: _SpawnTuple) -> _SpawnFuture:
+    """Build a _SpawnFuture with the result already set.
+
+    Returns:
+        A _SpawnFuture with the result already set.
+    """
+    f = _SpawnFuture(callback=None)
+    f.set_result(_spawn_result_from_tuple(result))
+    return f
+
+
 def test_blocked_spawn_does_not_starve_unrelated_active_jobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A forever-blocked spawn_job in one attempt must not prevent heartbeat/stop of active jobs."""
+    """A forever-blocked spawn_job must not prevent heartbeat/stop of active jobs."""
     blocker = _BlockingSpawn()
     supervisor = _supervisor(_settings(spawn_deadline_seconds=300.0))
     job = _active_job()
@@ -166,11 +176,13 @@ def test_blocked_spawn_does_not_starve_unrelated_active_jobs(
 
     supervisor._tick(time.monotonic())
 
+    time.sleep(0.05)
+
     assert "svc" in calls, "_service_processes was called"
     assert "drain" in calls, "_drain_captures was called"
     assert "spool" in calls, "_enforce_spool_bounds was called"
     assert len(supervisor._pending_starts) == 1, "one spawn attempt is pending"
-    assert blocker.start_count == 1, "spawn_job was called once in a thread"
+    assert blocker.start_count == 1, "spawn_job was called once in the pool"
 
 
 def test_spawn_deadline_fails_row_within_bounded_time(
@@ -179,7 +191,7 @@ def test_spawn_deadline_fails_row_within_bounded_time(
     """A timed-out spawn attempt's DB row is failed within the configured deadline."""
     blocker = _BlockingSpawn()
     job_id = uuid4()
-    supervisor = _supervisor(_settings(spawn_deadline_seconds=0.05))
+    supervisor = _supervisor(_settings(spawn_deadline_seconds=0.01))
 
     finalized: list[tuple[UUID, str]] = []
 
@@ -200,7 +212,7 @@ def test_spawn_deadline_fails_row_within_bounded_time(
     supervisor._tick(time.monotonic())
     assert len(supervisor._pending_starts) == 1
 
-    time.sleep(0.1)
+    time.sleep(0.05)
     supervisor._poll_pending_starts(time.monotonic())
 
     assert len(finalized) == 1, "the timed-out row was finalized"
@@ -211,10 +223,10 @@ def test_spawn_deadline_fails_row_within_bounded_time(
 def test_late_spawn_completion_aborted_without_executing_user_code(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If a blocked thread returns GatedSpawn after timeout, it is aborted/reaped fail-closed."""
+    """If a blocked worker returns GatedSpawn after timeout, it is aborted/reaped."""
     blocker = _BlockingSpawn()
     job_id = uuid4()
-    supervisor = _supervisor(_settings(spawn_deadline_seconds=0.05))
+    supervisor = _supervisor(_settings(spawn_deadline_seconds=0.01))
 
     finalized: list[UUID] = []
     aborted: list[UUID] = []
@@ -240,12 +252,12 @@ def test_late_spawn_completion_aborted_without_executing_user_code(
     supervisor._tick(time.monotonic())
     assert len(supervisor._pending_starts) == 1
 
-    time.sleep(0.1)
+    time.sleep(0.05)
     supervisor._poll_pending_starts(time.monotonic())
     assert len(finalized) == 1, "the row was failed"
 
     blocker.release()
-    time.sleep(0.2)
+    time.sleep(0.1)
 
     assert len(aborted) >= 1, "the late GatedSpawn was aborted"
     assert blocker.start_count == 1
@@ -285,7 +297,9 @@ def test_later_job_progresses_past_blocked_start(
     assert len(supervisor._pending_starts) == 2
     assert job2_id in supervisor._pending_starts
 
-    assert blocker.start_count == 2, "both spawns ran in separate threads"
+    time.sleep(0.05)
+
+    assert blocker.start_count == 2, "both spawns ran in separate pool threads"
 
 
 def test_cleanup_pending_starts_does_not_join_blocked_threads(
@@ -332,15 +346,14 @@ def test_poll_pending_starts_activates_completed_attempt(
 
     fake_proc = MagicMock()
     fake_proc.pid = 12345
-
-    result = _SpawnResult(
-        proc=fake_proc,
-        stdout_path=tmp_path / "stdout",
-        stderr_path=tmp_path / "stderr",
-        pgid=12345,
-        gate_fd=99,
-        stdout_read_fd=-1,
-        stderr_read_fd=-1,
+    spawn_tuple: _SpawnTuple = (
+        fake_proc,
+        tmp_path / "stdout",
+        tmp_path / "stderr",
+        12345,
+        99,
+        -1,
+        -1,
     )
 
     activated: list[UUID] = []
@@ -361,8 +374,7 @@ def test_poll_pending_starts_activates_completed_attempt(
         claim_mono=time.monotonic(),
         version=1,
         submitted_at=time.monotonic(),
-        thread=threading.Thread(target=lambda: None, daemon=True),
-        result=result,
+        future=_completed_future(spawn_tuple),
     )
     supervisor._pending_starts[job_id] = attempt
 
@@ -370,6 +382,57 @@ def test_poll_pending_starts_activates_completed_attempt(
 
     assert len(activated) == 1, "the attempt was activated"
     assert job_id in supervisor.active, "the job is now active"
+
+
+def test_repeated_blocked_starts_cannot_grow_threads_without_bound() -> None:
+    """Repeated blocked spawn attempts are bounded by the thread pool size.
+
+    The pool has ``NUM_START_LANES`` daemon worker threads.  Submitting
+    more blocking attempts than pool workers must NOT create additional
+    threads: the excess attempts queue inside the pool.  This proves the
+    bounded resource model.
+    """
+    blocker = _BlockingSpawn()
+    supervisor = _supervisor(_settings(spawn_deadline_seconds=300.0))
+
+    pool_threads_before = len(supervisor._spawn_pool._threads)
+
+    num_attempts = NUM_START_LANES * 3
+    for _ in range(num_attempts):
+        future = _SpawnFuture(callback=None)
+        jid = uuid4()
+        supervisor._spawn_pool.submit(jid, blocker, future)
+        supervisor._pending_starts[jid] = _StartAttempt(
+            job_id=jid,
+            job_spec=MagicMock(id=jid, cwd=_ANON_DIR, process=("/bin/true",)),
+            claim_mono=time.monotonic(),
+            version=1,
+            submitted_at=time.monotonic(),
+            future=future,
+        )
+
+    time.sleep(0.05)
+    pool_threads_after = len(supervisor._spawn_pool._threads)
+
+    assert pool_threads_before <= NUM_START_LANES
+    assert pool_threads_after <= NUM_START_LANES, (
+        f"pool has {pool_threads_after} threads but NUM_START_LANES={NUM_START_LANES}"
+    )
+    assert len(supervisor._pending_starts) == num_attempts
+    assert blocker.start_count == NUM_START_LANES
+
+
+def test_spawn_result_from_tuple_roundtrip() -> None:
+    """_spawn_result_from_tuple correctly wraps a spawn_job return tuple."""
+    fake_proc = MagicMock()
+    fake_proc.pid = 42
+    t: _SpawnTuple = (fake_proc, MagicMock(), MagicMock(), 42, 7, 8, 9)
+    result = _spawn_result_from_tuple(t)
+    assert result.proc is fake_proc
+    assert result.pgid == 42
+    assert result.gate_fd == 7
+    assert result.stdout_read_fd == 8
+    assert result.stderr_read_fd == 9
 
 
 # ---------------------------------------------------------------------------
