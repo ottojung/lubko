@@ -771,6 +771,9 @@ class _SpawnFuture:
     result and, if a callback was installed, invokes it immediately.  This
     eliminates the race where timeout observes ``done()=False``, then the
     worker completes before the callback is installed.
+
+    All callback invocations happen **outside** the lock so callbacks may
+    freely call ``result()`` or ``done()`` without self-deadlock.
     """
 
     __slots__ = ("_callback", "_done", "_lock", "_result")
@@ -795,10 +798,10 @@ class _SpawnFuture:
         """Install a late-completion callback atomically with completion.
 
         If the result is already present, the callback is invoked
-        immediately (in the calling thread) and ``True`` is returned so
-        the caller knows no further cleanup is needed.  If the result is
-        not yet present, the callback is stored for later invocation by
-        the worker thread and ``False`` is returned.
+        immediately (in the calling thread, outside the lock) and ``True``
+        is returned so the caller knows no further cleanup is needed.  If
+        the result is not yet present, the callback is stored for later
+        invocation by the worker thread and ``False`` is returned.
 
         Args:
             cb: Callback to invoke with this future when the result is a
@@ -808,12 +811,16 @@ class _SpawnFuture:
             ``True`` when the callback was invoked immediately (future was
             already done); ``False`` when it was stored for later.
         """
+        invoke: Callable[..., None] | None = None
         with self._lock:
             if self._done:
-                cb(self)
-                return True
-            self._callback = cb
-            return False
+                invoke = cb
+            else:
+                self._callback = cb
+        if invoke is not None:
+            invoke(self)
+            return True
+        return False
 
     def done(self) -> bool:
         with self._lock:

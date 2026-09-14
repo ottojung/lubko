@@ -510,6 +510,70 @@ def test_install_callback_already_done_invokes_immediately() -> None:
     assert invoked == ["cb"]
 
 
+def test_install_callback_result_reading_callback_does_not_deadlock() -> None:
+    """A callback that calls future.result() (production shape) does not self-deadlock.
+
+    Regression: install_callback invoked cb(self) while holding the
+    non-reentrant lock when already done; the production late-completion
+    callback immediately calls future.result(), causing self-deadlock.
+    The callback must be invoked outside the lock.
+    """
+    future = _SpawnFuture(callback=None)
+    fake_proc = MagicMock()
+    fake_proc.pid = 1
+    result = _SpawnResult(
+        proc=fake_proc,
+        stdout_path=MagicMock(),
+        stderr_path=MagicMock(),
+        pgid=1,
+        gate_fd=-1,
+        stdout_read_fd=-1,
+        stderr_read_fd=-1,
+    )
+    future.set_result(result)
+
+    read_result: list[object] = []
+
+    def production_callback(f: _SpawnFuture) -> None:
+        """Simulates the real late-completion callback that reads result()."""
+        r = f.result()
+        read_result.append(r)
+
+    was_already_done = future.install_callback(production_callback)
+    assert was_already_done is True
+    assert len(read_result) == 1
+    assert read_result[0] is result
+
+
+def test_set_result_result_reading_callback_does_not_deadlock() -> None:
+    """set_result invoking a callback that calls result() does not self-deadlock."""
+    future = _SpawnFuture(callback=None)
+
+    read_result: list[object] = []
+
+    def production_callback(f: _SpawnFuture) -> None:
+        r = f.result()
+        read_result.append(r)
+
+    future.install_callback(production_callback)
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 1
+    result = _SpawnResult(
+        proc=fake_proc,
+        stdout_path=MagicMock(),
+        stderr_path=MagicMock(),
+        pgid=1,
+        gate_fd=-1,
+        stdout_read_fd=-1,
+        stderr_read_fd=-1,
+    )
+    future.set_result(result)
+
+    assert len(read_result) == 1
+    assert read_result[0] is result
+
+
 def test_shutdown_drains_queue_and_cancels_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
