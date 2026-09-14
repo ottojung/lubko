@@ -398,6 +398,7 @@ DEFAULT_GC_INTERVAL_SECONDS: Final = 60.0
 DEFAULT_GC_BATCH_LIMIT: Final = 100
 DEFAULT_SPAWN_DEADLINE_SECONDS: Final = 30.0
 NUM_START_LANES: Final = 4
+SPAWN_LANE_QUEUE_SIZE: Final = NUM_START_LANES
 # Configurable safe bound on the per-job local stdout/stderr disk spool.  The
 # on-disk capture files are trimmed to the rolling live tail after every
 # publication, so a job's steady-state spool stays near OUTPUT_TAIL_MAX_BYTES
@@ -835,21 +836,39 @@ class _SpawnExecutor:
     """Bounded pool of daemon worker threads that run ``spawn_job`` off the main loop.
 
     Exactly ``NUM_START_LANES`` daemon threads run a loop that picks
-    ``(job_id, fn, future)`` triples from a work queue.  Each thread calls
-    ``fn()`` (which is ``spawn_job``) and stores the result in the
-    ``_SpawnFuture``.  Because every thread is daemon, they die with the
-    process and never hang shutdown.  Because the pool size is fixed, the
-    total number of live threads is bounded to ``NUM_START_LANES``.  One
-    permanently blocked ``spawn_job``/``Popen`` can never grow the thread
-    count without bound; later queue work still progresses through the
-    remaining unblocked lanes.
+    ``(job_id, fn, future)`` triples from a bounded work queue.  Each
+    thread calls ``fn()`` (which is ``spawn_job``) and stores the result
+    in the ``_SpawnFuture``.  Because every thread is daemon, they die
+    with the process and never hang shutdown.  Because the pool size is
+    fixed, the total number of live threads is bounded to
+    ``NUM_START_LANES``.  One permanently blocked ``spawn_job``/``Popen``
+    can never grow the thread count without bound; later queue work still
+    progresses through the remaining unblocked lanes.
 
-    ``shutdown()`` sets a flag, drains the queue, and cancels every pending
-    ``_SpawnFuture`` so stale queued starts never invoke ``spawn_job``.
+    The work queue is bounded to ``SPAWN_LANE_QUEUE_SIZE`` items.  When
+    every lane is busy and the queue is full, ``submit`` raises
+    ``queue.Full`` so the caller can fail the job immediately.  This
+    prevents unbounded stale work accumulation: at most
+    ``NUM_START_LANES + SPAWN_LANE_QUEUE_SIZE`` spawn attempts can be
+    admitted before rejection kicks in.
+
+    Timed-out attempts whose futures are marked done before a worker
+    picks them up are skipped without executing ``spawn_job``, so stale
+    callables never waste lane capacity.
+
+    ``shutdown()`` sets a flag, drains the queue, and delivers an
+    ``OSError`` to every pending future so stale queued starts never
+    invoke ``spawn_job``.
     """
 
-    def __init__(self, num_lanes: int = NUM_START_LANES) -> None:
-        self._queue: queue.Queue[tuple[UUID, Callable[..., object], _SpawnFuture]] = queue.Queue()
+    def __init__(
+        self,
+        num_lanes: int = NUM_START_LANES,
+        queue_size: int = SPAWN_LANE_QUEUE_SIZE,
+    ) -> None:
+        self._queue: queue.Queue[tuple[UUID, Callable[..., object], _SpawnFuture]] = queue.Queue(
+            maxsize=queue_size,
+        )
         self._threads: list[threading.Thread] = []
         self._shutdown = False
         for i in range(num_lanes):
@@ -870,6 +889,8 @@ class _SpawnExecutor:
             if self._shutdown:
                 future.set_result(OSError("spawn pool shut down"))
                 continue
+            if future.done():
+                continue
             try:
                 raw = fn()
             except BaseException as exc:  # ruff: ignore[blind-except] -- worker must not die
@@ -883,6 +904,9 @@ class _SpawnExecutor:
     def submit(self, job_id: UUID, fn: Callable[..., object], future: _SpawnFuture) -> None:
         """Submit a spawn function to a worker lane.
 
+        The caller should handle ``queue.Full`` when every lane is busy
+        and the waiting queue is at capacity, and fail the job immediately.
+
         Args:
             job_id: Identifier of the job being started.
             fn: Callable (typically ``spawn_job``) to run in the lane.
@@ -891,7 +915,7 @@ class _SpawnExecutor:
         if self._shutdown:
             future.set_result(OSError("spawn pool shut down"))
             return
-        self._queue.put((job_id, fn, future))
+        self._queue.put_nowait((job_id, fn, future))
 
     def shutdown(self) -> None:
         """Prevent new starts and drain stale queued work.
@@ -6087,7 +6111,24 @@ class Supervisor:
             submitted_at=time.monotonic(),
             future=future,
         )
-        self._spawn_pool.submit(claimed.id, lambda: spawn_job(job_spec), future)
+        try:
+            self._spawn_pool.submit(claimed.id, lambda: spawn_job(job_spec), future)
+        except queue.Full:
+            LOGGER.warning(
+                "spawn pool full for job %s; failing immediately",
+                claimed.id,
+            )
+            self._finalize_immediate(
+                claimed.id,
+                JobResult(
+                    status="failed",
+                    exit_code=EXECUTION_ERROR_EXIT_CODE,
+                    stdout="",
+                    stderr="spawn pool full; job not started",
+                    cancellation_note=None,
+                ),
+            )
+            return
         self._pending_starts[claimed.id] = attempt
         LOGGER.info("queued spawn attempt for job %s", claimed.id)
 

@@ -9,6 +9,7 @@ start must never consume the only start lane: later queue work must still progre
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from typing import TYPE_CHECKING, Any, cast
@@ -17,12 +18,12 @@ from uuid import uuid4
 
 from lubko.config import DatabaseConfig
 from lubko.worker import (
-    NUM_START_LANES,
     ActiveJob,
     OutputStream,
     Settings,
     Supervisor,
     _spawn_result_from_tuple,
+    _SpawnExecutor,
     _SpawnFuture,
     _SpawnResult,
     _StartAttempt,
@@ -386,41 +387,68 @@ def test_poll_pending_starts_activates_completed_attempt(
 
 
 def test_repeated_blocked_starts_cannot_grow_threads_without_bound() -> None:
-    """Repeated blocked spawn attempts are bounded by the thread pool size.
+    """Repeated blocked spawns are bounded by lane count; overflow is rejected.
 
-    The pool has ``NUM_START_LANES`` daemon worker threads.  Submitting
-    more blocking attempts than pool workers must NOT create additional
-    threads: the excess attempts queue inside the pool.  This proves the
-    bounded resource model.
+    The pool has ``NUM_START_LANES`` daemon worker threads and a queue of
+    ``SPAWN_LANE_QUEUE_SIZE`` slots.  Submitting more blocking attempts
+    than the combined lane+queue capacity must fail with ``queue.Full``
+    rather than grow threads without bound.  Every admitted spawn runs in
+    exactly one pool thread; rejected spawns never execute ``spawn_job``.
     """
     blocker = _BlockingSpawn()
-    supervisor = _supervisor(_settings(spawn_deadline_seconds=300.0))
+    lanes = 2
+    qsize = 2
+    pool = _SpawnExecutor(num_lanes=lanes, queue_size=qsize)
 
-    pool_threads_before = len(supervisor._spawn_pool._threads)
+    both_blocked = threading.Event()
+    block_lock = threading.Lock()
+    block_count = 0
 
-    num_attempts = NUM_START_LANES * 3
-    for _ in range(num_attempts):
+    def blocking_with_event() -> _SpawnTuple:
+        nonlocal block_count
+        with block_lock:
+            block_count += 1
+            if block_count == lanes:
+                both_blocked.set()
+        blocker._gate.wait()
+        fake_proc = MagicMock()
+        fake_proc.pid = 99999
+        return (fake_proc, MagicMock(), MagicMock(), 99999, -1, -1, -1)
+
+    pool_threads_before = len(pool._threads)
+    max_admitted = lanes + qsize
+
+    lane_admitted = 0
+    for _ in range(lanes):
+        future = _SpawnFuture(callback=None)
+        pool.submit(uuid4(), blocking_with_event, future)
+        lane_admitted += 1
+    both_blocked.wait(timeout=1.0)
+
+    queue_admitted = 0
+    queue_rejected = 0
+    for _ in range(max_admitted):
         future = _SpawnFuture(callback=None)
         jid = uuid4()
-        supervisor._spawn_pool.submit(jid, blocker, future)
-        supervisor._pending_starts[jid] = _StartAttempt(
-            job_id=jid,
-            job_spec=MagicMock(id=jid, cwd=_ANON_DIR, process=("/bin/true",)),
-            claim_mono=time.monotonic(),
-            version=1,
-            submitted_at=time.monotonic(),
-            future=future,
-        )
+        try:
+            pool.submit(jid, blocking_with_event, future)
+        except queue.Full:
+            queue_rejected += 1
+            future.set_result(OSError("spawn pool full"))
+        else:
+            queue_admitted += 1
 
-    time.sleep(0.05)
-    pool_threads_after = len(supervisor._spawn_pool._threads)
+    time.sleep(0.02)
+    pool_threads_after = len(pool._threads)
+    blocker.release()
+    pool.shutdown()
 
-    assert pool_threads_before <= NUM_START_LANES
-    assert pool_threads_after <= NUM_START_LANES, (
-        f"pool has {pool_threads_after} threads but NUM_START_LANES={NUM_START_LANES}"
+    assert pool_threads_before <= lanes
+    assert pool_threads_after <= lanes, (
+        f"pool has {pool_threads_after} threads but num_lanes={lanes}"
     )
-    assert len(supervisor._pending_starts) == num_attempts
-    assert blocker.start_count == NUM_START_LANES
+    assert lane_admitted + queue_admitted == max_admitted
+    assert queue_rejected == qsize
 
 
 def test_spawn_result_from_tuple_roundtrip() -> None:
@@ -572,6 +600,59 @@ def test_set_result_result_reading_callback_does_not_deadlock() -> None:
 
     assert len(read_result) == 1
     assert read_result[0] is result
+
+
+def test_timed_out_callable_skipped_without_execution() -> None:
+    """A future marked done before the worker dequeues it is skipped, not executed.
+
+    When ``_poll_pending_starts`` times out an attempt, the future is marked
+    done.  The worker thread must then skip the stale callable rather than
+    invoking ``spawn_job``, freeing the lane for fresh work.
+    """
+    pool = _SpawnExecutor(num_lanes=2, queue_size=2)
+    gate = threading.Event()
+    both_blocked = threading.Event()
+    block_lock = threading.Lock()
+    block_count = 0
+
+    def lane_spawn() -> _SpawnTuple:
+        nonlocal block_count
+        with block_lock:
+            block_count += 1
+            if block_count == 2:
+                both_blocked.set()
+        gate.wait()
+        fake_proc = MagicMock()
+        fake_proc.pid = 99999
+        return (fake_proc, MagicMock(), MagicMock(), 99999, -1, -1, -1)
+
+    for _ in range(2):
+        pool.submit(uuid4(), lane_spawn, _SpawnFuture(callback=None))
+
+    both_blocked.wait(timeout=1.0)
+
+    queue_executed = threading.Event()
+
+    def queue_spawn() -> _SpawnTuple:
+        queue_executed.set()
+        fake_proc = MagicMock()
+        fake_proc.pid = 88888
+        return (fake_proc, MagicMock(), MagicMock(), 88888, -1, -1, -1)
+
+    timed_out_future = _SpawnFuture(callback=None)
+    pool.submit(uuid4(), queue_spawn, timed_out_future)
+    pool.submit(uuid4(), queue_spawn, _SpawnFuture(callback=None))
+
+    timed_out_future.set_result(OSError("spawn timed out"))
+
+    gate.set()
+    queue_executed.wait(timeout=1.0)
+    time.sleep(0.02)
+
+    assert queue_executed.is_set(), "the non-timed-out queued callable ran"
+    assert timed_out_future.done()
+
+    pool.shutdown()
 
 
 def test_shutdown_drains_queue_and_cancels_pending(
