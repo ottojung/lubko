@@ -1725,7 +1725,11 @@ class SupervisorDaemon:
             inc, tok = snapshot.worker_incarnation, child.token
             return (False, f"snapshot incarnation {inc!r} != child token {tok!r}")
         eff = interpret_worker_health(snapshot)
-        return (True, "ok") if eff.live else (False, f"worker health not live: {eff.reason}")
+        if not eff.live:
+            return False, f"worker health not live: {eff.reason}"
+        if not eff.operational.ready:
+            return False, f"worker operational not ready: {eff.operational.reason}"
+        return True, "ok"
 
     def _record_not_ready(
         self,
