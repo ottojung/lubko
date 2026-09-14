@@ -775,23 +775,42 @@ class _SpawnFuture:
 
     All callback invocations happen **outside** the lock so callbacks may
     freely call ``result()`` or ``done()`` without self-deadlock.
+
+    ``cancel()`` marks the future as cancelled so the worker loop skips
+    the callable.  A cancelled future is ``done()``.  If an in-flight
+    spawn (already past the cancellation check) later publishes a result,
+    ``set_result`` still stores it and fires the callback so the late
+    physical completion is properly aborted/reaped.
     """
 
-    __slots__ = ("_callback", "_done", "_lock", "_result")
+    __slots__ = ("_callback", "_cancelled", "_done", "_executed", "_lock", "_result")
 
     def __init__(self, callback: Callable[..., None] | None) -> None:
         self._result: _SpawnResult | BaseException | None = None
         self._lock = threading.Lock()
         self._done = False
+        self._cancelled = False
+        self._executed = False
         self._callback: Callable[..., None] | None = callback
 
     def set_result(self, result: _SpawnResult | BaseException) -> None:
-        """Store the result and invoke the callback if one was installed."""
+        """Store the result and invoke the callback if one was installed.
+
+        If the future was cancelled **and** the worker never executed
+        (skipped via the cancellation check), the result is stored for
+        diagnostics but the callback is not invoked: the callable was
+        never run so there is no gated start to abort.
+
+        If the future was cancelled but the worker **did** execute (an
+        in-flight spawn that completed after timeout), the callback fires
+        so the late physical completion is properly aborted/reaped.
+        """
         cb: Callable[..., None] | None = None
         with self._lock:
             self._result = result
             self._done = True
-            cb = self._callback
+            if not self._cancelled or self._executed:
+                cb = self._callback
         if cb is not None and isinstance(result, _SpawnResult):
             cb(self)
 
@@ -830,6 +849,31 @@ class _SpawnFuture:
     def result(self) -> _SpawnResult | BaseException | None:
         with self._lock:
             return self._result
+
+    def cancel(self) -> None:
+        """Mark the future as cancelled so the worker loop skips the callable.
+
+        The future becomes ``done()``.  If an in-flight spawn later
+        publishes a result through ``set_result``, the callback still fires
+        so the late physical completion is properly aborted/reaped.
+        """
+        with self._lock:
+            self._cancelled = True
+            self._done = True
+
+    def cancelled(self) -> bool:
+        """Return whether the future was cancelled before the worker executed it."""
+        with self._lock:
+            return self._cancelled
+
+    def mark_executed(self) -> None:
+        """Mark that the worker passed the cancellation check and will call ``fn()``.
+
+        Must be called exactly once, after ``cancelled()`` returns ``False``
+        and before ``fn()`` is invoked.
+        """
+        with self._lock:
+            self._executed = True
 
 
 class _SpawnExecutor:
@@ -889,8 +933,9 @@ class _SpawnExecutor:
             if self._shutdown:
                 future.set_result(OSError("spawn pool shut down"))
                 continue
-            if future.done():
+            if future.cancelled():
                 continue
+            future.mark_executed()
             try:
                 raw = fn()
             except BaseException as exc:  # ruff: ignore[blind-except] -- worker must not die
@@ -6210,10 +6255,12 @@ class Supervisor:
         """Fail a timed-out spawn attempt and clean up if it later completes.
 
         The DB row is failed immediately so the row does not stay
-        non-terminal indefinitely.  A ``_SpawnFuture`` callback handles any
-        late completion: if the blocked worker thread eventually returns a
-        ``_SpawnResult`` the gated start is aborted/reaped fail-closed
-        without ever executing user code.
+        non-terminal indefinitely.  The future is cancelled so the worker
+        loop skips the callable if it has not started yet.  A
+        ``_SpawnFuture`` callback handles any late completion: if the
+        blocked worker thread eventually returns a ``_SpawnResult`` the
+        gated start is aborted/reaped fail-closed without ever executing
+        user code.
 
         Args:
             attempt: The timed-out attempt.
@@ -6234,6 +6281,7 @@ class Supervisor:
             ),
         )
         attempt.future.install_callback(self._make_late_completion_callback(attempt.job_id))
+        attempt.future.cancel()
 
     @staticmethod
     def _make_late_completion_callback(job_id: UUID) -> Callable[[_SpawnFuture], None]:
@@ -6270,10 +6318,12 @@ class Supervisor:
         """Fail-clean every pending spawn attempt without joining blocked threads.
 
         Called during shutdown before the drain phase.  Each pending attempt's
-        DB row is failed immediately so it does not stay non-terminal.  The
-        worker threads are daemon threads (they die with the process) and are
-        never joined, so a permanently blocked ``subprocess.Popen`` can never
-        hang shutdown.  A ``_SpawnFuture`` callback handles any late completion.
+        DB row is failed immediately so it does not stay non-terminal.  Each
+        future is cancelled so the worker loop skips the callable if it has
+        not started yet.  The worker threads are daemon threads (they die
+        with the process) and are never joined, so a permanently blocked
+        ``subprocess.Popen`` can never hang shutdown.  A ``_SpawnFuture``
+        callback handles any late completion.
         """
         for job_id in list(self._pending_starts):
             attempt = self._pending_starts.pop(job_id)
@@ -6292,6 +6342,7 @@ class Supervisor:
                 ),
             )
             attempt.future.install_callback(self._make_late_completion_callback(job_id))
+            attempt.future.cancel()
 
     @staticmethod
     def _abort_and_reap_late(gated: GatedSpawn, job_id: UUID) -> None:

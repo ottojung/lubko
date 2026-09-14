@@ -603,11 +603,13 @@ def test_set_result_result_reading_callback_does_not_deadlock() -> None:
 
 
 def test_timed_out_callable_skipped_without_execution() -> None:
-    """A future marked done before the worker dequeues it is skipped, not executed.
+    """A cancelled future's callable is skipped; an in-flight spawn still fires the callback.
 
-    When ``_poll_pending_starts`` times out an attempt, the future is marked
-    done.  The worker thread must then skip the stale callable rather than
-    invoking ``spawn_job``, freeing the lane for fresh work.
+    When ``_handle_timed_out_attempt`` calls ``cancel()``, the worker thread
+    must skip the stale callable rather than invoking ``spawn_job``, freeing
+    the lane for fresh work.  If the spawn was already executing when
+    ``cancel()`` was called, its result still publishes through the callback
+    so the late physical completion is properly aborted/reaped.
     """
     pool = _SpawnExecutor(num_lanes=2, queue_size=2)
     gate = threading.Event()
@@ -643,16 +645,62 @@ def test_timed_out_callable_skipped_without_execution() -> None:
     pool.submit(uuid4(), queue_spawn, timed_out_future)
     pool.submit(uuid4(), queue_spawn, _SpawnFuture(callback=None))
 
-    timed_out_future.set_result(OSError("spawn timed out"))
+    timed_out_future.cancel()
 
     gate.set()
     queue_executed.wait(timeout=1.0)
     time.sleep(0.02)
 
-    assert queue_executed.is_set(), "the non-timed-out queued callable ran"
+    assert queue_executed.is_set(), "the non-cancelled queued callable ran"
     assert timed_out_future.done()
+    assert timed_out_future.cancelled()
 
     pool.shutdown()
+
+
+def test_real_timeout_cancels_queued_callable_and_frees_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production timeout path cancels the future so the worker skips the callable.
+
+    When ``_poll_pending_starts`` detects a timeout, it calls
+    ``_handle_timed_out_attempt`` which cancels the future.  The worker
+    thread must then skip the stale callable if it has not started yet,
+    freeing the lane for a fresh submission.
+    """
+    blocker = _BlockingSpawn()
+    supervisor = _supervisor(_settings(spawn_deadline_seconds=0.01))
+
+    finalized: list[tuple[UUID, str]] = []
+
+    def fake_finalize(jid: UUID, result: object) -> None:
+        finalized.append((jid, cast("Any", result).status))
+
+    monkeypatch.setattr("lubko.worker.spawn_job", blocker)
+    monkeypatch.setattr(supervisor, "_finalize_immediate", fake_finalize)
+    monkeypatch.setattr(supervisor, "_db_phase", lambda _now: supervisor._claim_batch())
+    monkeypatch.setattr(supervisor, "_publish_health_force", lambda: None)
+    monkeypatch.setattr(
+        "lubko.worker.claim_jobs",
+        lambda _conn, _settings, _limit: [_make_claimed()],
+    )
+    monkeypatch.setattr("lubko.worker.parse_payload", lambda _payload: _FakePayload())
+    monkeypatch.setattr("lubko.worker._preflight_failure", lambda _spec: None)
+
+    supervisor._tick(time.monotonic())
+    assert len(supervisor._pending_starts) == 1
+
+    job_id = next(iter(supervisor._pending_starts))
+    future = supervisor._pending_starts[job_id].future
+
+    time.sleep(0.05)
+    supervisor._poll_pending_starts(time.monotonic())
+
+    assert len(finalized) == 1, "the timed-out row was finalized"
+    assert finalized[0][1] == "failed"
+    assert future.done(), "future must be done after timeout"
+    assert future.cancelled(), "future must be cancelled after timeout"
+    blocker.release()
 
 
 def test_shutdown_drains_queue_and_cancels_pending(
