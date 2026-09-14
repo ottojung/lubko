@@ -866,14 +866,26 @@ class _SpawnFuture:
         with self._lock:
             return self._cancelled
 
-    def mark_executed(self) -> None:
-        """Mark that the worker passed the cancellation check and will call ``fn()``.
+    def try_claim_execution(self) -> bool:
+        """Atomically check cancellation and claim execution under one lock.
 
-        Must be called exactly once, after ``cancelled()`` returns ``False``
-        and before ``fn()`` is invoked.
+        Returns ``True`` if the worker may call ``fn()`` (cancellation had
+        not yet arrived); ``False`` if the future was already cancelled and
+        the callable must be skipped.
+
+        This eliminates the race where ``cancel()`` arrives between a
+        separate ``cancelled()`` check and ``mark_executed()`` call,
+        allowing a stale queued callable to execute.
+
+        Returns:
+            ``True`` when execution is claimed; ``False`` when already
+            cancelled.
         """
         with self._lock:
+            if self._cancelled:
+                return False
             self._executed = True
+            return True
 
 
 class _SpawnExecutor:
@@ -933,9 +945,8 @@ class _SpawnExecutor:
             if self._shutdown:
                 future.set_result(OSError("spawn pool shut down"))
                 continue
-            if future.cancelled():
+            if not future.try_claim_execution():
                 continue
-            future.mark_executed()
             try:
                 raw = fn()
             except BaseException as exc:  # ruff: ignore[blind-except] -- worker must not die

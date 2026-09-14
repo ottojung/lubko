@@ -12,7 +12,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, cast, override
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -701,6 +701,84 @@ def test_real_timeout_cancels_queued_callable_and_frees_lane(
     assert future.done(), "future must be done after timeout"
     assert future.cancelled(), "future must be cancelled after timeout"
     blocker.release()
+
+
+def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
+    """Cancellation during the dequeue→claim window is atomically visible.
+
+    Regression: ``cancelled()`` and ``mark_executed()`` were separate lock
+    acquisitions.  ``cancel()`` arriving between them left
+    ``_cancelled=True`` but ``_executed=True`` too, so the worker still
+    ran ``fn()``.  The atomic ``try_claim_execution()`` makes the
+    handshake indivisible: cancellation that wins the race means the
+    callable is never invoked.
+    """
+    claim_pause = threading.Event()
+    claim_resume = threading.Event()
+    gate = threading.Event()
+    start_count = 0
+
+    class _RacingExecutor(_SpawnExecutor):
+        """Executor subclass that pauses between dequeue and claim."""
+
+        @override
+        def _worker_loop(self) -> None:
+            while True:
+                try:
+                    _job_id, fn, future = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if self._shutdown:
+                    future.set_result(OSError("spawn pool shut down"))
+                    continue
+                # --- HANDOFF WINDOW: cancel() can arrive here ---
+                claim_pause.set()
+                claim_resume.wait(timeout=1.0)
+                # ------------------------------------------------
+                if not future.try_claim_execution():
+                    continue
+                try:
+                    raw = fn()
+                except BaseException as exc:  # ruff: ignore[blind-except]
+                    future.set_result(exc)
+                else:
+                    if raw is None:
+                        continue
+                    result = _spawn_result_from_tuple(cast("_SpawnTuple", raw))
+                    future.set_result(result)
+
+    pool = _RacingExecutor(num_lanes=1, queue_size=2)
+
+    def blocking_spawn() -> _SpawnTuple:
+        nonlocal start_count
+        start_count += 1
+        gate.wait()
+        fake_proc = MagicMock()
+        fake_proc.pid = 99999
+        return (fake_proc, MagicMock(), MagicMock(), 99999, -1, -1, -1)
+
+    cancelled_future = _SpawnFuture(callback=None)
+    pool.submit(uuid4(), blocking_spawn, cancelled_future)
+
+    sibling_future = _SpawnFuture(callback=None)
+    pool.submit(uuid4(), blocking_spawn, sibling_future)
+
+    # Wait for the worker to dequeue the first item and reach the pause
+    claim_pause.wait(timeout=1.0)
+    # Worker is now between dequeue and try_claim_execution.
+    # Cancel the future before the worker resumes.
+    cancelled_future.cancel()
+    # Release the worker to call try_claim_execution (which must return False).
+    claim_resume.set()
+
+    gate.set()
+    time.sleep(0.2)
+
+    pool.shutdown()
+
+    assert cancelled_future.done()
+    assert cancelled_future.cancelled()
+    assert start_count >= 1, "at least the sibling callable ran"
 
 
 def test_shutdown_drains_queue_and_cancels_pending(
