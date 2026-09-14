@@ -123,6 +123,7 @@ convention = "google"
     # Tests assert invariants of the worker's internal state machine (outage
     # convergence, deadline derivation), which are deliberately not public API.
     "assert",
+    "import-private-name",
     "magic-value-comparison",
     "private-member-access",
     "subprocess-without-shell-equals-true",
