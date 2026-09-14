@@ -242,9 +242,9 @@ def test_explicit_legacy_rollback_ignores_live_supervisor(
         steps.append("retire")
         return True
 
-    def restore(_state: dc.RollbackState) -> bool:
+    def restore(_state: dc.RollbackState) -> tuple[bool, bool]:
         steps.append("restore")
-        return True
+        return True, False
 
     monkeypatch.setattr(dc, "_retire_candidate_locked", retire)
     monkeypatch.setattr(dc, "_restore_previous_locked", restore)

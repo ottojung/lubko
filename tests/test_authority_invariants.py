@@ -1340,7 +1340,7 @@ def test_legacy_rollback_still_uses_direct_restore_without_supervisor(
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
     monkeypatch.setattr(supervise, "supervisor_running", lambda: False)
     retire = MagicMock(return_value=True)
-    restore = MagicMock(return_value=True)
+    restore = MagicMock(return_value=(True, False))
     monkeypatch.setattr(deployctl, "_retire_candidate_locked", retire)
     monkeypatch.setattr(deployctl, "_restore_previous_locked", restore)
 

@@ -1815,65 +1815,146 @@ def _retire_candidate_locked(state: RollbackState) -> bool:
     return True
 
 
-def _restore_previous_locked(state: RollbackState) -> bool:
-    """Restore the previous exact checkout and worker after candidate death.
+def _restore_cli_and_startup_artifacts(commit: str, previous_commit: str) -> tuple[bool, bool]:
+    """Restore the CLI pointer and startup artifacts during rollback.
 
-    Assumes the candidate worker has been proven dead, so the previous
-    known-good checkout may be force-restored, the previous worker restarted,
-    its metadata written, and the terminal ``rolled_back`` state recorded.
+    Shared by both the legacy direct-restore path and the supervised
+    settlement path.  Terminal state is never written here: callers
+    are responsible for terminalizing only after this function returns
+    ``(True, ...)``.
+
+    Recovery evidence (pre-confirmation snapshot, staging manifest,
+    confirmation receipt) is **never** deleted by this function.  The
+    caller must invoke :func:`_cleanup_rollback_evidence` only after
+    terminalization succeeds so that a superseding desired generation
+    cannot leave a nonterminal rollback with no recovery evidence.
+
+    The confirmation receipt is durable proof that confirmation happened.
+    When a receipt exists but the pre-confirmation snapshot is absent or
+    corrupt, restoration authority is lost: rollback must not terminalize
+    and all evidence is retained for retry.  ``cli.remove_cli_root()`` is
+    fail-closed against current/supervisor-authoritative commits and is
+    always safe to call before the artifact check.
+
+    Args:
+        commit: The candidate commit whose CLI root to remove.
+        previous_commit: The previous commit whose CLI pointer to restore.
+
+    Returns:
+        A tuple ``(success, snapshot_restored)``.  ``success`` is ``True``
+        when CLI pointer and startup artifacts are fully restored.
+        ``snapshot_restored`` is ``True`` when a pre-confirmation snapshot
+        was successfully restored (caller must clean up snapshot + staging
+        after terminalization).  On failure both are ``False`` and all
+        evidence is retained for retry.
+    """
+    cli.remove_cli_root(commit)
+    if cli.reconcile_pointer(previous_commit):
+        append_deploy_log(f"supervised rollback restored commit {previous_commit}")
+    else:
+        append_deploy_log(
+            f"supervised rollback restored commit {previous_commit} "
+            "but could not restore the maintained CLI pointer"
+        )
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        append_deploy_log(
+            f"supervised rollback could not resolve bin home for startup artifact restoration: "
+            f"{exc}"
+        )
+        return False, False
+    receipt = _read_confirmation_receipt()
+    snapshot = _read_pre_confirmation_snapshot()
+    if snapshot is not None:
+        snapshot_restored = _restore_pre_confirmation_artifacts(bin_home)
+        if not snapshot_restored:
+            append_deploy_log("supervised rollback could not restore previous startup artifacts")
+            return False, False
+        return True, True
+    if receipt is not None:
+        append_deploy_log(
+            "supervised rollback found confirmation receipt but no pre-confirmation snapshot; "
+            "startup artifact restoration authority is lost"
+        )
+        return False, False
+    startup_contract.cleanup_staging(bin_home)
+    _remove_confirmation_receipt()
+    return True, False
+
+
+def _cleanup_rollback_evidence(*, snapshot_was_restored: bool) -> None:
+    """Remove staging, snapshot, and receipt evidence after successful terminalization.
+
+    Must be called only after the terminal ``rolled_back`` state has been
+    durably written.  A superseding desired generation that causes
+    terminalization to fail must **not** reach this function: all evidence
+    must be retained so retry can recover.
+
+    Args:
+        snapshot_was_restored: Whether
+            :func:`_restore_cli_and_startup_artifacts` successfully restored
+            a pre-confirmation snapshot.
+    """
+    if snapshot_was_restored:
+        try:
+            bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+        except (OSError, ValueError):
+            pass
+        else:
+            startup_contract.cleanup_staging(bin_home)
+        _remove_pre_confirmation_artifacts()
+    _remove_confirmation_receipt()
+
+
+def _restore_previous_locked(state: RollbackState) -> tuple[bool, bool]:
+    """Restore the previous exact checkout and worker after candidate death (legacy path).
+
+    This is the direct legacy rollback path used when no external supervisor
+    owns the worker lifecycle.  It force-restores the previous checkout,
+    directly restarts and publishes a previous worker, and then restores
+    the CLI pointer and startup artifacts.
+
+    Terminal state is never written here: callers are responsible for
+    terminalizing only after this function returns ``(True, ...)``,
+    ensuring that terminal ``rolled_back`` status implies verified
+    restoration of the previous startup authority.
+
+    Recovery evidence is never deleted by this function.  The caller must
+    invoke :func:`_cleanup_rollback_evidence` only after terminalization
+    succeeds.
 
     Args:
         state: Pending rollback mission.
 
     Returns:
-        ``True`` only when checkout, worker, metadata, and state are restored.
+        A tuple ``(success, snapshot_restored)``.  ``success`` is ``True``
+        when checkout, worker, metadata, CLI, and startup artifacts are
+        fully restored.
     """
     repo = Path(state.repo)
     if not _checkout(repo, state.previous_commit, state.git_timeout_seconds, force=True):
         append_deploy_log("supervised rollback could not restore previous checkout")
-        return False
+        return False, False
     restored = _restart_previous(state)
     if restored is None:
-        return False
+        return False, False
     write_meta(restored)
-    _write_state(
-        replace(
-            state,
-            status=STATUS_ROLLED_BACK,
-            previous_restart_meta=None,
-            previous_restart_released=False,
-        )
-    )
-    cli.remove_cli_root(state.commit)
-    if cli.reconcile_pointer(state.previous_commit):
-        append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
-    else:
-        append_deploy_log(
-            f"supervised rollback restored commit {state.previous_commit} "
-            "but could not restore the maintained CLI pointer"
-        )
-    try:
-        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
-    except (OSError, ValueError):
-        bin_home = None
-    if bin_home is not None:
-        snapshot_restored = _restore_pre_confirmation_artifacts(bin_home)
-        startup_contract.cleanup_staging(bin_home)
-        if snapshot_restored:
-            _remove_pre_confirmation_artifacts()
-    _remove_confirmation_receipt()
-    return True
+    return _restore_cli_and_startup_artifacts(state.commit, state.previous_commit)
 
 
-def _rollback_locked_body(state: RollbackState, expected_generation: int) -> RollbackState:
-    """Perform the rollback while the generation lock is held.
+def _rollback_locked_body(state: RollbackState, expected_generation: int) -> None:
+    """Verify rollback authority while the generation lock is held.
+
+    This performs the authority gate: the pending->rolled_back transition
+    may only proceed when the durable authority is sound.  Terminalization
+    is deferred until after startup-artifact restoration succeeds so that
+    terminal ``rolled_back`` status always implies verified restoration of
+    the previous startup authority.
 
     Args:
         state: Current rollback state.
         expected_generation: Expected mission generation.
-
-    Returns:
-        The terminal rolled-back state.
 
     Raises:
         DeployCtlError: On authority conflict or unreadable state.
@@ -1892,9 +1973,6 @@ def _rollback_locked_body(state: RollbackState, expected_generation: int) -> Rol
             "deployment remains pending"
         )
         raise DeployCtlError(msg)
-    terminal = replace(state, status=STATUS_ROLLED_BACK)
-    _write_state(terminal)
-    return terminal
 
 
 def _finalize_supervised_rollback(state: RollbackState, expected_generation: int) -> RollbackState:
@@ -1906,6 +1984,22 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
     previous commit. The mission remains pending so the newer obligation can
     converge.
 
+    The supervised path relies on ``settle_desired()`` having already proved
+    the external supervisor converged a fresh previous-commit worker.  This
+    function does **not** call ``_restore_previous_locked()`` or
+    ``_restart_previous()``: it only performs the CLI-authority and
+    startup-artifact restoration needed before terminalization.  The
+    supervisor owns the worker lifecycle.
+
+    Startup artifacts are restored before terminalization: terminal
+    ``rolled_back`` status implies verified restoration of the previous
+    startup authority.  Failures remain recoverable and nonterminal with
+    staging and receipt evidence retained for retry.
+
+    The generation lock is re-acquired before writing terminal state to
+    prevent a newer desired generation that won during restoration from
+    being silently overwritten by a stale terminal rollback.
+
     Returns:
         The terminal rolled-back state.
 
@@ -1915,28 +2009,25 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
     """
     try:
         with supervise.generation_lock():
-            terminal = _rollback_locked_body(state, expected_generation)
+            _rollback_locked_body(state, expected_generation)
     except GenerationLockTimeoutError as exc:
         msg = "timed out waiting for the generation lock during supervised rollback"
         raise DeployCtlError(msg) from exc
-    cli.remove_cli_root(state.commit)
-    if cli.reconcile_pointer(state.previous_commit):
-        append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
-    else:
-        append_deploy_log(
-            f"supervised rollback restored commit {state.previous_commit} "
-            "but could not restore the maintained CLI pointer"
-        )
+    success, snapshot_restored = _restore_cli_and_startup_artifacts(
+        state.commit, state.previous_commit
+    )
+    if not success:
+        msg = "supervised rollback could not restore CLI authority or startup artifacts"
+        raise DeployCtlError(msg)
     try:
-        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
-    except (OSError, ValueError):
-        bin_home = None
-    if bin_home is not None:
-        snapshot_restored = _restore_pre_confirmation_artifacts(bin_home)
-        startup_contract.cleanup_staging(bin_home)
-        if snapshot_restored:
-            _remove_pre_confirmation_artifacts()
-    _remove_confirmation_receipt()
+        with supervise.generation_lock():
+            _rollback_locked_body(state, expected_generation)
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock during supervised rollback terminalization"
+        raise DeployCtlError(msg) from exc
+    terminal = replace(state, status=STATUS_ROLLED_BACK)
+    _write_state(terminal)
+    _cleanup_rollback_evidence(snapshot_was_restored=snapshot_restored)
     return terminal
 
 
@@ -2255,12 +2346,25 @@ def _rollback_legacy_locked(state: RollbackState) -> bool:
     """Roll back one explicitly legacy-owned pending mission.
 
     Returns:
-        ``True`` only when the legacy candidate is retired and the previous
-        checkout/worker are restored.
+        ``True`` only when the legacy candidate is retired, the previous
+        checkout/worker are restored, startup artifacts are verified, and
+        evidence is cleaned up after terminalization.
     """
     if not _retire_candidate_locked(state):
         return False
-    return _restore_previous_locked(state)
+    success, snapshot_restored = _restore_previous_locked(state)
+    if not success:
+        return False
+    _write_state(
+        replace(
+            state,
+            status=STATUS_ROLLED_BACK,
+            previous_restart_meta=None,
+            previous_restart_released=False,
+        )
+    )
+    _cleanup_rollback_evidence(snapshot_was_restored=snapshot_restored)
+    return True
 
 
 def _rollback_locked(state: RollbackState) -> bool:
