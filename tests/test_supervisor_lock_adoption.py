@@ -559,11 +559,15 @@ def test_handoff_env_preserved_through_adopt(
         monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, "99")
         monkeypatch.setenv(supervise.HANDOFF_TRANSFER_FD_ENV, "98")
         monkeypatch.setenv(supervise.HANDOFF_MODE_ENV, "1")
+        monkeypatch.setenv(supervise.HANDOFF_TARGET_COMMIT_ENV, "a" * 40)
 
         daemon = SupervisorDaemon(Settings())
-        fd = daemon._try_adopt_inherited_lock()
+        result = daemon._try_adopt_inherited_lock()
 
+        assert result is not None
+        fd, target_commit = result
         assert fd == owner_fd
+        assert target_commit == "a" * 40
 
         assert os.environ.get(supervise.HANDOFF_READY_FD_ENV) == "99"
         assert os.environ.get(supervise.HANDOFF_TRANSFER_FD_ENV) == "98"
@@ -572,6 +576,7 @@ def test_handoff_env_preserved_through_adopt(
         assert os.environ.get(supervise.HANDOFF_FD_ENV) is None
         assert os.environ.get(supervise.HANDOFF_PATH_ENV) is None
         assert os.environ.get(supervise.HANDOFF_PID_ENV) is None
+        assert os.environ.get(supervise.HANDOFF_TARGET_COMMIT_ENV) is None
     finally:
         os.set_inheritable(owner_fd, False)
         os.close(owner_fd)

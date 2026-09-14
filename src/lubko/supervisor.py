@@ -738,6 +738,7 @@ class SupervisorDaemon:
         self._ownership_fd: int | None = None
         self._start_time_ticks: int = 0
         self._runtime_commit: str | None = capture_supervisor_runtime_commit()
+        self._handoff_target_commit: str | None = None
         self._handoff_completed: bool = False
 
     def _write_state_authority_safe(self, state: SupervisorState) -> bool:
@@ -793,6 +794,8 @@ class SupervisorDaemon:
         """
         LOGGER.info("lubko supervisor starting (pid %d)", os.getpid())
         self._acquire_ownership()
+        if self._handoff_target_commit is not None:
+            self._runtime_commit = self._handoff_target_commit
         try:
             if self._in_handoff_mode() and not self._run_handoff_protocol():
                 return
@@ -3167,10 +3170,10 @@ class SupervisorDaemon:
             SystemExit: If another live supervisor holds the ownership lock,
                 or if the inherited handoff fd cannot be validated.
         """
-        inherited_fd = self._try_adopt_inherited_lock()
-        if inherited_fd is not None:
-            self._ownership_fd = inherited_fd
-            LOGGER.info("supervisor ownership lock adopted via handoff (fd %d)", inherited_fd)
+        inherited = self._try_adopt_inherited_lock()
+        if inherited is not None:
+            self._ownership_fd, self._handoff_target_commit = inherited
+            LOGGER.info("supervisor ownership lock adopted via handoff (fd %d)", self._ownership_fd)
             return
         try:
             acquired = acquire_supervisor_lock()
@@ -3183,16 +3186,23 @@ class SupervisorDaemon:
         LOGGER.info("supervisor ownership lock acquired (fd %d)", acquired)
 
     @staticmethod
-    def _try_adopt_inherited_lock() -> int | None:
+    def _try_adopt_inherited_lock() -> tuple[int, str] | None:
         """Try to adopt an inherited lock fd from a two-phase handoff.
 
+        The handoff-target commit is mandatory authority: when a lock fd is
+        being adopted (i.e. we are in a handoff), the target commit must be
+        present and valid.  A missing or malformed target commit is a
+        fail-closed invariant violation — the successor must not guess its
+        identity from mutable ``cli/current``.
+
         Returns:
-            The validated adopted fd, or ``None`` when no handoff is in
-            progress (normal startup path).
+            ``(adopted_fd, target_commit)`` when a handoff is in progress,
+            or ``None`` for a normal startup path.
 
         Raises:
             SystemExit: If handoff env vars are present but validation fails,
-                to prevent running without the ownership lock.
+                to prevent running without the ownership lock or with an
+                untrusted identity.
         """
         fd_str = os.environ.get(supervise.HANDOFF_FD_ENV)
         if fd_str is None:
@@ -3214,6 +3224,19 @@ class SupervisorDaemon:
             )
             raise SystemExit(1) from None
         handoff_pid = os.environ.get(supervise.HANDOFF_PID_ENV, "?")
+        target_commit = os.environ.pop(supervise.HANDOFF_TARGET_COMMIT_ENV, None)
+        if target_commit is None:
+            LOGGER.error(
+                "handoff fd present but target commit metadata is missing; "
+                "refusing to start without bound successor identity"
+            )
+            raise SystemExit(1) from None
+        if not cli.is_valid_commit_name(target_commit):
+            LOGGER.error(
+                "malformed handoff target commit %r; refusing to start with untrusted identity",
+                target_commit,
+            )
+            raise SystemExit(1) from None
         try:
             adopted = supervise.adopt_supervisor_lock(fd_number, expected_path)
         except OSError:
@@ -3232,7 +3255,7 @@ class SupervisorDaemon:
             supervise.HANDOFF_PID_ENV,
         ):
             os.environ.pop(var, None)
-        return adopted
+        return adopted, target_commit
 
     def _release_ownership(self) -> None:
         """Release the process-level ownership lock held for the lifetime."""
@@ -3472,6 +3495,10 @@ class SupervisorDaemon:
     ) -> tuple[_HandoffPipes, subprocess.Popen[bytes] | None]:
         """Spawn the successor process in handoff mode with pipe fds.
 
+        The exact target commit is passed through the environment so the
+        successor binds its runtime identity to the commit A selected,
+        rather than re-deriving from mutable ``cli/current``.
+
         Returns:
             A ``(_HandoffPipes, process)`` tuple.
             ``process`` is ``None`` when the spawn failed; callers should
@@ -3496,6 +3523,7 @@ class SupervisorDaemon:
             supervise.HANDOFF_READY_FD_ENV: str(ready_w),
             supervise.HANDOFF_TRANSFER_FD_ENV: str(transfer_r),
             supervise.HANDOFF_MODE_ENV: "1",
+            supervise.HANDOFF_TARGET_COMMIT_ENV: confirmed,
         }
         try:
             os.set_inheritable(ownership_fd, True)  # ruff: ignore[boolean-positional-value-in-call]
