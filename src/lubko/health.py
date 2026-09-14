@@ -938,18 +938,239 @@ def _prune_dir(directory: Path, keep_prefix: str, pattern: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class OperationalReadiness:
+    """Separately machine-readable operational readiness derived from snapshot signals.
+
+    Process liveness and queue-operational readiness are distinct questions:
+    a worker process can be alive (PID, start-time ticks match) while its
+    safety-critical loop is badly behind.  This result considers current
+    overdue scan signals, lease safety, DB deadline breach recovery, DB
+    connectivity error recovery, and shutting-down state.
+
+    ``ready`` is ``True`` only when none of the checked safety-critical
+    conditions indicate the worker loop is degraded.  ``reason`` names the
+    operational state ("ok" or a bounded diagnostic); it is never overloaded
+    with liveness semantics.
+    """
+
+    ready: bool
+    reason: str
+    #: Whether any safety-critical scan (cancellation, recovery, or GC) is
+    #: overdue right now.
+    any_scan_overdue: bool
+    #: Whether the cancellation scan is specifically overdue.
+    cancellation_scan_overdue: bool
+    #: Whether the recovery pass is specifically overdue.
+    recovery_overdue: bool
+    #: Whether the GC pass is specifically overdue.
+    gc_overdue: bool
+    #: Whether the minimum lease-safety remaining is negative (unsafe).
+    lease_safety_negative: bool
+    #: The raw ``min_lease_safety_remaining_seconds`` value for diagnostics.
+    min_lease_safety_remaining_seconds: float | None
+    #: Whether a DB deadline breach is unrecovered.  A breach is recovered
+    #: when a later DB phase completed successfully (proved by
+    #: ``db_last_activity_at > db_deadline_breached_at``; see
+    #: :func:`interpret_operational_readiness`).
+    unrecovered_db_deadline_breach: bool
+    #: Whether a DB connectivity error is unrecovered.  An error is recovered
+    #: when the connection is currently established AND a successful
+    #: ``db_connected_at`` is newer than the error timestamp.
+    unrecovered_db_error: bool
+    #: Whether the worker is in shutting-down state.
+    shutting_down: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the operational readiness for status/JSON surfaces.
+
+        Returns:
+            A JSON-serialisable mapping.
+        """
+        return {
+            "ready": self.ready,
+            "reason": self.reason,
+            "any_scan_overdue": self.any_scan_overdue,
+            "cancellation_scan_overdue": self.cancellation_scan_overdue,
+            "recovery_overdue": self.recovery_overdue,
+            "gc_overdue": self.gc_overdue,
+            "lease_safety_negative": self.lease_safety_negative,
+            "min_lease_safety_remaining_seconds": _finite_or_none(
+                self.min_lease_safety_remaining_seconds
+            ),
+            "unrecovered_db_deadline_breach": self.unrecovered_db_deadline_breach,
+            "unrecovered_db_error": self.unrecovered_db_error,
+            "shutting_down": self.shutting_down,
+        }
+
+
+def _db_deadline_breach_recovered(snapshot: WorkerHealth) -> bool:
+    """Return whether any recorded DB deadline breach has been recovered.
+
+    A breach is proved recovered when the most recent DB activity timestamp
+    is *newer* than the most recent breach timestamp.  This ordering can only
+    occur after a later ``_db_phase()`` returned normally, because:
+
+    - ``db_last_activity_at`` is set at the *start* of each ``_db_phase()``
+      call (worker.py line ~4633);
+    - ``db_deadline_breached_at`` is set *after* the
+      ``DbOperationDeadlineError`` is caught, outside ``_db_phase()``
+      (worker.py line ~4559);
+    - ``_db_phase()`` is skipped entirely when ``conn is None`` (outage
+      state), so ``db_last_activity_at`` cannot advance while the connection
+      is down.
+
+    Therefore ``db_last_activity_at > db_deadline_breached_at`` implies a
+    full DB phase completed successfully after the breach.
+
+    Lifetime ``db_deadline_breach_count`` is never consulted; only the
+    recency ordering of the two timestamps matters.
+    """
+    if snapshot.db_deadline_breached_at is None:
+        return True
+    if snapshot.db_last_activity_at is None:
+        return False
+    return snapshot.db_last_activity_at > snapshot.db_deadline_breached_at
+
+
+def _db_error_recovered(snapshot: WorkerHealth) -> bool:
+    """Return whether any recorded DB connectivity error has been recovered.
+
+    An error is proved recovered when two conditions hold simultaneously:
+
+    1. ``db_connected`` is ``True`` — the connection handle is live.
+    2. ``db_connected_at`` is strictly newer than ``db_error_at`` — the
+       connection was established *after* the error, not before it.
+
+    This prevents a stale ``db_connected=True`` from masking a newer error:
+    ``db_connected_at`` only advances on successful connection, and
+    ``db_error_at`` advances on every error.  The ordering proof is
+    timestamp-monotonic.
+    """
+    if snapshot.db_error_at is None:
+        return True
+    if not snapshot.db_connected:
+        return False
+    if snapshot.db_connected_at is None:
+        return False
+    return snapshot.db_connected_at > snapshot.db_error_at
+
+
+def interpret_operational_readiness(
+    snapshot: WorkerHealth,
+) -> OperationalReadiness:
+    """Derive operational readiness from the raw health snapshot signals.
+
+    Recovery semantics use snapshot-internal ordering proofs rather than
+    arbitrary time windows:
+
+    - **DB deadline breach recovery**: proved by
+      ``db_last_activity_at > db_deadline_breached_at``, which can only hold
+      after a later ``_db_phase()`` returned normally.  Lifetime
+      ``db_deadline_breach_count`` is never consulted.
+
+    - **DB error recovery**: proved by ``db_connected=True`` AND
+      ``db_connected_at > db_error_at``, which proves reconnection
+      succeeded after the error.
+
+    - **Overdue scans / lease safety / shutting down**: direct boolean/value
+      signals from the snapshot; no recovery proof needed.
+
+    Historical recovered failures never create permanent degradation.
+
+    Args:
+        snapshot: The raw health snapshot (must be present, not ``None``).
+
+    Returns:
+        An ``OperationalReadiness`` result.
+    """
+    any_scan_overdue = (
+        snapshot.cancellation_scan_overdue or snapshot.recovery_overdue or snapshot.gc_overdue
+    )
+
+    lease_safety_negative = (
+        snapshot.min_lease_safety_remaining_seconds is not None
+        and snapshot.min_lease_safety_remaining_seconds < 0
+    )
+
+    unrecovered_breach = not _db_deadline_breach_recovered(snapshot)
+    unrecovered_error = not _db_error_recovered(snapshot)
+
+    reasons: list[str] = []
+    if any_scan_overdue:
+        overdue_scans: list[str] = []
+        if snapshot.cancellation_scan_overdue:
+            overdue_scans.append("cancellation")
+        if snapshot.recovery_overdue:
+            overdue_scans.append("recovery")
+        if snapshot.gc_overdue:
+            overdue_scans.append("gc")
+        reasons.append(f"overdue scans: {', '.join(overdue_scans)}")
+    if lease_safety_negative:
+        reasons.append(f"lease safety negative: {snapshot.min_lease_safety_remaining_seconds:.1f}s")
+    if unrecovered_breach:
+        reasons.append("unrecovered DB deadline breach")
+    if unrecovered_error:
+        reasons.append("unrecovered DB error")
+    if snapshot.shutting_down:
+        reasons.append("shutting down")
+
+    ready = len(reasons) == 0
+    reason = "ok" if ready else "; ".join(reasons)
+
+    return OperationalReadiness(
+        ready=ready,
+        reason=reason,
+        any_scan_overdue=any_scan_overdue,
+        cancellation_scan_overdue=snapshot.cancellation_scan_overdue,
+        recovery_overdue=snapshot.recovery_overdue,
+        gc_overdue=snapshot.gc_overdue,
+        lease_safety_negative=lease_safety_negative,
+        min_lease_safety_remaining_seconds=snapshot.min_lease_safety_remaining_seconds,
+        unrecovered_db_deadline_breach=unrecovered_breach,
+        unrecovered_db_error=unrecovered_error,
+        shutting_down=snapshot.shutting_down,
+    )
+
+
+_UNRECOVERED_OPERATIONAL: OperationalReadiness = OperationalReadiness(
+    ready=False,
+    reason="",
+    any_scan_overdue=False,
+    cancellation_scan_overdue=False,
+    recovery_overdue=False,
+    gc_overdue=False,
+    lease_safety_negative=False,
+    min_lease_safety_remaining_seconds=None,
+    unrecovered_db_deadline_breach=False,
+    unrecovered_db_error=False,
+    shutting_down=False,
+)
+
+
+@dataclass(frozen=True, slots=True)
 class EffectiveHealth:
-    """Interpreted health combining raw snapshot with liveness verification.
+    """Interpreted health combining raw snapshot with liveness and operational readiness.
 
     ``live`` is ``True`` only when the snapshot is fresh, the PID is alive,
     and the start-time ticks match the expected process identity — so a
     SIGKILLed worker's stale ``alive=true`` is never trusted.
+
+    ``operational`` is a separately machine-readable operational readiness
+    assessment that considers safety-critical overdue signals, lease safety,
+    DB deadline breach recovery, DB connectivity error recovery, and
+    shutting-down state.  A worker can be ``live=True`` but
+    ``operational.ready=False`` when its safety-critical loop is behind.
+
+    ``reason`` describes only the liveness interpretation; it is never
+    overloaded with operational semantics.  Operational diagnostics are
+    exclusively in ``operational.reason``.
     """
 
     snapshot: WorkerHealth | None
     live: bool
     stale: bool
     reason: str
+    operational: OperationalReadiness
 
 
 def _pinned_snapshot_process_live(snapshot: WorkerHealth) -> tuple[bool, str]:
@@ -982,6 +1203,31 @@ def _pinned_snapshot_process_live(snapshot: WorkerHealth) -> tuple[bool, str]:
         os.close(pidfd)
 
 
+def _dead_operational(reason: str) -> OperationalReadiness:
+    """Build an unrecovered OperationalReadiness for early-return liveness failures.
+
+    Args:
+        reason: Diagnostic reason for the unrecovered state.
+
+    Returns:
+        An unrecovered OperationalReadiness with all fields defaulted to
+        healthy except ``ready=False`` and the given ``reason``.
+    """
+    return OperationalReadiness(
+        ready=False,
+        reason=reason,
+        any_scan_overdue=False,
+        cancellation_scan_overdue=False,
+        recovery_overdue=False,
+        gc_overdue=False,
+        lease_safety_negative=False,
+        min_lease_safety_remaining_seconds=None,
+        unrecovered_db_deadline_breach=False,
+        unrecovered_db_error=False,
+        shutting_down=False,
+    )
+
+
 def interpret_worker_health(
     snapshot: WorkerHealth | None,
     *,
@@ -989,11 +1235,17 @@ def interpret_worker_health(
 ) -> EffectiveHealth:
     """Cross-check a health snapshot against live process state.
 
-    The interpretation verifies:
+    The liveness interpretation verifies:
     - the snapshot is present and parseable;
     - the recorded PID matches a live, non-zombie process;
     - the start-time ticks match the current process start time;
     - the snapshot is not stale (written within ``max_staleness_seconds``).
+
+    A separate operational readiness assessment is derived from safety-
+    critical snapshot signals (overdue scans, lease safety, DB deadline
+    breach recovery, DB connectivity error recovery, shutting-down state).
+    The ``reason`` field describes only liveness; operational diagnostics
+    are exclusively in ``operational.reason``.
 
     Args:
         snapshot: The raw health snapshot.
@@ -1003,13 +1255,20 @@ def interpret_worker_health(
         An ``EffectiveHealth`` result.
     """
     if snapshot is None:
-        return EffectiveHealth(snapshot=None, live=False, stale=False, reason="no health snapshot")
+        return EffectiveHealth(
+            snapshot=None,
+            live=False,
+            stale=False,
+            reason="no health snapshot",
+            operational=_dead_operational("no health snapshot"),
+        )
     if not math.isfinite(snapshot.published_at):
         return EffectiveHealth(
             snapshot=snapshot,
             live=False,
             stale=True,
             reason="non-finite published_at in snapshot",
+            operational=interpret_operational_readiness(snapshot),
         )
     now = time.time()
     if snapshot.published_at > now:
@@ -1018,6 +1277,7 @@ def interpret_worker_health(
             live=False,
             stale=True,
             reason="published_at in snapshot is in the future",
+            operational=interpret_operational_readiness(snapshot),
         )
     age = now - snapshot.published_at
     pid = snapshot.pid
@@ -1033,7 +1293,10 @@ def interpret_worker_health(
         live = False
     else:
         live, reason = _pinned_snapshot_process_live(snapshot)
-    return EffectiveHealth(snapshot=snapshot, live=live, stale=stale, reason=reason)
+    operational = interpret_operational_readiness(snapshot)
+    return EffectiveHealth(
+        snapshot=snapshot, live=live, stale=stale, reason=reason, operational=operational
+    )
 
 
 def _process_is_live(pid: int) -> bool:
@@ -1078,6 +1341,7 @@ def worker_health_payload(
         "live": effective.live,
         "stale": effective.stale,
         "reason": effective.reason,
+        "operational": effective.operational.to_dict(),
     }
 
 
