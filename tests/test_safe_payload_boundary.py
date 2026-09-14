@@ -40,7 +40,7 @@ from lubko.worker import (
     request_cancel,
 )
 from lubko.worker import (
-    _safe_payload_sql as _safe_payload_sql,  # ruff: ignore[useless-import-alias, import-private-name]
+    _safe_payload_sql as _safe_payload_sql,  # ruff: ignore[useless-import-alias]
 )
 
 if TYPE_CHECKING:

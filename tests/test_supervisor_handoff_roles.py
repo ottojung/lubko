@@ -24,7 +24,7 @@ from lubko import supervise
 from lubko.supervisor import (
     Settings,
     SupervisorDaemon,
-    _HandoffPipes,  # ruff: ignore[import-private-name]
+    _HandoffPipes,
 )
 
 if TYPE_CHECKING:
