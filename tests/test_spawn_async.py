@@ -703,6 +703,45 @@ def test_real_timeout_cancels_queued_callable_and_frees_lane(
     blocker.release()
 
 
+class _RacingExecutor(_SpawnExecutor):
+    """Executor subclass that pauses between dequeue and try_claim_execution.
+
+    The pause lets the test force ``cancel()`` during the exact handoff
+    window, proving the atomic claim prevents stale callable execution.
+    """
+
+    def __init__(self, **kw: object) -> None:
+        super().__init__(**kw)  # type: ignore[arg-type]
+        self._claim_pause = threading.Event()
+        self._claim_resume = threading.Event()
+
+    @override
+    def _worker_loop(self) -> None:
+        while True:
+            try:
+                _job_id, fn, future = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if self._shutdown:
+                future.set_result(OSError("spawn pool shut down"))
+                continue
+            # --- HANDOFF WINDOW: cancel() can arrive here ---
+            self._claim_pause.set()
+            self._claim_resume.wait(timeout=1.0)
+            # ------------------------------------------------
+            if not future.try_claim_execution():
+                continue
+            try:
+                raw = fn()
+            except BaseException as exc:  # ruff: ignore[blind-except]
+                future.set_result(exc)
+            else:
+                if raw is None:
+                    continue
+                result = _spawn_result_from_tuple(cast("_SpawnTuple", raw))
+                future.set_result(result)
+
+
 def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
     """Cancellation during the dequeue→claim window is atomically visible.
 
@@ -713,63 +752,38 @@ def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
     handshake indivisible: cancellation that wins the race means the
     callable is never invoked.
     """
-    claim_pause = threading.Event()
-    claim_resume = threading.Event()
     gate = threading.Event()
-    start_count = 0
-
-    class _RacingExecutor(_SpawnExecutor):
-        """Executor subclass that pauses between dequeue and claim."""
-
-        @override
-        def _worker_loop(self) -> None:
-            while True:
-                try:
-                    _job_id, fn, future = self._queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                if self._shutdown:
-                    future.set_result(OSError("spawn pool shut down"))
-                    continue
-                # --- HANDOFF WINDOW: cancel() can arrive here ---
-                claim_pause.set()
-                claim_resume.wait(timeout=1.0)
-                # ------------------------------------------------
-                if not future.try_claim_execution():
-                    continue
-                try:
-                    raw = fn()
-                except BaseException as exc:  # ruff: ignore[blind-except]
-                    future.set_result(exc)
-                else:
-                    if raw is None:
-                        continue
-                    result = _spawn_result_from_tuple(cast("_SpawnTuple", raw))
-                    future.set_result(result)
+    cancelled_ran = threading.Event()
+    sibling_ran = threading.Event()
 
     pool = _RacingExecutor(num_lanes=1, queue_size=2)
 
-    def blocking_spawn() -> _SpawnTuple:
-        nonlocal start_count
-        start_count += 1
+    def cancelled_callable() -> _SpawnTuple:
+        cancelled_ran.set()
+        fake_proc = MagicMock()
+        fake_proc.pid = 11111
+        return (fake_proc, MagicMock(), MagicMock(), 11111, -1, -1, -1)
+
+    def sibling_callable() -> _SpawnTuple:
+        sibling_ran.set()
         gate.wait()
         fake_proc = MagicMock()
-        fake_proc.pid = 99999
-        return (fake_proc, MagicMock(), MagicMock(), 99999, -1, -1, -1)
+        fake_proc.pid = 22222
+        return (fake_proc, MagicMock(), MagicMock(), 22222, -1, -1, -1)
 
     cancelled_future = _SpawnFuture(callback=None)
-    pool.submit(uuid4(), blocking_spawn, cancelled_future)
+    pool.submit(uuid4(), cancelled_callable, cancelled_future)
 
     sibling_future = _SpawnFuture(callback=None)
-    pool.submit(uuid4(), blocking_spawn, sibling_future)
+    pool.submit(uuid4(), sibling_callable, sibling_future)
 
-    # Wait for the worker to dequeue the first item and reach the pause
-    claim_pause.wait(timeout=1.0)
+    # Wait for the worker to dequeue the cancelled item and reach the pause
+    pool._claim_pause.wait(timeout=1.0)
     # Worker is now between dequeue and try_claim_execution.
     # Cancel the future before the worker resumes.
     cancelled_future.cancel()
     # Release the worker to call try_claim_execution (which must return False).
-    claim_resume.set()
+    pool._claim_resume.set()
 
     gate.set()
     time.sleep(0.2)
@@ -778,7 +792,8 @@ def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
 
     assert cancelled_future.done()
     assert cancelled_future.cancelled()
-    assert start_count >= 1, "at least the sibling callable ran"
+    assert not cancelled_ran.is_set(), "cancelled callable must never have been invoked"
+    assert sibling_ran.is_set(), "sibling callable must have executed"
 
 
 def test_shutdown_drains_queue_and_cancels_pending(
