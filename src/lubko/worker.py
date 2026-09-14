@@ -764,6 +764,13 @@ class _SpawnFuture:
     The main thread polls ``done()`` each tick.  A ``callback`` is invoked
     (in the worker thread) when the result becomes available, allowing
     late-completion cleanup without blocking the main loop.
+
+    Callback installation and result delivery are atomic under a single
+    lock: ``install_callback`` stores the callback and, if the result is
+    already present, invokes it immediately; ``set_result`` stores the
+    result and, if a callback was installed, invokes it immediately.  This
+    eliminates the race where timeout observes ``done()=False``, then the
+    worker completes before the callback is installed.
     """
 
     __slots__ = ("_callback", "_done", "_lock", "_result")
@@ -775,13 +782,38 @@ class _SpawnFuture:
         self._callback: Callable[..., None] | None = callback
 
     def set_result(self, result: _SpawnResult | BaseException) -> None:
+        """Store the result and invoke the callback if one was installed."""
+        cb: Callable[..., None] | None = None
         with self._lock:
             self._result = result
             self._done = True
-        if isinstance(result, _SpawnResult):
             cb = self._callback
-            if cb is not None:
+        if cb is not None and isinstance(result, _SpawnResult):
+            cb(self)
+
+    def install_callback(self, cb: Callable[..., None]) -> bool:
+        """Install a late-completion callback atomically with completion.
+
+        If the result is already present, the callback is invoked
+        immediately (in the calling thread) and ``True`` is returned so
+        the caller knows no further cleanup is needed.  If the result is
+        not yet present, the callback is stored for later invocation by
+        the worker thread and ``False`` is returned.
+
+        Args:
+            cb: Callback to invoke with this future when the result is a
+                ``_SpawnResult``.
+
+        Returns:
+            ``True`` when the callback was invoked immediately (future was
+            already done); ``False`` when it was stored for later.
+        """
+        with self._lock:
+            if self._done:
                 cb(self)
+                return True
+            self._callback = cb
+            return False
 
     def done(self) -> bool:
         with self._lock:
@@ -804,11 +836,15 @@ class _SpawnExecutor:
     permanently blocked ``spawn_job``/``Popen`` can never grow the thread
     count without bound; later queue work still progresses through the
     remaining unblocked lanes.
+
+    ``shutdown()`` sets a flag, drains the queue, and cancels every pending
+    ``_SpawnFuture`` so stale queued starts never invoke ``spawn_job``.
     """
 
     def __init__(self, num_lanes: int = NUM_START_LANES) -> None:
         self._queue: queue.Queue[tuple[UUID, Callable[..., object], _SpawnFuture]] = queue.Queue()
         self._threads: list[threading.Thread] = []
+        self._shutdown = False
         for i in range(num_lanes):
             t = threading.Thread(
                 target=self._worker_loop,
@@ -823,6 +859,9 @@ class _SpawnExecutor:
             try:
                 _job_id, fn, future = self._queue.get(timeout=0.5)
             except queue.Empty:
+                continue
+            if self._shutdown:
+                future.set_result(OSError("spawn pool shut down"))
                 continue
             try:
                 raw = fn()
@@ -842,17 +881,26 @@ class _SpawnExecutor:
             fn: Callable (typically ``spawn_job``) to run in the lane.
             future: Result holder for the attempt.
         """
+        if self._shutdown:
+            future.set_result(OSError("spawn pool shut down"))
+            return
         self._queue.put((job_id, fn, future))
 
     def shutdown(self) -> None:
-        """Drain the queue so no new work is picked up during teardown.
+        """Prevent new starts and drain stale queued work.
 
-        Worker threads are daemon threads and die with the process; this
-        method just prevents stale work from being started during interpreter
-        shutdown.
+        Sets the shutdown flag so worker threads skip stale queued entries.
+        Drains every remaining item from the queue and delivers an
+        ``OSError`` to its future so the attempt is cleanly failed.
+        Worker threads are daemon and die with the process.
         """
-        for _ in self._threads:
-            self._queue.put_nowait((uuid4(), lambda: None, _SpawnFuture(None)))
+        self._shutdown = True
+        while True:
+            try:
+                _job_id, _fn, future = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            future.set_result(OSError("spawn pool shut down"))
 
 
 @dataclass(slots=True)
@@ -6137,9 +6185,7 @@ class Supervisor:
                 cancellation_note=None,
             ),
         )
-        attempt.future._callback = self._make_late_completion_callback(  # ruff: ignore[private-member-access]
-            attempt.job_id,
-        )
+        attempt.future.install_callback(self._make_late_completion_callback(attempt.job_id))
 
     @staticmethod
     def _make_late_completion_callback(job_id: UUID) -> Callable[[_SpawnFuture], None]:
@@ -6197,9 +6243,7 @@ class Supervisor:
                     cancellation_note=None,
                 ),
             )
-            attempt.future._callback = self._make_late_completion_callback(  # ruff: ignore[private-member-access]
-                job_id,
-            )
+            attempt.future.install_callback(self._make_late_completion_callback(job_id))
 
     @staticmethod
     def _abort_and_reap_late(gated: GatedSpawn, job_id: UUID) -> None:

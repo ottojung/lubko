@@ -24,6 +24,7 @@ from lubko.worker import (
     Supervisor,
     _spawn_result_from_tuple,
     _SpawnFuture,
+    _SpawnResult,
     _StartAttempt,
 )
 
@@ -433,6 +434,114 @@ def test_spawn_result_from_tuple_roundtrip() -> None:
     assert result.gate_fd == 7
     assert result.stdout_read_fd == 8
     assert result.stderr_read_fd == 9
+
+
+def test_callback_installation_atomic_with_completion() -> None:
+    """install_callback is atomic with future completion.
+
+    Regression: timeout observed done()=False, then spawn completed before
+    callback was installed, so set_result saw callback=None and the late
+    gated child was never cleaned up.  Every interleaving must invoke the
+    callback exactly once.
+    """
+    for _ in range(200):
+        future = _SpawnFuture(callback=None)
+        invoked: list[str] = []
+
+        def cb(_f: _SpawnFuture, inv: list[str] = invoked) -> None:
+            inv.append("cb")
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 1
+        result = _SpawnResult(
+            proc=fake_proc,
+            stdout_path=MagicMock(),
+            stderr_path=MagicMock(),
+            pgid=1,
+            gate_fd=-1,
+            stdout_read_fd=-1,
+            stderr_read_fd=-1,
+        )
+
+        def _install(
+            f: _SpawnFuture = future,
+            c: Any = cb,  # ruff: ignore[any-type]
+        ) -> None:
+            f.install_callback(c)
+
+        def _set(f: _SpawnFuture = future, r: _SpawnResult = result) -> None:
+            f.set_result(r)
+
+        installer = threading.Thread(target=_install)
+        setter = threading.Thread(target=_set)
+
+        installer.start()
+        setter.start()
+        installer.join()
+        setter.join()
+
+        assert len(invoked) == 1, f"callback invoked {len(invoked)} times (expected exactly 1)"
+
+
+def test_install_callback_already_done_invokes_immediately() -> None:
+    """install_callback on an already-done future invokes the callback immediately."""
+    future = _SpawnFuture(callback=None)
+    fake_proc = MagicMock()
+    fake_proc.pid = 1
+    future.set_result(
+        _SpawnResult(
+            proc=fake_proc,
+            stdout_path=MagicMock(),
+            stderr_path=MagicMock(),
+            pgid=1,
+            gate_fd=-1,
+            stdout_read_fd=-1,
+            stderr_read_fd=-1,
+        )
+    )
+
+    invoked: list[str] = []
+
+    def cb(_f: _SpawnFuture) -> None:
+        invoked.append("cb")
+
+    was_already_done = future.install_callback(cb)
+    assert was_already_done is True
+    assert invoked == ["cb"]
+
+
+def test_shutdown_drains_queue_and_cancels_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """shutdown() drains the queue and delivers OSError to every pending future."""
+    supervisor = _supervisor(_settings(spawn_deadline_seconds=300.0))
+
+    # Submit a blocking spawn that will never complete
+    blocker = _BlockingSpawn()
+    monkeypatch.setattr("lubko.worker.spawn_job", blocker)
+
+    job_id = uuid4()
+    future = _SpawnFuture(callback=None)
+    supervisor._spawn_pool.submit(job_id, blocker, future)
+
+    # Now shut down the pool
+    supervisor._spawn_pool.shutdown()
+
+    # The future must have been failed (drained from queue)
+    assert future.done()
+    result = future.result()
+    assert isinstance(result, OSError)
+    assert "shut down" in str(result)
+
+    # A new submit after shutdown must also fail immediately
+    future2 = _SpawnFuture(callback=None)
+    supervisor._spawn_pool.submit(uuid4(), blocker, future2)
+    assert future2.done()
+    result2 = future2.result()
+    assert isinstance(result2, OSError)
+
+    # The blocking spawn was never actually called
+    assert blocker.start_count == 0
 
 
 # ---------------------------------------------------------------------------
