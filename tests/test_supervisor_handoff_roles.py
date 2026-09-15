@@ -19,6 +19,7 @@ import os
 import select
 import subprocess
 import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
@@ -240,7 +241,7 @@ def test_probe_nonzero_exit_aborts_handoff() -> None:
     daemon._ownership_fd = -1
 
     process = MagicMock()
-    process.wait.return_value = 1  # nonzero exit
+    process.wait.return_value = 1
 
     ready_r, ready_w = os.pipe()
     os.close(ready_w)
@@ -277,7 +278,6 @@ def test_exec_in_place_retires_pidfile_before_exec(
         return os.getpid(), 12345
 
     exec_calls: list[tuple[str, list[str], dict[str, str]]] = []
-
     msg = "simulated exec failure"
 
     def _fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
@@ -357,13 +357,12 @@ def test_no_authority_overlap_at_probe_exec_boundary(
 ) -> None:
     """At no point during probe->exec does a second reconciler exist.
 
-    The probe exits before exec.  The exec'd image enters normal startup
-    only after the probe has fully exited and its lock fd copy is closed.
+    The probe exits before exec. The exec'd image enters normal startup only
+    after the probe has fully exited and its lock fd copy is closed.
     """
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
     daemon._ownership_fd = -1
-
     lifecycle_log: list[str] = []
 
     def _track_pidfile(_self: object) -> None:
@@ -395,7 +394,6 @@ def test_no_authority_overlap_at_probe_exec_boundary(
     monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
 
     daemon.run()
-
     os.close(ready_r)
 
     assert lifecycle_log == [
@@ -475,10 +473,8 @@ class _TopologyContext:
         Returns:
             The target process return code after bounded cleanup.
         """
-        try:
+        with suppress(OSError):
             os.write(self.release_w, b"G")
-        except OSError:
-            pass
         os.close(self.release_w)
         try:
             self.proc.wait(timeout=5.0)
