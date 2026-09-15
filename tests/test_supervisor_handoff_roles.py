@@ -12,9 +12,14 @@ Proves:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-from typing import TYPE_CHECKING
+import select
+import signal
+import sys
+from contextlib import suppress
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,9 +30,6 @@ from lubko.supervisor import (
     SupervisorDaemon,
     _HandoffPipes,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 @pytest.fixture
@@ -395,3 +397,127 @@ def test_no_authority_overlap_at_probe_exec_boundary(
         "preflight_start",
         "preflight_done",
     ], f"preflight must exit before pidfile/reconcile; log: {lifecycle_log}"
+
+
+# ---------------------------------------------------------------------------
+# Exec-in-place: real fork, real exec, real lock, identity continuity
+# ---------------------------------------------------------------------------
+
+
+def _exec_child_main(report_r: int, hold_w: int, target: str, target_commit: str) -> None:
+    """Child entry point: set up lock and exec into target."""
+    os.close(report_r)
+    os.close(hold_w)
+    os.environ["XDG_STATE_HOME"] = str(Path(target).parent / "state")
+    os.set_inheritable(int(os.environ["LUBKO_TEST_REPORT_FD"]), True)  # ruff: ignore[boolean-positional-value-in-call]
+    os.set_inheritable(int(os.environ["LUBKO_TEST_HOLD_FD"]), True)  # ruff: ignore[boolean-positional-value-in-call]
+    supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)
+    lock_fd = supervise.acquire_supervisor_lock()
+    ticks = supervise.proc_start_ticks(os.getpid())
+    if ticks is None:
+        report_fd = int(os.environ["LUBKO_TEST_REPORT_FD"])
+        os.write(report_fd, b'{"error": "no ticks"}\n')
+        os._exit(2)
+    supervise.write_supervisor_pid(os.getpid(), ticks)
+    result = SupervisorDaemon._exec_in_place(str(target), target_commit, lock_fd)
+    if result is False:
+        report_fd = int(os.environ["LUBKO_TEST_REPORT_FD"])
+        os.write(report_fd, b'{"error": "exec_in_place returned False"}\n')
+        os._exit(3)
+
+
+def test_exec_in_place_preserves_pid_lock_and_target_identity(  # ruff: ignore[too-many-statements,too-many-locals]
+    tmp_path: Path,
+) -> None:
+    """After exec-in-place the child holds the same lock and commit identity."""
+    target_commit = "abcdef1234567890abcdef1234567890abcdef12"
+    target = tmp_path / "exec-target"
+
+    target.write_text(
+        f"#!{sys.executable}\n"
+        "import fcntl, json, os\n"
+        'report_fd = int(os.environ["LUBKO_TEST_REPORT_FD"])\n'
+        'hold_fd = int(os.environ["LUBKO_TEST_HOLD_FD"])\n'
+        "lock_fd = int(os.environ['LUBKO_SUPERVISOR_HANDOFF_FD'])\n"
+        "lock_path = os.environ['LUBKO_SUPERVISOR_HANDOFF_PATH']\n"
+        "commit = os.environ['LUBKO_SUPERVISOR_HANDOFF_TARGET_COMMIT']\n"
+        "fd_stat = os.fstat(lock_fd)\n"
+        "report = json.dumps({\n"
+        '    "pid": os.getpid(),\n'
+        '    "lock_fd_open": True,\n'
+        '    "lock_path": lock_path,\n'
+        '    "target_commit": commit,\n'
+        '}) + "\\n"\n'
+        "os.write(report_fd, report.encode())\n"
+        "os.read(hold_fd, 1)\n",
+        encoding="utf-8",
+    )
+    target.chmod(0o700)
+
+    report_r, report_w = os.pipe()
+    hold_r, hold_w = os.pipe()
+
+    os.environ["LUBKO_TEST_REPORT_FD"] = str(report_w)
+    os.environ["LUBKO_TEST_HOLD_FD"] = str(hold_r)
+
+    child_pid = os.fork()
+
+    if child_pid == 0:
+        try:
+            _exec_child_main(report_r, hold_w, str(target), target_commit)
+        except OSError:
+            os._exit(4)
+    else:
+        child_reaped = False
+        try:
+            os.close(report_w)
+            os.close(hold_r)
+
+            ready, _, _ = select.select([report_r], [], [], 3.0)
+            assert ready, "child did not send report within 3s"
+            raw = os.read(report_r, 4096)
+            assert raw, "empty report from child"
+            report = json.loads(raw)
+            assert "error" not in report, report.get("error")
+
+            pid = report["pid"]
+            assert pid == child_pid, f"expected pid {child_pid}, got {pid}"
+            assert report["lock_fd_open"] is True
+            commit = report["target_commit"]
+            assert commit == target_commit, f"expected commit {target_commit}, got {commit}"
+            lock_path = report["lock_path"]
+
+            # Lock still held: second flock must fail.
+            lock_fd2 = os.open(lock_path, os.O_RDWR)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(lock_fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(lock_fd2)
+
+            # Release the child so it exits.
+            os.close(hold_w)
+            hold_w = -1
+
+            pid2, status = os.waitpid(child_pid, 0)
+            assert pid2 == child_pid
+            assert os.WIFEXITED(status)
+            assert os.WEXITSTATUS(status) == 0
+            child_reaped = True
+
+            # Lock now free.
+            lock_fd3 = os.open(lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(lock_fd3, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock_fd3, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd3)
+        finally:
+            os.close(report_r)
+            if hold_w >= 0:
+                os.close(hold_w)
+            if not child_reaped:
+                with suppress(ProcessLookupError):
+                    os.kill(child_pid, signal.SIGKILL)
+                with suppress(ChildProcessError):
+                    os.waitpid(child_pid, 0)
