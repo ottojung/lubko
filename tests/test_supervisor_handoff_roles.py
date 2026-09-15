@@ -110,7 +110,7 @@ def test_preflight_probe_exits_without_durable_writes(
     monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
 
     ready_r, ready_w = os.pipe()
-    os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    os.set_inheritable(ready_w, True)
     monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, str(ready_w))
     monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
 
@@ -131,11 +131,11 @@ def test_preflight_probe_signals_ready_and_closes_lock_fd(
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
     fd_r, fd_w = os.pipe()
-    os.set_inheritable(fd_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    os.set_inheritable(fd_w, True)
     daemon._ownership_fd = fd_r
 
     ready_r, ready_w = os.pipe()
-    os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    os.set_inheritable(ready_w, True)
 
     monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", lambda _self: None)
     monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", lambda _self: None)
@@ -180,7 +180,7 @@ def test_preflight_probe_exits_without_reconcile(
     monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
 
     ready_r, ready_w = os.pipe()
-    os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    os.set_inheritable(ready_w, True)
     monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, str(ready_w))
     monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
 
@@ -384,7 +384,7 @@ def test_no_authority_overlap_at_probe_exec_boundary(
     monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
 
     ready_r, ready_w = os.pipe()
-    os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    os.set_inheritable(ready_w, True)
     monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, str(ready_w))
     monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
 
