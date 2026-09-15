@@ -116,9 +116,12 @@ class _BlockingSpawn:
     def __init__(self) -> None:
         self._gate = threading.Event()
         self._start_count = 0
+        self._start_cond = threading.Condition()
 
     def __call__(self, *_args: object, **_kwargs: object) -> _SpawnTuple:
-        self._start_count += 1
+        with self._start_cond:
+            self._start_count += 1
+            self._start_cond.notify_all()
         self._gate.wait()
         fake_proc = MagicMock()
         fake_proc.pid = 99999
@@ -134,6 +137,22 @@ class _BlockingSpawn:
 
     def release(self) -> None:
         self._gate.set()
+
+    def wait_started(self, count: int = 1, timeout: float = 5.0) -> bool:
+        """Block until ``start_count >= count``.
+
+        Args:
+            count: Minimum number of starts to wait for.
+            timeout: Maximum seconds to block.
+
+        Returns:
+            ``True`` when the count was reached; ``False`` on timeout.
+        """
+        with self._start_cond:
+            return self._start_cond.wait_for(
+                lambda: self._start_count >= count,
+                timeout=timeout,
+            )
 
     @property
     def start_count(self) -> int:
@@ -178,7 +197,7 @@ def test_blocked_spawn_does_not_starve_unrelated_active_jobs(
 
     supervisor._tick(time.monotonic())
 
-    time.sleep(0.05)
+    assert blocker.wait_started(1), "spawn must have started"
 
     assert "svc" in calls, "_service_processes was called"
     assert "drain" in calls, "_drain_captures was called"
@@ -214,8 +233,8 @@ def test_spawn_deadline_fails_row_within_bounded_time(
     supervisor._tick(time.monotonic())
     assert len(supervisor._pending_starts) == 1
 
-    time.sleep(0.05)
-    supervisor._poll_pending_starts(time.monotonic())
+    assert blocker.wait_started(1), "spawn must have started"
+    supervisor._poll_pending_starts(time.monotonic() + 1.0)
 
     assert len(finalized) == 1, "the timed-out row was finalized"
     assert finalized[0][1] == "failed"
@@ -232,12 +251,14 @@ def test_late_spawn_completion_aborted_without_executing_user_code(
 
     finalized: list[UUID] = []
     aborted: list[UUID] = []
+    abort_done = threading.Event()
 
     def fake_finalize(jid: UUID, _result: object) -> None:
         finalized.append(jid)
 
     def fake_abort_late(_gated: object, jid: UUID) -> None:
         aborted.append(jid)
+        abort_done.set()
 
     monkeypatch.setattr("lubko.worker.spawn_job", blocker)
     monkeypatch.setattr(supervisor, "_finalize_immediate", fake_finalize)
@@ -254,12 +275,12 @@ def test_late_spawn_completion_aborted_without_executing_user_code(
     supervisor._tick(time.monotonic())
     assert len(supervisor._pending_starts) == 1
 
-    time.sleep(0.05)
-    supervisor._poll_pending_starts(time.monotonic())
+    assert blocker.wait_started(1), "spawn must have started"
+    supervisor._poll_pending_starts(time.monotonic() + 1.0)
     assert len(finalized) == 1, "the row was failed"
 
     blocker.release()
-    time.sleep(0.1)
+    assert abort_done.wait(timeout=5.0), "abort must have completed"
 
     assert len(aborted) >= 1, "the late GatedSpawn was aborted"
     assert blocker.start_count == 1
@@ -299,7 +320,7 @@ def test_later_job_progresses_past_blocked_start(
     assert len(supervisor._pending_starts) == 2
     assert job2_id in supervisor._pending_starts
 
-    time.sleep(0.05)
+    assert blocker.wait_started(2), "both spawns must have started"
 
     assert blocker.start_count == 2, "both spawns ran in separate pool threads"
 
@@ -438,7 +459,6 @@ def test_repeated_blocked_starts_cannot_grow_threads_without_bound() -> None:
         else:
             queue_admitted += 1
 
-    time.sleep(0.02)
     pool_threads_after = len(pool._threads)
     blocker.release()
     pool.shutdown()
@@ -649,7 +669,6 @@ def test_timed_out_callable_skipped_without_execution() -> None:
 
     gate.set()
     queue_executed.wait(timeout=1.0)
-    time.sleep(0.02)
 
     assert queue_executed.is_set(), "the non-cancelled queued callable ran"
     assert timed_out_future.done()
@@ -693,8 +712,8 @@ def test_real_timeout_cancels_queued_callable_and_frees_lane(
     job_id = next(iter(supervisor._pending_starts))
     future = supervisor._pending_starts[job_id].future
 
-    time.sleep(0.05)
-    supervisor._poll_pending_starts(time.monotonic())
+    assert blocker.wait_started(1), "spawn must have started"
+    supervisor._poll_pending_starts(time.monotonic() + 1.0)
 
     assert len(finalized) == 1, "the timed-out row was finalized"
     assert finalized[0][1] == "failed"
@@ -755,6 +774,7 @@ def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
     gate = threading.Event()
     cancelled_ran = threading.Event()
     sibling_ran = threading.Event()
+    sibling_done = threading.Event()
 
     pool = _RacingExecutor(num_lanes=1, queue_size=2)
 
@@ -767,6 +787,7 @@ def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
     def sibling_callable() -> _SpawnTuple:
         sibling_ran.set()
         gate.wait()
+        sibling_done.set()
         fake_proc = MagicMock()
         fake_proc.pid = 22222
         return (fake_proc, MagicMock(), MagicMock(), 22222, -1, -1, -1)
@@ -786,7 +807,7 @@ def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
     pool._claim_resume.set()
 
     gate.set()
-    time.sleep(0.2)
+    assert sibling_done.wait(timeout=5.0), "sibling callable must have completed"
 
     pool.shutdown()
 
