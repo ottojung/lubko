@@ -83,7 +83,6 @@ from typing import TYPE_CHECKING, Final, NamedTuple, override
 import psycopg
 
 from lubko import cli, deployctl, lifecycle, lifecycle_state, startup_contract, supervise
-from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
 from lubko._exact_signal import process_ppid as _shared_process_ppid
@@ -133,8 +132,18 @@ from lubko.supervise import (
 from lubko.toolchain import UvResolutionError, resolve_uv
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from lubko.lifecycle import ProcessIdentity, WorkerMeta
     from lubko.supervise import SupervisorState
+
+
+def _worker_mod() -> Any:
+    """Lazy-import lubko.worker to defer psycopg loading."""
+    from lubko import worker as mod
+
+    return mod
+
 
 LOGGER: Final = logging.getLogger(__name__)
 
@@ -608,8 +617,8 @@ def recover_owned_groups(incarnation: str) -> None:
         msg = f"cannot connect to recover owned groups for {incarnation}"
         raise OwnedGroupRecoveryError(msg) from exc
     try:
-        result = worker_mod.recover_owned_job_groups(
-            conn, incarnation, worker_mod.DEFAULT_CANCEL_GRACE_SECONDS
+        result = _worker_mod().recover_owned_job_groups(
+            conn, incarnation, _worker_mod().DEFAULT_CANCEL_GRACE_SECONDS
         )
     except psycopg.Error as exc:
         msg = f"error recovering owned groups for incarnation {incarnation}"
@@ -626,9 +635,7 @@ def recover_owned_groups(incarnation: str) -> None:
         )
 
 
-def _require_owned_group_recovery_converged(
-    result: worker_mod.ReclaimedGroups, incarnation: str
-) -> None:
+def _require_owned_group_recovery_converged(result: Any, incarnation: str) -> None:
     """Raise while any durable owned-group recovery obligation remains.
 
     Raises:
@@ -1519,7 +1526,7 @@ class SupervisorDaemon:
                 # emergency recovery is required; otherwise recovery is a durable
                 # blocking obligation — a DB/config/SQL failure must not let us
                 # spawn a replacement alongside stale groups.
-                if not (meta.token and worker_mod.drain_sentinel_matches(meta.token)):
+                if not (meta.token and _worker_mod().drain_sentinel_matches(meta.token)):
                     recover_owned_groups(meta.token or "")
         self._spawn_and_publish(commit)
 
@@ -1855,7 +1862,7 @@ class SupervisorDaemon:
         # durable blocking obligation: a DB/config/SQL failure or a surviving/
         # unresolved group raises, which preserves the retired child and prevents
         # spawning a replacement alongside stale groups.
-        if not (child.token and worker_mod.drain_sentinel_matches(child.token)):
+        if not (child.token and _worker_mod().drain_sentinel_matches(child.token)):
             recover_owned_groups(child.token)
         if self.proc is not None:
             with suppress(Exception):
@@ -1939,7 +1946,7 @@ class SupervisorDaemon:
         )
         child = state.child
         if child is not None and not (
-            child.token and worker_mod.drain_sentinel_matches(child.token)
+            child.token and _worker_mod().drain_sentinel_matches(child.token)
         ):
             try:
                 recover_owned_groups(child.token)

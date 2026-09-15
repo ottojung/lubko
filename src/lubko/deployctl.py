@@ -26,9 +26,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
-import psycopg
-from psycopg.rows import tuple_row
-
 from lubko import cli, lifecycle, lifecycle_state, startup_contract, supervise
 from lubko.config import load_database_config
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
@@ -1287,6 +1284,9 @@ def _current_queue_job_id() -> tuple[object | None, bool]:
     Raises:
         DeployCtlError: If the injected job cannot be validated.
     """
+    import psycopg
+    from psycopg.rows import tuple_row
+
     job_text = os.environ.get(JOB_ID_ENV)
     if job_text is None:
         return None, False
@@ -1398,6 +1398,9 @@ def _wait_for_durable_success(job_id: object, deadline: float) -> None:
     Raises:
         DeployCtlError: If the row cannot be trusted as durably succeeded.
     """
+    import psycopg
+    from psycopg.rows import tuple_row
+
     try:
         database = load_database_config()
     except (OSError, ValueError) as exc:
