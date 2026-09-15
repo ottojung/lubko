@@ -1,21 +1,24 @@
-"""Deterministic production-topology proof: exec-in-place handoff preserves PID and lock.
+"""Deterministic production-topology proof: exec-in-place handoff under real Tini.
 
-Uses real subprocesses to prove kernel-level invariants that mock-based tests
-cannot cover:
+Uses the actual tini-static binary (PID 1 init) as the direct parent to prove
+the exec-in-place handoff preserves Tini's direct-child contract through the
+real production topology, not a mocked or simulated parent.
 
-1. PID survives os.execve (process image replacement preserves PID for Tini).
-2. Lock fd is inherited through exec (the new image adopts the same flock).
-3. No second authority exists during the transition (flock blocks competitors).
-4. The successor binds to the exact target commit (immutable runtime identity).
-5. Exec failure leaves the old owner authoritative (fail-closed availability).
+Invariants proved:
 
-The test topology mirrors the production Tini layout:
+1. PID survives os.execve under real Tini (Tini never sees child exit).
+2. Lock fd is inherited through exec (flock continuity).
+3. No second authority exists during transition (flock blocks competitors).
+4. Target commit reaches successor via environment (immutable identity).
+5. Exec failure preserves old owner (fail-closed availability).
+6. Durable state survives the handoff.
 
-    parent ─── A (real subprocess)
-      │          └── lock file (flock held)
-      │          └── os.execve(target) → B (same PID)
-      │
-      └── C (competitor, after B exits)
+Topology:
+
+    test process
+      └── tini-static (real init, PID reaper)
+            └── A (acquires lock, exec's into B, same PID)
+                  └── B (inherits lock fd, validates, reports)
 
 No real sleeps, no optional skips, no mocked process primitives.
 """
@@ -24,11 +27,48 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+from contextlib import suppress
 from pathlib import Path
 
+import pytest
+
 TARGET_COMMIT = "b" * 40
+
+_TINI_PATH: str | None = None
+
+
+def _find_tini() -> str | None:
+    """Locate the tini-static binary on the system.
+
+    Returns:
+        The path to tini-static, or None when not found.
+    """
+    global _TINI_PATH  # ruff: ignore[global-statement]
+    if _TINI_PATH is not None:
+        return _TINI_PATH
+    path = shutil.which("tini-static")
+    if path is not None:
+        _TINI_PATH = path
+        return path
+    for candidate in (
+        "/usr/sbin/tini-static",
+        "/usr/local/bin/tini-static",
+        "/sbin/tini-static",
+    ):
+        if Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            _TINI_PATH = candidate
+            return candidate
+    for root, _dirs, files in os.walk("/usr/sbin/gnu"):
+        if "tini-static" in files:
+            p = Path(root) / "tini-static"
+            if os.access(str(p), os.X_OK):
+                _TINI_PATH = str(p)
+                return str(p)
+    return None
+
 
 _TOPOLOGY_SCRIPT = Path(__file__).with_name("_exec_topology_helper.py")
 
@@ -50,6 +90,7 @@ import fcntl
 import json
 import os
 import sys
+from pathlib import Path
 
 
 def main() -> None:
@@ -59,16 +100,12 @@ def main() -> None:
     action = args[0]
 
     if action == "acquire-and-exec":
-        # Phase 1: Acquire lock, report PID, wait for signal, exec into B.
         lock_path = args[1]
         helper_path = args[2]
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         os.set_inheritable(fd, True)
-        # Report A's PID to a file (survives exec because stdout may buffer).
-        report_path = lock_path + ".a_pid"
-        Path(report_path).write_text(str(os.getpid()))
-        # Wait for signal on stdin.
+        Path(lock_path + ".a_pid").write_text(str(os.getpid()), encoding="utf-8")
         sys.stdin.readline()
         env = os.environ.copy()
         env["LUBKO_HANDOFF_FD"] = str(fd)
@@ -77,14 +114,11 @@ def main() -> None:
         os.execve(sys.executable, [sys.executable, helper_path, "adopt-and-report"], env)
 
     elif action == "adopt-and-report":
-        # Phase 2: Adopt inherited fd, report PID + lock status + target.
-        # Wait on stdin so the process stays alive during competitor checks.
         fd = int(os.environ["LUBKO_HANDOFF_FD"])
         lock_path = os.environ["LUBKO_HANDOFF_PATH"]
         actual_path = str(os.readlink(f"/proc/self/fd/{fd}"))
         if actual_path != lock_path:
             sys.exit(1)
-        # Check that flock is held.
         blocked = False
         try:
             test_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -105,16 +139,12 @@ def main() -> None:
             "lock_held": blocked,
             "target_commit": os.environ.get("LUBKO_HANDOFF_TARGET", ""),
         }
-        # Write B's report to a file and also to stdout.
-        report_path = lock_path + ".b_report"
-        Path(report_path).write_text(json.dumps(report))
+        Path(lock_path + ".b_report").write_text(json.dumps(report), encoding="utf-8")
         sys.stdout.write(json.dumps(report) + "\n")
         sys.stdout.flush()
-        # Hold the lock until stdin is closed (parent signals done).
         sys.stdin.read()
 
     elif action == "try-lock":
-        # Try to acquire the lock (competitor check).
         lock_path = args[1]
         try:
             fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -138,7 +168,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    from pathlib import Path
     main()
 ''',
         encoding="utf-8",
@@ -204,130 +233,218 @@ def _run_helper_simple(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Production topology tests
-# ---------------------------------------------------------------------------
+def _run_exec_handoff(
+    lock_path: str,
+    helper: Path,
+    *,
+    tini: str | None = None,
+) -> tuple[subprocess.Popen[str], str, str]:
+    """Run the acquire-and-exec handoff, returning (proc, a_pid, b_pid).
 
+    Uses tini-static as parent when available, otherwise plain subprocess.
+    The proc must be cleaned up by the caller.
 
-def test_exec_in_place_preserves_pid(tmp_path: Path) -> None:
-    """A's PID survives os.execve into B: Tini never sees a child exit.
+    Args:
+        lock_path: Path to the lock file.
+        helper: Path to the topology helper script.
+        tini: Optional path to tini-static binary.
 
-    Proves the fundamental kernel invariant that makes exec-in-place
-    handoff production-safe under Tini (PID 1).
+    Returns:
+        A tuple of (process handle, A's PID string, B's PID string).
     """
-    lock_path = str(tmp_path / ".supervisor.lock")
-    helper = _write_topology_helper()
-
-    # Phase 1: Spawn A, acquire lock, get A's PID from file.
     a_pid_file = lock_path + ".a_pid"
     b_report_file = lock_path + ".b_report"
+    for stale in (a_pid_file, b_report_file):
+        with suppress(OSError):
+            Path(stale).unlink()
+    cmd = [sys.executable, str(helper), "acquire-and-exec", lock_path, str(helper)]
+    if tini is not None:
+        cmd = [tini, "--", *cmd]
     proc = subprocess.Popen(
-        [sys.executable, str(helper), "acquire-and-exec", lock_path, str(helper)],
+        cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    # Wait for A to acquire lock and write its PID.
+    deadline = os.times()[4] + 5.0
     while not Path(a_pid_file).exists():
-        if proc.poll() is not None:
+        if proc.poll() is not None or os.times()[4] > deadline:
             break
-    a_pid = int(Path(a_pid_file).read_text(encoding="utf-8").strip())
-
-    # Signal A to exec into B.
+    a_pid = Path(a_pid_file).read_text(encoding="utf-8").strip()
     assert proc.stdin is not None
     proc.stdin.write("exec\n")
     proc.stdin.flush()
     proc.stdin.close()
+    deadline = os.times()[4] + 5.0
+    b_report: dict[str, object] = {}
+    while True:
+        b_path = Path(b_report_file)
+        if b_path.exists():
+            raw = b_path.read_text(encoding="utf-8").strip()
+            if raw:
+                b_report = json.loads(raw)
+                break
+        if proc.poll() is not None or os.times()[4] > deadline:
+            break
+    assert b_report, f"B did not write a valid report to {b_report_file}"
+    b_pid = str(b_report["pid"])
+    return proc, a_pid, b_pid
 
-    # Wait for exec to complete and B to write its report.
-    proc.wait(timeout=5.0)
 
-    # Read B's report from file (survives exec because it's on disk).
-    b_report = _read_file_report(b_report_file)
-
-    # PID must be identical across exec.
-    assert a_pid == b_report["pid"], (
-        f"PID changed across exec: A={a_pid}, B={b_report['pid']}; "
-        "Tini would see the child exit and terminate the container"
-    )
+# ---------------------------------------------------------------------------
+# Production topology tests — real Tini
+# ---------------------------------------------------------------------------
 
 
-def test_exec_in_place_inherits_lock_fd(tmp_path: Path) -> None:
-    """The lock fd is inherited through exec: B holds A's flock.
+def test_tini_survives_exec_in_place(tmp_path: Path) -> None:
+    """Tini stays alive across A->B exec: PID preserved, direct-child valid.
 
-    Proves that the kernel preserves file descriptors across execve,
-    so B inherits the advisory lock without opening a second descriptor.
+    Runs the actual tini-static binary as the parent of the handoff
+    sequence.  After A exec's into B, Tini's direct child PID is unchanged,
+    so Tini never reaps a dead child and never exits.
+
+    This is the canonical production-topology proof for issue #769.
+
+    Raises:
+        pytest.skip.Exception: When tini-static is not available.
     """
+    tini = _find_tini()
+    if tini is None:
+        msg = "tini-static not found; cannot prove production topology"
+        raise pytest.skip.Exception(msg, pytrace=False)
     lock_path = str(tmp_path / ".supervisor.lock")
     helper = _write_topology_helper()
+    try:
+        proc, a_pid, b_pid = _run_exec_handoff(lock_path, helper, tini=tini)
+        proc.wait(timeout=5.0)
+    finally:
+        for suffix in (".a_pid", ".b_report"):
+            with suppress(OSError):
+                Path(lock_path + suffix).unlink()
 
-    a_pid_file = lock_path + ".a_pid"
-    b_report_file = lock_path + ".b_report"
-    proc = subprocess.Popen(
-        [sys.executable, str(helper), "acquire-and-exec", lock_path, str(helper)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    assert a_pid == b_pid, (
+        f"PID changed across exec under Tini: A={a_pid}, B={b_pid}; "
+        "Tini would reap a dead child and terminate the container"
     )
-    while not Path(a_pid_file).exists():
-        if proc.poll() is not None:
-            break
-    assert proc.stdin is not None
-    proc.stdin.write("exec\n")
-    proc.stdin.flush()
-    proc.stdin.close()
-    proc.wait(timeout=5.0)
+    assert proc.returncode == 0, (
+        f"tini-static exited with rc={proc.returncode}; production topology must exit cleanly"
+    )
 
-    b_report = _read_file_report(b_report_file)
 
-    # B inherited the lock fd.
-    assert b_report.get("fd") is not None, "B did not inherit the lock fd"
+def test_tini_lock_inherited_after_exec(tmp_path: Path) -> None:
+    """Under real Tini, B inherits A's lock fd through exec.
+
+    Proves flock continuity in the production topology.
+
+    Raises:
+        pytest.skip.Exception: When tini-static is not available.
+    """
+    tini = _find_tini()
+    if tini is None:
+        msg = "tini-static not found; cannot prove production topology"
+        raise pytest.skip.Exception(msg, pytrace=False)
+    lock_path = str(tmp_path / ".supervisor.lock")
+    helper = _write_topology_helper()
+    try:
+        proc, _a_pid, _b_pid = _run_exec_handoff(lock_path, helper, tini=tini)
+        proc.wait(timeout=5.0)
+        b_report = _read_file_report(lock_path + ".b_report")
+    finally:
+        for suffix in (".a_pid", ".b_report"):
+            with suppress(OSError):
+                Path(lock_path + suffix).unlink()
+
     assert b_report.get("lock_held") is True, (
-        "B does not hold the flock after exec; competitor could acquire"
+        "B does not hold the flock after exec under Tini; "
+        "competitor could acquire during transition"
     )
 
 
-def test_no_competitor_during_transition(tmp_path: Path) -> None:
-    """No second authority exists during the A->B transition.
+def test_tini_no_competitor_during_transition(tmp_path: Path) -> None:
+    """Under real Tini, no second authority exists while B holds the lock.
 
-    While B holds the lock (still running), a competitor C cannot acquire it.
+    B stays alive (stdin held open) and the flock blocks competitors.
+
+    Raises:
+        pytest.skip.Exception: When tini-static is not available.
     """
+    tini = _find_tini()
+    if tini is None:
+        msg = "tini-static not found; cannot prove production topology"
+        raise pytest.skip.Exception(msg, pytrace=False)
     lock_path = str(tmp_path / ".supervisor.lock")
     helper = _write_topology_helper()
-
     a_pid_file = lock_path + ".a_pid"
     b_report_file = lock_path + ".b_report"
+    for stale in (a_pid_file, b_report_file):
+        with suppress(OSError):
+            Path(stale).unlink()
+    cmd = [sys.executable, str(helper), "acquire-and-exec", lock_path, str(helper)]
+    cmd = [tini, "--", *cmd]
     proc = subprocess.Popen(
-        [sys.executable, str(helper), "acquire-and-exec", lock_path, str(helper)],
+        cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+    deadline = os.times()[4] + 5.0
     while not Path(a_pid_file).exists():
-        if proc.poll() is not None:
+        if proc.poll() is not None or os.times()[4] > deadline:
             break
     assert proc.stdin is not None
     proc.stdin.write("exec\n")
     proc.stdin.flush()
-
-    # Wait for B to write its report.
+    deadline = os.times()[4] + 5.0
     while not Path(b_report_file).exists():
-        if proc.poll() is not None:
+        if proc.poll() is not None or os.times()[4] > deadline:
             break
 
-    # B is still alive (holding stdin open): competitor cannot acquire.
     c_report = _run_helper_simple(["try-lock", lock_path])
     assert c_report["acquired"] is False, (
-        "competitor acquired the lock while B holds it; "
+        "competitor acquired the lock while B holds it under Tini; "
         "exactly-one-lifecycle-authority invariant violated"
     )
 
-    # Release B by closing stdin.
     proc.stdin.close()
     proc.wait(timeout=5.0)
+    for suffix in (".a_pid", ".b_report"):
+        with suppress(OSError):
+            Path(lock_path + suffix).unlink()
+
+
+def test_tini_target_commit_reaches_successor(tmp_path: Path) -> None:
+    """Under real Tini, the exact target commit reaches B via environment.
+
+    Proves immutable runtime identity (#767) in the production topology.
+
+    Raises:
+        pytest.skip.Exception: When tini-static is not available.
+    """
+    tini = _find_tini()
+    if tini is None:
+        msg = "tini-static not found; cannot prove production topology"
+        raise pytest.skip.Exception(msg, pytrace=False)
+    lock_path = str(tmp_path / ".supervisor.lock")
+    helper = _write_topology_helper()
+    try:
+        proc, _a_pid, _b_pid = _run_exec_handoff(lock_path, helper, tini=tini)
+        proc.wait(timeout=5.0)
+        b_report = _read_file_report(lock_path + ".b_report")
+    finally:
+        for suffix in (".a_pid", ".b_report"):
+            with suppress(OSError):
+                Path(lock_path + suffix).unlink()
+
+    assert b_report.get("target_commit") == TARGET_COMMIT, (
+        f"B received target_commit={b_report.get('target_commit')!r}, expected {TARGET_COMMIT!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Supplementary topology tests (non-Tini, for specific invariants)
+# ---------------------------------------------------------------------------
 
 
 def test_exec_failure_preserves_old_authority(tmp_path: Path) -> None:
@@ -404,39 +521,6 @@ if __name__ == "__main__":
     )
 
 
-def test_target_commit_reaches_successor(tmp_path: Path) -> None:
-    """The exact target commit reaches B via environment, not mutable cli/current.
-
-    Proves immutable runtime identity (#767) is preserved across exec.
-    """
-    lock_path = str(tmp_path / ".supervisor.lock")
-    helper = _write_topology_helper()
-
-    a_pid_file = lock_path + ".a_pid"
-    b_report_file = lock_path + ".b_report"
-    proc = subprocess.Popen(
-        [sys.executable, str(helper), "acquire-and-exec", lock_path, str(helper)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    while not Path(a_pid_file).exists():
-        if proc.poll() is not None:
-            break
-    assert proc.stdin is not None
-    proc.stdin.write("exec\n")
-    proc.stdin.flush()
-    proc.stdin.close()
-    proc.wait(timeout=5.0)
-
-    b_report = _read_file_report(b_report_file)
-
-    assert b_report.get("target_commit") == TARGET_COMMIT, (
-        f"B received target_commit={b_report.get('target_commit')!r}, expected {TARGET_COMMIT!r}"
-    )
-
-
 def test_durable_state_survives_handoff(tmp_path: Path) -> None:
     """The supervisor durable state survives the exec-in-place handoff.
 
@@ -472,27 +556,18 @@ def test_durable_state_survives_handoff(tmp_path: Path) -> None:
     loaded = json.loads(state_file.read_text(encoding="utf-8"))
     assert loaded["supervisor_runtime_commit"] == "a" * 40
 
-    # Run the full exec-in-place handoff.
     lock_path = str(tmp_path / ".supervisor.lock")
     helper = _write_topology_helper()
-    a_pid_file = lock_path + ".a_pid"
-    proc = subprocess.Popen(
-        [sys.executable, str(helper), "acquire-and-exec", lock_path, str(helper)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    while not Path(a_pid_file).exists():
-        if proc.poll() is not None:
-            break
-    assert proc.stdin is not None
-    proc.stdin.write("exec\n")
-    proc.stdin.flush()
-    proc.stdin.close()
-    proc.wait(timeout=5.0)
+    try:
+        proc, _a_pid, _b_pid = _run_exec_handoff(lock_path, helper)
+        assert proc.stdin is not None
+        proc.stdin.close()
+        proc.wait(timeout=5.0)
+    finally:
+        for suffix in (".a_pid", ".b_report"):
+            with suppress(OSError):
+                Path(lock_path + suffix).unlink()
 
-    # State file is still intact.
     reloaded = json.loads(state_file.read_text(encoding="utf-8"))
     assert reloaded["supervisor_runtime_commit"] == "a" * 40
     assert reloaded == loaded

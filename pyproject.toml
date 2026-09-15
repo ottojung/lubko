@@ -121,22 +121,6 @@ convention = "google"
     "private-member-access",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
-    "boolean-positional-value-in-call",
-    "bad-file-permissions",
-    "start-process-with-no-shell",
-    "start-process-with-partial-path",
-]
-"tests/_exec_topology_helper.py" = [
-    "complex-structure",
-    "too-many-branches",
-    "too-many-statements",
-    "boolean-positional-value-in-call",
-    "unspecified-encoding",
-    "start-process-with-no-shell",
-    "os-readlink",
-    "too-many-statements-in-try-clause",
-    "shebang-missing-executable-file",
-    "unsorted-imports",
 ]
 
 [tool.ruff.format]
