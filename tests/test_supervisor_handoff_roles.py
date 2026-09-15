@@ -12,9 +12,12 @@ Proves:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-from typing import TYPE_CHECKING
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,9 +28,6 @@ from lubko.supervisor import (
     SupervisorDaemon,
     _HandoffPipes,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 @pytest.fixture
@@ -395,3 +395,100 @@ def test_no_authority_overlap_at_probe_exec_boundary(
         "preflight_start",
         "preflight_done",
     ], f"preflight must exit before pidfile/reconcile; log: {lifecycle_log}"
+
+
+# ---------------------------------------------------------------------------
+# Real-exec invariant: PID survives, lock fd open, flock exclusive, commit exact
+# ---------------------------------------------------------------------------
+
+
+def test_exec_in_place_real_exec_invariants(tmp_path: Path) -> None:
+    """One subprocess proves invariants through real _exec_in_place.
+
+    (1) Exec target PID matches the Popen pid (PID survives exec).
+    (2) Inherited lock fd is open in the exec target.
+    (3) A competing non-blocking flock from the parent raises BlockingIOError.
+    (4) HANDOFF_TARGET_COMMIT_ENV in the exec target is the exact commit.
+    (5) Parent can re-acquire the lock after the target exits.
+    """
+    target_commit = "abcdef1234567890abcdef1234567890abcdef12"
+    state_dir = tmp_path / "state"
+    target_script = tmp_path / "target.py"
+    helper_script = tmp_path / "helper.py"
+
+    target_script.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "fd = int(os.environ['LUBKO_SUPERVISOR_HANDOFF_FD'])\n"
+        "lock_path = os.environ['LUBKO_SUPERVISOR_HANDOFF_PATH']\n"
+        "commit = os.environ['LUBKO_SUPERVISOR_HANDOFF_TARGET_COMMIT']\n"
+        "fd_open = True\n"
+        "try:\n"
+        "    os.fstat(fd)\n"
+        "except OSError:\n"
+        "    fd_open = False\n"
+        "os.write(1, json.dumps({\n"
+        "    'pid': os.getpid(),\n"
+        "    'lock_fd_open': fd_open,\n"
+        "    'lock_path': lock_path,\n"
+        "    'target_commit': commit,\n"
+        "}).encode() + b'\\n')\n"
+        "sys.stdin.readline()\n",
+        encoding="utf-8",
+    )
+    target_script.chmod(0o700)
+
+    src_dir = repr(str(Path(__file__).resolve().parent.parent / "src"))
+    helper_script.write_text(
+        "import os, sys\n"
+        "sys.path.insert(0, " + src_dir + ")\n"
+        "from lubko import supervise\n"
+        "from lubko.supervisor import SupervisorDaemon\n"
+        "os.environ['XDG_STATE_HOME'] = " + repr(str(state_dir)) + "\n"
+        "supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)\n"
+        "fd = supervise.acquire_supervisor_lock()\n"
+        "ticks = supervise.proc_start_ticks(os.getpid())\n"
+        "if ticks is None:\n"
+        "    raise RuntimeError('proc_start_ticks returned None')\n"
+        "supervise.write_supervisor_pid(os.getpid(), ticks)\n"
+        "SupervisorDaemon._exec_in_place(\n"
+        "    target=" + repr(str(target_script)) + ",\n"
+        "    confirmed=" + repr(target_commit) + ",\n"
+        "    ownership_fd=fd,\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, str(helper_script)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    line = proc.stdout.readline()
+    assert line, (
+        f"exec target produced no stdout; stderr: {proc.stderr.read().decode(errors='replace')!r}"
+    )
+    report = json.loads(line)
+
+    assert report["pid"] == proc.pid, "exec target PID must equal the Popen PID"
+    assert report["lock_fd_open"], "inherited supervisor lock fd must still be open"
+    assert report["target_commit"] == target_commit, "target commit must match exactly"
+
+    lock_fd = os.open(report["lock_path"], os.O_RDONLY)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(lock_fd)
+
+    proc.stdin.close()
+    proc.wait(timeout=5)
+    assert proc.returncode == 0
+
+    after_fd = supervise.acquire_supervisor_lock()
+    os.close(after_fd)
