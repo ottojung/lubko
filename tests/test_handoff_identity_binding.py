@@ -302,21 +302,14 @@ def test_status_reports_bound_runtime_commit(
     daemon._runtime_commit = TARGET_COMMIT
     daemon._start_time_ticks = 42
 
-    monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", lambda _s: None)
-    monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", lambda _s: None)
-    monkeypatch.setattr(SupervisorDaemon, "_invalidate_stale_status", lambda _s: None)
-    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", lambda: None)
-    monkeypatch.setattr(SupervisorDaemon, "_install_signal_handlers", lambda _s: None)
-    monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
+    captured: list[supervise.SupervisorStatus] = []
+    monkeypatch.setattr("lubko.supervisor.write_status", captured.append)
+    monkeypatch.setattr("lubko.lifecycle.check_postgres", lambda _timeout: True)
 
     daemon._write_status()
 
-    # read_status may return None if pid liveness check fails in test env;
-    # instead check the written file directly.
-    status_path = supervise.status_path()
-    if status_path.exists():
-        raw = json.loads(status_path.read_text(encoding="utf-8"))
-        assert raw.get("supervisor_runtime_commit") == TARGET_COMMIT
+    assert len(captured) == 1
+    assert captured[0].supervisor_runtime_commit == TARGET_COMMIT
 
 
 # ------------------------------------------------------------------
