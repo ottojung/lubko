@@ -1186,6 +1186,12 @@ HANDOFF_TRANSFER_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_TRANSFER_FD"
 #: preparation mode: initialize, signal readiness, wait for transfer, then
 #: enter the normal reconcile loop.  Absent in normal startup.
 HANDOFF_MODE_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_MODE"
+#: Environment variable carrying the exact target commit the old supervisor
+#: resolved for the successor.  The successor binds its runtime identity to
+#: this commit rather than re-deriving from mutable ``cli/current``, closing
+#: a window where ``cli/current`` could change between target selection and
+#: successor construction.
+HANDOFF_TARGET_COMMIT_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_TARGET_COMMIT"
 
 
 def adopt_supervisor_lock(fd_number: int, expected_path: str) -> int:
