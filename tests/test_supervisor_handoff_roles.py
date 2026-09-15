@@ -1,14 +1,13 @@
-"""Regression tests for the two-phase handoff role separation.
+"""Regression tests for the exec-in-place handoff architecture.
 
 Proves:
-- B (successor) exits before durable writes on handoff failure.
-- B (successor) writes durable state only after successful protocol.
-- A (old) returns from run() after reconcile when _handoff_completed,
-  before _write_status, sleep, or _shutdown.
-- A retires its pidfile before sending TRANSFER.
-- Failed TRANSFER restores A's pidfile.
-- READY failure/timeout/EOF closes all pipe fds and reaps B.
-- retire_supervisor_pid() failure closes all pipe fds and reaps B.
+- Preflight probe validates lock, signals READY, exits before any durable write.
+- Preflight probe never enters reconcile, never writes pidfile/status/state.
+- A retires its pidfile before exec-in-place.
+- Failed exec restores A's pidfile and continues.
+- READY failure kills/reaps probe and aborts handoff.
+- Probe nonzero exit kills/reaps and aborts handoff.
+- No second lifecycle authority exists at any handoff boundary.
 """
 
 from __future__ import annotations
@@ -59,266 +58,158 @@ def _noop_signals(_self: object) -> None:
     pass
 
 
-@pytest.mark.usefixtures("_state_dir")
-def test_b_failure_exits_before_durable_writes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When handoff protocol fails, B returns from run() without any durable write."""
-    _write_fresh_state()
-    daemon = SupervisorDaemon(Settings())
-
-    writes: list[str] = []
-
-    def _track_pidfile(_self: object) -> None:
-        writes.append("pidfile")
-
-    def _track_runtime(_self: object) -> None:
-        writes.append("runtime")
-
-    def _track_status(_self: object, *_args: object) -> None:
-        writes.append("status")
-
-    monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", _track_pidfile)
-    monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", _track_runtime)
-    monkeypatch.setattr(SupervisorDaemon, "_write_status", _track_status)
-    monkeypatch.setattr(SupervisorDaemon, "_invalidate_stale_status", _noop_invalidate)
-    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", _noop_normalize)
-    monkeypatch.setattr(SupervisorDaemon, "_install_signal_handlers", _noop_signals)
-    monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
-    monkeypatch.setattr(
-        SupervisorDaemon,
-        "_in_handoff_mode",
-        staticmethod(lambda: True),
-    )
-    monkeypatch.setattr(
-        SupervisorDaemon,
-        "_run_handoff_protocol",
-        lambda _self: False,
-    )
-
-    daemon.run()
-
-    assert writes == []
+# ---------------------------------------------------------------------------
+# Preflight probe: must touch NO durable-write or reconcile hooks
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_b_success_proceeds_to_durable_writes(
+def test_preflight_probe_exits_without_durable_writes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When handoff protocol succeeds, B writes pidfile and runtime_commit."""
-    _write_fresh_state()
-    daemon = SupervisorDaemon(Settings())
-    daemon._stopping = True
+    """Preflight probe validates lock, signals READY, and returns.
 
-    writes: list[str] = []
-
-    def _track_pidfile(_self: object) -> None:
-        writes.append("pidfile")
-
-    def _track_runtime(_self: object) -> None:
-        writes.append("runtime")
-
-    monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", _track_pidfile)
-    monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", _track_runtime)
-    monkeypatch.setattr(SupervisorDaemon, "_invalidate_stale_status", _noop_invalidate)
-    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", _noop_normalize)
-    monkeypatch.setattr(SupervisorDaemon, "_install_signal_handlers", _noop_signals)
-    monkeypatch.setattr(SupervisorDaemon, "_write_status", lambda _self, *_a: None)
-    monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
-    monkeypatch.setattr(
-        SupervisorDaemon,
-        "_in_handoff_mode",
-        staticmethod(lambda: True),
-    )
-    monkeypatch.setattr(
-        SupervisorDaemon,
-        "_run_handoff_protocol",
-        lambda _self: True,
-    )
-
-    daemon.run()
-
-    assert "pidfile" in writes
-    assert "runtime" in writes
-
-
-@pytest.mark.usefixtures("_state_dir")
-def test_a_handoff_completed_returns_before_status_sleep_shutdown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """After reconcile sets _handoff_completed, run() returns immediately."""
+    Must return before ANY durable write, status write, normalization,
+    signal handler, or reconcile call.
+    """
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
     daemon._ownership_fd = -1
 
-    calls: list[str] = []
+    touched: list[str] = []
 
-    def _fake_reconcile(_self: object, _now: float) -> None:
-        daemon._handoff_completed = True
+    def _track_pidfile(_self: object) -> None:
+        touched.append("pidfile")
+
+    def _track_runtime(_self: object) -> None:
+        touched.append("runtime_commit")
 
     def _track_status(_self: object, *_args: object) -> None:
-        calls.append("write_status")
+        touched.append("status")
 
-    def _track_sleep(_seconds: float) -> None:
-        calls.append("sleep")
+    def _track_normalize() -> None:
+        touched.append("normalize")
+
+    def _track_signals(_self: object) -> None:
+        touched.append("signals")
+
+    def _track_reconcile(_self: object, _now: float) -> None:
+        touched.append("reconcile")
 
     def _track_shutdown(_self: object) -> None:
-        calls.append("shutdown")
+        touched.append("shutdown")
 
-    monkeypatch.setattr(SupervisorDaemon, "reconcile", _fake_reconcile)
+    monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", _track_pidfile)
+    monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", _track_runtime)
     monkeypatch.setattr(SupervisorDaemon, "_write_status", _track_status)
+    monkeypatch.setattr(SupervisorDaemon, "_invalidate_stale_status", _noop_invalidate)
+    monkeypatch.setattr(SupervisorDaemon, "reconcile", _track_reconcile)
     monkeypatch.setattr(SupervisorDaemon, "_shutdown", _track_shutdown)
-    monkeypatch.setattr("lubko.supervisor.time.sleep", _track_sleep)
+    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", _track_normalize)
+    monkeypatch.setattr(SupervisorDaemon, "_install_signal_handlers", _track_signals)
     monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
+
+    ready_r, ready_w = os.pipe()
+    os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, str(ready_w))
+    monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
+
+    daemon.run()
+
+    os.close(ready_r)
+
+    assert touched == [], (
+        f"preflight probe must not touch any durable-write or reconcile hooks; touched: {touched}"
+    )
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_preflight_probe_signals_ready_and_closes_lock_fd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r"""Preflight probe writes R\n on the readiness pipe and closes its lock fd."""
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    fd_r, fd_w = os.pipe()
+    os.set_inheritable(fd_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    daemon._ownership_fd = fd_r
+
+    ready_r, ready_w = os.pipe()
+    os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+
     monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", lambda _self: None)
     monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", lambda _self: None)
     monkeypatch.setattr(SupervisorDaemon, "_invalidate_stale_status", _noop_invalidate)
-    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", _noop_normalize)
     monkeypatch.setattr(SupervisorDaemon, "_install_signal_handlers", _noop_signals)
+    monkeypatch.setattr(SupervisorDaemon, "_write_status", lambda _self, *_a: None)
+    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", _noop_normalize)
+    monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
 
-    daemon._handoff_completed = False
-    daemon._stopping = False
+    monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, str(ready_w))
+    monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
+
     daemon.run()
 
-    assert "shutdown" not in calls
-    assert "sleep" not in calls
-    assert calls.count("write_status") <= 1
+    buf = os.read(ready_r, 16)
+    os.close(ready_r)
+    assert buf == b"R\n", f"probe must signal READY; got {buf!r}"
+    assert daemon._ownership_fd is None, "probe must close its lock fd copy"
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_a_retires_pidfile_before_transfer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A retires its own pidfile before sending TRANSFER.
-
-    Regression: before this fix, A's pidfile survived until A exited, so B's
-    _write_pidfile() could see A's live pid and raise SystemExit.
-    """
-    _write_fresh_state()
-    daemon = SupervisorDaemon(Settings())
-    daemon._ownership_fd = -1
-
-    pidfile_removed: list[bool] = []
-
-    def _fake_retire() -> tuple[int, int]:
-        pidfile_removed.append(True)
-        return os.getpid(), 12345
-
-    monkeypatch.setattr("lubko.supervise.retire_supervisor_pid", _fake_retire)
-    monkeypatch.setattr(
-        "lubko.supervise.restore_supervisor_pid",
-        lambda _pid, _ticks: None,
-    )
-    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
-
-    original_close = os.close
-    original_write = os.write
-
-    def _safe_close(fd: int) -> None:
-        if fd >= 0:
-            original_close(fd)
-
-    def _track_transfer_write(fd: int, data: bytes) -> int:
-        assert pidfile_removed, "pidfile should be retired before TRANSFER write"
-        return original_write(fd, data)
-
-    monkeypatch.setattr("lubko.supervisor.os.write", _track_transfer_write)
-    monkeypatch.setattr("lubko.supervisor.os.close", _safe_close)
-
-    transfer_r, transfer_w = os.pipe()
-    pipes = _HandoffPipes(ready_r=-1, transfer_r=transfer_r, transfer_w=transfer_w)
-    daemon._send_handoff_transfer(
-        process=__import__("subprocess").Popen(["true"]),
-        pipes=pipes,
-        confirmed="b" * 40,
-        ownership_fd=-1,
-    )
-
-
-@pytest.mark.usefixtures("_state_dir")
-def test_failed_transfer_restores_pidfile(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Failed TRANSFER write restores A's pidfile.
-
-    Regression: before this fix, a failed TRANSFER left A without a pidfile,
-    making A undiscoverable by CLIs.
-    """
-    _write_fresh_state()
-    daemon = SupervisorDaemon(Settings())
-    daemon._ownership_fd = -1
-
-    restored_pid: list[tuple[int, int]] = []
-
-    def _fake_retire() -> tuple[int, int]:
-        return os.getpid(), 12345
-
-    def _fake_restore(pid: int, ticks: int) -> None:
-        restored_pid.append((pid, ticks))
-
-    monkeypatch.setattr("lubko.supervise.retire_supervisor_pid", _fake_retire)
-    monkeypatch.setattr("lubko.supervise.restore_supervisor_pid", _fake_restore)
-
-    msg = "transfer pipe broken"
-
-    def _fail_transfer_write(_fd: int, _data: bytes) -> int:
-        raise OSError(msg)
-
-    monkeypatch.setattr("lubko.supervisor.os.write", _fail_transfer_write)
-    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
-
-    original_close = os.close
-
-    def _safe_close(fd: int) -> None:
-        if fd >= 0:
-            original_close(fd)
-
-    monkeypatch.setattr("lubko.supervisor.os.close", _safe_close)
-
-    transfer_r, transfer_w = os.pipe()
-    pipes = _HandoffPipes(ready_r=-1, transfer_r=transfer_r, transfer_w=transfer_w)
-    daemon._send_handoff_transfer(
-        process=__import__("subprocess").Popen(["true"]),
-        pipes=pipes,
-        confirmed="b" * 40,
-        ownership_fd=-1,
-    )
-
-    assert restored_pid, "pidfile should be restored after failed TRANSFER"
-    assert restored_pid[0] == (os.getpid(), 12345)
-
-
-@pytest.mark.usefixtures("_state_dir")
-def test_ready_failure_closes_all_pipes_and_reaps_b(
+def test_preflight_probe_exits_without_reconcile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """READY failure/timeout/EOF closes all pipe fds and reaps B.
-
-    Regression: before this fix, _await_handoff_ready leaked transfer_r
-    and transfer_w on abort, and did not close them when B was already
-    spawned.
-    """
+    """Preflight probe returns from run() before the reconcile loop starts."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
     daemon._ownership_fd = -1
 
-    closed_fds: list[int] = []
+    reconcile_calls: list[str] = []
 
-    original_close = os.close
+    def _track_reconcile(_self: object, _now: float) -> None:
+        reconcile_calls.append("reconcile")
 
-    def _track_close(fd: int) -> None:
-        closed_fds.append(fd)
-        if fd >= 0:
-            original_close(fd)
+    monkeypatch.setattr(SupervisorDaemon, "reconcile", _track_reconcile)
+    monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", lambda _self: None)
+    monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", lambda _self: None)
+    monkeypatch.setattr(SupervisorDaemon, "_invalidate_stale_status", _noop_invalidate)
+    monkeypatch.setattr(SupervisorDaemon, "_install_signal_handlers", _noop_signals)
+    monkeypatch.setattr(SupervisorDaemon, "_write_status", lambda _self, *_a: None)
+    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", _noop_normalize)
+    monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
+
+    ready_r, ready_w = os.pipe()
+    os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, str(ready_w))
+    monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
+
+    daemon.run()
+
+    os.close(ready_r)
+    assert reconcile_calls == [], "preflight must never enter reconcile loop"
+
+
+# ---------------------------------------------------------------------------
+# READY failure: probe must be killed/reaped, handoff aborted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_ready_failure_kills_probe_and_aborts_handoff() -> None:
+    """When the probe does not signal READY, A kills/reaps it and aborts."""
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = -1
 
     process = MagicMock()
     process.wait.return_value = 0
 
-    monkeypatch.setattr("lubko.supervisor.os.close", _track_close)
-    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
-
     ready_r, ready_w = os.pipe()
     os.close(ready_w)
-    transfer_r, transfer_w = os.pipe()
-    pipes = _HandoffPipes(ready_r=ready_r, transfer_r=transfer_r, transfer_w=transfer_w)
+    pipes = _HandoffPipes(ready_r=ready_r)
 
-    result = daemon._await_handoff_ready(
+    result = daemon._await_probe_ready(
         process=process,
         pipes=pipes,
         confirmed="b" * 40,
@@ -328,55 +219,179 @@ def test_ready_failure_closes_all_pipes_and_reaps_b(
     assert result is False
     process.kill.assert_called_once()
     process.wait.assert_called_once()
-    assert transfer_r in closed_fds, "transfer_r should be closed"
-    assert transfer_w in closed_fds, "transfer_w should be closed"
+
+
+# ---------------------------------------------------------------------------
+# Probe nonzero exit: must be killed/reaped, handoff aborted
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_retire_pidfile_failure_closes_all_pipes_and_reaps_b(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """retire_supervisor_pid() failure closes all pipe fds and reaps B.
-
-    Regression: before this fix, _send_handoff_transfer leaked transfer_r,
-    transfer_w, and left B stuck when retire_supervisor_pid() failed.
-    """
+def test_probe_nonzero_exit_aborts_handoff() -> None:
+    """When the probe exits with rc != 0 after READY, handoff is aborted."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
     daemon._ownership_fd = -1
 
-    closed_fds: list[int] = []
-
-    original_close = os.close
-
-    def _track_close(fd: int) -> None:
-        closed_fds.append(fd)
-        if fd >= 0:
-            original_close(fd)
-
     process = MagicMock()
-    process.wait.return_value = 0
+    process.wait.return_value = 1
 
-    msg = "pidfile mismatch"
+    ready_r, ready_w = os.pipe()
+    os.write(ready_w, b"R\n")
+    os.close(ready_w)
+    pipes = _HandoffPipes(ready_r=ready_r)
 
-    def _fail_retire() -> tuple[int, int]:
-        raise supervise.PidfileIdentityMismatchError(msg)
-
-    monkeypatch.setattr("lubko.supervise.retire_supervisor_pid", _fail_retire)
-    monkeypatch.setattr("lubko.supervisor.os.close", _track_close)
-    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
-
-    transfer_r, transfer_w = os.pipe()
-    pipes = _HandoffPipes(ready_r=-1, transfer_r=transfer_r, transfer_w=transfer_w)
-
-    daemon._send_handoff_transfer(
+    result = daemon._await_probe_ready(
         process=process,
         pipes=pipes,
         confirmed="b" * 40,
         ownership_fd=-1,
     )
 
-    process.kill.assert_called_once()
-    process.wait.assert_called_once()
-    assert transfer_r in closed_fds, "transfer_r should be closed"
-    assert transfer_w in closed_fds, "transfer_w should be closed"
+    assert result is False, "nonzero probe exit must abort handoff"
+    assert "failed (rc=1)" in daemon._message  # type: ignore[operator]
+
+
+# ---------------------------------------------------------------------------
+# Exec-in-place: pidfile retired before exec, exec uses os.execve
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_exec_in_place_retires_pidfile_before_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retires its own pidfile before exec-in-place."""
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = -1
+
+    retired: list[bool] = []
+
+    def _fake_retire() -> tuple[int, int]:
+        retired.append(True)
+        return os.getpid(), 12345
+
+    exec_calls: list[tuple[str, list[str], dict[str, str]]] = []
+    msg = "simulated exec failure"
+
+    def _fake_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        exec_calls.append((path, argv, env))
+        raise OSError(msg)
+
+    monkeypatch.setattr("lubko.supervise.retire_supervisor_pid", _fake_retire)
+    monkeypatch.setattr(
+        "lubko.supervise.restore_supervisor_pid",
+        lambda _pid, _ticks: None,
+    )
+    monkeypatch.setattr("lubko.supervisor.os.execve", _fake_execve)
+    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
+
+    result = daemon._exec_in_place(
+        target="/fake/target",
+        confirmed="b" * 40,
+        ownership_fd=-1,
+    )
+
+    assert result is False
+    assert retired, "pidfile must be retired before exec"
+    assert len(exec_calls) == 1, "execve must be called exactly once"
+    path, argv, env = exec_calls[0]
+    assert path == "/fake/target"
+    assert argv == ["/fake/target"]
+    assert env[supervise.HANDOFF_FD_ENV] == str(-1)
+    assert env[supervise.HANDOFF_TARGET_COMMIT_ENV] == "b" * 40
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_exec_failure_restores_pidfile_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When os.execve fails, A restores its pidfile and continues."""
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = -1
+
+    restored: list[tuple[int, int]] = []
+
+    def _fake_retire() -> tuple[int, int]:
+        return os.getpid(), 12345
+
+    def _fake_restore(pid: int, ticks: int) -> None:
+        restored.append((pid, ticks))
+
+    fail_msg = "exec failed"
+
+    def _fail_execve(_path: str, _argv: list[str], _env: dict[str, str]) -> None:
+        raise OSError(fail_msg)
+
+    monkeypatch.setattr("lubko.supervise.retire_supervisor_pid", _fake_retire)
+    monkeypatch.setattr("lubko.supervise.restore_supervisor_pid", _fake_restore)
+    monkeypatch.setattr("lubko.supervisor.os.execve", _fail_execve)
+    monkeypatch.setattr("lubko.supervisor.os.set_inheritable", lambda _fd, _val: None)
+
+    result = daemon._exec_in_place(
+        target="/fake/target",
+        confirmed="b" * 40,
+        ownership_fd=-1,
+    )
+
+    assert result is False, "exec failure must return False (continue)"
+    assert restored, "pidfile must be restored after exec failure"
+    assert restored[0] == (os.getpid(), 12345)
+
+
+# ---------------------------------------------------------------------------
+# No second authority: probe + exec boundary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_no_authority_overlap_at_probe_exec_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At no point during probe->exec does a second reconciler exist.
+
+    The probe exits before exec. The exec'd image enters normal startup only
+    after the probe has fully exited and its lock fd copy is closed.
+    """
+    _write_fresh_state()
+    daemon = SupervisorDaemon(Settings())
+    daemon._ownership_fd = -1
+    lifecycle_log: list[str] = []
+
+    def _track_pidfile(_self: object) -> None:
+        lifecycle_log.append("pidfile_write")
+
+    def _track_reconcile(_self: object, _now: float) -> None:
+        lifecycle_log.append("reconcile")
+
+    original_preflight = SupervisorDaemon._preflight_handoff
+
+    def _tracked_preflight(_self: SupervisorDaemon) -> None:
+        lifecycle_log.append("preflight_start")
+        original_preflight(_self)
+        lifecycle_log.append("preflight_done")
+
+    monkeypatch.setattr(SupervisorDaemon, "_preflight_handoff", _tracked_preflight)
+    monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", _track_pidfile)
+    monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", lambda _self: None)
+    monkeypatch.setattr(SupervisorDaemon, "_invalidate_stale_status", _noop_invalidate)
+    monkeypatch.setattr(SupervisorDaemon, "reconcile", _track_reconcile)
+    monkeypatch.setattr(SupervisorDaemon, "_install_signal_handlers", _noop_signals)
+    monkeypatch.setattr(SupervisorDaemon, "_write_status", lambda _self, *_a: None)
+    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", _noop_normalize)
+    monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
+
+    ready_r, ready_w = os.pipe()
+    os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+    monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, str(ready_w))
+    monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
+
+    daemon.run()
+    os.close(ready_r)
+
+    assert lifecycle_log == [
+        "preflight_start",
+        "preflight_done",
+    ], f"preflight must exit before pidfile/reconcile; log: {lifecycle_log}"

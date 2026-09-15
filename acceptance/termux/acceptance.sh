@@ -239,7 +239,7 @@ fi
 # -- Canonical pytest budget check (hard 10 s) ------------------------------
 
 printf '\n%s\n' '--- Canonical pytest budget check ---'
-if uv run python scripts/check_test_budget.py; then
+if uv run pytest; then
   pass "pytest within 10 s budget"
 else
   fail "pytest budget exceeded or tests failed"
