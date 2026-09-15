@@ -38,9 +38,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
-import psycopg
-from psycopg.rows import tuple_row
-
 from lubko import (
     _exact_signal,
     cli,
@@ -1000,6 +997,9 @@ def check_postgres(timeout_seconds: float) -> bool:
     Returns:
         ``True`` when a trivial query succeeds.
     """
+    import psycopg
+    from psycopg.rows import tuple_row
+
     try:
         config = load_database_config()
     except (OSError, ValueError):
@@ -1651,7 +1651,7 @@ def _current_queue_job() -> tuple[object | None, bool]:
     """
     if os.environ.get(JOB_ID_ENV) is None:
         return None, False
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 
@@ -1754,7 +1754,7 @@ def _queue_deploy(options: DeployOptions, job_id: object) -> int:
     Raises:
         DeployAbortedError: If the helper cannot be forked or never reports.
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 
@@ -1825,7 +1825,7 @@ def _run_deploy_helper(options: DeployOptions, job_id: object, writer: int) -> N
         job_id: Captured deploy queue row identifier.
         writer: Write end of the response pipe to the parent.
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 
@@ -1875,7 +1875,7 @@ def _deploy_helper_locked(options: DeployOptions, job_id: object, writer: int) -
         job_id: Captured deploy queue row identifier.
         writer: Write end of the response pipe to the parent.
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 
@@ -2884,6 +2884,8 @@ def _read_probe_sentinel(conn: JobsConnection, probe_id: UUID) -> bool:
     Returns:
         ``True`` when the sentinel string is present in the published stdout.
     """
+    from psycopg.rows import tuple_row
+
     with conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT (payload::jsonb)->'output'->'stdout'->>'tail' FROM lubko.jobs WHERE id = %s",
@@ -2930,6 +2932,8 @@ def _wait_for_probe_claim(
         a claim whose process was not spawned by the recovery worker, or a
         claim whose payload never produced positive execution evidence.
     """
+    from psycopg.rows import tuple_row
+
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
@@ -2976,6 +2980,8 @@ def _wait_for_probe_terminal(
         probe_id: Probe job identifier.
         timeout_seconds: Maximum seconds to wait.
     """
+    from psycopg.rows import tuple_row
+
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
@@ -3047,6 +3053,9 @@ def _verify_queue_roundtrip(
     Returns:
         ``True`` only when the exact worker consumed the probe.
     """
+    import psycopg
+    from psycopg.rows import tuple_row
+
     try:
         database = load_database_config()
     except (OSError, ValueError):
@@ -3496,6 +3505,8 @@ def _wait_for_any_claim(
     Returns:
         ``True`` when any worker claims the probe while it runs.
     """
+    from psycopg.rows import tuple_row
+
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         with conn.cursor(row_factory=tuple_row) as cursor:
@@ -3529,6 +3540,9 @@ def _queue_has_consumer(cwd: str, timeout_seconds: float) -> bool | None:
     Returns:
         ``True`` when some worker claimed the probe.
     """
+    import psycopg
+    from psycopg.rows import tuple_row
+
     try:
         database = load_database_config()
     except (OSError, ValueError):
@@ -3618,7 +3632,6 @@ def _recover_owned_groups(incarnation: str) -> bool:
         ``True`` when recovery provably succeeded; ``False`` when it failed
         and the incarnation's execution authority must not be dropped.
     """
-    # ruff: ignore[import-outside-top-level] - supervisor imports this module
     from lubko.supervisor import OwnedGroupRecoveryError, recover_owned_groups
 
     try:
@@ -4317,7 +4330,7 @@ def _queue_restart(job_id: object) -> int:
     Raises:
         DeployAbortedError: If the helper cannot be forked or never reports.
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 
@@ -4381,7 +4394,7 @@ def _run_restart_helper(job_id: object, writer: int) -> None:
         job_id: Captured restart queue row identifier.
         writer: Write end of the response pipe to the parent.
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 
@@ -4422,7 +4435,7 @@ def _prepare_restart_locked(writer: int) -> bool:
     Returns:
         ``True`` when the restart validated and may proceed after the lock.
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 
@@ -4468,7 +4481,7 @@ def _restart_helper_locked(job_id: object, writer: int) -> None:
         job_id: Captured restart queue row identifier.
         writer: Write end of the response pipe to the parent.
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 
@@ -4641,7 +4654,7 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
     Returns:
         A process exit code.
     """
-    from lubko import (  # ruff: ignore[import-outside-top-level] - breaks the deployctl<->lifecycle import cycle
+    from lubko import (
         deployctl,
     )
 

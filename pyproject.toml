@@ -66,6 +66,7 @@ convention = "google"
     "suspicious-subprocess-import",
 ]
 "src/lubko/lifecycle.py" = [
+    "import-outside-top-level",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
@@ -78,13 +79,19 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
+"src/lubko/deployctl.py" = [
+    "import-outside-top-level",
+]
 "src/lubko/install.py" = [
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
 "src/lubko/supervisor.py" = [
+    "any-type",
     "blind-except",
     "complex-structure",
+    "docstring-missing-returns",
+    "import-outside-top-level",
     "raise-vanilla-args",
     "start-process-with-no-shell",
     "subprocess-without-shell-equals-true",

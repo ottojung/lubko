@@ -4,3 +4,5 @@
 .ruff_cache/
 __pycache__/
 *.py[cod]
+tests/_exec_topology_helper.py
+tests/_exec_topology_target.py
