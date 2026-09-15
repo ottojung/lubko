@@ -153,11 +153,9 @@ class _HandoffTarget(NamedTuple):
 
 @dataclass(frozen=True, slots=True)
 class _HandoffPipes:
-    """Pipe file descriptors for the two-phase handoff protocol."""
+    """Pipe file descriptors for the preflight probe readiness protocol."""
 
     ready_r: int
-    transfer_r: int
-    transfer_w: int
 
 
 class _BoundedSupervisorLogHandler(RotatingFileHandler):
@@ -791,13 +789,44 @@ class SupervisorDaemon:
         shutdown, so a later supervisor can always take ownership afterwards.
         The daemon never exits on its own: an unexpected worker exit is
         recorded and backed off, and the intended worker is restored.
+
+        When a version-skew handoff is triggered, the old supervisor A
+        spawns a **non-authoritative preflight probe** that validates the
+        target executable can start and adopt the ownership lock, then A
+        **execs in place** into the target.  The exec replaces A's process
+        image while preserving its PID, so Tini (the direct-parent init)
+        never sees its child exit and the container stays alive.  The probe
+        never receives lifecycle authority and exits before A's exec.  If
+        exec fails, the process exits, letting Tini restart from durable
+        state.
+
+        Probe mode (``LUBKO_SUPERVISOR_HANDOFF_PREPARE=1``):
+            The process was spawned by A as a non-authoritative preflight
+            probe.  ``_acquire_ownership()`` already adopted the inherited
+            lock fd.  The probe validates the lock, signals READY on the
+            readiness pipe, closes its lock fd copy, and returns
+            unconditionally — before any pidfile, status, normalization,
+            signal handler, or reconcile writes.  The probe never enters
+            the normal reconcile loop.
+
+        Prepare-to-exec flow (A's side):
+            After the probe exits, A retires its pidfile, makes the lock fd
+            inheritable, sets adoption env vars, and calls ``os.execve`` into
+            the target.  The execed image adopts the inherited lock via the
+            env vars, binds the confirmed commit, and follows normal startup.
         """
         LOGGER.info("lubko supervisor starting (pid %d)", os.getpid())
         self._acquire_ownership()
         if self._handoff_target_commit is not None:
             self._runtime_commit = self._handoff_target_commit
         try:
-            if self._in_handoff_mode() and not self._run_handoff_protocol():
+            # --- Probe mode: validate lock, signal READY, exit immediately ---
+            # The probe was spawned by A as a non-authoritative preflight.
+            # _acquire_ownership() already adopted the inherited lock fd and
+            # set self._ownership_fd.  The probe must NOT write durable state,
+            # reconcile, or claim lifecycle authority.
+            if self._in_handoff_mode():
+                self._preflight_handoff()
                 return
             self._write_pidfile()
             self._persist_runtime_commit()
@@ -816,8 +845,6 @@ class SupervisorDaemon:
                 finally:
                     for handler in diagnostic_handlers:
                         handler.end_reconciliation_cycle()
-                if self._handoff_completed:
-                    return
                 self._write_status()
                 time.sleep(self.settings.poll_interval_seconds)
             self._shutdown()
@@ -837,8 +864,6 @@ class SupervisorDaemon:
         :meth:`run`.
         """
         self._message = None
-        if self._handoff_completed:
-            return
         state = read_state()
         if state.ownership_hold_malformed:
             # Materialize the hold so a later rewrite cannot turn authority
@@ -3227,13 +3252,13 @@ class SupervisorDaemon:
         target_commit = os.environ.pop(supervise.HANDOFF_TARGET_COMMIT_ENV, None)
         if target_commit is None:
             LOGGER.error(
-                "handoff fd present but target commit metadata is missing; "
-                "refusing to start without bound successor identity"
+                "handoff fd present but target commit is missing; "
+                "refusing to start with untrusted identity"
             )
             raise SystemExit(1) from None
         if not cli.is_valid_commit_name(target_commit):
             LOGGER.error(
-                "malformed handoff target commit %r; refusing to start with untrusted identity",
+                "handoff target commit %r is malformed; refusing to start with untrusted identity",
                 target_commit,
             )
             raise SystemExit(1) from None
@@ -3247,8 +3272,6 @@ class SupervisorDaemon:
             )
             raise SystemExit(1) from None
         # Clear the lock-adoption env vars so they are never consumed twice.
-        # Preserve handoff protocol env vars (READY_FD, TRANSFER_FD, MODE)
-        # until _run_handoff_protocol() completes/aborts the protocol.
         for var in (
             supervise.HANDOFF_FD_ENV,
             supervise.HANDOFF_PATH_ENV,
@@ -3353,86 +3376,88 @@ class SupervisorDaemon:
 
     @staticmethod
     def _in_handoff_mode() -> bool:
-        """Return ``True`` when this process was spawned as a handoff successor."""
-        return os.environ.get(supervise.HANDOFF_MODE_ENV) == "1"
+        """Return ``True`` when this process was spawned as a preflight probe."""
+        return os.environ.get(supervise.HANDOFF_PREPARE_MODE_ENV) == "1"
 
-    def _run_handoff_protocol(self) -> bool:
-        """Execute the two-phase handoff preparation protocol.
+    def _preflight_handoff(self) -> None:
+        r"""Validate the inherited lock, signal READY, and exit immediately.
 
-        When running in handoff mode (spawned by an active old supervisor),
-        this method:
-        1. Signals READY to the old supervisor over the readiness pipe.
-        2. Waits for the TRANSFER signal on the transfer pipe.
-        3. Cleans up the handoff environment variables.
+        Called from :meth:`run` when ``HANDOFF_PREPARE_MODE_ENV`` is set.
+        At this point ``_acquire_ownership()`` has already adopted the
+        inherited lock fd into ``self._ownership_fd`` and cleared the
+        lock-adoption env vars.
 
-        Returns:
-            ``True`` when transfer was received (caller should continue to
-            normal startup).  ``False`` when not in handoff mode, on
-            failure/EOF, or on unexpected signal (caller should exit without
-            claiming authority).
+        The probe:
+        1. Validates that ``self._ownership_fd`` is a valid, open fd.
+        2. Reads the readiness pipe fd from the environment.
+        3. Signals READY (``R\n``) to the old supervisor.
+        4. Closes its copy of the lock fd (the probe must not hold
+           lifecycle authority — only the flock reference in A, which
+           survives until A's exec, provides continuity).
+        5. Clears all probe env vars.
+        6. Returns unconditionally — the caller exits before any durable
+           lifecycle writes (pidfile, status, reconcile, etc.).
+
+        The probe never writes durable state, never enters the reconcile
+        loop, and never becomes the lifecycle authority.
         """
-        if not self._in_handoff_mode():
-            return False
+        lock_fd = self._ownership_fd
+        if lock_fd is None:
+            LOGGER.error("preflight probe has no adopted lock fd; exiting")
+            return
         ready_fd_str = os.environ.get(supervise.HANDOFF_READY_FD_ENV)
-        transfer_fd_str = os.environ.get(supervise.HANDOFF_TRANSFER_FD_ENV)
-        if ready_fd_str is None or transfer_fd_str is None:
-            LOGGER.error("handoff mode but missing pipe fds; proceeding normally")
-            return False
+        if ready_fd_str is None:
+            LOGGER.error("preflight probe missing readiness fd; exiting")
+            return
         ready_fd = int(ready_fd_str)
-        transfer_fd = int(transfer_fd_str)
         try:
             os.write(ready_fd, b"R\n")
-            LOGGER.info("supervisor handoff ready signal sent (pid %d)", os.getpid())
-            buf = b""
-            while b"\n" not in buf:
-                chunk = os.read(transfer_fd, 1)
-                if not chunk:
-                    LOGGER.error("handoff transfer pipe closed before signal; aborting")
-                    return False
-                buf += chunk
+            LOGGER.info("supervisor preflight probe ready (pid %d)", os.getpid())
+        except OSError:
+            LOGGER.exception("preflight probe failed to signal READY")
         finally:
-            os.close(ready_fd)
-            os.close(transfer_fd)
+            with suppress(OSError):
+                os.close(ready_fd)
+            # Close the probe's copy of the lock fd.  A still holds its
+            # own fd reference; the flock is maintained until A execs.
+            with suppress(OSError):
+                os.close(lock_fd)
+            self._ownership_fd = None
             for var in (
                 supervise.HANDOFF_READY_FD_ENV,
-                supervise.HANDOFF_TRANSFER_FD_ENV,
-                supervise.HANDOFF_MODE_ENV,
+                supervise.HANDOFF_PREPARE_MODE_ENV,
+                supervise.HANDOFF_FD_ENV,
+                supervise.HANDOFF_PATH_ENV,
+                supervise.HANDOFF_PID_ENV,
             ):
                 os.environ.pop(var, None)
-        if buf.strip() != b"T":
-            LOGGER.error("handoff received unexpected signal %r; aborting", buf)
-            return False
-        LOGGER.info("supervisor handoff transfer received (pid %d)", os.getpid())
-        return True
 
     def _maybe_handoff_to_new_supervisor(self) -> None:
-        r"""Spawn the confirmed supervisor runtime and hand off authority safely.
+        r"""Detect version skew and activate the new runtime via exec-in-place.
 
-        Two-phase protocol: A (old) remains sole lifecycle authority throughout.
-        B (successor) starts in handoff preparation mode, initializes, signals
-        READY, and waits.  Only after A confirms B is ready does A send
-        TRANSFER, close the lock fd, and exit.  No authority overlap and no
-        authority gap: A holds the lock until TRANSFER is sent, and B does not
-        reconcile or mutate state until it receives TRANSFER.
+        When the stored ``supervisor_runtime_commit`` (A) differs from the
+        confirmed ``cli/current_commit()`` (B), the old supervisor:
 
-        Readiness protocol (two dedicated pipes):
-        - A creates readiness_pipe (B→A) and transfer_pipe (A→B).
-        - A spawns B in handoff mode with the lock fd and pipe fds inherited.
-        - B closes unused pipe ends, initializes, writes ``R\n`` on the
-          readiness pipe, then reads ``T\n`` from the transfer pipe.
-        - A reads ``R\n`` from the readiness pipe (with timeout), then retires
-          its own pidfile, writes ``T\n`` on the transfer pipe, closes the
-          lock fd, and exits.
+        1. Spawns a **non-authoritative preflight probe** (B) that validates
+           the target executable can start and adopt the ownership lock.
+        2. Waits for B's READY signal on the readiness pipe.
+        3. Retires A's own pidfile.
+        4. **Execs in place** into the target executable, preserving A's PID
+           so Tini (the direct-parent init) never sees its child exit.
 
-        Pidfile protocol:
-        - A retires its own exact pidfile (pid+start_time_ticks match only)
-          immediately before writing TRANSFER, while A still holds the flock.
-        - If TRANSFER write fails, A restores its pidfile before continuing.
-        - B writes its pidfile only after receiving TRANSFER (in ``run()``).
+        The probe never receives TRANSFER and never enters the reconcile
+        loop.  It validates readiness and exits.  After the probe exits,
+        A execs the target image, which adopts the inherited lock fd via
+        the environment and becomes the sole lifecycle authority.
 
-        Worker consequence: if A exiting triggers PDEATHSIG on B, B must
-        recover from durable desired/applied authority after restart rather
-        than assuming the worker child survives across the handoff.
+        No authority overlap and no authority gap:  A holds the flock
+        throughout the probe.  The exec atomically replaces A's process
+        image; the new image inherits the lock fd and adopts it.  If exec
+        fails, the process exits, letting Tini restart from durable state.
+
+        Tini direct-child contract:  The exec preserves A's PID.  Tini
+        never observes a child exit, so the container stays alive.  The
+        worker child survives because its parent PID does not change.
         """
         handoff = self._resolve_handoff_target()
         if handoff is None:
@@ -3440,14 +3465,14 @@ class SupervisorDaemon:
         ownership_fd = self._ownership_fd
         if ownership_fd is None:
             return
-        pipes, process = self._spawn_handoff_successor(
+        pipes, process = self._spawn_preflight_probe(
             handoff.target, handoff.confirmed, handoff.stored, ownership_fd
         )
         if process is None:
             return
-        if not self._await_handoff_ready(process, pipes, handoff.confirmed, ownership_fd):
+        if not self._await_probe_ready(process, pipes, handoff.confirmed, ownership_fd):
             return
-        self._send_handoff_transfer(process, pipes, handoff.confirmed, ownership_fd)
+        self._exec_in_place(handoff.target, handoff.confirmed, ownership_fd)
 
     def _resolve_handoff_target(self) -> _HandoffTarget | None:
         """Resolve the handoff target executable and validate preconditions.
@@ -3486,18 +3511,18 @@ class SupervisorDaemon:
             return None
         return _HandoffTarget(target=target, confirmed=confirmed, stored=stored)
 
-    def _spawn_handoff_successor(
+    def _spawn_preflight_probe(
         self,
         target: str,
         confirmed: str,
         stored: str,
         ownership_fd: int,
     ) -> tuple[_HandoffPipes, subprocess.Popen[bytes] | None]:
-        """Spawn the successor process in handoff mode with pipe fds.
+        """Spawn a non-authoritative preflight probe with pipe fds.
 
-        The exact target commit is passed through the environment so the
-        successor binds its runtime identity to the commit A selected,
-        rather than re-deriving from mutable ``cli/current``.
+        The probe inherits the lock fd to validate adoption, but must close
+        it before exiting.  The probe never receives TRANSFER and never
+        enters the reconcile loop.
 
         Returns:
             A ``(_HandoffPipes, process)`` tuple.
@@ -3507,74 +3532,76 @@ class SupervisorDaemon:
         """
         lock_path = str(supervise.supervisor_lock_path())
         LOGGER.info(
-            "supervisor two-phase handoff: %s -> %s (%s)",
+            "supervisor preflight probe: %s -> %s (%s)",
             stored,
             confirmed,
             target,
         )
         lifecycle.append_deploy_log(f"supervisor handoff: {stored} -> {confirmed}")
         ready_r, ready_w = os.pipe()
-        transfer_r, transfer_w = os.pipe()
         handoff_env = {
             **os.environ,
             supervise.HANDOFF_FD_ENV: str(ownership_fd),
             supervise.HANDOFF_PATH_ENV: lock_path,
             supervise.HANDOFF_PID_ENV: str(os.getpid()),
             supervise.HANDOFF_READY_FD_ENV: str(ready_w),
-            supervise.HANDOFF_TRANSFER_FD_ENV: str(transfer_r),
-            supervise.HANDOFF_MODE_ENV: "1",
+            supervise.HANDOFF_PREPARE_MODE_ENV: "1",
             supervise.HANDOFF_TARGET_COMMIT_ENV: confirmed,
         }
         try:
             os.set_inheritable(ownership_fd, True)  # ruff: ignore[boolean-positional-value-in-call]
             os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
-            os.set_inheritable(transfer_r, True)  # ruff: ignore[boolean-positional-value-in-call]
             process = subprocess.Popen(
                 [target],
                 close_fds=False,
                 env=handoff_env,
             )
         except OSError:
-            for fd in (ready_r, ready_w, transfer_r, transfer_w):
-                with suppress(OSError):
-                    os.close(fd)
+            with suppress(OSError):
+                os.close(ready_r)
+            with suppress(OSError):
+                os.close(ready_w)
             os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
             LOGGER.exception(
-                "supervisor handoff failed to spawn successor; continuing with the current runtime"
+                "supervisor handoff failed to spawn preflight probe; "
+                "continuing with the current runtime"
             )
             self._message = (
                 f"supervisor handoff to {confirmed} failed to spawn; "
                 "continuing with the current runtime"
             )
-            return _HandoffPipes(
-                ready_r=ready_r, transfer_r=transfer_r, transfer_w=transfer_w
-            ), None
+            return _HandoffPipes(ready_r=ready_r), None
         with suppress(OSError):
             os.set_inheritable(ready_w, False)  # ruff: ignore[boolean-positional-value-in-call]
         with suppress(OSError):
-            os.set_inheritable(transfer_r, False)  # ruff: ignore[boolean-positional-value-in-call]
-        with suppress(OSError):
             os.close(ready_w)
-        return _HandoffPipes(ready_r=ready_r, transfer_r=transfer_r, transfer_w=transfer_w), process
+        return _HandoffPipes(ready_r=ready_r), process
 
-    def _await_handoff_ready(
+    def _await_probe_ready(
         self,
         process: subprocess.Popen[bytes],
         pipes: _HandoffPipes,
         confirmed: str,
         ownership_fd: int,
     ) -> bool:
-        """Wait for the successor's READY signal.
+        """Wait for the preflight probe's READY signal, then require clean exit.
+
+        The probe must exit successfully before A proceeds to exec-in-place.
+        This method:
+        1. Reads READY from the readiness pipe (with timeout).
+        2. Waits for the probe process to exit cleanly (rc=0).
+        3. On timeout, nonzero exit, or any failure: kills/reaps the probe
+           and aborts the handoff.
 
         Args:
-            process: The spawned successor process.
-            pipes: Pipe file descriptors for the handoff protocol.
+            process: The spawned probe process.
+            pipes: Pipe file descriptors for the probe protocol.
             confirmed: The target commit (for diagnostics).
             ownership_fd: The ownership lock file descriptor.
 
         Returns:
-            ``True`` when READY was received; ``False`` when the handoff
-            was aborted (caller should return).
+            ``True`` when READY was received and the probe exited cleanly;
+            ``False`` when the handoff was aborted (caller should return).
         """
         ready = False
         deadline = time.monotonic() + self.settings.lock_timeout_seconds
@@ -3601,89 +3628,112 @@ class SupervisorDaemon:
             with suppress(Exception):
                 process.wait(timeout=5.0)
             with suppress(OSError):
-                os.close(pipes.transfer_r)
-            with suppress(OSError):
-                os.close(pipes.transfer_w)
-            os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+                os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
             LOGGER.warning(
-                "supervisor handoff to %s did not complete; continuing with the current runtime",
+                "supervisor preflight probe to %s did not signal READY; "
+                "continuing with the current runtime",
                 confirmed,
             )
             self._message = (
-                f"supervisor handoff to {confirmed} did not complete; "
+                f"supervisor preflight probe to {confirmed} did not signal READY; "
+                "continuing with the current runtime"
+            )
+            return False
+        # Wait for the probe to exit cleanly.  The probe must close its lock
+        # fd copy on exit so A is the sole flock holder before exec-in-place.
+        try:
+            rc = process.wait(timeout=5.0)
+        except Exception:
+            with suppress(OSError):
+                process.kill()
+            with suppress(Exception):
+                process.wait(timeout=5.0)
+            with suppress(OSError):
+                os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.warning(
+                "supervisor preflight probe to %s did not exit; "
+                "killed and reaped; continuing with the current runtime",
+                confirmed,
+            )
+            self._message = (
+                f"supervisor preflight probe to {confirmed} did not exit; "
+                "continuing with the current runtime"
+            )
+            return False
+        if rc != 0:
+            with suppress(OSError):
+                os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.warning(
+                "supervisor preflight probe to %s exited with rc=%d; "
+                "continuing with the current runtime",
+                confirmed,
+                rc,
+            )
+            self._message = (
+                f"supervisor preflight probe to {confirmed} failed (rc={rc}); "
                 "continuing with the current runtime"
             )
             return False
         return True
 
-    def _send_handoff_transfer(
-        self,
-        process: subprocess.Popen[bytes],
-        pipes: _HandoffPipes,
+    @staticmethod
+    def _exec_in_place(
+        target: str,
         confirmed: str,
         ownership_fd: int,
-    ) -> None:
-        """Retire A's pidfile, send TRANSFER, close lock fd, and exit.
+    ) -> bool:
+        r"""Retire A's pidfile and exec in place into the target executable.
 
-        A retires its own exact pidfile while still holding the flock so B
-        never sees A's pid and rejects it.  If the TRANSFER write fails,
-        the pidfile is restored.
+        The probe has already validated the target and exited.  A now:
+        1. Retires its own pidfile (pid+start_time_ticks match only).
+        2. Makes the ownership fd inheritable so the exec'd target inherits it.
+        3. Sets the lock fd adoption env vars so the exec'd target can adopt
+           the inherited lock without entering handoff/probe mode.
+        4. Execs into the target via ``os.execve``, preserving A's PID for
+           Tini.  The confirmed target commit is passed through the env so
+           the exec'd image can bind its immutable runtime identity (#767).
+        5. On exec failure, restores the pidfile and returns ``False`` so
+           A continues with its current runtime (fail-closed availability:
+           the lock is still held and the process image is intact).
 
-        Args:
-            process: The spawned successor process.
-            pipes: Pipe file descriptors for the handoff protocol.
-            confirmed: The target commit (for diagnostics).
-            ownership_fd: The ownership lock file descriptor.
+        No TRANSFER is sent to the probe.  The probe has already exited.
+        The exec atomically replaces A's process image; the new image
+        inherits the lock fd and adopts it via the env vars.
+
+        Returns:
+            ``True`` when exec succeeded (process replaced; this code is
+            unreachable).  ``False`` when exec failed and A continues.
         """
         retired_pid: int
         retired_ticks: int
         try:
             retired_pid, retired_ticks = supervise.retire_supervisor_pid()
         except supervise.PidfileIdentityMismatchError:
-            with suppress(OSError):
-                process.kill()
-            with suppress(Exception):
-                process.wait(timeout=5.0)
-            with suppress(OSError):
-                os.close(pipes.transfer_r)
-            with suppress(OSError):
-                os.close(pipes.transfer_w)
             os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
             LOGGER.warning("handoff pidfile retirement failed; continuing with the current runtime")
-            return
+            return False
+        os.set_inheritable(ownership_fd, True)  # ruff: ignore[boolean-positional-value-in-call]
+        lock_path = str(supervise.supervisor_lock_path())
+        env = os.environ.copy()
+        env[supervise.HANDOFF_FD_ENV] = str(ownership_fd)
+        env[supervise.HANDOFF_PATH_ENV] = lock_path
+        env[supervise.HANDOFF_PID_ENV] = str(os.getpid())
+        env[supervise.HANDOFF_TARGET_COMMIT_ENV] = confirmed
+        LOGGER.info(
+            "supervisor exec-in-place: %s (pid %d)",
+            target,
+            os.getpid(),
+        )
         try:
-            os.write(pipes.transfer_w, b"T\n")
+            os.execve(target, [target], env)
         except OSError:
             supervise.restore_supervisor_pid(retired_pid, retired_ticks)
-            with suppress(OSError):
-                os.close(pipes.transfer_r)
-            with suppress(OSError):
-                os.close(pipes.transfer_w)
-            with suppress(OSError):
-                process.kill()
-            with suppress(Exception):
-                process.wait(timeout=5.0)
             os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
-            LOGGER.warning(
-                "supervisor handoff transfer to %s failed; continuing with the current runtime",
+            LOGGER.exception(
+                "supervisor exec-in-place to %s failed; continuing with the current runtime",
                 confirmed,
             )
-            self._message = (
-                f"supervisor handoff transfer to {confirmed} failed; "
-                "continuing with the current runtime"
-            )
-            return
-        with suppress(OSError):
-            os.close(pipes.transfer_r)
-        os.close(pipes.transfer_w)
-        os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
-        os.close(ownership_fd)
-        self._ownership_fd = None
-        self._handoff_completed = True
-        LOGGER.info(
-            "supervisor handoff to %s completed; successor is running",
-            confirmed,
-        )
+            return False
 
     def _write_pidfile(self) -> None:
         """Record our exact identity, refusing to double-run a live daemon.

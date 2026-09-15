@@ -1186,6 +1186,11 @@ HANDOFF_TRANSFER_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_TRANSFER_FD"
 #: preparation mode: initialize, signal readiness, wait for transfer, then
 #: enter the normal reconcile loop.  Absent in normal startup.
 HANDOFF_MODE_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_MODE"
+#: Environment variable signalling that the spawned process is a non-authoritative
+#: preflight probe: validate the lock fd, signal READY, close the lock fd,
+#: and exit.  The probe never receives TRANSFER and never enters the reconcile
+#: loop.  Distinct from ``HANDOFF_MODE_ENV`` which implies authority transfer.
+HANDOFF_PREPARE_MODE_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PREPARE"
 #: Environment variable carrying the exact target commit the old supervisor
 #: resolved for the successor.  The successor binds its runtime identity to
 #: this commit rather than re-deriving from mutable ``cli/current``, closing

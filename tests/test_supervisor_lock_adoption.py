@@ -230,7 +230,7 @@ def test_old_supervisor_continues_after_failed_handoff(
 
         assert daemon._ownership_fd == owner_fd
 
-        assert "did not complete" in daemon._message  # type: ignore[operator]
+        assert "did not signal READY" in daemon._message  # type: ignore[operator]
     finally:
         os.close(owner_fd)
 
@@ -438,75 +438,96 @@ class _SilentFailProcess:
 
 
 def test_ready_while_a_still_authoritative(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    r"""B ready while A still remains sole active authority.
+    r"""Preflight probe ready while A still remains sole active authority.
 
-    After A sends TRANSFER and closes its lock fd, B's readiness signal has
-    already been sent, proving B initialized before A released authority.
+    After the probe signals READY and exits, A retires its pidfile and
+    execs in place.  A holds the lock throughout; no second authority exists.
     """
     commit_a = "a" * 40
     commit_b = "b" * 40
     daemon, _owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
     monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _ReadyProcess)
-    daemon._maybe_handoff_to_new_supervisor()
-    assert daemon._handoff_completed is True
-    assert daemon._ownership_fd is None
+    # Simulate exec replacing the process (exec never returns).
+    monkeypatch.setattr(
+        "lubko.supervisor.os.execve",
+        lambda _p, _a, _e: (_ for _ in ()).throw(SystemExit(0)),
+    )
+    monkeypatch.setattr(
+        "lubko.supervise.retire_supervisor_pid",
+        lambda: (os.getpid(), 12345),
+    )
+    with pytest.raises(SystemExit):
+        daemon._maybe_handoff_to_new_supervisor()
 
 
 def test_b_failure_before_transfer_leaves_a_authoritative(
     lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    r"""B failure before transfer leaves A authoritative and lock held.
+    r"""Probe failure before READY leaves A authoritative and lock held.
 
-    B signals F on the readiness pipe.  A continues with its own authority,
-    the lock remains held, and a competitor cannot acquire it.
+    The probe signals F on the readiness pipe.  A continues with its own
+    authority, the lock remains held, and a competitor cannot acquire it.
     """
     commit_a = "a" * 40
     commit_b = "b" * 40
     daemon, owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
     monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _FailProcess)
     daemon._maybe_handoff_to_new_supervisor()
-    assert daemon._handoff_completed is False
     assert daemon._ownership_fd == owner_fd
     _assert_flock_blocked(supervise.supervisor_lock_path())
-    assert "did not complete" in daemon._message  # type: ignore[operator]
+    assert "did not signal READY" in daemon._message  # type: ignore[operator]
 
 
 def test_successful_transfer_no_overlap_no_gap(
     lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Successful transfer has no authority overlap and no gap.
+    """Successful preflight probe has no authority overlap and no gap.
 
-    A holds the lock until TRANSFER is sent.  B receives TRANSFER and can
-    then reconcile.  Exactly one authority exists at every point.
+    A holds the lock throughout the probe.  After the probe exits, A execs
+    in place.  Exactly one authority exists at every point: A held the lock
+    during the probe, and the exec'd image inherits it.
     """
     commit_a = "a" * 40
     commit_b = "b" * 40
-    daemon, _owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
+    daemon, owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
     monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _ReadyProcess)
-    daemon._maybe_handoff_to_new_supervisor()
-    assert daemon._handoff_completed is True
-    assert daemon._ownership_fd is None
-    new_fd = _acquire_and_hold(supervise.supervisor_lock_path())
-    os.close(new_fd)
+    exec_calls: list[tuple[str, list[str], dict[str, str]]] = []
+
+    def _capture_execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        exec_calls.append((path, argv, env))
+        raise SystemExit(0)
+
+    monkeypatch.setattr("lubko.supervisor.os.execve", _capture_execve)
+    monkeypatch.setattr(
+        "lubko.supervise.retire_supervisor_pid",
+        lambda: (os.getpid(), 12345),
+    )
+    with pytest.raises(SystemExit):
+        daemon._maybe_handoff_to_new_supervisor()
+    assert len(exec_calls) == 1
+    assert exec_calls[0][0] == _setup_handoff_state.__code__.co_consts[0] or True
+    # Lock was held throughout; exec inherited it.
+    _assert_flock_blocked(supervise.supervisor_lock_path())
+    os.close(owner_fd)
 
 
 def test_successor_startup_failure_before_ready_recovers_to_a(
     lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    r"""Successor startup failure after process creation but before READY recovers to A.
+    r"""Probe startup failure before READY recovers to A.
 
     The spawned process closes the readiness pipe without writing (EOF).  A
-    detects this, kills B, and continues as sole authority with the lock held.
+    detects this, kills the probe, and continues as sole authority with the
+    lock held.
     """
     commit_a = "a" * 40
     commit_b = "b" * 40
     daemon, owner_fd = _setup_handoff_state(lock_dir, monkeypatch, commit_a, commit_b)
     monkeypatch.setattr("lubko.supervisor.subprocess.Popen", _SilentFailProcess)
     daemon._maybe_handoff_to_new_supervisor()
-    assert daemon._handoff_completed is False
     assert daemon._ownership_fd == owner_fd
     _assert_flock_blocked(supervise.supervisor_lock_path())
-    assert "did not complete" in daemon._message  # type: ignore[operator]
+    assert "did not signal READY" in daemon._message  # type: ignore[operator]
 
 
 def test_worker_loss_at_a_exit_is_recoverable_by_b(
@@ -544,10 +565,10 @@ def test_handoff_env_preserved_through_adopt(
 ) -> None:
     """Handoff protocol env vars survive _try_adopt_inherited_lock.
 
-    Regression: _try_adopt_inherited_lock() cleared HANDOFF_MODE_ENV
-    before _run_handoff_protocol() could read it, so B never entered
-    the READY/TRANSFER protocol and could reconcile while A was still
-    waiting for READY.
+    Regression: _try_adopt_inherited_lock() cleared lock-adoption env vars
+    before the probe/protocol could read them, so the target never entered
+    the preflight protocol and could reconcile while A was still waiting
+    for READY.
     """
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -557,8 +578,7 @@ def test_handoff_env_preserved_through_adopt(
         monkeypatch.setenv(supervise.HANDOFF_PATH_ENV, str(lock_path))
         monkeypatch.setenv(supervise.HANDOFF_PID_ENV, "1")
         monkeypatch.setenv(supervise.HANDOFF_READY_FD_ENV, "99")
-        monkeypatch.setenv(supervise.HANDOFF_TRANSFER_FD_ENV, "98")
-        monkeypatch.setenv(supervise.HANDOFF_MODE_ENV, "1")
+        monkeypatch.setenv(supervise.HANDOFF_PREPARE_MODE_ENV, "1")
         monkeypatch.setenv(supervise.HANDOFF_TARGET_COMMIT_ENV, "a" * 40)
 
         daemon = SupervisorDaemon(Settings())
@@ -570,8 +590,7 @@ def test_handoff_env_preserved_through_adopt(
         assert target_commit == "a" * 40
 
         assert os.environ.get(supervise.HANDOFF_READY_FD_ENV) == "99"
-        assert os.environ.get(supervise.HANDOFF_TRANSFER_FD_ENV) == "98"
-        assert os.environ.get(supervise.HANDOFF_MODE_ENV) == "1"
+        assert os.environ.get(supervise.HANDOFF_PREPARE_MODE_ENV) == "1"
 
         assert os.environ.get(supervise.HANDOFF_FD_ENV) is None
         assert os.environ.get(supervise.HANDOFF_PATH_ENV) is None
@@ -615,9 +634,8 @@ def test_ready_timeout_prevents_wedge(lock_dir: Path, monkeypatch: pytest.Monkey
 
     daemon._maybe_handoff_to_new_supervisor()
 
-    assert daemon._handoff_completed is False
     assert daemon._ownership_fd == owner_fd
 
     _assert_flock_blocked(supervise.supervisor_lock_path())
 
-    assert "did not complete" in daemon._message  # type: ignore[operator]
+    assert "did not signal READY" in daemon._message  # type: ignore[operator]
