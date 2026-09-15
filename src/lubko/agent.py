@@ -184,7 +184,7 @@ def normalize_agent_id(raw: str | None) -> str | None:
     Returns:
         The normalized ID, or ``None`` when it is malformed.
     """
-    if not raw:
+    if not raw or not isinstance(raw, str):
         return None
     value = raw.strip().lower()
     if not value or any(char not in HEX_DIGITS for char in value):
@@ -214,28 +214,30 @@ def _require_agent_id(raw: str | None, subcommand: str) -> str | None:
 def _resolve_agent(
     raw: str | None,
     subcommand: str,
-) -> tuple[str, Meta] | tuple[None, None]:
+) -> tuple[str, Meta] | int:
     """Normalize an agent ID and read its metadata in one step.
 
     Combines ``normalize_agent_id`` and ``read_meta`` so callers that need both
-    validation and metadata can do a single ``if`` check instead of two return
-    branches.
+    validation and metadata can do a single ``isinstance`` check instead of two
+    return branches.
 
     Args:
         raw: Raw value from ``args.id``.
         subcommand: Name of the subcommand for the error message.
 
     Returns:
-        ``(aid, meta)`` on success, ``(None, None)`` after printing an error.
+        ``(aid, meta)`` on success, or an integer exit code on failure
+        (``EXIT_USAGE`` for malformed IDs, ``EXIT_NOT_FOUND`` for unknown
+        agents).
     """
     aid = normalize_agent_id(raw)
     if aid is None:
         _err(f"{PROG}: {subcommand}: --id is required and must be a base-16 string")
-        return None, None
+        return EXIT_USAGE
     meta = read_meta(aid)
     if meta is None:
         _err(f"{PROG}: unknown agent: {aid}")
-        return None, None
+        return EXIT_NOT_FOUND
     return aid, meta
 
 
@@ -3771,9 +3773,10 @@ def _dispatch_invocation(args: argparse.Namespace, prompt: str) -> int:
     Returns:
         A process exit code.
     """
-    aid, _meta = _resolve_agent(args.id, "prompt")
-    if aid is None:
-        return EXIT_USAGE
+    result = _resolve_agent(args.id, "prompt")
+    if isinstance(result, int):
+        return result
+    aid, _meta = result
     steer = bool(args.steer)
 
     _test_sync("sc_observe")
@@ -4841,9 +4844,10 @@ def cmd_log(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
-    aid, _meta = _resolve_agent(args.id, "log")
-    if aid is None:
-        return EXIT_USAGE
+    result = _resolve_agent(args.id, "log")
+    if isinstance(result, int):
+        return result
+    aid, _meta = result
     log_path = agent_dir(aid) / "output.log"
     if not log_path.is_file():
         if args.follow:
@@ -4924,19 +4928,19 @@ def cmd_wait(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
-    aid, meta = _resolve_agent(args.id, "wait")
-    if aid is None:
-        return EXIT_USAGE
-    meta = cast("Meta", meta)
+    result = _resolve_agent(args.id, "wait")
+    if isinstance(result, int):
+        return result
+    aid, meta = result
     timeout = args.timeout
     deadline = time.time() + timeout if timeout else None
 
     while True:
-        meta = read_meta(aid)
-        if meta is None:
+        current = read_meta(aid)
+        if current is None:
             _err(f"{PROG}: unknown agent: {aid}")
             return EXIT_NOT_FOUND
-        if is_alive(meta):
+        if is_alive(current):
             if deadline and time.time() >= deadline:
                 _err(f"{PROG}: wait: agent {aid} still running after {timeout}s")
                 return EXIT_TIMEOUT
@@ -4953,7 +4957,8 @@ def cmd_wait(args: argparse.Namespace) -> int:
             # The runner never finalized: converge the durable record instead
             # of returning while metadata still claims a running invocation.
             reconcile_meta(aid)
-            meta = read_meta(aid) or meta
+            current = read_meta(aid) or meta
+        meta = current
         break
 
     return exit_code_for(meta)
@@ -5228,10 +5233,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
-    aid, meta = _resolve_agent(args.id, "stop")
-    if aid is None:
-        return EXIT_USAGE
-    meta = cast("Meta", meta)
+    result = _resolve_agent(args.id, "stop")
+    if isinstance(result, int):
+        return result
+    aid, meta = result
     while True:
         if is_alive(meta) or group_alive(meta):
             return _signal_live_invocation(aid, meta, "stop")
@@ -5272,10 +5277,10 @@ def cmd_kill(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
-    aid, meta = _resolve_agent(args.id, "kill")
-    if aid is None:
-        return EXIT_USAGE
-    meta = cast("Meta", meta)
+    result = _resolve_agent(args.id, "kill")
+    if isinstance(result, int):
+        return result
+    aid, meta = result
     while True:
         if is_alive(meta) or group_alive(meta):
             return _signal_live_invocation(aid, meta, "kill")
@@ -5580,10 +5585,10 @@ def cmd_delete(args: argparse.Namespace) -> int:
     Returns:
         A process exit code.
     """
-    aid, meta = _resolve_agent(args.id, "delete")
-    if aid is None:
-        return EXIT_USAGE
-    meta = cast("Meta", meta)
+    result = _resolve_agent(args.id, "delete")
+    if isinstance(result, int):
+        return result
+    aid, meta = result
     live = is_alive(meta) or group_alive(meta) or runner_alive(meta) or reservation_in_flight(meta)
     if live and not args.force:
         _err(f"{PROG}: agent {aid} is running; stop it first or use --force")
