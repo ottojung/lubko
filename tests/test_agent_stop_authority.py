@@ -9,6 +9,8 @@ import pytest
 
 from lubko import agent
 
+_HEX_ID = "a11ce"
+
 
 @pytest.mark.parametrize("command", [agent.cmd_stop, agent.cmd_kill])
 @pytest.mark.parametrize("bad", [123, True, 1.5, [], {}, ""])
@@ -19,7 +21,7 @@ def test_stop_like_rejects_malformed_pending_prompt(
 ) -> None:
     """Malformed pending-prompt authority returns a bounded failure unchanged."""
     meta: agent.Meta = {
-        "id": "audit",
+        "id": _HEX_ID,
         "state": "running",
         "pending_prompt": bad,
         "runner_reservation": None,
@@ -36,7 +38,7 @@ def test_stop_like_rejects_malformed_pending_prompt(
 
     monkeypatch.setattr(agent, "_signal_live_invocation", fake_signal)
 
-    result = command(SimpleNamespace(agent_id="audit"))  # type: ignore[operator]
+    result = command(SimpleNamespace(id=_HEX_ID))  # type: ignore[operator]
 
     assert result == agent.EXIT_ERROR
     assert meta == before
@@ -59,7 +61,7 @@ def test_stop_like_rejects_malformed_runner_reservation(
 ) -> None:
     """Malformed runner-reservation authority fails without signals or mutation."""
     meta: agent.Meta = {
-        "id": "audit",
+        "id": _HEX_ID,
         "state": "running",
         "pending_prompt": None,
         "runner_reservation": reservation,
@@ -76,7 +78,7 @@ def test_stop_like_rejects_malformed_runner_reservation(
 
     monkeypatch.setattr(agent, "_signal_live_invocation", fake_signal)
 
-    result = command(SimpleNamespace(agent_id="audit"))  # type: ignore[operator]
+    result = command(SimpleNamespace(id=_HEX_ID))  # type: ignore[operator]
 
     assert result == agent.EXIT_ERROR
     assert meta == before

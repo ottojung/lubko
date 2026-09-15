@@ -9,8 +9,8 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
-from lubko import _exact_signal  # ruff: ignore[import-private-name]
-from lubko._exact_signal import (  # ruff: ignore[import-private-name]
+from lubko import _exact_signal
+from lubko._exact_signal import (
     STAT_MIN_FIELDS,
     STAT_PGRP_FIELD_INDEX,
     STAT_STARTTIME_FIELD_INDEX,

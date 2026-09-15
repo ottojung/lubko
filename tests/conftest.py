@@ -10,15 +10,37 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+pytest_plugins = ("tests._pytest_budget",)
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 _STATE_HOME_IDS = count()
 _EXEC_TMP_ROOT = Path(__file__).resolve().parents[1] / ".pytest_cache" / "exec-tmp"
+_TEST_PATH_IDS = count()
+
+
+@pytest.fixture(scope="session")
+def _exec_session_root() -> Iterator[Path]:
+    """Create one session-scoped root for executable test temporary directories.
+
+    A single ``mkdtemp`` call creates the root; individual tests get cheap
+    ``mkdir`` subdirectories inside it.  The entire tree is removed once at
+    session teardown, replacing per-test ``rmtree`` calls.
+
+    Yields:
+        A session-scoped directory on the repository filesystem.
+    """
+    _EXEC_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="session-", dir=_EXEC_TMP_ROOT))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture
-def tmp_path() -> Iterator[Path]:
+def tmp_path(_exec_session_root: Path) -> Path:
     """Provide a per-test temporary directory on the executable workspace filesystem.
 
     Some Lubko tests intentionally create and execute fake programs. Pytest's
@@ -26,17 +48,15 @@ def tmp_path() -> Iterator[Path]:
     mounted ``noexec`` in the production-like Lubko container. Keep the familiar
     fixture name while rooting it under the repository's ignored pytest cache so
     ordinary tests need no special setup and executable-fixture tests remain
-    representative. ``mkdtemp`` gives parallel test runs disjoint directories.
+    representative.  Each test gets a cheap ``mkdir`` subdirectory under the
+    session-scoped root; the recursive cleanup happens once at session end.
 
-    Yields:
+    Returns:
         A unique per-test directory on the repository filesystem.
     """
-    _EXEC_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    path = Path(tempfile.mkdtemp(prefix="test-", dir=_EXEC_TMP_ROOT))
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
+    path = _exec_session_root / f"test-{next(_TEST_PATH_IDS)}"
+    path.mkdir()
+    return path
 
 
 @pytest.fixture(autouse=True)

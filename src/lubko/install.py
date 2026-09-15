@@ -322,6 +322,7 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
         DurabilityError,
         supervise.DesiredAuthorityConflictError,
         supervise.DesiredIntentError,
+        supervise.GenerationLockTimeoutError,
     ) as exc:
         _err("could not establish supervisor desired state: " + str(exc))
         return EXIT_ERROR
