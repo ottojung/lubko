@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+pytest_plugins = ("tests._pytest_budget",)
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
