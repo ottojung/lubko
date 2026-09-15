@@ -367,12 +367,10 @@ def write_startup_launcher(bin_home: Path) -> None:
     expected = generate_startup_launcher_content().encode("utf-8")
     # Crash-durable, atomic install: write the bytes (temp + fsync + rename +
     # directory fsync) via the repository durable machinery, then durably
-    # establish the executable mode so the installed launcher is confirmed active
-    # before the deployment records success.
+    # establish the executable mode by fsyncing the inode after chmod.
     write_bytes_durable(target, expected)
     Path(target).chmod(STARTUP_LAUNCHER_MODE)
     _fsync_file(target)
-    fsync_directory(bin_home)
     if target.read_bytes() != expected:
         msg = f"startup launcher content mismatch after installation: {target}"
         raise OSError(msg)
@@ -900,7 +898,6 @@ def _stage_launcher(bin_home: Path) -> str | None:
         write_bytes_durable(target, expected)
         Path(target).chmod(STARTUP_LAUNCHER_MODE)
         _fsync_file(target)
-        fsync_directory(bin_home)
     except OSError as exc:
         return f"could not stage the startup launcher: {exc}"
     if target.read_bytes() != expected:
@@ -1077,7 +1074,7 @@ def _promote_launcher(manifest: dict[str, object], bin_home: Path) -> str | None
     if error is not None:
         return error
     staged_bytes = source.read_bytes()
-    error = _write_launcher_durable(dest, staged_bytes, bin_home)
+    error = _write_launcher_durable(dest, staged_bytes)
     if error is not None:
         return error
     if not _file_matches(dest, expected_hash, expected_size):
@@ -1103,7 +1100,7 @@ def _read_staged_launcher(source: Path, expected_hash: object) -> str | None:
     return None
 
 
-def _write_launcher_durable(dest: Path, data: bytes, bin_home: Path) -> str | None:
+def _write_launcher_durable(dest: Path, data: bytes) -> str | None:
     """Write launcher bytes durably with correct mode.
 
     Returns:
@@ -1113,7 +1110,6 @@ def _write_launcher_durable(dest: Path, data: bytes, bin_home: Path) -> str | No
         write_bytes_durable(dest, data)
         Path(dest).chmod(STARTUP_LAUNCHER_MODE)
         _fsync_file(dest)
-        fsync_directory(bin_home)
     except OSError as exc:
         return f"could not promote startup launcher: {exc}"
     return None
@@ -1305,7 +1301,7 @@ def restore_startup_artifacts(snapshot: dict[str, list[int] | None], bin_home: P
     if launcher_data is not None:
         write_bytes_durable(target, bytes(launcher_data))
         Path(target).chmod(STARTUP_LAUNCHER_MODE)
-        fsync_directory(bin_home)
+        _fsync_file(target)
     else:
         _durable_unlink(target)
 

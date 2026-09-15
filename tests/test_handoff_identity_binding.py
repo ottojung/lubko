@@ -301,6 +301,7 @@ def test_status_reports_bound_runtime_commit(
     daemon = SupervisorDaemon(Settings())
     daemon._runtime_commit = TARGET_COMMIT
     daemon._start_time_ticks = 42
+    daemon._next_db_check_at = float("inf")
 
     monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", lambda _s: None)
     monkeypatch.setattr(SupervisorDaemon, "_persist_runtime_commit", lambda _s: None)
