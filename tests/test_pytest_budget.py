@@ -26,7 +26,7 @@ def test_below_budget_passes() -> None:
     """Session completing under budget retains OK status."""
     gate = _gate_at(9.99)
     session = _fake_session()
-    gate.sessionstart(session)
+    gate.sessionstart()
     gate.sessionfinish(session, pytest.ExitCode.OK)
     assert session.exitstatus == pytest.ExitCode.OK
     assert not gate.budget_exceeded
@@ -36,7 +36,7 @@ def test_exactly_at_budget_fails() -> None:
     """Elapsed time equal to the budget triggers failure."""
     gate = _gate_at(10.0)
     session = _fake_session()
-    gate.sessionstart(session)
+    gate.sessionstart()
     gate.sessionfinish(session, pytest.ExitCode.OK)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
     assert gate.budget_exceeded
@@ -46,7 +46,7 @@ def test_over_budget_fails() -> None:
     """Elapsed time beyond the budget triggers failure."""
     gate = _gate_at(15.5)
     session = _fake_session()
-    gate.sessionstart(session)
+    gate.sessionstart()
     gate.sessionfinish(session, pytest.ExitCode.OK)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
     assert gate.budget_exceeded
@@ -56,7 +56,7 @@ def test_existing_failure_not_overridden() -> None:
     """When tests already failed the budget gate must not change exitstatus."""
     gate = _gate_at(999.0)
     session = _fake_session(exitstatus=pytest.ExitCode.TESTS_FAILED)
-    gate.sessionstart(session)
+    gate.sessionstart()
     gate.sessionfinish(session, pytest.ExitCode.TESTS_FAILED)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
     assert not gate.budget_exceeded
@@ -66,7 +66,7 @@ def test_existing_nonzero_exit_preserved() -> None:
     """Any nonzero exit status is preserved even if budget is exceeded."""
     gate = _gate_at(999.0)
     session = _fake_session(exitstatus=pytest.ExitCode.INTERRUPTED)
-    gate.sessionstart(session)
+    gate.sessionstart()
     gate.sessionfinish(session, pytest.ExitCode.INTERRUPTED)
     assert session.exitstatus == pytest.ExitCode.INTERRUPTED
     assert not gate.budget_exceeded

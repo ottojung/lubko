@@ -36,7 +36,7 @@ class _BudgetGate:
         self._start: float = 0.0
         self.budget_exceeded: bool = False
 
-    def sessionstart(self, session: pytest.Session) -> None:  # ruff: ignore[unused-method-argument]
+    def sessionstart(self) -> None:
         """Record the session start timestamp."""
         self._start = self._clock()
 
@@ -67,7 +67,8 @@ _gate = _BudgetGate()
 
 def pytest_sessionstart(session: pytest.Session) -> None:
     """Delegate to the budget gate."""
-    _gate.sessionstart(session)
+    del session
+    _gate.sessionstart()
 
 
 def pytest_sessionfinish(
