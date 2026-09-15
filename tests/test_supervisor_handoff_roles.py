@@ -244,6 +244,7 @@ def test_probe_nonzero_exit_aborts_handoff() -> None:
     process.wait.return_value = 1
 
     ready_r, ready_w = os.pipe()
+    os.write(ready_w, b"R\n")
     os.close(ready_w)
     pipes = _HandoffPipes(ready_r=ready_r)
 
@@ -255,6 +256,7 @@ def test_probe_nonzero_exit_aborts_handoff() -> None:
     )
 
     assert result is False, "nonzero probe exit must abort handoff"
+    assert "failed (rc=1)" in daemon._message  # type: ignore[operator]
 
 
 # ---------------------------------------------------------------------------

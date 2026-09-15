@@ -505,7 +505,7 @@ def test_successful_transfer_no_overlap_no_gap(
     with pytest.raises(SystemExit):
         daemon._maybe_handoff_to_new_supervisor()
     assert len(exec_calls) == 1
-    assert exec_calls[0][0] == _setup_handoff_state.__code__.co_consts[0] or True
+    assert exec_calls[0][0] == "/nonexistent/supervisor"
     # Lock was held throughout; exec inherited it.
     _assert_flock_blocked(supervise.supervisor_lock_path())
     os.close(owner_fd)
