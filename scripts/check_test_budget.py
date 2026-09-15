@@ -11,7 +11,7 @@ import sys
 import time
 
 BUDGET_SECONDS: float = 10.0
-PYTEST_CMD: list[str] = ["uv", "run", "pytest"]
+PYTEST_CMD: list[str] = ["uv", "run", "pytest", "--durations=40"]
 
 
 def _write_stderr(message: str) -> None:
