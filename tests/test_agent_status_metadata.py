@@ -77,7 +77,7 @@ def test_status_text_diagnoses_malformed_summary_without_crashing(
     monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
     monkeypatch.setattr(agent, "log_excerpt", lambda _path, _count: [])
 
-    args = argparse.Namespace(id="abc123", agent_id=None, json=False)
+    args = argparse.Namespace(id="abc123", json=False)
     assert agent.cmd_status(args) == agent.EXIT_OK
     output = capsys.readouterr().out
     assert output.count("<invalid>") == 6
@@ -162,7 +162,7 @@ def test_status_text_diagnoses_malformed_exit_code(
     monkeypatch.setattr(agent, "is_alive", lambda _meta: False)
     monkeypatch.setattr(agent, "log_excerpt", lambda _path, _count: [])
 
-    args = argparse.Namespace(id="abc123", agent_id=None, json=False)
+    args = argparse.Namespace(id="abc123", json=False)
     assert agent.cmd_status(args) == agent.EXIT_OK
     output = capsys.readouterr().out
     assert "exit code:  <invalid>" in output

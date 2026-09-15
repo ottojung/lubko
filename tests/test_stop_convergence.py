@@ -128,7 +128,7 @@ def test_stop_kill_converges_reserved_runner_work(
     assert not agent.group_alive(meta)
     assert agent.reservation_in_flight(meta)
 
-    code = agent.main([mode, aid])
+    code = agent.main([mode, "--id", aid])
     assert code == agent.EXIT_OK
     out = capsys.readouterr().out
     assert ("stopped" if mode == "stop" else "killed") in out
@@ -179,7 +179,7 @@ def test_stop_kill_converges_live_runner_queued_prompt(
     monkeypatch.setattr(agent, "group_alive", lambda _meta: False)
     monkeypatch.setattr(agent, "_converge_observed_runner", lambda *_a, **_k: True)
 
-    code = agent.main([mode, aid])
+    code = agent.main([mode, "--id", aid])
     assert code == agent.EXIT_OK
     out = capsys.readouterr().out
     assert ("stopped" if mode == "stop" else "killed") in out
@@ -217,7 +217,7 @@ def test_stop_kill_fails_closed_when_runner_convergence_fails(
     agent.write_meta(aid, meta)
     monkeypatch.setattr(agent, "_converge_observed_runner", lambda *_a, **_k: False)
 
-    code = agent.main([mode, aid])
+    code = agent.main([mode, "--id", aid])
     assert code == agent.EXIT_ERROR
     captured = capsys.readouterr()
     assert "did not converge" in captured.err
@@ -475,7 +475,7 @@ def test_invocation_spawn_gate_refuses_cancelled_prompt(
     agent.write_meta(aid, meta)
 
     # The concurrent stop/kill wins the lock and cancels the accepted work.
-    assert agent.main([mode, aid]) == agent.EXIT_OK
+    assert agent.main([mode, "--id", aid]) == agent.EXIT_OK
     capsys.readouterr()
 
     ctx = agent._RunnerContext(
