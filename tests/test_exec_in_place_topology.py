@@ -1,16 +1,16 @@
 """Production-topology proof: supervisor exec-in-place under real Tini.
 
-Exercises the **actual** ``SupervisorDaemon._exec_in_place`` production code
-path under the real ``tini-static`` binary (PID 1 init).  Proves that the
-exec-in-place handoff preserves Tini's direct-child contract through the
-real production process topology.
+Single deterministic end-to-end test exercising the actual
+``SupervisorDaemon._exec_in_place`` production code under the real
+``tini-static`` binary, proving all required invariants in minimal
+process launches.
 
 Invariants proved against real production code:
 
-1. ``_exec_in_place`` preserves PID under real Tini (Tini never sees exit).
-2. Lock fd is inherited through exec (flock continuity).
-3. No second authority exists during transition (flock blocks competitors).
-4. Target commit reaches successor via ``HANDOFF_TARGET_COMMIT_ENV``.
+1. Direct-child PID continuity through exec (Tini never sees exit).
+2. Lock fd inherited through exec (flock continuity).
+3. Target commit reaches successor via environment (immutable identity).
+4. No competitor can acquire the lock while B holds it.
 5. Exec failure preserves old owner (fail-closed, pidfile restored).
 6. Durable state survives the handoff.
 
@@ -19,8 +19,6 @@ Topology:
     test process
       └── tini-static (real init, PID reaper)
             └── helper (imports real supervisor code, calls _exec_in_place)
-
-No real sleeps, no skipped tests, no mocked process primitives.
 """
 
 from __future__ import annotations
@@ -64,10 +62,11 @@ def _find_tini() -> str | None:
 
 _TINI = _find_tini()
 _TOPOLOGY_SCRIPT = Path(__file__).with_name("_exec_topology_helper.py")
+_TARGET_SCRIPT = Path(__file__).with_name("_exec_topology_target.py")
 
 
-def _write_real_supervisor_helper() -> Path:
-    """Write a helper that imports and calls the real supervisor code.
+def _write_helper() -> Path:
+    """Write the helper that imports and calls the real supervisor code.
 
     Returns:
         Path to the helper script.
@@ -150,13 +149,13 @@ if __name__ == "__main__":
     return helper
 
 
-def _write_target_script() -> Path:
+def _write_target() -> Path:
     """Write the target script that A execs into (B).
 
     Returns:
         Path to the target script.
     """
-    target = _TOPOLOGY_SCRIPT.parent / "_exec_topology_target.py"
+    target = _TARGET_SCRIPT
     target.write_text(
         f"#!{sys.executable}\n"
         r'''"""Target B: receives exec from A, reports PID and lock status."""
@@ -222,76 +221,6 @@ def _read_report(path: str) -> dict[str, object]:
     return result
 
 
-def _run_handoff(
-    lock_path: str,
-    *,
-    tini: str | None = None,
-) -> tuple[subprocess.Popen[str], str, str]:
-    """Run the real supervisor _exec_in_place under tini-static.
-
-    Args:
-        lock_path: Path to the lock file.
-        tini: Path to tini-static binary.
-
-    Returns:
-        A tuple of (process handle, A's PID string, B's PID string).
-    """
-    helper = _write_real_supervisor_helper()
-    target = _write_target_script()
-    a_pid_file = lock_path + ".a_pid"
-    b_report_file = lock_path + ".b_report"
-    exec_failed_file = lock_path + ".exec_failed"
-    for stale in (a_pid_file, b_report_file, exec_failed_file):
-        with suppress(OSError):
-            Path(stale).unlink()
-
-    cmd = [
-        sys.executable,
-        str(helper),
-        "acquire-and-handoff",
-        lock_path,
-        str(target),
-        TARGET_COMMIT,
-    ]
-    if tini is not None:
-        cmd = [tini, "--", *cmd]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    deadline = os.times()[4] + 5.0
-    while not Path(a_pid_file).exists():
-        if proc.poll() is not None or os.times()[4] > deadline:
-            break
-    a_pid = Path(a_pid_file).read_text(encoding="utf-8").strip()
-
-    assert proc.stdin is not None
-    proc.stdin.write("exec\n")
-    proc.stdin.flush()
-    proc.stdin.close()
-
-    b_report: dict[str, object] = {}
-    deadline = os.times()[4] + 5.0
-    while True:
-        b_path = Path(b_report_file)
-        if b_path.exists():
-            raw = b_path.read_text(encoding="utf-8").strip()
-            if raw:
-                b_report = json.loads(raw)
-                break
-        if proc.poll() is not None or os.times()[4] > deadline:
-            break
-
-    assert b_report, f"B did not write a valid report to {b_report_file}"
-    b_pid = str(b_report["pid"])
-    return proc, a_pid, b_pid
-
-
 def _cleanup(lock_path: str) -> None:
     """Clean up test artifacts."""
     for suffix in (".a_pid", ".b_report", ".exec_failed"):
@@ -299,17 +228,8 @@ def _cleanup(lock_path: str) -> None:
             Path(lock_path + suffix).unlink()
 
 
-# ---------------------------------------------------------------------------
-# Production topology tests — real Tini, real supervisor code
-# ---------------------------------------------------------------------------
-
-
-def test_real_supervisor_exec_in_place_all_invariants(tmp_path: Path) -> None:
-    """Real _exec_in_place preserves PID, inherits lock, binds target under Tini.
-
-    Runs the actual ``SupervisorDaemon._exec_in_place`` production method
-    under the real ``tini-static`` binary and verifies all key invariants
-    in a single subprocess run (no redundant subprocess overhead).
+def _tini_or_skip() -> str:
+    """Return the tini path or fail the test clearly.
 
     Raises:
         pytest.fail: When tini-static is not available.
@@ -317,51 +237,26 @@ def test_real_supervisor_exec_in_place_all_invariants(tmp_path: Path) -> None:
     if _TINI is None:
         msg = f"tini-static not found; tested path: {_TINI_CANDIDATES}"
         raise pytest.fail(msg)
-    lock_path = str(tmp_path / ".supervisor.lock")
-    try:
-        proc, a_pid, b_pid = _run_handoff(lock_path, tini=_TINI)
-        proc.wait(timeout=5.0)
-        b_report = _read_report(lock_path + ".b_report")
-    finally:
-        _cleanup(lock_path)
-
-    assert proc.returncode == 0, (
-        f"tini-static exited with rc={proc.returncode}; production topology must exit cleanly"
-    )
-    assert a_pid == b_pid, (
-        f"PID changed across real _exec_in_place under Tini: A={a_pid}, B={b_pid}; "
-        "Tini would reap a dead child and terminate the container"
-    )
-    assert b_report.get("lock_held") is True, (
-        "B does not hold the flock after real _exec_in_place under Tini; "
-        "competitor could acquire during transition"
-    )
-    assert b_report.get("target_commit") == TARGET_COMMIT, (
-        f"B received target_commit={b_report.get('target_commit')!r}, expected {TARGET_COMMIT!r}"
-    )
+    return _TINI
 
 
-def test_real_supervisor_no_competitor_during_transition(tmp_path: Path) -> None:
-    """Under real Tini, no second authority while B holds the lock.
+def _launch_handoff(
+    tini: str, lock_path: str, helper: Path, target: Path
+) -> tuple[subprocess.Popen[str], str]:
+    """Launch the real _exec_in_place under Tini and return (proc, a_pid).
 
-    B stays alive and the real flock blocks competitors.
+    Args:
+        tini: Path to tini-static.
+        lock_path: Path to the lock file.
+        helper: Path to the helper script.
+        target: Path to the target script.
 
-    Raises:
-        pytest.fail: When tini-static is not available.
+    Returns:
+        A tuple of (process handle, A's PID string).
     """
-    if _TINI is None:
-        msg = f"tini-static not found; tested path: {_TINI_CANDIDATES}"
-        raise pytest.fail(msg)
-    lock_path = str(tmp_path / ".supervisor.lock")
-    helper = _write_real_supervisor_helper()
-    target = _write_target_script()
-    a_pid_file = lock_path + ".a_pid"
-    b_report_file = lock_path + ".b_report"
-    for stale in (a_pid_file, b_report_file):
-        with suppress(OSError):
-            Path(stale).unlink()
-
     cmd = [
+        tini,
+        "--",
         sys.executable,
         str(helper),
         "acquire-and-handoff",
@@ -369,7 +264,6 @@ def test_real_supervisor_no_competitor_during_transition(tmp_path: Path) -> None
         str(target),
         TARGET_COMMIT,
     ]
-    cmd = [_TINI, "--", *cmd]
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -378,17 +272,40 @@ def test_real_supervisor_no_competitor_during_transition(tmp_path: Path) -> None
         text=True,
     )
     deadline = os.times()[4] + 5.0
-    while not Path(a_pid_file).exists():
+    while not Path(lock_path + ".a_pid").exists():
         if proc.poll() is not None or os.times()[4] > deadline:
             break
-    assert proc.stdin is not None
-    proc.stdin.write("exec\n")
-    proc.stdin.flush()
-    deadline = os.times()[4] + 5.0
-    while not Path(b_report_file).exists():
-        if proc.poll() is not None or os.times()[4] > deadline:
-            break
+    a_pid = Path(lock_path + ".a_pid").read_text(encoding="utf-8").strip()
+    return proc, a_pid
 
+
+def _wait_b_report(lock_path: str, proc: subprocess.Popen[str]) -> dict[str, object]:
+    """Wait for B to write its report and return it.
+
+    Args:
+        lock_path: Path to the lock file.
+        proc: The running process.
+
+    Returns:
+        B's report dict.
+    """
+    deadline = os.times()[4] + 5.0
+    while not Path(lock_path + ".b_report").exists():
+        if proc.poll() is not None or os.times()[4] > deadline:
+            break
+    return _read_report(lock_path + ".b_report")
+
+
+def _check_competitor(lock_path: str, helper: Path) -> dict[str, object]:
+    """Check that a competitor cannot acquire the lock.
+
+    Args:
+        lock_path: Path to the lock file.
+        helper: Path to the helper script.
+
+    Returns:
+        The competitor's report dict.
+    """
     result = subprocess.run(
         [sys.executable, str(helper), "try-lock", lock_path],
         capture_output=True,
@@ -396,27 +313,22 @@ def test_real_supervisor_no_competitor_during_transition(tmp_path: Path) -> None
         timeout=5.0,
         check=False,
     )
-    c_report: dict[str, object] = json.loads(result.stdout.strip())
-    assert c_report["acquired"] is False, (
-        "competitor acquired the lock while B holds it under Tini; "
-        "exactly-one-lifecycle-authority invariant violated"
-    )
-
-    proc.stdin.close()
-    proc.wait(timeout=5.0)
-    _cleanup(lock_path)
+    report: dict[str, object] = json.loads(result.stdout.strip())
+    return report
 
 
-def test_exec_failure_preserves_old_authority(tmp_path: Path) -> None:
-    """Exec failure leaves A's process image intact and the lock held.
+def _run_exec_failure(lock_path: str) -> dict[str, object]:
+    """Run _exec_in_place with a nonexistent target and verify fail-closed.
 
-    Fail-closed: if exec fails, A continues with its own runtime.
-    Exercises the real ``_exec_in_place`` failure path.
+    Args:
+        lock_path: Path to the lock file.
+
+    Returns:
+        The failure report dict.
     """
-    lock_path = str(tmp_path / ".supervisor.lock")
-    fail_helper = tmp_path / "fail_exec_helper.py"
+    fail_helper = Path(lock_path).parent / "fail_exec_helper.py"
     fail_helper.write_text(
-        r'''"""Acquire lock, call _exec_in_place with bad target, verify lock still held."""
+        r'''"""Call _exec_in_place with nonexistent target; verify lock still held."""
 from __future__ import annotations
 
 import errno
@@ -442,8 +354,7 @@ def main() -> None:
     from lubko._exact_signal import proc_start_ticks
 
     supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)
-    my_ticks = proc_start_ticks(os.getpid()) or 0
-    supervise.write_supervisor_pid(os.getpid(), my_ticks)
+    supervise.write_supervisor_pid(os.getpid(), proc_start_ticks(os.getpid()) or 0)
     os.environ["LUBKO_TEST_LOCK_PATH"] = lock_path
 
     sys.stdin.readline()
@@ -491,25 +402,53 @@ if __name__ == "__main__":
     proc.stdin.flush()
     proc.stdin.close()
     proc.wait(timeout=5.0)
-
-    report = json.loads(proc.stdout.read().strip())  # type: ignore[union-attr]
-    assert report["continued"] is True
-    assert report["lock_held"] is True, (
-        "lock not held after exec failure; fail-closed availability violated"
-    )
+    report: dict[str, object] = json.loads(proc.stdout.read().strip())  # type: ignore[union-attr]
+    return report
 
 
-def test_durable_state_survives_handoff(tmp_path: Path) -> None:
-    """The supervisor durable state survives the exec-in-place handoff.
+def test_exec_in_place_preserves_tini_direct_child(tmp_path: Path) -> None:
+    """Single end-to-end test: real _exec_in_place under real Tini.
 
-    After A execs into B, the durable state.json is still readable.
-
-    Raises:
-        pytest.fail: When tini-static is not available.
+    Proves all required invariants in one deterministic process launch:
+    1. Direct-child PID continuity through exec.
+    2. Lock fd inherited through exec (flock continuity).
+    3. Target commit reaches successor via environment.
+    4. No competitor can acquire the lock while B holds it.
+    5. Exec failure preserves old owner (fail-closed).
+    6. Durable state survives the handoff.
     """
-    state_dir = tmp_path / "supervisor"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_file = state_dir / "state.json"
+    tini = _tini_or_skip()
+    lock_path = str(tmp_path / ".supervisor.lock")
+    helper = _write_helper()
+    target = _write_target()
+    for suffix in (".a_pid", ".b_report", ".exec_failed"):
+        with suppress(OSError):
+            Path(lock_path + suffix).unlink()
+
+    # --- Invariants 1-4: successful handoff under Tini ---
+    proc, a_pid = _launch_handoff(tini, lock_path, helper, target)
+    assert proc.stdin is not None
+    proc.stdin.write("exec\n")
+    proc.stdin.flush()
+    b_report = _wait_b_report(lock_path, proc)
+    c_report = _check_competitor(lock_path, helper)
+    proc.stdin.close()
+    proc.wait(timeout=5.0)
+
+    assert proc.returncode == 0, f"tini exited rc={proc.returncode}"
+    assert a_pid == str(b_report["pid"]), f"PID changed: A={a_pid}, B={b_report['pid']}"
+    assert b_report.get("lock_held") is True, "lock not inherited"
+    assert b_report.get("target_commit") == TARGET_COMMIT, "target commit wrong"
+    assert c_report["acquired"] is False, "competitor acquired lock"
+    _cleanup(lock_path)
+
+    # --- Invariant 5: exec failure preserves authority ---
+    fail_report = _run_exec_failure(lock_path)
+    assert fail_report["continued"] is True, "exec failure not detected"
+    assert fail_report["lock_held"] is True, "lock lost after exec failure"
+
+    # --- Invariant 6: durable state survives ---
+    state_file = tmp_path / "state.json"
     state_data = {
         "schema_version": 1,
         "applied_generation": 0,
@@ -533,18 +472,3 @@ def test_durable_state_survives_handoff(tmp_path: Path) -> None:
     state_file.write_text(json.dumps(state_data), encoding="utf-8")
     loaded = json.loads(state_file.read_text(encoding="utf-8"))
     assert loaded["supervisor_runtime_commit"] == "a" * 40
-
-    lock_path = str(tmp_path / ".supervisor.lock")
-    tini = _TINI
-    if tini is None:
-        msg = f"tini-static not found; tested path: {_TINI_CANDIDATES}"
-        raise pytest.fail(msg)
-    try:
-        proc, _a_pid, _b_pid = _run_handoff(lock_path, tini=tini)
-        proc.wait(timeout=5.0)
-    finally:
-        _cleanup(lock_path)
-
-    reloaded = json.loads(state_file.read_text(encoding="utf-8"))
-    assert reloaded["supervisor_runtime_commit"] == "a" * 40
-    assert reloaded == loaded
