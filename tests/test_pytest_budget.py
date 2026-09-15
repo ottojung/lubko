@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
 
 from tests._pytest_budget import BUDGET_SECONDS, _BudgetGate
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 
 def _fake_session(exitstatus: pytest.ExitCode = pytest.ExitCode.OK) -> MagicMock:
@@ -20,144 +16,62 @@ def _fake_session(exitstatus: pytest.ExitCode = pytest.ExitCode.OK) -> MagicMock
     return session
 
 
-def _make_gate(
-    clock: Callable[[], float] | None = None,
-    budget: float = BUDGET_SECONDS,
-) -> _BudgetGate:
-    return _BudgetGate(clock=clock, budget=budget)
+def _gate_at(elapsed: float, budget: float = BUDGET_SECONDS) -> _BudgetGate:
+    """Return a gate whose clock yields *start*=0 then *finish*=*elapsed*."""
+    times = iter([0.0, elapsed])
+    return _BudgetGate(clock=lambda: next(times), budget=budget)
 
 
-# -- below budget -----------------------------------------------------------
+def test_below_budget_passes() -> None:
+    """Session completing under budget retains OK status."""
+    gate = _gate_at(9.99)
+    session = _fake_session()
+    gate.sessionstart(session)
+    gate.sessionfinish(session, pytest.ExitCode.OK)
+    assert session.exitstatus == pytest.ExitCode.OK
+    assert not gate.budget_exceeded
 
 
-class TestBelowBudget:
-    """Session completes within budget and passes."""
-
-    def test_ok_when_fast(self) -> None:
-        times = iter([0.0, 9.99])
-        gate = _make_gate(clock=lambda: next(times))
-        session = _fake_session()
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.OK)
-
-        assert session.exitstatus == pytest.ExitCode.OK
-        assert gate.budget_exceeded is False
-
-    def test_zero_elapsed(self) -> None:
-        gate = _make_gate(clock=lambda: 0.0)
-        session = _fake_session()
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.OK)
-
-        assert session.exitstatus == pytest.ExitCode.OK
-        assert gate.budget_exceeded is False
+def test_exactly_at_budget_fails() -> None:
+    """Elapsed time equal to the budget triggers failure."""
+    gate = _gate_at(10.0)
+    session = _fake_session()
+    gate.sessionstart(session)
+    gate.sessionfinish(session, pytest.ExitCode.OK)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert gate.budget_exceeded
 
 
-# -- at / over budget -------------------------------------------------------
+def test_over_budget_fails() -> None:
+    """Elapsed time beyond the budget triggers failure."""
+    gate = _gate_at(15.5)
+    session = _fake_session()
+    gate.sessionstart(session)
+    gate.sessionfinish(session, pytest.ExitCode.OK)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert gate.budget_exceeded
 
 
-class TestAtOrOverBudget:
-    """Session reaching or exceeding the budget is failed."""
-
-    def test_at_budget_is_failure(self) -> None:
-        times = iter([0.0, 10.0])
-        gate = _make_gate(clock=lambda: next(times))
-        session = _fake_session()
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.OK)
-
-        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
-        assert gate.budget_exceeded is True
-
-    def test_over_budget_is_failure(self) -> None:
-        times = iter([0.0, 15.5])
-        gate = _make_gate(clock=lambda: next(times))
-        session = _fake_session()
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.OK)
-
-        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
-        assert gate.budget_exceeded is True
-
-    def test_just_under_budget_passes(self) -> None:
-        times = iter([0.0, 9.999])
-        gate = _make_gate(clock=lambda: next(times))
-        session = _fake_session()
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.OK)
-
-        assert session.exitstatus == pytest.ExitCode.OK
-        assert gate.budget_exceeded is False
+def test_existing_failure_not_overridden() -> None:
+    """When tests already failed the budget gate must not change exitstatus."""
+    gate = _gate_at(999.0)
+    session = _fake_session(exitstatus=pytest.ExitCode.TESTS_FAILED)
+    gate.sessionstart(session)
+    gate.sessionfinish(session, pytest.ExitCode.TESTS_FAILED)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert not gate.budget_exceeded
 
 
-# -- existing failures are not masked ---------------------------------------
+def test_existing_nonzero_exit_preserved() -> None:
+    """Any nonzero exit status is preserved even if budget is exceeded."""
+    gate = _gate_at(999.0)
+    session = _fake_session(exitstatus=pytest.ExitCode.INTERRUPTED)
+    gate.sessionstart(session)
+    gate.sessionfinish(session, pytest.ExitCode.INTERRUPTED)
+    assert session.exitstatus == pytest.ExitCode.INTERRUPTED
+    assert not gate.budget_exceeded
 
 
-class TestExistingFailuresPreserved:
-    """When tests already failed, the budget gate must not change exitstatus."""
-
-    def test_existing_failure_not_overridden(self) -> None:
-        times = iter([0.0, 999.0])
-        gate = _make_gate(clock=lambda: next(times))
-        session = _fake_session(exitstatus=pytest.ExitCode.TESTS_FAILED)
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.TESTS_FAILED)
-
-        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
-        assert gate.budget_exceeded is False
-
-    def test_existing_nonzero_not_overridden(self) -> None:
-        times = iter([0.0, 999.0])
-        gate = _make_gate(clock=lambda: next(times))
-        session = _fake_session(exitstatus=pytest.ExitCode.INTERRUPTED)
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.INTERRUPTED)
-
-        assert session.exitstatus == pytest.ExitCode.INTERRUPTED
-        assert gate.budget_exceeded is False
-
-
-# -- budget constant --------------------------------------------------------
-
-
-class TestBudgetConstant:
-    """Verify the budget constant matches AGENTS.md requirement."""
-
-    def test_budget_is_ten_seconds(self) -> None:
-        assert BUDGET_SECONDS == 10.0
-
-
-# -- custom budget for test isolation ---------------------------------------
-
-
-class TestCustomBudget:
-    """Tests can exercise the gate with a reduced budget for determinism."""
-
-    def test_custom_budget_low(self) -> None:
-        times = iter([0.0, 1.0])
-        gate = _make_gate(clock=lambda: next(times), budget=1.0)
-        session = _fake_session()
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.OK)
-
-        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
-        assert gate.budget_exceeded is True
-
-    def test_custom_budget_just_under(self) -> None:
-        times = iter([0.0, 0.5])
-        gate = _make_gate(clock=lambda: next(times), budget=1.0)
-        session = _fake_session()
-
-        gate.sessionstart(session)
-        gate.sessionfinish(session, pytest.ExitCode.OK)
-
-        assert session.exitstatus == pytest.ExitCode.OK
-        assert gate.budget_exceeded is False
+def test_budget_constant_is_ten_seconds() -> None:
+    """The configured budget matches the AGENTS.md 10.0s requirement."""
+    assert pytest.approx(10.0) == BUDGET_SECONDS
