@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-from contextlib import suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -71,9 +70,12 @@ def test_successor_binds_to_a_target_not_cli_current(
     cli/current between A's target resolution and B's startup would cause B
     to record the wrong identity.
 
-    Exercises SupervisorDaemon.run() end-to-end: ownership adoption binds
-    the target, run() persists it durably, and the durable state file
-    records A's exact target — not the changed cli/current.
+    Models the actual execed successor startup: A's ``_exec_in_place``
+    passes only the four lock-adoption env vars (HANDOFF_FD_ENV,
+    HANDOFF_PATH_ENV, HANDOFF_PID_ENV, HANDOFF_TARGET_COMMIT_ENV) with no
+    prepare-mode flag and no ready/transfer protocol.  B runs the normal
+    startup path, which calls ``_try_adopt_inherited_lock`` to adopt the
+    inherited fd and bind the target commit.
     """
     _write_state_with_runtime(TARGET_COMMIT)
     _set_cli_current(OTHER_COMMIT)
@@ -82,21 +84,13 @@ def test_successor_binds_to_a_target_not_cli_current(
     lock_path = str(supervise.supervisor_lock_path())
     lock_fd = supervise.acquire_supervisor_lock()
 
-    # Pre-fill the transfer pipe so the handoff protocol can read T\n.
-    transfer_r, transfer_w = os.pipe()
-    os.write(transfer_w, b"T\n")
-    os.close(transfer_w)
-
-    # Ready pipe: protocol writes R\n, test side reads it (discarded).
-    ready_r, ready_w = os.pipe()
-
+    # Model the exact env vars A's _exec_in_place sets for B: inherited
+    # lock fd, lock path, A's pid, and the confirmed target commit.
+    # No HANDOFF_PREPARE_MODE_ENV, no HANDOFF_READY_FD_ENV.
     env_overrides = {
         supervise.HANDOFF_FD_ENV: str(lock_fd),
         supervise.HANDOFF_PATH_ENV: lock_path,
         supervise.HANDOFF_PID_ENV: str(os.getpid()),
-        supervise.HANDOFF_READY_FD_ENV: str(ready_w),
-        supervise.HANDOFF_TRANSFER_FD_ENV: str(transfer_r),
-        supervise.HANDOFF_MODE_ENV: "1",
         supervise.HANDOFF_TARGET_COMMIT_ENV: TARGET_COMMIT,
     }
     for k, v in env_overrides.items():
@@ -113,16 +107,9 @@ def test_successor_binds_to_a_target_not_cli_current(
     monkeypatch.setattr(SupervisorDaemon, "_write_status", lambda _s, *_a: None)
     monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
 
-    # Exercise the real run() path: _acquire_ownership → bind → handoff
-    # protocol → _persist_runtime_commit.
+    # Exercise the real run() path: _acquire_ownership →
+    # _try_adopt_inherited_lock → _persist_runtime_commit.
     daemon.run()
-
-    # Drain the pipes closed by the handoff protocol's finally block.
-    # ready_w was already closed by the protocol; close the read end.
-    with suppress(OSError):
-        os.close(ready_r)
-    with suppress(OSError):
-        os.close(transfer_r)
 
     # The runtime commit persisted durably must be A's target, not the
     # cli/current value (OTHER_COMMIT) that __init__ captured.
@@ -148,10 +135,7 @@ def test_missing_target_commit_in_handoff_mode_fails_closed(
     env_overrides = {
         supervise.HANDOFF_FD_ENV: str(lock_fd),
         supervise.HANDOFF_PATH_ENV: lock_path,
-        supervise.HANDOFF_PID_ENV: "1",
-        supervise.HANDOFF_READY_FD_ENV: "5",
-        supervise.HANDOFF_TRANSFER_FD_ENV: "6",
-        supervise.HANDOFF_MODE_ENV: "1",
+        supervise.HANDOFF_PID_ENV: str(os.getpid()),
     }
     for k, v in env_overrides.items():
         monkeypatch.setenv(k, v)
@@ -161,8 +145,7 @@ def test_missing_target_commit_in_handoff_mode_fails_closed(
         daemon._acquire_ownership()
     assert exc_info.value.code == 1
 
-    with suppress(OSError):
-        os.close(lock_fd)
+    os.close(lock_fd)
     supervise.supervisor_lock_path().unlink(missing_ok=True)
 
 
@@ -183,10 +166,7 @@ def test_malformed_target_commit_in_handoff_mode_fails_closed(
     env_overrides = {
         supervise.HANDOFF_FD_ENV: str(lock_fd),
         supervise.HANDOFF_PATH_ENV: lock_path,
-        supervise.HANDOFF_PID_ENV: "1",
-        supervise.HANDOFF_READY_FD_ENV: "5",
-        supervise.HANDOFF_TRANSFER_FD_ENV: "6",
-        supervise.HANDOFF_MODE_ENV: "1",
+        supervise.HANDOFF_PID_ENV: str(os.getpid()),
         supervise.HANDOFF_TARGET_COMMIT_ENV: "not-a-valid-commit",
     }
     for k, v in env_overrides.items():
@@ -197,8 +177,7 @@ def test_malformed_target_commit_in_handoff_mode_fails_closed(
         daemon._acquire_ownership()
     assert exc_info.value.code == 1
 
-    with suppress(OSError):
-        os.close(lock_fd)
+    os.close(lock_fd)
     supervise.supervisor_lock_path().unlink(missing_ok=True)
 
 

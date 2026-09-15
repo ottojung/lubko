@@ -1175,21 +1175,12 @@ HANDOFF_PATH_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PATH"
 #: diagnostic logging only (not security-critical).
 HANDOFF_PID_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PID"
 #: Environment variable carrying the readiness pipe read-end fd number.
-#: The successor writes ``R\\n`` to this pipe after initializing, and the
+#: The successor writes ``R\n`` to this pipe after initializing, and the
 #: old supervisor reads from it to confirm the successor is ready.
 HANDOFF_READY_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_READY_FD"
-#: Environment variable carrying the transfer pipe write-end fd number.
-#: The old supervisor writes ``T\\n`` to this pipe to authorize the
-#: successor to become the active lifecycle authority.
-HANDOFF_TRANSFER_FD_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_TRANSFER_FD"
-#: Environment variable signalling that the successor must run in handoff
-#: preparation mode: initialize, signal readiness, wait for transfer, then
-#: enter the normal reconcile loop.  Absent in normal startup.
-HANDOFF_MODE_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_MODE"
 #: Environment variable signalling that the spawned process is a non-authoritative
 #: preflight probe: validate the lock fd, signal READY, close the lock fd,
-#: and exit.  The probe never receives TRANSFER and never enters the reconcile
-#: loop.  Distinct from ``HANDOFF_MODE_ENV`` which implies authority transfer.
+#: and exit.  The probe never enters the reconcile loop.
 HANDOFF_PREPARE_MODE_ENV: Final = "LUBKO_SUPERVISOR_HANDOFF_PREPARE"
 #: Environment variable carrying the exact target commit the old supervisor
 #: resolved for the successor.  The successor binds its runtime identity to
