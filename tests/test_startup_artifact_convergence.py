@@ -1241,3 +1241,385 @@ def test_receipt_durability_failure_retains_staging_for_retry(
     receipt = dc._read_confirmation_receipt()
     assert receipt is not None
     assert receipt.get("commit") == commit_b
+
+
+# ---------------------------------------------------------------------------
+# Rollback artifact-restoration invariants
+# ---------------------------------------------------------------------------
+
+
+def _rollback_mission(
+    *,
+    status: str = dc.STATUS_PENDING,
+    generation: int = 5,
+    commit: str = "b" * 40,
+    previous_commit: str = "a" * 40,
+    supervisor_owned: bool = True,
+) -> dc.RollbackState:
+    """Return a minimal rollback mission for supervised/legacy rollback tests.
+
+    Returns:
+        A valid rollback state in the given status.
+    """
+
+    def _meta(commit_ref: str, pid: int) -> WorkerMeta:
+        return WorkerMeta(
+            schema_version=SCHEMA_VERSION,
+            state=STATE_RUNNING,
+            pid=pid,
+            pgid=pid,
+            sid=pid,
+            start_time_ticks=pid * 10,
+            token=f"tok-{pid}",
+            repo="/repo",
+            git_commit=commit_ref,
+            worker_id="w",
+            log_path="/l",
+            started_at=1.0,
+            stopped_at=None,
+        )
+
+    return dc.RollbackState(
+        schema_version=dc.ROLLBACK_SCHEMA_VERSION,
+        generation=generation,
+        status=status,
+        commit=commit,
+        previous_commit=previous_commit,
+        deadline=999999.0,
+        repo="/repo",
+        uv_path="uv",
+        stop_grace_seconds=1.0,
+        git_timeout_seconds=1.0,
+        previous_retiring=False,
+        previous_meta=_meta(previous_commit, 100),
+        new_meta=None if supervisor_owned else _meta(commit, 200),
+        supervisor_owned=supervisor_owned,
+    )
+
+
+def _setup_supervised_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> tuple[Path, dc.RollbackState]:
+    """Set up shared state for supervised rollback tests.
+
+    Returns:
+        A tuple of (bin_home path, rollback mission state).
+    """
+    bin_home = _setup(monkeypatch, tmp_path)
+    mission = _rollback_mission()
+    child = SimpleNamespace(marker="child")
+    monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
+    monkeypatch.setattr(supervise, "generation_lock", nullcontext)
+    monkeypatch.setattr(
+        supervise,
+        "read_desired_strict",
+        lambda: SimpleNamespace(commit=mission.previous_commit, generation=mission.generation + 1),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_status",
+        lambda: SimpleNamespace(
+            commit=mission.previous_commit,
+            applied_generation=mission.generation + 1,
+            ready=True,
+            holding=False,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(
+        supervise,
+        "read_state",
+        lambda: SimpleNamespace(
+            commit=mission.previous_commit,
+            applied_generation=mission.generation + 1,
+            ready=True,
+            child=child,
+        ),
+    )
+    monkeypatch.setattr(supervise, "child_alive", lambda _c: True)
+    monkeypatch.setattr(supervise, "is_holding", lambda _s: False)
+    monkeypatch.setattr(cli, "remove_cli_root", lambda _c: None)
+    monkeypatch.setattr(cli, "reconcile_pointer", lambda _c: True)
+    monkeypatch.setattr(dc, "append_deploy_log", lambda _m: None)
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
+    return bin_home, mission
+
+
+def test_supervised_rollback_never_invokes_legacy_worker_restoration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Terminal supervised rollback uses settle_desired only, never _restart_previous.
+
+    Regression: _finalize_supervised_rollback must NOT call
+    _restore_previous_locked() or _restart_previous().  The supervised path
+    relies on settle_desired() having proved the external supervisor converged
+    a fresh previous-commit worker.  Calling the legacy direct-restore would
+    launch a second worker and mix legacy authority with supervisor ownership.
+    """
+    bin_home, mission = _setup_supervised_rollback(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest(mission.previous_commit, bin_home)
+
+    restart_called = [False]
+    original_restart = dc._restart_previous
+
+    def track_restart(state: dc.RollbackState) -> WorkerMeta | None:
+        restart_called[0] = True
+        return original_restart(state)
+
+    monkeypatch.setattr(dc, "_restart_previous", track_restart)
+    restore_locked_called = [False]
+    original_restore = dc._restore_previous_locked
+
+    def track_restore(state: dc.RollbackState) -> tuple[bool, bool]:
+        restore_locked_called[0] = True
+        return original_restore(state)
+
+    monkeypatch.setattr(dc, "_restore_previous_locked", track_restore)
+
+    terminal = dc._finalize_supervised_rollback(mission, mission.generation + 1)
+    assert terminal.status == dc.STATUS_ROLLED_BACK
+    assert not restart_called[0], "_restart_previous must not be called by supervised rollback"
+    assert not restore_locked_called[0], (
+        "_restore_previous_locked must not be called by supervised rollback"
+    )
+
+
+def test_bin_home_resolution_failure_keeps_rollback_nonterminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When _resolve_bin_home() fails, _restore_cli_and_startup_artifacts returns failure.
+
+    Terminal ``rolled_back`` status must NOT be written: the previous startup
+    authority was not verified.  Staging, snapshot, and receipt evidence are
+    retained so retry can recover.
+    """
+    bin_home, mission = _setup_supervised_rollback(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest(mission.previous_commit, bin_home)
+
+    snapshot_path = dc._pre_confirmation_artifacts_path()
+    raw = sc.snapshot_startup_artifacts(bin_home)
+    snapshot_path.write_text(json.dumps(dict(raw.items())), encoding="utf-8")
+    assert snapshot_path.is_file()
+
+    receipt_path = dc._confirmation_receipt_path()
+    receipt_path.write_text(json.dumps({"commit": mission.commit}), encoding="utf-8")
+    assert receipt_path.is_file()
+
+    monkeypatch.setattr(lifecycle, "_resolve_bin_home", _raise_os_error)
+
+    success, snapshot_restored = dc._restore_cli_and_startup_artifacts(
+        mission.commit, mission.previous_commit
+    )
+    assert success is False
+    assert snapshot_restored is False
+    assert snapshot_path.is_file(), "pre-confirmation snapshot must be retained"
+    assert receipt_path.is_file(), "confirmation receipt must be retained"
+    assert sc.read_staging_manifest() is not None, "staging manifest must be retained"
+
+
+def test_missing_snapshot_retains_evidence_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When no pre-confirmation snapshot and no receipt exist, rollback succeeds.
+
+    Absence of both receipt and snapshot means confirmation never completed,
+    so there is no previous startup authority to restore.  The restore
+    function cleans up staging and receipt inline (no evidence to defer).
+    """
+    bin_home, mission = _setup_supervised_rollback(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest(mission.previous_commit, bin_home)
+
+    assert not dc._pre_confirmation_artifacts_path().is_file()
+    assert not dc._confirmation_receipt_path().is_file()
+
+    success, snapshot_restored = dc._restore_cli_and_startup_artifacts(
+        mission.commit, mission.previous_commit
+    )
+    assert success is True
+    assert snapshot_restored is False
+    assert sc.read_staging_manifest() is None, "staging cleaned up when no snapshot exists"
+
+
+def test_missing_snapshot_with_receipt_is_restoration_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing pre-confirmation snapshot when a receipt exists is restoration failure.
+
+    The receipt proves confirmation happened, so the missing restoration
+    authority must keep rollback nonterminal.  All evidence (receipt,
+    staging) is retained for retry.
+    """
+    bin_home, mission = _setup_supervised_rollback(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest(mission.previous_commit, bin_home)
+
+    assert not dc._pre_confirmation_artifacts_path().is_file()
+    receipt_path = dc._confirmation_receipt_path()
+    receipt_path.write_text(json.dumps({"commit": mission.commit}), encoding="utf-8")
+
+    success, snapshot_restored = dc._restore_cli_and_startup_artifacts(
+        mission.commit, mission.previous_commit
+    )
+    assert success is False
+    assert snapshot_restored is False
+    assert receipt_path.is_file(), "confirmation receipt is retained"
+    assert sc.read_staging_manifest() is not None, "staging manifest is retained"
+
+
+def test_corrupt_snapshot_retains_evidence_and_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt pre-confirmation snapshot with a receipt is restoration failure.
+
+    The receipt proves confirmation happened, so the missing restoration
+    authority must keep rollback nonterminal.  The corrupt snapshot file is
+    retained for later diagnosis.  Staging, receipt, and snapshot evidence
+    are all retained so retry can recover.
+    """
+    bin_home, mission = _setup_supervised_rollback(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest(mission.previous_commit, bin_home)
+
+    snapshot_path = dc._pre_confirmation_artifacts_path()
+    snapshot_path.write_text("{corrupt", encoding="utf-8")
+
+    receipt_path = dc._confirmation_receipt_path()
+    receipt_path.write_text(json.dumps({"commit": mission.commit}), encoding="utf-8")
+
+    success, snapshot_restored = dc._restore_cli_and_startup_artifacts(
+        mission.commit, mission.previous_commit
+    )
+    assert success is False
+    assert snapshot_restored is False
+    assert snapshot_path.is_file(), "corrupt snapshot file is retained"
+    assert receipt_path.is_file(), "confirmation receipt is retained"
+    assert sc.read_staging_manifest() is not None, "staging manifest is retained"
+
+
+def test_supervised_rollback_generation_race_rejects_stale_terminalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newer desired generation winning during restoration preserves evidence.
+
+    Regression: because the initial generation check is separated from the
+    later terminal write, a newer desired generation that wins during
+    restoration must not be overwritten by a stale terminal rollback.
+    Evidence (snapshot, staging, receipt) must be retained so retry can
+    recover.  _finalize_supervised_rollback revalidates the generation
+    under the lock before writing terminal state.
+    """
+    bin_home, mission = _setup_supervised_rollback(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest(mission.previous_commit, bin_home)
+
+    snapshot_path = dc._pre_confirmation_artifacts_path()
+    raw = sc.snapshot_startup_artifacts(bin_home)
+    snapshot_path.write_text(json.dumps(dict(raw.items())), encoding="utf-8")
+
+    receipt_path = dc._confirmation_receipt_path()
+    receipt_path.write_text(json.dumps({"commit": mission.commit}), encoding="utf-8")
+
+    written: list[dc.RollbackState] = []
+    monkeypatch.setattr(dc, "_write_state", written.append)
+
+    desired_reads = [0]
+    new_commit = "c" * 40
+    new_gen = mission.generation + 99
+    superseded_desired = SimpleNamespace(commit=new_commit, generation=new_gen)
+    superseded_status = SimpleNamespace(
+        commit=new_commit,
+        applied_generation=new_gen,
+        ready=True,
+        holding=False,
+        child=SimpleNamespace(marker="new-child"),
+    )
+    original_desired_fn = supervise.read_desired_strict
+    original_status_fn = supervise.read_status
+
+    def _supersede_on_second_read() -> object:
+        desired_reads[0] += 1
+        if desired_reads[0] >= 2:
+            return superseded_desired
+        return original_desired_fn()
+
+    def _supersede_status_on_second_read() -> object:
+        if desired_reads[0] >= 2:
+            return superseded_status
+        return original_status_fn()
+
+    monkeypatch.setattr(supervise, "read_desired_strict", _supersede_on_second_read)
+    monkeypatch.setattr(supervise, "read_status", _supersede_status_on_second_read)
+
+    with pytest.raises(dc.DeployCtlError, match="superseded before rollback"):
+        dc._finalize_supervised_rollback(mission, mission.generation + 1)
+
+    assert not any(s.status == dc.STATUS_ROLLED_BACK for s in written), (
+        "terminal rolled_back must not be written when generation was superseded"
+    )
+    assert snapshot_path.is_file(), "pre-confirmation snapshot retained after superseded rollback"
+    assert receipt_path.is_file(), "confirmation receipt retained after superseded rollback"
+    assert sc.read_staging_manifest() is not None, (
+        "staging manifest retained after superseded rollback"
+    )
+
+
+def test_successful_supervised_rollback_through_real_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Full supervised rollback path: settle → authority check → restore artifacts → terminalize.
+
+    Exercises the complete _rollback_locked() → settle_desired() →
+    _finalize_supervised_rollback() path with real artifact restoration.
+    Verifies terminal state, staging cleanup, receipt removal, and that
+    the previous startup authority was verified before terminalization.
+    """
+    bin_home, mission = _setup_supervised_rollback(monkeypatch, tmp_path)
+    sc.write_contract()
+    sc.write_startup_definition()
+    sc.write_startup_launcher(bin_home)
+    sc.stage_startup_artifacts(bin_home)
+    sc.write_staging_manifest(mission.previous_commit, bin_home)
+
+    snapshot_path = dc._pre_confirmation_artifacts_path()
+    raw = sc.snapshot_startup_artifacts(bin_home)
+    snapshot_path.write_text(json.dumps(dict(raw.items())), encoding="utf-8")
+
+    written: list[dc.RollbackState] = []
+    monkeypatch.setattr(dc, "_write_state", written.append)
+    monkeypatch.setattr(dc, "settle_desired", lambda *_a, **_k: mission.generation + 1)
+
+    assert dc._rollback_locked(mission) is True
+
+    assert len(written) == 1
+    terminal = written[0]
+    assert terminal.status == dc.STATUS_ROLLED_BACK
+    assert not snapshot_path.is_file(), "snapshot cleaned up after successful rollback"
+    assert sc.read_staging_manifest() is None, "staging cleaned up after successful rollback"
+    assert not dc._confirmation_receipt_path().is_file(), (
+        "receipt removed after successful rollback"
+    )
+    assert sc.assess_recorded_contract().state == "current", "previous contract authority restored"
+    assert sc.validate_startup_launcher(bin_home), "previous launcher restored"
+    assert sc.validate_startup_definition().ok, "previous definition restored"

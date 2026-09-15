@@ -368,14 +368,13 @@ def test_reused_occupant_between_proof_and_pin_is_never_signalled(
     assert fake.returncode == -1
 
 
-def test_restore_retry_reuses_durable_previous_worker_after_state_write_failure(
+def test_restore_retry_reuses_durable_previous_worker_after_metadata_crash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A published restored worker survives a crash without a duplicate spawn."""
     state = pending_state(previous_retiring=True)
     spawned: list[FakePopen] = []
     published: list[lifecycle.WorkerMeta] = []
-    state_writes: list[dc.RollbackState] = []
     fake = FakePopen(42001, mode="converges")
     identity = ProcessIdentity(
         pid=fake.pid,
@@ -402,18 +401,16 @@ def test_restore_retry_reuses_durable_previous_worker_after_state_write_failure(
     )
     monkeypatch.setattr(dc, "write_meta", published.append)
 
-    terminal_crash_pending = True
+    cli_crash_pending = True
 
-    def write_state(value: dc.RollbackState) -> None:
-        nonlocal terminal_crash_pending
-        state_writes.append(value)
-        if value.status == dc.STATUS_ROLLED_BACK and terminal_crash_pending:
-            terminal_crash_pending = False
+    def remove_cli_crash(_commit: str) -> None:
+        nonlocal cli_crash_pending
+        if cli_crash_pending:
+            cli_crash_pending = False
             msg = "simulated crash after worker metadata publication"
             raise OSError(msg)
 
-    monkeypatch.setattr(dc, "_write_state", write_state)
-    monkeypatch.setattr(deploy_cli, "remove_cli_root", lambda _commit: None)
+    monkeypatch.setattr(deploy_cli, "remove_cli_root", remove_cli_crash)
     monkeypatch.setattr(deploy_cli, "reconcile_pointer", lambda _commit: True)
 
     with pytest.raises(OSError, match="simulated crash"):
@@ -423,16 +420,17 @@ def test_restore_retry_reuses_durable_previous_worker_after_state_write_failure(
     assert len(published) == 1
     restored = published[0]
     assert restored.git_commit == state.previous_commit
+
+    monkeypatch.setattr(deploy_cli, "remove_cli_root", lambda _commit: None)
     assert dc._restore_previous_locked(state)
     assert len(spawned) == 1
     assert published == [restored, restored]
-    assert state_writes[-1].status == dc.STATUS_ROLLED_BACK
 
 
-def test_released_previous_worker_is_adopted_after_metadata_publication_crash(
+def test_released_previous_worker_is_adopted_after_cli_crash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A released exact worker remains durable authority before ``write_meta``."""
+    """A released exact worker survives a post-metadata crash without duplicate spawn."""
     state = pending_state(previous_retiring=True)
     fake = FakePopen(42005, mode="converges")
     restored = replace(
@@ -448,12 +446,11 @@ def test_released_previous_worker_is_adopted_after_metadata_publication_crash(
     )
     spawned: list[dc.GatedWorker] = []
     released: list[int] = []
-    state_writes: list[dc.RollbackState] = []
     published: list[lifecycle.WorkerMeta] = []
-    metadata_crash_pending = True
+    cli_crash_pending = True
 
     monkeypatch.setattr(dc, "_checkout", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(dc, "read_meta_strict", lambda: None)
+    monkeypatch.setattr(dc, "read_meta_strict", lambda: published[-1] if published else None)
     monkeypatch.setattr(dc, "worker_alive", lambda meta: meta == restored)
     monkeypatch.setattr(dc, "check_postgres", lambda _timeout: True)
     monkeypatch.setattr(dc, "_wait_for_released_worker", lambda _meta: True)
@@ -464,37 +461,33 @@ def test_released_previous_worker_is_adopted_after_metadata_publication_crash(
 
     monkeypatch.setattr(dc, "_spawn_gated_previous_worker", spawn_gated)
     monkeypatch.setattr(dc, "_release_gate", released.append)
-    monkeypatch.setattr(dc, "_write_state", state_writes.append)
 
     def write_meta(meta: lifecycle.WorkerMeta) -> None:
-        nonlocal metadata_crash_pending
-        if metadata_crash_pending:
-            metadata_crash_pending = False
-            msg = "simulated crash before worker metadata publication"
-            raise OSError(msg)
         published.append(meta)
 
     monkeypatch.setattr(dc, "write_meta", write_meta)
-    monkeypatch.setattr(deploy_cli, "remove_cli_root", lambda _commit: None)
+
+    def remove_cli_crash(_commit: str) -> None:
+        nonlocal cli_crash_pending
+        if cli_crash_pending:
+            cli_crash_pending = False
+            msg = "simulated crash after worker metadata publication"
+            raise OSError(msg)
+
+    monkeypatch.setattr(deploy_cli, "remove_cli_root", remove_cli_crash)
     monkeypatch.setattr(deploy_cli, "reconcile_pointer", lambda _commit: True)
 
-    with pytest.raises(OSError, match="before worker metadata publication"):
+    with pytest.raises(OSError, match="simulated crash"):
         dc._restore_previous_locked(state)
 
     assert spawned == [gated]
     assert released == [gated.gate_writer]
-    assert published == []
-    recovery = state_writes[-1]
-    assert recovery.previous_restart_meta == restored
-    assert recovery.previous_restart_released is True
-
-    assert dc._restore_previous_locked(recovery)
-    assert spawned == [gated]
     assert published == [restored]
-    terminal = state_writes[-1]
-    assert terminal.status == dc.STATUS_ROLLED_BACK
-    assert terminal.previous_restart_meta is None
-    assert terminal.previous_restart_released is False
+
+    monkeypatch.setattr(deploy_cli, "remove_cli_root", lambda _commit: None)
+    assert dc._restore_previous_locked(state)
+    assert spawned == [gated]
+    assert published == [restored, restored]
 
 
 def test_unreleased_previous_restart_is_converged_before_another_spawn(
