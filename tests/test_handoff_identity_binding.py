@@ -43,31 +43,6 @@ def _write_state_with_runtime(runtime_commit: str | None = None) -> None:
     supervise.state_path().write_text(json.dumps(state.to_dict()), encoding="utf-8")
 
 
-def _make_handoff_env(
-    *,
-    target_commit: str | None = TARGET_COMMIT,
-    overrides: dict[str, str] | None = None,
-) -> dict[str, str]:
-    """Build a minimal handoff environment.
-
-    Returns:
-        A dictionary of environment variables for a handoff successor.
-    """
-    env: dict[str, str] = {
-        supervise.HANDOFF_FD_ENV: "-1",
-        supervise.HANDOFF_PATH_ENV: "/lock",
-        supervise.HANDOFF_PID_ENV: "1",
-        supervise.HANDOFF_READY_FD_ENV: "5",
-        supervise.HANDOFF_TRANSFER_FD_ENV: "6",
-        supervise.HANDOFF_MODE_ENV: "1",
-    }
-    if overrides is not None:
-        env.update(overrides)
-    if target_commit is not None:
-        env[supervise.HANDOFF_TARGET_COMMIT_ENV] = target_commit
-    return env
-
-
 def _set_cli_current(commit: str) -> None:
     """Create a cli/current symlink pointing to *commit* under XDG_STATE_HOME."""
     cldir = cli_root_dir()
@@ -95,48 +70,64 @@ def test_successor_binds_to_a_target_not_cli_current(
     cli.current_commit() at construction time, so a deployment that changed
     cli/current between A's target resolution and B's startup would cause B
     to record the wrong identity.
+
+    Exercises SupervisorDaemon.run() end-to-end: ownership adoption binds
+    the target, run() persists it durably, and the durable state file
+    records A's exact target — not the changed cli/current.
     """
     _write_state_with_runtime(TARGET_COMMIT)
-
-    # Simulate cli/current pointing to a DIFFERENT commit (deployment happened
-    # between A's resolution and B's construction).
     _set_cli_current(OTHER_COMMIT)
 
-    # Adopt a handoff lock fd with A's target commit.
+    # Acquire a real lock fd so _try_adopt_inherited_lock succeeds.
     lock_path = str(supervise.supervisor_lock_path())
     lock_fd = supervise.acquire_supervisor_lock()
 
-    # Simulate the handoff env vars being set (as A would set them).
-    env = _make_handoff_env(target_commit=TARGET_COMMIT)
-    env[supervise.HANDOFF_FD_ENV] = str(lock_fd)
-    env[supervise.HANDOFF_PATH_ENV] = lock_path
-    for k, v in env.items():
+    # Pre-fill the transfer pipe so the handoff protocol can read T\n.
+    transfer_r, transfer_w = os.pipe()
+    os.write(transfer_w, b"T\n")
+    os.close(transfer_w)
+
+    # Ready pipe: protocol writes R\n, test side reads it (discarded).
+    ready_r, ready_w = os.pipe()
+
+    env_overrides = {
+        supervise.HANDOFF_FD_ENV: str(lock_fd),
+        supervise.HANDOFF_PATH_ENV: lock_path,
+        supervise.HANDOFF_PID_ENV: str(os.getpid()),
+        supervise.HANDOFF_READY_FD_ENV: str(ready_w),
+        supervise.HANDOFF_TRANSFER_FD_ENV: str(transfer_r),
+        supervise.HANDOFF_MODE_ENV: "1",
+        supervise.HANDOFF_TARGET_COMMIT_ENV: TARGET_COMMIT,
+    }
+    for k, v in env_overrides.items():
         monkeypatch.setenv(k, v)
 
-    # __init__ reads cli.current_commit() (OTHER_COMMIT) at construction.
     daemon = SupervisorDaemon(Settings())
-    assert daemon._runtime_commit is not None
-    assert daemon._runtime_commit == OTHER_COMMIT
-    assert daemon._handoff_target_commit is None
+    daemon._stopping = True
 
-    # run() calls _acquire_ownership which adopts the handoff fd and
-    # extracts the target commit.
-    daemon._acquire_ownership()
+    # Stub out parts that are not under test.
+    monkeypatch.setattr(SupervisorDaemon, "_write_pidfile", lambda _s: None)
+    monkeypatch.setattr(SupervisorDaemon, "_invalidate_stale_status", lambda _s: None)
+    monkeypatch.setattr("lubko.supervisor.normalize_cross_boot_state", lambda: None)
+    monkeypatch.setattr(SupervisorDaemon, "_install_signal_handlers", lambda _s: None)
+    monkeypatch.setattr(SupervisorDaemon, "_write_status", lambda _s, *_a: None)
+    monkeypatch.setattr("lubko.supervisor._durable_log_handlers", list)
 
-    assert daemon._handoff_target_commit == TARGET_COMMIT
+    # Exercise the real run() path: _acquire_ownership → bind → handoff
+    # protocol → _persist_runtime_commit.
+    daemon.run()
 
-    # Simulate what run() does: bind _runtime_commit from the handoff target.
-    # In run(), this happens immediately after _acquire_ownership when
-    # _handoff_target_commit is set, overriding the cli.current_commit()
-    # value captured at __init__ time.
-    bound = daemon._handoff_target_commit  # type: ignore[unreachable]  # mypy: cannot track attribute mutation through method call
-    assert bound is not None
-    daemon._runtime_commit = bound
+    # Drain the pipes closed by the handoff protocol's finally block.
+    # ready_w was already closed by the protocol; close the read end.
+    with suppress(OSError):
+        os.close(ready_r)
+    with suppress(OSError):
+        os.close(transfer_r)
 
-    # The runtime commit must be A's target, not the changed cli/current.
-    assert daemon._runtime_commit == TARGET_COMMIT
-
-    supervise.supervisor_lock_path().unlink(missing_ok=True)
+    # The runtime commit persisted durably must be A's target, not the
+    # cli/current value (OTHER_COMMIT) that __init__ captured.
+    persisted = json.loads(supervise.state_path().read_text(encoding="utf-8"))
+    assert persisted.get("supervisor_runtime_commit") == TARGET_COMMIT
 
 
 @pytest.mark.usefixtures("_state_dir")
@@ -154,10 +145,15 @@ def test_missing_target_commit_in_handoff_mode_fails_closed(
     lock_fd = supervise.acquire_supervisor_lock()
 
     # Handoff env vars set but HANDOFF_TARGET_COMMIT_ENV is missing.
-    env = _make_handoff_env(target_commit=None)
-    env[supervise.HANDOFF_FD_ENV] = str(lock_fd)
-    env[supervise.HANDOFF_PATH_ENV] = lock_path
-    for k, v in env.items():
+    env_overrides = {
+        supervise.HANDOFF_FD_ENV: str(lock_fd),
+        supervise.HANDOFF_PATH_ENV: lock_path,
+        supervise.HANDOFF_PID_ENV: "1",
+        supervise.HANDOFF_READY_FD_ENV: "5",
+        supervise.HANDOFF_TRANSFER_FD_ENV: "6",
+        supervise.HANDOFF_MODE_ENV: "1",
+    }
+    for k, v in env_overrides.items():
         monkeypatch.setenv(k, v)
 
     daemon = SupervisorDaemon(Settings())
@@ -184,10 +180,16 @@ def test_malformed_target_commit_in_handoff_mode_fails_closed(
     lock_path = str(supervise.supervisor_lock_path())
     lock_fd = supervise.acquire_supervisor_lock()
 
-    env = _make_handoff_env(target_commit="not-a-valid-commit")
-    env[supervise.HANDOFF_FD_ENV] = str(lock_fd)
-    env[supervise.HANDOFF_PATH_ENV] = lock_path
-    for k, v in env.items():
+    env_overrides = {
+        supervise.HANDOFF_FD_ENV: str(lock_fd),
+        supervise.HANDOFF_PATH_ENV: lock_path,
+        supervise.HANDOFF_PID_ENV: "1",
+        supervise.HANDOFF_READY_FD_ENV: "5",
+        supervise.HANDOFF_TRANSFER_FD_ENV: "6",
+        supervise.HANDOFF_MODE_ENV: "1",
+        supervise.HANDOFF_TARGET_COMMIT_ENV: "not-a-valid-commit",
+    }
+    for k, v in env_overrides.items():
         monkeypatch.setenv(k, v)
 
     daemon = SupervisorDaemon(Settings())
@@ -297,7 +299,6 @@ def test_status_reports_bound_runtime_commit(
     _set_cli_current(TARGET_COMMIT)
 
     daemon = SupervisorDaemon(Settings())
-    # Simulate binding from handoff target.
     daemon._runtime_commit = TARGET_COMMIT
     daemon._start_time_ticks = 42
 
