@@ -1074,7 +1074,7 @@ def _promote_launcher(manifest: dict[str, object], bin_home: Path) -> str | None
     if error is not None:
         return error
     staged_bytes = source.read_bytes()
-    error = _write_launcher_durable(dest, staged_bytes, bin_home)
+    error = _write_launcher_durable(dest, staged_bytes)
     if error is not None:
         return error
     if not _file_matches(dest, expected_hash, expected_size):
@@ -1100,7 +1100,7 @@ def _read_staged_launcher(source: Path, expected_hash: object) -> str | None:
     return None
 
 
-def _write_launcher_durable(dest: Path, data: bytes, bin_home: Path) -> str | None:
+def _write_launcher_durable(dest: Path, data: bytes) -> str | None:
     """Write launcher bytes durably with correct mode.
 
     Returns:
