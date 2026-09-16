@@ -135,7 +135,7 @@ def _assert_schema3_predecessor_reader_accepts(payload: dict[str, object]) -> No
     assert candidate.worker_id is None
 
 
-def test_supervisor_owned_wire_is_readable_by_schema3_predecessor() -> None:
+def test_supervisor_owned_wire_is_readable_by_schema3_predecessor(supervisor_token: str) -> None:
     """A rolling upgrade cannot publish state the running trusted predecessor rejects."""
     payload = _supervised_mission().to_dict()
 
@@ -146,7 +146,7 @@ def test_supervisor_owned_wire_is_readable_by_schema3_predecessor() -> None:
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
     """Isolate every durable authority surface."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     supervise.state_path().parent.mkdir(parents=True, exist_ok=True)
@@ -191,7 +191,7 @@ def _establish_pending_supervisor_authority(
 
 
 def test_supervised_prepare_state_stays_readable_through_status_and_confirmation(  # ruff: ignore[too-many-statements]
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, supervisor_token: str
 ) -> None:
     """Prepared supervisor state round-trips before and after child publication."""
     previous = _meta(OLD, 1)
@@ -290,7 +290,9 @@ def test_supervised_prepare_state_stays_readable_through_status_and_confirmation
     assert terminal.new_meta is None
 
 
-def test_missing_candidate_identity_requires_explicit_supervisor_ownership() -> None:
+def test_missing_candidate_identity_requires_explicit_supervisor_ownership(
+    supervisor_token: str,
+) -> None:
     """Legacy or unknown ownership cannot omit the candidate process identity."""
     for supervisor_owned in (False, None):
         payload = _supervised_mission().to_dict()
@@ -299,7 +301,9 @@ def test_missing_candidate_identity_requires_explicit_supervisor_ownership() -> 
             deployctl.RollbackState.from_dict(payload)
 
 
-def test_exact_identityless_supervisor_sentinel_normalizes_to_absent_identity() -> None:
+def test_exact_identityless_supervisor_sentinel_normalizes_to_absent_identity(
+    supervisor_token: str,
+) -> None:
     """Previously persisted supervisor sentinels remain recoverable after upgrade."""
     payload = _supervised_mission().to_dict()
     payload["new_meta"] = _identityless_supervisor_sentinel()
@@ -307,7 +311,7 @@ def test_exact_identityless_supervisor_sentinel_normalizes_to_absent_identity() 
     assert parsed.new_meta is None
 
 
-def test_near_miss_identityless_supervisor_sentinel_fails_closed() -> None:
+def test_near_miss_identityless_supervisor_sentinel_fails_closed(supervisor_token: str) -> None:
     """Only the exact historical sentinel bypasses strict worker identity parsing."""
     payload = _supervised_mission().to_dict()
     sentinel = _identityless_supervisor_sentinel()
@@ -317,7 +321,7 @@ def test_near_miss_identityless_supervisor_sentinel_fails_closed() -> None:
         deployctl.RollbackState.from_dict(payload)
 
 
-def test_malformed_candidate_identity_still_fails_closed() -> None:
+def test_malformed_candidate_identity_still_fails_closed(supervisor_token: str) -> None:
     """Explicit supervisor ownership does not make malformed identity dictionaries valid."""
     payload = _supervised_mission().to_dict()
     invalid = _meta(NEW, 2).to_dict()
@@ -327,7 +331,7 @@ def test_malformed_candidate_identity_still_fails_closed() -> None:
         deployctl.RollbackState.from_dict(payload)
 
 
-def test_legacy_candidate_identity_still_round_trips() -> None:
+def test_legacy_candidate_identity_still_round_trips(supervisor_token: str) -> None:
     """The emergency legacy path retains its exact stored candidate identity."""
     legacy = replace(
         _supervised_mission(),

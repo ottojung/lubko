@@ -31,6 +31,7 @@ from typing import Final
 from lubko import cli, deployctl, startup_contract, supervise
 from lubko import lifecycle as _lifecycle
 from lubko.durable import DurabilityError
+from lubko.supervise_client import read_desired_client
 from lubko.toolchain import UvResolutionError, resolve_uv, write_toolchain
 
 DEFAULT_GIT_TIMEOUT_SECONDS: Final = 10.0
@@ -236,7 +237,7 @@ def _install_refusal(commit: str) -> str | None:
     if refusal is not None:
         return refusal
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError as exc:
         return "refusing to install with untrusted supervisor desired state: " + str(exc)
     try:

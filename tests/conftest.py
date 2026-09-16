@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import tempfile
 from itertools import count
@@ -103,3 +104,20 @@ def _isolated_state_home(
     """
     state_home = tmp_path_factory.getbasetemp() / f"xdg-state-{next(_STATE_HOME_IDS)}"
     monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+
+
+@pytest.fixture(autouse=False)
+def supervisor_token(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Provide a per-test supervisor state token for tests that need it.
+
+    Tests that directly access private authority (``read_state()``,
+    ``write_state()``, ``read_desired()``, etc.) must request this
+    fixture.  Tests that verify tokenless behavior must NOT request it
+    and must explicitly delete ``LUBKO_SUPERVISOR_STATE_TOKEN``.
+
+    Returns:
+        The hex token string.
+    """
+    token = secrets.token_hex(32)
+    monkeypatch.setenv("LUBKO_SUPERVISOR_STATE_TOKEN", token)
+    return token

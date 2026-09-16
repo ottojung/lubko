@@ -178,7 +178,7 @@ def converge(monkeypatch: pytest.MonkeyPatch) -> FakePinning:
 
 
 def test_recycled_pid_before_term_is_never_signalled(
-    converge: FakePinning,
+    converge: FakePinning, supervisor_token: str
 ) -> None:
     """A pinned process whose ticks diverge from the record ends the attempt."""
     fake = converge
@@ -192,7 +192,7 @@ def test_recycled_pid_before_term_is_never_signalled(
 
 
 def test_reuse_between_term_and_kill_keeps_one_pin_and_no_numeric_signal(
-    converge: FakePinning,
+    converge: FakePinning, supervisor_token: str
 ) -> None:
     """KILL at the escalation boundary hits only the pinned A, never recycled B.
 
@@ -222,7 +222,7 @@ def test_reuse_between_term_and_kill_keeps_one_pin_and_no_numeric_signal(
 
 
 def test_exact_pinned_delivery_converges_after_term(
-    converge: FakePinning,
+    converge: FakePinning, supervisor_token: str
 ) -> None:
     """A proven matching instance receives TERM via the pin and converges."""
     fake = converge
@@ -237,7 +237,7 @@ def test_exact_pinned_delivery_converges_after_term(
 
 
 def test_unknown_start_ticks_preserves_hold_without_any_signal(
-    converge: FakePinning,
+    converge: FakePinning, supervisor_token: str
 ) -> None:
     """Unobservable ticks authorize nothing: no pin, no signal, hold kept."""
     fake = converge
@@ -250,7 +250,9 @@ def test_unknown_start_ticks_preserves_hold_without_any_signal(
     assert fake.pins == []
 
 
-def test_unpinnable_process_preserves_the_hold(converge: FakePinning) -> None:
+def test_unpinnable_process_preserves_the_hold(
+    converge: FakePinning, supervisor_token: str
+) -> None:
     """When no pin can be opened, nothing is signalled and the hold remains."""
     fake = converge
     fake.fail_pin = True
@@ -317,7 +319,7 @@ def _owned_daemon(proc: subprocess.Popen[bytes]) -> supervisor.SupervisorDaemon:
     return daemon
 
 
-def test_owned_zombie_child_is_reaped_and_the_hold_clears() -> None:
+def test_owned_zombie_child_is_reaped_and_the_hold_clears(supervisor_token: str) -> None:
     """An exited-but-unreaped owned direct child converges instead of blocking.
 
     After the pinned TERM/KILL kills our own direct Popen child, the child
@@ -343,7 +345,9 @@ def test_owned_zombie_child_is_reaped_and_the_hold_clears() -> None:
         proc.poll()
 
 
-def test_owned_live_child_converges_through_pinned_term(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_owned_live_child_converges_through_pinned_term(
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+) -> None:
     """A live owned child receives pinned TERM and its exit is positively reaped."""
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
     proc = _spawn_blocking_child()
@@ -359,7 +363,9 @@ def test_owned_live_child_converges_through_pinned_term(monkeypatch: pytest.Monk
         proc.poll()
 
 
-def test_foreign_zombie_is_never_treated_as_owned(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_foreign_zombie_is_never_treated_as_owned(
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+) -> None:
     """A zombie that is not our still-owned direct child never clears a hold."""
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
     proc = _spawn_blocking_child()
@@ -410,8 +416,7 @@ def _state_with_hold(hold: UnresolvedChild) -> supervise.SupervisorState:
 
 
 def test_resolve_unresolved_child_clears_the_durable_hold(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Converging an owned zombie clears the persisted hold, not just in memory.
 

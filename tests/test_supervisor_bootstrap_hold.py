@@ -14,7 +14,10 @@ if TYPE_CHECKING:
 
 
 def test_bootstrap_hold_is_visible_and_not_relogged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    supervisor_token: str,
 ) -> None:
     """Expose fresh bootstrap hold once without spawning or log spam."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))

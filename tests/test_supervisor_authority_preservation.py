@@ -39,7 +39,7 @@ TOKEN = "c" * 32
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:
     """Use an isolated durable state root for each test.
 
     Returns:
@@ -143,7 +143,7 @@ def _arm_authority_race(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_crash_handling_never_erases_concurrently_established_recovery_authority(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """The crash path's late publication keeps a newer recovery obligation.
 
@@ -176,7 +176,7 @@ def test_crash_handling_never_erases_concurrently_established_recovery_authority
     assert final.next_attempt_at is not None, "crash backoff was still scheduled"
 
 
-def test_publication_is_serialized_against_a_held_consumer_boundary() -> None:
+def test_publication_is_serialized_against_a_held_consumer_boundary(supervisor_token: str) -> None:
     """An authority-preserving publication waits for the shared boundary.
 
     While another process holds ``consumer_lock``, the supervisor's
@@ -197,7 +197,7 @@ def test_publication_is_serialized_against_a_held_consumer_boundary() -> None:
 
 
 def test_no_authority_write_fits_between_fresh_read_and_publication(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """The in-lock fresh read merges the newest authority before publishing.
 
@@ -241,7 +241,7 @@ def test_no_authority_write_fits_between_fresh_read_and_publication(
 
 
 def test_live_recovery_obligation_blocks_a_later_supervisor_spawn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """While a recovery obligation is live, no maintained replacement starts."""
     _dead_child_state()
@@ -264,7 +264,7 @@ def test_live_recovery_obligation_blocks_a_later_supervisor_spawn(
 
 
 def test_ordinary_crash_handling_without_concurrency_still_converges(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """With no competing authority, crash handling behaves exactly as before."""
     state = _dead_child_state()
@@ -285,7 +285,7 @@ def test_ordinary_crash_handling_without_concurrency_still_converges(
 
 
 def test_not_ready_probe_bookkeeping_preserves_newer_authority(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Not-ready probe bookkeeping merges onto a newer recovery obligation.
 
@@ -313,7 +313,7 @@ def test_not_ready_probe_bookkeeping_preserves_newer_authority(
 
 
 def test_child_clearing_outside_the_lock_keeps_newer_authority(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """``_clear_child`` cannot erase an obligation established mid-flight."""
     _dead_child_state()
@@ -328,7 +328,7 @@ def test_child_clearing_outside_the_lock_keeps_newer_authority(
 
 
 def test_normalize_cross_boot_state_defers_instead_of_clobbering(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Startup normalization holds off when the consumer boundary is busy."""
     monkeypatch.setattr(supervisor, "DEFAULT_LOCK_TIMEOUT_SECONDS", 0.02)
@@ -349,7 +349,7 @@ def test_normalize_cross_boot_state_defers_instead_of_clobbering(
 
 
 def test_malformed_hold_materialization_keeps_newer_authority(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Even the corruption-materializing tick write preserves newer authority."""
     state = _dead_child_state()
@@ -364,7 +364,7 @@ def test_malformed_hold_materialization_keeps_newer_authority(
     assert final.spawning == _obligation(), "the materialization erased authority"
 
 
-def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
+def test_all_out_of_lock_writers_route_through_the_protected_writer(supervisor_token: str) -> None:
     """Structural audit: direct state writes stay confined to locked scopes.
 
     Every remaining direct ``write_state(...)`` call site in the supervisor
@@ -434,7 +434,7 @@ def _exit_handle(daemon: supervisor.SupervisorDaemon) -> object:
 
 
 def test_deferred_desired_publication_spawns_and_applies_nothing(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A deferred desired-state publication starts no worker and applies nothing."""
     write_state(fresh_state())
@@ -463,7 +463,7 @@ def test_deferred_desired_publication_spawns_and_applies_nothing(
 
 
 def test_deferred_readiness_publication_reports_no_success(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Readiness success is only reported once ``ready=True`` is durable."""
     _dead_child_state()
@@ -493,7 +493,7 @@ def test_deferred_readiness_publication_reports_no_success(
 
 
 def test_deferred_backoff_reset_reports_no_stability(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Backoff stability is only reported once the reset is durable."""
     state = replace(
@@ -519,7 +519,7 @@ def test_deferred_backoff_reset_reports_no_stability(
 
 
 def test_deferred_crash_record_keeps_the_exit_handle_and_silence(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A deferred crash publication keeps the handle and reports nothing."""
     state = _dead_child_state()
@@ -545,7 +545,7 @@ def test_deferred_crash_record_keeps_the_exit_handle_and_silence(
 
 
 def test_deferred_out_of_lock_retirement_is_not_reported_converged(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Retirement outside the lock fails closed when its write was deferred."""
     _dead_child_state()

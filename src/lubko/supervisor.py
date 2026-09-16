@@ -93,6 +93,14 @@ from lubko._supervisor_identity import (
     resolve_new_supervisor_executable,
 )
 from lubko.config import load_database_config
+from lubko.control_socket import (
+    ControlRequest,
+    ControlResponse,
+    _recv_message,
+    _send_message,
+    bind_abstract_socket,
+    validate_peercred,
+)
 from lubko.durable import DurabilityError, remove_durable
 from lubko.health import (
     interpret_worker_health,
@@ -145,6 +153,9 @@ LOGGER: Final = logging.getLogger(__name__)
 _SUPERVISOR_LOG_MAX_BYTES: Final = 4 * 1024 * 1024
 _SUPERVISOR_LOG_BACKUP_COUNT: Final = 2
 _PERSISTENT_DIAGNOSTIC_REPEAT_INTERVAL: Final = 256
+
+#: Default timeout for server-side control socket accept/recv (seconds).
+_SERVER_TIMEOUT_SECONDS: Final = 5.0
 
 
 class _HandoffTarget(NamedTuple):
@@ -738,6 +749,7 @@ class SupervisorDaemon:
         self._message: str | None = None
         self._bootstrap_hold_logged = False
         self._ownership_fd: int | None = None
+        self._control_sock: socket.socket | None = None
         self._start_time_ticks: int = 0
         self._runtime_commit: str | None = capture_supervisor_runtime_commit()
         self._handoff_target_commit: str | None = None
@@ -837,8 +849,10 @@ class SupervisorDaemon:
             self._invalidate_stale_status()
             normalize_cross_boot_state()
             self._install_signal_handlers()
+            self._open_control_socket()
             self._write_status("starting")
             while not self._stopping:
+                self._accept_control_requests()
                 diagnostic_handlers = _durable_log_handlers()
                 for handler in diagnostic_handlers:
                     handler.begin_reconciliation_cycle()
@@ -853,6 +867,7 @@ class SupervisorDaemon:
                 time.sleep(self.settings.poll_interval_seconds)
             self._shutdown()
         finally:
+            self._close_control_socket()
             self._release_ownership()
 
     # ------------------------------------------------------------------
@@ -3283,6 +3298,227 @@ class SupervisorDaemon:
         ):
             os.environ.pop(var, None)
         return adopted, target_commit
+
+    # ------------------------------------------------------------------
+    # Control socket
+    # ------------------------------------------------------------------
+
+    def _open_control_socket(self) -> None:
+        """Create and start listening on the abstract control socket.
+
+        The socket provides the exclusive write boundary for tokenless CLI
+        tools.  It is in the abstract namespace so no stale files remain
+        after a crash.
+        """
+        self._control_sock = bind_abstract_socket()
+        LOGGER.info("control socket listening (abstract namespace, uid %d)", os.getuid())
+
+    def _close_control_socket(self) -> None:
+        """Close the control socket."""
+        if self._control_sock is not None:
+            with suppress(Exception):
+                self._control_sock.close()
+            self._control_sock = None
+
+    def _accept_control_requests(self) -> None:
+        """Non-blocking accept and process all pending control requests.
+
+        Called once per supervisor tick before reconciliation.  Each
+        accepted connection is validated via ``SO_PEERCRED`` (same-UID
+        check) then handled synchronously.
+        """
+        if self._control_sock is None:
+            return
+        while True:
+            try:
+                conn, _addr = self._control_sock.accept()
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            try:
+                conn.settimeout(_SERVER_TIMEOUT_SECONDS)
+                validate_peercred(conn)
+                raw = _recv_message(conn)
+                if raw is None:
+                    continue
+                request = ControlRequest.from_dict(raw)
+                response = SupervisorDaemon._handle_control_request(request)
+                _send_message(conn, response)
+            except PermissionError:
+                LOGGER.warning("control socket peer UID mismatch; rejecting")
+                with suppress(OSError):
+                    _send_message(conn, ControlResponse.error("permission denied"))
+            except Exception:
+                LOGGER.exception("control request failed")
+                with suppress(OSError):
+                    _send_message(conn, ControlResponse.error("internal error"))
+            finally:
+                with suppress(Exception):
+                    conn.close()
+
+    @staticmethod
+    def _handle_control_request(request: ControlRequest) -> dict[str, object]:
+        """Dispatch one control request to the appropriate handler.
+
+        Args:
+            request: Parsed control request.
+
+        Returns:
+            JSON-serializable response dict.
+        """
+        if request.request_type == "ping":
+            return ControlResponse.ok()
+        if request.request_type == "deploy":
+            return SupervisorDaemon._handle_deploy_request(request.payload)
+        if request.request_type == "status":
+            return SupervisorDaemon._handle_status_request()
+        if request.request_type == "authority_snapshot":
+            return SupervisorDaemon._handle_authority_snapshot_request()
+        if request.request_type == "set_spawning_obligation":
+            return SupervisorDaemon._handle_set_spawning_obligation(request.payload)
+        if request.request_type == "clear_spawning_obligation":
+            return SupervisorDaemon._handle_clear_spawning_obligation()
+        return ControlResponse.error(f"unknown request type: {request.request_type}")
+
+    @staticmethod
+    def _handle_deploy_request(payload: dict[str, object]) -> dict[str, object]:
+        """Handle a deploy/restart/migrate request over the control socket.
+
+        Validates the request, acquires the generation lock, allocates a
+        generation, and writes the desired intent to the private tokenized
+        authority.  The reconcile loop picks it up on the next tick.
+
+        Args:
+            payload: Request payload with commit, repo, uv_path, etc.
+
+        Returns:
+            JSON-serializable response dict.
+        """
+        commit = payload.get("commit")
+        repo = payload.get("repo", "")
+        uv_path = payload.get("uv_path", "")
+        worker_id = payload.get("worker_id")
+        restart = payload.get("restart", False)
+        migration = payload.get("migration", False)
+        if not isinstance(commit, str) or not commit:
+            return ControlResponse.error("missing or invalid 'commit'")
+        if not isinstance(repo, str):
+            return ControlResponse.error("missing or invalid 'repo'")
+        if not isinstance(uv_path, str):
+            return ControlResponse.error("missing or invalid 'uv_path'")
+        if not isinstance(restart, bool):
+            return ControlResponse.error("'restart' must be a boolean")
+        if not isinstance(migration, bool):
+            return ControlResponse.error("'migration' must be a boolean")
+        try:
+            generation = supervise.request_run(
+                commit,
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id if isinstance(worker_id, str) else None,
+                restart=restart,
+                migration=migration,
+            )
+        except supervise.GenerationLockTimeoutError:
+            return ControlResponse.error("generation lock timed out")
+        except Exception:
+            LOGGER.exception("control deploy request failed")
+            return ControlResponse.error("failed to apply deploy request")
+        return ControlResponse.ok(generation=generation)
+
+    @staticmethod
+    def _handle_status_request() -> dict[str, object]:
+        """Handle a status request over the control socket.
+
+        Returns the current supervisor status as a JSON-serializable dict.
+
+        Returns:
+            JSON-serializable response dict with status payload.
+        """
+        try:
+            status = supervise.read_status()
+        except Exception:
+            LOGGER.exception("control status request failed")
+            return ControlResponse.error("failed to read status")
+        if status is None:
+            return ControlResponse.error("no supervisor status available")
+        return ControlResponse.ok(status=status.to_dict())
+
+    @staticmethod
+    def _handle_authority_snapshot_request() -> dict[str, object]:
+        """Handle an authority_snapshot request over the control socket.
+
+        Returns the exact private desired+state authority so tokenless
+        callers get authoritative snapshots without reconstructing from
+        the public status surface.
+
+        Returns:
+            JSON-serializable response dict with desired (nullable) and
+            state payloads.
+        """
+        try:
+            desired = supervise.read_desired_strict()
+        except Exception:
+            LOGGER.exception("control authority_snapshot desired read failed")
+            return ControlResponse.error("failed to read desired authority")
+        try:
+            state = supervise.read_state()
+        except Exception:
+            LOGGER.exception("control authority_snapshot state read failed")
+            return ControlResponse.error("failed to read state authority")
+        desired_dict = None if desired is None else desired.to_dict()
+        return ControlResponse.ok(desired=desired_dict, state=state.to_dict())
+
+    @staticmethod
+    def _handle_set_spawning_obligation(payload: dict[str, object]) -> dict[str, object]:
+        """Handle a narrow set_spawning_obligation request.
+
+        Validates the obligation payload, applies it to the current
+        durable state under the consumer lock, and writes durably.
+
+        Returns:
+            JSON-serializable response dict.
+        """
+        obligation_data = payload.get("obligation")
+        if not isinstance(obligation_data, dict):
+            return ControlResponse.error("missing or invalid 'obligation'")
+        try:
+            obligation = supervise.SpawningObligation.from_dict(obligation_data)
+        except (TypeError, ValueError) as exc:
+            return ControlResponse.error(f"malformed spawning obligation: {exc}")
+        try:
+            current = supervise.read_state()
+
+            supervise.write_state_preserving_authority(
+                replace(current, spawning=obligation),
+                timeout_seconds=supervise.DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            LOGGER.exception("control set_spawning_obligation failed")
+            return ControlResponse.error("failed to set spawning obligation")
+        return ControlResponse.ok()
+
+    @staticmethod
+    def _handle_clear_spawning_obligation() -> dict[str, object]:
+        """Handle a narrow clear_spawning_obligation request.
+
+        Clears the spawning obligation on the current durable state.
+
+        Returns:
+            JSON-serializable response dict.
+        """
+        try:
+            current = supervise.read_state()
+
+            supervise.write_state_preserving_authority(
+                replace(current, spawning=None),
+                timeout_seconds=supervise.DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            LOGGER.exception("control clear_spawning_obligation failed")
+            return ControlResponse.error("failed to clear spawning obligation")
+        return ControlResponse.ok()
 
     def _release_ownership(self) -> None:
         """Release the process-level ownership lock held for the lifetime."""

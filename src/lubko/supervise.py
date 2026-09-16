@@ -54,7 +54,12 @@ from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
 from lubko.durable import remove_durable, write_json_durable
 from lubko.health import validate_incarnation_token
-from lubko.state import rollback_state_path, state_root, supervisor_state_token
+from lubko.state import (
+    SupervisorStateTokenError,
+    rollback_state_path,
+    state_root,
+    supervisor_state_token,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -965,66 +970,55 @@ def supervisor_dir() -> Path:
 def supervisor_private_dir() -> Path:
     """Return the tokenized supervisor directory (private authoritative state).
 
-    The path is ``supervisor_dir() / <token>`` when a token is available,
-    isolating the daemon's authoritative mutable state under a
-    high-entropy opaque namespace so ordinary/default state resolution
-    cannot accidentally reach live supervisor authority.  When no token
-    is set, falls back to the untokenized parent directory for
-    backward-compatible access.
+    The path is ``supervisor_dir() / <token>``, isolating the daemon's
+    authoritative mutable state under a high-entropy opaque namespace so
+    ordinary/default state resolution cannot accidentally reach live
+    supervisor authority.
 
-    Returns:
-        The supervisor state directory (tokenized when a token is set).
+    Raises:
+        SupervisorStateTokenError: If ``LUBKO_SUPERVISOR_STATE_TOKEN`` is
+            absent or empty.  The daemon must never start without a valid
+            token.
     """
     token = supervisor_state_token()
-    if token is not None:
-        return supervisor_dir() / token
-    return supervisor_dir()
+    if token is None:
+        msg = (
+            "LUBKO_SUPERVISOR_STATE_TOKEN is required to resolve private supervisor authority paths"
+        )
+        raise SupervisorStateTokenError(msg)
+    return supervisor_dir() / token
 
 
 def desired_path() -> Path:
-    """Return the path of the durable desired-intent file (request surface).
+    """Return the path of the durable desired-intent file (private authority).
 
-    This is the non-authoritative request surface: CLI tools write run
-    intents here, and the supervisor daemon reads and applies them to its
-    private authoritative state.  The path is deliberately **not**
-    tokenized so tokenless client commands can submit requests.
-
-    Returns:
-        The ``desired.json`` path.
+    The desired intent lives under the tokenized directory so only the
+    token-holding supervisor daemon (and the control socket handler in
+    its process) may write it.  CLI tools submit requests through the
+    control socket, never by writing this file directly.
     """
-    return supervisor_dir() / "desired.json"
+    return supervisor_private_dir() / "desired.json"
 
 
 def state_path() -> Path:
-    """Return the path of the daemon's durable state file.
+    """Return the path of the daemon's durable state file (private authority).
 
-    The state file lives at the untokenized supervisor directory so CLI
-    tools can read it for confirmation cross-checks without holding the
-    supervisor state token.  The token instead isolates the private
-    spawning/recovery authority (see :func:`private_authority_path`).
-
-    Returns:
-        The ``state.json`` path.
+    The state file lives under the tokenized directory so only the
+    token-holding supervisor daemon may read or write it.  CLI tools
+    observe status through the non-authoritative ``status.json`` at the
+    untokenized path.
     """
-    return supervisor_dir() / "state.json"
+    return supervisor_private_dir() / "state.json"
 
 
 def private_authority_path() -> Path:
     """Return the path of the private spawning/recovery authority file.
 
-    When a token is available, the file lives under the tokenized
-    directory (``supervisor/<token>/authority.json``), isolating
+    The file lives under the tokenized directory, isolating
     replacement-blocking recovery authority from ordinary state
-    resolution.  When no token is set, falls back to the untokenized
-    parent directory for backward-compatible access.
-
-    Returns:
-        The ``authority.json`` path.
+    resolution.
     """
-    token = supervisor_state_token()
-    if token is not None:
-        return supervisor_dir() / token / "authority.json"
-    return supervisor_dir() / "authority.json"
+    return supervisor_private_dir() / "authority.json"
 
 
 def status_path() -> Path:
@@ -1178,8 +1172,14 @@ def generation_lock(
 def supervisor_lock_path() -> Path:
     """Return the path of the process-level supervisor ownership lock.
 
+    This is the **global singleton gate**: exactly one flock at this
+    untokenized path, held for the daemon's entire lifetime.  Two
+    differently-tokened supervisors must never both become authority, so
+    this lock is deliberately **not** tokenized.  The kernel releases it
+    automatically on process death (graceful, crash, or SIGKILL).
+
     Returns:
-        The lock file path inside the supervisor state directory.
+        The lock file path at the untokenized supervisor directory.
     """
     return supervisor_dir() / ".supervisor.lock"
 
@@ -1882,13 +1882,14 @@ def next_generation() -> int:
     return max(applied, desired_generation, _mission_generation()) + 1
 
 
-def _write_run_intent_locked(
+def _write_run_intent_locked(  # ruff: ignore[too-many-arguments]
     commit: str,
     *,
     repo: str,
     uv_path: str,
     worker_id: str | None,
     restart: bool,
+    migration: bool = False,
 ) -> int:
     """Write one fresh run intent while the generation lock is held.
 
@@ -1898,6 +1899,7 @@ def _write_run_intent_locked(
         uv_path: Resolved ``uv`` executable (recorded for coherence).
         worker_id: Worker identifier to hand to the worker.
         restart: Whether the intent explicitly replaces an existing process.
+        migration: Whether this is a cold migration intent.
 
     Returns:
         The generation of the written intent.
@@ -1913,6 +1915,7 @@ def _write_run_intent_locked(
             worker_id=worker_id,
             restart=restart,
             requested_at=time.time(),
+            migration=migration,
         )
     )
     return generation
@@ -1969,13 +1972,14 @@ def ensure_run_intent(
         )
 
 
-def request_run(
+def request_run(  # ruff: ignore[too-many-arguments]
     commit: str,
     *,
     repo: str,
     uv_path: str,
     worker_id: str | None,
     restart: bool = False,
+    migration: bool = False,
 ) -> int:
     """Request the daemon to run the exact confirmed worker commit.
 
@@ -1987,6 +1991,7 @@ def request_run(
         restart: Whether this intent force-replaces a process already running
             ``commit`` (restart) or may merely record the settlement if the
             exact commit is already the live worker (confirmation/rollback).
+        migration: Whether this is a cold migration intent.
 
     Returns:
         The generation of the written intent.
@@ -1998,6 +2003,7 @@ def request_run(
             uv_path=uv_path,
             worker_id=worker_id,
             restart=restart,
+            migration=migration,
         )
 
 

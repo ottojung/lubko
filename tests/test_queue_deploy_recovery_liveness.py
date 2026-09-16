@@ -42,7 +42,7 @@ def _desired(commit: str, generation: int) -> SimpleNamespace:
 
 
 def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A stale ready snapshot cannot suppress restoration after child death."""
     candidate = "a" * 40
@@ -75,7 +75,7 @@ def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
 
 
 def test_restore_after_handoff_failure_accepts_live_ready_child(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A synchronously live ready child remains a valid convergence proof."""
     candidate = "a" * 40
@@ -91,7 +91,7 @@ def test_restore_after_handoff_failure_accepts_live_ready_child(
     monkeypatch.setattr(supervise, "generation_lock", nullcontext)
     monkeypatch.setattr(supervise, "child_alive", lambda child: child is status.child)
     monkeypatch.setattr(cli, "current_commit", lambda: candidate)
-    monkeypatch.setattr(supervise, "request_run", fail_restore)
+    monkeypatch.setattr(lifecycle, "request_run_client", fail_restore)
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
 
     lifecycle._restore_after_handoff_failure(_options(), candidate, previous)
@@ -176,7 +176,7 @@ class _CandidateCase:
     ],
 )
 def test_candidate_convergence_requires_current_compatible_authority(
-    monkeypatch: pytest.MonkeyPatch, case: _CandidateCase
+    monkeypatch: pytest.MonkeyPatch, case: _CandidateCase, supervisor_token: str
 ) -> None:
     """Candidate convergence follows the shared desired/applied authority policy."""
     candidate = "a" * 40
@@ -196,7 +196,7 @@ def test_candidate_convergence_requires_current_compatible_authority(
 
 
 def test_candidate_convergence_holds_generation_lock_through_cli_decision(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Desired, applied, liveness, and CLI proof share one generation lock."""
     candidate = "a" * 40
@@ -369,8 +369,7 @@ class _RestoreCase:
     ],
 )
 def test_restoration_requires_current_live_queue_ready_authority(
-    monkeypatch: pytest.MonkeyPatch,
-    case: _RestoreCase,
+    monkeypatch: pytest.MonkeyPatch, case: _RestoreCase, supervisor_token: str
 ) -> None:
     """Only compatible live queue-ready restore authority may reconcile the CLI."""
     candidate = "a" * 40
@@ -421,7 +420,7 @@ def test_restoration_requires_current_live_queue_ready_authority(
 
 
 def test_restore_holds_generation_lock_through_cli_reconciliation(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Final authority proof and CLI reconciliation share one generation lock."""
     candidate = "a" * 40

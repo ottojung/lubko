@@ -62,6 +62,13 @@ from lubko.config import (
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.state import SUPERVISOR_STATE_TOKEN_ENV, rollback_state_path, state_root
 from lubko.supervise import GenerationLockTimeoutError
+from lubko.supervise_client import (
+    clear_spawning_obligation_client,
+    read_desired_client,
+    read_state_client,
+    request_run_client,
+    set_spawning_obligation_client,
+)
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import (
     DEFAULT_CANCEL_GRACE_SECONDS,
@@ -1978,7 +1985,7 @@ def _candidate_convergence_locked(commit: str) -> bool:
         Whether the authority converges on a live candidate.
     """
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError:
         return False
     status = supervise.read_status()
@@ -2013,7 +2020,7 @@ def _queue_deploy_candidate_converged(commit: str) -> bool:
 def _queue_deploy_restore_converged(commit: str, minimum_generation: int) -> bool:
     """Return whether restore authority still owns a live queue-ready child."""
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError:
         return False
     status = supervise.read_status()
@@ -2074,7 +2081,7 @@ def _restore_after_handoff_failure(
         append_deploy_log("queue deploy failed after durable success with no known previous commit")
         return
     try:
-        settle = supervise.request_run(
+        settle = request_run_client(
             previous.git_commit,
             repo=str(options.repo),
             uv_path=options.uv_path,
@@ -2255,7 +2262,7 @@ def _deploy_through_supervisor(options: DeployOptions, commit: str) -> WorkerMet
     worker_id = os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
     _out("requesting the external supervisor to start the worker ...")
     try:
-        generation = supervise.request_run(
+        generation = request_run_client(
             commit,
             repo=str(options.repo),
             uv_path=options.uv_path,
@@ -2512,7 +2519,7 @@ def _complete_deploy_handoff(
         new_meta = _deploy_direct(options, previous, state, commit)
         log_file = worker_log_path(new_meta.token)
         try:
-            supervise.request_run(
+            request_run_client(
                 commit,
                 repo=str(options.repo),
                 uv_path=options.uv_path,
@@ -3250,7 +3257,7 @@ def _release_adoption_authority(meta: WorkerMeta) -> str | None:
         ``None`` on success (including a genuinely absent hold), otherwise a
         failure message for the operator.
     """
-    current = supervise.read_state()
+    current = read_state_client()
     if current.spawning_hold_malformed:
         return (
             "the recovery worker was adopted, but its durable recovery authority "
@@ -3280,7 +3287,7 @@ def _pre_adoption_authority_error(meta: WorkerMeta) -> str | None:
     Returns:
         ``None`` when adoption may proceed, otherwise a failure message.
     """
-    state = supervise.read_state()
+    state = read_state_client()
     if state.spawning_hold_malformed:
         return (
             "the durable pre-spawn recovery obligation is malformed; only an explicit "
@@ -3655,12 +3662,19 @@ def _obligation_instance_gone(pid: int | None, start_time_ticks: int | None) -> 
 def _clear_spawning_obligation() -> bool:
     """Durably clear the pre-spawn recovery obligation.
 
+    Uses the narrow semantic ``clear_spawning_obligation_client`` so
+    tokenless recovery goes through the control socket with existing
+    serialization and validation.
+
     Returns:
         ``True`` when the state write was confirmed durable.
     """
     try:
-        supervise.write_state(replace(supervise.read_state(), spawning=None))
+        clear_spawning_obligation_client()
     except DurabilityError:
+        LOGGER.exception("could not durably clear the pre-spawn recovery obligation")
+        return False
+    except RuntimeError:
         LOGGER.exception("could not durably clear the pre-spawn recovery obligation")
         return False
     return True
@@ -3669,6 +3683,10 @@ def _clear_spawning_obligation() -> bool:
 def _write_spawning_obligation(obligation: supervise.SpawningObligation) -> bool:
     """Durably persist ``obligation`` as the replacement-blocking authority.
 
+    Uses the narrow semantic ``set_spawning_obligation_client`` so
+    tokenless recovery goes through the control socket with existing
+    serialization and validation.
+
     Args:
         obligation: The obligation to record.
 
@@ -3676,8 +3694,13 @@ def _write_spawning_obligation(obligation: supervise.SpawningObligation) -> bool
         ``True`` when the state write was confirmed durable.
     """
     try:
-        supervise.write_state(replace(supervise.read_state(), spawning=obligation))
+        set_spawning_obligation_client(obligation)
     except DurabilityError:
+        LOGGER.exception(
+            "could not durably record the recovery obligation for token %s", obligation.token
+        )
+        return False
+    except RuntimeError:
         LOGGER.exception(
             "could not durably record the recovery obligation for token %s", obligation.token
         )
@@ -3726,7 +3749,7 @@ def _resolve_stale_recovery_obligation() -> bool:
     Returns:
         ``True`` when no blocking obligation remains.
     """
-    state = supervise.read_state()
+    state = read_state_client()
     if state.spawning_hold_malformed:
         # The pre-spawn authority is present but unreadable: its recorded
         # spawn may still be live and owning groups. This deliberately does
@@ -4216,7 +4239,7 @@ def _restart_intent_locked() -> tuple[int | None, int | None, str | None]:
             "(the only supported way to stop Lubko is to stop its environment)"
         )
         return None, None, msg
-    state = supervise.read_state()
+    state = read_state_client()
     commit = state.commit
     if commit is None:
         return None, None, "no usable sealed runtime to restart"
@@ -4231,9 +4254,9 @@ def _restart_intent_locked() -> tuple[int | None, int | None, str | None]:
         previous.child.pid if previous is not None and previous.child is not None else None
     )
     _out(f"requesting a supervised restart of confirmed commit {commit} ...")
-    desired = supervise.read_desired()
+    desired = read_desired_client()
     try:
-        generation = supervise.request_restart(
+        generation = request_run_client(
             commit,
             repo=desired.repo if desired is not None else "",
             uv_path=desired.uv_path if desired is not None else "",
@@ -4440,7 +4463,7 @@ def _prepare_restart_locked(writer: int) -> bool:
             "no external supervisor is running; a supervised restart is not possible",
         )
         return False
-    state = supervise.read_state()
+    state = read_state_client()
     commit = state.commit
     if commit is None or not cli.runtime_is_usable(commit):
         deployctl.send_helper_error(
@@ -4514,7 +4537,7 @@ def _request_restart_intent_locked() -> tuple[int, int | None]:
     blocker = _supervised_mutation_blocker()
     if blocker is not None:
         raise DeployAbortedError(blocker)
-    state = supervise.read_state()
+    state = read_state_client()
     commit = state.commit
     if commit is None:
         msg = "no confirmed commit to restart"
@@ -4529,9 +4552,9 @@ def _request_restart_intent_locked() -> tuple[int, int | None]:
     previous_pid = (
         previous.child.pid if previous is not None and previous.child is not None else None
     )
-    desired = supervise.read_desired()
+    desired = read_desired_client()
     try:
-        generation = supervise.request_restart(
+        generation = request_run_client(
             commit,
             repo=desired.repo if desired is not None else "",
             uv_path=desired.uv_path if desired is not None else "",
@@ -4637,6 +4660,11 @@ def migrate_cmd(args: argparse.Namespace) -> int:
 def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
     """Write the verified desired intent and replace stale mission state.
 
+    The migration intent is published as ONE atomic supervisor IPC
+    operation: ``request_run_client(..., migration=True)`` handles
+    generation allocation and desired-intent publication together, so
+    mission/desired/applied generation alignment is always preserved.
+
     Args:
         commit: Exact verified commit to run.
         repo: Maintained checkout the commit belongs to.
@@ -4654,35 +4682,21 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
     except deployctl.DeployCtlError:
         mission = None
     if mission is None:
-        # The supervised-deployment authority is absent or already corrupt: this
-        # migration intentionally supersedes it, so remove any present file
-        # before allocating a generation. Allocation then observes genuine
-        # absence rather than failing closed on authority we are about to
-        # replace, and no malformed authority is silently deleted outside an
-        # explicit recovery path.
         remove_durable(rollback_state_path())
         append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
-    with supervise.generation_lock():
-        generation = supervise.next_generation()
-        # The migration flag travels inside this one atomically written
-        # desired intent: publishing the migrated target commit and recording
-        # the convergence obligation is a single durable transition, so no
-        # crash can leave the supervisor running the migrated commit without
-        # its completion obligation (nor an orphaned migration intent without
-        # a published commit).
-        supervise.write_desired(
-            supervise.SupervisorDesired(
-                schema_version=supervise.SCHEMA_VERSION,
-                generation=generation,
-                commit=commit,
-                repo=str(repo),
-                uv_path=uv_path,
-                worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-                restart=False,
-                requested_at=time.time(),
-                migration=True,
-            )
-        )
+    # Publish the migration intent as ONE atomic operation: generation
+    # allocation and desired-intent publication happen together inside the
+    # supervisor (or via the control socket), so the returned generation
+    # is authoritative and the mission/desired/applied alignment is
+    # always preserved.
+    generation = request_run_client(
+        commit,
+        repo=str(repo),
+        uv_path=uv_path,
+        worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+        restart=False,
+        migration=True,
+    )
     if (
         mission is not None
         and mission.status == deployctl.STATUS_PENDING

@@ -46,7 +46,7 @@ FAKE_RUNTIME_ROOT = Path("/opt/lubko-fake-runtime")
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:
     """Use an isolated durable state root for each test.
 
     Returns:
@@ -161,7 +161,7 @@ def _patch_recovery(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
 @pytest.mark.parametrize("raw_meta", ["{", "[]"])
 def test_supervisor_holds_on_invalid_maintained_worker_metadata(
-    monkeypatch: pytest.MonkeyPatch, raw_meta: str
+    monkeypatch: pytest.MonkeyPatch, raw_meta: str, supervisor_token: str
 ) -> None:
     """Corrupt maintained-worker authority must block replacement spawn."""
     path = lifecycle.meta_path()
@@ -182,7 +182,7 @@ def test_supervisor_holds_on_invalid_maintained_worker_metadata(
 
 
 def test_supervisor_still_spawns_when_maintained_worker_metadata_is_absent(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Genuine metadata absence retains normal first-establishment behavior."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -201,7 +201,7 @@ def test_supervisor_still_spawns_when_maintained_worker_metadata_is_absent(
 
 
 def test_child_published_with_spawning_then_meta_then_spawning_cleared(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Ordered protocol: child+spawning -> meta -> spawning cleared."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
@@ -245,7 +245,7 @@ def test_child_published_with_spawning_then_meta_then_spawning_cleared(
 
 
 def test_meta_write_failure_keeps_spawning_durable(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A failed meta write leaves spawning durable (replacement-blocking)."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
@@ -277,7 +277,7 @@ def test_meta_write_failure_keeps_spawning_durable(
 
 
 def test_deferred_publication_retries_then_clears_on_next_tick(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A restart reconciles child+spawning: retry meta, then clear spawning."""
     child = _published_child()
@@ -301,7 +301,7 @@ def test_deferred_publication_retries_then_clears_on_next_tick(
 
 
 def test_deferred_publication_meta_failure_stops_reconciliation_turn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A meta failure during reconciliation blocks the turn and keeps authority.
 
@@ -343,7 +343,7 @@ def test_deferred_publication_meta_failure_stops_reconciliation_turn(
 
 
 def test_in_progress_publication_is_not_converged_as_live_spawn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """child+spawning is recognized as in-progress, never as a live first spawn."""
     child = _published_child()
@@ -361,7 +361,7 @@ def test_in_progress_publication_is_not_converged_as_live_spawn(
     assert observed == [], "no group recovery ran for an in-progress publication"
 
 
-def test_manual_recovery_blocked_while_spawning_retained() -> None:
+def test_manual_recovery_blocked_while_spawning_retained(supervisor_token: str) -> None:
     """A retained spawning obligation blocks a second consumer's adoption."""
     child = _published_child()
     _in_progress_state(child)
@@ -406,7 +406,7 @@ def test_manual_recovery_blocked_while_spawning_retained() -> None:
 
 
 def test_fully_published_state_has_no_blocking_obligation(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A successful publication ends with child published, meta present, no spawning."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
@@ -434,7 +434,7 @@ def test_fully_published_state_has_no_blocking_obligation(
 
 
 def test_pre_popen_obligation_carries_no_child(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Before Popen the obligation is durable with no child identity yet."""
     observed: list[SpawningObligation | None] = []
@@ -492,7 +492,7 @@ class _FakeDirectProc:
 
 
 def test_missing_pre_popen_obligation_fails_closed_without_synthesis(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A live child without its pre-Popen obligation is converged, never published.
 
@@ -537,7 +537,7 @@ def test_missing_pre_popen_obligation_fails_closed_without_synthesis(
 
 
 def test_missing_obligation_convergence_failure_keeps_durable_blocking_hold(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A non-converging direct child is durably held, never forgotten or replaced.
 
@@ -600,7 +600,7 @@ def test_missing_obligation_convergence_failure_keeps_durable_blocking_hold(
 
 
 def test_missing_obligation_without_direct_handle_keeps_durable_blocking_hold(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A returned child with no usable Popen handle is still durably held.
 
@@ -649,7 +649,7 @@ def test_missing_obligation_without_direct_handle_keeps_durable_blocking_hold(
 
 
 def test_missing_obligation_converged_but_group_recovery_fails_keeps_token_hold(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Worker reaped but owned-group recovery fails: keep a token-bearing hold.
 

@@ -31,7 +31,7 @@ class FakeSpawnedProc:
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:
     """Use an isolated durable state root for each test.
 
     Returns:
@@ -103,7 +103,7 @@ def _patch_happy_recovery(
 
 
 def test_stale_preflight_never_spawns_beside_a_concurrent_supervisor_decision(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A preflight accepted before a concurrent supervisor decision spawns once.
 
@@ -160,7 +160,7 @@ def test_stale_preflight_never_spawns_beside_a_concurrent_supervisor_decision(
 
 
 def test_established_recovery_obligation_blocks_a_later_supervisor_spawn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Recovery establishing authority first makes the supervisor hold.
 
@@ -215,7 +215,7 @@ def test_established_recovery_obligation_blocks_a_later_supervisor_spawn(
 
 
 def test_recovery_fails_closed_while_the_boundary_is_busy(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Recovery cannot even start its preflight beside an active decision."""
     events: list[str] = []

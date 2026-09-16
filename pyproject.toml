@@ -121,6 +121,9 @@ convention = "google"
     "private-member-access",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
+    # supervisor_token is a pytest fixture whose setup side-effect (setting the
+    # env var) is required but never referenced directly in the test body.
+    "unused-function-argument",
 ]
 
 [tool.ruff.format]

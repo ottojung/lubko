@@ -21,11 +21,13 @@ import lubko.cli
 import lubko.deployctl
 import lubko.lifecycle
 import lubko.supervise
+import lubko.supervise_client
 
 cli = lubko.cli
 dc = lubko.deployctl
 lifecycle = lubko.lifecycle
 supervise = lubko.supervise
+supervise_client = lubko.supervise_client
 
 OLD_COMMIT = "1" * 40
 NEW_COMMIT = "2" * 40
@@ -249,12 +251,13 @@ def status_env(mission: dc.RollbackState, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
 
 
-def test_status_survives_restart_backoff(
+def test_status_survives_restart_backoff(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     mission: dc.RollbackState,
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
+    supervisor_token: str,
 ) -> None:
     """Status reporting must not roll back during ordinary restart backoff."""
     del cli_stubs, status_env, live_supervisor, mission
@@ -272,6 +275,7 @@ def test_expired_deadline_rolls_back_despite_matching_authority(
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
+    supervisor_token: str,
 ) -> None:
     """Once the mission deadline passes without a live candidate, roll back."""
     del cli_stubs, status_env, live_supervisor
@@ -299,12 +303,13 @@ def _live_candidate() -> supervise.WorkerChild:
     )
 
 
-def test_expired_deadline_rolls_back_live_but_not_ready_candidate(
+def test_expired_deadline_rolls_back_live_but_not_ready_candidate(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
     monkeypatch: pytest.MonkeyPatch,
+    supervisor_token: str,
 ) -> None:
     """An expired mission requires queue readiness, not only a live child."""
     del cli_stubs, status_env
@@ -334,12 +339,13 @@ def test_expired_deadline_rolls_back_live_but_not_ready_candidate(
     assert settlement == {OLD_COMMIT: 1}
 
 
-def test_expired_deadline_rolls_back_compatible_newer_live_but_not_ready_candidate(
+def test_expired_deadline_rolls_back_compatible_newer_live_but_not_ready_candidate(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
     monkeypatch: pytest.MonkeyPatch,
+    supervisor_token: str,
 ) -> None:
     """A newer same-commit generation must still be queue-ready after the deadline."""
     del cli_stubs, status_env
@@ -378,12 +384,13 @@ def test_expired_deadline_rolls_back_compatible_newer_live_but_not_ready_candida
     assert settlement == {OLD_COMMIT: 1}
 
 
-def test_future_deadline_keeps_live_but_not_ready_candidate_pending(
+def test_future_deadline_keeps_live_but_not_ready_candidate_pending(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
     monkeypatch: pytest.MonkeyPatch,
+    supervisor_token: str,
 ) -> None:
     """Before the deadline, live non-readiness remains retryable."""
     del cli_stubs, status_env
@@ -407,12 +414,13 @@ def test_future_deadline_keeps_live_but_not_ready_candidate_pending(
     assert settlement == {}
 
 
-def test_expired_deadline_keeps_queue_ready_live_candidate_pending(
+def test_expired_deadline_keeps_queue_ready_live_candidate_pending(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
     monkeypatch: pytest.MonkeyPatch,
+    supervisor_token: str,
 ) -> None:
     """An authoritative queue-ready live candidate remains confirmable after the deadline."""
     del cli_stubs, status_env
@@ -429,12 +437,13 @@ def test_expired_deadline_keeps_queue_ready_live_candidate_pending(
     assert settlement == {}
 
 
-def test_superseded_authority_fails_closed_before_deadline(
+def test_superseded_authority_fails_closed_before_deadline(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     mission: dc.RollbackState,
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
+    supervisor_token: str,
 ) -> None:
     """A supervisor snapshot naming another commit fails closed immediately."""
     del cli_stubs, status_env
@@ -453,12 +462,13 @@ def test_superseded_authority_fails_closed_before_deadline(
     assert settlement == {OLD_COMMIT: 1}
 
 
-def test_newer_generation_same_commit_authority_fails_closed(
+def test_newer_generation_same_commit_authority_fails_closed(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     mission: dc.RollbackState,
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
+    supervisor_token: str,
 ) -> None:
     """A higher applied generation supersedes the mission even for the same commit."""
     del cli_stubs, status_env
@@ -477,12 +487,13 @@ def test_newer_generation_same_commit_authority_fails_closed(
     assert settlement == {OLD_COMMIT: 1}
 
 
-def test_newer_generation_same_commit_compatible_authority_stays_pending(
+def test_newer_generation_same_commit_compatible_authority_stays_pending(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
     monkeypatch: pytest.MonkeyPatch,
+    supervisor_token: str,
 ) -> None:
     """A compatible newer same-commit lifecycle generation does not trigger rollback."""
     del cli_stubs, status_env
@@ -513,12 +524,13 @@ def test_newer_generation_same_commit_compatible_authority_stays_pending(
     assert current.status == dc.STATUS_PENDING
 
 
-def test_newer_generation_same_commit_restart_backoff_stays_pending(
+def test_newer_generation_same_commit_restart_backoff_stays_pending(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
     cli_stubs: None,
     status_env: None,
     monkeypatch: pytest.MonkeyPatch,
+    supervisor_token: str,
 ) -> None:
     """A compatible same-commit restart backoff remains retryable before deadline."""
     del cli_stubs, status_env
@@ -550,7 +562,7 @@ def test_newer_generation_same_commit_restart_backoff_stays_pending(
 
 
 def test_wait_until_ready_polls_through_transient_child_none(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """One ``child=None`` observation must not abort a readiness wait."""
     child = supervise.WorkerChild(
@@ -575,7 +587,7 @@ def test_wait_until_ready_polls_through_transient_child_none(
 
 
 def test_wait_until_ready_rejects_superseding_different_commit(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A newer ready generation for another commit cannot satisfy the wait."""
     observation = replace(
@@ -588,7 +600,7 @@ def test_wait_until_ready_rejects_superseding_different_commit(
 
 
 def test_wait_until_ready_accepts_newer_same_commit(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A newer generation remains valid when it proves the same exact commit ready."""
     observation = replace(
@@ -601,7 +613,7 @@ def test_wait_until_ready_accepts_newer_same_commit(
 
 
 def test_wait_until_ready_times_out_without_readiness(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A never-ready candidate bounds the wait by its timeout."""
     ticks = iter(range(100))

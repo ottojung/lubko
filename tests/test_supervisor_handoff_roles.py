@@ -65,7 +65,7 @@ def _noop_signals(_self: object) -> None:
 
 @pytest.mark.usefixtures("_state_dir")
 def test_preflight_probe_exits_without_durable_writes(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Preflight probe validates lock, signals READY, and returns.
 
@@ -125,7 +125,7 @@ def test_preflight_probe_exits_without_durable_writes(
 
 @pytest.mark.usefixtures("_state_dir")
 def test_preflight_probe_signals_ready_and_closes_lock_fd(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     r"""Preflight probe writes R\n on the readiness pipe and closes its lock fd."""
     _write_fresh_state()
@@ -158,7 +158,7 @@ def test_preflight_probe_signals_ready_and_closes_lock_fd(
 
 @pytest.mark.usefixtures("_state_dir")
 def test_preflight_probe_exits_without_reconcile(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Preflight probe returns from run() before the reconcile loop starts."""
     _write_fresh_state()
@@ -196,7 +196,7 @@ def test_preflight_probe_exits_without_reconcile(
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_ready_failure_kills_probe_and_aborts_handoff() -> None:
+def test_ready_failure_kills_probe_and_aborts_handoff(supervisor_token: str) -> None:
     """When the probe does not signal READY, A kills/reaps it and aborts."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
@@ -227,7 +227,7 @@ def test_ready_failure_kills_probe_and_aborts_handoff() -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_probe_nonzero_exit_aborts_handoff() -> None:
+def test_probe_nonzero_exit_aborts_handoff(supervisor_token: str) -> None:
     """When the probe exits with rc != 0 after READY, handoff is aborted."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
@@ -259,7 +259,7 @@ def test_probe_nonzero_exit_aborts_handoff() -> None:
 
 @pytest.mark.usefixtures("_state_dir")
 def test_exec_in_place_retires_pidfile_before_exec(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A retires its own pidfile before exec-in-place."""
     _write_fresh_state()
@@ -305,7 +305,7 @@ def test_exec_in_place_retires_pidfile_before_exec(
 
 @pytest.mark.usefixtures("_state_dir")
 def test_exec_failure_restores_pidfile_and_continues(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """When os.execve fails, A restores its pidfile and continues."""
     _write_fresh_state()
@@ -348,7 +348,7 @@ def test_exec_failure_restores_pidfile_and_continues(
 
 @pytest.mark.usefixtures("_state_dir")
 def test_no_authority_overlap_at_probe_exec_boundary(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """At no point during probe->exec does a second reconciler exist.
 

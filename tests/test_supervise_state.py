@@ -11,7 +11,7 @@ COMMIT = "a" * 40
 
 
 @pytest.fixture
-def state_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def state_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:
     """Use an isolated state root for each persistence test.
 
     Returns:
@@ -29,7 +29,7 @@ def write_raw_state(state_path: Path, **fields: object) -> None:
     state_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_genuine_child_absence_remains_idle(state_path: Path) -> None:
+def test_genuine_child_absence_remains_idle(state_path: Path, supervisor_token: str) -> None:
     """Missing state and an explicit null child remain valid absence."""
     assert supervise.read_state().ownership_hold_malformed is False
     state_path.write_text(
@@ -50,7 +50,9 @@ def test_genuine_child_absence_remains_idle(state_path: Path) -> None:
         json.dumps({"schema_version": supervise.SCHEMA_VERSION, "child": {"pid": "unknown"}}),
     ],
 )
-def test_present_corrupt_authority_is_durable_hold(state_path: Path, raw: str) -> None:
+def test_present_corrupt_authority_is_durable_hold(
+    state_path: Path, raw: str, supervisor_token: str
+) -> None:
     """Corrupt authority never becomes absence, including after a rewrite."""
     state_path.write_text(raw, encoding="utf-8")
     state = supervise.read_state()
@@ -61,7 +63,9 @@ def test_present_corrupt_authority_is_durable_hold(state_path: Path, raw: str) -
     assert rewritten.ownership_hold_malformed is True
 
 
-def test_present_non_boolean_safety_bit_is_durable_hold(state_path: Path) -> None:
+def test_present_non_boolean_safety_bit_is_durable_hold(
+    state_path: Path, supervisor_token: str
+) -> None:
     """Malformed persisted safety bits parse closed and remain durable."""
     fields = ("ownership_hold_malformed", "unresolved_hold_malformed")
     for field in fields:
@@ -75,14 +79,14 @@ def test_present_non_boolean_safety_bit_is_durable_hold(state_path: Path) -> Non
         assert getattr(supervise.read_state(), field) is True
 
 
-def test_boolean_safety_bit_values_are_preserved() -> None:
+def test_boolean_safety_bit_values_are_preserved(supervisor_token: str) -> None:
     """Actual JSON booleans retain their explicit safety-bit values."""
     for field in ("ownership_hold_malformed", "unresolved_hold_malformed"):
         for value in (False, True):
             assert supervise._strict_safety_hold({field: value}, field) is value
 
 
-def test_valid_non_negative_generations_parse() -> None:
+def test_valid_non_negative_generations_parse(supervisor_token: str) -> None:
     """Genuine non-negative integer generations keep their value."""
     for generation in (0, 7, 10**12):
         assert supervise._parse_present_strict(
@@ -92,7 +96,7 @@ def test_valid_non_negative_generations_parse() -> None:
         ) == (generation, False)
 
 
-def test_absent_generation_remains_fresh(state_path: Path) -> None:
+def test_absent_generation_remains_fresh(state_path: Path, supervisor_token: str) -> None:
     """A missing applied_generation stays a valid fresh state."""
     state_path.write_text(
         json.dumps({"schema_version": supervise.SCHEMA_VERSION}),
@@ -103,7 +107,9 @@ def test_absent_generation_remains_fresh(state_path: Path) -> None:
     assert state.ownership_hold_malformed is False
 
 
-def test_present_malformed_generation_is_durable_hold(state_path: Path) -> None:
+def test_present_malformed_generation_is_durable_hold(
+    state_path: Path, supervisor_token: str
+) -> None:
     """Malformed applied generations parse closed and the hold persists."""
     malformed: tuple[object, ...] = (True, False, "5", "", -1, 1.5, None, [5], {"n": 5}, "seven")
     for raw_generation in malformed:
@@ -121,8 +127,7 @@ def test_present_malformed_generation_is_durable_hold(state_path: Path) -> None:
 
 
 def test_reconcile_holds_before_retire_or_spawn_on_malformed_generation(
-    state_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Corrupt applied-generation authority never retires or spawns a worker."""
     supervise.desired_path().parent.mkdir(parents=True, exist_ok=True)
@@ -179,7 +184,7 @@ def test_reconcile_holds_before_retire_or_spawn_on_malformed_generation(
     assert rewritten.child.pid == 4242
 
 
-def test_valid_non_negative_restart_counts_parse() -> None:
+def test_valid_non_negative_restart_counts_parse(supervisor_token: str) -> None:
     """Genuine non-negative integer restart counts keep their value."""
     for count in (0, 1, 42, 10**12):
         assert supervise._parse_present_strict(
@@ -189,7 +194,7 @@ def test_valid_non_negative_restart_counts_parse() -> None:
         ) == (count, False)
 
 
-def test_absent_restart_count_remains_fresh(state_path: Path) -> None:
+def test_absent_restart_count_remains_fresh(state_path: Path, supervisor_token: str) -> None:
     """A missing restart_count stays a valid zero crash history."""
     state_path.write_text(
         json.dumps({"schema_version": supervise.SCHEMA_VERSION}),
@@ -200,7 +205,9 @@ def test_absent_restart_count_remains_fresh(state_path: Path) -> None:
     assert state.ownership_hold_malformed is False
 
 
-def test_present_malformed_restart_count_is_durable_hold(state_path: Path) -> None:
+def test_present_malformed_restart_count_is_durable_hold(
+    state_path: Path, supervisor_token: str
+) -> None:
     """Malformed restart counts parse closed and the hold persists."""
     malformed: tuple[object, ...] = (True, False, "5", "", -1, 1.5, None, [3], {"n": 3}, "three")
     for raw_count in malformed:
@@ -217,7 +224,7 @@ def test_present_malformed_restart_count_is_durable_hold(state_path: Path) -> No
     assert supervise.read_state().ownership_hold_malformed is True
 
 
-def test_valid_crash_history_fields_parse() -> None:
+def test_valid_crash_history_fields_parse(supervisor_token: str) -> None:
     """Genuine crash-history fields keep their values without any hold."""
     for count in (0, 5):
         for deadline in (0.0, 12345.75, 10**15):
@@ -231,7 +238,7 @@ def test_valid_crash_history_fields_parse() -> None:
             ) == (deadline, False)
 
 
-def test_null_and_absent_deadlines_are_no_deadline() -> None:
+def test_null_and_absent_deadlines_are_no_deadline(supervisor_token: str) -> None:
     """Null and absent backoff deadlines stay valid no-deadline states."""
     assert supervise._parse_present_nullable_float({}, "next_attempt_at") == (None, False)
     assert supervise._parse_present_nullable_float(
@@ -239,7 +246,9 @@ def test_null_and_absent_deadlines_are_no_deadline() -> None:
     ) == (None, False)
 
 
-def test_present_malformed_backoff_deadline_is_durable_hold(state_path: Path) -> None:
+def test_present_malformed_backoff_deadline_is_durable_hold(
+    state_path: Path, supervisor_token: str
+) -> None:
     """Malformed backoff deadlines parse closed and the hold persists."""
     malformed: tuple[object, ...] = (
         True,
@@ -264,7 +273,9 @@ def test_present_malformed_backoff_deadline_is_durable_hold(state_path: Path) ->
     assert supervise.read_state().ownership_hold_malformed is True
 
 
-def test_supervisor_monotonic_timestamps_are_strict_nullable_numbers(state_path: Path) -> None:
+def test_supervisor_monotonic_timestamps_are_strict_nullable_numbers(
+    state_path: Path, supervisor_token: str
+) -> None:
     """Lifecycle monotonic timestamps accept only non-negative finite JSON numbers or null."""
     malformed_values: tuple[object, ...] = (
         True,
@@ -307,8 +318,7 @@ def test_supervisor_monotonic_timestamps_are_strict_nullable_numbers(state_path:
 
 
 def test_reconcile_holds_before_malformed_monotonic_timing_can_drive_lifecycle(
-    state_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Corrupt stability/readiness timing cannot reach scheduling decisions."""
     for field, value in (("last_spawn_at", "nan"), ("next_readiness_at", "inf")):
@@ -352,7 +362,9 @@ def test_reconcile_holds_before_malformed_monotonic_timing_can_drive_lifecycle(
         assert supervise.read_state().ownership_hold_malformed is True
 
 
-def test_unrepresentably_large_integer_deadline_is_durable_hold(state_path: Path) -> None:
+def test_unrepresentably_large_integer_deadline_is_durable_hold(
+    state_path: Path, supervisor_token: str
+) -> None:
     """An integer beyond float range fails closed instead of raising."""
     huge = "1" + "0" * 10000
     state_path.write_text(
@@ -369,8 +381,7 @@ def test_unrepresentably_large_integer_deadline_is_durable_hold(state_path: Path
 
 
 def test_reconcile_holds_before_crash_handling_on_malformed_history(
-    state_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Corrupt crash-history authority never retires or spawns a worker."""
     state_path.write_text(
@@ -416,7 +427,7 @@ def test_reconcile_holds_before_crash_handling_on_malformed_history(
 
 
 def test_reconcile_holds_before_worker_spawn_on_ownership_corruption(
-    state_path: Path, monkeypatch: pytest.MonkeyPatch
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Reconcile returns before any worker path for a corrupt ownership bit."""
     write_raw_state(state_path, ownership_hold_malformed="not-a-boolean")
@@ -439,7 +450,7 @@ BOOT_B = "0bbbbbbb-0000-4000-8000-00000000000b"
 
 @pytest.mark.parametrize("deadline", [0.0, 12345.75])
 def test_same_boot_keeps_active_backoff_deadline(
-    state_path: Path, monkeypatch: pytest.MonkeyPatch, deadline: float
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, deadline: float, supervisor_token: str
 ) -> None:
     """A matching boot identity proves the clock domain and keeps backoff."""
     write_raw_state(state_path, boot_id=BOOT_B, next_attempt_at=deadline)
@@ -454,7 +465,7 @@ def test_same_boot_keeps_active_backoff_deadline(
 
 
 def test_genuine_cross_boot_mismatch_resets_monotonic_deadlines(
-    state_path: Path, monkeypatch: pytest.MonkeyPatch
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """A proven prior-boot record has its monotonic deadlines reset."""
     write_raw_state(
@@ -477,7 +488,7 @@ def test_genuine_cross_boot_mismatch_resets_monotonic_deadlines(
 
 
 def test_absent_boot_identity_is_treated_as_prior_boot(
-    state_path: Path, monkeypatch: pytest.MonkeyPatch
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Genuine absence of the boot identity stays a resettable unknown."""
     write_raw_state(state_path, next_attempt_at=1000.0)
@@ -491,7 +502,9 @@ def test_absent_boot_identity_is_treated_as_prior_boot(
     assert state.ownership_hold_malformed is False
 
 
-def test_fresh_state_round_trip_has_no_boot_identity_key(state_path: Path) -> None:
+def test_fresh_state_round_trip_has_no_boot_identity_key(
+    state_path: Path, supervisor_token: str
+) -> None:
     """Legacy unknown-boot state omits the key instead of writing null."""
     supervise.write_state(supervise.fresh_state())
     payload = json.loads(state_path.read_text(encoding="utf-8"))
@@ -501,7 +514,9 @@ def test_fresh_state_round_trip_has_no_boot_identity_key(state_path: Path) -> No
     assert state.ownership_hold_malformed is False
 
 
-def test_present_malformed_boot_identity_is_durable_hold(state_path: Path) -> None:
+def test_present_malformed_boot_identity_is_durable_hold(
+    state_path: Path, supervisor_token: str
+) -> None:
     """Malformed boot identifiers parse closed and the hold persists."""
     malformed: tuple[object, ...] = (1, True, 1.5, [], {}, ["x"], {"b": BOOT_A}, None, "")
     for raw_boot_id in malformed:
@@ -518,7 +533,7 @@ def test_present_malformed_boot_identity_is_durable_hold(state_path: Path) -> No
 
 
 def test_explicit_null_boot_identity_preserves_active_backoff(
-    state_path: Path, monkeypatch: pytest.MonkeyPatch
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Explicit JSON null is corruption: it holds instead of resetting."""
     write_raw_state(state_path, boot_id=None, next_attempt_at=1000.0)
@@ -542,7 +557,7 @@ def test_explicit_null_boot_identity_preserves_active_backoff(
 
 
 def test_corrupted_boot_identity_never_erases_active_backoff(
-    state_path: Path, monkeypatch: pytest.MonkeyPatch
+    state_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
 ) -> None:
     """Representative corrupt boot identity holds instead of clearing backoff."""
     write_raw_state(state_path, boot_id="", next_attempt_at=1000.0)
@@ -566,7 +581,7 @@ def test_corrupted_boot_identity_never_erases_active_backoff(
 
 
 def test_invalid_incarnation_tokens_make_persisted_worker_records_malformed(
-    state_path: Path,
+    state_path: Path, supervisor_token: str
 ) -> None:
     """Persisted lifecycle records share the canonical incarnation-token domain."""
     for token in ["", "bad token", "a/b", ".", "..", "bad.token"]:
@@ -605,7 +620,7 @@ def test_invalid_incarnation_tokens_make_persisted_worker_records_malformed(
             })
 
 
-def test_present_malformed_state_enum_enters_durable_hold() -> None:
+def test_present_malformed_state_enum_enters_durable_hold(supervisor_token: str) -> None:
     """Malformed present mode/intent never becomes healthy default authority."""
     for field in ["mode", "intent"]:
         for raw in [123, True, 1.5, [], {}, None]:
@@ -617,7 +632,7 @@ def test_present_malformed_state_enum_enters_durable_hold() -> None:
             assert state.ownership_hold_malformed is True
 
 
-def test_unsupported_state_enum_enters_durable_hold() -> None:
+def test_unsupported_state_enum_enters_durable_hold(supervisor_token: str) -> None:
     """Unsupported mode/intent strings fail closed instead of becoming defaults."""
     for field, raw in [
         ("mode", "unsupported"),
@@ -631,7 +646,7 @@ def test_unsupported_state_enum_enters_durable_hold() -> None:
         assert state.ownership_hold_malformed is True
 
 
-def test_present_malformed_commit_enters_durable_hold() -> None:
+def test_present_malformed_commit_enters_durable_hold(supervisor_token: str) -> None:
     """Malformed present commit cannot silently degrade to ordinary absence."""
     malformed: tuple[object, ...] = (123, True, 1.5, [], {})
     for raw in malformed:
@@ -644,7 +659,7 @@ def test_present_malformed_commit_enters_durable_hold() -> None:
         assert state.ownership_hold_malformed is True
 
 
-def test_state_string_absence_and_commit_null_remain_compatible() -> None:
+def test_state_string_absence_and_commit_null_remain_compatible(supervisor_token: str) -> None:
     """Documented absence defaults and nullable commit retain healthy semantics."""
     data = supervise.fresh_state().to_dict()
     data.pop("mode")
@@ -659,7 +674,7 @@ def test_state_string_absence_and_commit_null_remain_compatible() -> None:
     assert state.ownership_hold_malformed is False
 
 
-def test_state_string_valid_values_round_trip() -> None:
+def test_state_string_valid_values_round_trip(supervisor_token: str) -> None:
     """Canonical lifecycle strings remain exact and healthy."""
     data = supervise.fresh_state().to_dict()
     data.update(

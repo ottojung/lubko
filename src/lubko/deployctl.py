@@ -55,8 +55,12 @@ from lubko.lifecycle import (
     worker_log_path,
     write_meta,
 )
-from lubko.state import rollback_state_path, state_root
+from lubko.state import SupervisorStateTokenError, rollback_state_path, state_root
 from lubko.supervise import GenerationLockTimeoutError
+from lubko.supervise_client import (
+    read_desired_client,
+    read_state_client,
+)
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import JOB_ID_ENV
 
@@ -536,12 +540,13 @@ def next_mission_generation() -> int:
     """Allocate the next monotonic mission generation for a new checkout.
 
     Must run while the deploy lock is held. The returned generation is
-    strictly greater than every durable generation observed so far: the
-    existing rollback mission, the supervisor desired intent, and the
-    supervisor applied state. A supervisor that compares generations can then
-    never mistake a freshly created mission for an older or already-applied
-    generation. Allocation is serialized with the desired-intent writes so a
-    concurrent restart can never reuse or reorder a generation.
+    strictly greater than every durable generation observed so far.
+
+    With token: direct ``supervise.next_generation()`` under the
+    generation lock.
+    Without token: reads the current applied generation from the status
+    surface and returns ``applied + 1``.  The supervisor re-validates
+    when processing the deploy request.
 
     Returns:
         The next strictly greater positive generation.
@@ -560,6 +565,9 @@ def next_mission_generation() -> int:
     except GenerationLockTimeoutError as exc:
         msg = "timed out waiting for the generation lock during mission generation allocation"
         raise DeployCtlError(msg) from exc
+    except SupervisorStateTokenError:
+        state = read_state_client()
+        return state.applied_generation + 1
 
 
 def _supervised_mission_active(state: RollbackState) -> bool:
@@ -578,7 +586,7 @@ def _supervised_mission_active(state: RollbackState) -> bool:
         ``True`` when the supervisor owns a proven-live worker for
         ``state.commit`` that it began under this mission generation.
     """
-    supervisor_state = supervise.read_state()
+    supervisor_state = read_state_client()
     return (
         supervisor_state.commit == state.commit
         and supervisor_state.child is not None
@@ -660,7 +668,7 @@ def _supervised_terminalization_authority_matches(
         return False
     if status.ready is not True or status.holding or status.child is None:
         return False
-    supervisor_state = supervise.read_state()
+    supervisor_state = read_state_client()
     return (
         supervisor_state.commit == expected_commit
         and supervisor_state.applied_generation == expected_generation
@@ -680,9 +688,9 @@ def _supervised_mission_authoritative(state: RollbackState) -> bool:
     missing, contradictory, or different-commit authority. Terminalization
     still binds to the exact settled generation separately.
     """
-    supervisor_state = supervise.read_state()
+    supervisor_state = read_state_client()
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError:
         return False
     status = supervise.read_status()
@@ -715,7 +723,7 @@ def _require_confirmation_authority(state: RollbackState) -> None:
     if state.supervisor_owned is False or not supervise.supervisor_running():
         return
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError as exc:
         msg = "supervisor authority was superseded before confirmation; deployment remains pending"
         raise DeployCtlError(msg) from exc
@@ -780,7 +788,7 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
     """
     worker_id = os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError as exc:
         msg = "the supervisor desired intent is not trustworthy"
         raise DeployCtlError(msg) from exc
@@ -1960,7 +1968,7 @@ def _rollback_locked_body(state: RollbackState, expected_generation: int) -> Non
         DeployCtlError: On authority conflict or unreadable state.
     """
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError as exc:
         msg = "cannot roll back while supervisor desired authority is unreadable"
         raise DeployCtlError(msg) from exc
@@ -2292,7 +2300,7 @@ def _confirmation_locked_body(state: RollbackState, expected_generation: int) ->
         DeployCtlError: On authority conflict or unreadable state.
     """
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError as exc:
         msg = "cannot confirm while supervisor desired authority is unreadable"
         raise DeployCtlError(msg) from exc
@@ -3048,7 +3056,7 @@ def _cli_target_commit(state: RollbackState | None) -> str | None:
         The exact commit the CLI pointer should select, or ``None``.
     """
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError:
         # A present-but-malformed authoritative intent is observable
         # corruption: fail closed instead of falling back to other authority
