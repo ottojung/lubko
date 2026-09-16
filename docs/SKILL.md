@@ -119,6 +119,12 @@ Do not unnecessarily restrict commands merely because they modify files, install
 
 If the Lubko deployment architecture is later changed to weaken this isolation — for example by deliberately exposing privileged host resources — this invariant must be revalidated. Normal higher-level safety and ethical policies still apply.
 
+## Temporary packages and file transfer
+
+If `guix` is available on a Lubko host, use it as the general-purpose package manager for temporary job dependencies. Any package, library, runtime, compiler, build tool, CLI, debugger, formatter, network utility, or other dependency needed for the job should normally be supplied through an ephemeral Guix environment rather than treating a missing command as a blocker or modifying durable package state. For example, when `curl` is needed, use `guix environment --ad-hoc curl -- curl ...`.
+
+For transferring generated files from ChatGPT to a Lubko host, prefer the Dropbox connector: upload the artifact to Dropbox, create a short-lived unauthenticated direct-download link, then fetch that link from the Lubko job. Dropbox temporary download links are single-use and short-lived, so do not preflight, unfurl, issue `HEAD`, or otherwise consume the URL before the intended download. Routine post-transfer hash verification is not required and is generally a waste of time; normal Dropbox/HTTPS transfer integrity is sufficient unless the task has a specific integrity or security requirement, or there is concrete evidence of corruption. If the job needs an HTTP client or any other missing tool, provide it temporarily with Guix as above.
+
 ---
 
 # Supabase job transport
