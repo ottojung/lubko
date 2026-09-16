@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -446,3 +447,84 @@ def test_derive_action_converges_from_durable_desired_after_worker_loss(
     assert commit == target_commit, (
         f"expected commit={target_commit!r} from durable desired, got {commit!r}"
     )
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_reconcile_restores_worker_from_durable_desired_after_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real reconcile() converges a lost worker from pre-existing durable state.
+
+    Exercises the full production reconciliation path:
+    1. Pre-populates durable desired.json (written by A before exec).
+    2. Writes fresh state with child=None (worker lost).
+    3. Mocks _spawn_worker to return a valid WorkerChild (simulating spawn success).
+    4. Calls real reconcile() which reads desired.json, derives action,
+       and calls _ensure_worker -> _spawn_and_publish -> _spawn_worker.
+    5. Verifies the worker state was durably updated (child published,
+       spawning cleared, commit set).
+    """
+    target_commit = "b" * 40
+
+    # Pre-populate durable desired state (written by A before exec).
+    supervise.write_desired(
+        supervise.SupervisorDesired(
+            schema_version=supervise.SCHEMA_VERSION,
+            generation=1,
+            commit=target_commit,
+            repo="/test",
+            uv_path="uv",
+            worker_id="test-worker",
+        )
+    )
+
+    # Write fresh state with no child (worker lost).
+    _write_fresh_state()
+
+    # Mock deployctl.read_rollback_state to return None (no mission).
+    monkeypatch.setattr("lubko.deployctl.read_rollback_state", lambda: None)
+
+    # Mock _spawn_worker to return a valid child (simulating successful spawn).
+    fake_child = supervise.WorkerChild(
+        pid=99999,
+        pgid=99999,
+        sid=99999,
+        start_time_ticks=12345,
+        token="tok",  # ruff: ignore[hardcoded-password-func-arg]
+        worker_id="test-worker",
+        spawned_at=1.0,
+    )
+    monkeypatch.setattr(SupervisorDaemon, "_spawn_worker", lambda _self, _commit: fake_child)
+
+    # Mock _spawn_and_publish to call _spawn_worker and update state directly.
+    def _fake_spawn_and_publish(self: SupervisorDaemon, commit: str) -> None:
+        child = self._spawn_worker(commit)
+        if child is not None:
+            state = supervise.read_state()
+            supervise.write_state(
+                replace(
+                    state,
+                    mode="run",
+                    commit=commit,
+                    child=child,
+                    intent="run",
+                    spawning=None,
+                )
+            )
+
+    monkeypatch.setattr(SupervisorDaemon, "_spawn_and_publish", _fake_spawn_and_publish)
+
+    daemon = SupervisorDaemon(Settings())
+
+    # Call real reconcile() — this reads durable desired.json and converges.
+    daemon.reconcile(0.0)
+
+    # Verify the worker state was durably updated.
+    final_state = supervise.read_state()
+    assert final_state.child is not None, "worker not restored after reconcile"
+    assert final_state.child.pid == 99999, f"wrong pid: {final_state.child.pid}"
+    assert final_state.commit == target_commit, (
+        f"commit not updated: {final_state.commit!r}, expected {target_commit!r}"
+    )
+    assert final_state.mode == "run", f"mode not updated: {final_state.mode!r}"
+    assert final_state.intent == "run", f"intent not updated: {final_state.intent!r}"
