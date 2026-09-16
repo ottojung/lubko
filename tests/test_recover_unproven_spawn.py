@@ -23,8 +23,9 @@ NON_PRIVATE = ProcessIdentity(pid=PID, pgid=1, sid=9000, start_time_ticks=555)
 PIN_BASE = 20000
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_cleanup_ready_markers_tolerates_non_file_entries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Malformed marker filesystem shapes cannot abort recovery cleanup."""
     monkeypatch.setattr(lifecycle, "worker_state_dir", lambda: tmp_path)
@@ -163,7 +164,7 @@ def _write_pid_less_obligation() -> None:
 
 
 @pytest.fixture(autouse=True)
-def isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:
+def isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:  # ruff: ignore[unused-function-argument]
     """Use an isolated durable supervisor-state root for each test.
 
     Args:
@@ -286,11 +287,11 @@ def install_convergence(
     return delivered
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_converges_live_child_when_identity_is_none(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A live child with no observable identity is converged before failing."""
     spawned, _events = recover_env
@@ -327,11 +328,11 @@ def test_recover_converges_live_child_when_identity_is_none(
     assert supervise.read_state().spawning is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_converges_live_child_with_non_private_identity(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A live non-private session child is exactly signalled via its pin."""
     spawned, _events = recover_env
@@ -354,11 +355,11 @@ def test_recover_converges_live_child_with_non_private_identity(
     assert fake.poll() == -15
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_recovers_owned_groups_on_every_failure_exit(
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Every post-spawn failure exit recovers the token's groups first."""
     _spawned, events = recover_env
@@ -387,11 +388,11 @@ def test_recover_recovers_owned_groups_on_every_failure_exit(
     assert recovered == {TOKEN}
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_records_durable_authority_when_group_recovery_fails(
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Failed owned-group recovery leaves a durable blocking obligation."""
     _spawned, _events = recover_env
@@ -412,11 +413,11 @@ def test_recover_records_durable_authority_when_group_recovery_fails(
     assert json.loads(supervise.state_path().read_text())["spawning"]["token"] == TOKEN
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_refuses_to_spawn_until_stale_obligation_resolves(
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """A later recover neither races unresolved groups nor forgets them."""
     spawned, events = recover_env
@@ -470,11 +471,11 @@ def test_recover_refuses_to_spawn_until_stale_obligation_resolves(
     assert (TOKEN, "recovered") in events
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_never_spawns_without_durable_authority(
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """A recovery worker may only start once its authority is durably held."""
     spawned, _events = recover_env
@@ -503,8 +504,9 @@ def test_recover_never_spawns_without_durable_authority(
     assert supervise.read_state().spawning is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_never_resolves_pid_less_manual_obligation_by_assumption(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A pid-less manual obligation blocks even when pdeathsig is available."""
     _write_pid_less_obligation()
@@ -516,11 +518,11 @@ def test_supervisor_never_resolves_pid_less_manual_obligation_by_assumption(
     assert supervise.read_state().spawning is not None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_never_spawns_over_a_malformed_spawning_authority(
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """A malformed pre-spawn authority fails closed and survives untouched."""
     spawned, _events = recover_env
@@ -546,10 +548,10 @@ def test_recover_never_spawns_over_a_malformed_spawning_authority(
     assert json.loads(supervise.state_path().read_text()) == raw
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_honors_recorded_recovery_obligation(
     monkeypatch: pytest.MonkeyPatch,
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """The maintained supervisor resolves the recorded authority before spawning."""
     del recover_env
@@ -586,11 +588,11 @@ def test_supervisor_honors_recorded_recovery_obligation(
     assert supervise.read_state().spawning is not None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_does_not_report_success_for_dead_child(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A child that already exits is never reported as adoptable."""
     spawned, _events = recover_env
@@ -617,11 +619,11 @@ def test_recover_does_not_report_success_for_dead_child(
     assert f"pid={PID}" not in captured.out
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_reports_success_for_live_private_session_child(
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """A live child that establishes its private session is reported."""
     spawned, _events = recover_env
@@ -675,8 +677,9 @@ def _stub_repair(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_adoption_candidate_refuses_malformed_maintained_metadata(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A corrupt maintained authority cannot collapse to absence during adoption."""
     monkeypatch.setattr(lifecycle, "require_clean_checkout", lambda *_a: True)
@@ -694,8 +697,9 @@ def test_adoption_candidate_refuses_malformed_maintained_metadata(
         lifecycle._adoption_candidate(options(), PID, COMMIT)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_refuses_metadata_corruption_at_final_publication_boundary(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Corruption after candidate validation blocks the authoritative write."""
     _stub_repair(monkeypatch)
@@ -718,11 +722,11 @@ def test_repair_refuses_metadata_corruption_at_final_publication_boundary(
     assert "became untrustworthy before adoption publication" in captured.err
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_success_keeps_exact_authority_until_adoption(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A successful recover leaves the live worker durably represented."""
     spawned, _events = recover_env
@@ -743,10 +747,10 @@ def test_recover_success_keeps_exact_authority_until_adoption(
     assert obligation.parent_death_signal is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_success_holds_supervisor_reconcile_while_worker_is_live(
     monkeypatch: pytest.MonkeyPatch,
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """The retained authority stops a restarted supervisor from respawning."""
     spawned, _events = recover_env
@@ -766,11 +770,11 @@ def test_recover_success_holds_supervisor_reconcile_while_worker_is_live(
     assert len(spawned) == 1
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_adopts_and_durably_clears_exact_authority(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A verified adoption of the named worker releases the exact authority."""
     spawned, _events = recover_env
@@ -785,11 +789,11 @@ def test_repair_adopts_and_durably_clears_exact_authority(
     assert len(spawned) == 1
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_refuses_to_clear_a_mismatched_authority(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """An obligation naming a different instance stays blocking and wins."""
     _spawned, _events = recover_env
@@ -806,11 +810,11 @@ def test_repair_refuses_to_clear_a_mismatched_authority(
     assert (obligation.token, obligation.pid) == (TOKEN, PID)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_failure_to_release_authority_reports_no_success(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """Adoption without a confirmed release never reports success."""
     _spawned, _events = recover_env
@@ -831,11 +835,11 @@ def test_repair_failure_to_release_authority_reports_no_success(
     assert obligation.pid == PID
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_dead_before_repair_convergence_resolves_the_retained_authority(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A worker that dies before repair is converged out of the authority."""
     spawned, events = recover_env
@@ -855,8 +859,9 @@ def test_dead_before_repair_convergence_resolves_the_retained_authority(
     assert obligation.token == TOKEN
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_legacy_repair_without_authority_still_succeeds(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Repair keeps working when no recovery authority was ever recorded."""
     _stub_repair(monkeypatch)
@@ -866,11 +871,11 @@ def test_legacy_repair_without_authority_still_succeeds(
     assert supervise.read_state().spawning is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_failure_when_authority_became_malformed(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A concurrently malformed authority fails closed and stays durable."""
     _spawned, _events = recover_env
@@ -903,11 +908,11 @@ def test_repair_failure_when_authority_became_malformed(
     assert json.loads(supervise.state_path().read_text())["spawning"]["token"] == TOKEN
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_fails_closed_when_the_consumer_boundary_is_busy(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A busy consumer-establishment boundary blocks the whole adoption."""
     _spawned, _events = recover_env
@@ -964,11 +969,11 @@ def _maintained_meta() -> lifecycle.WorkerMeta:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_never_publishes_a_candidate_that_exited_before_the_lock(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A candidate proven outside the lock must be re-proved under the lock."""
     _spawned, _events = recover_env
@@ -1030,11 +1035,11 @@ def test_repair_never_publishes_a_candidate_that_exited_before_the_lock(
     assert lifecycle.read_meta() == maintained
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_adopts_a_candidate_that_stays_exact_through_the_lock(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A candidate still exactly live under the lock adopts successfully."""
     spawned, _events = recover_env
@@ -1057,11 +1062,11 @@ def test_repair_adopts_a_candidate_that_stays_exact_through_the_lock(
     assert len(spawned) == 1
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repair_refuses_a_candidate_whose_lifecycle_token_no_longer_matches(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     recover_env: tuple[list[FakePopen], list[tuple[str, str]]],
-    supervisor_token: str,
 ) -> None:
     """A same-identity candidate without its exact token is never published.
 

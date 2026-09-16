@@ -17,9 +17,9 @@ def _malformed_mission() -> deployctl.RollbackState | None:
     raise deployctl.DeployCtlError(message)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_derive_action_restores_confirmed_before_mission_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Malformed desired state cannot hide the independently confirmed runtime."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -36,9 +36,9 @@ def test_derive_action_restores_confirmed_before_mission_on_malformed_desired(
     assert mission_reads == []
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_reconcile_restores_confirmed_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Reconciliation keeps service available from the independent confirmed anchor."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -62,9 +62,9 @@ def test_reconcile_restores_confirmed_on_malformed_desired(
     assert "independently confirmed runtime" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_corrupt_candidate_mission_restores_confirmed_not_desired_candidate(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Unreadable candidate state cannot outrank the independently confirmed runtime."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -82,9 +82,9 @@ def test_corrupt_candidate_mission_restores_confirmed_not_desired_candidate(
     assert "restoring independently confirmed runtime" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_desired_cannot_advance_pending_mission_generation(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Mission progress cannot advance when desired generation authority is malformed."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -104,9 +104,9 @@ def test_malformed_desired_cannot_advance_pending_mission_generation(
     assert state_writes == []
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_desired_cannot_clear_cold_migration_authority(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Cold-migration completion cannot clear authority when desired state is malformed."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -135,9 +135,9 @@ def _desired(commit: str, generation: int = 1) -> supervise.SupervisorDesired:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_pre_spawn_revalidation_restores_confirmed_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """The final generation-locked spawn gate still selects confirmed A."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -159,9 +159,9 @@ def test_pre_spawn_revalidation_restores_confirmed_on_malformed_desired(
     assert spawned == [confirmed]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_authority_holds_without_usable_confirmed_anchor(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Recovery remains fail-closed when there is no trusted confirmed runtime."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -175,9 +175,9 @@ def test_malformed_authority_holds_without_usable_confirmed_anchor(
     assert "no usable confirmed runtime" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_pre_spawn_revalidation_blocks_superseded_commit(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """A newer durable commit cannot permit a stale commit selected earlier."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
@@ -196,9 +196,9 @@ def test_pre_spawn_revalidation_blocks_superseded_commit(
     assert "intent changed" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_pre_spawn_revalidation_preserves_unchanged_desired(
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """An unchanged valid desired commit still crosses the final spawn gate."""
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())

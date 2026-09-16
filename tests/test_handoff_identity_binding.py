@@ -27,7 +27,7 @@ OTHER_COMMIT = "b" * 40
 
 
 @pytest.fixture
-def _state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:  # ruff: ignore[unused-function-argument]
     """Isolated XDG_STATE_HOME with an empty supervisor directory."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)
@@ -60,9 +60,7 @@ def _set_cli_current(commit: str) -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_successor_binds_to_a_target_not_cli_current(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+def test_successor_binds_to_a_target_not_cli_current(monkeypatch: pytest.MonkeyPatch) -> None:
     """B records A's target commit as runtime identity, ignoring cli/current.
 
     Regression: before this fix, B derived supervisor_runtime_commit from
@@ -119,7 +117,7 @@ def test_successor_binds_to_a_target_not_cli_current(
 
 @pytest.mark.usefixtures("_state_dir")
 def test_missing_target_commit_in_handoff_mode_fails_closed(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handoff fd present but target commit metadata missing → SystemExit(1).
 
@@ -151,7 +149,7 @@ def test_missing_target_commit_in_handoff_mode_fails_closed(
 
 @pytest.mark.usefixtures("_state_dir")
 def test_malformed_target_commit_in_handoff_mode_fails_closed(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Handoff fd present but target commit is not a valid 40-hex name → SystemExit(1).
 
@@ -187,7 +185,7 @@ def test_malformed_target_commit_in_handoff_mode_fails_closed(
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_normal_startup_uses_current_commit(supervisor_token: str) -> None:
+def test_normal_startup_uses_current_commit() -> None:
     """Non-handoff startup captures cli.current_commit() as runtime identity.
 
     Fallback to cli.current_commit() is only valid for genuine non-handoff
@@ -211,7 +209,7 @@ def test_normal_startup_uses_current_commit(supervisor_token: str) -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_gc_preserves_handoff_target_commit(supervisor_token: str) -> None:
+def test_gc_preserves_handoff_target_commit() -> None:
     """supervisor_authoritative_commits() includes the bound runtime commit.
 
     The target commit B binds to must never be garbage-collected while B
@@ -240,7 +238,7 @@ def test_gc_preserves_handoff_target_commit(supervisor_token: str) -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_gc_does_not_preserve_unrelated_commits(supervisor_token: str) -> None:
+def test_gc_does_not_preserve_unrelated_commits() -> None:
     """Unrelated commits are not preserved by GC rooting."""
     _write_state_with_runtime(runtime_commit=TARGET_COMMIT)
 
@@ -270,9 +268,7 @@ def test_gc_does_not_preserve_unrelated_commits(supervisor_token: str) -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_status_reports_bound_runtime_commit(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+def test_status_reports_bound_runtime_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     """Status snapshot carries the bound supervisor_runtime_commit."""
     _write_state_with_runtime()
     _set_cli_current(TARGET_COMMIT)
@@ -297,7 +293,7 @@ def test_status_reports_bound_runtime_commit(
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_cli_current_skew_after_handoff_is_detected(supervisor_token: str) -> None:
+def test_cli_current_skew_after_handoff_is_detected() -> None:
     """After B binds to TARGET_COMMIT, a later cli/current change is detectable.
 
     The reconcile loop compares supervisor_runtime_commit against

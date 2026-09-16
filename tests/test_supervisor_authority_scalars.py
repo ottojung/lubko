@@ -71,7 +71,8 @@ def spawning_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
-def test_current_and_legacy_durable_authority_round_trip(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_current_and_legacy_durable_authority_round_trip() -> None:
     """Current records round-trip while genuine legacy path absence stays supported."""
     desired = supervise.SupervisorDesired.from_dict(desired_payload())
     assert desired.to_dict() == desired_payload()
@@ -94,7 +95,8 @@ def test_current_and_legacy_durable_authority_round_trip(supervisor_token: str) 
     )
 
 
-def test_zero_supervisor_wall_clock_values_are_valid(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_zero_supervisor_wall_clock_values_are_valid() -> None:
     """Epoch-zero compatibility remains valid for supervisor wall-clock metadata."""
     assert supervise.SupervisorDesired.from_dict(
         desired_payload(requested_at=0)
@@ -111,7 +113,8 @@ def test_zero_supervisor_wall_clock_values_are_valid(supervisor_token: str) -> N
     ).created_at == pytest.approx(0.0)
 
 
-def test_malformed_desired_scalars_fail_closed(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_malformed_desired_scalars_fail_closed() -> None:
     """Desired lifecycle authority rejects coercible malformed JSON scalars."""
     malformed_fields: tuple[tuple[str, object], ...] = (
         ("schema_version", "1"),
@@ -141,7 +144,8 @@ def test_malformed_desired_scalars_fail_closed(supervisor_token: str) -> None:
     ).requested_at == pytest.approx(0.0)
 
 
-def test_malformed_child_scalars_preserve_ownership_hold(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_malformed_child_scalars_preserve_ownership_hold() -> None:
     """Malformed maintained-child identity stays replacement-blocking."""
     for field, malformed in (
         ("pid", "4242"),
@@ -157,7 +161,8 @@ def test_malformed_child_scalars_preserve_ownership_hold(supervisor_token: str) 
         assert state.ownership_hold_malformed
 
 
-def test_malformed_unresolved_scalars_preserve_hold(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_malformed_unresolved_scalars_preserve_hold() -> None:
     """Malformed unresolved-child records stay durably replacement-blocking."""
     for field, malformed in (
         ("pid", "4242"),
@@ -173,7 +178,8 @@ def test_malformed_unresolved_scalars_preserve_hold(supervisor_token: str) -> No
         assert state.unresolved_hold_malformed
 
 
-def test_malformed_spawning_scalars_preserve_hold(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_malformed_spawning_scalars_preserve_hold() -> None:
     """Malformed pre-spawn records stay durably replacement-blocking."""
     for field, malformed in (
         ("creator_pid", "4000"),
@@ -193,7 +199,8 @@ def test_malformed_spawning_scalars_preserve_hold(supervisor_token: str) -> None
         assert state.spawning_hold_malformed
 
 
-def test_malformed_supervisor_state_schema_fails_closed(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_malformed_supervisor_state_schema_fails_closed() -> None:
     """Persisted state schema authority requires the exact current JSON integer."""
     canonical = supervise.fresh_state().to_dict()
     malformed_values: tuple[object, ...] = ("1", 1.0, True, 0, 2, None, {}, [])
@@ -212,7 +219,8 @@ def test_malformed_supervisor_state_schema_fails_closed(supervisor_token: str) -
     assert supervise.read_state() == supervise.fresh_state()
 
 
-def test_absent_in_memory_state_schema_preserves_legacy_defaults(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_absent_in_memory_state_schema_preserves_legacy_defaults() -> None:
     """Partial in-memory state mappings retain their documented absence compatibility."""
     state = supervise.SupervisorState.from_dict({})
     assert state == supervise.fresh_state()

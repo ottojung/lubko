@@ -161,8 +161,9 @@ def write_desired_commit(commit: str, repo: Path) -> None:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_gc_preserves_current_desired_and_applied_runtimes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """GC and explicit removal never delete supervisor-authoritative runtimes."""
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
@@ -209,8 +210,9 @@ def test_gc_preserves_current_desired_and_applied_runtimes(
     assert cli.cli_commit_dir(second).is_dir()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_fresh_install_establishes_supervisor_desired_commit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A successful fresh install leaves CLI and desired authority coherent."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -232,8 +234,9 @@ def test_fresh_install_establishes_supervisor_desired_commit(
     assert desired.migration is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_same_commit_install_preserves_existing_desired_intent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An idempotent install does not advance or erase same-commit authority."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -266,11 +269,11 @@ def test_same_commit_install_preserves_existing_desired_intent(
     assert cli.current_commit() == head
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_install_fails_closed_on_untrusted_supervised_mission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    supervisor_token: str,
 ) -> None:
     """Malformed mission authority is never treated as absent or stale history."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -289,11 +292,11 @@ def test_install_fails_closed_on_untrusted_supervised_mission(
     assert supervise.read_desired_strict() is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_install_does_not_outrank_active_supervised_mission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    supervisor_token: str,
 ) -> None:
     """A mission at or above desired generation remains separate authority."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -324,11 +327,11 @@ def test_install_does_not_outrank_active_supervised_mission(
     assert supervise.read_desired_strict() == desired
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_install_preserves_pending_migration_cli_hold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    supervisor_token: str,
 ) -> None:
     """Install cannot activate a provisional migration target before readiness."""
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
@@ -357,11 +360,11 @@ def test_install_preserves_pending_migration_cli_hold(
     assert supervise.read_desired_strict() == migration
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_install_fails_closed_on_untrusted_desired_intent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    supervisor_token: str,
 ) -> None:
     """A malformed durable desired file is never treated as fresh absence."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -378,11 +381,11 @@ def test_install_fails_closed_on_untrusted_desired_intent(
     assert cli.current_commit() is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_install_refuses_version_change_over_desired_worker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    supervisor_token: str,
 ) -> None:
     """Installing a different commit than the desired worker fails closed."""
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
@@ -400,8 +403,9 @@ def test_install_refuses_version_change_over_desired_worker(
     assert cli.current_commit() is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_same_commit_install_keeps_worker_runtime_startable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """After refusal the supervisor can still recover its maintained runtime."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -421,8 +425,9 @@ def test_same_commit_install_keeps_worker_runtime_startable(
     assert cli.reconcile_pointer(head) is True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_same_commit_install_succeeds_and_gcs_stale_roots(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A same-commit fresh install succeeds and GC keeps only authority roots."""
     repo, first = make_repo_with_pyproject(tmp_path / "repo")
@@ -444,8 +449,9 @@ def test_same_commit_install_succeeds_and_gcs_stale_roots(
     assert meta is not None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_legacy_supervisor_runtime_file_is_inert(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A leftover legacy override file cannot select or block a runtime."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -464,11 +470,11 @@ def test_legacy_supervisor_runtime_file_is_inert(
     assert legacy.read_text(encoding="utf-8") == "d" * 40 + "\n"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_dry_run_rejects_stale_launcher_until_install_repairs_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    supervisor_token: str,
 ) -> None:
     """Startup verification rejects an old supervisor launcher before it can run."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -488,11 +494,11 @@ def test_dry_run_rejects_stale_launcher_until_install_repairs_it(
     assert launcher.read_text(encoding="utf-8") == cli.launcher_source("lubko-supervisor")
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_install_rechecks_authority_under_deploy_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    supervisor_token: str,
 ) -> None:
     """Authority appearing between pre-check and lock still aborts.
 
@@ -521,11 +527,11 @@ def test_install_rechecks_authority_under_deploy_lock(
     assert cli.current_commit() is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_install_fails_closed_when_deploy_lock_is_busy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    supervisor_token: str,
 ) -> None:
     """A deployment-lock timeout makes the installer refuse without mutating CLIs."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -549,8 +555,9 @@ def test_install_fails_closed_when_deploy_lock_is_busy(
     assert (bin_dir / "lubko-agent").is_file()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_current_runtime_reseals_writable_content_identical_tree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The confirmed runtime self-reseals when only write bits drifted."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -567,8 +574,9 @@ def test_current_runtime_reseals_writable_content_identical_tree(
     assert cli._tree_is_read_only(cli.cli_commit_dir(head))
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_current_runtime_never_rebuilds_tampered_writable_tree(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Writable confirmed content is re-sealed only when identity still matches."""
     repo, _first = make_repo_with_pyproject(tmp_path / "repo")
@@ -589,9 +597,8 @@ def test_current_runtime_never_rebuilds_tampered_writable_tree(
     assert marker.read_text(encoding="utf-8") == "tampered\n"
 
 
-def test_sync_venv_uses_frozen_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_sync_venv_uses_frozen_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_sync_venv passes --frozen to uv so installed runtimes are immutable."""
     captured_argv: list[str] = []
 
@@ -604,14 +611,16 @@ def test_sync_venv_uses_frozen_flag(
     assert captured_argv == ["/usr/bin/uv", "sync", "--frozen", "--project", str(tmp_path)]
 
 
-def test_validation_steps_sync_frozen_dev_extra(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_validation_steps_sync_frozen_dev_extra() -> None:
     """Deployment validation syncs with --frozen --extra dev for dev tools."""
     sync_step = lifecycle.VALIDATION_STEPS[0]
     assert sync_step == ("sync", "--frozen", "--extra", "dev")
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_launcher_source_resolves_shell_from_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Launcher shebang uses the actual sh found on PATH, not /bin/sh."""
     fake_sh = tmp_path / "sh"
@@ -622,17 +631,17 @@ def test_launcher_source_resolves_shell_from_path(
     assert source.startswith(f"#!{fake_sh}\n")
 
 
-def test_launcher_source_fails_without_sh(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_launcher_source_fails_without_sh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Missing sh on PATH raises CliError, never silently emits /bin/sh."""
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(cli.CliError, match="sh not found"):
         cli.launcher_source("lubko-agent")
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_startup_launcher_resolves_shell_from_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Startup launcher shebang uses the actual sh found on PATH."""
     fake_sh = tmp_path / "sh"
@@ -643,9 +652,8 @@ def test_startup_launcher_resolves_shell_from_path(
     assert content.startswith(f"#!{fake_sh}\n")
 
 
-def test_startup_launcher_fails_without_sh(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_startup_launcher_fails_without_sh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Missing sh on PATH raises StartupContractError, never /bin/sh."""
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(startup_contract.StartupContractError, match="sh not found"):

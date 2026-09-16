@@ -80,21 +80,24 @@ def _write_raw(text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def test_absent_mission_contributes_zero(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_absent_mission_contributes_zero() -> None:
     """Genuine mission absence leaves allocation driven only by applied/desired."""
     assert not rollback_state_path().exists()
     assert supervise._mission_generation() == 0
     assert supervise.next_generation() == 1
 
 
-def test_present_valid_mission_participates_monotonically(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_valid_mission_participates_monotonically() -> None:
     """An open mission's generation is strictly observed by allocation."""
     _write_mission(_mission(5))
     assert supervise._mission_generation() == 5
     assert supervise.next_generation() == 6
 
 
-def test_present_valid_mission_outranks_older_desired(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_valid_mission_outranks_older_desired() -> None:
     """A valid mission generation is not outranked by an older desired intent."""
     supervise.write_desired(
         supervise.SupervisorDesired(
@@ -110,7 +113,8 @@ def test_present_valid_mission_outranks_older_desired(supervisor_token: str) -> 
     assert supervise.next_generation() == 6
 
 
-def test_present_unreadable_mission_blocks_without_overwrite(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_unreadable_mission_blocks_without_overwrite() -> None:
     """A present directory at the authority path is corruption, not absence."""
     path = rollback_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +124,8 @@ def test_present_unreadable_mission_blocks_without_overwrite(supervisor_token: s
     assert path.is_dir()
 
 
-def test_present_malformed_json_blocks_without_overwrite(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_malformed_json_blocks_without_overwrite() -> None:
     """Invalid JSON is corruption and the authority is left untouched."""
     _write_raw("{this is not valid json")
     with pytest.raises(supervise.MissionAuthorityError):
@@ -128,21 +133,24 @@ def test_present_malformed_json_blocks_without_overwrite(supervisor_token: str) 
     assert rollback_state_path().read_text(encoding="utf-8") == "{this is not valid json"
 
 
-def test_present_non_object_blocks(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_non_object_blocks() -> None:
     """A present non-object JSON value is corruption."""
     _write_raw("123")
     with pytest.raises(supervise.MissionAuthorityError):
         supervise._mission_generation()
 
 
-def test_present_missing_generation_blocks(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_missing_generation_blocks() -> None:
     """A present object missing a generation is corruption."""
     _write_raw(json.dumps({"schema_version": dc.ROLLBACK_SCHEMA_VERSION}))
     with pytest.raises(supervise.MissionAuthorityError):
         supervise._mission_generation()
 
 
-def test_present_string_generation_blocks(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_string_generation_blocks() -> None:
     """A present non-integer (string) generation is corruption."""
     payload = _mission(5).to_dict()
     payload["generation"] = "5"
@@ -151,7 +159,8 @@ def test_present_string_generation_blocks(supervisor_token: str) -> None:
         supervise._mission_generation()
 
 
-def test_present_bool_generation_blocks(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_bool_generation_blocks() -> None:
     """A present boolean generation is corruption, never trusted as 1."""
     payload = _mission(5).to_dict()
     payload["generation"] = True
@@ -160,7 +169,8 @@ def test_present_bool_generation_blocks(supervisor_token: str) -> None:
         supervise._mission_generation()
 
 
-def test_present_nonpositive_generation_blocks(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_nonpositive_generation_blocks() -> None:
     """A present zero or negative generation is corruption."""
     payload = _mission(5).to_dict()
     payload["generation"] = -3
@@ -169,7 +179,8 @@ def test_present_nonpositive_generation_blocks(supervisor_token: str) -> None:
         supervise._mission_generation()
 
 
-def test_recovery_after_explicit_removal(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_recovery_after_explicit_removal() -> None:
     """Removing corrupt authority restores genuine absence."""
     _write_raw("not json")
     with pytest.raises(supervise.MissionAuthorityError):
@@ -179,7 +190,8 @@ def test_recovery_after_explicit_removal(supervisor_token: str) -> None:
     assert supervise.next_generation() == 1
 
 
-def test_recovery_after_repair(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_recovery_after_repair() -> None:
     """Repairing the authority into a valid mission restores participation."""
     _write_raw("not json")
     with pytest.raises(supervise.MissionAuthorityError):
@@ -189,7 +201,8 @@ def test_recovery_after_repair(supervisor_token: str) -> None:
     assert supervise.next_generation() == 8
 
 
-def test_deployctl_mission_generation_fails_closed_on_corrupt(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_deployctl_mission_generation_fails_closed_on_corrupt() -> None:
     """The deployctl allocation entry point fails closed and recovers cleanly."""
     _write_raw("{bad")
     with pytest.raises(dc.DeployCtlError):
@@ -198,7 +211,8 @@ def test_deployctl_mission_generation_fails_closed_on_corrupt(supervisor_token: 
     assert dc.next_mission_generation() == 1
 
 
-def test_request_run_refuses_corrupt_mission_without_overwrite(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_request_run_refuses_corrupt_mission_without_overwrite() -> None:
     """An ordinary run request refuses and never writes a desired intent."""
     _write_raw("not json")
     desired = supervise.desired_path()
@@ -208,7 +222,8 @@ def test_request_run_refuses_corrupt_mission_without_overwrite(supervisor_token:
     assert rollback_state_path().read_text(encoding="utf-8") == "not json"
 
 
-def test_concurrent_monotonic_allocation_under_shared_lock(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_concurrent_monotonic_allocation_under_shared_lock() -> None:
     """Concurrent allocations never collide or reuse a generation.
 
     The shared generation lock serializes each allocation, so every returned
@@ -252,7 +267,8 @@ def test_concurrent_monotonic_allocation_under_shared_lock(supervisor_token: str
     assert sorted(set(generations)) == list(range(6, 6 + expected))
 
 
-def test_lifecycle_migration_recovers_from_corrupt_mission(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_lifecycle_migration_recovers_from_corrupt_mission() -> None:
     """An explicit recovery path supersedes a corrupt mission before allocating."""
     _write_raw("not json")
     assert rollback_state_path().exists()

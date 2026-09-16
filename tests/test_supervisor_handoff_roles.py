@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture
-def _state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:  # ruff: ignore[unused-function-argument]
     """Isolated XDG_STATE_HOME with an empty supervisor directory."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)
@@ -64,9 +64,7 @@ def _noop_signals(_self: object) -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_preflight_probe_exits_without_durable_writes(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+def test_preflight_probe_exits_without_durable_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Preflight probe validates lock, signals READY, and returns.
 
     Must return before ANY durable write, status write, normalization,
@@ -124,9 +122,7 @@ def test_preflight_probe_exits_without_durable_writes(
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_preflight_probe_signals_ready_and_closes_lock_fd(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+def test_preflight_probe_signals_ready_and_closes_lock_fd(monkeypatch: pytest.MonkeyPatch) -> None:
     r"""Preflight probe writes R\n on the readiness pipe and closes its lock fd."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
@@ -157,9 +153,7 @@ def test_preflight_probe_signals_ready_and_closes_lock_fd(
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_preflight_probe_exits_without_reconcile(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+def test_preflight_probe_exits_without_reconcile(monkeypatch: pytest.MonkeyPatch) -> None:
     """Preflight probe returns from run() before the reconcile loop starts."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
@@ -196,7 +190,7 @@ def test_preflight_probe_exits_without_reconcile(
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_ready_failure_kills_probe_and_aborts_handoff(supervisor_token: str) -> None:
+def test_ready_failure_kills_probe_and_aborts_handoff() -> None:
     """When the probe does not signal READY, A kills/reaps it and aborts."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
@@ -227,7 +221,7 @@ def test_ready_failure_kills_probe_and_aborts_handoff(supervisor_token: str) -> 
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_probe_nonzero_exit_aborts_handoff(supervisor_token: str) -> None:
+def test_probe_nonzero_exit_aborts_handoff() -> None:
     """When the probe exits with rc != 0 after READY, handoff is aborted."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
@@ -258,9 +252,7 @@ def test_probe_nonzero_exit_aborts_handoff(supervisor_token: str) -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_exec_in_place_retires_pidfile_before_exec(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+def test_exec_in_place_retires_pidfile_before_exec(monkeypatch: pytest.MonkeyPatch) -> None:
     """A retires its own pidfile before exec-in-place."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
@@ -304,9 +296,7 @@ def test_exec_in_place_retires_pidfile_before_exec(
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_exec_failure_restores_pidfile_and_continues(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+def test_exec_failure_restores_pidfile_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
     """When os.execve fails, A restores its pidfile and continues."""
     _write_fresh_state()
     daemon = SupervisorDaemon(Settings())
@@ -347,9 +337,7 @@ def test_exec_failure_restores_pidfile_and_continues(
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_no_authority_overlap_at_probe_exec_boundary(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+def test_no_authority_overlap_at_probe_exec_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     """At no point during probe->exec does a second reconciler exist.
 
     The probe exits before exec. The exec'd image enters normal startup only

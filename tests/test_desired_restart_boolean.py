@@ -31,7 +31,8 @@ def intent_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
-def test_missing_and_boolean_restart_values_parse(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_missing_and_boolean_restart_values_parse() -> None:
     """Missing parses as false; only literal JSON booleans are accepted."""
     for restart, expected in [(None, False), (True, True), (False, False)]:
         payload = intent_payload() if restart is None else intent_payload(restart=restart)
@@ -39,14 +40,16 @@ def test_missing_and_boolean_restart_values_parse(supervisor_token: str) -> None
         assert desired.restart is expected
 
 
-def test_present_non_boolean_restart_fails_closed(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_non_boolean_restart_fails_closed() -> None:
     """A present non-boolean ``restart`` (including null) enters malformed handling."""
     for malformed in [None, 1, 0, "true", "", {}, [], [True]]:  # type: ignore[var-annotated]
         with pytest.raises((TypeError, ValueError), match="malformed"):
             supervise.SupervisorDesired.from_dict(intent_payload(restart=malformed))
 
 
-def test_present_null_restart_is_malformed_unlike_absent_restart(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_null_restart_is_malformed_unlike_absent_restart() -> None:
     """Absent ``restart`` parses as false; an explicit null is corruption."""
     assert supervise.SupervisorDesired.from_dict(intent_payload()).restart is False
     with pytest.raises((TypeError, ValueError), match="malformed"):
@@ -71,7 +74,9 @@ LIVE_CHILD = supervise.WorkerChild(
 
 @pytest.fixture
 def settled_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    supervisor_token: str,  # ruff: ignore[unused-function-argument]
 ) -> Callable[[], supervise.SupervisorState]:
     """Isolate state and seed a durable live worker child at the same commit.
 
@@ -92,10 +97,10 @@ def settled_state(
     return supervise.read_state
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_restart_is_never_a_settlement(
     settled_state: Callable[[], supervise.SupervisorState],
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """A malformed ``restart`` cannot settle as restart=false at the live worker."""
     del settled_state
@@ -131,11 +136,11 @@ def test_malformed_restart_is_never_a_settlement(
 
 
 @pytest.mark.parametrize("restart", [None, False])
+@pytest.mark.usefixtures("supervisor_token")
 def test_same_commit_settlement_advances_without_retirement(
     settled_state: Callable[[], supervise.SupervisorState],
     monkeypatch: pytest.MonkeyPatch,
     restart: object,
-    supervisor_token: str,
 ) -> None:
     """A valid non-restart intent records the generation and keeps the worker."""
     del settled_state
@@ -161,8 +166,9 @@ def test_same_commit_settlement_advances_without_retirement(
     assert state.child == LIVE_CHILD
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_request_run_preserves_malformed_desired_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A malformed desired file cannot be erased by a new lifecycle request."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
@@ -182,8 +188,9 @@ def test_request_run_preserves_malformed_desired_authority(
     assert desired.generation == 1
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_request_run_keeps_valid_desired_generation_monotonic(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A valid pending desired generation still participates in ordering."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))

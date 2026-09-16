@@ -48,7 +48,8 @@ class _Scenario:
 # ---------------------------------------------------------------------------
 
 
-def test_failpoint_default_is_noop(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_failpoint_default_is_noop() -> None:
     """Every named boundary is inert unless a deterministic test arms it."""
     for name in (
         lifecycle_state.FAILPOINT_POPEN,
@@ -66,7 +67,8 @@ def test_failpoint_default_is_noop(supervisor_token: str) -> None:
         lifecycle_state.failpoint(name)  # must not raise
 
 
-def test_failpoint_arms_and_disarms(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_failpoint_arms_and_disarms() -> None:
     """An armed failpoint fires once and then reverts to no-op on disarm."""
     lifecycle_state.arm_failpoint(lifecycle_state.FAILPOINT_POPEN)
     with pytest.raises(FailpointError):
@@ -75,7 +77,8 @@ def test_failpoint_arms_and_disarms(supervisor_token: str) -> None:
     lifecycle_state.failpoint(lifecycle_state.FAILPOINT_POPEN)  # no-op again
 
 
-def test_failpoint_custom_exception(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_failpoint_custom_exception() -> None:
     """A caller-supplied exception is raised verbatim at the armed boundary."""
     err = RuntimeError("boom")
     with (
@@ -93,7 +96,8 @@ def test_failpoint_custom_exception(supervisor_token: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_refuses_version_change(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_refuses_version_change() -> None:
     """An ordinary deploy may not change the commit of a recorded worker."""
     assert refuses_version_change(None, "abc", git_commit=None) is False
     assert refuses_version_change(object(), "abc", git_commit="abc") is False
@@ -105,16 +109,16 @@ def test_refuses_version_change(supervisor_token: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_mutation_blocker_none_when_no_mission(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_mutation_blocker_none_when_no_mission(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without a supervised mission, ordinary mutation is permitted."""
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: None)
     assert mutation_blocker_reason() is None
     assert mutation_blocked() is False
 
 
-def test_mutation_blocker_pending(monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_mutation_blocker_pending(monkeypatch: pytest.MonkeyPatch) -> None:
     """A pending mission blocks mutation until it is confirmed or rolled back."""
     mission = SimpleNamespace(status=deployctl.STATUS_PENDING, commit="c" * 40, generation=3)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
@@ -124,9 +128,8 @@ def test_mutation_blocker_pending(monkeypatch: pytest.MonkeyPatch, supervisor_to
     assert mutation_blocked() is True
 
 
-def test_mutation_blocker_unknown_status(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_mutation_blocker_unknown_status(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unrecognized mission status blocks mutation as corrupt-ish authority."""
     mission = SimpleNamespace(status="weird", commit="c" * 40, generation=3)
     monkeypatch.setattr(deployctl, "read_rollback_state", lambda: mission)
@@ -135,9 +138,8 @@ def test_mutation_blocker_unknown_status(
     assert "unknown status" in reason
 
 
-def test_mutation_blocker_corrupt_fails_closed(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_mutation_blocker_corrupt_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unreadable mission state fails closed and blocks mutation."""
     monkeypatch.setattr(
         deployctl,
@@ -193,76 +195,79 @@ def _patch_sources(monkeypatch: pytest.MonkeyPatch, scenario: _Scenario) -> None
     monkeypatch.setattr(supervise, "child_alive", lambda _c: scenario.sup_child_alive)
 
 
-def test_phase_unmanaged(monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_unmanaged(monkeypatch: pytest.MonkeyPatch) -> None:
     """No durable consumer implies the unmanaged phase."""
     _patch_sources(monkeypatch, _Scenario())
     assert current_phase() == LifecyclePhase.UNMANAGED
 
 
-def test_phase_ownership_pending_on_corrupt_mission(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_ownership_pending_on_corrupt_mission(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unreadable mission forces the fail-closed ownership pending phase."""
     _patch_sources(monkeypatch, _Scenario(mission_error=True))
     assert current_phase() == LifecyclePhase.OWNERSHIP_PENDING
 
 
-def test_phase_ownership_pending_on_blocking_hold(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_ownership_pending_on_blocking_hold(monkeypatch: pytest.MonkeyPatch) -> None:
     """A malformed authority hold forces the fail-closed ownership pending phase."""
     _patch_sources(monkeypatch, _Scenario(blocking_hold=True))
     assert current_phase() == LifecyclePhase.OWNERSHIP_PENDING
 
 
-def test_phase_running_from_owned_meta(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_running_from_owned_meta(monkeypatch: pytest.MonkeyPatch) -> None:
     """A live owned worker metadata implies the running phase."""
     meta = SimpleNamespace(pid=1, git_commit="c" * 40)
     _patch_sources(monkeypatch, _Scenario(meta=meta, meta_alive=True))
     assert current_phase() == LifecyclePhase.RUNNING
 
 
-def test_phase_running_from_supervisor_child(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_running_from_supervisor_child(monkeypatch: pytest.MonkeyPatch) -> None:
     """A live supervisor child implies the running phase."""
     _patch_sources(monkeypatch, _Scenario(sup_child_alive=True))
     assert current_phase() == LifecyclePhase.RUNNING
 
 
-def test_phase_mission_pending(monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_mission_pending(monkeypatch: pytest.MonkeyPatch) -> None:
     """A pending mission implies the mission pending phase."""
     _patch_sources(monkeypatch, _Scenario(mission_status=deployctl.STATUS_PENDING))
     assert current_phase() == LifecyclePhase.MISSION_PENDING
 
 
-def test_phase_confirmed(monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_confirmed(monkeypatch: pytest.MonkeyPatch) -> None:
     """A confirmed mission implies the confirmed phase."""
     _patch_sources(monkeypatch, _Scenario(mission_status=deployctl.STATUS_CONFIRMED))
     assert current_phase() == LifecyclePhase.CONFIRMED
 
 
-def test_phase_rolled_back(monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_rolled_back(monkeypatch: pytest.MonkeyPatch) -> None:
     """A rolled-back mission implies the rolled back phase."""
     _patch_sources(monkeypatch, _Scenario(mission_status=deployctl.STATUS_ROLLED_BACK))
     assert current_phase() == LifecyclePhase.ROLLED_BACK
 
 
-def test_phase_spawn_obligation(monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_spawn_obligation(monkeypatch: pytest.MonkeyPatch) -> None:
     """An open spawning obligation implies the spawn obligation phase."""
     _patch_sources(monkeypatch, _Scenario(spawning=True))
     assert current_phase() == LifecyclePhase.SPAWN_OBLIGATION
 
 
-def test_phase_spawning_unresolved(monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_spawning_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unresolved spawned child implies the spawning phase."""
     _patch_sources(monkeypatch, _Scenario(unresolved=True))
     assert current_phase() == LifecyclePhase.SPAWNING
 
 
-def test_phase_is_single_valued(monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_phase_is_single_valued(monkeypatch: pytest.MonkeyPatch) -> None:
     """Two proven consumers collapse to one phase, not two live consumers."""
     meta = SimpleNamespace(pid=1, git_commit="c" * 40)
     _patch_sources(monkeypatch, _Scenario(meta=meta, meta_alive=True, sup_child_alive=True))
@@ -274,9 +279,8 @@ def test_phase_is_single_valued(monkeypatch: pytest.MonkeyPatch, supervisor_toke
 # ---------------------------------------------------------------------------
 
 
-def test_popen_failpoint_blocks_subprocess(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_popen_failpoint_blocks_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     """A popen failpoint prevents subprocess creation at the spawn boundary."""
     popen = MagicMock()
     monkeypatch.setattr("subprocess.Popen", popen)
@@ -290,9 +294,8 @@ def test_popen_failpoint_blocks_subprocess(
     popen.assert_not_called()
 
 
-def test_process_retirement_failpoint_blocks_signalling(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_process_retirement_failpoint_blocks_signalling(monkeypatch: pytest.MonkeyPatch) -> None:
     """A process retirement failpoint prevents pinning before any signal."""
     pin = MagicMock()
     monkeypatch.setattr(lifecycle, "_open_exact_pidfd", lambda _p: pin)
@@ -321,9 +324,8 @@ def test_process_retirement_failpoint_blocks_signalling(
     pin.assert_not_called()
 
 
-def test_metadata_publication_failpoint_blocks_write(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_metadata_publication_failpoint_blocks_write(monkeypatch: pytest.MonkeyPatch) -> None:
     """A metadata publication failpoint prevents the durable meta write."""
     writer = MagicMock()
     monkeypatch.setattr(lifecycle, "write_json_durable", writer)
@@ -406,9 +408,8 @@ def _pending_mission() -> deployctl.RollbackState:
     )
 
 
-def test_mission_publish_failpoint_blocks_watchdog(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_mission_publish_failpoint_blocks_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
     """A mission publish failpoint prevents arming the watchdog after write."""
     watchdog = MagicMock()
     monkeypatch.setattr(deployctl, "_fork_watchdog", watchdog)
@@ -423,9 +424,8 @@ def test_mission_publish_failpoint_blocks_watchdog(
     watchdog.assert_not_called()
 
 
-def test_mission_confirm_failpoint_blocks_readiness(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_mission_confirm_failpoint_blocks_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
     """A mission confirm failpoint prevents awaiting supervisor readiness."""
     monkeypatch.setattr(supervise, "request_run", lambda _commit, **_kw: 7)
     waited = MagicMock()
@@ -440,9 +440,8 @@ def test_mission_confirm_failpoint_blocks_readiness(
     waited.assert_not_called()
 
 
-def test_mission_rollback_failpoint_blocks_settlement(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_mission_rollback_failpoint_blocks_settlement(monkeypatch: pytest.MonkeyPatch) -> None:
     """A mission rollback failpoint prevents settling the previous commit."""
     monkeypatch.setattr(supervise, "supervisor_running", lambda: True)
     settled = MagicMock()
@@ -457,9 +456,8 @@ def test_mission_rollback_failpoint_blocks_settlement(
     settled.assert_not_called()
 
 
-def test_db_recovery_failpoint_blocks_before_db(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_db_recovery_failpoint_blocks_before_db(monkeypatch: pytest.MonkeyPatch) -> None:
     """A db recovery failpoint prevents touching the database at the boundary."""
     monkeypatch.setattr(
         supervisor,

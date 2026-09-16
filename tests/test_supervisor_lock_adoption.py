@@ -52,7 +52,8 @@ def _assert_flock_blocked(lock_path: Path) -> None:
     assert exc_info.value.errno in {errno.EAGAIN, errno.EWOULDBLOCK}
 
 
-def test_same_lock_held_through_adoption(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_same_lock_held_through_adoption(lock_dir: Path) -> None:
     """Adopting an inherited fd keeps the same flock held."""
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -66,7 +67,8 @@ def test_same_lock_held_through_adoption(lock_dir: Path, supervisor_token: str) 
         os.close(owner_fd)
 
 
-def test_adoption_validates_path(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_adoption_validates_path(lock_dir: Path) -> None:
     """Adoption fails when the fd points to a different file."""
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -78,19 +80,22 @@ def test_adoption_validates_path(lock_dir: Path, supervisor_token: str) -> None:
         os.close(owner_fd)
 
 
-def test_adoption_rejects_negative_fd(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_adoption_rejects_negative_fd(lock_dir: Path) -> None:
     """Negative fd numbers fail closed."""
     with pytest.raises(OSError, match="outside the open-fd limit"):
         supervise.adopt_supervisor_lock(-1, HANDOFF_LOCK_PATH)
 
 
-def test_adoption_rejects_huge_fd(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_adoption_rejects_huge_fd(lock_dir: Path) -> None:
     """Fd numbers beyond RLIMIT_NOFILE fail closed."""
     with pytest.raises(OSError, match="outside the open-fd limit"):
         supervise.adopt_supervisor_lock(999999, HANDOFF_LOCK_PATH)
 
 
-def test_adoption_rejects_closed_fd(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_adoption_rejects_closed_fd(lock_dir: Path) -> None:
     """Adopting a closed fd fails closed."""
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -99,7 +104,8 @@ def test_adoption_rejects_closed_fd(lock_dir: Path, supervisor_token: str) -> No
         supervise.adopt_supervisor_lock(owner_fd, str(lock_path))
 
 
-def test_competitor_blocked_while_owner_holds(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_competitor_blocked_while_owner_holds(lock_dir: Path) -> None:
     """A second flock attempt fails while the owner holds the lock."""
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -109,7 +115,8 @@ def test_competitor_blocked_while_owner_holds(lock_dir: Path, supervisor_token: 
         os.close(owner_fd)
 
 
-def test_competitor_blocked_during_adoption(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_competitor_blocked_during_adoption(lock_dir: Path) -> None:
     """A competitor cannot acquire while adoption is in progress."""
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -124,7 +131,8 @@ def test_competitor_blocked_during_adoption(lock_dir: Path, supervisor_token: st
         os.close(owner_fd)
 
 
-def test_lock_released_after_owner_exits(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_lock_released_after_owner_exits(lock_dir: Path) -> None:
     """After the owner closes the fd, a competitor can acquire."""
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -133,9 +141,8 @@ def test_lock_released_after_owner_exits(lock_dir: Path, supervisor_token: str) 
     os.close(competitor_fd)
 
 
-def test_malformed_fd_env_fails_closed(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_malformed_fd_env_fails_closed(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Non-integer handoff fd env var causes SystemExit."""
     monkeypatch.setenv(supervise.HANDOFF_FD_ENV, "not-a-number")
     monkeypatch.setenv(supervise.HANDOFF_PATH_ENV, HANDOFF_LOCK_PATH)
@@ -144,9 +151,8 @@ def test_malformed_fd_env_fails_closed(
         daemon._try_adopt_inherited_lock()
 
 
-def test_missing_path_env_fails_closed(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_missing_path_env_fails_closed(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Handoff fd present but path missing causes SystemExit."""
     monkeypatch.setenv(supervise.HANDOFF_FD_ENV, "5")
     monkeypatch.delenv(supervise.HANDOFF_PATH_ENV, raising=False)
@@ -155,9 +161,8 @@ def test_missing_path_env_fails_closed(
         daemon._try_adopt_inherited_lock()
 
 
-def test_wrong_path_env_fails_closed(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_wrong_path_env_fails_closed(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Handoff fd pointing at wrong path causes SystemExit."""
     lock_path = supervise.supervisor_lock_path()
     owner_fd = _acquire_and_hold(lock_path)
@@ -173,8 +178,9 @@ def test_wrong_path_env_fails_closed(
         os.close(owner_fd)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_injected_fd_wrong_path_fails_closed(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An fd that exists but points to the wrong path causes SystemExit."""
     regular = lock_dir / "regular.txt"
@@ -190,8 +196,9 @@ def test_injected_fd_wrong_path_fails_closed(
         os.close(fd)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_old_supervisor_continues_after_failed_handoff(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     r"""B failure before transfer leaves A authoritative and lock held.
 
@@ -241,13 +248,15 @@ def test_old_supervisor_continues_after_failed_handoff(
         os.close(owner_fd)
 
 
-def test_fresh_state_has_no_runtime_commit(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_fresh_state_has_no_runtime_commit() -> None:
     """A fresh state has supervisor_runtime_commit=None."""
     state = supervise.fresh_state()
     assert state.supervisor_runtime_commit is None
 
 
-def test_runtime_commit_round_trips(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_runtime_commit_round_trips() -> None:
     """supervisor_runtime_commit survives serialization round-trip."""
     state = supervise.SupervisorState(
         schema_version=supervise.SCHEMA_VERSION,
@@ -276,7 +285,8 @@ def test_runtime_commit_round_trips(supervisor_token: str) -> None:
     assert restored.supervisor_runtime_commit == "a" * 40
 
 
-def test_absent_field_defaults_to_none(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_absent_field_defaults_to_none() -> None:
     """Old state files without the field parse as None."""
     data = supervise.fresh_state().to_dict()
     assert "supervisor_runtime_commit" not in data
@@ -284,7 +294,8 @@ def test_absent_field_defaults_to_none(supervisor_token: str) -> None:
     assert restored.supervisor_runtime_commit is None
 
 
-def test_malformed_field_does_not_cause_hold(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_malformed_field_does_not_cause_hold() -> None:
     """A present-but-malformed supervisor_runtime_commit is treated as None."""
     data = supervise.fresh_state().to_dict()
     data["supervisor_runtime_commit"] = 12345
@@ -292,7 +303,8 @@ def test_malformed_field_does_not_cause_hold(supervisor_token: str) -> None:
     assert restored.supervisor_runtime_commit is None
 
 
-def test_gc_preserves_supervisor_runtime_commit(lock_dir: Path, supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_gc_preserves_supervisor_runtime_commit(lock_dir: Path) -> None:
     """cli.supervisor_authoritative_commits() includes supervisor_runtime_commit."""
     from lubko import cli
 
@@ -310,9 +322,8 @@ def test_gc_preserves_supervisor_runtime_commit(lock_dir: Path, supervisor_token
     assert commit_a in authoritative
 
 
-def test_runtime_commit_persisted_through_startup_path(
-    lock_dir: Path, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_runtime_commit_persisted_through_startup_path(lock_dir: Path) -> None:
     """Prove _persist_runtime_commit() stores the captured commit from fresh state.
 
     Regression: write_state_preserving_authority() was unconditionally
@@ -443,9 +454,8 @@ class _SilentFailProcess:
         pass
 
 
-def test_ready_while_a_still_authoritative(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_ready_while_a_still_authoritative(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     r"""Preflight probe ready while A still remains sole active authority.
 
     After the probe signals READY and exits, A retires its pidfile and
@@ -468,8 +478,9 @@ def test_ready_while_a_still_authoritative(
         daemon._maybe_handoff_to_new_supervisor()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_b_failure_before_transfer_leaves_a_authoritative(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     r"""Probe failure before READY leaves A authoritative and lock held.
 
@@ -486,8 +497,9 @@ def test_b_failure_before_transfer_leaves_a_authoritative(
     assert "did not signal READY" in daemon._message  # type: ignore[operator]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_successful_transfer_no_overlap_no_gap(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Successful preflight probe has no authority overlap and no gap.
 
@@ -519,8 +531,9 @@ def test_successful_transfer_no_overlap_no_gap(
     os.close(owner_fd)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_successor_startup_failure_before_ready_recovers_to_a(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     r"""Probe startup failure before READY recovers to A.
 
@@ -538,8 +551,9 @@ def test_successor_startup_failure_before_ready_recovers_to_a(
     assert "did not signal READY" in daemon._message  # type: ignore[operator]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_worker_loss_at_a_exit_is_recoverable_by_b(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Worker loss at A exit is recoverable by B from durable state.
 
@@ -568,8 +582,9 @@ def test_worker_loss_at_a_exit_is_recoverable_by_b(
     assert reloaded.commit is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_handoff_env_preserved_through_adopt(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    lock_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Handoff protocol env vars survive _try_adopt_inherited_lock.
 
@@ -609,9 +624,8 @@ def test_handoff_env_preserved_through_adopt(
         os.close(owner_fd)
 
 
-def test_ready_timeout_prevents_wedge(
-    lock_dir: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_ready_timeout_prevents_wedge(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A bounded wait prevents a stuck B from wedging A.
 
     If B never sends READY (pipe stays open but no data), A's

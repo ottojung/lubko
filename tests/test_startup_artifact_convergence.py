@@ -114,8 +114,9 @@ def _raise_os_error(*_a: object, **_k: object) -> str:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_manifest_well_formed_rejects_missing_fields(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A manifest missing required fields is rejected as corrupt."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -131,9 +132,8 @@ def test_manifest_well_formed_rejects_missing_fields(
     assert "corrupt" in result
 
 
-def test_manifest_rejects_wrong_commit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_manifest_rejects_wrong_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Staging for commit-B is not promoted when commit-C is requested."""
     bin_home = _setup(monkeypatch, tmp_path)
     sc.write_contract()
@@ -146,8 +146,9 @@ def test_manifest_rejects_wrong_commit(
     assert "does not match" in result
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_manifest_rejects_commit_mismatch_with_confirmed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Staging for commit-B is not promoted when commit-C is confirmed."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -166,9 +167,8 @@ def test_manifest_rejects_commit_mismatch_with_confirmed(
 # ---------------------------------------------------------------------------
 
 
-def test_promote_all_three_artifacts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_promote_all_three_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """All three artifacts are promoted from staging to active paths."""
     bin_home = _setup(monkeypatch, tmp_path)
     sc.write_contract()
@@ -187,9 +187,8 @@ def test_promote_all_three_artifacts(
     assert not _manifest_path(tmp_path).is_file()
 
 
-def test_promote_is_idempotent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_promote_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Artifacts remain correct after promotion; manifest is cleaned up."""
     bin_home = _setup(monkeypatch, tmp_path)
     sc.write_contract()
@@ -203,8 +202,9 @@ def test_promote_is_idempotent(
     assert sc.validate_startup_definition().ok is True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_promote_verifies_launcher_executable_mode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Promoted launcher has the required executable mode."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -223,8 +223,9 @@ def test_promote_verifies_launcher_executable_mode(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_stale_staging_from_c_not_promoted_for_b(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Staging for commit-C is never promoted when commit-B is confirmed."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -238,8 +239,9 @@ def test_stale_staging_from_c_not_promoted_for_b(
     assert "does not match confirmed" in result
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_corrupt_manifest_never_yields_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A corrupt manifest is rejected and never yields promotion success."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -253,8 +255,9 @@ def test_corrupt_manifest_never_yields_success(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_validation_only_does_not_overwrite_b(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Supervisor validation reports mismatch but never writes from own code."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -271,9 +274,8 @@ def test_supervisor_validation_only_does_not_overwrite_b(
 # ---------------------------------------------------------------------------
 
 
-def test_rollback_restores_all_artifacts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_rollback_restores_all_artifacts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Rollback restores contract, definition, and launcher from snapshot."""
     bin_home = _setup(monkeypatch, tmp_path)
     sc.write_contract()
@@ -290,8 +292,9 @@ def test_rollback_restores_all_artifacts(
     assert sc.validate_startup_launcher(bin_home) is True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_rollback_retains_snapshot_on_corrupt_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Snapshot is retained when the file is corrupt and restore cannot run."""
     _setup(monkeypatch, tmp_path)
@@ -307,8 +310,9 @@ def test_rollback_retains_snapshot_on_corrupt_file(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmed_idempotent_response_fails_on_stale_artifacts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Fast path returns ok:false when artifacts are stale and promotion fails."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -319,10 +323,9 @@ def test_confirmed_idempotent_response_fails_on_stale_artifacts(
     assert "promotion incomplete" in str(response.get("error", ""))
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmed_idempotent_fails_on_unresolvable_bin_home(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    supervisor_token: str,
 ) -> None:
     """Fast path fails closed when bin_home cannot be resolved."""
     monkeypatch.setattr(lifecycle, "_resolve_bin_home", _raise_os_error)
@@ -337,8 +340,9 @@ def test_confirmed_idempotent_fails_on_unresolvable_bin_home(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_promotes_staged_bytes_without_synthesizing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Supervisor A promotes opaque staged B bytes — never generates from own code."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -374,8 +378,9 @@ def _confirm_opts() -> dc.Options:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_post_terminalization_exception_retains_recovery_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Invoke _confirm_locked; cause durable STATUS_CONFIRMED then raise.
 
@@ -487,8 +492,9 @@ def test_post_terminalization_exception_retains_recovery_data(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_first_install_rollback_removes_artifacts_that_were_absent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On first install, snapshot records absence; rollback removes B's artifacts."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -517,8 +523,9 @@ def test_first_install_rollback_removes_artifacts_that_were_absent(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_read_pre_confirmation_snapshot_rejects_malformed_data(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A snapshot with invalid values is rejected."""
     _setup(monkeypatch, tmp_path)
@@ -553,8 +560,9 @@ def test_read_pre_confirmation_snapshot_rejects_malformed_data(
     assert result["launcher"] == [4, 5]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_read_pre_confirmation_snapshot_rejects_missing_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A snapshot missing a required key is malformed."""
     _setup(monkeypatch, tmp_path)
@@ -570,8 +578,9 @@ def test_read_pre_confirmation_snapshot_rejects_missing_key(
     assert dc._read_pre_confirmation_snapshot() is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_read_pre_confirmation_snapshot_rejects_unknown_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A snapshot with an unknown key is malformed."""
     _setup(monkeypatch, tmp_path)
@@ -589,8 +598,9 @@ def test_read_pre_confirmation_snapshot_rejects_unknown_key(
     assert dc._read_pre_confirmation_snapshot() is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_snapshot_propagates_read_error_on_existing_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If an existing artifact cannot be read, OSError propagates."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -618,8 +628,9 @@ def test_snapshot_propagates_read_error_on_existing_file(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_snapshot_write_failure_prevents_terminalization(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Snapshot write failure prevents terminalization.
 
@@ -715,8 +726,9 @@ def _make_confirmed_mission(commit: str) -> RollbackState:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_reconcile_promotes_b_when_b_confirmed_and_staging_retained(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Strongest crash boundary: durable B confirmed, active artifacts still wholly A.
 
@@ -775,8 +787,9 @@ def test_supervisor_reconcile_promotes_b_when_b_confirmed_and_staging_retained(
     assert sc.read_staging_manifest() is not None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_reconcile_skips_when_no_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No manifest: supervisor does not mutate artifacts or infer B staleness."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -813,8 +826,9 @@ def test_supervisor_reconcile_skips_when_no_manifest(
     assert sc.assess_recorded_contract().state == "current"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_reconcile_skips_wrong_commit_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Wrong-commit manifest: supervisor does not mutate artifacts."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -861,8 +875,9 @@ def test_supervisor_reconcile_skips_wrong_commit_manifest(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repeat_confirm_after_successful_promotion_returns_ok_true(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Repeat confirm of a fully-promoted deployment returns ok:true.
 
@@ -912,8 +927,9 @@ def test_repeat_confirm_after_successful_promotion_returns_ok_true(
     assert response2["confirmed"] is True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repeat_confirm_wrong_commit_receipt_is_fail_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Receipt for a different commit does not grant success."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -947,8 +963,9 @@ def test_repeat_confirm_wrong_commit_receipt_is_fail_closed(
     assert response["ok"] is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_corrupt_confirmation_receipt_is_fail_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Corrupt receipt is treated as absent — does not grant false success."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -984,8 +1001,9 @@ def test_corrupt_confirmation_receipt_is_fail_closed(
     assert response["ok"] is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_rollback_removes_confirmation_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Rollback removes the confirmation receipt so stale receipts don't persist."""
     bin_home = _setup(monkeypatch, tmp_path)
@@ -1002,8 +1020,9 @@ def test_rollback_removes_confirmation_receipt(
     assert dc._read_confirmation_receipt() is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repeat_confirm_drift_returns_ok_false(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """After receipt creation, if active artifacts drift, repeat confirm returns ok:false.
 
@@ -1061,8 +1080,9 @@ def test_repeat_confirm_drift_returns_ok_false(
     assert response2["ok"] is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_repeat_confirm_repair_via_staging_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When receipt is stale but valid staging manifest exists, promotion repairs.
 
@@ -1125,8 +1145,9 @@ def test_repeat_confirm_repair_via_staging_manifest(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_receipt_write_failure_after_promotion_retains_staging_for_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If receipt write fails after successful promotion, staging is retained.
 
@@ -1188,8 +1209,9 @@ def test_receipt_write_failure_after_promotion_retains_staging_for_retry(
     assert receipt.get("commit") == commit_b
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_receipt_durability_failure_retains_staging_for_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real DurabilityError (fsync failure) during receipt write retains staging.
 
@@ -1355,8 +1377,9 @@ def _setup_supervised_rollback(
     return bin_home, mission
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervised_rollback_never_invokes_legacy_worker_restoration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Terminal supervised rollback uses settle_desired only, never _restart_previous.
 
@@ -1398,8 +1421,9 @@ def test_supervised_rollback_never_invokes_legacy_worker_restoration(
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_bin_home_resolution_failure_keeps_rollback_nonterminal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When _resolve_bin_home() fails, _restore_cli_and_startup_artifacts returns failure.
 
@@ -1435,8 +1459,9 @@ def test_bin_home_resolution_failure_keeps_rollback_nonterminal(
     assert sc.read_staging_manifest() is not None, "staging manifest must be retained"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_missing_snapshot_retains_evidence_and_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When no pre-confirmation snapshot and no receipt exist, rollback succeeds.
 
@@ -1462,8 +1487,9 @@ def test_missing_snapshot_retains_evidence_and_succeeds(
     assert sc.read_staging_manifest() is None, "staging cleaned up when no snapshot exists"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_missing_snapshot_with_receipt_is_restoration_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A missing pre-confirmation snapshot when a receipt exists is restoration failure.
 
@@ -1491,8 +1517,9 @@ def test_missing_snapshot_with_receipt_is_restoration_failure(
     assert sc.read_staging_manifest() is not None, "staging manifest is retained"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_corrupt_snapshot_retains_evidence_and_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A corrupt pre-confirmation snapshot with a receipt is restoration failure.
 
@@ -1524,8 +1551,9 @@ def test_corrupt_snapshot_retains_evidence_and_fails(
     assert sc.read_staging_manifest() is not None, "staging manifest is retained"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervised_rollback_generation_race_rejects_stale_terminalization(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A newer desired generation winning during restoration preserves evidence.
 
@@ -1594,8 +1622,9 @@ def test_supervised_rollback_generation_race_rejects_stale_terminalization(
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_successful_supervised_rollback_through_real_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Full supervised rollback path: settle → authority check → restore artifacts → terminalize.
 

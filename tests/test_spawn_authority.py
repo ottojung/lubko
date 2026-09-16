@@ -31,7 +31,7 @@ COMMIT = "a" * 40
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:  # ruff: ignore[unused-function-argument]
     """Use an isolated durable state root for each test.
 
     Returns:
@@ -122,16 +122,16 @@ def _blocking_child() -> subprocess.Popen[bytes]:
 # ---------------------------------------------------------------------------
 
 
-def test_obligation_roundtrip_is_exact(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_obligation_roundtrip_is_exact() -> None:
     """The serialized obligation preserves every field exactly."""
     obligation = _obligation(pid=4242, ticks=777)
     restored = SpawningObligation.from_dict(obligation.to_dict())
     assert restored == obligation
 
 
-def test_present_malformed_obligation_is_durable_hold(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_present_malformed_obligation_is_durable_hold(monkeypatch: pytest.MonkeyPatch) -> None:
     """All malformed shapes parse closed; one durable shape blocks spawns."""
     malformed: tuple[object, ...] = (7, "nope", {"token": 5}, {"commit": COMMIT})
     for raw in malformed:
@@ -161,7 +161,8 @@ def test_present_malformed_obligation_is_durable_hold(
     assert "malformed" in daemon._message
 
 
-def test_parent_death_signal_field_parses_strictly(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_parent_death_signal_field_parses_strictly() -> None:
     """An absent field stays legacy-True; explicit booleans round-trip."""
     cases: tuple[tuple[dict[str, object], bool], ...] = (
         ({}, True),
@@ -176,8 +177,9 @@ def test_parent_death_signal_field_parses_strictly(supervisor_token: str) -> Non
         assert restored.pid == 4242
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_present_malformed_parent_death_signal_is_durable_hold(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """All non-booleans parse closed; representative corruption stays durable."""
     malformed: tuple[object, ...] = (None, "true", 1, 0.0, [True], {"pds": True})
@@ -209,9 +211,8 @@ def test_present_malformed_parent_death_signal_is_durable_hold(
     assert "malformed" in daemon._message
 
 
-def test_malformed_pid_less_obligation_never_auto_resolves(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_malformed_pid_less_obligation_never_auto_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
     """All malformed flags parse closed; durable corruption never auto-resolves."""
     malformed: tuple[object, ...] = (None, "false", 0, [False])
     for value in malformed:
@@ -234,8 +235,9 @@ def test_malformed_pid_less_obligation_never_auto_resolves(
     assert supervise.read_state().spawning_hold_malformed is True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_explicit_parent_death_signal_false_blocks_pid_less_resolution(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A well-formed manual obligation without the kernel guarantee blocks."""
     obligation = replace(_obligation(), parent_death_signal=False)
@@ -249,9 +251,8 @@ def test_explicit_parent_death_signal_false_blocks_pid_less_resolution(
     assert supervise.read_state().spawning == obligation
 
 
-def test_legacy_absent_field_keeps_pid_less_resolution(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_legacy_absent_field_keeps_pid_less_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     """A pre-field record still resolves through the kernel guarantee."""
     data = _obligation(pid=None, ticks=None).to_dict()
     del data["parent_death_signal"]
@@ -306,9 +307,8 @@ def _patch_recovery(
     return observed
 
 
-def test_pid_less_obligation_from_dead_creator_resolves(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_pid_less_obligation_from_dead_creator_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
     """A crash between the pre-Popen write and the identity upgrade resolves."""
     obligation = _obligation()
     _write_state_with_spawning(obligation)
@@ -323,8 +323,9 @@ def test_pid_less_obligation_from_dead_creator_resolves(
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_owned_group_recovery_failure_keeps_the_pid_less_hold(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed owned-group recovery keeps the hold and forbids any spawn."""
     obligation = _obligation()
@@ -355,7 +356,8 @@ def test_owned_group_recovery_failure_keeps_the_pid_less_hold(
     assert read_state().spawning is None
 
 
-def test_previous_boot_obligation_resolves_without_evidence(supervisor_token: str) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_previous_boot_obligation_resolves_without_evidence() -> None:
     """No spawn can survive its host's reboot, so the obligation clears."""
     _write_state_with_spawning(_obligation(boot_id="00000000-0000-0000-0000-000000000000"))
 
@@ -365,9 +367,8 @@ def test_previous_boot_obligation_resolves_without_evidence(supervisor_token: st
     assert read_state().spawning is None
 
 
-def test_live_first_spawn_blocks_every_new_spawn(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_live_first_spawn_blocks_every_new_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     """A proven-live first spawn blocks every replacement until proven gone."""
     pid = 4242
     ticks = 777
@@ -405,9 +406,8 @@ def test_live_first_spawn_blocks_every_new_spawn(
     assert read_state().spawning is None
 
 
-def test_recycled_identity_never_extends_the_obligation(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_recycled_identity_never_extends_the_obligation(monkeypatch: pytest.MonkeyPatch) -> None:
     """A PID whose start ticks differ from the record proves the instance gone."""
     _patch_recovery(monkeypatch)
     pid = 4242
@@ -431,8 +431,9 @@ def test_recycled_identity_never_extends_the_obligation(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_recover_unpublished_spawn_failure_keeps_token_authority(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Failed group recovery after converging an unpublished spawn blocks.
 
@@ -478,8 +479,9 @@ def test_recover_unpublished_spawn_failure_keeps_token_authority(
     assert observed == [("recover", obligation.token)]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_identified_dead_worker_group_recovery_failure_keeps_the_hold(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A resolved dead identified worker still owes exact group recovery.
 
@@ -514,8 +516,9 @@ def test_identified_dead_worker_group_recovery_failure_keeps_the_hold(
     assert observed == [("recover", obligation.token)]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_identified_converged_worker_group_recovery_failure_keeps_the_holds(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Converging a live identified worker is not enough to drop its token.
 
@@ -599,8 +602,9 @@ class UnconvergableProc:
         raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout or 0.0)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_transferred_unresolved_hold_clears_only_after_group_recovery(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A token-bearing hold from failed identity publication owes recovery.
 
@@ -643,8 +647,9 @@ def test_transferred_unresolved_hold_clears_only_after_group_recovery(
     assert observed == [("recover", obligation.token)]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_live_identified_first_spawn_converges_by_exact_pinned_signal(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A live identified first spawn is converged by pinned single-PID signals.
 
@@ -720,11 +725,11 @@ class FakeProc:
         """Nothing to kill."""
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_normal_spawn_writes_obligation_before_popen_and_clears_afterwards(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    supervisor_token: str,
 ) -> None:
     """Every successful or failed normal spawn keeps the protocol coherent.
 
@@ -765,9 +770,8 @@ def test_normal_spawn_writes_obligation_before_popen_and_clears_afterwards(
     assert f"worker log: {lifecycle.worker_log_path(during.token)}" in caplog.text
 
 
-def test_failed_runtime_check_never_leaves_an_obligation(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_failed_runtime_check_never_leaves_an_obligation(monkeypatch: pytest.MonkeyPatch) -> None:
     """A refused spawn (missing runtime) never happens after the Popen gate."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: False)
 
@@ -777,8 +781,9 @@ def test_failed_runtime_check_never_leaves_an_obligation(
     assert read_state().spawning is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_unavailable_pdeathsig_never_crosses_popen(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An unsupported parent-death guard holds before any spawn authority exists."""
     calls: list[str] = []
@@ -807,8 +812,9 @@ def test_unavailable_pdeathsig_never_crosses_popen(
     assert "parent-death protection is unavailable" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_child_side_pdeathsig_failure_never_execs_worker_code(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed child-side parent-death install blocks exec and keeps authority safe.
 
@@ -938,8 +944,9 @@ class ExitDuringObservationProc:
         return 0
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_already_exited_unproven_spawn_recovery_failure_then_success(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An already-exited unproven spawn still owes exact group recovery."""
     obligation = _settle_obligation()
@@ -971,8 +978,9 @@ def test_already_exited_unproven_spawn_recovery_failure_then_success(
     assert observed == [("recover", obligation.token)]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_converged_unproven_spawn_recovery_failure_then_success(
-    monkeypatch: pytest.MonkeyPatch, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Direct convergence of a live unproven spawn does not drop token authority."""
     obligation = _settle_obligation()
@@ -998,8 +1006,9 @@ def test_converged_unproven_spawn_recovery_failure_then_success(
     assert [token for _, token in observed] == [obligation.token]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_exit_during_observation_recovery_failure_then_success(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, supervisor_token: str
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A child exiting during identity observation owes exact group recovery."""
     obligation = _settle_obligation()
