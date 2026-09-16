@@ -395,3 +395,54 @@ def test_no_authority_overlap_at_probe_exec_boundary(
         "preflight_start",
         "preflight_done",
     ], f"preflight must exit before pidfile/reconcile; log: {lifecycle_log}"
+
+
+# ---------------------------------------------------------------------------
+# Invariant 5: worker-loss convergence from durable desired state
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_state_dir")
+def test_derive_action_converges_from_durable_desired_after_worker_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real _derive_action reads pre-existing desired.json after worker loss.
+
+    When the supervisor has no child (worker lost) and durable desired.json
+    names a commit, _derive_action returns ("run", commit) — proving the
+    reconciliation path will attempt to restart the worker from durable state.
+    """
+    target_commit = "b" * 40
+
+    # Pre-populate durable desired state (written by A before exec).
+    supervise.write_desired(
+        supervise.SupervisorDesired(
+            schema_version=supervise.SCHEMA_VERSION,
+            generation=1,
+            commit=target_commit,
+            repo="/test",
+            uv_path="uv",
+            worker_id="test-worker",
+        )
+    )
+
+    # Write fresh state with no child (worker lost).
+    _write_fresh_state()
+
+    # Monkeypatch deployctl.read_rollback_state to return None (no mission).
+    monkeypatch.setattr("lubko.deployctl.read_rollback_state", lambda: None)
+
+    daemon = SupervisorDaemon(Settings())
+    state = supervise.read_state()
+
+    # Verify state has no child (worker lost).
+    assert state.child is None
+
+    # Call real _derive_action — this reads durable desired.json.
+    action, commit = daemon._derive_action(state)
+
+    # The supervisor must decide to run the worker from durable desired state.
+    assert action == "run", f"expected 'run' after worker loss, got {action!r}"
+    assert commit == target_commit, (
+        f"expected commit={target_commit!r} from durable desired, got {commit!r}"
+    )
