@@ -108,16 +108,19 @@ def bind_abstract_socket() -> socket.socket:
     The socket is bound to the abstract namespace (null-byte prefix) so
     it is independent of filesystem path length and creates no stale
     files.  ``SO_REUSEADDR`` is set so a restart after crash rebinds
-    immediately.
+    immediately.  The listening socket is set nonblocking so
+    ``accept()`` in the supervisor tick loop returns immediately when no
+    clients are pending rather than blocking the reconciliation cycle.
 
     Returns:
-        A bound, listening ``AF_UNIX`` socket.
+        A bound, listening, nonblocking ``AF_UNIX`` socket.
     """
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     name = b"\0" + _abstract_socket_name()
     sock.bind(name)
     sock.listen(8)
+    sock.setblocking(False)  # ruff: ignore[boolean-positional-value-in-call]
     return sock
 
 

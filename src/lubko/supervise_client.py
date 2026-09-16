@@ -39,7 +39,6 @@ def _socket_request(request: dict[str, object]) -> dict[str, object]:
 
     Raises:
         ConnectionError: If the socket closes before responding.
-        TypeError: If the response is not a JSON object.
     """
     conn = connect_abstract_socket()
     try:

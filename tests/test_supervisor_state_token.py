@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from lubko import lifecycle, supervise, supervise_client
+from lubko import lifecycle, supervise, supervise_client, supervisor
+from lubko.control_socket import bind_abstract_socket
 from lubko.state import (
     SUPERVISOR_STATE_TOKEN_ENV,
     SupervisorStateTokenError,
@@ -645,3 +646,57 @@ class TestClientAPIDualMode:
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
         # No status.json exists, so result is None
         assert supervise_client.read_status_cli() is None
+
+
+# ---------------------------------------------------------------------------
+# supervisor.main fails closed on absent token
+# ---------------------------------------------------------------------------
+
+
+class TestMainFailsClosedWithoutToken:
+    """supervisor.main must return exit code 1 when the token is absent."""
+
+    @staticmethod
+    def test_main_returns_error_without_token(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """main() refuses to start when LUBKO_SUPERVISOR_STATE_TOKEN is absent."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
+        # No --status flag: falls through to token validation
+        assert supervisor.main([]) == 1
+
+    @staticmethod
+    def test_main_returns_error_with_invalid_token(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """main() refuses to start when LUBKO_SUPERVISOR_STATE_TOKEN is invalid."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, "not-valid-hex!")
+        assert supervisor.main([]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Nonblocking control socket
+# ---------------------------------------------------------------------------
+
+
+class TestNonblockingControlSocket:
+    """The listening socket must be nonblocking so reconciliation never stalls."""
+
+    @staticmethod
+    def test_accept_returns_immediately_without_client() -> None:
+        """accept() on the bound socket raises BlockingIOError immediately.
+
+        A blocking socket would hang until a client connects, blocking the
+        supervisor reconciliation loop.  The socket must be nonblocking so
+        accept() returns instantly when no clients are pending.
+        """
+        sock = bind_abstract_socket()
+        try:
+            with pytest.raises(BlockingIOError):
+                sock.accept()
+        finally:
+            sock.close()

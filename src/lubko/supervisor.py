@@ -4133,11 +4133,15 @@ def main(argv: list[str] | None = None) -> int:
     # invalidity fails closed so the daemon never starts without namespace
     # isolation.
     try:
-        supervisor_state_token()
+        token = supervisor_state_token()
     except SupervisorStateTokenError:
         LOGGER.exception(
-            "LUBKO_SUPERVISOR_STATE_TOKEN is required but missing or invalid; "
-            "supervisor startup refused"
+            "LUBKO_SUPERVISOR_STATE_TOKEN is present but invalid; supervisor startup refused"
+        )
+        return 1
+    if token is None:
+        LOGGER.error(
+            "LUBKO_SUPERVISOR_STATE_TOKEN is required but absent; supervisor startup refused"
         )
         return 1
     with suppress(UvResolutionError):
