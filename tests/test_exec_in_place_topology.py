@@ -128,6 +128,19 @@ def main() -> None:
 
         supervise.write_supervisor_pid(os.getpid(), proc_start_ticks(os.getpid()) or 0)
 
+        # Pre-populate durable desired state BEFORE exec, so B converges
+        # from already-durable state rather than writing its own.
+        supervise.write_desired(
+            supervise.SupervisorDesired(
+                schema_version=supervise.SCHEMA_VERSION,
+                generation=1,
+                commit=confirmed,
+                repo="/test",
+                uv_path="uv",
+                worker_id="test-worker",
+            )
+        )
+
         os.environ["LUBKO_TEST_REPORT_PATH"] = supervisor_lock + ".b_report"
 
         # Report the supervisor lock path so the test can find state files.
@@ -226,17 +239,10 @@ def main() -> None:
             timeout_seconds=5.0,
         )
 
-    # --- Invariant 5: durable state proves worker-loss convergence ---
-    supervise.write_desired(
-        supervise.SupervisorDesired(
-            schema_version=supervise.SCHEMA_VERSION,
-            generation=1,
-            commit=target_commit,
-            repo="/test",
-            uv_path="uv",
-            worker_id="test-worker",
-        )
-    )
+    # --- Invariant 5: observe pre-existing durable desired state ---
+    # The desired state was written by A before exec.  B observes it
+    # without supplying it, proving convergence from durable state.
+    desired = supervise.read_desired()
 
     # --- Report all invariant evidence ---
     final_state = supervise.read_state()
@@ -246,7 +252,8 @@ def main() -> None:
         "runtime_commit": final_state.supervisor_runtime_commit,
         "target_commit": target_commit,
         "lock_held": False,
-        "desired_commit": None,
+        "desired_commit": desired.commit if desired is not None else None,
+        "desired_generation": desired.generation if desired is not None else None,
     }
 
     # Verify lock is held (use the real lock path).
@@ -263,11 +270,6 @@ def main() -> None:
             os.close(test_fd)
     except OSError:
         pass
-
-    # Read back the desired state.
-    desired = supervise.read_desired()
-    if desired is not None:
-        report["desired_commit"] = desired.commit
 
     # Write report to both the real lock path and a test-discoverable location.
     report_path = real_lock_path + ".b_report"
