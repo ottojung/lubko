@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from itertools import count
@@ -18,6 +19,35 @@ if TYPE_CHECKING:
 _STATE_HOME_IDS = count()
 _EXEC_TMP_ROOT = Path(__file__).resolve().parents[1] / ".pytest_cache" / "exec-tmp"
 _TEST_PATH_IDS = count()
+
+
+def _noop_fsync(_fd: int) -> None:
+    """No-op replacement for ``os.fsync`` used by the session fixture."""
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _noop_successful_fsync() -> Iterator[None]:
+    """Replace successful ``os.fsync`` with a no-op for the entire session.
+
+    Real disk flush latency is filesystem- and host-dependent; a successful
+    ``fsync`` return does not prove crash persistence, so exercising the
+    syscall adds variance without exercising a meaningful product invariant.
+    The production durability control flow (write-temp, fsync-temp, replace,
+    fsync-dir, serialization locks, fault-injection points) is fully
+    preserved; only the kernel flush is elided.  Deterministic failure
+    injectors fire *before* the ``os.fsync`` call, so durability boundary
+    tests that inject ``DurabilityError`` at the file/replace/dir stages
+    are unaffected.
+
+    Yields:
+        ``None`` while the no-op is active.
+    """
+    patcher = pytest.MonkeyPatch()
+    patcher.setattr(os, "fsync", _noop_fsync)
+    try:
+        yield
+    finally:
+        patcher.undo()
 
 
 @pytest.fixture(scope="session")
