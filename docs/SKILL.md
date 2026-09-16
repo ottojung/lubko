@@ -44,7 +44,7 @@ A basic protocol-v4 command submission, addressed to the execution server that m
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":4,"type":"command","server":"alpha-server","request":{"cwd":"/workspace/Lubko","process":["git","status","--short"]},"state":{"status":"pending"}}'
+    '{\"v\":4,\"type\":\"command\",\"server\":\"alpha-server\",\"request\":{\"cwd\":\"/workspace/Lubko\",\"process\":[\"git\",\"status\",\"--short\"]},\"state\":{\"status\":\"pending\"}}'
 )
 returning id;
 ```
@@ -121,9 +121,9 @@ If the Lubko deployment architecture is later changed to weaken this isolation �
 
 ## Temporary packages and file transfer
 
-If `guix` is available on a Lubko host, use it to provide packages needed temporarily for a job instead of treating a missing command as a blocker or modifying durable package state. Prefer an ephemeral environment such as `guix environment --ad-hoc curl -- curl ...`.
+If `guix` is available on a Lubko host, use it as the general-purpose package manager for temporary job dependencies. Any package, library, runtime, compiler, build tool, CLI, debugger, formatter, network utility, or other dependency needed for the job should normally be supplied through an ephemeral Guix environment rather than treating a missing command as a blocker or modifying durable package state. For example, when `curl` is needed, use `guix environment --ad-hoc curl -- curl ...`.
 
-For transferring generated files from ChatGPT to a Lubko host, prefer the Dropbox connector: upload the artifact to Dropbox, create a short-lived unauthenticated direct-download link, then fetch that link from the Lubko job. Dropbox temporary download links are single-use and short-lived, so do not preflight, unfurl, issue `HEAD`, or otherwise consume the URL before the intended download. If the host lacks an HTTP client and Guix is available, provision one temporarily as above.
+For transferring generated files from ChatGPT to a Lubko host, prefer the Dropbox connector: upload the artifact to Dropbox, create a short-lived unauthenticated direct-download link, then fetch that link from the Lubko job. Dropbox temporary download links are single-use and short-lived, so do not preflight, unfurl, issue `HEAD`, or otherwise consume the URL before the intended download. Routine post-transfer hash verification is not required and is generally a waste of time; normal Dropbox/HTTPS transfer integrity is sufficient unless the task has a specific integrity or security requirement, or there is concrete evidence of corruption. If the job needs an HTTP client or any other missing tool, provide it temporarily with Guix as above.
 
 ---
 
@@ -155,7 +155,7 @@ The current application protocol is versioned inside `payload` and documented in
 ```text
 payload.v                  application protocol version
 payload.server             required non-empty execution-server identity
-payload.type               "command" or "output_chunk"
+payload.type               \"command\" or \"output_chunk\"
 payload.request.cwd        working directory
 payload.request.process    argv array
 payload.state.status       pending | running | succeeded | failed | cancelled
@@ -179,7 +179,7 @@ A basic protocol-v4 job insertion:
 ```sql
 insert into lubko.jobs (payload)
 values (
-    '{"v":4,"type":"command","server":"alpha-server","request":{"cwd":"/workspace/Lubko","process":["git","status","--short"]},"state":{"status":"pending"}}'
+    '{\"v\":4,\"type\":\"command\",\"server\":\"alpha-server\",\"request\":{\"cwd\":\"/workspace/Lubko\",\"process\":[\"git\",\"status\",\"--short\"]},\"state\":{\"status\":\"pending\"}}'
 )
 returning id;
 ```
@@ -190,7 +190,7 @@ Example result:
 id: 12345678-1234-1234-1234-123456789abc
 ```
 
-Always retain the returned UUID. `payload.request.cwd` is the working directory for the queued process, and `payload.state.status` must be `"pending"` for the worker to claim it. The submitted `request.process` argv is executed directly — never through a shell — so to run a shell snippet the orchestrator must select a shell interpreter explicitly, for example `"process": ["/bin/sh", "-c", "<snippet>"]`. The process may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
+Always retain the returned UUID. `payload.request.cwd` is the working directory for the queued process, and `payload.state.status` must be `\"pending\"` for the worker to claim it. The submitted `request.process` argv is executed directly — never through a shell — so to run a shell snippet the orchestrator must select a shell interpreter explicitly, for example `\"process\": [\"/bin/sh\", \"-c\", \"<snippet>\"]`. The process may itself launch or manage a `lubko-agent` session whose own working directory is specified with `--cwd`.
 
 Poll by ID:
 
@@ -268,11 +268,11 @@ update lubko.jobs
 set payload = (
     jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(
         payload::jsonb,
-        '{state,status}', '"cancelled"'),
+        '{state,status}', '\"cancelled\"'),
         '{state,cancel_requested_at}', to_jsonb(now())),
         '{state,finished_at}', to_jsonb(now())),
         '{state,updated_at}', to_jsonb(now())),
-        '{result}', '{"stdout":"","stderr":"","exit_code":null,"cancellation_note":"cancelled before the worker claimed the job"}'::jsonb)
+        '{result}', '{\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":null,\"cancellation_note\":\"cancelled before the worker claimed the job\"}'::jsonb)
 )::text
 where id = '<job-id>' and (payload::jsonb)->'state'->>'status' = 'pending';
 ```
@@ -287,15 +287,15 @@ The worker-side helper `lubko.worker.request_cancel` implements this contract an
 
 # Orchestrator liveness and completion invariants
 
-This section is the most important operational material in the manual. It exists because an orchestration run once *failed while the work was still progressing*: the orchestrator knew jobs were outstanding, decided to "wait," made no further tool call, and the turn silently ended in an intermediate state.
+This section is the most important operational material in the manual. It exists because an orchestration run once *failed while the work was still progressing*: the orchestrator knew jobs were outstanding, decided to \"wait,\" made no further tool call, and the turn silently ended in an intermediate state.
 
 ## The orchestrator cannot passively wait
 
 There is **no background execution loop** that will wake the orchestrator later; an orchestration turn does not resume by itself.
 
-> **If work is still outstanding, "wait" must mean another bounded observation/polling step in the current turn.**
+> **If work is still outstanding, \"wait\" must mean another bounded observation/polling step in the current turn.**
 
-Whenever the orchestrator is about to say or think "I'm waiting for X", it must identify the exact next tool call that will observe X. If there is no such call, the orchestration is about to lose liveness.
+Whenever the orchestrator is about to say or think \"I'm waiting for X\", it must identify the exact next tool call that will observe X. If there is no such call, the orchestration is about to lose liveness.
 
 ## Maintain an explicit outstanding-root-job set
 
@@ -309,7 +309,7 @@ Only remove a UUID after observing that **exact root row** in a terminal state. 
 
 ## Normal completion is illegal while outstanding work exists
 
-> **If the requested workflow is incomplete and the outstanding root-job set is non-empty, the orchestrator must not end the turn merely to "wait". It must continue with another bounded observation step.**
+> **If the requested workflow is incomplete and the outstanding root-job set is non-empty, the orchestrator must not end the turn merely to \"wait\". It must continue with another bounded observation step.**
 
 ```text
 if outstanding_root_jobs != ∅ and workflow incomplete:
@@ -358,7 +358,7 @@ Rules:
 
 - only a UUID recorded for the current orchestration step can satisfy that step;
 - check timestamps and creation ordering when historical rows could be confused with newly submitted work;
-- do not infer "our job succeeded" from a matching-looking older command row;
+- do not infer \"our job succeeded\" from a matching-looking older command row;
 - distinguish root jobs from output-chunk rows (output chunks are immutable historical output owned by a root job via `payload.thread`);
 - distinguish Supabase root UUIDs from Lubko agent IDs (below).
 
@@ -375,11 +375,11 @@ Default behavior:
 - keep one **active attached prompt transport job per managed agent**;
 - before creating another prompt/steer transport job for an already-active agent, inspect the existing agent/job status and understand why another root job is needed;
 - use `--steer` only when there is a concrete reason to redirect an already-running invocation;
-- when overlapping control is intentional, track both root jobs explicitly rather than treating "the agent" as one job.
+- when overlapping control is intentional, track both root jobs explicitly rather than treating \"the agent\" as one job.
 
 ## Define a completion predicate before complex workflows
 
-For multi-step work, decide up front what evidence constitutes completion. Intermediate success signals — an agent saying "done", a command exiting zero, one transitional state succeeding, one deployment phase succeeding, one reviewer reporting success — are evidence used by the workflow, not substitutes for its completion predicate.
+For multi-step work, decide up front what evidence constitutes completion. Intermediate success signals — an agent saying \"done\", a command exiting zero, one transitional state succeeding, one deployment phase succeeding, one reviewer reporting success — are evidence used by the workflow, not substitutes for its completion predicate.
 
 Use a generic form such as:
 
@@ -392,7 +392,7 @@ The completion predicate must include whatever independent verification the user
 
 ## Narration must correspond to an operation
 
-Narration such as "waiting for the worker transition" can sound like active orchestration even when nothing is scheduled. "I'll wait for this to finish", "waiting for the transition", or "I'll check again after the agent is done" are **not operations**. They are only valid when immediately followed by an actual polling or status call in the same turn. Whenever the orchestrator is about to say or think "I'm waiting for X", it must identify the exact next tool call that will observe X; if there is no such call, the orchestration is about to lose liveness.
+Narration such as \"waiting for the worker transition\" can sound like active orchestration even when nothing is scheduled. \"I'll wait for this to finish\", \"waiting for the transition\", or \"I'll check again after the agent is done\" are **not operations**. They are only valid when immediately followed by an actual polling or status call in the same turn. Whenever the orchestrator is about to say or think \"I'm waiting for X\", it must identify the exact next tool call that will observe X; if there is no such call, the orchestration is about to lose liveness.
 
 ---
 
@@ -491,7 +491,7 @@ Useful options: `--cwd DIR`, `--title TEXT`, `--json`.
 Example machine-readable result:
 
 ```json
-{"id": "a13f09c2", "state": "idle", "cwd": "/workspace/project", "created_at": 1786681506.5262172}
+{\"id\": \"a13f09c2\", \"state\": \"idle\", \"cwd\": \"/workspace/project\", \"created_at\": 1786681506.5262172}
 ```
 
 ---
@@ -524,13 +524,13 @@ While the agent is running, `--steer` is **hard preemption**. The steer is durab
 
 Hard preemption is not rollback. Files already written, output already emitted, external requests already sent, and other side effects that happened before termination may remain. The continued agent must inspect the real repository/system state and reconcile it. `status --json` exposes `steer_preempting`, and text status reports when the old invocation is still being hard-preempted.
 
-If the agent is **not currently running** (idle, finished, stopped, or never-started), `prompt --id <ID> --steer 'task'` is exactly equivalent to `prompt --id <ID> 'task'`. `--steer` is harmless and redundant on an idle/finished/not-yet-started agent; it is never rejected merely because there is nothing currently running to interrupt. This lets caller code always request "make the latest instruction take precedence" without first branching on whether the agent happens to be busy.
+If the agent is **not currently running** (idle, finished, stopped, or never-started), `prompt --id <ID> --steer 'task'` is exactly equivalent to `prompt --id <ID> 'task'`. `--steer` is harmless and redundant on an idle/finished/not-yet-started agent; it is never rejected merely because there is nothing currently running to interrupt. This lets caller code always request \"make the latest instruction take precedence\" without first branching on whether the agent happens to be busy.
 
 ## Inspect before you steer
 
-The most over-orchestrated agents are the ones whose orchestrator sent frequent prompts ("now do X", "are you done?") without first reading status or the log. Each such prompt interrupts the agent's reasoning and can push it to declare premature completion.
+The most over-orchestrated agents are the ones whose orchestrator sent frequent prompts (\"now do X\", \"are you done?\") without first reading status or the log. Each such prompt interrupts the agent's reasoning and can push it to declare premature completion.
 
-Before any prompt, read the evidence: the agent's `status`, then a focused log tail when more detail is needed. Only prompt when the evidence shows a concrete problem or a new requirement. Steer with *constraints and acceptance criteria*, not with play-by-play instructions: one precise follow-up that says what is wrong and what "done" means is worth ten that say what to type next.
+Before any prompt, read the evidence: the agent's `status`, then a focused log tail when more detail is needed. Only prompt when the evidence shows a concrete problem or a new requirement. Steer with *constraints and acceptance criteria*, not with play-by-play instructions: one precise follow-up that says what is wrong and what \"done\" means is worth ten that say what to type next.
 
 ---
 
@@ -650,7 +650,7 @@ Use this for housekeeping, not as part of every development task. Running agents
 
 # Let agents think without arbitrary time pressure
 
-Agents that were stopped or killed because the orchestrator judged them "slow" had, in several cases, just spent that time on exactly the reasoning the task required — reading the real code before editing it. Stopping them forced the orchestrator to redo or re-verify the work later, and interrupted sessions were not resumable as-is: a fresh agent had to re-derive context the interrupted agent had already built.
+Agents that were stopped or killed because the orchestrator judged them \"slow\" had, in several cases, just spent that time on exactly the reasoning the task required — reading the real code before editing it. Stopping them forced the orchestrator to redo or re-verify the work later, and interrupted sessions were not resumable as-is: a fresh agent had to re-derive context the interrupted agent had already built.
 
 At the same time, agents are not immune to stalling: an agent can absolutely get stuck — looping on one failing action, waiting on a dead tool, or silently idle. Liveness and useful progress are different questions.
 
@@ -659,7 +659,7 @@ Rules:
 - Do not impose deadlines on thinking.
 - **Check liveness on a cadence, not by feel.** For any long-running agent, run a direct `lubko-agent status --id <ID>` health check at least every 5 minutes. Prefer `status --id <ID>` over `list` for the health check so the evidence is for the exact agent being monitored.
 - **Use CPU/process evidence as a health signal, not as proof of progress.** `status` reports whether the agent's process is alive and its total CPU time. Growing CPU time shows process activity, not health or progress: a stuck loop can burn CPU, and low CPU can be legitimate while an agent waits on a subprocess or a tool. Judge useful progress from a focused log tail and recent observable progress, not from CPU alone.
-- **Pair status with a focused log tail when ambiguous.** When state or CPU alone does not answer "is it making progress?", read a focused log tail such as `lubko-agent log <ID> --lines 100` and look at what the agent is currently doing. Ask "is it making progress?" not "is it done yet?"
+- **Pair status with a focused log tail when ambiguous.** When state or CPU alone does not answer \"is it making progress?\", read a focused log tail such as `lubko-agent log <ID> --lines 100` and look at what the agent is currently doing. Ask \"is it making progress?\" not \"is it done yet?\"
 - An agent that is reading files, running tests, and converging is working; an agent that is looping on one failing action is stuck.
 - **Do not nag solely because time elapsed.** A quiet long-running agent that is still consuming CPU and converging is healthy; interrupting it on a schedule destroys the reasoning it is doing. Only intervene when the evidence shows a genuine stall or a concrete problem.
 - **Steer, stop, or kill genuinely stalled agents.** Once the evidence shows a real stall, do not keep waiting and polling forever: redirect it with a focused `--steer`, or if the task is abandoned, `stop` it and escalate to `kill` only when graceful stopping is insufficient.
@@ -878,7 +878,7 @@ Give independent agents separate responsibilities. The cleanest outcomes come fr
 
 Rules:
 
-- Assign disjoint filesystems and disjoint responsibilities. An acceptance agent should not be told "verify the implementation"; it should be given the *contract* and asked to test the *behavior*.
+- Assign disjoint filesystems and disjoint responsibilities. An acceptance agent should not be told \"verify the implementation\"; it should be given the *contract* and asked to test the *behavior*.
 - **Never assign a code-review mandate to an agent.** An agent may implement fixes requested by the orchestrator, but it must not be used as the reviewer and its opinion does not satisfy the review requirement.
 - Put every agent's mandate in the initial prompt, including what it must *not* do. The cost of a wrong responsibility split is usually only discovered at reconciliation, which is the most expensive time to find it.
 - The orchestrator keeps the map: which branch, which base commit, which responsibility, which agent ID, and which PR is the review surface.
@@ -921,7 +921,7 @@ A strong agent prompt usually contains:
 5. **Local instructions** — tell the agent to read and obey `AGENTS.md`, `CONTRIBUTING.md`, or equivalent repository guidance.
 6. **Validation** — tests, linters, type checking, builds, or other required checks.
 7. **Completion criteria** — what counts as done.
-8. **Non-goals / negative requirements** — explicitly what the agent must not do: "do not deploy", "do not push", "do not expose credentials", "do not close the issue yourself", "do not touch unrelated files", "do not expand scope into a sibling issue", "do not edit a file another agent owns", **"do not perform code review; the orchestrator reviews through the GitHub plugin."**
+8. **Non-goals / negative requirements** — explicitly what the agent must not do: \"do not deploy\", \"do not push\", \"do not expose credentials\", \"do not close the issue yourself\", \"do not touch unrelated files\", \"do not expand scope into a sibling issue\", \"do not edit a file another agent owns\", **\"do not perform code review; the orchestrator reviews through the GitHub plugin.\"**
 
 Example:
 
@@ -946,7 +946,7 @@ The prompts that produce the best work are long on *constraint* and short on *ho
 Additional rules:
 
 - Name the invariants the agent must preserve, drawn from the project's own design docs: for example atomic, exactly-once state transitions; precise process signaling; no credentials in logs, commits, or process environments; and git state changed only on the agent's own branch.
-- Ask agents to report early, risky findings: *"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end."* Do not require agents to finish before communicating.
+- Ask agents to report early, risky findings: *\"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end.\"* Do not require agents to finish before communicating.
 - Ask agents to commit incrementally on their branch as they go, and to keep the branch pushed. A branch with frequent, logical commits is far easier to reconcile and salvage than one last-minute commit.
 - Ask agents to open or prepare a PR early when they are responsible for Git publication, but do not ask them to review that PR. The PR exists so the orchestrator's GitHub plugin can inspect the diff.
 
@@ -982,8 +982,8 @@ Reconciling parallel branches repeatedly turns on knowing the exact base commit 
 
 Rules:
 
-- Cut every branch from a known, clean, tested base — a real commit SHA, not "whatever the tree looked like."
-- Before launching an implementation agent, ensure its clone is on a known commit with a clean tree, and put the base commit in the prompt: *"Baseline is <sha>, tests green; reconcile from there."* Record the base in your own state so reconciliation can verify it.
+- Cut every branch from a known, clean, tested base — a real commit SHA, not \"whatever the tree looked like.\"
+- Before launching an implementation agent, ensure its clone is on a known commit with a clean tree, and put the base commit in the prompt: *\"Baseline is <sha>, tests green; reconcile from there.\"* Record the base in your own state so reconciliation can verify it.
 - After an agent finishes, verify `git status --short` shows only intended changes, the intended commits exist on the branch, and the tree was not force-reset or squashed without your knowledge. A clean, committed branch is the contract your acceptance and orchestrator-review steps depend on.
 
 ---
@@ -1004,7 +1004,7 @@ Then run repository-required validation when appropriate. Do not report a develo
 
 ## Tests are evidence, not proof
 
-The orchestrator has repeatedly found hard bugs that passing tests did not catch: concurrency races in job claiming, leasing, and recovery; wrong process-group handling; a "fixed" deadline race that the tests' timing happened to mask; and accidental test-only production knobs. In each case the finding came from *reading the code and the diff* against the system's stated invariants — not from running tests.
+The orchestrator has repeatedly found hard bugs that passing tests did not catch: concurrency races in job claiming, leasing, and recovery; wrong process-group handling; a \"fixed\" deadline race that the tests' timing happened to mask; and accidental test-only production knobs. In each case the finding came from *reading the code and the diff* against the system's stated invariants — not from running tests.
 
 Rules:
 
@@ -1030,8 +1030,8 @@ Hard rules:
 
 - **Every code review is performed by the orchestrator.** Do not create, prompt, or rely on a `lubko-agent` agent to review code.
 - **Use the GitHub plugin as the review interface.** Inspect the PR's changed files and diff/patch, trace important execution paths, and compare the change against the task contract and repository invariants.
-- **An agent's self-review, second-agent review, review summary, or "looks good" report does not count.** Agents can implement fixes, run tests, investigate, and explain their work; the review judgment remains with the orchestrator.
-- **Open PRs early because review depends on them.** The GitHub plugin can return a useful canonical diff once work is published to a PR. Do not wait until implementation is "finished" to create the PR; open it as soon as there is a reviewable commit, then review incrementally as the diff evolves.
+- **An agent's self-review, second-agent review, review summary, or \"looks good\" report does not count.** Agents can implement fixes, run tests, investigate, and explain their work; the review judgment remains with the orchestrator.
+- **Open PRs early because review depends on them.** The GitHub plugin can return a useful canonical diff once work is published to a PR. Do not wait until implementation is \"finished\" to create the PR; open it as soon as there is a reviewable commit, then review incrementally as the diff evolves.
 - **Re-review after material updates.** If review findings cause new commits, inspect the updated PR diff through the GitHub plugin before merging.
 - Human review is welcome as additional evidence, but it does not replace the orchestrator's required review step.
 
@@ -1054,7 +1054,7 @@ When the user asks to inspect changes before deployment: modify the repository (
 
 ## Commit, push, and deploy are distinct, ordered steps
 
-These three operations have different blast radius, and conflating them has caused real incidents: a change committed and pushed to the remote default branch was treated as "deployed", and an agent that was told to deploy performed its own push without the orchestrator reviewing the committed state first.
+These three operations have different blast radius, and conflating them has caused real incidents: a change committed and pushed to the remote default branch was treated as \"deployed\", and an agent that was told to deploy performed its own push without the orchestrator reviewing the committed state first.
 
 Treat them as strictly ordered, separable steps:
 
@@ -1062,7 +1062,7 @@ Treat them as strictly ordered, separable steps:
 2. **Push** — publishes commits to a remote. **Push non-default work branches early and keep them pushed**; the remote branch is the durable copy and survives a lost or recycled clone. Open a **draft PR early** as soon as there is a reviewable commit: this makes work visible and gives the orchestrator's GitHub plugin the canonical diff it needs for review. A push to the **default branch (`main`/`master`) is different**: it requires establishing user intent at task start, unless the user already specified it.
 3. **Deploy** — replaces the running service/worker/daemon. Highest blast radius; only via the project's managed deploy tool, on explicit instruction, and from a reviewed, validated checkout at an exact commit.
 
-Publication (pushing a change) is not deployment. Pushing makes work visible for review; deploying replaces the running system. Name the target of each action in prompts: "Commit and push the change" is one instruction; "Deploy the already-pushed commit" is a different instruction — in practice it is given as a separate agent session whose sole job is to verify the checkout at the exact commit and run the managed deployment. Match that separation.
+Publication (pushing a change) is not deployment. Pushing makes work visible for review; deploying replaces the running system. Name the target of each action in prompts: \"Commit and push the change\" is one instruction; \"Deploy the already-pushed commit\" is a different instruction — in practice it is given as a separate agent session whose sole job is to verify the checkout at the exact commit and run the managed deployment. Match that separation.
 
 The orchestrator must also not deploy implicitly. Deploying is its own explicit step, performed through the project's managed deploy tool (never through manual process-tree manipulation), from a checkout that passed the full validation and the orchestrator's GitHub-plugin code review, and after verifying the target commit is exactly the commit you intend to run.
 
@@ -1109,7 +1109,7 @@ it emits a live `SupervisorStatus` (`live: true`) carrying the confirmed child,
 intent, crash-loop `restart_count`/`next_attempt_at` backoff, queue `ready`/
 `db_ready` readiness, and a derived `holding` flag. When the supervisor is
 dead, replaced, or PID-reused — so no live status survives — it emits a
-`SupervisorDiagnostic` (`live: false`, `source: "durable-state"`) derived
+`SupervisorDiagnostic` (`live: false`, `source: \"durable-state\"`) derived
 solely from the durable `state.json` and the recorded identity file. The
 diagnostic never pretends to be current health: it reports holding/backoff/
 readiness from durable authority only, and is safe to read after a crash
@@ -1188,13 +1188,13 @@ reports the validated outcome so the row is durably `succeeded`/`failed` before
 the handoff, and the helper then drives the supervisor convergence and the
 maintained CLI activation, so the CLI pointer, the supervisor desired+applied
 state, and the new worker commit converge without a later manual status
-reconciliation (see the README "Queue-invoked self-deploy survives the old
-worker's shutdown" section). A queue-invoked `--bootstrap` is refused because a
+reconciliation (see the README \"Queue-invoked self-deploy survives the old
+worker's shutdown\" section). A queue-invoked `--bootstrap` is refused because a
 queue job is executed by a live worker.
 
 ## Verify a deployment with a real round trip
 
-The strongest end-to-end evidence comes from submitting a real job through the production execution path and watching it run in the live environment, then reading back its status and output. Simulated or mocked round trips have, more than once, passed while the real execution path failed — for example a runtime started with the wrong working directory, or a deployment that verified "the process started" but not that it could reach its database.
+The strongest end-to-end evidence comes from submitting a real job through the production execution path and watching it run in the live environment, then reading back its status and output. Simulated or mocked round trips have, more than once, passed while the real execution path failed — for example a runtime started with the wrong working directory, or a deployment that verified \"the process started\" but not that it could reach its database.
 
 For any change to the execution transport, the worker/runtime, or a deployment lifecycle, verify with a real round trip after deployment:
 
@@ -1237,7 +1237,7 @@ Reconcile in this order:
 6. Push the integration branch and open/update its PR early enough for the GitHub plugin to expose the evolving diff.
 7. Only after the integrated branch is green **and the orchestrator has reviewed the integration PR through the GitHub plugin** do you consider the main branch or a merge.
 
-When the orchestrator reviews the integration PR diff and finds a discrepancy with an invariant, investigate it to closure before proceeding. A "fixed" conflict that reintroduces a bug is worse than no fix.
+When the orchestrator reviews the integration PR diff and finds a discrepancy with an invariant, investigate it to closure before proceeding. A \"fixed\" conflict that reintroduces a bug is worse than no fix.
 
 ---
 
@@ -1267,7 +1267,7 @@ Push non-default work branches as soon as there is something to see, and keep th
 
 ## Open draft PRs early for review and observability
 
-Open a **draft PR as soon as there is a reviewable commit**. Do not wait for implementation to be complete. GitHub cannot create a PR with no commits relative to its base, so "early" means immediately after the first meaningful commit.
+Open a **draft PR as soon as there is a reviewable commit**. Do not wait for implementation to be complete. GitHub cannot create a PR with no commits relative to its base, so \"early\" means immediately after the first meaningful commit.
 
 This is operationally necessary, not just cosmetic: **all code review is performed by the orchestrator through the GitHub plugin, and the PR gives that plugin the stable changed-file set and useful diff/patch it needs.** An early PR lets the orchestrator review incrementally, catch a wrong direction while it is cheap to fix, and re-review only the evolving change rather than reconstructing history at the end.
 
@@ -1305,11 +1305,11 @@ Do not merge a branch that has not been reviewed, even if the checks pass. **The
 
 ## Merge regular changes
 
-Once a PR has been reviewed by the orchestrator through the GitHub plugin and the checks are green on the integrated branch, merge it — do not leave finished branches dangling forever. A merged PR closes the loop and is the cleanest possible record: "this change was reviewed and landed." Hiding a completed change in an unmerged branch buries it.
+Once a PR has been reviewed by the orchestrator through the GitHub plugin and the checks are green on the integrated branch, merge it — do not leave finished branches dangling forever. A merged PR closes the loop and is the cleanest possible record: \"this change was reviewed and landed.\" Hiding a completed change in an unmerged branch buries it.
 
-## Keep experimental and "wisdom" PRs separate
+## Keep experimental and \"wisdom\" PRs separate
 
-Keep experimental, exploratory, or "capture the lesson" changes in their own PRs, clearly labeled as such, and do not merge them into a delivery branch. Label experimental PRs as drafts and close them when the experiment is over.
+Keep experimental, exploratory, or \"capture the lesson\" changes in their own PRs, clearly labeled as such, and do not merge them into a delivery branch. Label experimental PRs as drafts and close them when the experiment is over.
 
 ## Delete stale branches and clones after merge
 
@@ -1334,7 +1334,7 @@ Every finding must be triaged into one of two classes:
 
 GitHub issues are the durable backlog for important-but-non-critical findings: high-effort non-critical bugs, architecture questions or open decisions, refactors, and improvements spotted while working on something else. A useful issue carries enough context to act on later without relying on the session that produced it:
 
-- What was found and where — file/function references, not just "something was wrong."
+- What was found and where — file/function references, not just \"something was wrong.\"
 - Why it matters — the rationale and the impact if left unaddressed.
 - Reproduction or evidence — a failing test, a log excerpt, a traceback, a snippet.
 - Acceptance criteria, or the open questions that still need answering.
@@ -1350,7 +1350,7 @@ The most useful findings arrive *before* the task completes: the orchestrator fl
 
 Rules:
 
-- Ask agents to report early, risky findings in their prompt: *"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end."*
+- Ask agents to report early, risky findings in their prompt: *\"If you find a blocker, a violated invariant, or a changed understanding of the task, surface it now rather than continuing to the end.\"*
 - Open the PR early enough that the orchestrator can use the GitHub plugin to surface code-review findings while implementation is still in flight.
 - When the orchestrator spots something mid-flight, share it immediately with the affected implementation agent via a steering prompt, even if it means the agent re-plans. A stopped-wrong task is cheaper than a finished-wrong task.
 - Keep partial progress durable: ask agents to commit incrementally on their branch, not only at the end.
@@ -1382,17 +1382,17 @@ Do not use broad process-killing shell commands when the agent-management interf
 
 Each of these has happened. Name the failure mode when you see it forming.
 
-- **Passive waiting** — deciding to "wait" for an outstanding job without scheduling another polling/status call, so the orchestration turn ends in an intermediate state. Avoid: apply the [liveness invariants](#orchestrator-liveness-and-completion-invariants); every unfinished future-dependent state needs an executable next observation step.
+- **Passive waiting** — deciding to \"wait\" for an outstanding job without scheduling another polling/status call, so the orchestration turn ends in an intermediate state. Avoid: apply the [liveness invariants](#orchestrator-liveness-and-completion-invariants); every unfinished future-dependent state needs an executable next observation step.
 - **Two write agents on a shared tree** — one agent's `git checkout`, `git reset --hard`, or broad edit destroyed another agent's in-flight work. Avoid: always give writers separate clones and branches; before launching any agent, know which trees are exclusively owned by whom.
 - **Rushing or stopping active agents** — agents stopped because they seemed slow had often been doing exactly the right reading, and repeatedly prompting a healthy agent pushed it toward premature completion. Avoid: inspect status and the log before touching an agent; distinguish progress from stuck; prefer a steering prompt with acceptance criteria; reserve stop/kill for abandoned work.
-- **Delegating code review to agents** — a second agent's "review" can look independent while still being outside the orchestrator's required GitHub review path, and it deprives the orchestrator of direct responsibility for the merge decision. Avoid: open the PR early, inspect its diff through the GitHub plugin yourself, and use agents only to implement fixes or run independent acceptance tests.
+- **Delegating code review to agents** — a second agent's \"review\" can look independent while still being outside the orchestrator's required GitHub review path, and it deprives the orchestrator of direct responsibility for the merge decision. Avoid: open the PR early, inspect its diff through the GitHub plugin yourself, and use agents only to implement fixes or run independent acceptance tests.
 - **Self-referential tests** — acceptance tests written from the implementation encoded its assumptions and passed while behavior violated the contract. Avoid: write tests from the contract, not the code.
-- **Test-only production knobs** — sub-second timing, fake output paths, and confirmation timeouts have crept into production code as environment variables "for the tests." Avoid: in orchestrator review, ask whether every knob and branch is reachable and meaningful in production.
+- **Test-only production knobs** — sub-second timing, fake output paths, and confirmation timeouts have crept into production code as environment variables \"for the tests.\" Avoid: in orchestrator review, ask whether every knob and branch is reachable and meaningful in production.
 - **Stale docs** — documentation drifted from behavior after refactors, and an agent then built on the stale text. Avoid: treat docs as a deliverable in the same change that changes behavior; update them in the same reconciliation pass; when docs and code disagree, code is not automatically right — resolve the discrepancy deliberately.
 - **Multiple deployment authorities** — more than one actor believing it can deploy is a latent accident. Avoid: exactly one authority — the orchestrator — decides to deploy, and only via the managed deploy tool from a validated, reviewed checkout. No agent deploys unless its prompt explicitly says so.
 - **Destructive actions before durable rollback state** — delete/stop/overwrite first, then discover the replacement is broken with no recorded previous state. Avoid: any destructive action (replacing a worker, deleting a branch, resetting a tree, dropping schema) is only safe when durable rollback state exists first and you can restore it. If you cannot say what will restore the old state, do not destroy.
 - **Output bloat and truncated evidence** — full logs and full dumps were truncated by an output limit, so conclusions were drawn from incomplete output. Avoid: keep commands focused; prefer log tails and `git diff --stat`; when output is truncated, run a narrower follow-up rather than guessing.
-- **Trusting a report of green** — "tests passed" has been reported for subsets, for the wrong branch, or for stale trees. Avoid: independent re-run on the reconciled branch is the only trustworthy green.
+- **Trusting a report of green** — \"tests passed\" has been reported for subsets, for the wrong branch, or for stale trees. Avoid: independent re-run on the reconciled branch is the only trustworthy green.
 
 ---
 
@@ -1516,8 +1516,8 @@ Do not turn routine development operations back into instructions for the user w
 | Course correction | a steering prompt with acceptance criteria | frequent steering |
 | Parallel work | separate clones/worktrees + branches + mandates; use as many agents as useful | two writers in one tree, or an arbitrary agent cap |
 | Several outstanding jobs | poll all outstanding root UUIDs together in one bounded query | polling parallel jobs one-by-one |
-| Work is still outstanding | make another bounded observation/polling step in the current turn | ending the turn to "wait" passively |
-| Stalled work | inspect the exact agent/job status and log, then continue or report a blocker | replacing polling with prose such as "waiting for it to finish" |
+| Work is still outstanding | make another bounded observation/polling step in the current turn | ending the turn to \"wait\" passively |
+| Stalled work | inspect the exact agent/job status and log, then continue or report a blocker | replacing polling with prose such as \"waiting for it to finish\" |
 | Acceptance | contract-based tests, independent acceptance agent | tests derived from the implementation |
 | Verification | objective state checks + full validation | trusting a report of green |
 | Code review | orchestrator reviews the open PR diff with the GitHub plugin; follow `docs/skills/review.md` | delegating review to `lubko-agent`, accepting an agent review, or merging unreviewed work |
