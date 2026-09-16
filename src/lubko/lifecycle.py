@@ -60,7 +60,7 @@ from lubko.config import (
     load_worker_server,
 )
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
-from lubko.state import rollback_state_path, state_root
+from lubko.state import SUPERVISOR_STATE_TOKEN_ENV, rollback_state_path, state_root
 from lubko.supervise import GenerationLockTimeoutError
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import (
@@ -1098,6 +1098,10 @@ def worker_env(token: str) -> dict[str, str]:
     worker instead reads its connection settings from the restricted database
     configuration file.
 
+    The supervisor state namespace token (``LUBKO_SUPERVISOR_STATE_TOKEN``)
+    is also stripped: workers must never hold private supervisor authority
+    paths.
+
     Args:
         token: Unique lifecycle token for this deployment.
 
@@ -1107,7 +1111,7 @@ def worker_env(token: str) -> dict[str, str]:
     env = {
         name: value
         for name, value in os.environ.items()
-        if not _credential_environment_variable(name)
+        if not _credential_environment_variable(name) and name != SUPERVISOR_STATE_TOKEN_ENV
     }
     env[LIFECYCLE_MARKER_VAR] = token
     env["PYTHONDONTWRITEBYTECODE"] = "1"

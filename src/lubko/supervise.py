@@ -54,7 +54,7 @@ from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
 from lubko.durable import remove_durable, write_json_durable
 from lubko.health import validate_incarnation_token
-from lubko.state import rollback_state_path, state_root
+from lubko.state import rollback_state_path, state_root, supervisor_state_token
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -947,16 +947,47 @@ def derive_durable_diagnostic() -> SupervisorDiagnostic:
 
 
 def supervisor_dir() -> Path:
-    """Return the directory holding external-supervisor state.
+    """Return the untokenized supervisor directory (public request/observation surface).
+
+    This path is the stable, non-authoritative surface that CLI tools
+    (``lubko-deploy``, ``lubko-deploy-ctl``) use to write requests
+    (``desired.json``) and read observations (``status.json``).  It is
+    deliberately **not** tokenized so tokenless client commands can
+    request and observe lifecycle actions without holding the supervisor
+    state token.
 
     Returns:
-        The per-user supervisor state directory.
+        The per-user supervisor state directory (untokenized).
     """
     return state_root() / "supervisor"
 
 
+def supervisor_private_dir() -> Path:
+    """Return the tokenized supervisor directory (private authoritative state).
+
+    The path is ``supervisor_dir() / <token>`` when a token is available,
+    isolating the daemon's authoritative mutable state under a
+    high-entropy opaque namespace so ordinary/default state resolution
+    cannot accidentally reach live supervisor authority.  When no token
+    is set, falls back to the untokenized parent directory for
+    backward-compatible access.
+
+    Returns:
+        The supervisor state directory (tokenized when a token is set).
+    """
+    token = supervisor_state_token()
+    if token is not None:
+        return supervisor_dir() / token
+    return supervisor_dir()
+
+
 def desired_path() -> Path:
-    """Return the path of the durable desired-intent file.
+    """Return the path of the durable desired-intent file (request surface).
+
+    This is the non-authoritative request surface: CLI tools write run
+    intents here, and the supervisor daemon reads and applies them to its
+    private authoritative state.  The path is deliberately **not**
+    tokenized so tokenless client commands can submit requests.
 
     Returns:
         The ``desired.json`` path.
@@ -967,14 +998,42 @@ def desired_path() -> Path:
 def state_path() -> Path:
     """Return the path of the daemon's durable state file.
 
+    The state file lives at the untokenized supervisor directory so CLI
+    tools can read it for confirmation cross-checks without holding the
+    supervisor state token.  The token instead isolates the private
+    spawning/recovery authority (see :func:`private_authority_path`).
+
     Returns:
         The ``state.json`` path.
     """
     return supervisor_dir() / "state.json"
 
 
+def private_authority_path() -> Path:
+    """Return the path of the private spawning/recovery authority file.
+
+    When a token is available, the file lives under the tokenized
+    directory (``supervisor/<token>/authority.json``), isolating
+    replacement-blocking recovery authority from ordinary state
+    resolution.  When no token is set, falls back to the untokenized
+    parent directory for backward-compatible access.
+
+    Returns:
+        The ``authority.json`` path.
+    """
+    token = supervisor_state_token()
+    if token is not None:
+        return supervisor_dir() / token / "authority.json"
+    return supervisor_dir() / "authority.json"
+
+
 def status_path() -> Path:
-    """Return the path of the machine-readable status file.
+    """Return the path of the machine-readable status file (observation surface).
+
+    This is the non-authoritative observation surface: the supervisor
+    daemon publishes status here for CLI tools to read.  The path is
+    deliberately **not** tokenized so tokenless client commands can
+    observe lifecycle state.
 
     Returns:
         The ``status.json`` path.

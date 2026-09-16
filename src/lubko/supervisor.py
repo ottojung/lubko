@@ -102,7 +102,11 @@ from lubko.health import (
     read_worker_health_by_incarnation,
     worker_health_payload,
 )
-from lubko.state import rollback_state_path
+from lubko.state import (
+    SupervisorStateTokenError,
+    rollback_state_path,
+    supervisor_state_token,
+)
 from lubko.supervise import (
     INTENT_RUN,
     MODE_RUN,
@@ -3888,6 +3892,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.status:
         return _status_cmd()
+    # Validate the supervisor state token before any daemon logic.  The token
+    # is required and must be a path-safe 256-bit hex string; absence or
+    # invalidity fails closed so the daemon never starts without namespace
+    # isolation.
+    try:
+        supervisor_state_token()
+    except SupervisorStateTokenError:
+        LOGGER.exception(
+            "LUBKO_SUPERVISOR_STATE_TOKEN is required but missing or invalid; "
+            "supervisor startup refused"
+        )
+        return 1
     with suppress(UvResolutionError):
         # The daemon itself never needs uv: it restores workers from immutable
         # per-commit environments. Refusing to start here would defeat crash
@@ -3900,6 +3916,7 @@ def main(argv: list[str] | None = None) -> int:
     logger = logging.getLogger("lubko.supervisor")
     with suppress(OSError):
         supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
         handler = _BoundedSupervisorLogHandler(supervisor_log_path())
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logger.addHandler(handler)
