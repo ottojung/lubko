@@ -397,6 +397,12 @@ def ensure_run_intent_client(
         request_id=request_id,
     )
 
+    # Fast path: if supervisor is known-dead, return immediately rather
+    # than polling for the full timeout.  The pending request is durably
+    # written and will be promoted when the supervisor starts.
+    if not supervisor_alive():
+        return None
+
     return _poll_pending_request(
         request_id, commit, repo=repo, uv_path=uv_path, worker_id=worker_id
     )
