@@ -63,7 +63,8 @@ fi
 # execute its canonical `exec tini-static -- lubko-supervisor` chain.
 # The shim execs its arguments, so the exec chain preserves a single PID
 # from launcher through tini to supervisor.
-TINI_DIR=$(mktemp -d)
+TINI_DIR="${HOME}/.lubko-acceptance-tini"
+mkdir -p "${TINI_DIR}"
 cat > "${TINI_DIR}/tini-static" << 'SHIM'
 #!/bin/sh
 exec "$@"
@@ -90,7 +91,7 @@ STATUSFILE="${STATE_ROOT}/supervisor/status.json"
 if [ ! -f "$PIDFILE" ]; then
   fail "supervisor pidfile not created within 8 s"
 else
-  SVPID=$(cat "$PIDFILE" | python3 -c "import sys,json; print(json.load(sys.stdin)['pid'])")
+  SVPID=$(sed -n 's/.*"pid": \([0-9]*\).*/\1/p' "$PIDFILE")
   if [ "$SVPID" = "$SUPERVISOR_PID" ]; then
     pass "supervisor pidfile records correct PID ${SVPID}"
   else
