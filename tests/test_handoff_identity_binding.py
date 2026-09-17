@@ -27,7 +27,7 @@ OTHER_COMMIT = "b" * 40
 
 
 @pytest.fixture
-def _state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> None:  # ruff: ignore[unused-function-argument]
     """Isolated XDG_STATE_HOME with an empty supervisor directory."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)
@@ -60,9 +60,7 @@ def _set_cli_current(commit: str) -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_successor_binds_to_a_target_not_cli_current(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_successor_binds_to_a_target_not_cli_current(monkeypatch: pytest.MonkeyPatch) -> None:
     """B records A's target commit as runtime identity, ignoring cli/current.
 
     Regression: before this fix, B derived supervisor_runtime_commit from
@@ -270,9 +268,7 @@ def test_gc_does_not_preserve_unrelated_commits() -> None:
 
 
 @pytest.mark.usefixtures("_state_dir")
-def test_status_reports_bound_runtime_commit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_status_reports_bound_runtime_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     """Status snapshot carries the bound supervisor_runtime_commit."""
     _write_state_with_runtime()
     _set_cli_current(TARGET_COMMIT)

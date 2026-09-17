@@ -120,7 +120,7 @@ def _facts(**overrides: Any) -> AuthorityFacts:  # ruff: ignore[any-type]
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:  # ruff: ignore[unused-function-argument]
     """Use an isolated durable state root for each test.
 
     Returns:
@@ -136,6 +136,7 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_invariant_single_consumer_and_crash_convergence() -> None:
     """Two live consumer roles violate SINGLE_CONSUMER and CRASH_CONVERGES."""
     codes = check_authority_invariants(
@@ -146,6 +147,7 @@ def test_invariant_single_consumer_and_crash_convergence() -> None:
     assert check_authority_invariants(_facts(supervisor_child_present=True)) == []
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_invariant_generation_monotonic() -> None:
     """Generations never regress; a strictly newer mission is allowed."""
     assert INVARIANT_GENERATION_MONOTONIC in check_authority_invariants(
@@ -164,6 +166,7 @@ def test_invariant_generation_monotonic() -> None:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_invariant_generation_monotonic_pending_mission_authority() -> None:
     """A pending supervised mission is itself a trusted generation authority.
 
@@ -241,6 +244,7 @@ def test_invariant_generation_monotonic_pending_mission_authority() -> None:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_invariant_malformed_never_erased() -> None:
     """Corruption without a blocking hold is flagged; with one it is not."""
     assert INVARIANT_MALFORMED_NEVER_ERASED in check_authority_invariants(
@@ -251,6 +255,7 @@ def test_invariant_malformed_never_erased() -> None:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_invariant_no_replacement_while_unresolved() -> None:
     """A new spawn must not start beside an unresolved earlier child."""
     assert INVARIANT_NO_REPLACEMENT_WHILE_UNRESOLVED in check_authority_invariants(
@@ -261,6 +266,7 @@ def test_invariant_no_replacement_while_unresolved() -> None:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_invariant_no_signal_without_proof() -> None:
     """A published child whose recorded identity is proven dead must not be signalled."""
     assert INVARIANT_NO_SIGNAL_WITHOUT_PROOF in check_authority_invariants(
@@ -275,6 +281,7 @@ def test_invariant_no_signal_without_proof() -> None:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_invariant_no_live_consumer_without_authority() -> None:
     """A live consumer must not exist under malformed durable authority."""
     codes = check_authority_invariants(
@@ -283,6 +290,7 @@ def test_invariant_no_live_consumer_without_authority() -> None:
     assert INVARIANT_NO_LIVE_CONSUMER_WITHOUT_AUTHORITY in codes
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_assert_raises_first_violation_code() -> None:
     """assert_authority_invariants raises with the violating code and facts."""
     facts = _facts(owned_worker_identity_proven=True, unresolved_child=True)
@@ -292,6 +300,7 @@ def test_assert_raises_first_violation_code() -> None:
     assert exc.value.facts is facts
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_clean_state_satisfies_all_invariants() -> None:
     """A reconciled clean running state violates no invariant."""
     monkeypatch_state_running()
@@ -303,6 +312,7 @@ def test_clean_state_satisfies_all_invariants() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_authorize_decisions() -> None:
     """The transition/authorization decisions follow the reconciled facts."""
     assert authorize_spawn(_facts()) is True
@@ -353,6 +363,7 @@ def test_authorize_decisions() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_unreadable_supervisor_state_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unreadable supervisor state fails closed: spawn is not authorized.
 
@@ -369,6 +380,7 @@ def test_unreadable_supervisor_state_blocks_spawn(monkeypatch: pytest.MonkeyPatc
     assert authorize_spawn(facts) is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_unknown_process_identity_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     """A transient process-identity read failure must not authorize replacement."""
     meta = lifecycle.WorkerMeta(
@@ -396,6 +408,7 @@ def test_unknown_process_identity_blocks_spawn(monkeypatch: pytest.MonkeyPatch) 
     assert authorize_spawn(facts) is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_running_meta_without_pid_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     """Running authority without an observable PID must fail closed."""
     meta = lifecycle.WorkerMeta(
@@ -420,6 +433,7 @@ def test_running_meta_without_pid_blocks_spawn(monkeypatch: pytest.MonkeyPatch) 
     assert authorize_spawn(facts) is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmed_dead_process_does_not_create_unknown_hold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -448,9 +462,8 @@ def test_confirmed_dead_process_does_not_create_unknown_hold(
     assert authorize_spawn(facts) is True
 
 
-def test_runtime_spawn_holds_on_unknown_process_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_runtime_spawn_holds_on_unknown_process_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     """The final supervisor spawn boundary must not reach Popen on unknown liveness."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: True)
     monkeypatch.setattr(cli, "cli_entry_executable", _fake_entry)
@@ -472,6 +485,7 @@ def test_runtime_spawn_holds_on_unknown_process_identity(
     assert daemon._spawn_worker(COMMIT) is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_unreadable_meta_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unreadable worker meta fails closed: spawn is not authorized."""
 
@@ -485,6 +499,7 @@ def test_unreadable_meta_blocks_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
     assert authorize_spawn(facts) is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_unreadable_supervisor_state_holds_spawn_in_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -510,6 +525,7 @@ def test_unreadable_supervisor_state_holds_spawn_in_runtime(
     assert daemon._spawn_worker(COMMIT) is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_desired_intent_blocks_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     """Malformed desired authority is not normalized to genuine absence."""
     monkeypatch.setattr(
@@ -529,6 +545,7 @@ def test_malformed_desired_intent_blocks_authority(monkeypatch: pytest.MonkeyPat
     assert authorize_spawn(facts) is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_absent_desired_intent_remains_non_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Genuine desired absence retains the mission/bootstrap generation-zero semantics."""
     monkeypatch.setattr(supervise, "read_desired_strict", lambda: None)
@@ -542,6 +559,7 @@ def test_absent_desired_intent_remains_non_malformed(monkeypatch: pytest.MonkeyP
     assert facts.durable_malformed is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_desired_generation_read_from_intent(monkeypatch: pytest.MonkeyPatch) -> None:
     """The actual desired generation participates in the monotonic invariant.
 
@@ -582,6 +600,7 @@ def test_desired_generation_read_from_intent(monkeypatch: pytest.MonkeyPatch) ->
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_spawn_publication_protocol_stays_single_consumer() -> None:
     """The child+spawning -> meta -> spawning-clear protocol never yields two.
 
@@ -602,6 +621,7 @@ def test_spawn_publication_protocol_stays_single_consumer() -> None:
         assert check_authority_invariants(snapshot) == [], snapshot
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_crash_leaves_replacement_blocking_unresolved_interleaving() -> None:
     """A supervisor crash beside an unresolved manual-recovery hold blocks a second.
 
@@ -622,6 +642,7 @@ def test_crash_leaves_replacement_blocking_unresolved_interleaving() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_spawn_write_failpoint_blocks_pre_popen(monkeypatch: pytest.MonkeyPatch) -> None:
     """The supervisor.spawning_write failpoint fires before Popen and any write."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: True)
@@ -644,6 +665,7 @@ def test_spawn_write_failpoint_blocks_pre_popen(monkeypatch: pytest.MonkeyPatch)
     assert written == [], "the pre-spawn obligation was never written at the crash"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_authorize_spawn_blocks_replacement_in_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """The runtime spawn decision routes through authorize_spawn and holds on a hold."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _c: True)
@@ -716,6 +738,7 @@ def monkeypatch_state_running() -> None:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_current_phase_derived_from_reconciled_facts(monkeypatch: pytest.MonkeyPatch) -> None:
     """The fact-derived phase reports RUNNING for the clean running state."""
     monkeypatch_state_running()
@@ -791,6 +814,7 @@ def _options() -> deployctl.Options:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_post_popen_invariant_refusal_converges_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -840,9 +864,8 @@ def test_post_popen_invariant_refusal_converges_child(
     )
 
 
-def test_recovery_gate_refuses_conflicting_authority(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_recovery_gate_refuses_conflicting_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     """_resolve_unresolved_child holds (no convergence) when authority refuses."""
     monkeypatch.setattr(
         lifecycle_state,
@@ -879,9 +902,8 @@ def test_recovery_gate_refuses_conflicting_authority(
     assert recovered == [], "group recovery must not run beside a competing live consumer"
 
 
-def test_recovery_gate_allows_when_authority_permitted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_recovery_gate_allows_when_authority_permitted(monkeypatch: pytest.MonkeyPatch) -> None:
     """_resolve_unresolved_child converges when the authority permits recovery."""
     monkeypatch.setattr(
         lifecycle_state,
@@ -910,9 +932,8 @@ def test_recovery_gate_allows_when_authority_permitted(
     assert converged == [True]
 
 
-def test_retirement_gate_refuses_unproven_live_child(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_retirement_gate_refuses_unproven_live_child(monkeypatch: pytest.MonkeyPatch) -> None:
     """_retire_child refuses (no signal) when authority denies retirement."""
     monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: True)
     monkeypatch.setattr(
@@ -947,9 +968,8 @@ def test_retirement_gate_refuses_unproven_live_child(
     assert signalled == [], "no signal may be delivered when authority refuses retirement"
 
 
-def test_retirement_gate_allows_proven_live_child(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_retirement_gate_allows_proven_live_child(monkeypatch: pytest.MonkeyPatch) -> None:
     """_retire_child signals and clears a provably-our-direct-child worker."""
     monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: True)
     monkeypatch.setattr(
@@ -978,9 +998,8 @@ def test_retirement_gate_allows_proven_live_child(
     assert daemon._retire_child() is True
 
 
-def test_retirement_gate_clears_dead_recorded_child(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_retirement_gate_clears_dead_recorded_child(monkeypatch: pytest.MonkeyPatch) -> None:
     """A dead recorded child is cleared (no destructive signal) despite the gate."""
     monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: False)
     monkeypatch.setattr(
@@ -1009,9 +1028,8 @@ def test_retirement_gate_clears_dead_recorded_child(
     assert daemon._retire_child() is True
 
 
-def test_confirm_gate_refuses_malformed_authority(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_confirm_gate_refuses_malformed_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     """_confirm_locked rolls back and refuses when durable authority is malformed."""
     mission = _make_mission(deployctl.STATUS_PENDING)
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
@@ -1049,6 +1067,7 @@ def test_confirm_gate_refuses_malformed_authority(
     assert recorded.status == deployctl.STATUS_PENDING
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """_confirm_locked proceeds when the authority permits the transition."""
     mission = _make_mission(deployctl.STATUS_PENDING)
@@ -1109,6 +1128,7 @@ def test_confirm_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert written[-1].status == deployctl.STATUS_CONFIRMED
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_holds_for_superseding_unready_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1140,6 +1160,7 @@ def test_confirmation_holds_for_superseding_unready_generation(
     written.assert_not_called()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_holds_while_current_generation_is_holding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1171,9 +1192,8 @@ def test_confirmation_holds_while_current_generation_is_holding(
     written.assert_not_called()
 
 
-def test_settlement_preserves_existing_same_commit_intent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_settlement_preserves_existing_same_commit_intent(monkeypatch: pytest.MonkeyPatch) -> None:
     """Settlement cannot erase an already-published same-commit replacement intent."""
     generation = 71
     desired = SimpleNamespace(commit=COMMIT, generation=generation, restart=True)
@@ -1193,9 +1213,8 @@ def test_settlement_preserves_existing_same_commit_intent(
     request_run.assert_not_called()
 
 
-def test_rollback_gate_refuses_malformed_authority(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_rollback_gate_refuses_malformed_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     """_rollback_locked holds (no destructive mutation) when authority is malformed."""
     mission = _make_mission(deployctl.STATUS_PENDING)
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
@@ -1210,6 +1229,7 @@ def test_rollback_gate_refuses_malformed_authority(
     assert deployctl._read_state() is mission
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_rollback_gate_keeps_pending_when_final_readiness_is_superseded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1233,6 +1253,7 @@ def test_rollback_gate_keeps_pending_when_final_readiness_is_superseded(
     assert logged == ["supervised rollback readiness was superseded before terminalization"]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervised_rollback_does_not_fall_back_to_legacy_without_supervisor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1255,6 +1276,7 @@ def test_supervised_rollback_does_not_fall_back_to_legacy_without_supervisor(
     ]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_watchdog_uses_canonical_supervised_rollback_decision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1274,9 +1296,8 @@ def test_watchdog_uses_canonical_supervised_rollback_decision(
     rollback.assert_called_once_with(mission)
 
 
-def test_watchdog_respects_canonical_pending_decision(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_watchdog_respects_canonical_pending_decision(monkeypatch: pytest.MonkeyPatch) -> None:
     """A canonical pending decision prevents watchdog rollback side effects."""
     mission = _make_mission(deployctl.STATUS_PENDING)
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
@@ -1301,9 +1322,8 @@ def test_watchdog_respects_canonical_pending_decision(
     rollback.assert_not_called()
 
 
-def test_watchdog_supervised_rollback_race_stays_pending(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_watchdog_supervised_rollback_race_stays_pending(monkeypatch: pytest.MonkeyPatch) -> None:
     """Supervisor loss after watchdog decision cannot dispatch legacy recovery."""
     mission = replace(_make_mission(deployctl.STATUS_PENDING), deadline=time.time() - 1.0)
     monkeypatch.setattr(deployctl, "_read_state", lambda: mission)
@@ -1332,6 +1352,7 @@ def test_watchdog_supervised_rollback_race_stays_pending(
     restore.assert_not_called()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_legacy_rollback_still_uses_direct_restore_without_supervisor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1349,6 +1370,7 @@ def test_legacy_rollback_still_uses_direct_restore_without_supervisor(
     restore.assert_called_once_with(mission)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> None:
     """_rollback_locked proceeds when the authority permits the transition."""
     mission = _make_mission(deployctl.STATUS_PENDING)
@@ -1395,9 +1417,8 @@ def test_rollback_gate_allows_legitimate(monkeypatch: pytest.MonkeyPatch) -> Non
     assert recorded.status == deployctl.STATUS_ROLLED_BACK
 
 
-def test_publish_gate_refuses_conflicting_mission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_publish_gate_refuses_conflicting_mission(monkeypatch: pytest.MonkeyPatch) -> None:
     """_prepare_locked refuses a new pending mission while one is already pending."""
     existing = _make_mission(deployctl.STATUS_PENDING)
     monkeypatch.setattr(deployctl, "_read_state", lambda: existing)
@@ -1419,6 +1440,7 @@ def test_publish_gate_refuses_conflicting_mission(
         deployctl._prepare_locked(_options(), COMMIT, supervised=True)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_respawn_gate_accepts_pending_mission_after_progress_no_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1468,9 +1490,8 @@ def test_respawn_gate_accepts_pending_mission_after_progress_no_desired(
     assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(facts)
 
 
-def test_publish_gate_allows_when_no_pending_mission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_publish_gate_allows_when_no_pending_mission(monkeypatch: pytest.MonkeyPatch) -> None:
     """_prepare_locked creates the pending mission when no conflict exists."""
     monkeypatch.setattr(deployctl, "_read_state", lambda: None)
     monkeypatch.setattr(deployctl, "_cleanup_pending_locked", lambda: None)
@@ -1498,6 +1519,7 @@ def test_publish_gate_allows_when_no_pending_mission(
         ("d" * 40, 1, 1, True, False),
     ],
 )
+@pytest.mark.usefixtures("supervisor_token")
 def test_rollback_terminalization_rejects_superseded_readiness(
     monkeypatch: pytest.MonkeyPatch,
     case: tuple[str | None, int, int, bool, bool],
@@ -1533,6 +1555,7 @@ def test_rollback_terminalization_rejects_superseded_readiness(
     written.assert_not_called()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_rejects_newer_unapplied_different_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1573,6 +1596,7 @@ def test_confirmation_rejects_newer_unapplied_different_commit(
     rollback.assert_not_called()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_authority_accepts_direct_mission_over_older_desired() -> None:
     """A mission may directly outrank the older desired intent it supersedes."""
     mission = replace(_make_mission(deployctl.STATUS_PENDING), generation=2)
@@ -1607,6 +1631,7 @@ def test_confirmation_authority_accepts_direct_mission_over_older_desired() -> N
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_ready_direct_mission_is_not_rollback_due_with_older_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1646,6 +1671,7 @@ def test_ready_direct_mission_is_not_rollback_due_with_older_desired(
     assert deployctl._pending_mission_rollback_due(mission) is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_authority_distinguishes_superseding_and_same_commit_intents() -> None:
     """Different commits supersede a mission while same-commit replacements remain obligations."""
     mission = _make_mission(deployctl.STATUS_PENDING)
@@ -1681,6 +1707,7 @@ def test_confirmation_authority_distinguishes_superseding_and_same_commit_intent
     assert deployctl._supervised_confirmation_authority_matches(mission, desired, status) is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_rejects_unreadable_desired_before_settlement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1709,6 +1736,7 @@ def test_confirmation_rejects_unreadable_desired_before_settlement(
     rollback.assert_not_called()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_terminalization_rejects_newer_same_commit_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1741,6 +1769,7 @@ def test_confirmation_terminalization_rejects_newer_same_commit_generation(
     written.assert_not_called()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_terminalization_accepts_exact_settled_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1789,6 +1818,7 @@ def test_confirmation_terminalization_accepts_exact_settled_generation(
     assert written == [terminal]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_terminalization_rejects_dead_settled_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1834,6 +1864,7 @@ def test_confirmation_terminalization_rejects_dead_settled_child(
     written.assert_not_called()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_rollback_terminalization_requires_live_settled_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1887,6 +1918,7 @@ def test_rollback_terminalization_requires_live_settled_child(
     assert written == [terminal]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirmation_preparation_returns_settled_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

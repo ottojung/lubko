@@ -108,6 +108,7 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return root
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_completion_holds_deployment_lock(isolated: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Authority mutations are serialized under the deployctl deployment lock."""
     del isolated
@@ -130,9 +131,8 @@ def test_completion_holds_deployment_lock(isolated: Path, monkeypatch: pytest.Mo
     assert lock_held_during_mutation
 
 
-def test_newer_mission_survives_and_owns_authority_over_stale_migration(
-    isolated: Path,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_newer_mission_survives_and_owns_authority_over_stale_migration(isolated: Path) -> None:
     """A newer published mission outranks the stale migration completion."""
     del isolated
     migration_intent(6, NEW)
@@ -152,6 +152,7 @@ def test_newer_mission_survives_and_owns_authority_over_stale_migration(
     "malformed",
     ["{broken", "0", "true", "[]", "{}", '"unsupported"'],
 )
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_mission_holds_cold_migration_completion(
     isolated: Path, monkeypatch: pytest.MonkeyPatch, malformed: str
 ) -> None:
@@ -182,6 +183,7 @@ def test_malformed_mission_holds_cold_migration_completion(
         )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_in_flight_migration_holds_cli_reconciliation(isolated: Path) -> None:
     """Reconciliation never targets the unproven migrated commit."""
     del isolated
@@ -190,6 +192,7 @@ def test_in_flight_migration_holds_cli_reconciliation(isolated: Path) -> None:
     assert dc._cli_target_commit(mission(5, dc.STATUS_CONFIRMED, OLD)) is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_newer_mission_resumes_normal_reconciliation(isolated: Path) -> None:
     """A strictly newer mission supersedes the hold and owns the pointer."""
     del isolated
@@ -198,6 +201,7 @@ def test_newer_mission_resumes_normal_reconciliation(isolated: Path) -> None:
     assert dc._cli_target_commit(dc.read_rollback_state()) == NEWER
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_present_non_boolean_migration_flag_fails_closed() -> None:
     """A present ``migration`` value must be a real JSON boolean or fail closed."""
     malformed_values: tuple[object, ...] = (1, "true", None, {}, [])
@@ -212,6 +216,7 @@ def test_present_non_boolean_migration_flag_fails_closed() -> None:
             supervise.SupervisorDesired.from_dict(payload)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_absent_migration_flag_remains_backward_compatible_false() -> None:
     """Legacy intents without a ``migration`` key parse as migration=False."""
     desired = supervise.SupervisorDesired.from_dict({
@@ -222,9 +227,8 @@ def test_absent_migration_flag_remains_backward_compatible_false() -> None:
     assert desired.migration is False
 
 
-def test_corrupt_migration_intent_holds_instead_of_trusting_meta(
-    isolated: Path,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_corrupt_migration_intent_holds_instead_of_trusting_meta(isolated: Path) -> None:
     """A malformed authoritative intent never falls back to live meta."""
     del isolated
     supervise.desired_path().parent.mkdir(parents=True, exist_ok=True)
@@ -242,6 +246,7 @@ def test_corrupt_migration_intent_holds_instead_of_trusting_meta(
     assert dc._cli_target_commit(None) is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_unreadable_intent_fails_closed(isolated: Path) -> None:
     """A present but unreadable authority file is corruption, not absence."""
     del isolated
@@ -253,6 +258,7 @@ def test_unreadable_intent_fails_closed(isolated: Path) -> None:
     assert dc._cli_target_commit(None) is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_genuinely_absent_intent_still_reconciles_to_live_meta(
     isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -17,6 +17,7 @@ def _malformed_mission() -> deployctl.RollbackState | None:
     raise deployctl.DeployCtlError(message)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_derive_action_restores_confirmed_before_mission_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -35,6 +36,7 @@ def test_derive_action_restores_confirmed_before_mission_on_malformed_desired(
     assert mission_reads == []
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_reconcile_restores_confirmed_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -60,6 +62,7 @@ def test_reconcile_restores_confirmed_on_malformed_desired(
     assert "independently confirmed runtime" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_corrupt_candidate_mission_restores_confirmed_not_desired_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -79,6 +82,7 @@ def test_corrupt_candidate_mission_restores_confirmed_not_desired_candidate(
     assert "restoring independently confirmed runtime" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_desired_cannot_advance_pending_mission_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -100,6 +104,7 @@ def test_malformed_desired_cannot_advance_pending_mission_generation(
     assert state_writes == []
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_desired_cannot_clear_cold_migration_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -130,6 +135,7 @@ def _desired(commit: str, generation: int = 1) -> supervise.SupervisorDesired:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_pre_spawn_revalidation_restores_confirmed_on_malformed_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -153,6 +159,7 @@ def test_pre_spawn_revalidation_restores_confirmed_on_malformed_desired(
     assert spawned == [confirmed]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_authority_holds_without_usable_confirmed_anchor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -168,6 +175,7 @@ def test_malformed_authority_holds_without_usable_confirmed_anchor(
     assert "no usable confirmed runtime" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_pre_spawn_revalidation_blocks_superseded_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -188,6 +196,7 @@ def test_pre_spawn_revalidation_blocks_superseded_commit(
     assert "intent changed" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_pre_spawn_revalidation_preserves_unchanged_desired(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

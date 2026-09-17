@@ -46,7 +46,7 @@ FAKE_RUNTIME_ROOT = Path("/opt/lubko-fake-runtime")
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:  # ruff: ignore[unused-function-argument]
     """Use an isolated durable state root for each test.
 
     Returns:
@@ -160,6 +160,7 @@ def _patch_recovery(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
 
 @pytest.mark.parametrize("raw_meta", ["{", "[]"])
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_holds_on_invalid_maintained_worker_metadata(
     monkeypatch: pytest.MonkeyPatch, raw_meta: str
 ) -> None:
@@ -181,6 +182,7 @@ def test_supervisor_holds_on_invalid_maintained_worker_metadata(
     assert path.read_text() == raw_meta
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_supervisor_still_spawns_when_maintained_worker_metadata_is_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,6 +202,7 @@ def test_supervisor_still_spawns_when_maintained_worker_metadata_is_absent(
     assert spawned == [COMMIT]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_child_published_with_spawning_then_meta_then_spawning_cleared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -244,9 +247,8 @@ def test_child_published_with_spawning_then_meta_then_spawning_cleared(
     assert meta_log[0].token == published.child.token
 
 
-def test_meta_write_failure_keeps_spawning_durable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_meta_write_failure_keeps_spawning_durable(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed meta write leaves spawning durable (replacement-blocking)."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
     monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: FAKE_RUNTIME_ROOT)
@@ -276,6 +278,7 @@ def test_meta_write_failure_keeps_spawning_durable(
     assert lifecycle.read_meta() is None, "no meta was published on failure"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_deferred_publication_retries_then_clears_on_next_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -300,6 +303,7 @@ def test_deferred_publication_retries_then_clears_on_next_tick(
     assert meta_log[0].pid == child.pid
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_deferred_publication_meta_failure_stops_reconciliation_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -342,6 +346,7 @@ def test_deferred_publication_meta_failure_stops_reconciliation_turn(
     assert read_state().child is not None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_in_progress_publication_is_not_converged_as_live_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -361,6 +366,7 @@ def test_in_progress_publication_is_not_converged_as_live_spawn(
     assert observed == [], "no group recovery ran for an in-progress publication"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_manual_recovery_blocked_while_spawning_retained() -> None:
     """A retained spawning obligation blocks a second consumer's adoption."""
     child = _published_child()
@@ -405,9 +411,8 @@ def test_manual_recovery_blocked_while_spawning_retained() -> None:
     assert lifecycle._pre_adoption_authority_error(matching) is not None
 
 
-def test_fully_published_state_has_no_blocking_obligation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_fully_published_state_has_no_blocking_obligation(monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful publication ends with child published, meta present, no spawning."""
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
     monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: FAKE_RUNTIME_ROOT)
@@ -433,9 +438,8 @@ def test_fully_published_state_has_no_blocking_obligation(
     assert lifecycle._pre_adoption_authority_error(meta) is None
 
 
-def test_pre_popen_obligation_carries_no_child(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_pre_popen_obligation_carries_no_child(monkeypatch: pytest.MonkeyPatch) -> None:
     """Before Popen the obligation is durable with no child identity yet."""
     observed: list[SpawningObligation | None] = []
 
@@ -491,6 +495,7 @@ class _FakeDirectProc:
         self.terminated = True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_missing_pre_popen_obligation_fails_closed_without_synthesis(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -536,6 +541,7 @@ def test_missing_pre_popen_obligation_fails_closed_without_synthesis(
     assert "pre-Popen obligation" in daemon._message
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_missing_obligation_convergence_failure_keeps_durable_blocking_hold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -599,6 +605,7 @@ def test_missing_obligation_convergence_failure_keeps_durable_blocking_hold(
     assert read_state().unresolved_child is not None, "the hold stayed durable"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_missing_obligation_without_direct_handle_keeps_durable_blocking_hold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -648,6 +655,7 @@ def test_missing_obligation_without_direct_handle_keeps_durable_blocking_hold(
     assert spawn_attempts == [], "the durable hold blocked any replacement spawn"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_missing_obligation_converged_but_group_recovery_fails_keeps_token_hold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

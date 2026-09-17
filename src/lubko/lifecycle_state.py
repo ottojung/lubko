@@ -248,6 +248,10 @@ def reconcile_authority_facts() -> AuthorityFacts:
         The reconciled :class:`AuthorityFacts` snapshot.
     """
     from lubko import deployctl, lifecycle, supervise  # ruff: ignore[import-outside-top-level]
+    from lubko.supervise_client import (  # ruff: ignore[import-outside-top-level]
+        read_desired_client,
+        read_state_client,
+    )
 
     malformed = False
     owned_pid: int | None = None
@@ -275,7 +279,7 @@ def reconcile_authority_facts() -> AuthorityFacts:
         mission = None
 
     try:
-        desired_intent = supervise.read_desired_strict()
+        desired_intent = read_desired_client()
     except Exception:  # ruff: ignore[blind-except] - unreadable desired intent fails closed
         desired_intent = None
         malformed = True
@@ -283,7 +287,7 @@ def reconcile_authority_facts() -> AuthorityFacts:
         desired_generation = desired_intent.generation if desired_intent is not None else 0
 
     try:
-        state = supervise.read_state()
+        state = read_state_client()
     except Exception:  # ruff: ignore[blind-except] - unreadable supervisor state fails closed
         state = None
         malformed = True

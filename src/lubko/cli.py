@@ -48,7 +48,8 @@ from typing import TYPE_CHECKING, Final
 
 from lubko.durable import DurabilityError, write_symlink_durable
 from lubko.state import cli_root_dir, state_root
-from lubko.supervise import read_desired, read_state
+from lubko.supervise import DesiredIntentError
+from lubko.supervise_client import read_desired_client, read_state_client
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -752,10 +753,16 @@ def supervisor_authoritative_commits() -> set[str]:
         The set of valid 40-hex commits that must be preserved.
     """
     preserved: set[str] = set()
-    desired = read_desired()
+    try:
+        desired = read_desired_client()
+    except (DesiredIntentError, ConnectionError, OSError):
+        desired = None
     if desired is not None and is_valid_commit_name(desired.commit):
         preserved.add(desired.commit)
-    state = read_state()
+    try:
+        state = read_state_client()
+    except (ConnectionError, OSError):
+        return preserved
     state_commit = state.commit
     if state_commit is not None and is_valid_commit_name(state_commit):
         preserved.add(state_commit)

@@ -25,6 +25,7 @@ def isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_fresh_state_is_reported_holding_not_running(isolated_state: Path) -> None:
     """No supervisor process: diagnostic is non-live and marked holding."""
     assert isolated_state.is_dir()
@@ -37,6 +38,7 @@ def test_fresh_state_is_reported_holding_not_running(isolated_state: Path) -> No
     assert diag.child_present is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_ownership_hold_malformed_is_reported_holding(isolated_state: Path) -> None:
     """A durable replacement-blocking hold is surfaced as holding."""
     assert isolated_state.is_dir()
@@ -48,6 +50,7 @@ def test_ownership_hold_malformed_is_reported_holding(isolated_state: Path) -> N
     assert diag.ownership_hold_malformed is True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_running_child_is_not_holding(isolated_state: Path) -> None:
     """A confirmed running child with a run intent is not holding."""
     assert isolated_state.is_dir()
@@ -75,6 +78,7 @@ def test_running_child_is_not_holding(isolated_state: Path) -> None:
     assert diag.ready is True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_diagnostic_round_trips(isolated_state: Path) -> None:
     """The durable diagnostic serializes and parses back identically."""
     assert isolated_state.is_dir()
@@ -95,6 +99,7 @@ def test_diagnostic_round_trips(isolated_state: Path) -> None:
     assert restored.ownership_hold_malformed is True
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_live_status_carries_holding_flag(isolated_state: Path) -> None:
     """A live SupervisorStatus exposes the derived holding state."""
     assert isolated_state.is_dir()
@@ -163,6 +168,7 @@ def _assert_diagnostic_rejects(field: str, malformed: object) -> None:
         supervise.SupervisorDiagnostic.from_dict(data)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_diagnostic_rejects_malformed_present_booleans() -> None:
     """Present diagnostic boolean fields are literal JSON booleans only."""
     cases: tuple[tuple[str, object], ...] = (
@@ -182,6 +188,7 @@ def test_diagnostic_rejects_malformed_present_booleans() -> None:
         _assert_diagnostic_rejects(field, malformed)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_diagnostic_rejects_noncanonical_numbers() -> None:
     """Diagnostic counters and timestamps never use permissive coercion."""
     counter_cases: tuple[tuple[str, object], ...] = (
@@ -200,6 +207,7 @@ def test_diagnostic_rejects_noncanonical_numbers() -> None:
             _assert_diagnostic_rejects(field, malformed)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_diagnostic_rejects_malformed_present_strings() -> None:
     """Present diagnostic strings cannot collapse to defaults or null."""
     cases: tuple[tuple[str, object], ...] = (
@@ -216,6 +224,7 @@ def test_diagnostic_rejects_malformed_present_strings() -> None:
         _assert_diagnostic_rejects(field, malformed)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_diagnostic_defaults_apply_only_to_absent_legacy_fields() -> None:
     """Legacy absence keeps documented defaults without accepting malformed presence."""
     data = _canonical_diagnostic_mapping()

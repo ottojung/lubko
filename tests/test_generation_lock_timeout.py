@@ -116,6 +116,7 @@ def _make_deploy_options() -> DeployOptions:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_acquire_and_release() -> None:
     """generation_lock succeeds immediately when uncontended."""
     with supervise.generation_lock():
@@ -125,6 +126,7 @@ def test_generation_lock_acquire_and_release() -> None:
     assert desired.generation == 1
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_reentrant_after_release() -> None:
     """A second acquisition succeeds after the first releases."""
     with supervise.generation_lock():
@@ -141,6 +143,7 @@ def test_generation_lock_reentrant_after_release() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_timeout_on_deadline() -> None:
     """Timeout fires when monotonic exceeds the deadline during contention.
 
@@ -159,6 +162,7 @@ def test_generation_lock_timeout_on_deadline() -> None:
         pass  # pragma: no cover
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_timeout_message_content() -> None:
     """The timeout error message mentions the generation lock."""
     _call_count, monotonic_fn = _deadline_exceeded_monotonic()
@@ -172,6 +176,7 @@ def test_generation_lock_timeout_message_content() -> None:
         pass  # pragma: no cover
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_no_mutation_on_timeout() -> None:
     """No durable state changes when the lock times out.
 
@@ -200,6 +205,7 @@ def test_generation_lock_no_mutation_on_timeout() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_release_on_normal_exit() -> None:
     """Lock is released after a normal with-block completes."""
     with supervise.generation_lock():
@@ -208,6 +214,7 @@ def test_generation_lock_release_on_normal_exit() -> None:
         _write_desired(2)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_release_on_exception() -> None:
     """Lock is released even when the body raises.
 
@@ -229,6 +236,7 @@ def test_generation_lock_release_on_exception() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_eventual_acquisition() -> None:
     """Second holder acquires once the first releases."""
     lock_path = supervise.supervisor_dir() / ".generation.lock"
@@ -264,6 +272,7 @@ def test_generation_lock_eventual_acquisition() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_generation_lock_contended_monotonicity() -> None:
     """Two threads allocating under the lock produce unique generations."""
     generations: list[int] = []
@@ -296,6 +305,7 @@ def test_generation_lock_contended_monotonicity() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_next_mission_generation_wraps_timeout() -> None:
     """deployctl.next_mission_generation wraps timeout as DeployCtlError."""
     with (
@@ -308,6 +318,7 @@ def test_next_mission_generation_wraps_timeout() -> None:
         deployctl.next_mission_generation()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_settle_desired_wraps_timeout() -> None:
     """deployctl.settle_desired wraps timeout as DeployCtlError."""
     with (
@@ -320,6 +331,7 @@ def test_settle_desired_wraps_timeout() -> None:
         deployctl.settle_desired("abc", "/repo", "uv")
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_finalize_rollback_wraps_timeout() -> None:
     """_finalize_supervised_rollback wraps timeout as DeployCtlError."""
     state = _make_rollback_state()
@@ -333,6 +345,7 @@ def test_finalize_rollback_wraps_timeout() -> None:
         deployctl._finalize_supervised_rollback(state, 1)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_finalize_confirmation_wraps_timeout() -> None:
     """_finalize_supervised_confirmation wraps timeout as DeployCtlError."""
     state = _make_rollback_state()
@@ -351,6 +364,7 @@ def test_finalize_confirmation_wraps_timeout() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_queue_deploy_candidate_converged_returns_false() -> None:
     """_queue_deploy_candidate_converged returns False on timeout."""
     with patch(
@@ -360,6 +374,7 @@ def test_queue_deploy_candidate_converged_returns_false() -> None:
         assert lifecycle._queue_deploy_candidate_converged("abc") is False
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_restore_after_handoff_logs_on_timeout() -> None:
     """_restore_after_handoff_failure logs and returns on request_run timeout."""
     options = _make_deploy_options()
@@ -375,12 +390,13 @@ def test_restore_after_handoff_logs_on_timeout() -> None:
         lifecycle._restore_after_handoff_failure(options, "abc", None)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_deploy_through_supervisor_wraps_timeout() -> None:
     """_deploy_through_supervisor wraps timeout as DeployAbortedError."""
     options = _make_deploy_options()
     with (
         patch(
-            "lubko.lifecycle.supervise.request_run",
+            "lubko.lifecycle.request_run_client",
             side_effect=supervise.GenerationLockTimeoutError("test"),
         ),
         pytest.raises(lifecycle.DeployAbortedError, match="generation lock"),
@@ -388,6 +404,7 @@ def test_deploy_through_supervisor_wraps_timeout() -> None:
         lifecycle._deploy_through_supervisor(options, "abc")
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_restart_intent_locked_returns_error() -> None:
     """_restart_intent_locked returns error string on timeout."""
     state = MagicMock()
@@ -395,12 +412,12 @@ def test_restart_intent_locked_returns_error() -> None:
     with (
         patch("lubko.lifecycle._supervised_mutation_blocker", return_value=None),
         patch("lubko.lifecycle.supervise.supervisor_running", return_value=True),
-        patch("lubko.lifecycle.supervise.read_state", return_value=state),
+        patch("lubko.lifecycle.read_state_client", return_value=state),
         patch("lubko.lifecycle.cli.runtime_is_usable", return_value=True),
         patch("lubko.lifecycle.supervise.read_status", return_value=None),
-        patch("lubko.lifecycle.supervise.read_desired", return_value=None),
+        patch("lubko.lifecycle.read_desired_client", return_value=None),
         patch(
-            "lubko.lifecycle.supervise.request_restart",
+            "lubko.lifecycle.request_run_client",
             side_effect=supervise.GenerationLockTimeoutError("test"),
         ),
     ):
@@ -411,16 +428,17 @@ def test_restart_intent_locked_returns_error() -> None:
     assert "generation lock" in error
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_request_restart_intent_locked_wraps_timeout() -> None:
     """_request_restart_intent_locked raises DeployAbortedError on timeout."""
     with (
         patch("lubko.lifecycle._supervised_mutation_blocker", return_value=None),
-        patch("lubko.lifecycle.supervise.read_state"),
+        patch("lubko.lifecycle.read_state_client"),
         patch("lubko.lifecycle.cli.runtime_is_usable", return_value=True),
         patch("lubko.lifecycle.supervise.read_status", return_value=None),
-        patch("lubko.lifecycle.supervise.read_desired", return_value=None),
+        patch("lubko.lifecycle.read_desired_client", return_value=None),
         patch(
-            "lubko.lifecycle.supervise.request_restart",
+            "lubko.lifecycle.request_run_client",
             side_effect=supervise.GenerationLockTimeoutError("test"),
         ),
         pytest.raises(lifecycle.DeployAbortedError, match="generation lock"),
@@ -428,6 +446,7 @@ def test_request_restart_intent_locked_wraps_timeout() -> None:
         lifecycle._request_restart_intent_locked()
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_migrate_locked_propagates_timeout() -> None:
     """_migrate_locked propagates GenerationLockTimeoutError on timeout."""
     with (
@@ -451,11 +470,13 @@ def test_migrate_locked_propagates_timeout() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_default_timeout_is_positive() -> None:
     """DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS is a positive number."""
     assert supervise.DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS > 0
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_poll_interval_is_bounded() -> None:
     """GENERATION_LOCK_POLL_SECONDS is a small positive fraction."""
     assert 0 < supervise.GENERATION_LOCK_POLL_SECONDS < 1.0

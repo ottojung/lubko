@@ -5,16 +5,19 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import pytest
+
 from lubko import supervisor
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
 
-
+@pytest.mark.usefixtures("supervisor_token")
 def test_bootstrap_hold_is_visible_and_not_relogged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Expose fresh bootstrap hold once without spawning or log spam."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))

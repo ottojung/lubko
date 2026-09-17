@@ -52,9 +52,14 @@ from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
-from lubko.durable import remove_durable, write_json_durable
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.health import validate_incarnation_token
-from lubko.state import rollback_state_path, state_root
+from lubko.state import (
+    SupervisorStateTokenError,
+    rollback_state_path,
+    state_root,
+    supervisor_state_token,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -947,34 +952,164 @@ def derive_durable_diagnostic() -> SupervisorDiagnostic:
 
 
 def supervisor_dir() -> Path:
-    """Return the directory holding external-supervisor state.
+    """Return the untokenized supervisor directory (public request/observation surface).
+
+    This path is the stable, non-authoritative surface that CLI tools
+    (``lubko-deploy``, ``lubko-deploy-ctl``) use to write requests
+    (``desired.json``) and read observations (``status.json``).  It is
+    deliberately **not** tokenized so tokenless client commands can
+    request and observe lifecycle actions without holding the supervisor
+    state token.
 
     Returns:
-        The per-user supervisor state directory.
+        The per-user supervisor state directory (untokenized).
     """
     return state_root() / "supervisor"
 
 
+def supervisor_private_dir() -> Path:
+    """Return the tokenized supervisor directory (private authoritative state).
+
+    The path is ``supervisor_dir() / <token>``, isolating the daemon's
+    authoritative mutable state under a high-entropy opaque namespace so
+    ordinary/default state resolution cannot accidentally reach live
+    supervisor authority.
+
+    Raises:
+        SupervisorStateTokenError: If ``LUBKO_SUPERVISOR_STATE_TOKEN`` is
+            absent or empty.  The daemon must never start without a valid
+            token.
+    """
+    token = supervisor_state_token()
+    if token is None:
+        msg = (
+            "LUBKO_SUPERVISOR_STATE_TOKEN is required to resolve private supervisor authority paths"
+        )
+        raise SupervisorStateTokenError(msg)
+    return supervisor_dir() / token
+
+
 def desired_path() -> Path:
-    """Return the path of the durable desired-intent file.
+    """Return the path of the durable desired-intent file (private authority).
+
+    The desired intent is lifecycle authority: it names the exact commit the
+    supervisor daemon must run.  The file lives under the tokenized directory
+    so only the token-holding supervisor daemon may read or write it.  CLI
+    tools submit requests through the control socket or the non-authoritative
+    pending-request surface, never by writing this file directly.
+    """
+    return supervisor_private_dir() / "desired.json"
+
+
+def pending_request_path() -> Path:
+    """Return the path of the non-authoritative pending install request.
+
+    During fresh ``lubko-install`` (no supervisor running, no token), the
+    install command writes the initial desired intent here.  The supervisor
+    daemon promotes it to the tokenized ``desired_path()`` on startup.
+
+    The file is in the public supervisor directory (untokenized) so
+    tokenless install commands can write it.  It is never read as
+    lifecycle authority by the running supervisor — only promoted.
+    """
+    return supervisor_dir() / "pending-request.json"
+
+
+def pending_request_ack_dir() -> Path:
+    """Return the directory for non-authoritative pending-request acknowledgments.
+
+    After the supervisor promotes a pending request, it writes an ack
+    file keyed to the request's ``request_id`` so the installing CLI
+    can confirm its request was consumed.  The directory is in the
+    public supervisor directory (untokenized) so tokenless install
+    commands can read acks.
+    """
+    return supervisor_dir() / "pending-ack"
+
+
+_VALID_REQUEST_ID_LEN: Final = 32
+
+
+def validate_pending_request_id(request_id: str) -> str:
+    """Validate a pending request ID is exactly 32 lowercase hex characters.
+
+    Args:
+        request_id: The candidate request ID.
 
     Returns:
-        The ``desired.json`` path.
+        The validated request ID.
+
+    Raises:
+        ValueError: If the request ID is not 32 lowercase hex characters.
     """
-    return supervisor_dir() / "desired.json"
+    if len(request_id) != _VALID_REQUEST_ID_LEN or not all(
+        ch in "0123456789abcdef" for ch in request_id
+    ):
+        msg = "pending request_id must be exactly 32 lowercase hex chars"
+        raise ValueError(msg)
+    return request_id
+
+
+def pending_request_ack_path(request_id: str) -> Path:
+    """Return the ack file path for a specific pending request.
+
+    Args:
+        request_id: The request ID (must be validated hex).
+
+    Returns:
+        The ack file path.
+    """
+    validate_pending_request_id(request_id)
+    return pending_request_ack_dir() / f"{request_id}.json"
 
 
 def state_path() -> Path:
-    """Return the path of the daemon's durable state file.
+    """Return the path of the daemon's durable state file (private authority).
 
-    Returns:
-        The ``state.json`` path.
+    The state file lives under the tokenized directory, isolating
+    recovery authority from ordinary state resolution.
+
+    Raises:
+        SupervisorStateTokenError: If ``LUBKO_SUPERVISOR_STATE_TOKEN`` is
+            absent or empty.  State is lifecycle authority and must never
+            be resolvable without the token.
     """
-    return supervisor_dir() / "state.json"
+    token = supervisor_state_token()
+    if token is None:
+        msg = "LUBKO_SUPERVISOR_STATE_TOKEN is required to resolve state_path"
+        raise SupervisorStateTokenError(msg)
+    return supervisor_dir() / token / "state.json"
+
+
+def private_authority_path() -> Path:
+    """Return the path of the private spawning/recovery authority file.
+
+    The file lives under the tokenized directory, isolating
+    replacement-blocking recovery authority from ordinary state
+    resolution.
+    """
+    return supervisor_private_dir() / "authority.json"
+
+
+def reserved_generation_path() -> Path:
+    """Return the path of the reserved generation record (private authority).
+
+    When a tokenless caller allocates a generation via the supervisor
+    control socket, the supervisor durably records the reserved generation
+    here so that concurrent allocators cannot reuse it.  The reservation
+    is overwritten by the next allocation and does not require explicit
+    clearing.
+    """
+    return supervisor_private_dir() / "reserved_generation.json"
 
 
 def status_path() -> Path:
-    """Return the path of the machine-readable status file.
+    """Return the path of the machine-readable status file (observation surface).
+
+    This is the non-authoritative observation surface: the supervisor
+    daemon publishes status here for CLI tools to read.  The path is
+    deliberately **not** tokenized so tokenless client commands can
+    observe lifecycle state.
 
     Returns:
         The ``status.json`` path.
@@ -1002,6 +1137,8 @@ class GenerationLockTimeoutError(Exception):
 CONSUMER_LOCK_POLL_SECONDS = 0.05
 GENERATION_LOCK_POLL_SECONDS = 0.05
 DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS = 30.0
+PENDING_REQUEST_LOCK_POLL_SECONDS = 0.05
+DEFAULT_PENDING_REQUEST_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 @contextmanager
@@ -1116,11 +1253,65 @@ def generation_lock(
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+class PendingRequestLockTimeoutError(Exception):
+    """The pending-request lock could not be acquired in time."""
+
+
+@contextmanager
+def pending_request_lock(
+    timeout_seconds: float = DEFAULT_PENDING_REQUEST_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Serialize pending-request write and promotion across processes.
+
+    The pending-request file is a shared public surface written by tokenless
+    CLI callers and consumed by the supervisor daemon.  Concurrent writers
+    must not clobber each other's durable ack, and the supervisor must not
+    remove the pending file while a newer writer is about to overwrite it.
+
+    Lock ordering: pending-request lock may be held while ensure_run_intent
+    acquires the generation lock (the promoter calls ensure_run_intent inside
+    the pending-request lock).  Code must never acquire the pending-request
+    lock while the generation lock is already held.
+
+    Args:
+        timeout_seconds: Maximum seconds to wait for the lock.
+
+    Yields:
+        Nothing while the lock is held.
+
+    Raises:
+        PendingRequestLockTimeoutError: If the lock cannot be acquired in time.
+    """
+    path = supervisor_dir() / ".pending-request.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    msg = "timed out waiting for the pending-request lock"
+                    raise PendingRequestLockTimeoutError(msg) from None
+                time.sleep(PENDING_REQUEST_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def supervisor_lock_path() -> Path:
     """Return the path of the process-level supervisor ownership lock.
 
+    This is the **global singleton gate**: exactly one flock at this
+    untokenized path, held for the daemon's entire lifetime.  Two
+    differently-tokened supervisors must never both become authority, so
+    this lock is deliberately **not** tokenized.  The kernel releases it
+    automatically on process death (graceful, crash, or SIGKILL).
+
     Returns:
-        The lock file path inside the supervisor state directory.
+        The lock file path at the untokenized supervisor directory.
     """
     return supervisor_dir() / ".supervisor.lock"
 
@@ -1318,12 +1509,19 @@ def write_desired(desired: SupervisorDesired) -> None:
     Args:
         desired: Intent to store.
 
+    Raises:
+        DurabilityError: If the write cannot be confirmed durable.
+
     Note:
         Fails closed: the write raises :class:`DurabilityError` from
         :func:`lubko.durable.write_json_durable` when it cannot be confirmed
         durable, so callers must not advance a dependent action.
     """
-    write_json_durable(desired_path(), desired.to_dict())
+    try:
+        write_json_durable(desired_path(), desired.to_dict())
+    except DurabilityError:
+        msg = "failed to durably write desired intent"
+        raise DurabilityError(msg) from None
 
 
 class DesiredIntentError(RuntimeError):
@@ -1356,9 +1554,9 @@ def read_desired_strict() -> SupervisorDesired | None:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError as exc:
-        msg = f"cannot read the supervisor desired intent: {exc}"
-        raise DesiredIntentError(msg) from exc
+    except OSError:
+        msg = "cannot read the supervisor desired intent"
+        raise DesiredIntentError(msg) from None
     try:
         decoded = json.loads(raw)
     except ValueError as exc:
@@ -1405,12 +1603,19 @@ def write_state(state: SupervisorState) -> None:
     Args:
         state: State to store.
 
+    Raises:
+        DurabilityError: If the write cannot be confirmed durable.
+
     Note:
         Fails closed: the write raises :class:`DurabilityError` from
         :func:`lubko.durable.write_json_durable` when it cannot be confirmed
         durable, so callers must not advance a dependent action.
     """
-    write_json_durable(state_path(), state.to_dict())
+    try:
+        write_json_durable(state_path(), state.to_dict())
+    except DurabilityError:
+        msg = "failed to durably write supervisor state"
+        raise DurabilityError(msg) from None
 
 
 def write_state_preserving_authority(
@@ -1806,11 +2011,11 @@ def next_generation() -> int:
     """Return the next generation for a new desired intent.
 
     The generation is one greater than every generation seen so far: the
-    supervisor applied generation, the desired intent, and the durable
-    supervised-mission generation. A writer that lost a read-modify-write race
-    never reuses a generation the daemon has already applied, and a restart or
-    deploy issued against an open mission can never be outranked by that older
-    mission.
+    supervisor applied generation, the desired intent, the durable
+    supervised-mission generation, and any reserved generation.  A writer
+    that lost a read-modify-write race never reuses a generation the daemon
+    has already applied, and a restart or deploy issued against an open
+    mission can never be outranked by that older mission.
 
     Returns:
         The next monotonic generation.
@@ -1820,16 +2025,219 @@ def next_generation() -> int:
     # writer must fail closed rather than erase or outrank an unreadable intent.
     desired = read_desired_strict()
     desired_generation = desired.generation if desired is not None else 0
-    return max(applied, desired_generation, _mission_generation()) + 1
+    return max(applied, desired_generation, _mission_generation(), _reserved_generation()) + 1
 
 
-def _write_run_intent_locked(
+def _reserved_generation() -> int:
+    """Return the reserved generation, or 0 when genuinely absent.
+
+    A reserved generation is a generation allocated by the supervisor for
+    a tokenless caller that has not yet been used in a published mission.
+    The reservation prevents concurrent allocators from reusing the same
+    generation.
+
+    Genuine absence (no file) returns 0. A present but unreadable,
+    malformed, or non-positive reservation is durable authority corruption
+    and fails closed: returning 0 would silently permit generation reuse
+    behind a possibly-live reservation.
+
+    Returns:
+        The reserved generation, or 0 when absent.
+
+    Raises:
+        MissionAuthorityError: If a present reservation cannot be trusted.
+    """
+    path = reserved_generation_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        msg = "cannot read reserved generation authority"
+        raise MissionAuthorityError(msg) from None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        msg = "reserved generation authority is malformed JSON"
+        raise MissionAuthorityError(msg) from exc
+    if not isinstance(data, dict):
+        msg = "reserved generation authority is not a JSON object"
+        raise MissionAuthorityError(msg)
+    gen = data.get("generation")
+    if not isinstance(gen, int) or gen <= 0:
+        msg = "reserved generation authority has invalid generation"
+        raise MissionAuthorityError(msg)
+    return gen
+
+
+def write_pending_request(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+    request_id: str,
+) -> None:
+    """Write a non-authoritative pending install request.
+
+    During fresh ``lubko-install`` (no token, no running supervisor), the
+    install command writes the initial desired intent here.  The supervisor
+    daemon promotes it to the tokenized ``desired_path()`` on startup.
+
+    The file is a plain JSON dict with the same fields as
+    ``SupervisorDesired`` but without generation (the supervisor allocates
+    that atomically on promotion).
+
+    The write is serialized under the pending-request lock so a concurrent
+    promotion cannot read a half-written file or remove the file between
+    our write and our ack check.
+
+    Args:
+        commit: Exact commit the install wants to activate.
+        repo: Maintained checkout path.
+        uv_path: Resolved ``uv`` executable path.
+        worker_id: Worker identifier, or ``None``.
+        request_id: Strict 32-lowercase-hex identifier for ack correlation.
+    """
+    validate_pending_request_id(request_id)
+    data: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "commit": commit,
+        "repo": repo,
+        "uv_path": uv_path,
+        "worker_id": worker_id,
+        "request_id": request_id,
+    }
+    with pending_request_lock():
+        write_json_durable(pending_request_path(), data)
+
+
+def promote_pending_request() -> bool:
+    """Promote a pending install request to the tokenized desired authority.
+
+    Called by the supervisor daemon every reconciliation loop (after acquiring
+    the token).  The whole load-validate-promote-ack-remove sequence runs
+    under the pending-request lock so a concurrent writer cannot clobber the
+    file between our load and our removal.
+
+    Returns:
+        ``True`` when a pending request was processed, ``False`` when none
+        existed or the request was malformed.
+    """
+    with pending_request_lock():
+        path = pending_request_path()
+        data = _load_pending_request(path)
+        if data is None:
+            return False
+
+        # Extract and validate request_id first so every failure path can write
+        # a safe ack.  An invalid or missing request_id means no ack is written
+        # (there is no safe public path to target) and the pending file is
+        # simply removed as corrupt.
+        raw_request_id = data.get("request_id")
+        if not isinstance(raw_request_id, str):
+            remove_durable(path)
+            return False
+        try:
+            request_id = validate_pending_request_id(raw_request_id)
+        except ValueError:
+            remove_durable(path)
+            return False
+
+        processed = _promote_pending_request_validated(data, request_id)
+        remove_durable(path)
+        return processed
+
+
+def _promote_pending_request_validated(
+    data: dict[str, object],
+    request_id: str,
+) -> bool:
+    """Process a pending request whose request_id is already validated.
+
+    Args:
+        data: The parsed pending request dict.
+        request_id: The validated 32-lowercase-hex request ID.
+
+    Returns:
+        ``True`` when the request was successfully promoted.
+    """
+    commit = data.get("commit")
+    if not isinstance(commit, str) or not commit:
+        _write_pending_ack(request_id, ok=False, error="missing or invalid commit")
+        return False
+    repo_val = data.get("repo", "")
+    uv_val = data.get("uv_path", "")
+    worker_val = data.get("worker_id")
+    try:
+        generation = ensure_run_intent(
+            commit,
+            repo=str(repo_val) if isinstance(repo_val, str) else "",
+            uv_path=str(uv_val) if isinstance(uv_val, str) else "",
+            worker_id=str(worker_val) if isinstance(worker_val, str) else None,
+        )
+    except DesiredAuthorityConflictError:
+        _write_pending_ack(
+            request_id, ok=False, error="conflict with existing supervisor authority"
+        )
+        return False
+    except (DesiredIntentError, MissionAuthorityError):
+        _write_pending_ack(
+            request_id, ok=False, error="supervisor authority is malformed or unreadable"
+        )
+        return False
+    _write_pending_ack(request_id, ok=True, generation=generation)
+    return True
+
+
+def _write_pending_ack(
+    request_id: str,
+    *,
+    ok: bool,
+    generation: int | None = None,
+    error: str | None = None,
+) -> None:
+    """Write a durable ack for a pending request.
+
+    Args:
+        request_id: The validated 32-lowercase-hex request ID.
+        ok: Whether the promotion succeeded.
+        generation: The allocated generation on success.
+        error: The error message on failure.
+    """
+    data: dict[str, object] = {"ok": ok}
+    if generation is not None:
+        data["generation"] = generation
+    if error is not None:
+        data["error"] = error
+    write_json_durable(pending_request_ack_path(request_id), data)
+
+
+def _load_pending_request(path: Path) -> dict[str, object] | None:
+    """Load and validate a pending request file, returning None on any failure.
+
+    Returns:
+        The parsed JSON dict, or ``None`` on any read/parse error.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_run_intent_locked(  # ruff: ignore[too-many-arguments]
     commit: str,
     *,
     repo: str,
     uv_path: str,
     worker_id: str | None,
     restart: bool,
+    migration: bool = False,
 ) -> int:
     """Write one fresh run intent while the generation lock is held.
 
@@ -1839,6 +2247,7 @@ def _write_run_intent_locked(
         uv_path: Resolved ``uv`` executable (recorded for coherence).
         worker_id: Worker identifier to hand to the worker.
         restart: Whether the intent explicitly replaces an existing process.
+        migration: Whether this is a cold migration intent.
 
     Returns:
         The generation of the written intent.
@@ -1854,6 +2263,7 @@ def _write_run_intent_locked(
             worker_id=worker_id,
             restart=restart,
             requested_at=time.time(),
+            migration=migration,
         )
     )
     return generation
@@ -1884,7 +2294,11 @@ def ensure_run_intent(
 
     Raises:
         DesiredAuthorityConflictError: If existing lifecycle authority forbids convergence.
+        SupervisorStateTokenError: If ``LUBKO_SUPERVISOR_STATE_TOKEN`` is absent.
     """
+    if supervisor_state_token() is None:
+        msg = "LUBKO_SUPERVISOR_STATE_TOKEN is required for direct ensure_run_intent"
+        raise SupervisorStateTokenError(msg)
     with generation_lock():
         current = read_desired_strict()
         if current is not None:
@@ -1910,13 +2324,14 @@ def ensure_run_intent(
         )
 
 
-def request_run(
+def request_run(  # ruff: ignore[too-many-arguments]
     commit: str,
     *,
     repo: str,
     uv_path: str,
     worker_id: str | None,
     restart: bool = False,
+    migration: bool = False,
 ) -> int:
     """Request the daemon to run the exact confirmed worker commit.
 
@@ -1928,6 +2343,7 @@ def request_run(
         restart: Whether this intent force-replaces a process already running
             ``commit`` (restart) or may merely record the settlement if the
             exact commit is already the live worker (confirmation/rollback).
+        migration: Whether this is a cold migration intent.
 
     Returns:
         The generation of the written intent.
@@ -1939,6 +2355,7 @@ def request_run(
             uv_path=uv_path,
             worker_id=worker_id,
             restart=restart,
+            migration=migration,
         )
 
 
