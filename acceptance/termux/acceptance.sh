@@ -337,6 +337,16 @@ else
   fail "uv sync --frozen --extra dev"
 fi
 
+# Re-run lubko-install after the dev sync so the startup contract is always
+# written with the current code's CONTRACT_SCHEMA_VERSION, regardless of
+# whether uv sync re-installed a cached lubko package layer.
+printf '\n%s\n' '--- Re-install lubko after dev sync ---'
+if uv run lubko-install --repo "$REPO"; then
+  pass "lubko-install (post dev-sync)"
+else
+  fail "lubko-install (post dev-sync)"
+fi
+
 # -- Canonical pytest budget check (hard 10 s) ------------------------------
 
 printf '\n%s\n' '--- Canonical pytest budget check ---'
