@@ -126,10 +126,22 @@ else
   fail "lubko-deploy startup-contract"
 fi
 
-printf '%s\n' '  valid token: supervisor crosses startup, creates pidfile + status'
+# A minimal tini-static shim so the installed lubko-startup launcher can
+# execute its canonical `exec tini-static -- lubko-supervisor` chain.
+# The shim execs its arguments, so the exec chain preserves a single PID
+# from launcher through tini to supervisor.
+TINI_DIR=$(mktemp -d)
+cat > "${TINI_DIR}/tini-static" << 'SHIM'
+#!/bin/sh
+exec "$@"
+SHIM
+chmod 755 "${TINI_DIR}/tini-static"
+export PATH="${TINI_DIR}:${PATH}"
+
+printf '%s\n' '  valid token: lubko-startup crosses startup boundary'
 VALID_TOKEN="aabbccddee00112233445566778899aabbccddee00112233445566778899aabb"
 export LUBKO_SUPERVISOR_STATE_TOKEN="${VALID_TOKEN}"
-lubko-supervisor &
+lubko-startup &
 SUPERVISOR_PID=$!
 WAIT=0
 while [ "$WAIT" -lt 8 ]; do
@@ -173,34 +185,37 @@ else
   wait "$SUPERVISOR_PID" 2>/dev/null || true
   pass "supervisor exited cleanly after SIGTERM"
 fi
+rm -rf "${STATE_ROOT}/supervisor"
 unset LUBKO_SUPERVISOR_STATE_TOKEN
 
-printf '%s\n' '  absent token: supervisor fails closed immediately'
+printf '%s\n' '  absent token: lubko-startup fails closed immediately'
 unset LUBKO_SUPERVISOR_STATE_TOKEN || true
-if lubko-supervisor 2>/dev/null; then
-  fail "lubko-supervisor should fail without token"
+if lubko-startup 2>/dev/null; then
+  fail "lubko-startup should fail without token"
 else
   EXIT_CODE=$?
   if [ "$EXIT_CODE" -eq 1 ]; then
-    pass "lubko-supervisor exit code 1 without token"
+    pass "lubko-startup exit code 1 without token"
   else
-    fail "lubko-supervisor exit code ${EXIT_CODE} (expected 1) without token"
+    fail "lubko-startup exit code ${EXIT_CODE} (expected 1) without token"
   fi
 fi
 
-printf '%s\n' '  invalid token: supervisor fails closed immediately'
+printf '%s\n' '  invalid token: lubko-startup fails closed immediately'
 export LUBKO_SUPERVISOR_STATE_TOKEN="not-a-valid-hex-token"
-if lubko-supervisor 2>/dev/null; then
-  fail "lubko-supervisor should fail with invalid token"
+if lubko-startup 2>/dev/null; then
+  fail "lubko-startup should fail with invalid token"
 else
   EXIT_CODE=$?
   if [ "$EXIT_CODE" -eq 1 ]; then
-    pass "lubko-supervisor exit code 1 with invalid token"
+    pass "lubko-startup exit code 1 with invalid token"
   else
-    fail "lubko-supervisor exit code ${EXIT_CODE} (expected 1) with invalid token"
+    fail "lubko-startup exit code ${EXIT_CODE} (expected 1) with invalid token"
   fi
 fi
 unset LUBKO_SUPERVISOR_STATE_TOKEN
+
+rm -rf "${TINI_DIR}"
 
 printf '\n%s\n' '--- cli/current points to source HEAD ---'
 CURRENT="${STATE_ROOT}/cli/current"
