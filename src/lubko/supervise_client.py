@@ -327,3 +327,37 @@ def clear_spawning_obligation_client() -> None:
     if not response.get("ok"):
         msg = response.get("error", "unknown error from supervisor")
         raise RuntimeError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Generation allocation
+# ---------------------------------------------------------------------------
+
+
+def allocate_generation_client() -> int:
+    """Allocate the next generation via the supervisor.
+
+    With token: direct ``supervise.next_generation()`` under the
+    generation lock.
+    Without token: control socket IPC to the supervisor, which
+    computes ``max(applied, desired, mission) + 1`` atomically.
+
+    Returns:
+        The allocated generation.
+
+    Raises:
+        RuntimeError: If the supervisor rejects the request.
+        TypeError: If the response is malformed.
+    """
+    if _has_token():
+        with supervise.generation_lock():
+            return supervise.next_generation()
+    response = _socket_request({"type": "allocate_generation"})
+    if not response.get("ok"):
+        msg = response.get("error", "unknown error from supervisor")
+        raise RuntimeError(msg)
+    generation = response.get("generation")
+    if not isinstance(generation, int):
+        msg = "supervisor response missing 'generation'"
+        raise TypeError(msg)
+    return generation

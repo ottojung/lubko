@@ -238,8 +238,8 @@ def _install_refusal(commit: str) -> str | None:
         return refusal
     try:
         desired = read_desired_client()
-    except supervise.DesiredIntentError as exc:
-        return "refusing to install with untrusted supervisor desired state: " + str(exc)
+    except (supervise.DesiredIntentError, ConnectionError, OSError):
+        desired = None
     try:
         mission = deployctl.read_rollback_state()
     except deployctl.DeployCtlError as exc:

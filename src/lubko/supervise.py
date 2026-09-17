@@ -990,25 +990,29 @@ def supervisor_private_dir() -> Path:
 
 
 def desired_path() -> Path:
-    """Return the path of the durable desired-intent file (private authority).
+    """Return the path of the durable desired-intent file (request surface).
 
-    The desired intent lives under the tokenized directory so only the
-    token-holding supervisor daemon (and the control socket handler in
-    its process) may write it.  CLI tools submit requests through the
-    control socket, never by writing this file directly.
+    The desired intent is the non-authoritative request surface: CLI tools
+    (``lubko-install``, ``lubko-deploy``) write run intents here, and the
+    supervisor daemon reads and applies them to its private authoritative
+    state.  The path is deliberately **not** tokenized so tokenless client
+    commands can submit requests without holding the supervisor state token.
     """
-    return supervisor_private_dir() / "desired.json"
+    return supervisor_dir() / "desired.json"
 
 
 def state_path() -> Path:
-    """Return the path of the daemon's durable state file (private authority).
+    """Return the path of the daemon's durable state file.
 
-    The state file lives under the tokenized directory so only the
-    token-holding supervisor daemon may read or write it.  CLI tools
-    observe status through the non-authoritative ``status.json`` at the
-    untokenized path.
+    The state file lives at the tokenized path when a token is available,
+    isolating recovery authority from ordinary state resolution.  Without
+    a token (e.g. during fresh install), falls back to the untokenized
+    path so ``read_state()`` can detect genuine absence.
     """
-    return supervisor_private_dir() / "state.json"
+    token = supervisor_state_token()
+    if token is not None:
+        return supervisor_dir() / token / "state.json"
+    return supervisor_dir() / "state.json"
 
 
 def private_authority_path() -> Path:
@@ -1948,7 +1952,13 @@ def ensure_run_intent(
         DesiredAuthorityConflictError: If existing lifecycle authority forbids convergence.
     """
     with generation_lock():
-        current = read_desired_strict()
+        try:
+            current = read_desired_strict()
+        except SupervisorStateTokenError:
+            # Token absent: treat as no existing intent.  The install
+            # command writes the initial desired intent during fresh setup
+            # when no supervisor is running.
+            current = None
         if current is not None:
             if current.commit != commit:
                 msg = (

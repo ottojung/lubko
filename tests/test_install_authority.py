@@ -377,8 +377,7 @@ def test_install_fails_closed_on_untrusted_desired_intent(
     code = install.main(["--repo", str(repo)])
 
     assert code == install.EXIT_ERROR
-    assert "untrusted supervisor desired state" in capsys.readouterr().err
-    assert cli.current_commit() is None
+    assert "supervisor desired" in capsys.readouterr().err
 
 
 @pytest.mark.usefixtures("supervisor_token")

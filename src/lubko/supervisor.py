@@ -3379,6 +3379,8 @@ class SupervisorDaemon:
             return SupervisorDaemon._handle_set_spawning_obligation(request.payload)
         if request.request_type == "clear_spawning_obligation":
             return SupervisorDaemon._handle_clear_spawning_obligation()
+        if request.request_type == "allocate_generation":
+            return SupervisorDaemon._handle_allocate_generation()
         return ControlResponse.error(f"unknown request type: {request.request_type}")
 
     @staticmethod
@@ -3519,6 +3521,27 @@ class SupervisorDaemon:
             LOGGER.exception("control clear_spawning_obligation failed")
             return ControlResponse.error("failed to clear spawning obligation")
         return ControlResponse.ok()
+
+    @staticmethod
+    def _handle_allocate_generation() -> dict[str, object]:
+        """Handle an allocate_generation request over the control socket.
+
+        Computes the next generation under the generation lock, exactly
+        as ``supervise.next_generation()`` does.  This is the only
+        correct way to allocate a generation without the token.
+
+        Returns:
+            JSON-serializable response dict with the generation.
+        """
+        try:
+            with supervise.generation_lock():
+                generation = supervise.next_generation()
+        except supervise.GenerationLockTimeoutError:
+            return ControlResponse.error("generation lock timed out")
+        except Exception:
+            LOGGER.exception("control allocate_generation failed")
+            return ControlResponse.error("failed to allocate generation")
+        return ControlResponse.ok(generation=generation)
 
     def _release_ownership(self) -> None:
         """Release the process-level ownership lock held for the lifetime."""

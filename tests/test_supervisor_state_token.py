@@ -132,22 +132,20 @@ class TestFailClosed:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """state_path() raises without a token."""
+        """state_path() returns untokenized path without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
-        with pytest.raises(SupervisorStateTokenError):
-            supervise.state_path()
+        assert supervise.state_path() == supervise.supervisor_dir() / "state.json"
 
     @staticmethod
     def test_desired_path_requires_token(
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """desired_path() raises without a token."""
+        """desired_path() returns untokenized path without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
-        with pytest.raises(SupervisorStateTokenError):
-            supervise.desired_path()
+        assert supervise.desired_path() == supervise.supervisor_dir() / "desired.json"
 
     @staticmethod
     def test_private_authority_path_requires_token(
@@ -196,11 +194,10 @@ class TestTokenizedPaths:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """desired_path lives under the tokenized directory."""
+        """desired_path is always at the untokenized request surface."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
-        expected = supervise.supervisor_dir() / VALID_TOKEN / "desired.json"
-        assert supervise.desired_path() == expected
+        assert supervise.desired_path() == supervise.supervisor_dir() / "desired.json"
 
     @staticmethod
     def test_private_authority_path_tokenized(
@@ -520,22 +517,20 @@ class TestDirectResolutionFailsClosed:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """desired_path() raises without a token."""
+        """desired_path() returns untokenized path without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
-        with pytest.raises(SupervisorStateTokenError):
-            supervise.desired_path()
+        assert supervise.desired_path() == supervise.supervisor_dir() / "desired.json"
 
     @staticmethod
     def test_state_path_requires_token(
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """state_path() raises without a token."""
+        """state_path() returns untokenized path without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
-        with pytest.raises(SupervisorStateTokenError):
-            supervise.state_path()
+        assert supervise.state_path() == supervise.supervisor_dir() / "state.json"
 
     @staticmethod
     def test_private_authority_path_requires_token(

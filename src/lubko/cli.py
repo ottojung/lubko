@@ -755,11 +755,14 @@ def supervisor_authoritative_commits() -> set[str]:
     preserved: set[str] = set()
     try:
         desired = read_desired_client()
-    except DesiredIntentError:
+    except (DesiredIntentError, ConnectionError, OSError):
         desired = None
     if desired is not None and is_valid_commit_name(desired.commit):
         preserved.add(desired.commit)
-    state = read_state_client()
+    try:
+        state = read_state_client()
+    except (ConnectionError, OSError):
+        return preserved
     state_commit = state.commit
     if state_commit is not None and is_valid_commit_name(state_commit):
         preserved.add(state_commit)

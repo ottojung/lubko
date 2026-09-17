@@ -54,6 +54,13 @@ Request types:
     Narrow semantic write: clear the spawning obligation on the state.
     Response: ``{"ok": true}`` or error.
 
+``allocate_generation``
+    Compute and return the next generation under the generation lock.
+    The supervisor reads state, desired, and mission authority, then
+    returns ``max(applied, desired, mission) + 1``.  This is the only
+    correct way to allocate a generation without the token.
+    Response: ``{"ok": true, "generation": <int>}`` or error.
+
 ``ping``
     Liveness check.  Response: ``{"ok": true}``.
 """

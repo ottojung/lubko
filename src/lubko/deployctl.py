@@ -58,6 +58,7 @@ from lubko.lifecycle import (
 from lubko.state import SupervisorStateTokenError, rollback_state_path, state_root
 from lubko.supervise import GenerationLockTimeoutError
 from lubko.supervise_client import (
+    allocate_generation_client,
     read_desired_client,
     read_state_client,
 )
@@ -566,8 +567,11 @@ def next_mission_generation() -> int:
         msg = "timed out waiting for the generation lock during mission generation allocation"
         raise DeployCtlError(msg) from exc
     except SupervisorStateTokenError:
-        state = read_state_client()
-        return state.applied_generation + 1
+        try:
+            return allocate_generation_client()
+        except (ConnectionError, OSError) as exc:
+            msg = "supervisor is not running; cannot allocate generation without a token"
+            raise DeployCtlError(msg) from exc
 
 
 def _supervised_mission_active(state: RollbackState) -> bool:
