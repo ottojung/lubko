@@ -16,6 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build acceptance image
-        run: docker build -f acceptance/ubuntu/Dockerfile -t lubko-acceptance .
+        run: docker build --no-cache -f acceptance/ubuntu/Dockerfile -t lubko-acceptance .
       - name: Run acceptance
         run: docker run --rm lubko-acceptance acceptance.sh
