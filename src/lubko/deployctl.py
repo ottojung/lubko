@@ -29,7 +29,7 @@ from uuid import UUID
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, lifecycle, lifecycle_state, startup_contract, supervise
+from lubko import cli, lifecycle, lifecycle_state, startup_contract, supervise, supervise_client
 from lubko.config import load_database_config
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.lifecycle import (
@@ -803,7 +803,7 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
         generation = desired.generation
     else:
         try:
-            generation = supervise.request_run(
+            generation = supervise_client.request_run_client(
                 commit,
                 repo=repo,
                 uv_path=uv_path,

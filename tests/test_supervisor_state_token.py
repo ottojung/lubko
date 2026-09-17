@@ -17,6 +17,7 @@ import pytest
 
 from lubko import lifecycle, supervise, supervise_client, supervisor
 from lubko.control_socket import bind_abstract_socket
+from lubko.durable import write_json_durable
 from lubko.state import (
     SUPERVISOR_STATE_TOKEN_ENV,
     SupervisorStateTokenError,
@@ -132,20 +133,33 @@ class TestFailClosed:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """state_path() returns untokenized path without a token."""
+        """state_path() raises without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
-        assert supervise.state_path() == supervise.supervisor_dir() / "state.json"
+        with pytest.raises(SupervisorStateTokenError):
+            supervise.state_path()
 
     @staticmethod
     def test_desired_path_requires_token(
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """desired_path() returns untokenized path without a token."""
+        """desired_path() raises without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
-        assert supervise.desired_path() == supervise.supervisor_dir() / "desired.json"
+        with pytest.raises(SupervisorStateTokenError):
+            supervise.desired_path()
+
+    @staticmethod
+    def test_pending_request_path_accessible_without_token(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """pending_request_path() is accessible without a token."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
+        expected = supervise.supervisor_dir() / "pending-request.json"
+        assert supervise.pending_request_path() == expected
 
     @staticmethod
     def test_private_authority_path_requires_token(
@@ -190,14 +204,26 @@ class TestTokenizedPaths:
         assert supervise.state_path() == expected
 
     @staticmethod
-    def test_desired_path_tokenized(
+    def test_desired_path_requires_token(
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """desired_path is always at the untokenized request surface."""
+        """desired_path() raises without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
-        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
-        assert supervise.desired_path() == supervise.supervisor_dir() / "desired.json"
+        monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
+        with pytest.raises(SupervisorStateTokenError):
+            supervise.desired_path()
+
+    @staticmethod
+    def test_pending_request_path_without_token(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """pending_request_path() is always accessible without a token."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
+        expected = supervise.supervisor_dir() / "pending-request.json"
+        assert supervise.pending_request_path() == expected
 
     @staticmethod
     def test_private_authority_path_tokenized(
@@ -517,20 +543,22 @@ class TestDirectResolutionFailsClosed:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """desired_path() returns untokenized path without a token."""
+        """desired_path() raises without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
-        assert supervise.desired_path() == supervise.supervisor_dir() / "desired.json"
+        with pytest.raises(SupervisorStateTokenError):
+            supervise.desired_path()
 
     @staticmethod
     def test_state_path_requires_token(
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """state_path() returns untokenized path without a token."""
+        """state_path() raises without a token."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
-        assert supervise.state_path() == supervise.supervisor_dir() / "state.json"
+        with pytest.raises(SupervisorStateTokenError):
+            supervise.state_path()
 
     @staticmethod
     def test_private_authority_path_requires_token(
@@ -695,3 +723,206 @@ class TestNonblockingControlSocket:
                 sock.accept()
         finally:
             sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Tokenless write isolation
+# ---------------------------------------------------------------------------
+
+
+class TestTokenlessWriteIsolation:
+    """Tokenless desired writes cannot affect live supervisor authority."""
+
+    @staticmethod
+    def test_pending_request_does_not_create_desired_authority(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Writing to pending_request_path does not create tokenized desired.json.
+
+        A tokenless install writes to the non-authoritative pending request
+        surface.  This must never create or mutate the tokenized desired
+        authority that the supervisor daemon reads.
+        """
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+
+        # Write a pending request (tokenless path)
+        request_path = supervise.pending_request_path()
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_durable(
+            request_path,
+            {"schema_version": 1, "commit": "a" * 40, "repo": "/r", "uv_path": "uv"},
+        )
+
+        # The tokenized desired.json must NOT exist
+        desired = supervise.desired_path()
+        assert not desired.exists(), f"pending request created undesired authority at {desired}"
+
+    @staticmethod
+    def test_promote_pending_request_creates_desired_authority(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """promote_pending_request() promotes to tokenized desired_path.
+
+        After promotion, the pending request file is removed and the
+        tokenized desired authority contains the correct intent.
+        """
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+
+        # Create the private directory
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+
+        # Write a pending request
+        commit = "b" * 40
+        request_path = supervise.pending_request_path()
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_durable(
+            request_path,
+            {"schema_version": 1, "commit": commit, "repo": "/r", "uv_path": "uv"},
+        )
+
+        # Promote
+        result = supervise.promote_pending_request()
+        assert result is True
+
+        # Pending request file should be removed
+        assert not request_path.exists()
+
+        # Tokenized desired authority should exist with correct commit
+        desired = supervise.read_desired_strict()
+        assert desired is not None
+        assert desired.commit == commit
+
+
+# ---------------------------------------------------------------------------
+# Generation reservation: atomic allocation prevents reuse
+# ---------------------------------------------------------------------------
+
+
+class TestGenerationReservation:
+    """Supervisor-owned generation reservation prevents concurrent reuse.
+
+    When a tokenless caller allocates a generation via the control socket,
+    the supervisor durably reserves it so concurrent allocators cannot
+    reuse the same generation.  The reservation is overwritten by the next
+    allocation and does not require explicit clearing.
+    """
+
+    @staticmethod
+    def test_reserved_generation_path_requires_token(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """reserved_generation_path() raises without a token."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
+        with pytest.raises(SupervisorStateTokenError):
+            supervise.reserved_generation_path()
+
+    @staticmethod
+    def test_reserved_generation_path_tokenized(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """reserved_generation_path lives under the tokenized directory."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        expected = supervise.supervisor_dir() / VALID_TOKEN / "reserved_generation.json"
+        assert supervise.reserved_generation_path() == expected
+
+    @staticmethod
+    def test_reserved_generation_under_private_dir(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Reserved generation file lives under the private tokenized directory."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        expected = supervise.supervisor_private_dir() / "reserved_generation.json"
+        assert supervise.reserved_generation_path() == expected
+
+    @staticmethod
+    def test_next_generation_includes_reservation(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """next_generation() includes a durable reservation in its max."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        # No reservation: generation is 1 (max(0, 0, 0, 0) + 1)
+        gen_no_reservation = supervise.next_generation()
+        assert gen_no_reservation == 1
+        # Write a reservation for generation 5
+        write_json_durable(
+            supervise.reserved_generation_path(),
+            {"generation": 5},
+        )
+        gen_with_reservation = supervise.next_generation()
+        assert gen_with_reservation == 6  # max(0, 0, 0, 5) + 1
+
+    @staticmethod
+    def test_reservation_overwritten_by_next_allocation(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Writing a new reservation overwrites the previous one."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        # First reservation
+        write_json_durable(
+            supervise.reserved_generation_path(),
+            {"generation": 5},
+        )
+        assert supervise.next_generation() == 6
+        # Second reservation overwrites
+        write_json_durable(
+            supervise.reserved_generation_path(),
+            {"generation": 10},
+        )
+        assert supervise.next_generation() == 11
+
+    @staticmethod
+    def test_malformed_reservation_ignored(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A malformed reservation file is treated as absent."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        supervise.reserved_generation_path().write_text("not json", encoding="utf-8")
+        # Malformed reservation is ignored; generation is 1
+        assert supervise.next_generation() == 1
+
+    @staticmethod
+    def test_concurrent_allocations_get_distinct_generations(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Two sequential allocations never return the same generation.
+
+        This simulates the race: allocate generation, don't publish yet,
+        allocate again.  The second allocation must return a strictly
+        greater generation because the first was durably reserved.
+        """
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        # Simulate first allocation: compute + reserve
+        gen1 = supervise.next_generation()
+        write_json_durable(
+            supervise.reserved_generation_path(),
+            {"generation": gen1},
+        )
+        # Simulate second allocation: sees first reservation
+        gen2 = supervise.next_generation()
+        assert gen2 > gen1, f"second allocation {gen2} must exceed first {gen1}"

@@ -101,7 +101,7 @@ from lubko.control_socket import (
     bind_abstract_socket,
     validate_peercred,
 )
-from lubko.durable import DurabilityError, remove_durable
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.health import (
     interpret_worker_health,
     prune_old_incarnation_artifacts,
@@ -848,6 +848,7 @@ class SupervisorDaemon:
             self._persist_runtime_commit()
             self._invalidate_stale_status()
             normalize_cross_boot_state()
+            supervise.promote_pending_request()
             self._install_signal_handlers()
             self._open_control_socket()
             self._write_status("starting")
@@ -3526,9 +3527,10 @@ class SupervisorDaemon:
     def _handle_allocate_generation() -> dict[str, object]:
         """Handle an allocate_generation request over the control socket.
 
-        Computes the next generation under the generation lock, exactly
-        as ``supervise.next_generation()`` does.  This is the only
-        correct way to allocate a generation without the token.
+        Computes the next generation under the generation lock, durably
+        reserves it so concurrent allocators cannot reuse it, and returns
+        the generation.  This is the only correct way to allocate a
+        generation without the token.
 
         Returns:
             JSON-serializable response dict with the generation.
@@ -3536,6 +3538,10 @@ class SupervisorDaemon:
         try:
             with supervise.generation_lock():
                 generation = supervise.next_generation()
+                write_json_durable(
+                    supervise.reserved_generation_path(),
+                    {"generation": generation},
+                )
         except supervise.GenerationLockTimeoutError:
             return ControlResponse.error("generation lock timed out")
         except Exception:

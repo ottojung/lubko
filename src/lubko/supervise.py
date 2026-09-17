@@ -990,29 +990,47 @@ def supervisor_private_dir() -> Path:
 
 
 def desired_path() -> Path:
-    """Return the path of the durable desired-intent file (request surface).
+    """Return the path of the durable desired-intent file (private authority).
 
-    The desired intent is the non-authoritative request surface: CLI tools
-    (``lubko-install``, ``lubko-deploy``) write run intents here, and the
-    supervisor daemon reads and applies them to its private authoritative
-    state.  The path is deliberately **not** tokenized so tokenless client
-    commands can submit requests without holding the supervisor state token.
+    The desired intent is lifecycle authority: it names the exact commit the
+    supervisor daemon must run.  The file lives under the tokenized directory
+    so only the token-holding supervisor daemon may read or write it.  CLI
+    tools submit requests through the control socket or the non-authoritative
+    pending-request surface, never by writing this file directly.
     """
-    return supervisor_dir() / "desired.json"
+    return supervisor_private_dir() / "desired.json"
+
+
+def pending_request_path() -> Path:
+    """Return the path of the non-authoritative pending install request.
+
+    During fresh ``lubko-install`` (no supervisor running, no token), the
+    install command writes the initial desired intent here.  The supervisor
+    daemon promotes it to the tokenized ``desired_path()`` on startup.
+
+    The file is in the public supervisor directory (untokenized) so
+    tokenless install commands can write it.  It is never read as
+    lifecycle authority by the running supervisor — only promoted.
+    """
+    return supervisor_dir() / "pending-request.json"
 
 
 def state_path() -> Path:
-    """Return the path of the daemon's durable state file.
+    """Return the path of the daemon's durable state file (private authority).
 
-    The state file lives at the tokenized path when a token is available,
-    isolating recovery authority from ordinary state resolution.  Without
-    a token (e.g. during fresh install), falls back to the untokenized
-    path so ``read_state()`` can detect genuine absence.
+    The state file lives under the tokenized directory, isolating
+    recovery authority from ordinary state resolution.
+
+    Raises:
+        SupervisorStateTokenError: If ``LUBKO_SUPERVISOR_STATE_TOKEN`` is
+            absent or empty.  State is lifecycle authority and must never
+            be resolvable without the token.
     """
     token = supervisor_state_token()
-    if token is not None:
-        return supervisor_dir() / token / "state.json"
-    return supervisor_dir() / "state.json"
+    if token is None:
+        msg = "LUBKO_SUPERVISOR_STATE_TOKEN is required to resolve state_path"
+        raise SupervisorStateTokenError(msg)
+    return supervisor_dir() / token / "state.json"
 
 
 def private_authority_path() -> Path:
@@ -1023,6 +1041,18 @@ def private_authority_path() -> Path:
     resolution.
     """
     return supervisor_private_dir() / "authority.json"
+
+
+def reserved_generation_path() -> Path:
+    """Return the path of the reserved generation record (private authority).
+
+    When a tokenless caller allocates a generation via the supervisor
+    control socket, the supervisor durably records the reserved generation
+    here so that concurrent allocators cannot reuse it.  The reservation
+    is overwritten by the next allocation and does not require explicit
+    clearing.
+    """
+    return supervisor_private_dir() / "reserved_generation.json"
 
 
 def status_path() -> Path:
@@ -1869,11 +1899,11 @@ def next_generation() -> int:
     """Return the next generation for a new desired intent.
 
     The generation is one greater than every generation seen so far: the
-    supervisor applied generation, the desired intent, and the durable
-    supervised-mission generation. A writer that lost a read-modify-write race
-    never reuses a generation the daemon has already applied, and a restart or
-    deploy issued against an open mission can never be outranked by that older
-    mission.
+    supervisor applied generation, the desired intent, the durable
+    supervised-mission generation, and any reserved generation.  A writer
+    that lost a read-modify-write race never reuses a generation the daemon
+    has already applied, and a restart or deploy issued against an open
+    mission can never be outranked by that older mission.
 
     Returns:
         The next monotonic generation.
@@ -1883,7 +1913,133 @@ def next_generation() -> int:
     # writer must fail closed rather than erase or outrank an unreadable intent.
     desired = read_desired_strict()
     desired_generation = desired.generation if desired is not None else 0
-    return max(applied, desired_generation, _mission_generation()) + 1
+    return max(applied, desired_generation, _mission_generation(), _reserved_generation()) + 1
+
+
+def _reserved_generation() -> int:
+    """Return the reserved generation, or 0 when genuinely absent.
+
+    A reserved generation is a generation allocated by the supervisor for
+    a tokenless caller that has not yet been used in a published mission.
+    The reservation prevents concurrent allocators from reusing the same
+    generation.
+
+    Genuine absence (no file) returns 0. A present but unreadable,
+    malformed, or non-positive reservation is durable authority corruption
+    and fails closed: returning 0 would silently permit generation reuse
+    behind a possibly-live reservation.
+
+    Returns:
+        The reserved generation, or 0 when absent.
+
+    Raises:
+        MissionAuthorityError: If a present reservation cannot be trusted.
+    """
+    path = reserved_generation_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        msg = f"cannot read reserved generation authority: {exc}"
+        raise MissionAuthorityError(msg) from exc
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        msg = "reserved generation authority is malformed JSON"
+        raise MissionAuthorityError(msg) from exc
+    if not isinstance(data, dict):
+        msg = "reserved generation authority is not a JSON object"
+        raise MissionAuthorityError(msg)
+    gen = data.get("generation")
+    if not isinstance(gen, int) or gen <= 0:
+        msg = "reserved generation authority has invalid generation"
+        raise MissionAuthorityError(msg)
+    return gen
+
+
+def _write_pending_request(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+) -> None:
+    """Write a non-authoritative pending install request.
+
+    During fresh ``lubko-install`` (no token, no running supervisor), the
+    install command writes the initial desired intent here.  The supervisor
+    daemon promotes it to the tokenized ``desired_path()`` on startup.
+
+    The file is a plain JSON dict with the same fields as
+    ``SupervisorDesired`` but without generation (the supervisor allocates
+    that atomically on promotion).
+    """
+    data: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "commit": commit,
+        "repo": repo,
+        "uv_path": uv_path,
+        "worker_id": worker_id,
+    }
+    write_json_durable(pending_request_path(), data)
+
+
+def promote_pending_request() -> bool:
+    """Promote a pending install request to the tokenized desired authority.
+
+    Called by the supervisor daemon on startup (after acquiring the token
+    and the generation lock).  Reads the pending request, allocates a
+    generation, and writes it to the tokenized ``desired_path()``.
+
+    Returns:
+        ``True`` when a pending request was promoted, ``False`` when none
+        existed or the request was stale/malformed.
+    """
+    path = pending_request_path()
+    data = _load_pending_request(path)
+    if data is None:
+        return False
+    commit = data.get("commit")
+    if not isinstance(commit, str) or not commit:
+        return False
+    repo_val = data.get("repo", "")
+    uv_val = data.get("uv_path", "")
+    worker_val = data.get("worker_id")
+    with generation_lock():
+        try:
+            existing = read_desired_strict()
+        except SupervisorStateTokenError:
+            return False
+        if existing is not None:
+            remove_durable(path)
+            return False
+        _write_run_intent_locked(
+            commit,
+            repo=str(repo_val) if isinstance(repo_val, str) else "",
+            uv_path=str(uv_val) if isinstance(uv_val, str) else "",
+            worker_id=str(worker_val) if isinstance(worker_val, str) else None,
+            restart=False,
+        )
+    remove_durable(path)
+    return True
+
+
+def _load_pending_request(path: Path) -> dict[str, object] | None:
+    """Load and validate a pending request file, returning None on any failure.
+
+    Returns:
+        The parsed JSON dict, or ``None`` on any read/parse error.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _write_run_intent_locked(  # ruff: ignore[too-many-arguments]
@@ -1955,10 +2111,15 @@ def ensure_run_intent(
         try:
             current = read_desired_strict()
         except SupervisorStateTokenError:
-            # Token absent: treat as no existing intent.  The install
-            # command writes the initial desired intent during fresh setup
-            # when no supervisor is running.
-            current = None
+            # Token absent: no existing authoritative intent.  Write a
+            # pending request for the supervisor to promote on startup.
+            _write_pending_request(
+                commit,
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id,
+            )
+            return 1
         if current is not None:
             if current.commit != commit:
                 msg = (
