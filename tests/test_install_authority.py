@@ -17,7 +17,16 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 
-from lubko import cli, deployctl, install, lifecycle, startup_contract, supervise, toolchain
+from lubko import (
+    cli,
+    deployctl,
+    install,
+    lifecycle,
+    startup_contract,
+    supervise,
+    supervise_client,
+    toolchain,
+)
 from lubko.state import rollback_state_path
 
 if TYPE_CHECKING:
@@ -657,3 +666,41 @@ def test_startup_launcher_fails_without_sh(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(startup_contract.StartupContractError, match="sh not found"):
         startup_contract.generate_startup_launcher_content()
+
+
+# ---------------------------------------------------------------------------
+# Regression: PendingRequestLockTimeoutError normalized to EXIT_ERROR
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_install_normalizes_pending_request_lock_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PendingRequestLockTimeoutError during install yields EXIT_ERROR, no traceback."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    monkeypatch.setattr(cli, "_sync_venv", fake_uv_sync)
+    monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
+    installable_bin(monkeypatch, tmp_path)
+
+    def _raising_client(  # ruff: ignore[unused-function-argument]
+        _commit: str,
+        *,
+        repo: str,
+        uv_path: str,
+        worker_id: str | None,
+    ) -> int | None:
+        del repo, uv_path, worker_id
+        msg = "lock timed out"
+        raise supervise.PendingRequestLockTimeoutError(msg)
+
+    monkeypatch.setattr(supervise_client, "ensure_run_intent_client", _raising_client)
+
+    code = install.main(["--repo", str(repo)])
+
+    assert code == install.EXIT_ERROR
+    output = capsys.readouterr()
+    assert "lock timed out" in output.err
+    assert "Traceback" not in output.err

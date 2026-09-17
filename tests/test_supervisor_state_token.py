@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import secrets
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
@@ -1266,3 +1267,131 @@ class TestEnsureRunIntentClientWithToken:
         desired = supervise.read_desired_strict()
         assert desired is not None
         assert desired.commit == commit
+
+
+# ---------------------------------------------------------------------------
+# Regression: pending-request ack never leaks private authority text
+# ---------------------------------------------------------------------------
+
+
+def test_pending_ack_sanitizes_private_authority_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Promoter acks generic error when ensure_run_intent raises.
+
+    When the underlying authority error contains a token value or a private
+    path, the public ack must never expose it.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+    supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+    supervise.write_state(supervise.fresh_state())
+
+    rid = "d" * 32
+    commit = "e" * 40
+    supervise.write_pending_request(
+        commit,
+        repo="/r",
+        uv_path="uv",
+        worker_id=None,
+        request_id=rid,
+    )
+
+    private_marker = f"/private/{VALID_TOKEN}/authority.json"
+
+    def _bombing_ensure(
+        _commit: str,
+        **_kwargs: object,
+    ) -> int:
+        msg = f"token={VALID_TOKEN} path={private_marker}"
+        raise supervise.MissionAuthorityError(msg)
+
+    monkeypatch.setattr(supervise, "ensure_run_intent", _bombing_ensure)
+    result = supervise.promote_pending_request()
+    assert result is False
+
+    ack = supervise.pending_request_ack_path(rid)
+    assert ack.exists()
+    ack_data = json.loads(ack.read_text(encoding="utf-8"))
+    assert ack_data["ok"] is False
+    error_text = str(ack_data.get("error", ""))
+    assert VALID_TOKEN not in error_text
+    assert private_marker not in error_text
+    assert error_text  # must have *some* generic error
+
+
+# ---------------------------------------------------------------------------
+# Regression: pending-request lock serializes promoter and new writer
+# ---------------------------------------------------------------------------
+
+
+def test_pending_request_lock_serializes_promoter_and_new_writer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Promoter holding the lock blocks a concurrent writer.
+
+    The promoter must not delete a newer pending request written after it
+    loaded the old one.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+    supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+    supervise.write_state(supervise.fresh_state())
+
+    commit_a = "a" * 40
+    commit_b = "b" * 40
+    rid_a = "a" * 32
+    rid_b = "b" * 32
+
+    supervise.write_pending_request(
+        commit_a,
+        repo="/r",
+        uv_path="uv",
+        worker_id=None,
+        request_id=rid_a,
+    )
+
+    promoter_entered = threading.Event()
+    promoter_blocker = threading.Event()
+    writer_finished = threading.Event()
+
+    def _blocking_ensure(_commit: str, **_kwargs: object) -> int:
+        promoter_entered.set()
+        assert promoter_blocker.wait(timeout=3.0), "promoter blocker not released"
+        return 1
+
+    monkeypatch.setattr(supervise, "ensure_run_intent", _blocking_ensure)
+
+    def _blocking_writer() -> None:
+        supervise.write_pending_request(
+            commit_b,
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+            request_id=rid_b,
+        )
+        writer_finished.set()
+
+    promoter_thread = threading.Thread(target=supervise.promote_pending_request)
+    promoter_thread.start()
+    assert promoter_entered.wait(timeout=2.0), "promoter did not enter"
+
+    writer_thread = threading.Thread(target=_blocking_writer)
+    writer_thread.start()
+    writer_thread.join(timeout=1.0)
+    assert not writer_finished.is_set(), "writer must not finish while promoter holds lock"
+
+    promoter_blocker.set()
+    writer_thread.join(timeout=2.0)
+    promoter_thread.join(timeout=2.0)
+
+    raw = supervise.pending_request_path().read_text(encoding="utf-8")
+    data = json.loads(raw)
+    assert data["request_id"] == rid_b
+
+    ack_a = supervise.pending_request_ack_path(rid_a)
+    assert ack_a.exists()
+    ack_a_data = json.loads(ack_a.read_text(encoding="utf-8"))
+    assert ack_a_data["ok"] is True
