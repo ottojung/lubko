@@ -43,6 +43,7 @@ STALE_CONTRACT = {
     "supervisor_command": ["infinity"],
     "required_state_dirs": ["old"],
     "required_config_files": [],
+    "required_environment": [],
 }
 
 STALE_DEFINITION = {
@@ -50,6 +51,7 @@ STALE_DEFINITION = {
     "command": ["sleep", "infinity"],
     "required_state_dirs": ["old"],
     "required_config_files": [],
+    "required_environment": [],
 }
 
 
@@ -1070,6 +1072,7 @@ def test_repeat_confirm_drift_returns_ok_false(
             "supervisor_command": list(CURRENT_CONTRACT.supervisor_command),
             "required_state_dirs": list(CURRENT_CONTRACT.required_state_dirs),
             "required_config_files": list(CURRENT_CONTRACT.required_config_files),
+            "required_environment": list(CURRENT_CONTRACT.required_environment),
         }),
         encoding="utf-8",
     )
@@ -1126,6 +1129,7 @@ def test_repeat_confirm_repair_via_staging_manifest(
             "supervisor_command": list(CURRENT_CONTRACT.supervisor_command),
             "required_state_dirs": list(CURRENT_CONTRACT.required_state_dirs),
             "required_config_files": list(CURRENT_CONTRACT.required_config_files),
+            "required_environment": list(CURRENT_CONTRACT.required_environment),
         }),
         encoding="utf-8",
     )
