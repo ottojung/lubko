@@ -685,7 +685,7 @@ def test_install_normalizes_pending_request_lock_timeout(
     monkeypatch.setattr(cli, "_extract_archive", fake_extract_archive)
     installable_bin(monkeypatch, tmp_path)
 
-    def _raising_client(  # ruff: ignore[unused-function-argument]
+    def _raising_client(
         _commit: str,
         *,
         repo: str,
