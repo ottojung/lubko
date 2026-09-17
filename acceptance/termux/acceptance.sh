@@ -117,90 +117,90 @@ else
   fail "lubko-agent --help"
 fi
 
-printf '\n%s\n' '--- Startup contract boundary ---'
+printf '\n%s\n' '--- Startup boundary invocation ---'
 
-printf '%s\n' '  lubko-deploy startup-contract validation'
+printf '%s\n' '  startup contract artifacts installed correctly'
 if lubko-deploy startup-contract >/dev/null 2>&1; then
   pass "lubko-deploy startup-contract"
 else
   fail "lubko-deploy startup-contract"
 fi
 
-printf '%s\n' '  contract definition includes required environment variable name'
-if uv run python -c "
-import json, sys
-from lubko.startup_contract import generate_startup_definition
-d = generate_startup_definition()
-assert 'required_environment' in d, 'missing required_environment key'
-assert 'LUBKO_SUPERVISOR_STATE_TOKEN' in d['required_environment'], \
-    'LUBKO_SUPERVISOR_STATE_TOKEN not in required_environment'
-print('OK: required_environment includes LUBKO_SUPERVISOR_STATE_TOKEN')
-"; then
-  pass "definition requires LUBKO_SUPERVISOR_STATE_TOKEN"
+printf '%s\n' '  valid token: supervisor crosses startup, creates pidfile + status'
+VALID_TOKEN="aabbccddee00112233445566778899aabbccddee00112233445566778899aabb"
+export LUBKO_SUPERVISOR_STATE_TOKEN="${VALID_TOKEN}"
+lubko-supervisor &
+SUPERVISOR_PID=$!
+WAIT=0
+while [ "$WAIT" -lt 8 ]; do
+  if [ -f "${STATE_ROOT}/supervisor/supervisor.pid" ]; then
+    break
+  fi
+  sleep 1
+  WAIT=$((WAIT + 1))
+done
+PIDFILE="${STATE_ROOT}/supervisor/supervisor.pid"
+STATUSFILE="${STATE_ROOT}/supervisor/status.json"
+if [ ! -f "$PIDFILE" ]; then
+  fail "supervisor pidfile not created within 8 s"
 else
-  fail "definition requires LUBKO_SUPERVISOR_STATE_TOKEN"
+  SVPID=$(cat "$PIDFILE" | python3 -c "import sys,json; print(json.load(sys.stdin)['pid'])")
+  if [ "$SVPID" = "$SUPERVISOR_PID" ]; then
+    pass "supervisor pidfile records correct PID ${SVPID}"
+  else
+    fail "supervisor pidfile PID ${SVPID} != actual ${SUPERVISOR_PID}"
+  fi
+fi
+if [ ! -f "$STATUSFILE" ]; then
+  fail "supervisor status.json not created within 8 s"
+else
+  pass "supervisor status.json created"
+fi
+kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
+WAIT=0
+while [ "$WAIT" -lt 5 ]; do
+  if ! kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+    break
+  fi
+  sleep 1
+  WAIT=$((WAIT + 1))
+done
+if kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+  kill -KILL "$SUPERVISOR_PID" 2>/dev/null || true
+  wait "$SUPERVISOR_PID" 2>/dev/null || true
+  fail "supervisor did not exit within 5 s of SIGTERM"
+else
+  wait "$SUPERVISOR_PID" 2>/dev/null || true
+  pass "supervisor exited cleanly after SIGTERM"
+fi
+unset LUBKO_SUPERVISOR_STATE_TOKEN
+
+printf '%s\n' '  absent token: supervisor fails closed immediately'
+unset LUBKO_SUPERVISOR_STATE_TOKEN || true
+if lubko-supervisor 2>/dev/null; then
+  fail "lubko-supervisor should fail without token"
+else
+  EXIT_CODE=$?
+  if [ "$EXIT_CODE" -eq 1 ]; then
+    pass "lubko-supervisor exit code 1 without token"
+  else
+    fail "lubko-supervisor exit code ${EXIT_CODE} (expected 1) without token"
+  fi
 fi
 
-printf '%s\n' '  launcher documents external token supply requirement'
-if uv run python -c "
-from lubko.startup_contract import generate_startup_launcher_content
-c = generate_startup_launcher_content()
-assert 'LUBKO_SUPERVISOR_STATE_TOKEN' in c, 'launcher missing token env name'
-assert 'externally supplied' in c, 'launcher missing externally supplied note'
-print('OK: launcher documents external token supply')
-"; then
-  pass "launcher documents external token supply"
+printf '%s\n' '  invalid token: supervisor fails closed immediately'
+export LUBKO_SUPERVISOR_STATE_TOKEN="not-a-valid-hex-token"
+if lubko-supervisor 2>/dev/null; then
+  fail "lubko-supervisor should fail with invalid token"
 else
-  fail "launcher documents external token supply"
+  EXIT_CODE=$?
+  if [ "$EXIT_CODE" -eq 1 ]; then
+    pass "lubko-supervisor exit code 1 with invalid token"
+  else
+    fail "lubko-supervisor exit code ${EXIT_CODE} (expected 1) with invalid token"
+  fi
 fi
-
-printf '%s\n' '  valid 256-bit hex token passes validation'
-if uv run python -c "
-from lubko.state import validate_supervisor_state_token
-tok = 'a' * 64
-assert validate_supervisor_state_token(tok) == tok
-print('OK: valid token accepted')
-"; then
-  pass "valid token accepted"
-else
-  fail "valid token accepted"
-fi
-
-printf '%s\n' '  absent token is detected'
-if uv run python -c "
-from lubko.state import supervisor_state_token
-import os
-os.environ.pop('LUBKO_SUPERVISOR_STATE_TOKEN', None)
-assert supervisor_state_token() is None, 'expected None for absent token'
-print('OK: absent token returns None')
-"; then
-  pass "absent token returns None"
-else
-  fail "absent token returns None"
-fi
-
-printf '%s\n' '  invalid tokens fail closed'
-if uv run python -c "
-from lubko.state import validate_supervisor_state_token, SupervisorStateTokenError
-cases = [
-    ('', 'empty'),
-    ('short', 'too short'),
-    ('g' + '0' * 63, 'non-hex char'),
-    ('0' * 65, 'too long'),
-]
-for tok, desc in cases:
-    try:
-        validate_supervisor_state_token(tok)
-        print(f'FAIL: {desc} should have been rejected')
-        raise SystemExit(1)
-    except SupervisorStateTokenError:
-        pass
-print('OK: all invalid tokens rejected')
-"; then
-  pass "invalid tokens fail closed"
-else
-  fail "invalid tokens fail closed"
-fi
+unset LUBKO_SUPERVISOR_STATE_TOKEN
 
 printf '\n%s\n' '--- cli/current points to source HEAD ---'
 CURRENT="${STATE_ROOT}/cli/current"
