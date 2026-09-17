@@ -65,6 +65,9 @@ TINI_DIR="${HOME}/.lubko-acceptance-tini"
 mkdir -p "${TINI_DIR}"
 cat > "${TINI_DIR}/tini-static" << 'SHIM'
 #!/bin/sh
+# Tini shim: consume the leading -- separator (tini static convention)
+# then exec the remaining command and arguments.
+shift
 exec "$@"
 SHIM
 chmod 755 "${TINI_DIR}/tini-static"
