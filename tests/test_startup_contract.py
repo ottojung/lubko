@@ -18,6 +18,7 @@ from lubko.startup_contract import (
     StartupContract,
     StartupContractError,
 )
+from lubko.state import SUPERVISOR_STATE_TOKEN_ENV
 
 
 def test_canonical_startup_command() -> None:
@@ -96,18 +97,20 @@ def test_contract_malformed_fails_closed(tmp_path: Path, monkeypatch: pytest.Mon
 
 
 def test_contract_legacy_keys_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Legacy schema-v1 keys are silently ignored."""
+    """Legacy keys present alongside a valid contract are silently ignored."""
     monkeypatch.setattr(sc, "contract_path", lambda: tmp_path / "startup-contract.json")
     config_files_json = json.dumps(list(CURRENT_CONTRACT.required_config_files))
+    environment_json = json.dumps(list(CURRENT_CONTRACT.required_environment))
     (tmp_path / "startup-contract.json").write_text(
-        '{"schema_version": 1, '
+        '{"schema_version": 2, '
         '"init_markers": ["tini-static", "tini"], '
         '"init_command": ["tini-static", "--"], '
         '"supervisor_markers": ["lubko-supervisor", "lubko.supervisor"], '
         '"supervisor_command": ["lubko-supervisor"], '
         '"worker_relationship": "direct-child", '
         '"required_state_dirs": ["supervisor", "worker", "deploy"], '
-        f'"required_config_files": {config_files_json}'
+        f'"required_config_files": {config_files_json}, '
+        f'"required_environment": {environment_json}'
         "}",
         encoding="utf-8",
     )
@@ -127,6 +130,7 @@ def test_contract_semantic_mismatch_is_distinct(
         supervisor_command=CURRENT_CONTRACT.supervisor_command,
         required_state_dirs=("supervisor",),
         required_config_files=CURRENT_CONTRACT.required_config_files,
+        required_environment=CURRENT_CONTRACT.required_environment,
     )
     sc.write_contract(divergent)
     assessment = sc.assess_recorded_contract()
@@ -217,6 +221,45 @@ def test_contract_is_frozen_and_current_matches_version() -> None:
     assert CURRENT_CONTRACT.schema_version == CONTRACT_SCHEMA_VERSION
     assert "tini-static" in CURRENT_CONTRACT.init_command
     assert "lubko-supervisor" in CURRENT_CONTRACT.supervisor_command
+
+
+def test_contract_requires_supervisor_state_token_env() -> None:
+    """The current contract requires the supervisor state token environment variable."""
+    assert SUPERVISOR_STATE_TOKEN_ENV in CURRENT_CONTRACT.required_environment
+    assert len(CURRENT_CONTRACT.required_environment) == 1
+
+
+def test_contract_missing_required_environment_is_malformed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A schema-v2 contract missing required_environment fails to parse."""
+    monkeypatch.setattr(sc, "contract_path", lambda: tmp_path / "startup-contract.json")
+    (tmp_path / "startup-contract.json").write_text(
+        '{"schema_version": 2, '
+        '"init_command": ["tini-static", "--"], '
+        '"supervisor_command": ["lubko-supervisor"], '
+        '"required_state_dirs": ["supervisor", "worker", "deploy"], '
+        '"required_config_files": []'
+        "}",
+        encoding="utf-8",
+    )
+    with pytest.raises(StartupContractError, match="malformed"):
+        sc.read_contract_strict()
+
+
+def test_startup_launcher_mentions_required_environment() -> None:
+    """The generated launcher script documents the required external environment."""
+    content = sc.generate_startup_launcher_content()
+    assert SUPERVISOR_STATE_TOKEN_ENV in content
+    assert "externally supplied" in content
+    assert "do not generate it here" in content
+
+
+def test_startup_definition_includes_required_environment() -> None:
+    """The startup definition artifact includes required environment variable names."""
+    definition = sc.generate_startup_definition()
+    assert "required_environment" in definition
+    assert definition["required_environment"] == list(CURRENT_CONTRACT.required_environment)
 
 
 # --- Status / startup-contract command tests (no topology) ---
