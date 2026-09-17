@@ -848,7 +848,6 @@ class SupervisorDaemon:
             self._persist_runtime_commit()
             self._invalidate_stale_status()
             normalize_cross_boot_state()
-            supervise.promote_pending_request()
             self._install_signal_handlers()
             self._open_control_socket()
             self._write_status("starting")
@@ -884,6 +883,7 @@ class SupervisorDaemon:
         :meth:`run`.
         """
         self._message = None
+        supervise.promote_pending_request()
         state = read_state()
         if state.ownership_hold_malformed:
             # Materialize the hold so a later rewrite cannot turn authority
@@ -3382,6 +3382,8 @@ class SupervisorDaemon:
             return SupervisorDaemon._handle_clear_spawning_obligation()
         if request.request_type == "allocate_generation":
             return SupervisorDaemon._handle_allocate_generation()
+        if request.request_type == "ensure_run_intent":
+            return SupervisorDaemon._handle_ensure_run_intent(request.payload)
         return ControlResponse.error(f"unknown request type: {request.request_type}")
 
     @staticmethod
@@ -3547,6 +3549,46 @@ class SupervisorDaemon:
         except Exception:
             LOGGER.exception("control allocate_generation failed")
             return ControlResponse.error("failed to allocate generation")
+        return ControlResponse.ok(generation=generation)
+
+    @staticmethod
+    def _handle_ensure_run_intent(payload: dict[str, object]) -> dict[str, object]:
+        """Handle an ensure_run_intent request over the control socket.
+
+        Validates the request and delegates to ``supervise.ensure_run_intent()``,
+        which applies the same idempotent semantics: same-commit preservation,
+        conflict on different commit, fresh generation on absence.
+
+        Args:
+            payload: Request payload with commit, repo, uv_path, etc.
+
+        Returns:
+            JSON-serializable response dict with the generation.
+        """
+        commit = payload.get("commit")
+        repo = payload.get("repo", "")
+        uv_path = payload.get("uv_path", "")
+        worker_id = payload.get("worker_id")
+        if not isinstance(commit, str) or not commit:
+            return ControlResponse.error("missing or invalid 'commit'")
+        if not isinstance(repo, str):
+            return ControlResponse.error("missing or invalid 'repo'")
+        if not isinstance(uv_path, str):
+            return ControlResponse.error("missing or invalid 'uv_path'")
+        try:
+            generation = supervise.ensure_run_intent(
+                commit,
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id if isinstance(worker_id, str) else None,
+            )
+        except supervise.GenerationLockTimeoutError:
+            return ControlResponse.error("generation lock timed out")
+        except supervise.DesiredAuthorityConflictError as exc:
+            return ControlResponse.error(str(exc))
+        except Exception:
+            LOGGER.exception("control ensure_run_intent failed")
+            return ControlResponse.error("failed to ensure run intent")
         return ControlResponse.ok(generation=generation)
 
     def _release_ownership(self) -> None:

@@ -42,6 +42,7 @@ import json
 import math
 import os
 import resource
+import secrets
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
@@ -1015,6 +1016,54 @@ def pending_request_path() -> Path:
     return supervisor_dir() / "pending-request.json"
 
 
+def pending_request_ack_dir() -> Path:
+    """Return the directory for non-authoritative pending-request acknowledgments.
+
+    After the supervisor promotes a pending request, it writes an ack
+    file keyed to the request's ``request_id`` so the installing CLI
+    can confirm its request was consumed.  The directory is in the
+    public supervisor directory (untokenized) so tokenless install
+    commands can read acks.
+    """
+    return supervisor_dir() / "pending-ack"
+
+
+_VALID_REQUEST_ID_LEN: Final = 32
+
+
+def validate_pending_request_id(request_id: str) -> str:
+    """Validate a pending request ID is exactly 32 lowercase hex characters.
+
+    Args:
+        request_id: The candidate request ID.
+
+    Returns:
+        The validated request ID.
+
+    Raises:
+        ValueError: If the request ID is not 32 lowercase hex characters.
+    """
+    if len(request_id) != _VALID_REQUEST_ID_LEN or not all(
+        ch in "0123456789abcdef" for ch in request_id
+    ):
+        msg = "pending request_id must be exactly 32 lowercase hex chars"
+        raise ValueError(msg)
+    return request_id
+
+
+def pending_request_ack_path(request_id: str) -> Path:
+    """Return the ack file path for a specific pending request.
+
+    Args:
+        request_id: The request ID (must be validated hex).
+
+    Returns:
+        The ack file path.
+    """
+    validate_pending_request_id(request_id)
+    return pending_request_ack_dir() / f"{request_id}.json"
+
+
 def state_path() -> Path:
     """Return the path of the daemon's durable state file (private authority).
 
@@ -1089,6 +1138,8 @@ class GenerationLockTimeoutError(Exception):
 CONSUMER_LOCK_POLL_SECONDS = 0.05
 GENERATION_LOCK_POLL_SECONDS = 0.05
 DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS = 30.0
+PENDING_REQUEST_LOCK_POLL_SECONDS = 0.05
+DEFAULT_PENDING_REQUEST_LOCK_TIMEOUT_SECONDS = 10.0
 
 
 @contextmanager
@@ -1197,6 +1248,54 @@ def generation_lock(
                     msg = "timed out waiting for the generation lock"
                     raise GenerationLockTimeoutError(msg) from None
                 time.sleep(GENERATION_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+class PendingRequestLockTimeoutError(Exception):
+    """The pending-request lock could not be acquired in time."""
+
+
+@contextmanager
+def pending_request_lock(
+    timeout_seconds: float = DEFAULT_PENDING_REQUEST_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Serialize pending-request write and promotion across processes.
+
+    The pending-request file is a shared public surface written by tokenless
+    CLI callers and consumed by the supervisor daemon.  Concurrent writers
+    must not clobber each other's durable ack, and the supervisor must not
+    remove the pending file while a newer writer is about to overwrite it.
+
+    Lock ordering: pending-request lock may be held while ensure_run_intent
+    acquires the generation lock (the promoter calls ensure_run_intent inside
+    the pending-request lock).  Code must never acquire the pending-request
+    lock while the generation lock is already held.
+
+    Args:
+        timeout_seconds: Maximum seconds to wait for the lock.
+
+    Yields:
+        Nothing while the lock is held.
+
+    Raises:
+        PendingRequestLockTimeoutError: If the lock cannot be acquired in time.
+    """
+    path = supervisor_dir() / ".pending-request.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    msg = "timed out waiting for the pending-request lock"
+                    raise PendingRequestLockTimeoutError(msg) from None
+                time.sleep(PENDING_REQUEST_LOCK_POLL_SECONDS)
         try:
             yield
         finally:
@@ -1958,12 +2057,13 @@ def _reserved_generation() -> int:
     return gen
 
 
-def _write_pending_request(
+def write_pending_request(
     commit: str,
     *,
     repo: str,
     uv_path: str,
     worker_id: str | None,
+    request_id: str,
 ) -> None:
     """Write a non-authoritative pending install request.
 
@@ -1974,55 +2074,130 @@ def _write_pending_request(
     The file is a plain JSON dict with the same fields as
     ``SupervisorDesired`` but without generation (the supervisor allocates
     that atomically on promotion).
+
+    The write is serialized under the pending-request lock so a concurrent
+    promotion cannot read a half-written file or remove the file between
+    our write and our ack check.
+
+    Args:
+        commit: Exact commit the install wants to activate.
+        repo: Maintained checkout path.
+        uv_path: Resolved ``uv`` executable path.
+        worker_id: Worker identifier, or ``None``.
+        request_id: Strict 32-lowercase-hex identifier for ack correlation.
     """
+    validate_pending_request_id(request_id)
     data: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "commit": commit,
         "repo": repo,
         "uv_path": uv_path,
         "worker_id": worker_id,
+        "request_id": request_id,
     }
-    write_json_durable(pending_request_path(), data)
+    with pending_request_lock():
+        write_json_durable(pending_request_path(), data)
 
 
 def promote_pending_request() -> bool:
     """Promote a pending install request to the tokenized desired authority.
 
-    Called by the supervisor daemon on startup (after acquiring the token
-    and the generation lock).  Reads the pending request, allocates a
-    generation, and writes it to the tokenized ``desired_path()``.
+    Called by the supervisor daemon every reconciliation loop (after acquiring
+    the token).  The whole load-validate-promote-ack-remove sequence runs
+    under the pending-request lock so a concurrent writer cannot clobber the
+    file between our load and our removal.
 
     Returns:
-        ``True`` when a pending request was promoted, ``False`` when none
-        existed or the request was stale/malformed.
+        ``True`` when a pending request was processed, ``False`` when none
+        existed or the request was malformed.
     """
-    path = pending_request_path()
-    data = _load_pending_request(path)
-    if data is None:
-        return False
+    with pending_request_lock():
+        path = pending_request_path()
+        data = _load_pending_request(path)
+        if data is None:
+            return False
+
+        # Extract and validate request_id first so every failure path can write
+        # a safe ack.  An invalid or missing request_id means no ack is written
+        # (there is no safe public path to target) and the pending file is
+        # simply removed as corrupt.
+        raw_request_id = data.get("request_id")
+        if not isinstance(raw_request_id, str):
+            remove_durable(path)
+            return False
+        try:
+            request_id = validate_pending_request_id(raw_request_id)
+        except ValueError:
+            remove_durable(path)
+            return False
+
+        processed = _promote_pending_request_validated(data, request_id)
+        remove_durable(path)
+        return processed
+
+
+def _promote_pending_request_validated(
+    data: dict[str, object],
+    request_id: str,
+) -> bool:
+    """Process a pending request whose request_id is already validated.
+
+    Args:
+        data: The parsed pending request dict.
+        request_id: The validated 32-lowercase-hex request ID.
+
+    Returns:
+        ``True`` when the request was successfully promoted.
+    """
     commit = data.get("commit")
     if not isinstance(commit, str) or not commit:
+        _write_pending_ack(request_id, ok=False, error="missing or invalid commit")
         return False
     repo_val = data.get("repo", "")
     uv_val = data.get("uv_path", "")
     worker_val = data.get("worker_id")
-    with generation_lock():
-        try:
-            existing = read_desired_strict()
-        except SupervisorStateTokenError:
-            return False
-        if existing is not None:
-            remove_durable(path)
-            return False
-        _write_run_intent_locked(
+    try:
+        generation = ensure_run_intent(
             commit,
             repo=str(repo_val) if isinstance(repo_val, str) else "",
             uv_path=str(uv_val) if isinstance(uv_val, str) else "",
             worker_id=str(worker_val) if isinstance(worker_val, str) else None,
-            restart=False,
         )
-    remove_durable(path)
+    except DesiredAuthorityConflictError:
+        _write_pending_ack(
+            request_id, ok=False, error="conflict with existing supervisor authority"
+        )
+        return False
+    except (DesiredIntentError, MissionAuthorityError):
+        _write_pending_ack(
+            request_id, ok=False, error="supervisor authority is malformed or unreadable"
+        )
+        return False
+    _write_pending_ack(request_id, ok=True, generation=generation)
     return True
+
+
+def _write_pending_ack(
+    request_id: str,
+    *,
+    ok: bool,
+    generation: int | None = None,
+    error: str | None = None,
+) -> None:
+    """Write a durable ack for a pending request.
+
+    Args:
+        request_id: The validated 32-lowercase-hex request ID.
+        ok: Whether the promotion succeeded.
+        generation: The allocated generation on success.
+        error: The error message on failure.
+    """
+    data: dict[str, object] = {"ok": ok}
+    if generation is not None:
+        data["generation"] = generation
+    if error is not None:
+        data["error"] = error
+    write_json_durable(pending_request_ack_path(request_id), data)
 
 
 def _load_pending_request(path: Path) -> dict[str, object] | None:
@@ -2113,11 +2288,12 @@ def ensure_run_intent(
         except SupervisorStateTokenError:
             # Token absent: no existing authoritative intent.  Write a
             # pending request for the supervisor to promote on startup.
-            _write_pending_request(
+            write_pending_request(
                 commit,
                 repo=repo,
                 uv_path=uv_path,
                 worker_id=worker_id,
+                request_id=secrets.token_hex(16),
             )
             return 1
         if current is not None:

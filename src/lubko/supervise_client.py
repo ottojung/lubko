@@ -14,6 +14,9 @@ This module provides functions that:
 
 from __future__ import annotations
 
+import json
+import secrets
+import time
 from dataclasses import replace
 
 from lubko import supervise
@@ -327,6 +330,208 @@ def clear_spawning_obligation_client() -> None:
     if not response.get("ok"):
         msg = response.get("error", "unknown error from supervisor")
         raise RuntimeError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Ensure run intent (install path)
+# ---------------------------------------------------------------------------
+
+
+def ensure_run_intent_client(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+) -> int | None:
+    """Ensure durable desired authority names ``commit`` without restarting it.
+
+    Race-safe tokenless protocol:
+
+    1. With token: direct ``supervise.ensure_run_intent()`` (fast, no IPC).
+    2. Without token: attempt a control socket request immediately (no
+       ``supervisor_alive()`` TOCTOU check — a live supervisor is always
+       preferred).  On success, return the generation.
+    3. On connection failure: write a non-authoritative pending request
+       with a fresh ``request_id`` and enter a bounded poll loop.  On each
+       iteration it (a) checks the ack file for this ``request_id`` and
+       returns when found, (b) retries the control socket in case the
+       supervisor started after the initial probe.  If the control socket
+       becomes live and returns a result, use it — but only remove the
+       pending file if it still contains this exact ``request_id`` (a
+       concurrent conflicting supervisor would have consumed or replaced it).
+    4. At timeout: ``None`` is returned only when the control socket is
+       *still* unreachable AND ``pending-request.json`` still contains this
+       exact ``request_id``.  Any other outcome (supervisor live but
+       conflicting, ack with ok=false, pending file overwritten) raises
+       immediately.
+
+    Returns:
+        The existing or newly allocated desired generation, or ``None``
+        when a pending request was written and is durably queued for future
+        supervisor promotion (no real generation is available yet).
+    """
+    if _has_token():
+        return supervise.ensure_run_intent(
+            commit,
+            repo=repo,
+            uv_path=uv_path,
+            worker_id=worker_id,
+        )
+
+    # --- Attempt 1: direct control socket (no TOCTOU) ---
+    try:
+        return _try_socket_ensure_run_intent(
+            commit, repo=repo, uv_path=uv_path, worker_id=worker_id
+        )
+    except (ConnectionRefusedError, OSError):
+        pass
+
+    # --- Socket failed: write pending request with fresh request_id ---
+    request_id = secrets.token_hex(16)
+    supervise.write_pending_request(
+        commit,
+        repo=repo,
+        uv_path=uv_path,
+        worker_id=worker_id,
+        request_id=request_id,
+    )
+
+    return _poll_pending_request(
+        request_id, commit, repo=repo, uv_path=uv_path, worker_id=worker_id
+    )
+
+
+def _poll_pending_request(
+    request_id: str,
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+) -> int | None:
+    """Poll for ack or retry control socket until timeout.
+
+    Returns:
+        The generation on success, or ``None`` when the pending request
+        is durably queued and no supervisor is reachable.
+
+    Raises:
+        RuntimeError: If the ack reports failure or the supervisor
+            came alive but did not consume the pending request.
+        TypeError: If the ack is ok but missing the generation field.
+    """
+    deadline = time.monotonic() + supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        ack = _read_pending_ack(request_id)
+        if ack is not None:
+            if ack.get("ok"):
+                gen = ack.get("generation")
+                if isinstance(gen, int):
+                    return gen
+                msg = "pending ack ok but missing generation"
+                raise TypeError(msg)
+            error = str(ack.get("error", "pending request failed"))
+            raise RuntimeError(error)
+
+        try:
+            result = _try_socket_ensure_run_intent(
+                commit, repo=repo, uv_path=uv_path, worker_id=worker_id
+            )
+        except (ConnectionRefusedError, OSError):
+            pass
+        else:
+            return result
+
+        time.sleep(supervise.REQUEST_POLL_SECONDS)
+
+    try:
+        return _try_socket_ensure_run_intent(
+            commit, repo=repo, uv_path=uv_path, worker_id=worker_id
+        )
+    except (ConnectionRefusedError, OSError):
+        if _pending_request_is_ours(request_id):
+            return None
+        msg = "pending request was overwritten or consumed without acknowledgment"
+        raise RuntimeError(msg) from None
+
+
+def _try_socket_ensure_run_intent(
+    commit: str,
+    *,
+    repo: str,
+    uv_path: str,
+    worker_id: str | None,
+) -> int:
+    """Send an ensure_run_intent request over the control socket.
+
+    Returns:
+        The generation from the supervisor response.
+
+    Raises:
+        supervise.DesiredAuthorityConflictError: On conflict.
+        RuntimeError: On other supervisor errors.
+        TypeError: On malformed response.
+    """
+    response = _socket_request({
+        "type": "ensure_run_intent",
+        "commit": commit,
+        "repo": repo,
+        "uv_path": uv_path,
+        "worker_id": worker_id,
+    })
+    if not response.get("ok"):
+        error = response.get("error", "unknown error from supervisor")
+        if "conflicts" in str(error):
+            raise supervise.DesiredAuthorityConflictError(error)
+        raise RuntimeError(error)
+    generation = response.get("generation")
+    if not isinstance(generation, int):
+        msg = "supervisor response missing 'generation'"
+        raise TypeError(msg)
+    return generation
+
+
+def _read_pending_ack(request_id: str) -> dict[str, object] | None:
+    """Read the ack file for a pending request, returning None if absent.
+
+    Args:
+        request_id: The validated 32-lowercase-hex request ID.
+
+    Returns:
+        The ack dict, or ``None`` when no ack exists yet.
+    """
+    try:
+        raw = supervise.pending_request_ack_path(request_id).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _pending_request_is_ours(request_id: str) -> bool:
+    """Check whether pending-request.json still contains this exact request_id.
+
+    Args:
+        request_id: The validated 32-lowercase-hex request ID.
+
+    Returns:
+        ``True`` when the pending file exists and carries our request_id.
+    """
+    try:
+        raw = supervise.pending_request_path().read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get("request_id") == request_id
 
 
 # ---------------------------------------------------------------------------

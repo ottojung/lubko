@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Final
 
-from lubko import cli, deployctl, startup_contract, supervise
+from lubko import cli, deployctl, startup_contract, supervise, supervise_client
 from lubko import lifecycle as _lifecycle
 from lubko.durable import DurabilityError
 from lubko.supervise_client import read_desired_client
@@ -313,7 +313,7 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
         _err("could not activate the maintained CLI environment: " + str(exc))
         return EXIT_ERROR
     try:
-        supervise.ensure_run_intent(
+        supervise_client.ensure_run_intent_client(
             commit,
             repo=str(repo),
             uv_path=uv_path,
@@ -324,6 +324,11 @@ def _activate_mutation_locked(repo: Path, commit: str, uv_path: str) -> int:
         supervise.DesiredAuthorityConflictError,
         supervise.DesiredIntentError,
         supervise.GenerationLockTimeoutError,
+        supervise.PendingRequestLockTimeoutError,
+        RuntimeError,
+        ConnectionError,
+        OSError,
+        TypeError,
     ) as exc:
         _err("could not establish supervisor desired state: " + str(exc))
         return EXIT_ERROR

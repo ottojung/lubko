@@ -752,7 +752,13 @@ class TestTokenlessWriteIsolation:
         request_path.parent.mkdir(parents=True, exist_ok=True)
         write_json_durable(
             request_path,
-            {"schema_version": 1, "commit": "a" * 40, "repo": "/r", "uv_path": "uv"},
+            {
+                "schema_version": 1,
+                "commit": "a" * 40,
+                "repo": "/r",
+                "uv_path": "uv",
+                "request_id": "a" * 32,
+            },
         )
 
         # The tokenized desired.json must NOT exist
@@ -777,11 +783,18 @@ class TestTokenlessWriteIsolation:
 
         # Write a pending request
         commit = "b" * 40
+        request_id = "c" * 32
         request_path = supervise.pending_request_path()
         request_path.parent.mkdir(parents=True, exist_ok=True)
         write_json_durable(
             request_path,
-            {"schema_version": 1, "commit": commit, "repo": "/r", "uv_path": "uv"},
+            {
+                "schema_version": 1,
+                "commit": commit,
+                "repo": "/r",
+                "uv_path": "uv",
+                "request_id": request_id,
+            },
         )
 
         # Promote
@@ -790,6 +803,13 @@ class TestTokenlessWriteIsolation:
 
         # Pending request file should be removed
         assert not request_path.exists()
+
+        # Ack file should exist with ok=true
+        ack = supervise.pending_request_ack_path(request_id)
+        assert ack.exists()
+        ack_data = json.loads(ack.read_text(encoding="utf-8"))
+        assert ack_data["ok"] is True
+        assert isinstance(ack_data["generation"], int)
 
         # Tokenized desired authority should exist with correct commit
         desired = supervise.read_desired_strict()
@@ -893,14 +913,57 @@ class TestGenerationReservation:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """A malformed reservation file is treated as absent."""
+        """A malformed reservation file fails closed, not treated as absent."""
         monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
         monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
         supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
         supervise.write_state(supervise.fresh_state())
         supervise.reserved_generation_path().write_text("not json", encoding="utf-8")
-        # Malformed reservation is ignored; generation is 1
-        assert supervise.next_generation() == 1
+        # Malformed reservation fails closed: raising rather than returning 0
+        with pytest.raises(supervise.MissionAuthorityError):
+            supervise.next_generation()
+
+    @staticmethod
+    def test_non_dict_reservation_fails_closed(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A reservation that is not a JSON object fails closed."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        supervise.reserved_generation_path().write_text('"just a string"', encoding="utf-8")
+        with pytest.raises(supervise.MissionAuthorityError):
+            supervise.next_generation()
+
+    @staticmethod
+    def test_missing_generation_field_fails_closed(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A reservation without a generation field fails closed."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        supervise.reserved_generation_path().write_text('{"other": "field"}', encoding="utf-8")
+        with pytest.raises(supervise.MissionAuthorityError):
+            supervise.next_generation()
+
+    @staticmethod
+    def test_non_positive_generation_fails_closed(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A reservation with a non-positive generation fails closed."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        supervise.reserved_generation_path().write_text('{"generation": 0}', encoding="utf-8")
+        with pytest.raises(supervise.MissionAuthorityError):
+            supervise.next_generation()
 
     @staticmethod
     def test_concurrent_allocations_get_distinct_generations(
@@ -926,3 +989,280 @@ class TestGenerationReservation:
         # Simulate second allocation: sees first reservation
         gen2 = supervise.next_generation()
         assert gen2 > gen1, f"second allocation {gen2} must exceed first {gen1}"
+
+
+# ---------------------------------------------------------------------------
+# Pending request request_id validation
+# ---------------------------------------------------------------------------
+
+
+class TestPendingRequestIdValidation:
+    """request_id must be exactly 32 lowercase hex characters."""
+
+    @staticmethod
+    def test_valid_request_id_accepted() -> None:
+        """A 32-char lowercase hex string passes."""
+        valid = "a" * 32
+        assert supervise.validate_pending_request_id(valid) == valid
+
+    @staticmethod
+    def test_uppercase_rejected() -> None:
+        """Uppercase hex is rejected."""
+        with pytest.raises(ValueError, match="request_id"):
+            supervise.validate_pending_request_id("A" + "a" * 31)
+
+    @staticmethod
+    def test_short_rejected() -> None:
+        """31 characters is too short."""
+        with pytest.raises(ValueError, match="request_id"):
+            supervise.validate_pending_request_id("a" * 31)
+
+    @staticmethod
+    def test_long_rejected() -> None:
+        """33 characters is too long."""
+        with pytest.raises(ValueError, match="request_id"):
+            supervise.validate_pending_request_id("a" * 33)
+
+    @staticmethod
+    def test_non_hex_rejected() -> None:
+        """Characters outside 0-9a-f are rejected."""
+        with pytest.raises(ValueError, match="request_id"):
+            supervise.validate_pending_request_id("g" + "a" * 31)
+
+    @staticmethod
+    def test_empty_rejected() -> None:
+        """Empty string is rejected."""
+        with pytest.raises(ValueError, match="request_id"):
+            supervise.validate_pending_request_id("")
+
+    @staticmethod
+    def test_ack_path_rejects_invalid_id() -> None:
+        """pending_request_ack_path rejects non-hex request_id."""
+        with pytest.raises(ValueError, match="request_id"):
+            supervise.pending_request_ack_path("not-hex!")
+
+    @staticmethod
+    def test_ack_path_accepts_valid_id() -> None:
+        """pending_request_ack_path accepts valid 32-hex request_id."""
+        rid = "0" * 32
+        path = supervise.pending_request_ack_path(rid)
+        assert path.name == f"{rid}.json"
+
+
+# ---------------------------------------------------------------------------
+# Pending request protocol: fresh absent, queued, ack
+# ---------------------------------------------------------------------------
+
+
+class TestPendingRequestProtocol:
+    """Pending request lifecycle: write, promote, ack."""
+
+    @staticmethod
+    def test_write_pending_includes_request_id(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """write_pending_request persists the request_id field."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        commit = "d" * 40
+        rid = "e" * 32
+        supervise.write_pending_request(
+            commit,
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+            request_id=rid,
+        )
+        raw = supervise.pending_request_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+        assert data["request_id"] == rid
+        assert data["commit"] == commit
+
+    @staticmethod
+    def test_promote_writes_ack_on_conflict(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Promote writes ok=false ack when desired authority conflicts."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        # Write a desired intent for commit A
+        commit_a = "a" * 40
+        commit_b = "b" * 40
+        supervise.write_desired(
+            SupervisedDesired(
+                schema_version=1,
+                generation=1,
+                commit=commit_a,
+                repo="/r",
+                uv_path="uv",
+                worker_id=None,
+            )
+        )
+        # Write a pending request for commit B (conflict)
+        rid = "f" * 32
+        supervise.write_pending_request(
+            commit_b,
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+            request_id=rid,
+        )
+        result = supervise.promote_pending_request()
+        assert result is False
+        # Ack should be ok=false with error
+        ack = supervise.pending_request_ack_path(rid)
+        assert ack.exists()
+        ack_data = json.loads(ack.read_text(encoding="utf-8"))
+        assert ack_data["ok"] is False
+        assert "conflict" in ack_data["error"]
+        # Pending file should be removed
+        assert not supervise.pending_request_path().exists()
+
+    @staticmethod
+    def test_promote_removes_malformed_commit(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Promote removes pending with empty commit and writes ack."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        rid = "1" * 32
+        supervise.write_pending_request(
+            "",
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+            request_id=rid,
+        )
+        result = supervise.promote_pending_request()
+        assert result is False
+        assert not supervise.pending_request_path().exists()
+        ack = supervise.pending_request_ack_path(rid)
+        assert ack.exists()
+        ack_data = json.loads(ack.read_text(encoding="utf-8"))
+        assert ack_data["ok"] is False
+
+    @staticmethod
+    def test_promote_skips_without_request_id(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Promote silently removes pending with no request_id (no ack)."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        request_path = supervise.pending_request_path()
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_durable(
+            request_path,
+            {"schema_version": 1, "commit": "a" * 40, "repo": "/r", "uv_path": "uv"},
+        )
+        result = supervise.promote_pending_request()
+        assert result is False
+        assert not request_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Tokenless client: ensure_run_intent_client race protocol
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureRunIntentClientRace:
+    """Race-safe tokenless ensure_run_intent_client protocol."""
+
+    @staticmethod
+    def test_socket_fail_writes_pending_with_request_id(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """When socket fails, pending is written with a valid request_id."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
+        commit = "a" * 40
+        # Short timeout so the test is fast
+        monkeypatch.setattr(supervise, "DEFAULT_REQUEST_TIMEOUT_SECONDS", 0.2)
+        result = supervise_client.ensure_run_intent_client(
+            commit,
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+        )
+        assert result is None
+        # Pending file should exist with valid request_id
+        raw = supervise.pending_request_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+        assert "request_id" in data
+        assert len(data["request_id"]) == 32
+        assert data["commit"] == commit
+
+    @staticmethod
+    def test_no_success_without_ack(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Without an ack, pending remains and None is returned at timeout."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
+        monkeypatch.setattr(supervise, "DEFAULT_REQUEST_TIMEOUT_SECONDS", 0.1)
+        result = supervise_client.ensure_run_intent_client(
+            "b" * 40,
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+        )
+        assert result is None
+        assert supervise.pending_request_path().exists()
+
+    @staticmethod
+    def test_invalid_request_id_rejected_on_write() -> None:
+        """write_pending_request rejects invalid request_id."""
+        with pytest.raises(ValueError, match="request_id"):
+            supervise.write_pending_request(
+                "a" * 40,
+                repo="/r",
+                uv_path="uv",
+                worker_id=None,
+                request_id="bad!",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Client dual-mode: with token delegates to direct ensure_run_intent
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureRunIntentClientWithToken:
+    """With token, ensure_run_intent_client delegates to supervise directly."""
+
+    @staticmethod
+    def test_with_token_delegates_directly(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """With token, pending is not written; desired is written directly."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+        supervise.write_state(supervise.fresh_state())
+        commit = "a" * 40
+        gen = supervise_client.ensure_run_intent_client(
+            commit,
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+        )
+        assert isinstance(gen, int)
+        assert gen > 0
+        # No pending request should exist
+        assert not supervise.pending_request_path().exists()
+        # Desired should exist
+        desired = supervise.read_desired_strict()
+        assert desired is not None
+        assert desired.commit == commit
