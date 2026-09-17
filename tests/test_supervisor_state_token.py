@@ -12,13 +12,14 @@ import json
 import os
 import secrets
 import threading
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 from lubko import lifecycle, supervise, supervise_client, supervisor
 from lubko.control_socket import bind_abstract_socket
-from lubko.durable import write_json_durable
+from lubko.durable import DurabilityError, write_json_durable
 from lubko.state import (
     SUPERVISOR_STATE_TOKEN_ENV,
     SupervisorStateTokenError,
@@ -26,9 +27,6 @@ from lubko.state import (
     validate_supervisor_state_token,
 )
 from lubko.supervise import SupervisorDesired as SupervisedDesired
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 VALID_TOKEN = secrets.token_hex(32)
 
@@ -1395,3 +1393,194 @@ def test_pending_request_lock_serializes_promoter_and_new_writer(
     assert ack_a.exists()
     ack_a_data = json.loads(ack_a.read_text(encoding="utf-8"))
     assert ack_a_data["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: direct ensure_run_intent fails closed without token
+# ---------------------------------------------------------------------------
+
+
+def test_direct_ensure_run_intent_absent_token_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ensure_run_intent raises without token and creates no pending request."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.delenv(SUPERVISOR_STATE_TOKEN_ENV, raising=False)
+    with pytest.raises(SupervisorStateTokenError):
+        supervise.ensure_run_intent(
+            "a" * 40,
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+        )
+    assert not supervise.pending_request_path().exists()
+
+
+# ---------------------------------------------------------------------------
+# Regression: private-read OSError sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestPrivateReadSanitization:
+    """OSError in private authority reads must not leak tokens or paths."""
+
+    @staticmethod
+    def test_desired_read_oserror_sanitized(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """read_desired_strict OSError yields clean DesiredIntentError."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+
+        original_read_text = Path.read_text
+
+        def _intercepting_read_text(
+            self: Path,
+            *args: Any,
+            **kwargs: Any,
+        ) -> str:
+            if VALID_TOKEN in str(self):
+                msg = f"permission denied on /private/{VALID_TOKEN}/desired.json"
+                raise OSError(msg)
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _intercepting_read_text)
+        with pytest.raises(
+            supervise.DesiredIntentError,
+            match="cannot read the supervisor desired intent",
+        ) as exc_info:
+            supervise.read_desired_strict()
+        assert VALID_TOKEN not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+
+    @staticmethod
+    def test_reserved_generation_read_oserror_sanitized(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """_reserved_generation OSError yields clean MissionAuthorityError."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+
+        original_read_text = Path.read_text
+
+        def _intercepting_read_text(
+            self: Path,
+            *args: Any,
+            **kwargs: Any,
+        ) -> str:
+            if VALID_TOKEN in str(self):
+                msg = f"permission denied on /private/{VALID_TOKEN}/reserved_generation.json"
+                raise OSError(msg)
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _intercepting_read_text)
+        with pytest.raises(
+            supervise.MissionAuthorityError,
+            match="cannot read reserved generation authority",
+        ) as exc_info:
+            supervise._reserved_generation()
+        assert VALID_TOKEN not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: write_desired/write_state DurabilityError sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestWriteDurabilityErrorSanitization:
+    """Injected DurabilityError containing private markers must be re-raised clean."""
+
+    @staticmethod
+    def test_write_desired_durability_error_sanitized(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """write_desired re-raises generic DurabilityError without cause."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+
+        def _bombing_write(_path: object, _data: object) -> None:
+            msg = f"fsync failed at /private/{VALID_TOKEN}/desired.json"
+            raise DurabilityError(msg)
+
+        monkeypatch.setattr(supervise, "write_json_durable", _bombing_write)
+        desired = SupervisedDesired(
+            schema_version=1,
+            generation=1,
+            commit="a" * 40,
+            repo="/r",
+            uv_path="uv",
+            worker_id=None,
+        )
+        with pytest.raises(
+            DurabilityError, match="failed to durably write desired intent"
+        ) as exc_info:
+            supervise.write_desired(desired)
+        assert VALID_TOKEN not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+
+    @staticmethod
+    def test_write_state_durability_error_sanitized(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """write_state re-raises generic DurabilityError without cause."""
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+
+        def _bombing_write(_path: object, _data: object) -> None:
+            msg = f"fsync failed at /private/{VALID_TOKEN}/state.json"
+            raise DurabilityError(msg)
+
+        monkeypatch.setattr(supervise, "write_json_durable", _bombing_write)
+        with pytest.raises(
+            DurabilityError, match="failed to durably write supervisor state"
+        ) as exc_info:
+            supervise.write_state(supervise.fresh_state())
+        assert VALID_TOKEN not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__ is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: _handle_allocate_generation DurabilityError handling
+# ---------------------------------------------------------------------------
+
+
+def test_handle_allocate_generation_durability_error_generic(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """_handle_allocate_generation returns generic error on DurabilityError.
+
+    The injected error contains a private token/path marker; the response and
+    log must never expose it.
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
+    supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+    supervise.write_state(supervise.fresh_state())
+
+    def _bombing_write(_path: object, _data: object) -> None:
+        msg = f"fsync failed at /private/{VALID_TOKEN}/reserved_generation.json"
+        raise DurabilityError(msg)
+
+    monkeypatch.setattr(supervisor, "write_json_durable", _bombing_write)
+    response = supervisor.SupervisorDaemon._handle_allocate_generation()
+    assert response["ok"] is False
+    assert response["error"] == "failed to allocate generation"
+    # Must not leak the private error text or token into logs
+    for record in caplog.records:
+        assert VALID_TOKEN not in record.getMessage()

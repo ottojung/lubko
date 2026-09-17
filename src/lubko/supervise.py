@@ -42,7 +42,6 @@ import json
 import math
 import os
 import resource
-import secrets
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
@@ -53,7 +52,7 @@ from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
-from lubko.durable import remove_durable, write_json_durable
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.health import validate_incarnation_token
 from lubko.state import (
     SupervisorStateTokenError,
@@ -1510,12 +1509,19 @@ def write_desired(desired: SupervisorDesired) -> None:
     Args:
         desired: Intent to store.
 
+    Raises:
+        DurabilityError: If the write cannot be confirmed durable.
+
     Note:
         Fails closed: the write raises :class:`DurabilityError` from
         :func:`lubko.durable.write_json_durable` when it cannot be confirmed
         durable, so callers must not advance a dependent action.
     """
-    write_json_durable(desired_path(), desired.to_dict())
+    try:
+        write_json_durable(desired_path(), desired.to_dict())
+    except DurabilityError:
+        msg = "failed to durably write desired intent"
+        raise DurabilityError(msg) from None
 
 
 class DesiredIntentError(RuntimeError):
@@ -1548,9 +1554,9 @@ def read_desired_strict() -> SupervisorDesired | None:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError as exc:
-        msg = f"cannot read the supervisor desired intent: {exc}"
-        raise DesiredIntentError(msg) from exc
+    except OSError:
+        msg = "cannot read the supervisor desired intent"
+        raise DesiredIntentError(msg) from None
     try:
         decoded = json.loads(raw)
     except ValueError as exc:
@@ -1597,12 +1603,19 @@ def write_state(state: SupervisorState) -> None:
     Args:
         state: State to store.
 
+    Raises:
+        DurabilityError: If the write cannot be confirmed durable.
+
     Note:
         Fails closed: the write raises :class:`DurabilityError` from
         :func:`lubko.durable.write_json_durable` when it cannot be confirmed
         durable, so callers must not advance a dependent action.
     """
-    write_json_durable(state_path(), state.to_dict())
+    try:
+        write_json_durable(state_path(), state.to_dict())
+    except DurabilityError:
+        msg = "failed to durably write supervisor state"
+        raise DurabilityError(msg) from None
 
 
 def write_state_preserving_authority(
@@ -2039,9 +2052,9 @@ def _reserved_generation() -> int:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return 0
-    except OSError as exc:
-        msg = f"cannot read reserved generation authority: {exc}"
-        raise MissionAuthorityError(msg) from exc
+    except OSError:
+        msg = "cannot read reserved generation authority"
+        raise MissionAuthorityError(msg) from None
     try:
         data = json.loads(raw)
     except (ValueError, TypeError) as exc:
@@ -2281,21 +2294,13 @@ def ensure_run_intent(
 
     Raises:
         DesiredAuthorityConflictError: If existing lifecycle authority forbids convergence.
+        SupervisorStateTokenError: If ``LUBKO_SUPERVISOR_STATE_TOKEN`` is absent.
     """
+    if supervisor_state_token() is None:
+        msg = "LUBKO_SUPERVISOR_STATE_TOKEN is required for direct ensure_run_intent"
+        raise SupervisorStateTokenError(msg)
     with generation_lock():
-        try:
-            current = read_desired_strict()
-        except SupervisorStateTokenError:
-            # Token absent: no existing authoritative intent.  Write a
-            # pending request for the supervisor to promote on startup.
-            write_pending_request(
-                commit,
-                repo=repo,
-                uv_path=uv_path,
-                worker_id=worker_id,
-                request_id=secrets.token_hex(16),
-            )
-            return 1
+        current = read_desired_strict()
         if current is not None:
             if current.commit != commit:
                 msg = (

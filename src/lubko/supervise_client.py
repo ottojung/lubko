@@ -357,14 +357,15 @@ def ensure_run_intent_client(
        iteration it (a) checks the ack file for this ``request_id`` and
        returns when found, (b) retries the control socket in case the
        supervisor started after the initial probe.  If the control socket
-       becomes live and returns a result, use it — but only remove the
-       pending file if it still contains this exact ``request_id`` (a
-       concurrent conflicting supervisor would have consumed or replaced it).
+       becomes live and returns a result, use it.
     4. At timeout: ``None`` is returned only when the control socket is
        *still* unreachable AND ``pending-request.json`` still contains this
        exact ``request_id``.  Any other outcome (supervisor live but
        conflicting, ack with ok=false, pending file overwritten) raises
-       immediately.
+        immediately.
+
+    Only supervisor promotion under ``pending_request_lock`` consumes or
+    removes ``pending-request.json``.
 
     Returns:
         The existing or newly allocated desired generation, or ``None``
@@ -426,6 +427,9 @@ def _poll_pending_request(
         RuntimeError: If the ack reports failure or the supervisor
             came alive but did not consume the pending request.
         TypeError: If the ack is ok but missing the generation field.
+
+    Only supervisor promotion under ``pending_request_lock`` consumes or
+    removes ``pending-request.json``.
     """
     deadline = time.monotonic() + supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS
     while time.monotonic() < deadline:

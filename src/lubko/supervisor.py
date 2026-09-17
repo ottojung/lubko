@@ -3546,6 +3546,9 @@ class SupervisorDaemon:
                 )
         except supervise.GenerationLockTimeoutError:
             return ControlResponse.error("generation lock timed out")
+        except DurabilityError:
+            LOGGER.error("failed to allocate generation")  # ruff: ignore[error-instead-of-exception]
+            return ControlResponse.error("failed to allocate generation")
         except Exception:
             LOGGER.exception("control allocate_generation failed")
             return ControlResponse.error("failed to allocate generation")
