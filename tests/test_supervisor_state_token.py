@@ -13,7 +13,6 @@ import os
 import secrets
 import threading
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -1439,13 +1438,13 @@ class TestPrivateReadSanitization:
 
         def _intercepting_read_text(
             self: Path,
-            *args: Any,
-            **kwargs: Any,
+            encoding: str | None = None,
+            errors: str | None = None,
         ) -> str:
             if VALID_TOKEN in str(self):
                 msg = f"permission denied on /private/{VALID_TOKEN}/desired.json"
                 raise OSError(msg)
-            return original_read_text(self, *args, **kwargs)
+            return original_read_text(self, encoding=encoding, errors=errors)
 
         monkeypatch.setattr(Path, "read_text", _intercepting_read_text)
         with pytest.raises(
@@ -1471,13 +1470,13 @@ class TestPrivateReadSanitization:
 
         def _intercepting_read_text(
             self: Path,
-            *args: Any,
-            **kwargs: Any,
+            encoding: str | None = None,
+            errors: str | None = None,
         ) -> str:
             if VALID_TOKEN in str(self):
                 msg = f"permission denied on /private/{VALID_TOKEN}/reserved_generation.json"
                 raise OSError(msg)
-            return original_read_text(self, *args, **kwargs)
+            return original_read_text(self, encoding=encoding, errors=errors)
 
         monkeypatch.setattr(Path, "read_text", _intercepting_read_text)
         with pytest.raises(
