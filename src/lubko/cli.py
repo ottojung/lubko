@@ -48,7 +48,8 @@ from typing import TYPE_CHECKING, Final
 
 from lubko.durable import DurabilityError, write_symlink_durable
 from lubko.state import cli_root_dir, state_root
-from lubko.supervise import read_desired, read_state
+from lubko.supervise import DesiredIntentError
+from lubko.supervise_client import read_desired_client, read_state_client
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -736,22 +737,41 @@ def reconcile_pointer(commit: str) -> bool:
 def supervisor_authoritative_commits() -> set[str]:
     """Return every runtime commit the supervisor may still rely on.
 
-    The union covers the durable desired intent and the daemon's applied state.
-    Either can name a runtime the
-    supervisor daemon or its maintained worker must still be able to start
-    (including on restart), so garbage collection must never delete them —
+    The union covers:
+    - the durable desired intent (worker target commit);
+    - the daemon's applied state commit;
+    - the supervisor's own runtime commit (the code the supervisor is
+      executing from, which may differ from the worker commit after a
+      deployment).
+
+    All three can name a runtime the supervisor daemon or its maintained
+    worker must still be able to start (including on restart and during
+    spawned two-phase handoff), so garbage collection must never delete them —
     even when they are absent from an explicit keep list.
 
     Returns:
         The set of valid 40-hex commits that must be preserved.
     """
     preserved: set[str] = set()
-    desired = read_desired()
+    try:
+        desired = read_desired_client()
+    except (DesiredIntentError, ConnectionError, OSError):
+        desired = None
     if desired is not None and is_valid_commit_name(desired.commit):
         preserved.add(desired.commit)
-    state_commit = read_state().commit
+    try:
+        state = read_state_client()
+    except (ConnectionError, OSError):
+        return preserved
+    state_commit = state.commit
     if state_commit is not None and is_valid_commit_name(state_commit):
         preserved.add(state_commit)
+    # The supervisor's own runtime must never be garbage-collected while
+    # the supervisor is still executing from it (before a successful
+    # spawned two-phase handoff).
+    sr_commit = state.supervisor_runtime_commit
+    if sr_commit is not None and is_valid_commit_name(sr_commit):
+        preserved.add(sr_commit)
     return preserved
 
 

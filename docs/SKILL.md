@@ -455,13 +455,13 @@ The primary interface is:
 ```text
 lubko-agent new --id <ID> [--cwd DIR] [--title TEXT]
 lubko-agent list [...]
-lubko-agent status <id> / status --id <ID>
+lubko-agent status --id <ID>
 lubko-agent prompt --id <ID> [--steer] PROMPT
-lubko-agent log <id> [--lines N] [--follow]
-lubko-agent wait <id> --timeout SEC
-lubko-agent stop <id>
-lubko-agent kill <id>
-lubko-agent delete <id> [--force]
+lubko-agent log --id <ID> [--lines N] [--follow]
+lubko-agent wait --id <ID> --timeout SEC
+lubko-agent stop --id <ID>
+lubko-agent kill --id <ID>
+lubko-agent delete --id <ID> [--force]
 lubko-agent clean [--days N] [--dry-run]
 ```
 
@@ -554,26 +554,26 @@ Use it to recover context after losing track of an agent ID, to check which sess
 
 ---
 
-# `lubko-agent status <id>`
+# `lubko-agent status --id <ID>`
 
 Show detailed state for one exact agent:
 
 ```sh
-lubko-agent status 8e064622
+lubko-agent status --id 8e064622
 ```
 
-The `--id` flag form is also supported. Status may include the Lubko agent ID, current state, whether its process is alive, total CPU time used by the agent process (from Linux `/proc` data), PID and process-group information, working directory, creation/start/finish timestamps, exit code, prompt count, title, log path, and the internal native session identifier for diagnostics. Use `status` as the primary health check for an agent. A live process is not the same as useful progress: a process can be alive and consuming CPU while looping on a failing action, or alive but idle while the task is genuinely finished. Judge useful progress by pairing `status` with a focused log tail and recent observable progress, not by CPU alone. For any long-running agent, run a direct `lubko-agent status --id <ID>` health check at least every 5 minutes.
+Status may include the Lubko agent ID, current state, whether its process is alive, total CPU time used by the agent process (from Linux `/proc` data), PID and process-group information, working directory, creation/start/finish timestamps, exit code, prompt count, title, log path, and the internal native session identifier for diagnostics. Use `status` as the primary health check for an agent. A live process is not the same as useful progress: a process can be alive and consuming CPU while looping on a failing action, or alive but idle while the task is genuinely finished. Judge useful progress by pairing `status` with a focused log tail and recent observable progress, not by CPU alone. For any long-running agent, run a direct `lubko-agent status --id <ID>` health check at least every 5 minutes.
 
 ---
 
-# `lubko-agent log <id>`
+# `lubko-agent log --id <ID>`
 
 Inspect an agent's output log:
 
 ```sh
-lubko-agent log 8e064622
-lubko-agent log 8e064622 --lines 100
-lubko-agent log 8e064622 --follow
+lubko-agent log --id 8e064622
+lubko-agent log --id 8e064622 --lines 100
+lubko-agent log --id 8e064622 --follow
 ```
 
 `log --follow` attaches to an already-running agent and streams its output. `--lines N` counts **displayed lines**: long logical log lines are folded to 80 characters per displayed line, and only the requested number of displayed lines limits the tail, so `--lines N` shows exactly N folded lines (or fewer if the log is shorter). The durable log file is never rewritten; folding is presentation only. Use logs for observability while the agent is working: seeing what the agent is currently doing, diagnosing a long-running task, understanding a failure, checking whether it is making progress, and deciding whether another prompt is needed. Prefer a focused tail such as 100 or 200 lines over dumping an enormous log. `log --follow` on a just-started agent waits for its first output (or a terminal state) instead of giving up immediately.
@@ -582,48 +582,48 @@ For an attached `prompt`, the invocation's current/final output is also exposed 
 
 ---
 
-# `lubko-agent wait <id>`
+# `lubko-agent wait --id <ID>`
 
 Wait until an agent stops actively running. A timeout must be used:
 
 ```sh
-lubko-agent wait 8e064622 --timeout 300
+lubko-agent wait --id 8e064622 --timeout 300
 ```
 
 A timeout only stops waiting; it does not automatically terminate the agent. Use `wait` when the orchestrator knows that no useful intermediate action is needed and simply wants to block until the task finishes. For longer or uncertain tasks, it is often better to poll `status` and occasionally inspect `log` so the orchestrator can react to progress or problems.
 
 ---
 
-# `lubko-agent stop <id>`
+# `lubko-agent stop --id <ID>`
 
 Gracefully stop one exact running agent:
 
 ```sh
-lubko-agent stop 8e064622
+lubko-agent stop --id 8e064622
 ```
 
 This uses the managed process identity for the selected agent rather than a broad process-name match. Use `stop` when the user asks to stop the task, the task is no longer needed, the agent is clearly proceeding in an unwanted direction, a replacement approach is preferred, or the agent should be interrupted cleanly. Stopping is distinct from natural failure; the resulting state should normally be recorded as `stopped`. Prefer `stop` before `kill`.
 
 ---
 
-# `lubko-agent kill <id>`
+# `lubko-agent kill --id <ID>`
 
 Forcefully terminate one exact agent:
 
 ```sh
-lubko-agent kill 8e064622
+lubko-agent kill --id 8e064622
 ```
 
 Use `kill` only when graceful stopping is insufficient or an immediate hard termination is specifically required. It targets the selected agent's managed process group. A killed agent should normally end in state `killed` with a signal-derived exit status. Do not use generic `killall`, `pkill`, or process-name matching when `lubko-agent kill` can target the exact session.
 
 ---
 
-# `lubko-agent delete <id>`
+# `lubko-agent delete --id <ID>`
 
 Delete the local Lubko management state and logs for an agent:
 
 ```sh
-lubko-agent delete 8e064622
+lubko-agent delete --id 8e064622
 ```
 
 Use deletion when the session is no longer useful and does not need to be continued or inspected later. By default, do not delete actively running agents. Deleting an agent is about its Lubko-managed session state; it must not be treated as permission to delete the repository or project files the agent worked on. Do not routinely delete every successful agent immediately — keeping recent completed sessions is useful because the orchestrator may need to continue them after reviewing the result.
@@ -659,7 +659,7 @@ Rules:
 - Do not impose deadlines on thinking.
 - **Check liveness on a cadence, not by feel.** For any long-running agent, run a direct `lubko-agent status --id <ID>` health check at least every 5 minutes. Prefer `status --id <ID>` over `list` for the health check so the evidence is for the exact agent being monitored.
 - **Use CPU/process evidence as a health signal, not as proof of progress.** `status` reports whether the agent's process is alive and its total CPU time. Growing CPU time shows process activity, not health or progress: a stuck loop can burn CPU, and low CPU can be legitimate while an agent waits on a subprocess or a tool. Judge useful progress from a focused log tail and recent observable progress, not from CPU alone.
-- **Pair status with a focused log tail when ambiguous.** When state or CPU alone does not answer "is it making progress?", read a focused log tail such as `lubko-agent log <ID> --lines 100` and look at what the agent is currently doing. Ask "is it making progress?" not "is it done yet?"
+- **Pair status with a focused log tail when ambiguous.** When state or CPU alone does not answer "is it making progress?", read a focused log tail such as `lubko-agent log --id <ID> --lines 100` and look at what the agent is currently doing. Ask "is it making progress?" not "is it done yet?"
 - An agent that is reading files, running tests, and converging is working; an agent that is looping on one failing action is stuck.
 - **Do not nag solely because time elapsed.** A quiet long-running agent that is still consuming CPU and converging is healthy; interrupting it on a schedule destroys the reasoning it is doing. Only intervene when the evidence shows a genuine stall or a concrete problem.
 - **Steer, stop, or kill genuinely stalled agents.** Once the evidence shows a real stall, do not keep waiting and polling forever: redirect it with a focused `--steer`, or if the task is abandoned, `stop` it and escalate to `kill` only when graceful stopping is insufficient.
@@ -768,13 +768,13 @@ Poll the Supabase job. While `prompt` follows the agent, the enclosing Lubko roo
 ## 2. Observe the agent
 
 ```sh
-lubko-agent status a13f09c2
+lubko-agent status --id a13f09c2
 ```
 
 and, when useful:
 
 ```sh
-lubko-agent log a13f09c2 --lines 100
+lubko-agent log --id a13f09c2 --lines 100
 ```
 
 plus polling the enclosing Supabase root job to read its bounded live output tail.
@@ -784,7 +784,7 @@ plus polling the enclosing Supabase root job to read its bounded live output tai
 If no intervention is needed:
 
 ```sh
-lubko-agent wait a13f09c2 --timeout 300
+lubko-agent wait --id a13f09c2 --timeout 300
 ```
 
 If another instruction is needed:
@@ -832,7 +832,7 @@ After the fix is pushed, the orchestrator reviews the updated PR diff again thro
 Keep the session while follow-up is plausible. Delete it later when it is no longer useful:
 
 ```sh
-lubko-agent delete a13f09c2
+lubko-agent delete --id a13f09c2
 ```
 
 ---
@@ -1083,6 +1083,14 @@ lubko-deploy log [--lines N]
 lubko-supervisor --status
 ```
 
+For version-changing deployments with provenance-aware source authority, use `lubko-deploy-ctl`:
+
+```sh
+lubko-deploy-ctl '<json-request>' [--repo DIR] [--uv PATH] [--source-url URL]
+```
+
+The `--source-url` argument declares the authoritative Git remote. When set, the checkout fetches the exact commit from that authority before checking it out detached, making the deployment source deterministic and provenance-aware.
+
 The maintained worker is owned by an external supervisor (`lubko-supervisor`,
 the container's main process, replacing the former `sleep infinity` child of
 Tini). `deploy` hands the exact confirmed commit to the supervisor, which owns
@@ -1167,10 +1175,12 @@ exec lubko-supervisor
 
 After a fresh install has established the first desired commit and the supervisor owns the maintained worker, use `lubko-deploy-ctl` for version-changing self-deployments; see [`docs/issue21-deploy-protocol.md`](issue21-deploy-protocol.md).
 
+The maintained checkout procedure is deterministic and provenance-aware: given an exact reviewed commit and a declared source authority URL (`--source-url`), the procedure fetches that commit from the authoritative remote, verifies it is present locally, and checks it out detached. The source authority replaces implicit reliance on `origin` or any mutable local branch state, making the deployment source checkout reproducible and auditable.
+
 The normal supervised sequence is:
 
 ```text
-checkout exact commit
+checkout exact commit (from declared source authority)
     -> provisional candidate + armed rollback watchdog
 confirm exact commit
     -> exact candidate is queue-ready + terminal confirmation
@@ -1365,7 +1375,7 @@ If the job used to invoke a Lubko command fails: inspect stdout and stderr, dete
 
 ## Agent failure
 
-If `lubko-agent status <id>` reports a failed agent: inspect `lubko-agent log <id> --lines 100` or another focused tail, then decide whether to continue the same session with a corrective prompt or start a new agent. Prefer continuing the same agent when it retains useful task context.
+If `lubko-agent status --id <id>` reports a failed agent: inspect `lubko-agent log --id <id> --lines 100` or another focused tail, then decide whether to continue the same session with a corrective prompt or start a new agent. Prefer continuing the same agent when it retains useful task context.
 
 ## Agent appears stuck
 
@@ -1469,7 +1479,7 @@ Examples:
 
 ```sh
 git status --short
-lubko-agent log <id> --lines 100
+lubko-agent log --id <id> --lines 100
 sed -n '1,200p' file
 ```
 

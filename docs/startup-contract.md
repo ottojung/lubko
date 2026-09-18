@@ -6,9 +6,9 @@ Lubko requires a simple startup command:
 tini-static -- lubko-supervisor
 ```
 
-Tini is PID 1 and launches `lubko-supervisor` as its direct child. The supervisor owns the maintained worker as its direct child. Lubko validates the installed startup artifacts (launcher, definition, state directories, and private config permissions).
+Tini is PID 1 and launches `lubko-supervisor` as its direct child. The supervisor owns the maintained worker as its direct child. Lubko validates the installed startup artifacts (launcher, definition, state directories, private config permissions, and required environment variable names).
 
-The outer host/container/service environment is **trusted** to restart Lubko appropriately. Lubko does not declare, inspect, infer, or verify Docker, Podman, systemd, or any host restart policy. There is no runtime proof seam for outer host/service-manager behavior, and Lubko does not inspect the live process topology.
+The outer host/container/service environment is **trusted** to restart Lubko appropriately and must supply the stable environment variables named by the versioned contract, including `LUBKO_SUPERVISOR_STATE_TOKEN`. Lubko records only required variable names, never their values. Other external setup remains outside this contract and is not inspected by Lubko.
 
 ## Rolling-upgrade readiness compatibility
 
@@ -27,7 +27,7 @@ Supervisor-owned deployment missions also use a stable backward-readable schema-
 `lubko-install` publishes repository-owned artifacts under `$XDG_STATE_HOME/lubko/deploy/`:
 
 - `startup-contract.json` — the versioned observable startup contract;
-- `lubko-startup-definition.json` — the exact `tini-static -- lubko-supervisor` startup definition plus required state/config paths;
+- `lubko-startup-definition.json` — the exact `tini-static -- lubko-supervisor` startup definition plus required state/config paths and required external environment variable names;
 - `lubko-startup` — the generated launcher.
 
 `lubko-deploy startup-contract` validates those artifacts. It does not inspect the live process topology or anything outside the Lubko environment.

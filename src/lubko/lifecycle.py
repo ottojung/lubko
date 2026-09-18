@@ -60,7 +60,15 @@ from lubko.config import (
     load_worker_server,
 )
 from lubko.durable import DurabilityError, remove_durable, write_json_durable
-from lubko.state import rollback_state_path, state_root
+from lubko.state import SUPERVISOR_STATE_TOKEN_ENV, rollback_state_path, state_root
+from lubko.supervise import GenerationLockTimeoutError
+from lubko.supervise_client import (
+    clear_spawning_obligation_client,
+    read_desired_client,
+    read_state_client,
+    request_run_client,
+    set_spawning_obligation_client,
+)
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import (
     DEFAULT_CANCEL_GRACE_SECONDS,
@@ -109,6 +117,9 @@ LOCK_POLL_INTERVAL_SECONDS: Final = 0.1
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 5.0
 SESSION_WAIT_INTERVAL_SECONDS: Final = 0.01
 UV_HTTP_TIMEOUT: Final = "30"
+
+#: Deterministic sentinel the probe payload writes to stdout on successful exec.
+READINESS_SENTINEL: Final = "lubko-readiness-sentinel"
 
 VALIDATION_STEPS: Final = (
     ("sync", "--frozen", "--extra", "dev"),
@@ -1094,6 +1105,10 @@ def worker_env(token: str) -> dict[str, str]:
     worker instead reads its connection settings from the restricted database
     configuration file.
 
+    The supervisor state namespace token (``LUBKO_SUPERVISOR_STATE_TOKEN``)
+    is also stripped: workers must never hold private supervisor authority
+    paths.
+
     Args:
         token: Unique lifecycle token for this deployment.
 
@@ -1103,7 +1118,7 @@ def worker_env(token: str) -> dict[str, str]:
     env = {
         name: value
         for name, value in os.environ.items()
-        if not _credential_environment_variable(name)
+        if not _credential_environment_variable(name) and name != SUPERVISOR_STATE_TOKEN_ENV
     }
     env[LIFECYCLE_MARKER_VAR] = token
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1960,37 +1975,52 @@ def _finish_queue_deploy(
     _restore_after_handoff_failure(options, commit, previous)
 
 
+def _candidate_convergence_locked(commit: str) -> bool:
+    """Check convergence while the generation lock is held.
+
+    Args:
+        commit: Exact candidate commit.
+
+    Returns:
+        Whether the authority converges on a live candidate.
+    """
+    try:
+        desired = read_desired_client()
+    except supervise.DesiredIntentError:
+        return False
+    status = supervise.read_status()
+    if desired is None or status is None:
+        return False
+    child = status.child
+    converged = lifecycle_state.authorize_supervisor_convergence(
+        lifecycle_state.SupervisorConvergenceFacts(
+            target_commit=commit,
+            minimum_generation=status.applied_generation,
+            desired_commit=desired.commit,
+            desired_generation=desired.generation,
+            applied_commit=status.commit,
+            applied_generation=status.applied_generation,
+            ready=status.ready,
+            holding=status.holding,
+            live_child=child is not None and supervise.child_alive(child),
+        )
+    )
+    return converged and cli.current_commit() == commit
+
+
 def _queue_deploy_candidate_converged(commit: str) -> bool:
     """Return whether current authority still converges on a live candidate."""
-    with supervise.generation_lock():
-        try:
-            desired = supervise.read_desired_strict()
-        except supervise.DesiredIntentError:
-            return False
-        status = supervise.read_status()
-        if desired is None or status is None:
-            return False
-        child = status.child
-        converged = lifecycle_state.authorize_supervisor_convergence(
-            lifecycle_state.SupervisorConvergenceFacts(
-                target_commit=commit,
-                minimum_generation=status.applied_generation,
-                desired_commit=desired.commit,
-                desired_generation=desired.generation,
-                applied_commit=status.commit,
-                applied_generation=status.applied_generation,
-                ready=status.ready,
-                holding=status.holding,
-                live_child=child is not None and supervise.child_alive(child),
-            )
-        )
-        return converged and cli.current_commit() == commit
+    try:
+        with supervise.generation_lock():
+            return _candidate_convergence_locked(commit)
+    except GenerationLockTimeoutError:
+        return False
 
 
 def _queue_deploy_restore_converged(commit: str, minimum_generation: int) -> bool:
     """Return whether restore authority still owns a live queue-ready child."""
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError:
         return False
     status = supervise.read_status()
@@ -2051,13 +2081,13 @@ def _restore_after_handoff_failure(
         append_deploy_log("queue deploy failed after durable success with no known previous commit")
         return
     try:
-        settle = supervise.request_run(
+        settle = request_run_client(
             previous.git_commit,
             repo=str(options.repo),
             uv_path=options.uv_path,
             worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
         )
-    except OSError as exc:
+    except (OSError, GenerationLockTimeoutError) as exc:
         append_deploy_log(
             f"queue deploy failed after durable success and restoring the previous commit "
             f"errored: {exc}"
@@ -2072,10 +2102,16 @@ def _restore_after_handoff_failure(
     )
     reconciled = False
     if restored:
-        with supervise.generation_lock():
-            reconciled = _queue_deploy_restore_converged(
-                previous.git_commit, settle
-            ) and cli.reconcile_pointer(previous.git_commit)
+        try:
+            with supervise.generation_lock():
+                reconciled = _queue_deploy_restore_converged(
+                    previous.git_commit, settle
+                ) and cli.reconcile_pointer(previous.git_commit)
+        except GenerationLockTimeoutError:
+            append_deploy_log(
+                "queue deploy failed after durable success and the generation lock timed out "
+                "during restore reconciliation"
+            )
     if reconciled:
         append_deploy_log(
             "queue deploy failed after durable success; supervisor restored previous commit "
@@ -2225,12 +2261,16 @@ def _deploy_through_supervisor(options: DeployOptions, commit: str) -> WorkerMet
     """
     worker_id = os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
     _out("requesting the external supervisor to start the worker ...")
-    generation = supervise.request_run(
-        commit,
-        repo=str(options.repo),
-        uv_path=options.uv_path,
-        worker_id=worker_id,
-    )
+    try:
+        generation = request_run_client(
+            commit,
+            repo=str(options.repo),
+            uv_path=options.uv_path,
+            worker_id=worker_id,
+        )
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock to request worker start"
+        raise DeployAbortedError(msg) from exc
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         _err("the external supervisor did not apply the requested worker start")
         raise DeployAbortedError
@@ -2478,12 +2518,16 @@ def _complete_deploy_handoff(
     elif options.bootstrap or options.direct_spawn:
         new_meta = _deploy_direct(options, previous, state, commit)
         log_file = worker_log_path(new_meta.token)
-        supervise.request_run(
-            commit,
-            repo=str(options.repo),
-            uv_path=options.uv_path,
-            worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-        )
+        try:
+            request_run_client(
+                commit,
+                repo=str(options.repo),
+                uv_path=options.uv_path,
+                worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+            )
+        except GenerationLockTimeoutError as exc:
+            msg = "timed out waiting for the generation lock to record deploy intent"
+            raise DeployAbortedError(msg) from exc
         _out(f"worker running: pid={new_meta.pid} pgid={new_meta.pgid} session={new_meta.sid}")
     else:
         _err(
@@ -2683,21 +2727,76 @@ def _probe_server() -> str:
         raise RuntimeError(msg) from exc
 
 
+def _probe_python_path(cwd: str) -> str:
+    """Return the absolute path to the candidate worker's Python interpreter.
+
+    The probe uses the same sealed runtime Python that runs the worker, not
+    any host-installed interpreter.  This is portable across environments
+    (Guix, Nix, containerised hosts) where ``/usr/bin/sleep`` or
+    ``/usr/bin/python3`` may not exist.
+
+    Args:
+        cwd: Working directory of the probe job (the per-commit runtime root).
+
+    Returns:
+        The absolute Python interpreter path inside the sealed runtime.
+
+    Raises:
+        FileNotFoundError: When the sealed runtime Python is absent.
+    """
+    python = Path(cwd) / ".venv" / "bin" / "python"
+    if not python.is_file():
+        msg = (
+            f"sealed runtime Python not found at {python}; "
+            "the candidate worker cannot execute a probe"
+        )
+        raise FileNotFoundError(msg)
+    return str(python)
+
+
+def _probe_process(cwd: str) -> list[str]:
+    """Return the probe process argv that emits a readiness sentinel.
+
+    The probe writes ``READINESS_SENTINEL`` followed by a newline to stdout,
+    flushes, then blocks until cancelled.  Positive appearance of the sentinel
+    in the published output proves successful exec inside the exact worker
+    runtime.
+
+    Args:
+        cwd: Working directory of the probe job.
+
+    Returns:
+        A three-element argv list.
+    """
+    python = _probe_python_path(cwd)
+    script = (
+        f"import time,sys;"
+        f"sys.stdout.write({READINESS_SENTINEL!r}+'\\n');"
+        f"sys.stdout.flush();"
+        f"time.sleep(3600)"
+    )
+    return [python, "-c", script]
+
+
 def _insert_probe_job(conn: JobsConnection, cwd: str) -> UUID | None:
     """Insert one pending queue probe job.
 
     Args:
         conn: Open PostgreSQL connection.
-        cwd: Working directory for the probe process.
+        cwd: Working directory for the probe process (per-commit runtime root).
 
     Returns:
         The probe job identifier, or ``None`` if the insert failed.
     """
+    try:
+        process = _probe_process(cwd)
+    except FileNotFoundError:
+        return None
     probe_payload = json.dumps(
         protocol.build_payload(
             server=_probe_server(),
             cwd=cwd,
-            process=["/usr/bin/sleep", "60"],
+            process=process,
         )
     )
     with conn.cursor() as cursor:
@@ -2781,6 +2880,32 @@ def _parse_probe_claim_state(
     return status, owner, process_pid
 
 
+def _read_probe_sentinel(conn: JobsConnection, probe_id: UUID) -> bool:
+    """Return whether the probe's published stdout contains the readiness sentinel.
+
+    The worker publishes output tails to the database; a positive sentinel
+    match proves the probe payload actually ``exec``'d inside the exact worker
+    runtime rather than failing at the OS level (exit 127 for missing
+    executables, bad working directory, etc.).
+
+    Args:
+        conn: Open PostgreSQL connection.
+        probe_id: Probe job identifier.
+
+    Returns:
+        ``True`` when the sentinel string is present in the published stdout.
+    """
+    with conn.cursor(row_factory=tuple_row) as cursor:
+        cursor.execute(
+            "SELECT (payload::jsonb)->'output'->'stdout'->>'tail' FROM lubko.jobs WHERE id = %s",
+            (probe_id,),
+        )
+        row = cursor.fetchone()
+    if row is None or row[0] is None:
+        return False
+    return READINESS_SENTINEL in str(row[0])
+
+
 def _wait_for_probe_claim(
     conn: JobsConnection,
     probe_id: UUID,
@@ -2788,7 +2913,7 @@ def _wait_for_probe_claim(
     recovery_worker_pid: int,
     timeout_seconds: float,
 ) -> bool:
-    """Wait until the exact recovery worker claims the probe job.
+    """Wait until the exact recovery worker claims and successfully executes the probe.
 
     ``worker_id`` alone is not proof of identity: it defaults to the host name
     and is shared by every worker on the machine. The claim is therefore bound
@@ -2796,6 +2921,12 @@ def _wait_for_probe_claim(
     ``process_pid`` of the probe command and verifying, from ``/proc``, that
     the command process is a descendant of the recovery worker. The worker_id
     match is retained as an additional check.
+
+    Claiming the row and spawning a process is not sufficient: the requested
+    executable may not exist in the worker's runtime (exit 127), or the
+    working directory may be invalid.  Success therefore additionally requires
+    the deterministic ``READINESS_SENTINEL`` to appear in the published stdout
+    output of the probe, proving that the payload actually ``exec``'d.
 
     Args:
         conn: Open PostgreSQL connection.
@@ -2807,7 +2938,8 @@ def _wait_for_probe_claim(
     Returns:
         ``True`` only when the exact recovery worker claimed and executed the
         probe; ``False`` on timeout, terminal status, a different worker_id,
-        or a claim whose process was not spawned by the recovery worker.
+        a claim whose process was not spawned by the recovery worker, or a
+        claim whose payload never produced positive execution evidence.
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -2817,9 +2949,7 @@ def _wait_for_probe_claim(
                 (probe_id,),
             )
             row = cursor.fetchone()
-        if row is None:
-            return False
-        claim = _parse_probe_claim_state(row[0])
+        claim = _parse_probe_claim_state(row[0]) if row is not None else None
         if claim is None:
             return False
         status, owner, process_pid = claim
@@ -2829,7 +2959,12 @@ def _wait_for_probe_claim(
             if process_pid is None:
                 time.sleep(LOCK_POLL_INTERVAL_SECONDS)
                 continue
-            return _spawned_by_recovery_worker(process_pid, recovery_worker_pid)
+            if not _spawned_by_recovery_worker(process_pid, recovery_worker_pid):
+                return False
+            if not _read_probe_sentinel(conn, probe_id):
+                time.sleep(LOCK_POLL_INTERVAL_SECONDS)
+                continue
+            return True
         if status in {"succeeded", "failed", "cancelled"}:
             return False
         time.sleep(LOCK_POLL_INTERVAL_SECONDS)
@@ -2878,7 +3013,10 @@ def verify_worker_consumes_queue(
     This is the public readiness proof used by the external supervisor: PID
     aliveness and database connectivity do not prove a worker is the queue
     consumer, so a probe job must be claimed and executed by the exact process.
-    The probe is cancelled, awaited terminal, and removed in all cases.
+    The probe payload uses the sealed runtime's Python to emit a deterministic
+    sentinel on successful exec; the sentinel must appear in the published
+    output before readiness succeeds.  The probe is cancelled, awaited terminal,
+    and removed in all cases.
 
     Args:
         worker_id: Worker identifier the worker records on claims.
@@ -2887,7 +3025,8 @@ def verify_worker_consumes_queue(
         timeout_seconds: Maximum seconds to wait for the probe to be claimed.
 
     Returns:
-        ``True`` only when the exact worker consumed the probe.
+        ``True`` only when the exact worker consumed the probe and the payload
+        produced positive execution evidence.
     """
     return _verify_queue_roundtrip(worker_id, cwd, worker_pid, timeout_seconds)
 
@@ -2903,10 +3042,12 @@ def _verify_queue_roundtrip(
     A probe job is inserted and must be claimed and executed by the exact
     recovery worker: the claim is bound to the supplied PID through the
     persisted ``process_pid`` descendant check, with ``worker_id`` as an
-    additional check. If any other worker claims the probe, one-consumer
-    semantics are violated and the repair fails. The probe is cancelled,
-    awaited terminal, and removed in all cases, so the roundtrip leaves no
-    queue row and no process behind.
+    additional check.  The probe payload uses the sealed runtime's Python to
+    emit a deterministic sentinel on successful exec; the sentinel must appear
+    in the published output before readiness succeeds.  If any other worker
+    claims the probe, one-consumer semantics are violated and the repair fails.
+    The probe is cancelled, awaited terminal, and removed in all cases, so the
+    roundtrip leaves no queue row and no process behind.
 
     Args:
         worker_id: Worker identifier the recovery worker will record on claims.
@@ -3116,7 +3257,7 @@ def _release_adoption_authority(meta: WorkerMeta) -> str | None:
         ``None`` on success (including a genuinely absent hold), otherwise a
         failure message for the operator.
     """
-    current = supervise.read_state()
+    current = read_state_client()
     if current.spawning_hold_malformed:
         return (
             "the recovery worker was adopted, but its durable recovery authority "
@@ -3146,7 +3287,7 @@ def _pre_adoption_authority_error(meta: WorkerMeta) -> str | None:
     Returns:
         ``None`` when adoption may proceed, otherwise a failure message.
     """
-    state = supervise.read_state()
+    state = read_state_client()
     if state.spawning_hold_malformed:
         return (
             "the durable pre-spawn recovery obligation is malformed; only an explicit "
@@ -3521,12 +3662,19 @@ def _obligation_instance_gone(pid: int | None, start_time_ticks: int | None) -> 
 def _clear_spawning_obligation() -> bool:
     """Durably clear the pre-spawn recovery obligation.
 
+    Uses the narrow semantic ``clear_spawning_obligation_client`` so
+    tokenless recovery goes through the control socket with existing
+    serialization and validation.
+
     Returns:
         ``True`` when the state write was confirmed durable.
     """
     try:
-        supervise.write_state(replace(supervise.read_state(), spawning=None))
+        clear_spawning_obligation_client()
     except DurabilityError:
+        LOGGER.exception("could not durably clear the pre-spawn recovery obligation")
+        return False
+    except RuntimeError:
         LOGGER.exception("could not durably clear the pre-spawn recovery obligation")
         return False
     return True
@@ -3535,6 +3683,10 @@ def _clear_spawning_obligation() -> bool:
 def _write_spawning_obligation(obligation: supervise.SpawningObligation) -> bool:
     """Durably persist ``obligation`` as the replacement-blocking authority.
 
+    Uses the narrow semantic ``set_spawning_obligation_client`` so
+    tokenless recovery goes through the control socket with existing
+    serialization and validation.
+
     Args:
         obligation: The obligation to record.
 
@@ -3542,8 +3694,13 @@ def _write_spawning_obligation(obligation: supervise.SpawningObligation) -> bool
         ``True`` when the state write was confirmed durable.
     """
     try:
-        supervise.write_state(replace(supervise.read_state(), spawning=obligation))
+        set_spawning_obligation_client(obligation)
     except DurabilityError:
+        LOGGER.exception(
+            "could not durably record the recovery obligation for token %s", obligation.token
+        )
+        return False
+    except RuntimeError:
         LOGGER.exception(
             "could not durably record the recovery obligation for token %s", obligation.token
         )
@@ -3592,7 +3749,7 @@ def _resolve_stale_recovery_obligation() -> bool:
     Returns:
         ``True`` when no blocking obligation remains.
     """
-    state = supervise.read_state()
+    state = read_state_client()
     if state.spawning_hold_malformed:
         # The pre-spawn authority is present but unreadable: its recorded
         # spawn may still be live and owning groups. This deliberately does
@@ -3973,12 +4130,27 @@ def startup_contract_cmd(args: argparse.Namespace) -> int:
     It does not inspect the live process topology, which is intentionally out
     of scope — the external host/container environment is trusted.
 
+    ``--write-staged`` writes artifacts to staging paths instead of active
+    paths.  This is used by the confirmation controller to have the candidate
+    code (B) generate its own startup artifacts without touching the active
+    startup authority, which must only change at the confirmation boundary.
+
     Args:
         args: Parsed command line arguments.
 
     Returns:
         A process exit code.
     """
+    if getattr(args, "write_staged", False):
+        error = startup_contract.stage_startup_artifacts(_resolve_bin_home())
+        if error is not None:
+            _err(error)
+            return EXIT_ERROR
+        _out(
+            f"startup contract version {startup_contract.CONTRACT_SCHEMA_VERSION}, "
+            f"launcher, and startup definition staged"
+        )
+        return EXIT_OK
     if getattr(args, "write", False):
         startup_contract.write_contract()
         startup_contract.write_startup_launcher(_resolve_bin_home())
@@ -4067,7 +4239,7 @@ def _restart_intent_locked() -> tuple[int | None, int | None, str | None]:
             "(the only supported way to stop Lubko is to stop its environment)"
         )
         return None, None, msg
-    state = supervise.read_state()
+    state = read_state_client()
     commit = state.commit
     if commit is None:
         return None, None, "no usable sealed runtime to restart"
@@ -4082,17 +4254,20 @@ def _restart_intent_locked() -> tuple[int | None, int | None, str | None]:
         previous.child.pid if previous is not None and previous.child is not None else None
     )
     _out(f"requesting a supervised restart of confirmed commit {commit} ...")
-    desired = supervise.read_desired()
-    generation = supervise.request_restart(
-        commit,
-        repo=desired.repo if desired is not None else "",
-        uv_path=desired.uv_path if desired is not None else "",
-        worker_id=(
-            desired.worker_id
-            if desired is not None
-            else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
-        ),
-    )
+    desired = read_desired_client()
+    try:
+        generation = request_run_client(
+            commit,
+            repo=desired.repo if desired is not None else "",
+            uv_path=desired.uv_path if desired is not None else "",
+            worker_id=(
+                desired.worker_id
+                if desired is not None
+                else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
+            ),
+        )
+    except GenerationLockTimeoutError:
+        return None, None, "timed out waiting for the generation lock to request restart"
     return generation, previous_pid, None
 
 
@@ -4288,7 +4463,7 @@ def _prepare_restart_locked(writer: int) -> bool:
             "no external supervisor is running; a supervised restart is not possible",
         )
         return False
-    state = supervise.read_state()
+    state = read_state_client()
     commit = state.commit
     if commit is None or not cli.runtime_is_usable(commit):
         deployctl.send_helper_error(
@@ -4362,7 +4537,7 @@ def _request_restart_intent_locked() -> tuple[int, int | None]:
     blocker = _supervised_mutation_blocker()
     if blocker is not None:
         raise DeployAbortedError(blocker)
-    state = supervise.read_state()
+    state = read_state_client()
     commit = state.commit
     if commit is None:
         msg = "no confirmed commit to restart"
@@ -4377,17 +4552,21 @@ def _request_restart_intent_locked() -> tuple[int, int | None]:
     previous_pid = (
         previous.child.pid if previous is not None and previous.child is not None else None
     )
-    desired = supervise.read_desired()
-    generation = supervise.request_restart(
-        commit,
-        repo=desired.repo if desired is not None else "",
-        uv_path=desired.uv_path if desired is not None else "",
-        worker_id=(
-            desired.worker_id
-            if desired is not None
-            else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
-        ),
-    )
+    desired = read_desired_client()
+    try:
+        generation = request_run_client(
+            commit,
+            repo=desired.repo if desired is not None else "",
+            uv_path=desired.uv_path if desired is not None else "",
+            worker_id=(
+                desired.worker_id
+                if desired is not None
+                else os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
+            ),
+        )
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock to request restart"
+        raise DeployAbortedError(msg) from exc
     return generation, previous_pid
 
 
@@ -4473,10 +4652,18 @@ def migrate_cmd(args: argparse.Namespace) -> int:
     except LockTimeoutError:
         _err("another deployment is running; refusing to race")
         return EXIT_ERROR
+    except GenerationLockTimeoutError:
+        _err("timed out waiting for the generation lock during migration")
+        return EXIT_ERROR
 
 
 def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
     """Write the verified desired intent and replace stale mission state.
+
+    The migration intent is published as ONE atomic supervisor IPC
+    operation: ``request_run_client(..., migration=True)`` handles
+    generation allocation and desired-intent publication together, so
+    mission/desired/applied generation alignment is always preserved.
 
     Args:
         commit: Exact verified commit to run.
@@ -4495,35 +4682,21 @@ def _migrate_locked(commit: str, repo: Path, uv_path: str) -> int:
     except deployctl.DeployCtlError:
         mission = None
     if mission is None:
-        # The supervised-deployment authority is absent or already corrupt: this
-        # migration intentionally supersedes it, so remove any present file
-        # before allocating a generation. Allocation then observes genuine
-        # absence rather than failing closed on authority we are about to
-        # replace, and no malformed authority is silently deleted outside an
-        # explicit recovery path.
         remove_durable(rollback_state_path())
         append_deploy_log("migration replaced corrupt/legacy supervised-deployment state")
-    with supervise.generation_lock():
-        generation = supervise.next_generation()
-        # The migration flag travels inside this one atomically written
-        # desired intent: publishing the migrated target commit and recording
-        # the convergence obligation is a single durable transition, so no
-        # crash can leave the supervisor running the migrated commit without
-        # its completion obligation (nor an orphaned migration intent without
-        # a published commit).
-        supervise.write_desired(
-            supervise.SupervisorDesired(
-                schema_version=supervise.SCHEMA_VERSION,
-                generation=generation,
-                commit=commit,
-                repo=str(repo),
-                uv_path=uv_path,
-                worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
-                restart=False,
-                requested_at=time.time(),
-                migration=True,
-            )
-        )
+    # Publish the migration intent as ONE atomic operation: generation
+    # allocation and desired-intent publication happen together inside the
+    # supervisor (or via the control socket), so the returned generation
+    # is authoritative and the mission/desired/applied alignment is
+    # always preserved.
+    generation = request_run_client(
+        commit,
+        repo=str(repo),
+        uv_path=uv_path,
+        worker_id=os.getenv("LUBKO_WORKER_ID") or socket.gethostname(),
+        restart=False,
+        migration=True,
+    )
     if (
         mission is not None
         and mission.status == deployctl.STATUS_PENDING
@@ -4704,6 +4877,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--write",
         action="store_true",
         help="publish the current versioned startup contract, launcher, and definition",
+    )
+    contract_parser.add_argument(
+        "--write-staged",
+        action="store_true",
+        help="stage startup artifacts without activating them (for confirmation controller)",
     )
 
     deploy_parser = subparsers.add_parser(

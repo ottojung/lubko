@@ -68,6 +68,7 @@ import logging
 import math
 import os
 import secrets
+import select
 import signal
 import socket
 import subprocess
@@ -77,17 +78,30 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, override
+from typing import TYPE_CHECKING, Final, NamedTuple, override
 
 import psycopg
 
-from lubko import cli, deployctl, lifecycle, lifecycle_state, supervise
+from lubko import cli, deployctl, lifecycle, lifecycle_state, startup_contract, supervise
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
 from lubko._exact_signal import process_ppid as _shared_process_ppid
+from lubko._supervisor_identity import (
+    capture_supervisor_runtime_commit,
+    contract_schema_version,
+    resolve_new_supervisor_executable,
+)
 from lubko.config import load_database_config
-from lubko.durable import DurabilityError, remove_durable
+from lubko.control_socket import (
+    ControlRequest,
+    ControlResponse,
+    _recv_message,
+    _send_message,
+    bind_abstract_socket,
+    validate_peercred,
+)
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.health import (
     interpret_worker_health,
     prune_old_incarnation_artifacts,
@@ -96,12 +110,17 @@ from lubko.health import (
     read_worker_health_by_incarnation,
     worker_health_payload,
 )
-from lubko.state import rollback_state_path
+from lubko.state import (
+    SupervisorStateTokenError,
+    rollback_state_path,
+    supervisor_state_token,
+)
 from lubko.supervise import (
     INTENT_RUN,
     MODE_RUN,
     SCHEMA_VERSION,
     ConsumerLockTimeoutError,
+    GenerationLockTimeoutError,
     LastExit,
     MalformedSupervisorIdentityError,
     SpawningObligation,
@@ -134,6 +153,24 @@ LOGGER: Final = logging.getLogger(__name__)
 _SUPERVISOR_LOG_MAX_BYTES: Final = 4 * 1024 * 1024
 _SUPERVISOR_LOG_BACKUP_COUNT: Final = 2
 _PERSISTENT_DIAGNOSTIC_REPEAT_INTERVAL: Final = 256
+
+#: Default timeout for server-side control socket accept/recv (seconds).
+_SERVER_TIMEOUT_SECONDS: Final = 5.0
+
+
+class _HandoffTarget(NamedTuple):
+    """Resolved handoff target with non-optional validated fields."""
+
+    target: str
+    confirmed: str
+    stored: str
+
+
+@dataclass(frozen=True, slots=True)
+class _HandoffPipes:
+    """Pipe file descriptors for the preflight probe readiness protocol."""
+
+    ready_r: int
 
 
 class _BoundedSupervisorLogHandler(RotatingFileHandler):
@@ -712,7 +749,11 @@ class SupervisorDaemon:
         self._message: str | None = None
         self._bootstrap_hold_logged = False
         self._ownership_fd: int | None = None
+        self._control_sock: socket.socket | None = None
         self._start_time_ticks: int = 0
+        self._runtime_commit: str | None = capture_supervisor_runtime_commit()
+        self._handoff_target_commit: str | None = None
+        self._handoff_completed: bool = False
 
     def _write_state_authority_safe(self, state: SupervisorState) -> bool:
         """Publish a supervisor transition without erasing newer consumer authority.
@@ -764,16 +805,54 @@ class SupervisorDaemon:
         shutdown, so a later supervisor can always take ownership afterwards.
         The daemon never exits on its own: an unexpected worker exit is
         recorded and backed off, and the intended worker is restored.
+
+        When a version-skew handoff is triggered, the old supervisor A
+        spawns a **non-authoritative preflight probe** that validates the
+        target executable can start and adopt the ownership lock, then A
+        **execs in place** into the target.  The exec replaces A's process
+        image while preserving its PID, so Tini (the direct-parent init)
+        never sees its child exit and the container stays alive.  The probe
+        never receives lifecycle authority and exits before A's exec.  If
+        exec fails, the process exits, letting Tini restart from durable
+        state.
+
+        Probe mode (``LUBKO_SUPERVISOR_HANDOFF_PREPARE=1``):
+            The process was spawned by A as a non-authoritative preflight
+            probe.  ``_acquire_ownership()`` already adopted the inherited
+            lock fd.  The probe validates the lock, signals READY on the
+            readiness pipe, closes its lock fd copy, and returns
+            unconditionally — before any pidfile, status, normalization,
+            signal handler, or reconcile writes.  The probe never enters
+            the normal reconcile loop.
+
+        Prepare-to-exec flow (A's side):
+            After the probe exits, A retires its pidfile, makes the lock fd
+            inheritable, sets adoption env vars, and calls ``os.execve`` into
+            the target.  The execed image adopts the inherited lock via the
+            env vars, binds the confirmed commit, and follows normal startup.
         """
         LOGGER.info("lubko supervisor starting (pid %d)", os.getpid())
         self._acquire_ownership()
+        if self._handoff_target_commit is not None:
+            self._runtime_commit = self._handoff_target_commit
         try:
+            # --- Probe mode: validate lock, signal READY, exit immediately ---
+            # The probe was spawned by A as a non-authoritative preflight.
+            # _acquire_ownership() already adopted the inherited lock fd and
+            # set self._ownership_fd.  The probe must NOT write durable state,
+            # reconcile, or claim lifecycle authority.
+            if self._in_handoff_mode():
+                self._preflight_handoff()
+                return
             self._write_pidfile()
+            self._persist_runtime_commit()
             self._invalidate_stale_status()
             normalize_cross_boot_state()
             self._install_signal_handlers()
+            self._open_control_socket()
             self._write_status("starting")
             while not self._stopping:
+                self._accept_control_requests()
                 diagnostic_handlers = _durable_log_handlers()
                 for handler in diagnostic_handlers:
                     handler.begin_reconciliation_cycle()
@@ -788,6 +867,7 @@ class SupervisorDaemon:
                 time.sleep(self.settings.poll_interval_seconds)
             self._shutdown()
         finally:
+            self._close_control_socket()
             self._release_ownership()
 
     # ------------------------------------------------------------------
@@ -803,6 +883,7 @@ class SupervisorDaemon:
         :meth:`run`.
         """
         self._message = None
+        supervise.promote_pending_request()
         state = read_state()
         if state.ownership_hold_malformed:
             # Materialize the hold so a later rewrite cannot turn authority
@@ -817,6 +898,7 @@ class SupervisorDaemon:
             )
             LOGGER.error("%s", self._message)
             return
+        self._maybe_handoff_to_new_supervisor()
         action, commit = self._derive_action(state)
         if action != "hold" and self._apply_newer_desired(state, commit):
             return
@@ -848,6 +930,7 @@ class SupervisorDaemon:
         self._record_mission_progress(commit)
         self._probe_readiness(now)
         self._complete_cold_migration()
+        self._converge_startup_artifacts()
 
     def _apply_newer_desired(
         self,
@@ -934,10 +1017,11 @@ class SupervisorDaemon:
         except lifecycle.LockTimeoutError:
             LOGGER.warning("cold-migration completion deferred: deployment lock is held")
             self._message = "cold-migration completion deferred; deployment in progress"
+        except GenerationLockTimeoutError:
+            LOGGER.warning("cold-migration completion deferred: generation lock timed out")
+            self._message = "cold-migration completion deferred; generation lock timed out"
 
-    def _complete_cold_migration_locked(  # ruff: ignore[too-many-return-statements]
-        self, desired: supervise.SupervisorDesired
-    ) -> None:
+    def _complete_cold_migration_locked(self, desired: supervise.SupervisorDesired) -> None:
         """Perform cold-migration convergence while holding the deployment lock.
 
         All authority inputs are re-read inside the critical section so the
@@ -1010,6 +1094,48 @@ class SupervisorDaemon:
             f"cold migration complete: deployment authority converged to commit {desired.commit}"
         )
         LOGGER.info("cold migration converged deployment authority to commit %s", desired.commit)
+
+    def _converge_startup_artifacts(self) -> None:
+        """Promote pre-staged startup artifacts for the durable confirmed commit.
+
+        The supervisor runtime may outlive the confirmed commit, so generating
+        artifacts from its own loaded ``CURRENT_CONTRACT`` would revert
+        confirmed artifacts to the supervisor's older code version.  The
+        recovery decision is driven entirely by durable recovery authority:
+        the confirmed mission plus the staging manifest/snapshot state.  If
+        ``STATUS_CONFIRMED`` has a retained manifest bound exactly to
+        ``mission.commit``, opaque staged bytes are promoted regardless of
+        what the old supervisor contract validation would say about the
+        active artifacts.  ``promote_staged_artifacts`` already idempotently
+        skips correct destinations and verifies manifest hashes.
+
+        If there is no recovery manifest or the manifest commit does not
+        match the durable confirmed commit, promotion is not attempted and
+        no artifacts are mutated — the old A contract validation is never
+        used as evidence that B is stale.
+        """
+        try:
+            bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+        except (OSError, ValueError) as exc:
+            self._message = f"startup artifact convergence skipped: {exc}"
+            return
+        try:
+            mission = deployctl.read_rollback_state()
+        except deployctl.DeployCtlError:
+            return
+        if mission is None or mission.status != deployctl.STATUS_CONFIRMED:
+            return
+        promotion_error = startup_contract.promote_staged_artifacts(
+            mission.commit, mission.commit, bin_home
+        )
+        if promotion_error is not None:
+            LOGGER.debug(
+                "startup artifact promotion skipped for %s: %s",
+                mission.commit,
+                promotion_error,
+            )
+        else:
+            LOGGER.info("startup artifacts converged to confirmed commit %s", mission.commit)
 
     def _record_mission_progress(self, commit: str) -> None:
         """Advance the applied generation once a mission candidate is running.
@@ -1647,7 +1773,11 @@ class SupervisorDaemon:
             inc, tok = snapshot.worker_incarnation, child.token
             return (False, f"snapshot incarnation {inc!r} != child token {tok!r}")
         eff = interpret_worker_health(snapshot)
-        return (True, "ok") if eff.live else (False, f"worker health not live: {eff.reason}")
+        if not eff.live:
+            return False, f"worker health not live: {eff.reason}"
+        if not eff.operational.ready:
+            return False, f"worker operational not ready: {eff.operational.reason}"
+        return True, "ok"
 
     def _record_not_ready(
         self,
@@ -3074,9 +3204,22 @@ class SupervisorDaemon:
         when this process exits — even under SIGKILL or a crash — a later
         supervisor can always take ownership afterwards.
 
+        When an inherited handoff fd is present (spawn-based two-phase
+        handoff), the adopted fd is validated and used directly instead of
+        opening/acquiring a second lock.  The lock-adoption environment
+        variables are cleared after adoption so they are never consumed
+        twice; the handoff protocol env vars are preserved until
+        :meth:`_run_handoff_protocol` completes.
+
         Raises:
-            SystemExit: If another live supervisor holds the ownership lock.
+            SystemExit: If another live supervisor holds the ownership lock,
+                or if the inherited handoff fd cannot be validated.
         """
+        inherited = self._try_adopt_inherited_lock()
+        if inherited is not None:
+            self._ownership_fd, self._handoff_target_commit = inherited
+            LOGGER.info("supervisor ownership lock adopted via handoff (fd %d)", self._ownership_fd)
+            return
         try:
             acquired = acquire_supervisor_lock()
         except OSError:
@@ -3086,6 +3229,370 @@ class SupervisorDaemon:
             raise SystemExit(1) from None
         self._ownership_fd = acquired
         LOGGER.info("supervisor ownership lock acquired (fd %d)", acquired)
+
+    @staticmethod
+    def _try_adopt_inherited_lock() -> tuple[int, str] | None:
+        """Try to adopt an inherited lock fd from a two-phase handoff.
+
+        The handoff-target commit is mandatory authority: when a lock fd is
+        being adopted (i.e. we are in a handoff), the target commit must be
+        present and valid.  A missing or malformed target commit is a
+        fail-closed invariant violation — the successor must not guess its
+        identity from mutable ``cli/current``.
+
+        Returns:
+            ``(adopted_fd, target_commit)`` when a handoff is in progress,
+            or ``None`` for a normal startup path.
+
+        Raises:
+            SystemExit: If handoff env vars are present but validation fails,
+                to prevent running without the ownership lock or with an
+                untrusted identity.
+        """
+        fd_str = os.environ.get(supervise.HANDOFF_FD_ENV)
+        if fd_str is None:
+            return None
+        try:
+            fd_number = int(fd_str)
+        except ValueError:
+            LOGGER.exception(
+                "malformed handoff fd environment variable %r; "
+                "refusing to start without validated ownership",
+                fd_str,
+            )
+            raise SystemExit(1) from None
+        expected_path = os.environ.get(supervise.HANDOFF_PATH_ENV)
+        if expected_path is None:
+            LOGGER.error(
+                "handoff fd present but handoff path is missing; "
+                "refusing to start without validated ownership"
+            )
+            raise SystemExit(1) from None
+        handoff_pid = os.environ.get(supervise.HANDOFF_PID_ENV, "?")
+        target_commit = os.environ.pop(supervise.HANDOFF_TARGET_COMMIT_ENV, None)
+        if target_commit is None:
+            LOGGER.error(
+                "handoff fd present but target commit is missing; "
+                "refusing to start with untrusted identity"
+            )
+            raise SystemExit(1) from None
+        if not cli.is_valid_commit_name(target_commit):
+            LOGGER.error(
+                "handoff target commit %r is malformed; refusing to start with untrusted identity",
+                target_commit,
+            )
+            raise SystemExit(1) from None
+        try:
+            adopted = supervise.adopt_supervisor_lock(fd_number, expected_path)
+        except OSError:
+            LOGGER.exception(
+                "handoff fd adoption failed (handed off by pid %s); "
+                "refusing to start without validated ownership",
+                handoff_pid,
+            )
+            raise SystemExit(1) from None
+        # Clear the lock-adoption env vars so they are never consumed twice.
+        for var in (
+            supervise.HANDOFF_FD_ENV,
+            supervise.HANDOFF_PATH_ENV,
+            supervise.HANDOFF_PID_ENV,
+        ):
+            os.environ.pop(var, None)
+        return adopted, target_commit
+
+    # ------------------------------------------------------------------
+    # Control socket
+    # ------------------------------------------------------------------
+
+    def _open_control_socket(self) -> None:
+        """Create and start listening on the abstract control socket.
+
+        The socket provides the exclusive write boundary for tokenless CLI
+        tools.  It is in the abstract namespace so no stale files remain
+        after a crash.
+        """
+        self._control_sock = bind_abstract_socket()
+        LOGGER.info("control socket listening (abstract namespace, uid %d)", os.getuid())
+
+    def _close_control_socket(self) -> None:
+        """Close the control socket."""
+        if self._control_sock is not None:
+            with suppress(Exception):
+                self._control_sock.close()
+            self._control_sock = None
+
+    def _accept_control_requests(self) -> None:
+        """Non-blocking accept and process all pending control requests.
+
+        Called once per supervisor tick before reconciliation.  Each
+        accepted connection is validated via ``SO_PEERCRED`` (same-UID
+        check) then handled synchronously.
+        """
+        if self._control_sock is None:
+            return
+        while True:
+            try:
+                conn, _addr = self._control_sock.accept()
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            try:
+                conn.settimeout(_SERVER_TIMEOUT_SECONDS)
+                validate_peercred(conn)
+                raw = _recv_message(conn)
+                if raw is None:
+                    continue
+                request = ControlRequest.from_dict(raw)
+                response = SupervisorDaemon._handle_control_request(request)
+                _send_message(conn, response)
+            except PermissionError:
+                LOGGER.warning("control socket peer UID mismatch; rejecting")
+                with suppress(OSError):
+                    _send_message(conn, ControlResponse.error("permission denied"))
+            except Exception:
+                LOGGER.exception("control request failed")
+                with suppress(OSError):
+                    _send_message(conn, ControlResponse.error("internal error"))
+            finally:
+                with suppress(Exception):
+                    conn.close()
+
+    @staticmethod
+    def _handle_control_request(request: ControlRequest) -> dict[str, object]:
+        """Dispatch one control request to the appropriate handler.
+
+        Args:
+            request: Parsed control request.
+
+        Returns:
+            JSON-serializable response dict.
+        """
+        if request.request_type == "ping":
+            return ControlResponse.ok()
+        if request.request_type == "deploy":
+            return SupervisorDaemon._handle_deploy_request(request.payload)
+        if request.request_type == "status":
+            return SupervisorDaemon._handle_status_request()
+        if request.request_type == "authority_snapshot":
+            return SupervisorDaemon._handle_authority_snapshot_request()
+        if request.request_type == "set_spawning_obligation":
+            return SupervisorDaemon._handle_set_spawning_obligation(request.payload)
+        if request.request_type == "clear_spawning_obligation":
+            return SupervisorDaemon._handle_clear_spawning_obligation()
+        if request.request_type == "allocate_generation":
+            return SupervisorDaemon._handle_allocate_generation()
+        if request.request_type == "ensure_run_intent":
+            return SupervisorDaemon._handle_ensure_run_intent(request.payload)
+        return ControlResponse.error(f"unknown request type: {request.request_type}")
+
+    @staticmethod
+    def _handle_deploy_request(payload: dict[str, object]) -> dict[str, object]:
+        """Handle a deploy/restart/migrate request over the control socket.
+
+        Validates the request, acquires the generation lock, allocates a
+        generation, and writes the desired intent to the private tokenized
+        authority.  The reconcile loop picks it up on the next tick.
+
+        Args:
+            payload: Request payload with commit, repo, uv_path, etc.
+
+        Returns:
+            JSON-serializable response dict.
+        """
+        commit = payload.get("commit")
+        repo = payload.get("repo", "")
+        uv_path = payload.get("uv_path", "")
+        worker_id = payload.get("worker_id")
+        restart = payload.get("restart", False)
+        migration = payload.get("migration", False)
+        if not isinstance(commit, str) or not commit:
+            return ControlResponse.error("missing or invalid 'commit'")
+        if not isinstance(repo, str):
+            return ControlResponse.error("missing or invalid 'repo'")
+        if not isinstance(uv_path, str):
+            return ControlResponse.error("missing or invalid 'uv_path'")
+        if not isinstance(restart, bool):
+            return ControlResponse.error("'restart' must be a boolean")
+        if not isinstance(migration, bool):
+            return ControlResponse.error("'migration' must be a boolean")
+        try:
+            generation = supervise.request_run(
+                commit,
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id if isinstance(worker_id, str) else None,
+                restart=restart,
+                migration=migration,
+            )
+        except supervise.GenerationLockTimeoutError:
+            return ControlResponse.error("generation lock timed out")
+        except Exception:
+            LOGGER.exception("control deploy request failed")
+            return ControlResponse.error("failed to apply deploy request")
+        return ControlResponse.ok(generation=generation)
+
+    @staticmethod
+    def _handle_status_request() -> dict[str, object]:
+        """Handle a status request over the control socket.
+
+        Returns the current supervisor status as a JSON-serializable dict.
+
+        Returns:
+            JSON-serializable response dict with status payload.
+        """
+        try:
+            status = supervise.read_status()
+        except Exception:
+            LOGGER.exception("control status request failed")
+            return ControlResponse.error("failed to read status")
+        if status is None:
+            return ControlResponse.error("no supervisor status available")
+        return ControlResponse.ok(status=status.to_dict())
+
+    @staticmethod
+    def _handle_authority_snapshot_request() -> dict[str, object]:
+        """Handle an authority_snapshot request over the control socket.
+
+        Returns the exact private desired+state authority so tokenless
+        callers get authoritative snapshots without reconstructing from
+        the public status surface.
+
+        Returns:
+            JSON-serializable response dict with desired (nullable) and
+            state payloads.
+        """
+        try:
+            desired = supervise.read_desired_strict()
+        except Exception:
+            LOGGER.exception("control authority_snapshot desired read failed")
+            return ControlResponse.error("failed to read desired authority")
+        try:
+            state = supervise.read_state()
+        except Exception:
+            LOGGER.exception("control authority_snapshot state read failed")
+            return ControlResponse.error("failed to read state authority")
+        desired_dict = None if desired is None else desired.to_dict()
+        return ControlResponse.ok(desired=desired_dict, state=state.to_dict())
+
+    @staticmethod
+    def _handle_set_spawning_obligation(payload: dict[str, object]) -> dict[str, object]:
+        """Handle a narrow set_spawning_obligation request.
+
+        Validates the obligation payload, applies it to the current
+        durable state under the consumer lock, and writes durably.
+
+        Returns:
+            JSON-serializable response dict.
+        """
+        obligation_data = payload.get("obligation")
+        if not isinstance(obligation_data, dict):
+            return ControlResponse.error("missing or invalid 'obligation'")
+        try:
+            obligation = supervise.SpawningObligation.from_dict(obligation_data)
+        except (TypeError, ValueError) as exc:
+            return ControlResponse.error(f"malformed spawning obligation: {exc}")
+        try:
+            current = supervise.read_state()
+
+            supervise.write_state_preserving_authority(
+                replace(current, spawning=obligation),
+                timeout_seconds=supervise.DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            LOGGER.exception("control set_spawning_obligation failed")
+            return ControlResponse.error("failed to set spawning obligation")
+        return ControlResponse.ok()
+
+    @staticmethod
+    def _handle_clear_spawning_obligation() -> dict[str, object]:
+        """Handle a narrow clear_spawning_obligation request.
+
+        Clears the spawning obligation on the current durable state.
+
+        Returns:
+            JSON-serializable response dict.
+        """
+        try:
+            current = supervise.read_state()
+
+            supervise.write_state_preserving_authority(
+                replace(current, spawning=None),
+                timeout_seconds=supervise.DEFAULT_GENERATION_LOCK_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            LOGGER.exception("control clear_spawning_obligation failed")
+            return ControlResponse.error("failed to clear spawning obligation")
+        return ControlResponse.ok()
+
+    @staticmethod
+    def _handle_allocate_generation() -> dict[str, object]:
+        """Handle an allocate_generation request over the control socket.
+
+        Computes the next generation under the generation lock, durably
+        reserves it so concurrent allocators cannot reuse it, and returns
+        the generation.  This is the only correct way to allocate a
+        generation without the token.
+
+        Returns:
+            JSON-serializable response dict with the generation.
+        """
+        try:
+            with supervise.generation_lock():
+                generation = supervise.next_generation()
+                write_json_durable(
+                    supervise.reserved_generation_path(),
+                    {"generation": generation},
+                )
+        except supervise.GenerationLockTimeoutError:
+            return ControlResponse.error("generation lock timed out")
+        except DurabilityError:
+            LOGGER.error("failed to allocate generation")  # ruff: ignore[error-instead-of-exception]
+            return ControlResponse.error("failed to allocate generation")
+        except Exception:
+            LOGGER.exception("control allocate_generation failed")
+            return ControlResponse.error("failed to allocate generation")
+        return ControlResponse.ok(generation=generation)
+
+    @staticmethod
+    def _handle_ensure_run_intent(payload: dict[str, object]) -> dict[str, object]:
+        """Handle an ensure_run_intent request over the control socket.
+
+        Validates the request and delegates to ``supervise.ensure_run_intent()``,
+        which applies the same idempotent semantics: same-commit preservation,
+        conflict on different commit, fresh generation on absence.
+
+        Args:
+            payload: Request payload with commit, repo, uv_path, etc.
+
+        Returns:
+            JSON-serializable response dict with the generation.
+        """
+        commit = payload.get("commit")
+        repo = payload.get("repo", "")
+        uv_path = payload.get("uv_path", "")
+        worker_id = payload.get("worker_id")
+        if not isinstance(commit, str) or not commit:
+            return ControlResponse.error("missing or invalid 'commit'")
+        if not isinstance(repo, str):
+            return ControlResponse.error("missing or invalid 'repo'")
+        if not isinstance(uv_path, str):
+            return ControlResponse.error("missing or invalid 'uv_path'")
+        try:
+            generation = supervise.ensure_run_intent(
+                commit,
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id if isinstance(worker_id, str) else None,
+            )
+        except supervise.GenerationLockTimeoutError:
+            return ControlResponse.error("generation lock timed out")
+        except supervise.DesiredAuthorityConflictError as exc:
+            return ControlResponse.error(str(exc))
+        except Exception:
+            LOGGER.exception("control ensure_run_intent failed")
+            return ControlResponse.error("failed to ensure run intent")
+        return ControlResponse.ok(generation=generation)
 
     def _release_ownership(self) -> None:
         """Release the process-level ownership lock held for the lifetime."""
@@ -3154,6 +3661,393 @@ class SupervisorDaemon:
         """
         with suppress(OSError):
             supervise.status_path().unlink(missing_ok=True)
+
+    def _persist_runtime_commit(self) -> None:
+        """Store the supervisor's own runtime commit durably in state.json.
+
+        This is called once at startup, after the ownership lock is acquired.
+        The value is captured from ``cli.current_commit()`` at startup time —
+        the only moment when it correctly names the code this process is
+        executing from.  After a later deployment changes ``cli/current``,
+        this stored value remains correct.
+
+        Uses the authority-preserving writer so that a concurrent manual
+        recovery's consumer-establishment decision cannot be accidentally
+        overwritten during startup.
+        """
+        state = read_state()
+        if state.supervisor_runtime_commit == self._runtime_commit:
+            return
+        write_state_preserving_authority(
+            replace(state, supervisor_runtime_commit=self._runtime_commit),
+            timeout_seconds=self.settings.lock_timeout_seconds,
+        )
+        LOGGER.info(
+            "recorded supervisor runtime commit %s (contract version %d)",
+            self._runtime_commit,
+            contract_schema_version(),
+        )
+
+    @staticmethod
+    def _in_handoff_mode() -> bool:
+        """Return ``True`` when this process was spawned as a preflight probe."""
+        return os.environ.get(supervise.HANDOFF_PREPARE_MODE_ENV) == "1"
+
+    def _preflight_handoff(self) -> None:
+        r"""Validate the inherited lock, signal READY, and exit immediately.
+
+        Called from :meth:`run` when ``HANDOFF_PREPARE_MODE_ENV`` is set.
+        At this point ``_acquire_ownership()`` has already adopted the
+        inherited lock fd into ``self._ownership_fd`` and cleared the
+        lock-adoption env vars.
+
+        The probe:
+        1. Validates that ``self._ownership_fd`` is a valid, open fd.
+        2. Reads the readiness pipe fd from the environment.
+        3. Signals READY (``R\n``) to the old supervisor.
+        4. Closes its copy of the lock fd (the probe must not hold
+           lifecycle authority — only the flock reference in A, which
+           survives until A's exec, provides continuity).
+        5. Clears all probe env vars.
+        6. Returns unconditionally — the caller exits before any durable
+           lifecycle writes (pidfile, status, reconcile, etc.).
+
+        The probe never writes durable state, never enters the reconcile
+        loop, and never becomes the lifecycle authority.
+        """
+        lock_fd = self._ownership_fd
+        if lock_fd is None:
+            LOGGER.error("preflight probe has no adopted lock fd; exiting")
+            return
+        ready_fd_str = os.environ.get(supervise.HANDOFF_READY_FD_ENV)
+        if ready_fd_str is None:
+            LOGGER.error("preflight probe missing readiness fd; exiting")
+            return
+        ready_fd = int(ready_fd_str)
+        try:
+            os.write(ready_fd, b"R\n")
+            LOGGER.info("supervisor preflight probe ready (pid %d)", os.getpid())
+        except OSError:
+            LOGGER.exception("preflight probe failed to signal READY")
+        finally:
+            with suppress(OSError):
+                os.close(ready_fd)
+            # Close the probe's copy of the lock fd.  A still holds its
+            # own fd reference; the flock is maintained until A execs.
+            with suppress(OSError):
+                os.close(lock_fd)
+            self._ownership_fd = None
+            for var in (
+                supervise.HANDOFF_READY_FD_ENV,
+                supervise.HANDOFF_PREPARE_MODE_ENV,
+                supervise.HANDOFF_FD_ENV,
+                supervise.HANDOFF_PATH_ENV,
+                supervise.HANDOFF_PID_ENV,
+            ):
+                os.environ.pop(var, None)
+
+    def _maybe_handoff_to_new_supervisor(self) -> None:
+        r"""Detect version skew and activate the new runtime via exec-in-place.
+
+        When the stored ``supervisor_runtime_commit`` (A) differs from the
+        confirmed ``cli/current_commit()`` (B), the old supervisor:
+
+        1. Spawns a **non-authoritative preflight probe** (B) that validates
+           the target executable can start and adopt the ownership lock.
+        2. Waits for B's READY signal on the readiness pipe.
+        3. Retires A's own pidfile.
+        4. **Execs in place** into the target executable, preserving A's PID
+           so Tini (the direct-parent init) never sees its child exit.
+
+        The probe never receives TRANSFER and never enters the reconcile
+        loop.  It validates readiness and exits.  After the probe exits,
+        A execs the target image, which adopts the inherited lock fd via
+        the environment and becomes the sole lifecycle authority.
+
+        No authority overlap and no authority gap:  A holds the flock
+        throughout the probe.  The exec atomically replaces A's process
+        image; the new image inherits the lock fd and adopts it.  If exec
+        fails, the process exits, letting Tini restart from durable state.
+
+        Tini direct-child contract:  The exec preserves A's PID.  Tini
+        never observes a child exit, so the container stays alive.  The
+        worker child survives because its parent PID does not change.
+        """
+        handoff = self._resolve_handoff_target()
+        if handoff is None:
+            return
+        ownership_fd = self._ownership_fd
+        if ownership_fd is None:
+            return
+        pipes, process = self._spawn_preflight_probe(
+            handoff.target, handoff.confirmed, handoff.stored, ownership_fd
+        )
+        if process is None:
+            return
+        if not self._await_probe_ready(process, pipes, handoff.confirmed, ownership_fd):
+            return
+        self._exec_in_place(handoff.target, handoff.confirmed, ownership_fd)
+
+    def _resolve_handoff_target(self) -> _HandoffTarget | None:
+        """Resolve the handoff target executable and validate preconditions.
+
+        Returns:
+            A ``_HandoffTarget`` with non-optional validated fields, or
+            ``None`` when no handoff is needed or possible.
+        """
+        state = read_state()
+        stored = state.supervisor_runtime_commit
+        if stored is None or not cli.is_valid_commit_name(stored):
+            return None
+        confirmed = cli.current_commit()
+        if confirmed is None or confirmed == stored:
+            return None
+        if not cli.is_valid_commit_name(confirmed):
+            return None
+        target = resolve_new_supervisor_executable(confirmed)
+        if target is None:
+            self._message = (
+                f"supervisor runtime skew detected (ours={stored}, "
+                f"confirmed={confirmed}) but the new runtime is not usable; "
+                "continuing with the current runtime"
+            )
+            LOGGER.warning(
+                "supervisor runtime skew detected (ours=%s, confirmed=%s) "
+                "but the new runtime is not usable; continuing",
+                stored,
+                confirmed,
+            )
+            return None
+        if self._ownership_fd is None:
+            LOGGER.error(
+                "cannot handoff without an ownership fd; continuing with the current runtime"
+            )
+            return None
+        return _HandoffTarget(target=target, confirmed=confirmed, stored=stored)
+
+    def _spawn_preflight_probe(
+        self,
+        target: str,
+        confirmed: str,
+        stored: str,
+        ownership_fd: int,
+    ) -> tuple[_HandoffPipes, subprocess.Popen[bytes] | None]:
+        """Spawn a non-authoritative preflight probe with pipe fds.
+
+        The probe inherits the lock fd to validate adoption, but must close
+        it before exiting.  The probe never receives TRANSFER and never
+        enters the reconcile loop.
+
+        Returns:
+            A ``(_HandoffPipes, process)`` tuple.
+            ``process`` is ``None`` when the spawn failed; callers should
+            return early.  The ``_HandoffPipes`` fields are still valid
+            fds that must be closed by the caller on abort.
+        """
+        lock_path = str(supervise.supervisor_lock_path())
+        LOGGER.info(
+            "supervisor preflight probe: %s -> %s (%s)",
+            stored,
+            confirmed,
+            target,
+        )
+        lifecycle.append_deploy_log(f"supervisor handoff: {stored} -> {confirmed}")
+        ready_r, ready_w = os.pipe()
+        handoff_env = {
+            **os.environ,
+            supervise.HANDOFF_FD_ENV: str(ownership_fd),
+            supervise.HANDOFF_PATH_ENV: lock_path,
+            supervise.HANDOFF_PID_ENV: str(os.getpid()),
+            supervise.HANDOFF_READY_FD_ENV: str(ready_w),
+            supervise.HANDOFF_PREPARE_MODE_ENV: "1",
+            supervise.HANDOFF_TARGET_COMMIT_ENV: confirmed,
+        }
+        try:
+            os.set_inheritable(ownership_fd, True)  # ruff: ignore[boolean-positional-value-in-call]
+            os.set_inheritable(ready_w, True)  # ruff: ignore[boolean-positional-value-in-call]
+            process = subprocess.Popen(
+                [target],
+                close_fds=False,
+                env=handoff_env,
+            )
+        except OSError:
+            with suppress(OSError):
+                os.close(ready_r)
+            with suppress(OSError):
+                os.close(ready_w)
+            os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.exception(
+                "supervisor handoff failed to spawn preflight probe; "
+                "continuing with the current runtime"
+            )
+            self._message = (
+                f"supervisor handoff to {confirmed} failed to spawn; "
+                "continuing with the current runtime"
+            )
+            return _HandoffPipes(ready_r=ready_r), None
+        with suppress(OSError):
+            os.set_inheritable(ready_w, False)  # ruff: ignore[boolean-positional-value-in-call]
+        with suppress(OSError):
+            os.close(ready_w)
+        return _HandoffPipes(ready_r=ready_r), process
+
+    def _await_probe_ready(
+        self,
+        process: subprocess.Popen[bytes],
+        pipes: _HandoffPipes,
+        confirmed: str,
+        ownership_fd: int,
+    ) -> bool:
+        """Wait for the preflight probe's READY signal, then require clean exit.
+
+        The probe must exit successfully before A proceeds to exec-in-place.
+        This method:
+        1. Reads READY from the readiness pipe (with timeout).
+        2. Waits for the probe process to exit cleanly (rc=0).
+        3. On timeout, nonzero exit, or any failure: kills/reaps the probe
+           and aborts the handoff.
+
+        Args:
+            process: The spawned probe process.
+            pipes: Pipe file descriptors for the probe protocol.
+            confirmed: The target commit (for diagnostics).
+            ownership_fd: The ownership lock file descriptor.
+
+        Returns:
+            ``True`` when READY was received and the probe exited cleanly;
+            ``False`` when the handoff was aborted (caller should return).
+        """
+        ready = False
+        deadline = time.monotonic() + self.settings.lock_timeout_seconds
+        try:
+            buf = b""
+            while b"\n" not in buf:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readyfds, _, _ = select.select([pipes.ready_r], [], [], remaining)
+                if not readyfds:
+                    break
+                chunk = os.read(pipes.ready_r, 1)
+                if not chunk:
+                    break
+                buf += chunk
+            ready = buf.strip() == b"R"
+        except OSError:
+            pass
+        os.close(pipes.ready_r)
+        if not ready:
+            with suppress(OSError):
+                process.kill()
+            with suppress(Exception):
+                process.wait(timeout=5.0)
+            with suppress(OSError):
+                os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.warning(
+                "supervisor preflight probe to %s did not signal READY; "
+                "continuing with the current runtime",
+                confirmed,
+            )
+            self._message = (
+                f"supervisor preflight probe to {confirmed} did not signal READY; "
+                "continuing with the current runtime"
+            )
+            return False
+        # Wait for the probe to exit cleanly.  The probe must close its lock
+        # fd copy on exit so A is the sole flock holder before exec-in-place.
+        try:
+            rc = process.wait(timeout=5.0)
+        except Exception:
+            with suppress(OSError):
+                process.kill()
+            with suppress(Exception):
+                process.wait(timeout=5.0)
+            with suppress(OSError):
+                os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.warning(
+                "supervisor preflight probe to %s did not exit; "
+                "killed and reaped; continuing with the current runtime",
+                confirmed,
+            )
+            self._message = (
+                f"supervisor preflight probe to {confirmed} did not exit; "
+                "continuing with the current runtime"
+            )
+            return False
+        if rc != 0:
+            with suppress(OSError):
+                os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.warning(
+                "supervisor preflight probe to %s exited with rc=%d; "
+                "continuing with the current runtime",
+                confirmed,
+                rc,
+            )
+            self._message = (
+                f"supervisor preflight probe to {confirmed} failed (rc={rc}); "
+                "continuing with the current runtime"
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _exec_in_place(
+        target: str,
+        confirmed: str,
+        ownership_fd: int,
+    ) -> bool:
+        r"""Retire A's pidfile and exec in place into the target executable.
+
+        The probe has already validated the target and exited.  A now:
+        1. Retires its own pidfile (pid+start_time_ticks match only).
+        2. Makes the ownership fd inheritable so the exec'd target inherits it.
+        3. Sets the lock fd adoption env vars so the exec'd target can adopt
+           the inherited lock without entering handoff/probe mode.
+        4. Execs into the target via ``os.execve``, preserving A's PID for
+           Tini.  The confirmed target commit is passed through the env so
+           the exec'd image can bind its immutable runtime identity (#767).
+        5. On exec failure, restores the pidfile and returns ``False`` so
+           A continues with its current runtime (fail-closed availability:
+           the lock is still held and the process image is intact).
+
+        No TRANSFER is sent to the probe.  The probe has already exited.
+        The exec atomically replaces A's process image; the new image
+        inherits the lock fd and adopts it via the env vars.
+
+        Returns:
+            ``True`` when exec succeeded (process replaced; this code is
+            unreachable).  ``False`` when exec failed and A continues.
+        """
+        retired_pid: int
+        retired_ticks: int
+        try:
+            retired_pid, retired_ticks = supervise.retire_supervisor_pid()
+        except supervise.PidfileIdentityMismatchError:
+            os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.warning("handoff pidfile retirement failed; continuing with the current runtime")
+            return False
+        os.set_inheritable(ownership_fd, True)  # ruff: ignore[boolean-positional-value-in-call]
+        lock_path = str(supervise.supervisor_lock_path())
+        env = os.environ.copy()
+        env[supervise.HANDOFF_FD_ENV] = str(ownership_fd)
+        env[supervise.HANDOFF_PATH_ENV] = lock_path
+        env[supervise.HANDOFF_PID_ENV] = str(os.getpid())
+        env[supervise.HANDOFF_TARGET_COMMIT_ENV] = confirmed
+        LOGGER.info(
+            "supervisor exec-in-place: %s (pid %d)",
+            target,
+            os.getpid(),
+        )
+        try:
+            os.execve(target, [target], env)
+        except OSError:
+            supervise.restore_supervisor_pid(retired_pid, retired_ticks)
+            os.set_inheritable(ownership_fd, False)  # ruff: ignore[boolean-positional-value-in-call]
+            LOGGER.exception(
+                "supervisor exec-in-place to %s failed; continuing with the current runtime",
+                confirmed,
+            )
+            return False
 
     def _write_pidfile(self) -> None:
         """Record our exact identity, refusing to double-run a live daemon.
@@ -3229,6 +4123,8 @@ class SupervisorDaemon:
                 message=effective_message,
                 worker_health=worker_health,
                 holding=is_holding(state),
+                supervisor_runtime_commit=self._runtime_commit,
+                supervisor_runtime_contract_version=contract_schema_version(),
             )
         )
 
@@ -3306,6 +4202,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.status:
         return _status_cmd()
+    # Validate the supervisor state token before any daemon logic.  The token
+    # is required and must be a path-safe 256-bit hex string; absence or
+    # invalidity fails closed so the daemon never starts without namespace
+    # isolation.
+    try:
+        token = supervisor_state_token()
+    except SupervisorStateTokenError:
+        LOGGER.exception(
+            "LUBKO_SUPERVISOR_STATE_TOKEN is present but invalid; supervisor startup refused"
+        )
+        return 1
+    if token is None:
+        LOGGER.error(
+            "LUBKO_SUPERVISOR_STATE_TOKEN is required but absent; supervisor startup refused"
+        )
+        return 1
     with suppress(UvResolutionError):
         # The daemon itself never needs uv: it restores workers from immutable
         # per-commit environments. Refusing to start here would defeat crash
@@ -3318,6 +4230,7 @@ def main(argv: list[str] | None = None) -> int:
     logger = logging.getLogger("lubko.supervisor")
     with suppress(OSError):
         supervise.supervisor_dir().mkdir(parents=True, exist_ok=True)
+        supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
         handler = _BoundedSupervisorLogHandler(supervisor_log_path())
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         logger.addHandler(handler)

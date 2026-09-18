@@ -76,6 +76,7 @@ import json
 import logging
 import math
 import os
+import queue
 import select
 import selectors
 import signal
@@ -83,6 +84,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -96,7 +98,7 @@ from psycopg.rows import tuple_row
 
 from lubko._exact_signal import open_pidfd as _shared_open_pidfd
 from lubko._exact_signal import pidfd_send_signal as _shared_pidfd_send_signal
-from lubko._exact_signal import process_pgrp as _shared_process_pgrp
+from lubko._process_group import _process_pgrp, group_has_members
 from lubko._start_gate import GATE_RELEASE_BYTE
 from lubko.config import (
     load_database_config,
@@ -132,7 +134,7 @@ from lubko.protocol_versioning import (
 from lubko.state import state_root
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterable
+    from collections.abc import Callable, Collection, Iterable
     from uuid import UUID
 
     from psycopg.abc import RV, PQGen
@@ -394,6 +396,9 @@ DEFAULT_DB_OPERATION_TIMEOUT_SECONDS: Final = 15.0
 DEFAULT_GC_RETENTION_SECONDS: Final = 3600.0
 DEFAULT_GC_INTERVAL_SECONDS: Final = 60.0
 DEFAULT_GC_BATCH_LIMIT: Final = 100
+DEFAULT_SPAWN_DEADLINE_SECONDS: Final = 30.0
+NUM_START_LANES: Final = 4
+SPAWN_LANE_QUEUE_SIZE: Final = NUM_START_LANES
 # Configurable safe bound on the per-job local stdout/stderr disk spool.  The
 # on-disk capture files are trimmed to the rolling live tail after every
 # publication, so a job's steady-state spool stays near OUTPUT_TAIL_MAX_BYTES
@@ -715,6 +720,301 @@ class _RetryTerminalization:
     next_retry_at: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class _SpawnResult:
+    """Result of a ``spawn_job`` call from a daemon worker thread.
+
+    Carries the successful gated start, so the main supervisor loop can
+    decide without blocking on the thread.
+    """
+
+    proc: subprocess.Popen[bytes]
+    stdout_path: Path
+    stderr_path: Path
+    pgid: int
+    gate_fd: int
+    stdout_read_fd: int
+    stderr_read_fd: int
+
+
+def _spawn_result_from_tuple(
+    t: tuple[subprocess.Popen[bytes], Path, Path, int, int, int, int],
+) -> _SpawnResult:
+    """Wrap a ``spawn_job`` return tuple into a ``_SpawnResult``.
+
+    Returns:
+        The converted ``_SpawnResult``.
+    """
+    return _SpawnResult(
+        proc=t[0],
+        stdout_path=t[1],
+        stderr_path=t[2],
+        pgid=t[3],
+        gate_fd=t[4],
+        stdout_read_fd=t[5],
+        stderr_read_fd=t[6],
+    )
+
+
+_SpawnTuple = tuple[subprocess.Popen[bytes], Path, Path, int, int, int, int]
+
+
+class _SpawnFuture:
+    """Pollable result holder for one spawn attempt running in a worker lane.
+
+    The main thread polls ``done()`` each tick.  A ``callback`` is invoked
+    (in the worker thread) when the result becomes available, allowing
+    late-completion cleanup without blocking the main loop.
+
+    Callback installation and result delivery are atomic under a single
+    lock: ``install_callback`` stores the callback and, if the result is
+    already present, invokes it immediately; ``set_result`` stores the
+    result and, if a callback was installed, invokes it immediately.  This
+    eliminates the race where timeout observes ``done()=False``, then the
+    worker completes before the callback is installed.
+
+    All callback invocations happen **outside** the lock so callbacks may
+    freely call ``result()`` or ``done()`` without self-deadlock.
+
+    ``cancel()`` marks the future as cancelled so the worker loop skips
+    the callable.  A cancelled future is ``done()``.  If an in-flight
+    spawn (already past the cancellation check) later publishes a result,
+    ``set_result`` still stores it and fires the callback so the late
+    physical completion is properly aborted/reaped.
+    """
+
+    __slots__ = ("_callback", "_cancelled", "_done", "_executed", "_lock", "_result")
+
+    def __init__(self, callback: Callable[..., None] | None) -> None:
+        self._result: _SpawnResult | BaseException | None = None
+        self._lock = threading.Lock()
+        self._done = False
+        self._cancelled = False
+        self._executed = False
+        self._callback: Callable[..., None] | None = callback
+
+    def set_result(self, result: _SpawnResult | BaseException) -> None:
+        """Store the result and invoke the callback if one was installed.
+
+        If the future was cancelled **and** the worker never executed
+        (skipped via the cancellation check), the result is stored for
+        diagnostics but the callback is not invoked: the callable was
+        never run so there is no gated start to abort.
+
+        If the future was cancelled but the worker **did** execute (an
+        in-flight spawn that completed after timeout), the callback fires
+        so the late physical completion is properly aborted/reaped.
+        """
+        cb: Callable[..., None] | None = None
+        with self._lock:
+            self._result = result
+            self._done = True
+            if not self._cancelled or self._executed:
+                cb = self._callback
+        if cb is not None and isinstance(result, _SpawnResult):
+            cb(self)
+
+    def install_callback(self, cb: Callable[..., None]) -> bool:
+        """Install a late-completion callback atomically with completion.
+
+        If the result is already present, the callback is invoked
+        immediately (in the calling thread, outside the lock) and ``True``
+        is returned so the caller knows no further cleanup is needed.  If
+        the result is not yet present, the callback is stored for later
+        invocation by the worker thread and ``False`` is returned.
+
+        Args:
+            cb: Callback to invoke with this future when the result is a
+                ``_SpawnResult``.
+
+        Returns:
+            ``True`` when the callback was invoked immediately (future was
+            already done); ``False`` when it was stored for later.
+        """
+        invoke: Callable[..., None] | None = None
+        with self._lock:
+            if self._done:
+                invoke = cb
+            else:
+                self._callback = cb
+        if invoke is not None:
+            invoke(self)
+            return True
+        return False
+
+    def done(self) -> bool:
+        with self._lock:
+            return self._done
+
+    def result(self) -> _SpawnResult | BaseException | None:
+        with self._lock:
+            return self._result
+
+    def cancel(self) -> None:
+        """Mark the future as cancelled so the worker loop skips the callable.
+
+        The future becomes ``done()``.  If an in-flight spawn later
+        publishes a result through ``set_result``, the callback still fires
+        so the late physical completion is properly aborted/reaped.
+        """
+        with self._lock:
+            self._cancelled = True
+            self._done = True
+
+    def cancelled(self) -> bool:
+        """Return whether the future was cancelled before the worker executed it."""
+        with self._lock:
+            return self._cancelled
+
+    def try_claim_execution(self) -> bool:
+        """Atomically check cancellation and claim execution under one lock.
+
+        Returns ``True`` if the worker may call ``fn()`` (cancellation had
+        not yet arrived); ``False`` if the future was already cancelled and
+        the callable must be skipped.
+
+        This eliminates the race where ``cancel()`` arrives between a
+        separate ``cancelled()`` check and ``mark_executed()`` call,
+        allowing a stale queued callable to execute.
+
+        Returns:
+            ``True`` when execution is claimed; ``False`` when already
+            cancelled.
+        """
+        with self._lock:
+            if self._cancelled:
+                return False
+            self._executed = True
+            return True
+
+
+class _SpawnExecutor:
+    """Bounded pool of daemon worker threads that run ``spawn_job`` off the main loop.
+
+    Exactly ``NUM_START_LANES`` daemon threads run a loop that picks
+    ``(job_id, fn, future)`` triples from a bounded work queue.  Each
+    thread calls ``fn()`` (which is ``spawn_job``) and stores the result
+    in the ``_SpawnFuture``.  Because every thread is daemon, they die
+    with the process and never hang shutdown.  Because the pool size is
+    fixed, the total number of live threads is bounded to
+    ``NUM_START_LANES``.  One permanently blocked ``spawn_job``/``Popen``
+    can never grow the thread count without bound; later queue work still
+    progresses through the remaining unblocked lanes.
+
+    The work queue is bounded to ``SPAWN_LANE_QUEUE_SIZE`` items.  When
+    every lane is busy and the queue is full, ``submit`` raises
+    ``queue.Full`` so the caller can fail the job immediately.  This
+    prevents unbounded stale work accumulation: at most
+    ``NUM_START_LANES + SPAWN_LANE_QUEUE_SIZE`` spawn attempts can be
+    admitted before rejection kicks in.
+
+    Timed-out attempts whose futures are marked done before a worker
+    picks them up are skipped without executing ``spawn_job``, so stale
+    callables never waste lane capacity.
+
+    ``shutdown()`` sets a flag, drains the queue, and delivers an
+    ``OSError`` to every pending future so stale queued starts never
+    invoke ``spawn_job``.
+    """
+
+    def __init__(
+        self,
+        num_lanes: int = NUM_START_LANES,
+        queue_size: int = SPAWN_LANE_QUEUE_SIZE,
+    ) -> None:
+        self._queue: queue.Queue[tuple[UUID, Callable[..., object], _SpawnFuture]] = queue.Queue(
+            maxsize=queue_size,
+        )
+        self._threads: list[threading.Thread] = []
+        self._shutdown = False
+        for i in range(num_lanes):
+            t = threading.Thread(
+                target=self._worker_loop,
+                name=f"spawn-lane-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+    def _worker_loop(self) -> None:
+        while True:
+            try:
+                _job_id, fn, future = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if self._shutdown:
+                future.set_result(OSError("spawn pool shut down"))
+                continue
+            if not future.try_claim_execution():
+                continue
+            try:
+                raw = fn()
+            except BaseException as exc:  # ruff: ignore[blind-except] -- worker must not die
+                future.set_result(exc)
+            else:
+                if raw is None:
+                    continue
+                result: _SpawnTuple = cast("_SpawnTuple", raw)
+                future.set_result(_spawn_result_from_tuple(result))
+
+    def submit(self, job_id: UUID, fn: Callable[..., object], future: _SpawnFuture) -> None:
+        """Submit a spawn function to a worker lane.
+
+        The caller should handle ``queue.Full`` when every lane is busy
+        and the waiting queue is at capacity, and fail the job immediately.
+
+        Args:
+            job_id: Identifier of the job being started.
+            fn: Callable (typically ``spawn_job``) to run in the lane.
+            future: Result holder for the attempt.
+        """
+        if self._shutdown:
+            future.set_result(OSError("spawn pool shut down"))
+            return
+        self._queue.put_nowait((job_id, fn, future))
+
+    def shutdown(self) -> None:
+        """Prevent new starts and drain stale queued work.
+
+        Sets the shutdown flag so worker threads skip stale queued entries.
+        Drains every remaining item from the queue and delivers an
+        ``OSError`` to its future so the attempt is cleanly failed.
+        Worker threads are daemon and die with the process.
+        """
+        self._shutdown = True
+        while True:
+            try:
+                _job_id, _fn, future = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            future.set_result(OSError("spawn pool shut down"))
+
+
+@dataclass(slots=True)
+class _StartAttempt:
+    """One asynchronous spawn attempt tracked by a bounded daemon pool.
+
+    The bounded ``_SpawnExecutor`` runs ``spawn_job`` in a daemon worker
+    thread which may block forever on ``subprocess.Popen``.  The main
+    supervisor loop polls the ``_SpawnFuture`` each tick and enforces a
+    bounded deadline: after the deadline the attempt is logically timed out,
+    its DB row is failed, and it is removed from active-start accounting.
+    A ``_SpawnFuture`` callback handles any late completion: if the blocked
+    worker thread eventually returns a ``_SpawnResult`` the gated start is
+    aborted/reaped fail-closed without ever executing user code.  Because
+    the pool has a fixed number of daemon threads, one permanently blocked
+    start can never grow the thread count without bound; later queue work
+    still progresses through the remaining unblocked lanes.
+    """
+
+    job_id: UUID
+    job_spec: Job
+    claim_mono: float
+    version: int
+    submitted_at: float
+    future: _SpawnFuture
+
+
 class SchemaInvariantError(RuntimeError):
     """Raised when ``lubko.jobs`` violates the two-column transport invariant."""
 
@@ -759,6 +1059,7 @@ class Settings:
     gc_interval_seconds: float = DEFAULT_GC_INTERVAL_SECONDS
     gc_batch_limit: int = DEFAULT_GC_BATCH_LIMIT
     output_spool_max_bytes: int = DEFAULT_OUTPUT_SPOOL_MAX_BYTES
+    spawn_deadline_seconds: float = DEFAULT_SPAWN_DEADLINE_SECONDS
 
     def __post_init__(self) -> None:
         """Validate lease timing so a live worker's lease never expires idle.
@@ -798,6 +1099,7 @@ class Settings:
             "db_operation_timeout_seconds",
             "gc_retention_seconds",
             "gc_interval_seconds",
+            "spawn_deadline_seconds",
         )
         for field_name in fields:
             value = getattr(self, field_name)
@@ -993,6 +1295,12 @@ class Settings:
                 os.getenv(
                     "LUBKO_OUTPUT_SPOOL_MAX_BYTES",
                     str(DEFAULT_OUTPUT_SPOOL_MAX_BYTES),
+                )
+            ),
+            spawn_deadline_seconds=float(
+                os.getenv(
+                    "LUBKO_SPAWN_DEADLINE_SECONDS",
+                    str(DEFAULT_SPAWN_DEADLINE_SECONDS),
                 )
             ),
         )
@@ -2258,46 +2566,6 @@ def _persist_process(
             ),
         )
         return cursor.rowcount == 1
-
-
-def _process_pgrp(pid: int) -> int | None:
-    """Return the exact process group of a running process.
-
-    Args:
-        pid: Process ID to inspect.
-
-    Returns:
-        The process group ID, or ``None`` if the process is dead or unknown.
-    """
-    return _shared_process_pgrp(pid)
-
-
-def group_has_members(pgid: int) -> bool:
-    """Return whether any live process still belongs to the exact process group.
-
-    Uses the process table under ``/proc`` when available so membership is
-    matched by exact process group, never by process name. Falls back to
-    querying the kernel directly otherwise.
-
-    Args:
-        pgid: Process group identifier to inspect.
-
-    Returns:
-        ``True`` when at least one running process still belongs to the group.
-    """
-    proc_dir = Path("/proc")
-    if proc_dir.is_dir():
-        for entry in proc_dir.iterdir():
-            if not entry.name.isdigit():
-                continue
-            if _process_pgrp(int(entry.name)) == pgid:
-                return True
-        return False
-    try:
-        os.getpgid(pgid)
-    except ProcessLookupError:
-        return False
-    return True
 
 
 def drain_sentinel_dir() -> Path:
@@ -4555,6 +4823,8 @@ class Supervisor:
         self._recovery_batch_bound_hit = False
         self._next_health_publish_at = 0.0
         self._health_force = True
+        self._pending_starts: dict[UUID, _StartAttempt] = {}
+        self._spawn_pool = _SpawnExecutor()
 
     def request_shutdown(self) -> None:
         """Request a graceful shutdown from another thread or a signal handler.
@@ -4624,6 +4894,7 @@ class Supervisor:
         self._service_processes()
         self._drain_captures()
         self._enforce_spool_bounds()
+        self._poll_pending_starts(now)
         if self._stopping:
             return
         if self.conn is None:
@@ -5817,9 +6088,11 @@ class Supervisor:
     def _start_job(self, claimed: ClaimedJob, claim_mono: float) -> None:
         """Start one claimed job as a process group and register it.
 
-        If the process cannot be started (for example because the operating
-        system refused to spawn it), the job fails clearly and independently
-        while the daemon stays alive to supervise the jobs that did start.
+        The actual ``subprocess.Popen`` call (inside :func:`spawn_job`) runs in
+        a daemon thread so it can never block the supervisor tick loop.  The
+        synchronous path only performs fast validation (payload parsing, server
+        check, preflight) and then hands off to the thread pool.  Completed
+        attempts are polled each tick by :meth:`_poll_pending_starts`.
 
         The local lease-safety deadline is anchored to ``claim_mono``: the
         monotonic time captured immediately before the claim database operation
@@ -5883,54 +6156,232 @@ class Supervisor:
         if failure is not None:
             self._finalize_immediate(claimed.id, failure)
             return
+        version = payload.version
+
+        future = _SpawnFuture(callback=None)
+        attempt = _StartAttempt(
+            job_id=claimed.id,
+            job_spec=job_spec,
+            claim_mono=claim_mono,
+            version=version,
+            submitted_at=time.monotonic(),
+            future=future,
+        )
         try:
-            proc, stdout_path, stderr_path, pgid, gate_fd, stdout_r, stderr_r = spawn_job(job_spec)
-        except OSError as exc:
-            LOGGER.warning("unable to start job %s: %s", claimed.id, exc)
+            self._spawn_pool.submit(claimed.id, lambda: spawn_job(job_spec), future)
+        except queue.Full:
+            LOGGER.warning(
+                "spawn pool full for job %s; failing immediately",
+                claimed.id,
+            )
             self._finalize_immediate(
                 claimed.id,
                 JobResult(
                     status="failed",
                     exit_code=EXECUTION_ERROR_EXIT_CODE,
                     stdout="",
-                    stderr=f"unable to execute job: {exc}",
+                    stderr="spawn pool full; job not started",
                     cancellation_note=None,
                 ),
             )
             return
-        gated = GatedSpawn(
-            proc=proc,
-            pgid=pgid,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            gate_fd=gate_fd,
-            stdout_read_fd=stdout_r,
-            stderr_read_fd=stderr_r,
-        )
+        self._pending_starts[claimed.id] = attempt
+        LOGGER.info("queued spawn attempt for job %s", claimed.id)
 
-        # Fail closed BEFORE any release and activate only on success.
+    def _poll_pending_starts(self, now: float) -> None:
+        """Poll completed or timed-out spawn attempts and activate or fail them.
+
+        Each completed attempt either activates the gated job (persisting the
+        identity and releasing the gate) or finalizes the job failed.  Each
+        timed-out attempt fails the DB row and removes it from active-start
+        accounting; a ``_SpawnFuture`` callback handles any late completion
+        by aborting/reaping the gated start fail-closed without ever
+        executing user code.
+
+        Args:
+            now: Current monotonic time.
+        """
+        deadline = self.settings.spawn_deadline_seconds
+        for job_id in list(self._pending_starts):
+            attempt = self._pending_starts[job_id]
+            if attempt.future.done():
+                del self._pending_starts[job_id]
+                self._handle_completed_attempt(attempt)
+            elif now - attempt.submitted_at >= deadline:
+                del self._pending_starts[job_id]
+                self._handle_timed_out_attempt(attempt)
+
+    def _handle_completed_attempt(self, attempt: _StartAttempt) -> None:
+        """Handle a completed (success or failure) spawn attempt.
+
+        Args:
+            attempt: The completed attempt.
+        """
+        conn = self.conn
+        result = attempt.future.result()
+        if isinstance(result, BaseException):
+            if conn is None:
+                return
+            LOGGER.warning("unable to start job %s: %s", attempt.job_id, result)
+            self._finalize_immediate(
+                attempt.job_id,
+                JobResult(
+                    status="failed",
+                    exit_code=EXECUTION_ERROR_EXIT_CODE,
+                    stdout="",
+                    stderr=f"unable to execute job: {result}",
+                    cancellation_note=None,
+                ),
+            )
+            return
+        assert isinstance(result, _SpawnResult)  # ruff: ignore[assert] -- narrowed by isinstance above
+        gated = GatedSpawn(
+            proc=result.proc,
+            pgid=result.pgid,
+            stdout_path=result.stdout_path,
+            stderr_path=result.stderr_path,
+            gate_fd=result.gate_fd,
+            stdout_read_fd=result.stdout_read_fd,
+            stderr_read_fd=result.stderr_read_fd,
+        )
+        if conn is None:
+            self._abort_and_reap_late(gated, attempt.job_id)
+            return
         job = self._activate_gated_job(
             conn,
-            claimed.id,
-            job_spec,
+            attempt.job_id,
+            attempt.job_spec,
             gated,
-            claim_mono=claim_mono,
-            version=payload.version,
+            claim_mono=attempt.claim_mono,
+            version=attempt.version,
         )
         if job is None:
-            # The gated start was aborted and finalized; close the capture fds
-            # and drop the spool files so nothing leaks.
-            for capture_fd in (stdout_r, stderr_r):
-                with suppress(OSError):
-                    os.close(capture_fd)
-            _cleanup_output_files(stdout_path, stderr_path)
             return
-        job.stdout = OutputStream(path=stdout_path, fd=stdout_r)
-        job.stderr = OutputStream(path=stderr_path, fd=stderr_r)
-        job.last_heartbeat_at = claim_mono
-        self.active[claimed.id] = job
+        job.last_heartbeat_at = attempt.claim_mono
+        self.active[attempt.job_id] = job
         LOGGER.info("claimed job %s (pid %d)", job.id, job.pid)
         self._publish_health_force()
+
+    def _handle_timed_out_attempt(self, attempt: _StartAttempt) -> None:
+        """Fail a timed-out spawn attempt and clean up if it later completes.
+
+        The DB row is failed immediately so the row does not stay
+        non-terminal indefinitely.  The future is cancelled so the worker
+        loop skips the callable if it has not started yet.  A
+        ``_SpawnFuture`` callback handles any late completion: if the
+        blocked worker thread eventually returns a ``_SpawnResult`` the
+        gated start is aborted/reaped fail-closed without ever executing
+        user code.
+
+        Args:
+            attempt: The timed-out attempt.
+        """
+        LOGGER.error(
+            "spawn attempt for job %s timed out after %.1fs; failing the row",
+            attempt.job_id,
+            time.monotonic() - attempt.submitted_at,
+        )
+        self._finalize_immediate(
+            attempt.job_id,
+            JobResult(
+                status="failed",
+                exit_code=EXECUTION_ERROR_EXIT_CODE,
+                stdout="",
+                stderr="spawn timed out; job not started",
+                cancellation_note=None,
+            ),
+        )
+        attempt.future.install_callback(self._make_late_completion_callback(attempt.job_id))
+        attempt.future.cancel()
+
+    @staticmethod
+    def _make_late_completion_callback(job_id: UUID) -> Callable[[_SpawnFuture], None]:
+        """Return a ``_SpawnFuture`` callback that aborts/reaps a late ``GatedSpawn``.
+
+        The callback is invoked in the worker thread when the (possibly blocked)
+        ``spawn_job`` eventually returns.  It aborts and reaps the gated start
+        without ever releasing the gate, so user code never executes.
+
+        Args:
+            job_id: Identifier of the already-failed job (for diagnostics).
+
+        Returns:
+            A callable suitable for ``_SpawnFuture`` callback.
+        """
+
+        def _on_complete(future: _SpawnFuture) -> None:
+            result = future.result()
+            if isinstance(result, _SpawnResult):
+                gated = GatedSpawn(
+                    proc=result.proc,
+                    pgid=result.pgid,
+                    stdout_path=result.stdout_path,
+                    stderr_path=result.stderr_path,
+                    gate_fd=result.gate_fd,
+                    stdout_read_fd=result.stdout_read_fd,
+                    stderr_read_fd=result.stderr_read_fd,
+                )
+                Supervisor._abort_and_reap_late(gated, job_id)
+
+        return _on_complete
+
+    def _cleanup_pending_starts(self) -> None:
+        """Fail-clean every pending spawn attempt without joining blocked threads.
+
+        Called during shutdown before the drain phase.  Each pending attempt's
+        DB row is failed immediately so it does not stay non-terminal.  Each
+        future is cancelled so the worker loop skips the callable if it has
+        not started yet.  The worker threads are daemon threads (they die
+        with the process) and are never joined, so a permanently blocked
+        ``subprocess.Popen`` can never hang shutdown.  A ``_SpawnFuture``
+        callback handles any late completion.
+        """
+        for job_id in list(self._pending_starts):
+            attempt = self._pending_starts.pop(job_id)
+            LOGGER.warning(
+                "abandoning pending spawn attempt for job %s during shutdown",
+                job_id,
+            )
+            self._finalize_immediate(
+                job_id,
+                JobResult(
+                    status="failed",
+                    exit_code=EXECUTION_ERROR_EXIT_CODE,
+                    stdout="",
+                    stderr="worker shutting down before spawn completed",
+                    cancellation_note=None,
+                ),
+            )
+            attempt.future.install_callback(self._make_late_completion_callback(job_id))
+            attempt.future.cancel()
+
+    @staticmethod
+    def _abort_and_reap_late(gated: GatedSpawn, job_id: UUID) -> None:
+        """Abort a gated start and block until its wrapper is reaped.
+
+        Used when a late-completing daemon thread returns a ``GatedSpawn``
+        after the job row was already failed.  The gate is closed without
+        release and the exact direct child is converged.
+
+        Args:
+            gated: Handles and exact identity of the gated start.
+            job_id: Identifier of the affected job (for diagnostics).
+        """
+        LOGGER.warning(
+            "late spawn completion for already-failed job %s (pid %d); "
+            "aborting gated start without executing user code",
+            job_id,
+            gated.proc.pid,
+        )
+        if abort_gated_start(
+            gated.proc, gated.pgid, gated.stdout_path, gated.stderr_path, gated.gate_fd
+        ):
+            for capture_fd in (gated.stdout_read_fd, gated.stderr_read_fd):
+                if capture_fd is not None:
+                    with suppress(OSError):
+                        os.close(capture_fd)
+            return
+        await_gated_group_gone(gated)
 
     @staticmethod
     def _abort_and_converge(gated: GatedSpawn, job_id: UUID) -> None:
@@ -6435,6 +6886,8 @@ class Supervisor:
         (deterministic/schema/programming) fault propagates naturally: Python runs
         the ``finally`` cleanup and final health publication first, then re-raises.
         """
+        self._cleanup_pending_starts()
+        self._spawn_pool.shutdown()
         try:
             self._shutdown_finalize()
         finally:

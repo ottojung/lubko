@@ -29,9 +29,9 @@ from uuid import UUID
 import psycopg
 from psycopg.rows import tuple_row
 
-from lubko import cli, lifecycle_state, supervise
+from lubko import cli, lifecycle, lifecycle_state, startup_contract, supervise, supervise_client
 from lubko.config import load_database_config
-from lubko.durable import DurabilityError, write_json_durable
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.lifecycle import (
     SCHEMA_VERSION,
     STATE_RUNNING,
@@ -55,7 +55,13 @@ from lubko.lifecycle import (
     worker_log_path,
     write_meta,
 )
-from lubko.state import rollback_state_path
+from lubko.state import SupervisorStateTokenError, rollback_state_path, state_root
+from lubko.supervise import GenerationLockTimeoutError
+from lubko.supervise_client import (
+    allocate_generation_client,
+    read_desired_client,
+    read_state_client,
+)
 from lubko.toolchain import UvResolutionError, resolve_uv
 from lubko.worker import JOB_ID_ENV
 
@@ -93,6 +99,13 @@ HANDOFF_RESPONSE_MAX_BYTES: Final = 1048576
 HELPER_ERROR_MAX_CHARS: Final = 8000
 HANDOFF_DURABLE_WAIT_SECONDS: Final = 60.0
 
+#: Durable file that preserves the pre-confirmation startup artifacts so
+#: rollback can restore them exactly.  Written before confirmation mutates
+#: the artifacts and removed after confirmation succeeds.
+_PRE_CONFIRMATION_ARTIFACTS_NAME: Final = "pre-confirmation-startup-artifacts.json"
+_CONFIRMATION_RECEIPT_NAME: Final = "startup-confirmation-receipt.json"
+_MAX_BYTE_VALUE: Final = 255
+
 GATED_SHIM_SOURCE: Final = """
 import os
 import sys
@@ -112,6 +125,10 @@ class DeployCtlError(RuntimeError):
     """Raised when a supervised deployment cannot proceed safely."""
 
 
+class ProvenanceError(DeployCtlError):
+    """Raised when a commit cannot be obtained from the declared source authority."""
+
+
 @dataclass(frozen=True, slots=True)
 class Options:
     """Runtime inputs shared by supervised-deployment operations."""
@@ -125,6 +142,7 @@ class Options:
     validation_timeout_seconds: float
     git_timeout_seconds: float
     cli_timeout_seconds: float
+    source_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -523,12 +541,13 @@ def next_mission_generation() -> int:
     """Allocate the next monotonic mission generation for a new checkout.
 
     Must run while the deploy lock is held. The returned generation is
-    strictly greater than every durable generation observed so far: the
-    existing rollback mission, the supervisor desired intent, and the
-    supervisor applied state. A supervisor that compares generations can then
-    never mistake a freshly created mission for an older or already-applied
-    generation. Allocation is serialized with the desired-intent writes so a
-    concurrent restart can never reuse or reorder a generation.
+    strictly greater than every durable generation observed so far.
+
+    With token: direct ``supervise.next_generation()`` under the
+    generation lock.
+    Without token: reads the current applied generation from the status
+    surface and returns ``applied + 1``.  The supervisor re-validates
+    when processing the deploy request.
 
     Returns:
         The next strictly greater positive generation.
@@ -538,11 +557,21 @@ def next_mission_generation() -> int:
             or malformed; allocation must fail closed rather than silently
             outrank an untrustworthy open mission.
     """
-    with supervise.generation_lock():
+    try:
+        with supervise.generation_lock():
+            try:
+                return supervise.next_generation()
+            except supervise.MissionAuthorityError as exc:
+                raise DeployCtlError(str(exc)) from exc
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock during mission generation allocation"
+        raise DeployCtlError(msg) from exc
+    except SupervisorStateTokenError:
         try:
-            return supervise.next_generation()
-        except supervise.MissionAuthorityError as exc:
-            raise DeployCtlError(str(exc)) from exc
+            return allocate_generation_client()
+        except (ConnectionError, OSError) as exc:
+            msg = "supervisor is not running; cannot allocate generation without a token"
+            raise DeployCtlError(msg) from exc
 
 
 def _supervised_mission_active(state: RollbackState) -> bool:
@@ -561,7 +590,7 @@ def _supervised_mission_active(state: RollbackState) -> bool:
         ``True`` when the supervisor owns a proven-live worker for
         ``state.commit`` that it began under this mission generation.
     """
-    supervisor_state = supervise.read_state()
+    supervisor_state = read_state_client()
     return (
         supervisor_state.commit == state.commit
         and supervisor_state.child is not None
@@ -643,7 +672,7 @@ def _supervised_terminalization_authority_matches(
         return False
     if status.ready is not True or status.holding or status.child is None:
         return False
-    supervisor_state = supervise.read_state()
+    supervisor_state = read_state_client()
     return (
         supervisor_state.commit == expected_commit
         and supervisor_state.applied_generation == expected_generation
@@ -663,9 +692,9 @@ def _supervised_mission_authoritative(state: RollbackState) -> bool:
     missing, contradictory, or different-commit authority. Terminalization
     still binds to the exact settled generation separately.
     """
-    supervisor_state = supervise.read_state()
+    supervisor_state = read_state_client()
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError:
         return False
     status = supervise.read_status()
@@ -698,7 +727,7 @@ def _require_confirmation_authority(state: RollbackState) -> None:
     if state.supervisor_owned is False or not supervise.supervisor_running():
         return
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError as exc:
         msg = "supervisor authority was superseded before confirmation; deployment remains pending"
         raise DeployCtlError(msg) from exc
@@ -763,7 +792,7 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
     """
     worker_id = os.getenv("LUBKO_WORKER_ID") or socket.gethostname()
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError as exc:
         msg = "the supervisor desired intent is not trustworthy"
         raise DeployCtlError(msg) from exc
@@ -773,12 +802,16 @@ def settle_desired(commit: str, repo: str, uv_path: str) -> int:
         # migration by publishing a newer ordinary settlement generation.
         generation = desired.generation
     else:
-        generation = supervise.request_run(
-            commit,
-            repo=repo,
-            uv_path=uv_path,
-            worker_id=worker_id,
-        )
+        try:
+            generation = supervise_client.request_run_client(
+                commit,
+                repo=repo,
+                uv_path=uv_path,
+                worker_id=worker_id,
+            )
+        except GenerationLockTimeoutError as exc:
+            msg = "timed out waiting for the generation lock during settlement"
+            raise DeployCtlError(msg) from exc
     lifecycle_state.failpoint(lifecycle_state.FAILPOINT_MISSION_CONFIRM)
     if not supervise.wait_for_generation(generation, supervise.DEFAULT_REQUEST_TIMEOUT_SECONDS):
         msg = "the external supervisor did not apply the requested target"
@@ -912,6 +945,109 @@ def _require_clean_checkout(repo: Path, timeout: float) -> None:
     if proc.stdout:
         msg = "deployment checkout is dirty; commit or discard changes first"
         raise DeployCtlError(msg)
+
+
+def _has_userinfo(source_url: str) -> bool:
+    """Return whether the source URL contains credential-bearing userinfo.
+
+    Detects both ``scheme://user:password@host/path`` and SCP-style
+    ``user@host:path`` forms.  When userinfo is present, raw Git stderr
+    must never be appended to error messages because Git may normalize or
+    encode the credentials differently than the raw input string.
+
+    Args:
+        source_url: The raw source authority URL.
+
+    Returns:
+        ``True`` when the URL carries credential material.
+    """
+    if "@" not in source_url:
+        return False
+    scheme_end = source_url.find("://")
+    if scheme_end != -1:
+        # scheme://user:pass@host — userinfo follows "://"
+        return "@" in source_url[scheme_end + 3 :]
+    # SCP-style user@host:path — first component before ':' contains '@'
+    colon_pos = source_url.find(":")
+    prefix = source_url if colon_pos == -1 else source_url[:colon_pos]
+    return "@" in prefix
+
+
+def _redact_source_url(source_url: str) -> str:
+    """Return a redacted display label for a source URL, hiding credentials.
+
+    Handles both ``scheme://user:password@host/path`` and SCP-style
+    ``user@host:path`` forms.  The redacted label preserves the host/path
+    structure useful for diagnostics while stripping any credential material.
+
+    Args:
+        source_url: The raw source authority URL.
+
+    Returns:
+        A credential-free display string.
+    """
+    if "@" not in source_url:
+        return source_url
+    scheme_end = source_url.find("://")
+    if scheme_end != -1:
+        # scheme://user:pass@host/path → scheme://host/path
+        authority_start = scheme_end + 3
+        at_pos = source_url.find("@", authority_start)
+        if at_pos == -1:
+            return source_url
+        return source_url[:authority_start] + source_url[at_pos + 1 :]
+    # SCP-style user@host:path → host:path
+    at_pos = source_url.find("@")
+    if at_pos == -1:
+        return source_url
+    return source_url[at_pos + 1 :]
+
+
+def fetch_from_authority(
+    repo: Path,
+    commit: str,
+    source_url: str,
+    timeout: float,
+) -> None:
+    """Fetch the exact commit from the declared source authority.
+
+    Proves the commit originates from the explicit authority rather than
+    relying on whatever local state or ``origin`` remote happened to exist.
+    After a successful fetch, ``_require_exact_commit`` confirms the commit
+    is present in the local object store.
+
+    Args:
+        repo: Repository checkout.
+        commit: Exact commit to fetch.
+        source_url: The authoritative remote URL to fetch from.
+        timeout: Git timeout.
+
+    Raises:
+        ProvenanceError: If the fetch from the declared source fails.
+    """
+    label = _redact_source_url(source_url)
+    try:
+        proc = _run_git(repo, ("fetch", "--depth=1", source_url, commit), timeout)
+    except subprocess.TimeoutExpired:
+        msg = f"fetching commit {commit} from source authority {label!r} timed out after {timeout}s"
+        raise ProvenanceError(msg) from None
+    except OSError as exc:
+        errno_part = f" (errno {exc.errno})" if getattr(exc, "errno", None) else ""
+        msg = (
+            f"could not execute git fetch from source authority "
+            f"{label!r} for commit {commit}{errno_part}"
+        )
+        raise ProvenanceError(msg) from None
+    if proc.returncode != 0:
+        if _has_userinfo(source_url):
+            detail = ""
+        else:
+            detail = f": {(proc.stderr or '').strip()}" if proc.stderr else ""
+        msg = (
+            f"source authority {label!r} does not contain commit {commit}{detail}; "
+            "the commit was not fetched from the declared authority"
+        )
+        raise ProvenanceError(msg)
 
 
 def _checkout(repo: Path, commit: str, timeout: float, *, force: bool) -> bool:
@@ -1691,44 +1827,164 @@ def _retire_candidate_locked(state: RollbackState) -> bool:
     return True
 
 
-def _restore_previous_locked(state: RollbackState) -> bool:
-    """Restore the previous exact checkout and worker after candidate death.
+def _restore_cli_and_startup_artifacts(commit: str, previous_commit: str) -> tuple[bool, bool]:
+    """Restore the CLI pointer and startup artifacts during rollback.
 
-    Assumes the candidate worker has been proven dead, so the previous
-    known-good checkout may be force-restored, the previous worker restarted,
-    its metadata written, and the terminal ``rolled_back`` state recorded.
+    Shared by both the legacy direct-restore path and the supervised
+    settlement path.  Terminal state is never written here: callers
+    are responsible for terminalizing only after this function returns
+    ``(True, ...)``.
+
+    Recovery evidence (pre-confirmation snapshot, staging manifest,
+    confirmation receipt) is **never** deleted by this function.  The
+    caller must invoke :func:`_cleanup_rollback_evidence` only after
+    terminalization succeeds so that a superseding desired generation
+    cannot leave a nonterminal rollback with no recovery evidence.
+
+    The confirmation receipt is durable proof that confirmation happened.
+    When a receipt exists but the pre-confirmation snapshot is absent or
+    corrupt, restoration authority is lost: rollback must not terminalize
+    and all evidence is retained for retry.  ``cli.remove_cli_root()`` is
+    fail-closed against current/supervisor-authoritative commits and is
+    always safe to call before the artifact check.
+
+    Args:
+        commit: The candidate commit whose CLI root to remove.
+        previous_commit: The previous commit whose CLI pointer to restore.
+
+    Returns:
+        A tuple ``(success, snapshot_restored)``.  ``success`` is ``True``
+        when CLI pointer and startup artifacts are fully restored.
+        ``snapshot_restored`` is ``True`` when a pre-confirmation snapshot
+        was successfully restored (caller must clean up snapshot + staging
+        after terminalization).  On failure both are ``False`` and all
+        evidence is retained for retry.
+    """
+    cli.remove_cli_root(commit)
+    if cli.reconcile_pointer(previous_commit):
+        append_deploy_log(f"supervised rollback restored commit {previous_commit}")
+    else:
+        append_deploy_log(
+            f"supervised rollback restored commit {previous_commit} "
+            "but could not restore the maintained CLI pointer"
+        )
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        append_deploy_log(
+            f"supervised rollback could not resolve bin home for startup artifact restoration: "
+            f"{exc}"
+        )
+        return False, False
+    receipt = _read_confirmation_receipt()
+    snapshot = _read_pre_confirmation_snapshot()
+    if snapshot is not None:
+        snapshot_restored = _restore_pre_confirmation_artifacts(bin_home)
+        if not snapshot_restored:
+            append_deploy_log("supervised rollback could not restore previous startup artifacts")
+            return False, False
+        return True, True
+    if receipt is not None:
+        append_deploy_log(
+            "supervised rollback found confirmation receipt but no pre-confirmation snapshot; "
+            "startup artifact restoration authority is lost"
+        )
+        return False, False
+    startup_contract.cleanup_staging(bin_home)
+    _remove_confirmation_receipt()
+    return True, False
+
+
+def _cleanup_rollback_evidence(*, snapshot_was_restored: bool) -> None:
+    """Remove staging, snapshot, and receipt evidence after successful terminalization.
+
+    Must be called only after the terminal ``rolled_back`` state has been
+    durably written.  A superseding desired generation that causes
+    terminalization to fail must **not** reach this function: all evidence
+    must be retained so retry can recover.
+
+    Args:
+        snapshot_was_restored: Whether
+            :func:`_restore_cli_and_startup_artifacts` successfully restored
+            a pre-confirmation snapshot.
+    """
+    if snapshot_was_restored:
+        try:
+            bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+        except (OSError, ValueError):
+            pass
+        else:
+            startup_contract.cleanup_staging(bin_home)
+        _remove_pre_confirmation_artifacts()
+    _remove_confirmation_receipt()
+
+
+def _restore_previous_locked(state: RollbackState) -> tuple[bool, bool]:
+    """Restore the previous exact checkout and worker after candidate death (legacy path).
+
+    This is the direct legacy rollback path used when no external supervisor
+    owns the worker lifecycle.  It force-restores the previous checkout,
+    directly restarts and publishes a previous worker, and then restores
+    the CLI pointer and startup artifacts.
+
+    Terminal state is never written here: callers are responsible for
+    terminalizing only after this function returns ``(True, ...)``,
+    ensuring that terminal ``rolled_back`` status implies verified
+    restoration of the previous startup authority.
+
+    Recovery evidence is never deleted by this function.  The caller must
+    invoke :func:`_cleanup_rollback_evidence` only after terminalization
+    succeeds.
 
     Args:
         state: Pending rollback mission.
 
     Returns:
-        ``True`` only when checkout, worker, metadata, and state are restored.
+        A tuple ``(success, snapshot_restored)``.  ``success`` is ``True``
+        when checkout, worker, metadata, CLI, and startup artifacts are
+        fully restored.
     """
     repo = Path(state.repo)
     if not _checkout(repo, state.previous_commit, state.git_timeout_seconds, force=True):
         append_deploy_log("supervised rollback could not restore previous checkout")
-        return False
+        return False, False
     restored = _restart_previous(state)
     if restored is None:
-        return False
+        return False, False
     write_meta(restored)
-    _write_state(
-        replace(
-            state,
-            status=STATUS_ROLLED_BACK,
-            previous_restart_meta=None,
-            previous_restart_released=False,
+    return _restore_cli_and_startup_artifacts(state.commit, state.previous_commit)
+
+
+def _rollback_locked_body(state: RollbackState, expected_generation: int) -> None:
+    """Verify rollback authority while the generation lock is held.
+
+    This performs the authority gate: the pending->rolled_back transition
+    may only proceed when the durable authority is sound.  Terminalization
+    is deferred until after startup-artifact restoration succeeds so that
+    terminal ``rolled_back`` status always implies verified restoration of
+    the previous startup authority.
+
+    Args:
+        state: Current rollback state.
+        expected_generation: Expected mission generation.
+
+    Raises:
+        DeployCtlError: On authority conflict or unreadable state.
+    """
+    try:
+        desired = read_desired_client()
+    except supervise.DesiredIntentError as exc:
+        msg = "cannot roll back while supervisor desired authority is unreadable"
+        raise DeployCtlError(msg) from exc
+    status = supervise.read_status()
+    if not _supervised_terminalization_authority_matches(
+        state.previous_commit, expected_generation, desired, status
+    ):
+        msg = (
+            "the supervisor readiness proof was superseded before rollback; "
+            "deployment remains pending"
         )
-    )
-    cli.remove_cli_root(state.commit)
-    if cli.reconcile_pointer(state.previous_commit):
-        append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
-    else:
-        append_deploy_log(
-            f"supervised rollback restored commit {state.previous_commit} "
-            "but could not restore the maintained CLI pointer"
-        )
-    return True
+        raise DeployCtlError(msg)
 
 
 def _finalize_supervised_rollback(state: RollbackState, expected_generation: int) -> RollbackState:
@@ -1740,6 +1996,22 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
     previous commit. The mission remains pending so the newer obligation can
     converge.
 
+    The supervised path relies on ``settle_desired()`` having already proved
+    the external supervisor converged a fresh previous-commit worker.  This
+    function does **not** call ``_restore_previous_locked()`` or
+    ``_restart_previous()``: it only performs the CLI-authority and
+    startup-artifact restoration needed before terminalization.  The
+    supervisor owns the worker lifecycle.
+
+    Startup artifacts are restored before terminalization: terminal
+    ``rolled_back`` status implies verified restoration of the previous
+    startup authority.  Failures remain recoverable and nonterminal with
+    staging and receipt evidence retained for retry.
+
+    The generation lock is re-acquired before writing terminal state to
+    prevent a newer desired generation that won during restoration from
+    being silently overwritten by a stale terminal rollback.
+
     Returns:
         The terminal rolled-back state.
 
@@ -1747,31 +2019,306 @@ def _finalize_supervised_rollback(state: RollbackState, expected_generation: int
         DeployCtlError: If the queue-readiness proof was superseded or cannot
             be bound to the current durable supervisor generation.
     """
-    with supervise.generation_lock():
-        try:
-            desired = supervise.read_desired_strict()
-        except supervise.DesiredIntentError as exc:
-            msg = "cannot roll back while supervisor desired authority is unreadable"
-            raise DeployCtlError(msg) from exc
-        status = supervise.read_status()
-        if not _supervised_terminalization_authority_matches(
-            state.previous_commit, expected_generation, desired, status
+    try:
+        with supervise.generation_lock():
+            _rollback_locked_body(state, expected_generation)
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock during supervised rollback"
+        raise DeployCtlError(msg) from exc
+    success, snapshot_restored = _restore_cli_and_startup_artifacts(
+        state.commit, state.previous_commit
+    )
+    if not success:
+        msg = "supervised rollback could not restore CLI authority or startup artifacts"
+        raise DeployCtlError(msg)
+    try:
+        with supervise.generation_lock():
+            _rollback_locked_body(state, expected_generation)
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock during supervised rollback terminalization"
+        raise DeployCtlError(msg) from exc
+    terminal = replace(state, status=STATUS_ROLLED_BACK)
+    _write_state(terminal)
+    _cleanup_rollback_evidence(snapshot_was_restored=snapshot_restored)
+    return terminal
+
+
+def _pre_confirmation_artifacts_path() -> Path:
+    """Return the durable path for the pre-confirmation startup-artifact snapshot.
+
+    Returns:
+        The snapshot path under the deploy state directory.
+    """
+    return state_root() / "deploy" / _PRE_CONFIRMATION_ARTIFACTS_NAME
+
+
+def _snapshot_pre_confirmation_artifacts(bin_home: Path) -> None:
+    """Durably preserve the current startup artifacts before confirmation mutates them.
+
+    The snapshot always records all three artifact keys: ``None`` for absent
+    artifacts, or a list of integers (0..255) for present artifacts.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+    """
+    raw = startup_contract.snapshot_startup_artifacts(bin_home)
+    snapshot = dict[str, object](raw.items())
+    write_json_durable(_pre_confirmation_artifacts_path(), snapshot)
+
+
+def _restore_pre_confirmation_artifacts(bin_home: Path) -> bool:
+    """Restore startup artifacts from the pre-confirmation snapshot during rollback.
+
+    Returns ``True`` only when every recorded artifact (including launcher
+    executable mode) was restored successfully.  If no snapshot exists or
+    any restore step fails, returns ``False`` so the caller retains the
+    snapshot for later recovery.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Returns:
+        ``True`` when all artifacts were restored; ``False`` otherwise.
+    """
+    snapshot = _read_pre_confirmation_snapshot()
+    if snapshot is None:
+        return False
+    try:
+        startup_contract.restore_startup_artifacts(snapshot, bin_home)
+        append_deploy_log("startup artifacts restored from pre-confirmation snapshot")
+    except (DurabilityError, OSError) as exc:
+        append_deploy_log(f"warning: could not restore pre-confirmation startup artifacts: {exc}")
+        return False
+    return _verify_restored_launcher_mode(
+        bin_home, had_launcher=snapshot.get("launcher") is not None
+    )
+
+
+_SNAPSHOT_KNOWN_KEYS: Final = frozenset({"contract", "definition", "launcher"})
+
+
+def _read_pre_confirmation_snapshot() -> dict[str, list[int] | None] | None:
+    """Read and decode the pre-confirmation snapshot.
+
+    Requires exactly the three known artifact keys (contract, definition,
+    launcher) with no missing or unknown keys.  Missing or extra keys are
+    treated as malformed so rollback never interprets them as absence.
+
+    Returns:
+        The decoded snapshot, or ``None`` on any failure.
+    """
+    path = _pre_confirmation_artifacts_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if set(decoded.keys()) != _SNAPSHOT_KNOWN_KEYS:
+        return None
+    snapshot: dict[str, list[int] | None] = {}
+    for key in _SNAPSHOT_KNOWN_KEYS:
+        value = decoded[key]
+        if value is None:
+            snapshot[key] = None
+        elif isinstance(value, list) and all(
+            isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _MAX_BYTE_VALUE
+            for v in value
         ):
-            msg = (
-                "the supervisor readiness proof was superseded before rollback; "
-                "deployment remains pending"
-            )
-            raise DeployCtlError(msg)
-        terminal = replace(state, status=STATUS_ROLLED_BACK)
-        _write_state(terminal)
-    cli.remove_cli_root(state.commit)
-    if cli.reconcile_pointer(state.previous_commit):
-        append_deploy_log(f"supervised rollback restored commit {state.previous_commit}")
-    else:
+            snapshot[key] = value
+        else:
+            return None
+    return snapshot
+
+
+def _verify_restored_launcher_mode(bin_home: Path, *, had_launcher: bool) -> bool:
+    """Check the restored launcher has the required executable mode.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+        had_launcher: Whether the snapshot contained launcher bytes.
+
+    Returns:
+        ``True`` when mode is correct or launcher was not in snapshot.
+    """
+    if not had_launcher:
+        return True
+    launcher = bin_home / startup_contract.STARTUP_LAUNCHER_NAME
+    try:
+        mode = launcher.stat().st_mode & 0o777
+    except OSError:
+        return False
+    if mode != startup_contract.STARTUP_LAUNCHER_MODE:
         append_deploy_log(
-            f"supervised rollback restored commit {state.previous_commit} "
-            "but could not restore the maintained CLI pointer"
+            f"warning: restored launcher has mode {oct(mode)}, "
+            f"expected {oct(startup_contract.STARTUP_LAUNCHER_MODE)}"
         )
+        return False
+    return True
+
+
+def _remove_pre_confirmation_artifacts() -> None:
+    """Remove the pre-confirmation startup-artifact snapshot after successful confirmation."""
+    path = _pre_confirmation_artifacts_path()
+    with suppress(DurabilityError, FileNotFoundError, OSError):
+        remove_durable(path)
+
+
+def _confirmation_receipt_path() -> Path:
+    """Return the durable path for the startup confirmation receipt."""
+    return state_root() / "deploy" / _CONFIRMATION_RECEIPT_NAME
+
+
+def _write_confirmation_receipt(commit: str, manifest: dict[str, object]) -> None:
+    """Durably record the content authority for promoted startup artifacts.
+
+    Stores the commit plus all hash/size fields from the successful staging
+    manifest so that repeat confirm can verify active artifacts against this
+    durable authority without re-reading the (now-deleted) staging manifest.
+
+    Args:
+        commit: The exact commit whose startup artifacts were promoted.
+        manifest: The staging manifest that was used for promotion.
+    """
+    receipt: dict[str, object] = {"commit": commit}
+    for key in (
+        "contract_hash",
+        "contract_size",
+        "definition_hash",
+        "definition_size",
+        "launcher_hash",
+        "launcher_size",
+    ):
+        receipt[key] = manifest.get(key)
+    write_json_durable(_confirmation_receipt_path(), receipt)
+
+
+def _read_confirmation_receipt() -> dict[str, object] | None:
+    """Read the durable confirmation receipt, treating corruption as absent.
+
+    Returns:
+        The receipt dict, or ``None`` if absent/corrupt.
+    """
+    path = _confirmation_receipt_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    commit = decoded.get("commit")
+    if not isinstance(commit, str):
+        return None
+    return decoded
+
+
+def _remove_confirmation_receipt() -> None:
+    """Remove the confirmation receipt during rollback."""
+    with suppress(DurabilityError, FileNotFoundError, OSError):
+        remove_durable(_confirmation_receipt_path())
+
+
+def _finalize_post_promotion(commit: str, manifest: dict[str, object], bin_home: Path) -> None:
+    """Write the durable content-authority receipt and clean up staging.
+
+    This must be called AFTER promotion succeeds and BEFORE returning
+    success to the caller.  The receipt write is durable so a crash after
+    this point leaves a recoverable state.  Staging cleanup happens only
+    after the receipt is durably written.
+
+    Args:
+        commit: The confirmed commit whose artifacts were promoted.
+        manifest: The staging manifest used for promotion.
+        bin_home: Directory containing the launcher scripts.
+
+    Raises:
+        DeployCtlError: If the receipt cannot be durably written.
+    """
+    try:
+        _write_confirmation_receipt(commit, manifest)
+    except (DurabilityError, OSError) as exc:
+        msg = "could not write startup confirmation receipt"
+        raise DeployCtlError(msg) from exc
+    startup_contract.cleanup_staging(bin_home)
+
+
+def _stage_candidate_startup_artifacts(commit: str) -> None:
+    """Run the candidate code's startup-contract staging to produce B's artifacts.
+
+    The candidate commit B's own ``lubko-deploy`` entry point is invoked
+    directly from B's sealed CLI environment so the staged bytes are generated
+    by B's loaded module, not by the current (A) runtime.  This preserves the
+    invariant that unconfirmed candidate artifacts never become startup
+    authority and that only B's code defines B's startup contract.
+
+    Args:
+        commit: Candidate commit hash whose CLI environment to use.
+
+    Raises:
+        DeployCtlError: If B's staging command fails.
+    """
+    cli_root = cli.cli_commit_dir(commit)
+    b_deploy_ctl = cli_root / ".venv" / "bin" / "lubko-deploy"
+    if not b_deploy_ctl.is_file():
+        msg = f"candidate CLI environment for {commit} is incomplete (lubko-deploy missing)"
+        raise DeployCtlError(msg)
+    try:
+        result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]
+            [str(b_deploy_ctl), "startup-contract", "--write-staged"],
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        msg = f"candidate startup-artifact staging timed out for {commit}"
+        raise DeployCtlError(msg) from exc
+    except OSError as exc:
+        msg = f"could not execute candidate startup-artifact staging: {exc}"
+        raise DeployCtlError(msg) from exc
+    if result.returncode != 0:
+        stderr = result.stderr.strip()[-HELPER_ERROR_MAX_CHARS:]
+        msg = f"candidate startup-artifact staging failed for {commit}: {stderr}"
+        raise DeployCtlError(msg)
+
+
+def _confirmation_locked_body(state: RollbackState, expected_generation: int) -> RollbackState:
+    """Perform the confirmation while the generation lock is held.
+
+    Args:
+        state: Current rollback state.
+        expected_generation: Expected mission generation.
+
+    Returns:
+        The terminal confirmed state.
+
+    Raises:
+        DeployCtlError: On authority conflict or unreadable state.
+    """
+    try:
+        desired = read_desired_client()
+    except supervise.DesiredIntentError as exc:
+        msg = "cannot confirm while supervisor desired authority is unreadable"
+        raise DeployCtlError(msg) from exc
+    status = supervise.read_status()
+    if not _supervised_terminalization_authority_matches(
+        state.commit, expected_generation, desired, status
+    ):
+        msg = (
+            "the supervisor readiness proof was superseded before confirmation; "
+            "deployment remains pending"
+        )
+        raise DeployCtlError(msg)
+    terminal = replace(state, status=STATUS_CONFIRMED)
+    _write_state(terminal)
     return terminal
 
 
@@ -1792,23 +2339,12 @@ def _finalize_supervised_confirmation(
         DeployCtlError: If the queue-readiness proof was superseded or cannot
             be bound to the current durable supervisor generation.
     """
-    with supervise.generation_lock():
-        try:
-            desired = supervise.read_desired_strict()
-        except supervise.DesiredIntentError as exc:
-            msg = "cannot confirm while supervisor desired authority is unreadable"
-            raise DeployCtlError(msg) from exc
-        status = supervise.read_status()
-        if not _supervised_terminalization_authority_matches(
-            state.commit, expected_generation, desired, status
-        ):
-            msg = (
-                "the supervisor readiness proof was superseded before confirmation; "
-                "deployment remains pending"
-            )
-            raise DeployCtlError(msg)
-        terminal = replace(state, status=STATUS_CONFIRMED)
-        _write_state(terminal)
+    try:
+        with supervise.generation_lock():
+            terminal = _confirmation_locked_body(state, expected_generation)
+    except GenerationLockTimeoutError as exc:
+        msg = "timed out waiting for the generation lock during supervised confirmation"
+        raise DeployCtlError(msg) from exc
     try:
         cli.set_current(state.commit)
     except cli.CliError as exc:
@@ -1822,12 +2358,25 @@ def _rollback_legacy_locked(state: RollbackState) -> bool:
     """Roll back one explicitly legacy-owned pending mission.
 
     Returns:
-        ``True`` only when the legacy candidate is retired and the previous
-        checkout/worker are restored.
+        ``True`` only when the legacy candidate is retired, the previous
+        checkout/worker are restored, startup artifacts are verified, and
+        evidence is cleaned up after terminalization.
     """
     if not _retire_candidate_locked(state):
         return False
-    return _restore_previous_locked(state)
+    success, snapshot_restored = _restore_previous_locked(state)
+    if not success:
+        return False
+    _write_state(
+        replace(
+            state,
+            status=STATUS_ROLLED_BACK,
+            previous_restart_meta=None,
+            previous_restart_released=False,
+        )
+    )
+    _cleanup_rollback_evidence(snapshot_was_restored=snapshot_restored)
+    return True
 
 
 def _rollback_locked(state: RollbackState) -> bool:
@@ -2120,6 +2669,23 @@ def _mission_authority_facts(
     )
 
 
+def _provenance_fetch(options: Options, commit: str) -> None:
+    """Fetch the exact commit from the declared source authority when set.
+
+    When ``source_url`` is ``None``, this is a no-op: the commit is assumed
+    to already be present from prior provenance-preserving operations. When
+    set, the commit is fetched from the declared authority and then verified
+    present locally.
+
+    Args:
+        options: Deployment options.
+        commit: Exact candidate commit.
+    """
+    if options.source_url is not None:
+        fetch_from_authority(options.repo, commit, options.source_url, options.git_timeout_seconds)
+        _require_exact_commit(options.repo, commit, options.git_timeout_seconds)
+
+
 def _prepare_locked(
     options: Options,
     commit: str,
@@ -2161,6 +2727,7 @@ def _prepare_locked(
     if commit == previous_commit:
         msg = "candidate commit is already the maintained worker commit"
         raise DeployCtlError(msg)
+    _provenance_fetch(options, commit)
     _require_clean_checkout(options.repo, options.git_timeout_seconds)
     if not _checkout(options.repo, commit, options.git_timeout_seconds, force=False):
         msg = f"could not check out candidate commit {commit}"
@@ -2493,7 +3060,7 @@ def _cli_target_commit(state: RollbackState | None) -> str | None:
         The exact commit the CLI pointer should select, or ``None``.
     """
     try:
-        desired = supervise.read_desired_strict()
+        desired = read_desired_client()
     except supervise.DesiredIntentError:
         # A present-but-malformed authoritative intent is observable
         # corruption: fail closed instead of falling back to other authority
@@ -2699,18 +3266,237 @@ def _finalize_confirmation(
     return terminal
 
 
+def _pre_terminalize(state: RollbackState, options: Options) -> int | None:
+    """Execute pre-terminalization steps and return the settled generation.
+
+    Authorizes the confirmation, prepares the candidate, stages B's startup
+    artifacts, and writes the staging manifest.
+
+    Args:
+        state: Pending mission.
+        options: Deployment options.
+
+    Returns:
+        The settled supervisor generation for ``_finalize_confirmation``,
+        or ``None`` for legacy ownership.
+
+    Raises:
+        DeployCtlError: If any pre-terminalization step fails.
+    """
+    _authorize_confirmation(state)
+    expected_generation = _prepare_confirmation_candidate(state, options)
+    _stage_candidate_startup_artifacts(state.commit)
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        msg = f"cannot confirm: startup artifact manifest write failed: {exc}"
+        raise DeployCtlError(msg) from exc
+    startup_contract.write_staging_manifest(state.commit, bin_home)
+    return expected_generation
+
+
+def _resolve_bin_home_or_fail() -> Path:
+    """Resolve the bin home path.
+
+    Returns:
+        The resolved bin home path.
+
+    Raises:
+        DeployCtlError: If the path cannot be resolved.
+    """
+    try:
+        return lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        msg = f"cannot confirm: startup artifact snapshot failed: {exc}"
+        raise DeployCtlError(msg) from exc
+
+
+def _write_snapshot_or_fail(bin_home: Path) -> None:
+    """Write the pre-confirmation snapshot.
+
+    Converts both :class:`DurabilityError` (from durable write) and
+    :class:`OSError` (from reading existing artifacts) into a clear
+    :class:`DeployCtlError` so confirmation fails before terminalization.
+
+    Args:
+        bin_home: Directory containing the launcher scripts.
+
+    Raises:
+        DeployCtlError: If the snapshot cannot be recorded.
+    """
+    try:
+        _snapshot_pre_confirmation_artifacts(bin_home)
+    except (DurabilityError, OSError) as exc:
+        msg = "cannot confirm: pre-confirmation startup artifact snapshot could not be recorded"
+        raise DeployCtlError(msg) from exc
+
+
+def _durable_mission_matches(state: RollbackState) -> bool:
+    """Check if the durable mission state confirms the same commit.
+
+    Used after a post-terminalization exception to decide whether the durable
+    terminal write happened despite the exception.  Only STATUS_CONFIRMED
+    with the same commit and compatible ownership is checked — the generation
+    is deliberately ignored because ``_finalize_supervised_confirmation``
+    may write a *different* generation when a newer desired generation
+    supersedes the mission before the terminal lock is acquired.  In that
+    case the confirmed deployment is still valid and recovery data must be
+    retained.
+
+    Returns:
+        ``True`` when the durable state is STATUS_CONFIRMED with the same
+        commit and compatible ownership as ``state``.
+    """
+    try:
+        durable = read_rollback_state()
+    except DeployCtlError:
+        return False
+    return (
+        durable is not None
+        and durable.status == STATUS_CONFIRMED
+        and durable.commit == state.commit
+        and durable.supervisor_owned == state.supervisor_owned
+    )
+
+
 def _confirm_locked(request: dict[str, object], options: Options) -> dict[str, object]:
     """Confirm one exact pending deployment as a single idempotent primitive.
+
+    Candidate startup artifacts are staged *before* the terminal state write
+    by invoking the candidate code's own staging command.  This ensures B's
+    startup artifacts are generated by B's loaded module, never by the
+    old (A) runtime.  A durable manifest binds the staged bytes to the exact
+    commit with content hashes.  Activation happens *after* the terminal
+    state write so that unconfirmed candidates never become startup authority.
+
+    A synchronous promotion failure after terminalization surfaces as
+    non-success to the caller: the durable confirmed state and staged
+    recovery data are preserved, but the response is ``ok: false`` until
+    promotion succeeds.  The ``STATUS_CONFIRMED`` fast path retries
+    idempotent promotion and fails closed if artifacts still don't match.
+
+    Exception discipline: after any exception, the durable mission state is
+    re-read to decide whether terminalization may have happened.  If the
+    durable state is still pending, staging + snapshot are cleaned up (B was
+    never confirmed).  If the durable state is terminal (STATUS_CONFIRMED),
+    staging + snapshot are retained for supervisor or retry promotion — the
+    durable terminal write precedes all potentially-raising post-write work
+    (CLI activation, GC, logging) so a crash/exception after that write must
+    not discard recovery data.
 
     Returns:
         Protocol response for the confirmed deployment.
     """
     state = _confirmation_state(request)
     if state.status == STATUS_CONFIRMED:
-        return _confirmation_response(state)
-    _authorize_confirmation(state)
-    expected_generation = _prepare_confirmation_candidate(state, options)
-    state = _finalize_confirmation(state, expected_generation)
+        return _confirmed_idempotent_response(state)
+    bin_home = _resolve_bin_home_or_fail()
+    _write_snapshot_or_fail(bin_home)
+    terminalized = False
+    try:
+        expected_generation = _pre_terminalize(state, options)
+        state = _finalize_confirmation(state, expected_generation)
+        terminalized = True
+    except BaseException:
+        if not terminalized and _durable_mission_matches(state):
+            terminalized = True
+        if not terminalized:
+            startup_contract.cleanup_staging(bin_home)
+            _remove_pre_confirmation_artifacts()
+        raise
+    # Read manifest before promotion (promotion retains it for crash safety).
+    manifest = startup_contract.read_staging_manifest()
+    promotion_error = startup_contract.promote_staged_artifacts(
+        state.commit, state.commit, bin_home
+    )
+    if promotion_error is not None:
+        msg = f"startup artifact promotion failed: {promotion_error}"
+        append_deploy_log(msg)
+        return {"type": "confirm", "ok": False, "commit": state.commit, "error": msg}
+    # Finalize: write receipt then clean staging.
+    if manifest is not None:
+        try:
+            _finalize_post_promotion(state.commit, manifest, bin_home)
+        except DeployCtlError as exc:
+            msg = f"startup artifact confirmation receipt could not be written: {exc}"
+            append_deploy_log(msg)
+            return {"type": "confirm", "ok": False, "commit": state.commit, "error": msg}
+    _remove_pre_confirmation_artifacts()
+    return _confirmation_response(state)
+
+
+def _confirmed_idempotent_response(state: RollbackState) -> dict[str, object]:
+    """Handle the STATUS_CONFIRMED fast path with idempotent promotion.
+
+    When confirmation is retried for an already-terminal mission, the
+    startup artifacts may still be stale from a prior crash between
+    terminalization and promotion.  This function retries idempotent
+    promotion using the retained manifest and staged bytes.
+
+    A durable confirmation receipt records the content authority (commit
+    plus hashes/sizes) after successful promotion.  On repeat confirm,
+    the receipt is checked first and active artifacts are verified against
+    it.  If active bytes have drifted or the receipt is corrupt/wrong-commit,
+    a retained valid staging manifest can repair them.
+
+    Fails closed if bin_home cannot be resolved: returning success without
+    verifying artifacts would be a false positive.
+
+    Args:
+        state: Terminal confirmed mission state.
+
+    Returns:
+        Protocol response — success only when artifacts match.
+    """
+    try:
+        bin_home = lifecycle._resolve_bin_home()  # ruff: ignore[private-member-access]
+    except (OSError, ValueError) as exc:
+        return {
+            "type": "confirm",
+            "ok": False,
+            "commit": state.commit,
+            "error": f"startup artifact promotion incomplete: cannot resolve bin home: {exc}",
+        }
+    # Check durable receipt: verify active artifacts against content authority.
+    receipt = _read_confirmation_receipt()
+    if receipt is not None and receipt.get("commit") == state.commit:
+        error = startup_contract.verify_active_artifacts_match(receipt, bin_home)
+        if error is None:
+            return _confirmation_response(state)
+        # Active artifacts drifted despite receipt — try repair via manifest.
+    # No receipt, wrong-commit receipt, or drift — attempt promotion.
+    # Read manifest before promotion (promotion retains it for crash safety).
+    manifest = startup_contract.read_staging_manifest()
+    promotion_error = startup_contract.promote_staged_artifacts(
+        state.commit, state.commit, bin_home
+    )
+    if promotion_error is not None:
+        return {
+            "type": "confirm",
+            "ok": False,
+            "commit": state.commit,
+            "error": f"startup artifact promotion incomplete: {promotion_error}",
+        }
+    # Promotion succeeded — finalize: write receipt then clean staging.
+    if manifest is not None:
+        verify_error = startup_contract.verify_active_artifacts_match(manifest, bin_home)
+        if verify_error is not None:
+            return {
+                "type": "confirm",
+                "ok": False,
+                "commit": state.commit,
+                "error": f"startup artifact verification failed after promotion: {verify_error}",
+            }
+        try:
+            _finalize_post_promotion(state.commit, manifest, bin_home)
+        except DeployCtlError as exc:
+            return {
+                "type": "confirm",
+                "ok": False,
+                "commit": state.commit,
+                "error": f"startup artifact confirmation receipt could not be written: {exc}",
+            }
+    _remove_pre_confirmation_artifacts()
     return _confirmation_response(state)
 
 
@@ -2809,9 +3595,12 @@ def _dispatch(options: Options, request: dict[str, object]) -> dict[str, object]
         Protocol response.
 
     Raises:
-        DeployCtlError: For unknown request types.
+        DeployCtlError: For unknown request types or invalid option combinations.
     """
     request_type = request.get("type")
+    if options.source_url is not None and request_type != "checkout":
+        msg = "--source-url is only supported for checkout requests"
+        raise DeployCtlError(msg)
     if request_type == "checkout":
         return _handle_checkout(options, request)
     if request_type == "confirm":
@@ -2883,6 +3672,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--git-timeout", type=float, default=DEFAULT_GIT_TIMEOUT_SECONDS)
     parser.add_argument("--cli-timeout", type=float, default=DEFAULT_CLI_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--source-url",
+        default=None,
+        help="authoritative Git remote URL for provenance-checked checkout",
+    )
     return parser
 
 
@@ -2964,6 +3758,7 @@ def _build_options(args: argparse.Namespace) -> Options:
         validation_timeout_seconds=args.validation_timeout,
         git_timeout_seconds=args.git_timeout,
         cli_timeout_seconds=args.cli_timeout,
+        source_url=getattr(args, "source_url", None),
     )
     if options.confirm_window_seconds <= 0:
         msg = "confirmation window must be positive"

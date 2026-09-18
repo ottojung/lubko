@@ -23,3 +23,16 @@ def test_tmp_path_supports_test_executables_outside_system_tmp(tmp_path: Path) -
 
     completed = subprocess.run([str(probe)], capture_output=True, text=True, check=True)
     assert completed.stdout == "executable-temp-ok"
+
+
+def test_tmp_path_is_direct_child_of_session_root(tmp_path: Path) -> None:
+    """Each test gets a unique subdirectory directly under the session root."""
+    parent = tmp_path.parent
+    assert parent.exists()
+    assert parent.is_dir()
+    assert tmp_path.name.startswith("test-")
+
+
+def test_tmp_path_names_are_sequential(tmp_path: Path) -> None:
+    """The directory name encodes a monotonic counter for uniqueness."""
+    assert tmp_path.name.removeprefix("test-").isdigit()

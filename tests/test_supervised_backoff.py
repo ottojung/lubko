@@ -21,11 +21,13 @@ import lubko.cli
 import lubko.deployctl
 import lubko.lifecycle
 import lubko.supervise
+import lubko.supervise_client
 
 cli = lubko.cli
 dc = lubko.deployctl
 lifecycle = lubko.lifecycle
 supervise = lubko.supervise
+supervise_client = lubko.supervise_client
 
 OLD_COMMIT = "1" * 40
 NEW_COMMIT = "2" * 40
@@ -249,6 +251,7 @@ def status_env(mission: dc.RollbackState, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(dc, "_reconcile_cli", lambda _state: None)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_status_survives_restart_backoff(
     mission: dc.RollbackState,
     live_supervisor: list[supervise.SupervisorState],
@@ -267,6 +270,7 @@ def test_status_survives_restart_backoff(
     assert current.status == dc.STATUS_PENDING
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_expired_deadline_rolls_back_despite_matching_authority(
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
@@ -299,6 +303,7 @@ def _live_candidate() -> supervise.WorkerChild:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_expired_deadline_rolls_back_live_but_not_ready_candidate(
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
@@ -334,6 +339,7 @@ def test_expired_deadline_rolls_back_live_but_not_ready_candidate(
     assert settlement == {OLD_COMMIT: 1}
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_expired_deadline_rolls_back_compatible_newer_live_but_not_ready_candidate(
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
@@ -378,6 +384,7 @@ def test_expired_deadline_rolls_back_compatible_newer_live_but_not_ready_candida
     assert settlement == {OLD_COMMIT: 1}
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_future_deadline_keeps_live_but_not_ready_candidate_pending(
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
@@ -407,6 +414,7 @@ def test_future_deadline_keeps_live_but_not_ready_candidate_pending(
     assert settlement == {}
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_expired_deadline_keeps_queue_ready_live_candidate_pending(
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
@@ -429,6 +437,7 @@ def test_expired_deadline_keeps_queue_ready_live_candidate_pending(
     assert settlement == {}
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_superseded_authority_fails_closed_before_deadline(
     mission: dc.RollbackState,
     live_supervisor: list[supervise.SupervisorState],
@@ -453,6 +462,7 @@ def test_superseded_authority_fails_closed_before_deadline(
     assert settlement == {OLD_COMMIT: 1}
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_newer_generation_same_commit_authority_fails_closed(
     mission: dc.RollbackState,
     live_supervisor: list[supervise.SupervisorState],
@@ -477,6 +487,7 @@ def test_newer_generation_same_commit_authority_fails_closed(
     assert settlement == {OLD_COMMIT: 1}
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_newer_generation_same_commit_compatible_authority_stays_pending(
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
@@ -513,6 +524,7 @@ def test_newer_generation_same_commit_compatible_authority_stays_pending(
     assert current.status == dc.STATUS_PENDING
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_newer_generation_same_commit_restart_backoff_stays_pending(
     live_supervisor: list[supervise.SupervisorState],
     settlement: dict[str, int],
@@ -549,6 +561,7 @@ def test_newer_generation_same_commit_restart_backoff_stays_pending(
     assert current.status == dc.STATUS_PENDING
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_wait_until_ready_polls_through_transient_child_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -574,6 +587,7 @@ def test_wait_until_ready_polls_through_transient_child_none(
     assert observations == []
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_wait_until_ready_rejects_superseding_different_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -587,9 +601,8 @@ def test_wait_until_ready_rejects_superseding_different_commit(
     assert supervise.wait_until_ready(GENERATION, timeout_seconds=10.0, commit=NEW_COMMIT) is False
 
 
-def test_wait_until_ready_accepts_newer_same_commit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_wait_until_ready_accepts_newer_same_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     """A newer generation remains valid when it proves the same exact commit ready."""
     observation = replace(
         _supervisor_status(child=None, ready=True),
@@ -600,9 +613,8 @@ def test_wait_until_ready_accepts_newer_same_commit(
     assert supervise.wait_until_ready(GENERATION, timeout_seconds=10.0, commit=NEW_COMMIT) is True
 
 
-def test_wait_until_ready_times_out_without_readiness(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_wait_until_ready_times_out_without_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
     """A never-ready candidate bounds the wait by its timeout."""
     ticks = iter(range(100))
     monkeypatch.setattr(

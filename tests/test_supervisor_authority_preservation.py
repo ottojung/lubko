@@ -39,7 +39,7 @@ TOKEN = "c" * 32
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:  # ruff: ignore[unused-function-argument]
     """Use an isolated durable state root for each test.
 
     Returns:
@@ -142,6 +142,7 @@ def _arm_authority_race(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(supervisor, "read_state", racing_read_state)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_crash_handling_never_erases_concurrently_established_recovery_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -176,6 +177,7 @@ def test_crash_handling_never_erases_concurrently_established_recovery_authority
     assert final.next_attempt_at is not None, "crash backoff was still scheduled"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_publication_is_serialized_against_a_held_consumer_boundary() -> None:
     """An authority-preserving publication waits for the shared boundary.
 
@@ -196,6 +198,7 @@ def test_publication_is_serialized_against_a_held_consumer_boundary() -> None:
     assert read_state() == state, "the contended publication wrote anyway"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_no_authority_write_fits_between_fresh_read_and_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -240,6 +243,7 @@ def test_no_authority_write_fits_between_fresh_read_and_publication(
     assert final.child is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_live_recovery_obligation_blocks_a_later_supervisor_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -263,6 +267,7 @@ def test_live_recovery_obligation_blocks_a_later_supervisor_spawn(
     assert daemon._message is not None, "the supervisor held instead of spawning"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_ordinary_crash_handling_without_concurrency_still_converges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -284,6 +289,7 @@ def test_ordinary_crash_handling_without_concurrency_still_converges(
     assert recovered == [TOKEN]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_not_ready_probe_bookkeeping_preserves_newer_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -312,6 +318,7 @@ def test_not_ready_probe_bookkeeping_preserves_newer_authority(
     assert final.next_readiness_at is not None, "the readiness retry was still scheduled"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_child_clearing_outside_the_lock_keeps_newer_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -327,6 +334,7 @@ def test_child_clearing_outside_the_lock_keeps_newer_authority(
     assert final.spawning == _obligation(), "the child-clearing write erased authority"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_normalize_cross_boot_state_defers_instead_of_clobbering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -348,6 +356,7 @@ def test_normalize_cross_boot_state_defers_instead_of_clobbering(
     assert final.spawning is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_malformed_hold_materialization_keeps_newer_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -364,6 +373,7 @@ def test_malformed_hold_materialization_keeps_newer_authority(
     assert final.spawning == _obligation(), "the materialization erased authority"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
     """Structural audit: direct state writes stay confined to locked scopes.
 
@@ -433,6 +443,7 @@ def _exit_handle(daemon: supervisor.SupervisorDaemon) -> object:
     return daemon.proc
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_deferred_desired_publication_spawns_and_applies_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -462,9 +473,8 @@ def test_deferred_desired_publication_spawns_and_applies_nothing(
     )
 
 
-def test_deferred_readiness_publication_reports_no_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_deferred_readiness_publication_reports_no_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """Readiness success is only reported once ``ready=True`` is durable."""
     _dead_child_state()
     daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
@@ -492,9 +502,8 @@ def test_deferred_readiness_publication_reports_no_success(
     assert len(deploy_log) == 1
 
 
-def test_deferred_backoff_reset_reports_no_stability(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_deferred_backoff_reset_reports_no_stability(monkeypatch: pytest.MonkeyPatch) -> None:
     """Backoff stability is only reported once the reset is durable."""
     state = replace(
         _dead_child_state(),
@@ -518,6 +527,7 @@ def test_deferred_backoff_reset_reports_no_stability(
     assert final.next_attempt_at is None
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_deferred_crash_record_keeps_the_exit_handle_and_silence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -544,6 +554,7 @@ def test_deferred_crash_record_keeps_the_exit_handle_and_silence(
     assert len(deploy_log) == 1
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_deferred_out_of_lock_retirement_is_not_reported_converged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

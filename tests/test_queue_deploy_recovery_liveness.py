@@ -41,6 +41,7 @@ def _desired(commit: str, generation: int) -> SimpleNamespace:
     return SimpleNamespace(commit=commit, generation=generation)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -74,6 +75,7 @@ def test_restore_after_handoff_failure_rejects_stale_ready_dead_child(
     assert requested == [previous_commit]
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_restore_after_handoff_failure_accepts_live_ready_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -91,7 +93,7 @@ def test_restore_after_handoff_failure_accepts_live_ready_child(
     monkeypatch.setattr(supervise, "generation_lock", nullcontext)
     monkeypatch.setattr(supervise, "child_alive", lambda child: child is status.child)
     monkeypatch.setattr(cli, "current_commit", lambda: candidate)
-    monkeypatch.setattr(supervise, "request_run", fail_restore)
+    monkeypatch.setattr(lifecycle, "request_run_client", fail_restore)
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
 
     lifecycle._restore_after_handoff_failure(_options(), candidate, previous)
@@ -175,6 +177,7 @@ class _CandidateCase:
         "cli-mismatch",
     ],
 )
+@pytest.mark.usefixtures("supervisor_token")
 def test_candidate_convergence_requires_current_compatible_authority(
     monkeypatch: pytest.MonkeyPatch, case: _CandidateCase
 ) -> None:
@@ -195,6 +198,7 @@ def test_candidate_convergence_requires_current_compatible_authority(
     assert lifecycle._queue_deploy_candidate_converged(candidate) is case.expected
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_candidate_convergence_holds_generation_lock_through_cli_decision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -368,9 +372,9 @@ class _RestoreCase:
         "holding",
     ],
 )
+@pytest.mark.usefixtures("supervisor_token")
 def test_restoration_requires_current_live_queue_ready_authority(
-    monkeypatch: pytest.MonkeyPatch,
-    case: _RestoreCase,
+    monkeypatch: pytest.MonkeyPatch, case: _RestoreCase
 ) -> None:
     """Only compatible live queue-ready restore authority may reconcile the CLI."""
     candidate = "a" * 40
@@ -420,6 +424,7 @@ def test_restoration_requires_current_live_queue_ready_authority(
     assert reconciled == ([previous_commit] if case.expected else [])
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_restore_holds_generation_lock_through_cli_reconciliation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

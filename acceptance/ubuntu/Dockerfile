@@ -26,5 +26,10 @@ RUN uv run lubko-install --repo /src/lubko
 
 RUN uv sync --frozen --extra dev
 
+# Re-run lubko-install after the dev sync so the startup contract is always
+# written with the current code's CONTRACT_SCHEMA_VERSION, regardless of
+# whether uv sync re-installed a cached lubko package layer.
+RUN uv run lubko-install --repo /src/lubko
+
 COPY acceptance/ubuntu/acceptance.sh /usr/local/bin/acceptance.sh
 RUN chmod +x /usr/local/bin/acceptance.sh

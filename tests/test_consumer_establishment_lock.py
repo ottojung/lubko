@@ -31,7 +31,7 @@ class FakeSpawnedProc:
 
 
 @pytest.fixture(autouse=True)
-def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, supervisor_token: str) -> Path:  # ruff: ignore[unused-function-argument]
     """Use an isolated durable state root for each test.
 
     Returns:
@@ -102,6 +102,7 @@ def _patch_happy_recovery(
     monkeypatch.setattr(lifecycle, "_settle_spawned_recovery_worker", fake_settle)
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_stale_preflight_never_spawns_beside_a_concurrent_supervisor_decision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -159,6 +160,7 @@ def test_stale_preflight_never_spawns_beside_a_concurrent_supervisor_decision(
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_established_recovery_obligation_blocks_a_later_supervisor_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -214,9 +216,8 @@ def test_established_recovery_obligation_blocks_a_later_supervisor_spawn(
     assert events.count("recovery_spawn") == 1
 
 
-def test_recovery_fails_closed_while_the_boundary_is_busy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+@pytest.mark.usefixtures("supervisor_token")
+def test_recovery_fails_closed_while_the_boundary_is_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Recovery cannot even start its preflight beside an active decision."""
     events: list[str] = []
     _patch_happy_recovery(monkeypatch, events)

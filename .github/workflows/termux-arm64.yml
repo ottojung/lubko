@@ -16,6 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build acceptance image
-        run: docker build -f acceptance/termux/Dockerfile -t lubko-acceptance-termux .
+        run: docker build --no-cache -f acceptance/termux/Dockerfile -t lubko-acceptance-termux .
       - name: Run acceptance
         run: docker run --rm --security-opt seccomp=unconfined lubko-acceptance-termux

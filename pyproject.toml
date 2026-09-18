@@ -84,9 +84,13 @@ convention = "google"
 ]
 "src/lubko/supervisor.py" = [
     "blind-except",
+    "complex-structure",
     "raise-vanilla-args",
+    "start-process-with-no-shell",
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
+    "too-many-return-statements",
+    "too-many-statements-in-try-clause",
 ]
 "src/lubko/cli.py" = [
     "start-process-with-partial-path",
@@ -97,17 +101,22 @@ convention = "google"
     "subprocess-without-shell-equals-true",
     "suspicious-subprocess-import",
 ]
-"scripts/check_test_budget.py" = [
-    # This script intentionally invokes `uv run pytest` as an unshelled subprocess
-    # to measure its real wall-clock duration.  shell=True would change process-group
-    # semantics and break the measurement.
-    "subprocess-without-shell-equals-true",
-    "suspicious-subprocess-import",
+"tests/test_supervisor_lock_adoption.py" = [
+    # lock_dir is a pytest fixture whose setup side-effect is required but
+    # never referenced directly; mock class methods match patterns established
+    # across the suite.
+    "boolean-positional-value-in-call",
+    "docstring-missing-returns",
+    "import-outside-top-level",
+    "no-self-use",
+    "unused-function-argument",
+    "unused-method-argument",
 ]
 "tests/**/*.py" = [
     # Tests assert invariants of the worker's internal state machine (outage
     # convergence, deadline derivation), which are deliberately not public API.
     "assert",
+    "import-private-name",
     "magic-value-comparison",
     "private-member-access",
     "subprocess-without-shell-equals-true",

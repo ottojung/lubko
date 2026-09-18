@@ -76,6 +76,7 @@ def live_old_worker() -> None:
     )
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_failed_retirement_holds_authority_and_spawns_nothing(
     daemon: tuple[SupervisorDaemon, list[str]],
     monkeypatch: pytest.MonkeyPatch,
@@ -97,6 +98,7 @@ def test_failed_retirement_holds_authority_and_spawns_nothing(
     assert state.next_attempt_at is not None, "a retry hold was recorded"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_retry_after_transient_retirement_failure_applies_normally(
     daemon: tuple[SupervisorDaemon, list[str]],
     monkeypatch: pytest.MonkeyPatch,
@@ -118,6 +120,7 @@ def test_retry_after_transient_retirement_failure_applies_normally(
     assert state.next_attempt_at is None, "the transient hold cleared"
 
 
+@pytest.mark.usefixtures("supervisor_token")
 def test_same_commit_non_restart_settlement_keeps_live_worker(
     daemon: tuple[SupervisorDaemon, list[str]],
     monkeypatch: pytest.MonkeyPatch,
