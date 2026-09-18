@@ -6531,7 +6531,7 @@ class Supervisor:
                 # the gate release: exec keeps the identity, and /proc is never
                 # re-read after release. The member ledger is seeded with the
                 # persisted leader identity itself.
-                return ActiveJob(
+                job = ActiveJob(
                     id=job_id,
                     cwd=job_spec.cwd,
                     process=job_spec.process,
@@ -6544,6 +6544,15 @@ class Supervisor:
                     start_ticks=start_ticks,
                     owned_members={gated.proc.pid: start_ticks},
                 )
+                job.stdout = OutputStream(
+                    path=gated.stdout_path,
+                    fd=gated.stdout_read_fd,
+                )
+                job.stderr = OutputStream(
+                    path=gated.stderr_path,
+                    fd=gated.stderr_read_fd,
+                )
+                return job
             self._abort_and_converge(gated, job_id)
             LOGGER.error(
                 "failed to release the start gate for job %s (pid %d); "
