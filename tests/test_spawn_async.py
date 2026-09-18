@@ -19,6 +19,8 @@ from uuid import uuid4
 from lubko.config import DatabaseConfig
 from lubko.worker import (
     ActiveJob,
+    GatedSpawn,
+    Job,
     OutputStream,
     Settings,
     Supervisor,
@@ -358,6 +360,48 @@ def test_cleanup_pending_starts_does_not_join_blocked_threads(
     assert elapsed < 0.5, f"_cleanup_pending_starts took {elapsed:.2f}s (must not join)"
     assert len(finalized) == 1, "the pending start was finalized"
     assert len(supervisor._pending_starts) == 0
+
+
+def test_activate_gated_job_initializes_capture_streams(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A successfully activated gated job immediately owns both capture streams."""
+    supervisor = _supervisor()
+    conn = cast("JobsConnection", supervisor.conn)
+    job_id = uuid4()
+    proc = MagicMock()
+    proc.pid = 12345
+    stdout_path = tmp_path / "stdout"
+    stderr_path = tmp_path / "stderr"
+    gated = GatedSpawn(
+        proc=proc,
+        pgid=12345,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        gate_fd=99,
+        stdout_read_fd=100,
+        stderr_read_fd=101,
+    )
+    spec = Job(id=job_id, cwd=_ANON_DIR, process=("/bin/true",))
+
+    monkeypatch.setattr(supervisor, "_pre_release_failure", lambda *_args: (None, 456))
+    monkeypatch.setattr("lubko.worker.release_gate", lambda _fd: True)
+
+    job = supervisor._activate_gated_job(
+        conn,
+        job_id,
+        spec,
+        gated,
+        claim_mono=time.monotonic(),
+        version=1,
+    )
+
+    assert job is not None
+    assert job.stdout.path == stdout_path
+    assert job.stdout.fd == 100
+    assert job.stderr.path == stderr_path
+    assert job.stderr.fd == 101
 
 
 def test_poll_pending_starts_activates_completed_attempt(
