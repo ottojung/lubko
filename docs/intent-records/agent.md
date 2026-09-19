@@ -1,10 +1,10 @@
 $id-9448585901481383
-title: lubko-agent uses paid OpenCode Go MiMo-V2.5
-date: 2026/09/08
+title: lubko-agent uses paid OpenCode Go DeepSeek V4.1 Flash
+date: 2026/09/19
 source: @ottojung
 kind: constraint
 
-`lubko-agent` must use MiMo-V2.5 through the paid OpenCode Go provider, identified in OpenCode as `opencode-go/mimo-v2.5`. Free model variants, including model identifiers ending in `-free`, must never be used as the configured `lubko-agent` model or as a fallback.
+`lubko-agent` must use DeepSeek V4.1 Flash through the paid OpenCode Go provider, identified in OpenCode as `opencode-go/deepseek-v4.1-flash`. Free model variants, including model identifiers ending in `-free`, must never be used as the configured `lubko-agent` model or as a fallback.
 
 $id-8612645784701677
 title: Agent IDs are case-insensitive and use --id uniformly
