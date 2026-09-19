@@ -63,7 +63,7 @@ class _BackendFailureRule:
 
 
 # Implementation details (hidden from the user-facing interface).
-AGENT_MODEL: Final = "opencode-go/mimo-v2.5"
+AGENT_MODEL: Final = "opencode-go/deepseek-v4.1-flash"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
