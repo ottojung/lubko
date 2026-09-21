@@ -1,10 +1,10 @@
 $id-9448585901481383
-title: lubko-agent uses paid OpenCode Go DeepSeek V4.1 Flash
-date: 2026/09/19
+title: lubko-agent uses paid OpenCode Go Muse Spark 1.3 Contributor
+date: 2026/09/21
 source: @ottojung
 kind: constraint
 
-`lubko-agent` must use DeepSeek V4.1 Flash through the paid OpenCode Go provider, identified in OpenCode as `opencode-go/deepseek-v4.1-flash`. Free model variants, including model identifiers ending in `-free`, must never be used as the configured `lubko-agent` model or as a fallback.
+`lubko-agent` must use Muse Spark 1.3 Contributor through the paid OpenCode Go provider, identified in OpenCode as `opencode-go/muse-spark-1.3-contributor`. Free model variants, including model identifiers ending in `-free`, must never be used as the configured `lubko-agent` model or as a fallback.
 
 $id-8612645784701677
 title: Agent IDs are case-insensitive and use --id uniformly
