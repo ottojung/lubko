@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -138,8 +137,8 @@ def _fake_active(last_heartbeat_at: float, *, claimed_at: float = 0.0) -> worker
     job.stop_started = None
     job.claimed_at = claimed_at
     job.last_heartbeat_at = last_heartbeat_at
-    job.stdout = worker.OutputStream(path=Path("/dev/null"))
-    job.stderr = worker.OutputStream(path=Path("/dev/null"))
+    job.stdout = worker.OutputStream()
+    job.stderr = worker.OutputStream()
     job.version = PROTOCOL_VERSION
     return job
 
