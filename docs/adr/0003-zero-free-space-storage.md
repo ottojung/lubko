@@ -116,10 +116,14 @@ holds only the unpublished tail and is lost on reboot by design.
 ### Principle 1 — Steady-state progress requires no successful persistent-filesystem mutation
 
 After deployment, every action on the supervisor/worker hot path — daemon
-start, crash recovery, child spawn and supervision, queue polling, job
+start, crash recovery, child spawn and authority-independent supervision
+(observation, reaping, pipe draining), queue polling, job
 execution, result publication, status/health publication — must be able to
 complete with zero free persistent blocks **even when every local
-filesystem mutation attempted on that path fails**. Concretely, no
+filesystem mutation attempted on that path fails**. Authority-gated
+supervision actions (ownership-dependent signals, retire, adopt) need a
+fresh database row rather than local bytes, which is available exactly
+whenever job progress itself is possible (Principle 2). Concretely, no
 lifecycle decision and no job-execution step may depend on a local file
 write succeeding. Local filesystem writes on these paths are permitted
 only as opportunistic caches whose failure is ignored (see Principle 2).
@@ -195,11 +199,13 @@ It then verifies, fail-closed, that the row exists (else it runs the
 bootstrap insert above and re-reads), that `payload.server` equals its own
 server name, that the payload kind is `lifecycle_authority` at a supported
 protocol version, and that the schema validates — any mismatch means "no
-usable authority": hold, never act. Destructive decisions additionally
-re-read the row inside the decision transaction, so a cache or an early
-read can never authorize killing, spawning, or retiring. At zero free
-blocks this path performs zero local writes: config read, in-memory UUID
-derivation, database reads, kernel liveness proof.
+usable authority": hold, never act. Every ownership-dependent or
+destructive child action — signaling, killing, spawning, adopting, or
+retiring — additionally requires a fresh row read inside the decision
+transaction whose fencing epoch matches the acting incarnation's own
+epoch, so a cache or an early read can never authorize such an action.
+At zero free blocks this path performs zero local writes: config read,
+in-memory UUID derivation, database reads, kernel liveness proof.
 
 **Ordering.** The linearization point of every lifecycle transition is the
 commit of a single database transaction against the authority row. Mutations
@@ -225,15 +231,24 @@ the row invalidates all pre-crash claims after a host reboot.
 **Network-unavailable behavior.** Losing the database never causes unsafe
 action, and never causes more harm than the status quo: without the
 database the worker can neither claim jobs nor publish results today, so
-holding lifecycle transitions adds no new outage. While disconnected, the
-daemons hold (no spawn, no retire, no reconcile, no generation allocation),
-keep supervising already-owned children (signal decisions need no
-authority), buffer unpublished results in bounded memory, and retry with
-bounded backoff. Destructive actions additionally require a fresh row read;
-cached authority older than the decision is never sufficient. On reconnect,
-the first act is a row read; any local incarnation whose epoch no longer
-matches the row stands down immediately (fencing), so a partitioned old
-supervisor can never contradict the new authority.
+holding lifecycle transitions adds no new outage. While disconnected, an
+incarnation may perform only authority-independent work: observation
+(pipe draining into memory buffers, `waitpid` reaping of naturally exited
+children, liveness polling), non-destructive bookkeeping (in-memory
+counters, best-effort diagnostics), and bounded buffering of unpublished
+results. It must not signal, kill, retire, spawn, or adopt based on stale
+authority — a partitioned incarnation that has lost its fencing epoch is
+indistinguishable from a superseded one, so every ownership-dependent or
+destructive signal or child action requires a fresh canonical row read
+matching the local fencing epoch (see above), and without that read the
+action does not happen. A naturally exited child is reaped and its
+buffered result retained for publication on reconnect; no kill, retire, or
+replacement decision follows until fresh authority is available. Retry
+uses bounded backoff. On reconnect, the first act is a row read; any local
+incarnation whose epoch no longer matches the row stands down immediately
+(fencing) without touching any child process, so a partitioned old
+supervisor can never signal a child from stale ownership and can never
+contradict the new authority.
 
 **Boundedness.** The authority row has a fixed small schema (generations,
 epochs, exact-identity tuples, phase flags, bounded mission descriptor);
@@ -264,6 +279,9 @@ Crash recovery with zero free blocks works because recovery:
 - treats a missing drain sentinel as "not drained" (conservative,
   fail-closed) rather than requiring sentinel creation during recovery.
 
+Recovery with an unreachable database is observation-only hold: the daemon
+may observe and reap, but adopts, spawns, signals, kills, and retires
+nothing until the first successful canonical row read plus fencing check.
 No recovery path may create files, create directories, rotate logs, or
 publish health/status as a precondition for resuming supervision. Deferred
 maintenance (directory creation for new incarnation artifacts, log rotation,
@@ -304,6 +322,15 @@ semantics and may fail loudly.
   the exact `{pid, start-time-ticks}` match against live kernel evidence,
   now cross-checked with the row's claimed identity and epoch; a missing
   row, an epoch mismatch, or a failed proof never reads as "reusable".
+- **No signal from stale ownership:** no incarnation signals, kills,
+  retires, spawns, or adopts unless a fresh canonical row read taken
+  inside the decision matches its own fencing epoch. A disconnected or
+  superseded incarnation is limited to authority-independent
+  observation (`waitpid` reaping of naturally exited children, pipe
+  draining, liveness polling), non-destructive bookkeeping, and bounded
+  result buffering; natural child exit is reaped and buffered for later
+  publication, never followed by a kill/retire/replace decision without
+  fresh authority.
 - **No false durable transition after a crash:** the durable transition
   is the database commit. An uncommitted transaction is invisible to every
   recoverer; a committed one is visible to all of them. Local caches can
