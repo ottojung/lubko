@@ -81,8 +81,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple, override
 
 import psycopg
+from psycopg.rows import tuple_row
 
 from lubko import cli, deployctl, lifecycle, lifecycle_state, startup_contract, supervise
+from lubko import lifecycle_authority as authority
 from lubko import worker as worker_mod
 from lubko._exact_signal import open_pidfd as _open_unresolved_pidfd
 from lubko._exact_signal import pidfd_send_signal as _signal_pinned_unresolved
@@ -92,7 +94,7 @@ from lubko._supervisor_identity import (
     contract_schema_version,
     resolve_new_supervisor_executable,
 )
-from lubko.config import load_database_config
+from lubko.config import load_database_config, load_worker_server
 from lubko.control_socket import (
     ControlRequest,
     ControlResponse,
@@ -145,8 +147,11 @@ from lubko.supervise import (
 from lubko.toolchain import UvResolutionError, resolve_uv
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from lubko.lifecycle import ProcessIdentity, WorkerMeta
     from lubko.supervise import SupervisorState
+    from lubko.worker import JobsConnection
 
 LOGGER: Final = logging.getLogger(__name__)
 
@@ -754,6 +759,10 @@ class SupervisorDaemon:
         self._runtime_commit: str | None = capture_supervisor_runtime_commit()
         self._handoff_target_commit: str | None = None
         self._handoff_completed: bool = False
+        self._status_write_drops: int = 0
+        self._authority: authority.AuthorityClaim | None = None
+        self._authority_conn: JobsConnection | None = None
+        self._authority_conn_factory: Callable[[], JobsConnection] | None = None
 
     def _write_state_authority_safe(self, state: SupervisorState) -> bool:
         """Publish a supervisor transition without erasing newer consumer authority.
@@ -844,7 +853,10 @@ class SupervisorDaemon:
             if self._in_handoff_mode():
                 self._preflight_handoff()
                 return
-            self._write_pidfile()
+            while not self._authority_established() and not self._stopping:
+                time.sleep(self.settings.poll_interval_seconds)
+            if self._authority is None:
+                return
             self._persist_runtime_commit()
             self._invalidate_stale_status()
             normalize_cross_boot_state()
@@ -868,6 +880,7 @@ class SupervisorDaemon:
             self._shutdown()
         finally:
             self._close_control_socket()
+            self._discard_authority_connection()
             self._release_ownership()
 
     # ------------------------------------------------------------------
@@ -1473,9 +1486,20 @@ class SupervisorDaemon:
     def _ensure_consumer_locked(self, commit: str) -> None:
         """Run the worker-ownership decision while holding the consumer lock.
 
+        A fresh canonical authority read matching this incarnation's fencing
+        epoch is required before any ownership-dependent step: a partitioned
+        or superseded incarnation is limited to observation and never
+        signals, adopts, retires, or spawns.
+
         Args:
             commit: Exact commit the worker must run.
         """
+        if not self._confirm_authority():
+            self._message = (
+                "fresh lifecycle authority is unavailable or superseded; "
+                "holding without signalling, adopting, retiring, or spawning"
+            )
+            return
         if not self._resolve_spawning_obligation():
             return
         if not self._resolve_unresolved_child():
@@ -1567,6 +1591,12 @@ class SupervisorDaemon:
                         "worker intent changed before the pre-spawn boundary; "
                         "holding for a fresh reconciliation"
                     )
+                return
+            if not self._confirm_authority():
+                self._message = (
+                    "fresh lifecycle authority is unavailable or superseded; "
+                    "holding without spawning"
+                )
                 return
             child = self._spawn_worker(commit)
         now = time.monotonic()
@@ -1839,6 +1869,13 @@ class SupervisorDaemon:
         child = state.child
         if child is None:
             return True
+        if not self._confirm_authority():
+            self._message = (
+                "fresh lifecycle authority is unavailable or superseded; "
+                "preserving child identity and holding without signalling"
+            )
+            LOGGER.error("%s", self._message)
+            return False
         meta = _child_to_meta(child, _runtime_dir(state.commit))
         # Exact-authority gate: a live worker may only be retired when its exact
         # identity is proven to be our own direct child; an unproven (reparented,
@@ -4050,23 +4087,46 @@ class SupervisorDaemon:
             return False
 
     def _write_pidfile(self) -> None:
-        """Record our exact identity, refusing to double-run a live daemon.
+        """Establish fencing-epoch ownership of this execution server.
+
+        The name is historical: crash-durable lifecycle authority lives in
+        the database row (see :mod:`lubko.lifecycle_authority`), and the
+        ``supervisor.pid`` file is only a best-effort read-through cache. The
+        linearization point of taking ownership is the commit of a single
+        row update guarded by a fencing-epoch compare-and-swap: exactly one
+        contender's commit wins and the loser stands down without spawning.
 
         The process-level ownership lock acquired in :meth:`run` already held
-        off any second flock-aware daemon, so the read/check/write here cannot
-        race a concurrent start.  The recorded-pid liveness check stays as
-        defense in depth against a legacy flock-less daemon instance.
+        off any second flock-aware daemon, so the check-and-take here cannot
+        race a concurrent start. The recorded-pid liveness check stays as
+        defense in depth against a legacy flock-less daemon instance. A torn
+        or stale cache never decides anything: the row is read fresh and
+        always wins, so an interrupted local write followed by a zero-space
+        restart recovers safely instead of bricking startup.
+
+        At zero free blocks this path performs zero local writes: config
+        reads, in-memory id derivation, database reads/writes, kernel
+        liveness proof, and a best-effort cache refresh whose failure is
+        ignored.
 
         Raises:
-            SystemExit: If another live supervisor daemon is already running.
+            SystemExit: If another live supervisor daemon is already running,
+                the authority row is corrupt or untrusted, the fencing epoch
+                was lost to a concurrent contender, or the server identity
+                cannot be established.
+
+        Note:
+            An unreachable database surfaces as
+            :class:`AuthorityUnavailableError` from the authority layer; the
+            caller holds without acting and retries.
         """
         try:
             recorded = read_supervisor_pid()
         except MalformedSupervisorIdentityError:
-            LOGGER.exception(
-                "supervisor identity record is malformed; refusing to overwrite recovery authority"
+            LOGGER.warning(
+                "supervisor identity cache is torn; recovering ownership from the authority row"
             )
-            raise SystemExit(1) from None
+            recorded = None
         if recorded is not None and supervise.supervisor_running():
             msg = (
                 f"another lubko supervisor is already running (pid {recorded[0]}); "
@@ -4074,11 +4134,167 @@ class SupervisorDaemon:
             )
             LOGGER.error(msg)
             raise SystemExit(1)
+        try:
+            server = load_worker_server()
+        except (FileNotFoundError, PermissionError, ValueError):
+            LOGGER.exception("cannot establish the execution-server identity")
+            raise SystemExit(1) from None
         self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
+        owner = authority.AuthorityOwner(
+            pid=os.getpid(),
+            start_time_ticks=self._start_time_ticks,
+            boot_id=supervise.current_boot_id() or "",
+        )
+        if not owner.boot_id:
+            LOGGER.error("cannot establish ownership without a host boot identity")
+            raise SystemExit(1)
+        conn = self._open_authority_connection()
+        row = authority.bootstrap_authority(conn, server)
+        if row.owner != owner:
+            current = row.owner
+            if current is not None and supervise.supervisor_owner_live(
+                current.pid, current.start_time_ticks
+            ):
+                LOGGER.error(
+                    "the fencing epoch for server %r is held by live supervisor pid %d; "
+                    "refusing to start a second owner",
+                    server,
+                    current.pid,
+                )
+                raise SystemExit(1)
+            taken = authority.take_authority(conn, server, owner)
+            if taken is None:
+                LOGGER.error(
+                    "lost the fencing epoch to a concurrent supervisor for server %r; "
+                    "standing down without spawning",
+                    server,
+                )
+                raise SystemExit(1)
+            row = taken
+        self._authority = authority.AuthorityClaim(
+            server=server,
+            epoch=row.epoch,
+            pid=owner.pid,
+            start_time_ticks=owner.start_time_ticks,
+            boot_id=owner.boot_id,
+        )
         write_supervisor_pid(os.getpid(), self._start_time_ticks)
 
+    def _authority_established(self) -> bool:
+        """Establish fencing-epoch ownership unless the database is unreachable.
+
+        A partitioned incarnation holds without acting and retries on a
+        later tick; the daemon stays alive but spawns nothing.
+
+        Returns:
+            ``True`` when this incarnation holds the fencing epoch,
+            ``False`` when the database is unreachable and the decision must
+            be retried.
+        """
+        if self._authority is not None:
+            return True
+        try:
+            self._write_pidfile()
+        except authority.AuthorityUnavailableError:
+            LOGGER.warning(
+                "lifecycle authority is unreachable; holding without ownership "
+                "until the database is reachable"
+            )
+            self._discard_authority_connection()
+            return False
+        return True
+
+    def _open_authority_connection(self) -> JobsConnection:
+        """Open the database connection carrying lifecycle authority.
+
+        The connection is held for the daemon's lifetime and reused for
+        fresh row reads inside every ownership-dependent decision; it is
+        discarded on the first failure so a partitioned incarnation can
+        never act on a stale fencing epoch.
+
+        Returns:
+            An open database connection.
+
+        Raises:
+            AuthorityUnavailableError: If the database cannot be reached.
+        """
+        if self._authority_conn_factory is not None:
+            return self._authority_conn_factory()
+        try:
+            config = load_database_config()
+            conn = psycopg.connect(
+                config.conninfo(),
+                connect_timeout=max(1, min(5, int(self.settings.postgres_timeout_seconds))),
+                row_factory=tuple_row,
+                options=(
+                    f"-c statement_timeout={int(self.settings.postgres_timeout_seconds * 1000)}"
+                ),
+            )
+        except psycopg.Error as exc:
+            msg = "lifecycle authority database is unreachable"
+            raise authority.AuthorityUnavailableError(msg) from exc
+        return conn
+
+    def _discard_authority_connection(self) -> None:
+        """Drop the authority connection so no stale epoch can authorize action."""
+        conn = self._authority_conn
+        self._authority_conn = None
+        if conn is not None:
+            with suppress(Exception):
+                conn.close()
+
+    def _confirm_authority(self) -> bool:
+        """Confirm the in-memory fencing claim against a fresh row read.
+
+        Every ownership-dependent or destructive child action requires this
+        fresh match inside the decision. Daemons constructed without an
+        established claim retain their legacy file-based guards.
+
+        Returns:
+            ``True`` only when no claim was established yet (legacy path) or
+            a fresh canonical row read matches the claim's server, epoch,
+            and exact owner. A fencing mismatch reads as ``False`` on the
+            same connection and stands down; a connection-level outage
+            discards the cached connection so the next confirmation opens a
+            fresh one, and also reads as ``False``: without a fresh match
+            the action does not happen.
+        """
+        claim = self._authority
+        if claim is None:
+            return True
+        try:
+            if self._authority_conn is None:
+                self._authority_conn = self._open_authority_connection()
+            if not authority.confirm_authority(self._authority_conn, claim):
+                LOGGER.warning(
+                    "fencing epoch no longer matches the authority row; "
+                    "standing down without touching any child process"
+                )
+                return False
+        except authority.AuthorityUnavailableError:
+            LOGGER.warning(
+                "lifecycle authority is unreachable; holding without ownership-dependent action"
+            )
+            self._discard_authority_connection()
+            return False
+        except psycopg.Error:
+            LOGGER.warning(
+                "lifecycle authority connection failed; holding without ownership-dependent action",
+                exc_info=True,
+            )
+            self._discard_authority_connection()
+            return False
+        return True
+
     def _write_status(self, message: str | None = None) -> None:
-        """Publish the machine-readable status snapshot.
+        """Publish the machine-readable status snapshot, best-effort.
+
+        The status snapshot is observation-only diagnostics: it is never
+        recovery authority (readers already fail closed on absence), so a
+        persistent-filesystem write failure — including exhausted free
+        space — is dropped rather than propagated. Dropped snapshots are
+        counted in memory in ``_status_write_drops`` and never fail,
+        block, or alter a lifecycle decision.
 
         Args:
             message: Optional human-facing diagnostic.
@@ -4103,30 +4319,37 @@ class SupervisorDaemon:
         if rollback is not None:
             mission = rollback.status
         worker_health = worker_health_payload(read_worker_health())
-        write_status(
-            SupervisorStatus(
-                schema_version=SCHEMA_VERSION,
-                supervisor_pid=os.getpid(),
-                supervisor_start_time_ticks=self._start_time_ticks,
-                started_at=self._started_at,
-                applied_generation=state.applied_generation,
-                mode=state.mode,
-                commit=state.commit,
-                child=state.child,
-                intent=state.intent,
-                restart_count=state.restart_count,
-                next_attempt_at=state.next_attempt_at,
-                last_exit=state.last_exit,
-                mission=mission,
-                db_ready=db_ready,
-                ready=state.ready if state.child is not None else None,
-                message=effective_message,
-                worker_health=worker_health,
-                holding=is_holding(state),
-                supervisor_runtime_commit=self._runtime_commit,
-                supervisor_runtime_contract_version=contract_schema_version(),
+        try:
+            write_status(
+                SupervisorStatus(
+                    schema_version=SCHEMA_VERSION,
+                    supervisor_pid=os.getpid(),
+                    supervisor_start_time_ticks=self._start_time_ticks,
+                    started_at=self._started_at,
+                    applied_generation=state.applied_generation,
+                    mode=state.mode,
+                    commit=state.commit,
+                    child=state.child,
+                    intent=state.intent,
+                    restart_count=state.restart_count,
+                    next_attempt_at=state.next_attempt_at,
+                    last_exit=state.last_exit,
+                    mission=mission,
+                    db_ready=db_ready,
+                    ready=state.ready if state.child is not None else None,
+                    message=effective_message,
+                    worker_health=worker_health,
+                    holding=is_holding(state),
+                    supervisor_runtime_commit=self._runtime_commit,
+                    supervisor_runtime_contract_version=contract_schema_version(),
+                )
             )
-        )
+        except OSError:
+            self._status_write_drops += 1
+            LOGGER.debug(
+                "status snapshot dropped (%d total); lifecycle decisions unaffected",
+                self._status_write_drops,
+            )
 
 
 def _status_cmd() -> int:

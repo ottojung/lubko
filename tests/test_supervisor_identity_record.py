@@ -1,16 +1,20 @@
-"""Fail-closed tests for the durable supervisor identity record."""
+"""Fail-closed tests for the supervisor identity cache record."""
 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from lubko.worker import JobsConnection
+
 import pytest
 
 from lubko import supervise, supervisor
+from tests._fake_authority_db import FakeAuthorityConnection
 
 
 @pytest.fixture
@@ -68,13 +72,19 @@ def test_malformed_supervisor_identity_fails_closed_without_mutation(
     assert isolated_state.read_text(encoding="utf-8") == raw
 
 
-def test_daemon_refuses_to_overwrite_malformed_supervisor_identity(isolated_state: Path) -> None:
-    """Daemon startup preserves malformed recovery authority and exits."""
-    raw = _write_raw(
-        isolated_state, {"schema_version": "1", "pid": "4242", "start_time_ticks": "999"}
-    )
+def test_daemon_recovers_malformed_identity_cache_from_the_row(
+    isolated_state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Daemon startup treats a torn cache as unusable and recovers from the row."""
+    _write_raw(isolated_state, {"schema_version": "1", "pid": "4242", "start_time_ticks": "999"})
+    with pytest.raises(supervise.MalformedSupervisorIdentityError):
+        supervise.read_supervisor_pid()
+    table = FakeAuthorityConnection()
+    monkeypatch.setattr(supervisor, "load_worker_server", lambda: "srv-test")
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
-    with pytest.raises(SystemExit) as exc_info:
-        daemon._write_pidfile()
-    assert exc_info.value.code == 1
-    assert isolated_state.read_text(encoding="utf-8") == raw
+    daemon._authority_conn_factory = lambda: cast("JobsConnection", table)
+    daemon._write_pidfile()
+    assert daemon._authority is not None
+    assert daemon._authority.epoch == 1
+    assert daemon._authority.pid == os.getpid()
+    assert supervise.read_supervisor_pid() is not None
