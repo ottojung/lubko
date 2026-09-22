@@ -77,7 +77,7 @@ def make_active_job(tmp_path: Path, *, completed: bool) -> ActiveJob:
     """Build a structurally complete registry entry with no live child.
 
     Args:
-        tmp_path: Directory for the job's capture spool files.
+        tmp_path: Directory for the job's working directory.
         completed: Whether the job is already observed as exited.
 
     Returns:
@@ -96,12 +96,8 @@ def make_active_job(tmp_path: Path, *, completed: bool) -> ActiveJob:
     job.pgid = os.getpid()
     job.started_mono = 0.0
     job.claimed_at = 0.0
-    stdout_path = tmp_path / f"out-{job.id}"
-    stderr_path = tmp_path / f"err-{job.id}"
-    stdout_path.write_bytes(b"out")
-    stderr_path.write_bytes(b"err")
-    job.stdout = OutputStream(path=stdout_path)
-    job.stderr = OutputStream(path=stderr_path)
+    job.stdout = OutputStream(data=bytearray(b"out"))
+    job.stderr = OutputStream(data=bytearray(b"err"))
     # Capture pipes are already fully drained so the bounded finalization
     # cycle proceeds straight to publication without waiting on EOF.
     for stream in (job.stdout, job.stderr):
@@ -193,8 +189,8 @@ def test_root_deleted_after_publication_converges_as_local_row_loss(
     assert lost.id not in supervisor.active
     assert lost.row_lost
     assert lost.finalized
-    assert not lost.stdout.path.exists()
-    assert not lost.stderr.path.exists()
+    assert lost.stdout.data == b""
+    assert lost.stderr.data == b""
     # The sibling stays tracked and untouched.
     assert supervisor.active[sibling.id] is sibling
     assert not sibling.row_lost

@@ -1,12 +1,12 @@
-"""Worker output transformation invariants (pure and file-backed, no processes)."""
+"""Worker output transformation invariants (pure and memory-backed, no processes)."""
 
 import json
-import logging
+import os
 import time
 import uuid
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from uuid import UUID
 
 import pytest
 
@@ -26,6 +26,28 @@ from lubko.worker import (
     pg_safe_decode,
     truncate_output,
 )
+
+
+def _stream(
+    content: bytes,
+    *,
+    spool_start: int = 0,
+    archived_upto: int = 0,
+    last_chunk: UUID | None = None,
+    sequence: int = 0,
+) -> OutputStream:
+    """Build a capture stream holding ``content`` in its memory buffer.
+
+    Returns:
+        A capture stream whose spool holds exactly ``content``.
+    """
+    return OutputStream(
+        data=bytearray(content),
+        spool_start=spool_start,
+        archived_upto=archived_upto,
+        last_chunk=last_chunk,
+        sequence=sequence,
+    )
 
 
 def test_pg_safe_decode_replaces_nul_and_invalid_bytes() -> None:
@@ -65,106 +87,89 @@ def test_archive_target_never_shortens_the_live_tail() -> None:
     assert 0 < target < 10**9
 
 
-def test_output_window_text_returns_logical_offsets(tmp_path: Path) -> None:
+def test_output_window_text_returns_logical_offsets() -> None:
     """Live windows return the newest bytes with logical offsets."""
-    path = tmp_path / "stdout"
-    path.write_bytes(b"abcdefgh")
-    text, start, end = output_window_text(path, 4)
+    stream = _stream(b"abcdefgh")
+    text, start, end = output_window_text(stream, 4)
     assert (text, start, end) == ("efgh", 4, 8)
-    text, start, end = output_window_text(path, 100)
+    text, start, end = output_window_text(stream, 100)
     assert (text, start, end) == ("abcdefgh", 0, 8)
-    # ``base`` translates physical file offsets to logical stream offsets.
-    _text, start, end = output_window_text(path, 4, base=100)
+    # ``base`` translates physical buffer offsets to logical stream offsets.
+    _text, start, end = output_window_text(stream, 4, base=100)
     assert (start, end) == (104, 108)
 
 
-def test_output_window_preserves_multibyte_rune_alignment(tmp_path: Path) -> None:
+def test_output_window_preserves_multibyte_rune_alignment() -> None:
     """Window limits stay byte-bounded but never split a multi-byte rune."""
-    path = tmp_path / "s"
-    path.write_bytes("é".encode())  # two bytes
+    stream = _stream("é".encode())  # two bytes
     # A 1-byte window cannot hold the rune, so the head aligns forward to the
     # rune boundary; the empty window stays strictly within the byte bound.
-    head_text, start, end = output_window_text(path, 1)
+    head_text, start, end = output_window_text(stream, 1)
     assert (start, end) == (2, 2)
     assert not head_text
     # A window that fits the rune keeps it intact with byte offsets.
-    text, start, end = output_window_text(path, 2)
+    text, start, end = output_window_text(stream, 2)
     assert (text, start, end) == ("é", 0, 2)
 
 
-def test_cleanup_job_isolates_spool_removal_failures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_cleanup_job_releases_buffers_without_filesystem_use(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed spool unlink cannot block sibling cleanup or escape."""
-    stdout_path = tmp_path / "stdout"
-    stderr_path = tmp_path / "stderr"
-    stdout_path.write_bytes(b"out")
-    stderr_path.write_bytes(b"err")
-    real_unlink = Path.unlink
-    attempted: list[Path] = []
+    """Finalized-job cleanup drops buffers and closes fds, touching no files."""
+    stdout = cast("Any", _stream(b"out"))
+    stderr = cast("Any", _stream(b"err"))
+    stdout.fd = 100
+    stderr.fd = 101
+    closed: list[int] = []
 
-    def unlink(path: Path, *, missing_ok: bool = False) -> None:
-        attempted.append(path)
-        if path == stdout_path:
-            message = "synthetic spool cleanup failure"
-            raise PermissionError(message)
-        real_unlink(path, missing_ok=missing_ok)
+    def record_close(fd: int) -> None:
+        closed.append(fd)
 
-    monkeypatch.setattr(Path, "unlink", unlink)
+    monkeypatch.setattr(os, "close", record_close)
 
-    def stream(path: Path) -> SimpleNamespace:
-        return SimpleNamespace(fd=None, path=path)
+    def forbid_unlink(*_args: object, **_kwargs: object) -> None:
+        """Fail any filesystem unlink attempted during cleanup.
+
+        Raises:
+            AssertionError: Always; cleanup must not touch the filesystem.
+        """
+        msg = "cleanup must not touch the filesystem"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("pathlib.Path.unlink", forbid_unlink)
 
     job = cast(
         "Any",
-        SimpleNamespace(
-            stdout=stream(stdout_path), stderr=stream(stderr_path), version=PROTOCOL_VERSION
-        ),
+        SimpleNamespace(stdout=stdout, stderr=stderr, version=PROTOCOL_VERSION),
     )
-    with caplog.at_level(logging.WARNING, logger="lubko.worker"):
-        cleanup_job(job)
+    cleanup_job(job)
 
-    assert attempted == [stdout_path, stderr_path]
-    assert stdout_path.exists()
-    assert not stderr_path.exists()
-    assert "failed to remove capture spool" in caplog.text
+    assert closed == [100, 101]
+    assert bytes(stdout.data) == b""
+    assert bytes(stderr.data) == b""
+    assert stdout.fd is None
+    assert stderr.fd is None
 
 
-def test_cleanup_all_files_continues_after_one_spool_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Shutdown cleanup keeps visiting later jobs after one unlink failure."""
-    paths = [tmp_path / name for name in ("a-out", "a-err", "b-out", "b-err")]
-    for path in paths:
-        path.write_bytes(b"x")
-    real_unlink = Path.unlink
-    attempted: list[Path] = []
+def test_cleanup_all_files_releases_every_buffer() -> None:
+    """Shutdown cleanup releases every job's buffers without filesystem use."""
 
-    def unlink(path: Path, *, missing_ok: bool = False) -> None:
-        attempted.append(path)
-        if path == paths[0]:
-            message = "synthetic cleanup failure"
-            raise OSError(message)
-        real_unlink(path, missing_ok=missing_ok)
-
-    monkeypatch.setattr(Path, "unlink", unlink)
-
-    def job(stdout: Path, stderr: Path) -> SimpleNamespace:
+    def job(content: bytes) -> SimpleNamespace:
         return SimpleNamespace(
-            stdout=SimpleNamespace(fd=None, path=stdout),
-            stderr=SimpleNamespace(fd=None, path=stderr),
+            stdout=_stream(content),
+            stderr=_stream(content),
             version=PROTOCOL_VERSION,
         )
 
     supervisor = cast(
         "Any",
-        SimpleNamespace(active={"a": job(paths[0], paths[1]), "b": job(paths[2], paths[3])}),
+        SimpleNamespace(active={"a": job(b"x"), "b": job(b"y")}),
     )
     worker.Supervisor._cleanup_all_files(supervisor)
 
-    assert attempted == paths
-    assert paths[0].exists()
-    assert all(not path.exists() for path in paths[1:])
+    for active in supervisor.active.values():
+        assert active.stdout.data == b""
+        assert active.stderr.data == b""
 
 
 def _mixed_runes(byte_len: int, seed: int) -> bytes:
@@ -222,19 +227,18 @@ def _is_lead(byte: int) -> bool:
     return byte < 0x80 or byte >= 0xC0
 
 
-def test_live_tail_never_splits_multibyte_rune(tmp_path: Path) -> None:
+def test_live_tail_never_splits_multibyte_rune() -> None:
     """The live-tail window stays within its byte bound and keeps whole runes.
 
     A 4-byte rune is placed so the ``OUTPUT_TAIL_MAX_BYTES`` cut lands on its
     second byte; the window head must align forward to the next rune boundary,
     never emitting a partial rune replaced with U+FFFD.
     """
-    path = tmp_path / "s"
     rune4 = "𐍈".encode()
     # rune4 starts at offset 3999 so the tail cut (size - 4000 = 4000) is its 2nd byte.
     content = b"x" * 3999 + rune4 + b"y" * 3997
-    path.write_bytes(content)
-    text, start, end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+    stream = _stream(content)
+    text, start, end = output_window_text(stream, OUTPUT_TAIL_MAX_BYTES)
     # Head moved forward by at most three bytes to a code-point boundary.
     assert start >= len(content) - OUTPUT_TAIL_MAX_BYTES
     assert start - (len(content) - OUTPUT_TAIL_MAX_BYTES) <= 3
@@ -244,20 +248,18 @@ def test_live_tail_never_splits_multibyte_rune(tmp_path: Path) -> None:
     assert "\ufffd" not in text
 
 
-def test_archive_chunk_preserves_multibyte_rune_across_boundary(tmp_path: Path) -> None:
+def test_archive_chunk_preserves_multibyte_rune_across_boundary() -> None:
     """An immutable chunk ends on a code-point boundary; runes are not split.
 
     A 4-byte rune is placed so ``OUTPUT_CHUNK_MAX_BYTES`` falls on its second
     byte. The planned chunk must contain the whole rune in exactly one chunk and
     its decoded value must equal the exact decode of its byte range.
     """
-    path = tmp_path / "s"
     rune4 = "𐍈".encode()
     content = (
         b"x" * (OUTPUT_CHUNK_MAX_BYTES - 1) + rune4 + rune4 + b"y" * (OUTPUT_TAIL_MAX_BYTES + 500)
     )
-    path.write_bytes(content)
-    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    stream = _stream(content, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     chunks, _archived, _last, _seq = worker._plan_chunks(
         uuid.UUID(int=1), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
     )
@@ -277,20 +279,16 @@ def test_archive_chunk_preserves_multibyte_rune_across_boundary(tmp_path: Path) 
     assert owners[0]["value"] == content[owners[0]["start"] : owners[0]["end"]].decode("utf-8")
 
 
-def test_repeated_trim_publication_cycles_preserve_runes(tmp_path: Path) -> None:
+def test_repeated_trim_publication_cycles_preserve_runes() -> None:
     """Many append/plan/trim cycles keep every published byte range faithful.
 
     Across live-tail and archive-chunk boundaries, no 2/3/4-byte rune is ever
     split into U+FFFD: each emitted chunk value and the final tail equal the
     exact decode of their absolute byte range in the whole stream.
     """
-    path = tmp_path / "stdout"
-    path.write_bytes(b"")
     job = cast(
         "Any",
-        SimpleNamespace(
-            id=uuid.UUID(int=0), stdout=OutputStream(path=path), version=PROTOCOL_VERSION
-        ),
+        SimpleNamespace(id=uuid.UUID(int=0), stdout=_stream(b""), version=PROTOCOL_VERSION),
     )
     full = bytearray()
     published: list[tuple[int, int, str]] = []
@@ -298,10 +296,8 @@ def test_repeated_trim_publication_cycles_preserve_runes(tmp_path: Path) -> None
     for cycle in range(8):
         delta = _mixed_runes(900 + (cycle % 7) * 137, cycle)
         full += delta
-        # Append the new tail to the spool file (it already holds [spool_start, ...]).
-        with path.open("r+b") as fh:
-            fh.seek(0, 2)
-            fh.write(delta)
+        # Append the new tail to the spool buffer (it already holds [spool_start, ...]).
+        job.stdout.data += delta
         plans = worker._plan_streams(job, ["stdout"], server="server", force=True)
         for name, plan in plans.items():
             for _cid, payload in plan.chunks:
@@ -322,33 +318,32 @@ def test_repeated_trim_publication_cycles_preserve_runes(tmp_path: Path) -> None
         assert align_code_point_end(bytes(full), end) == end
 
 
-def test_invalid_utf8_policy_is_deterministic_and_safe(tmp_path: Path) -> None:
+def test_invalid_utf8_policy_is_deterministic_and_safe() -> None:
     """Invalid bytes become U+FFFD deterministically; boundaries never raise.
 
     An invalid byte sequence (a lead with no continuation) is placed across both
     the archive-chunk and live-tail byte boundaries. Publication must never raise
     and must match the canonical ``pg_safe_decode`` of each byte range exactly.
     """
-    path = tmp_path / "s"
     # b"\xc3" alone is an orphan 2-byte lead; padding puts it across boundaries.
     content = b"a" * (OUTPUT_CHUNK_MAX_BYTES - 1) + b"\xc3" + b"b" * (OUTPUT_TAIL_MAX_BYTES + 5)
-    path.write_bytes(content)
     # The canonical conversion is deterministic and safe for PostgreSQL.
     assert pg_safe_decode(b"\xc3") == "\ufffd"
     # Live tail: no exception, exact canonical decode of its range.
-    text, start, end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+    stream = _stream(content)
+    text, start, end = output_window_text(stream, OUTPUT_TAIL_MAX_BYTES)
     assert text == pg_safe_decode(content[start:end])
     # Archive chunks: no exception, exact canonical decode of each range.
-    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    plan_stream = _stream(content, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     chunks, _archived, _last, _seq = worker._plan_chunks(
-        uuid.UUID(int=2), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
+        uuid.UUID(int=2), "stdout", plan_stream, len(content), "server", version=PROTOCOL_VERSION
     )
     for _cid, payload in chunks:
         parsed = json.loads(payload)
         assert parsed["value"] == pg_safe_decode(content[parsed["start"] : parsed["end"]])
 
 
-def test_plan_chunks_makes_progress_through_invalid_continuation_run(tmp_path: Path) -> None:
+def test_plan_chunks_makes_progress_through_invalid_continuation_run() -> None:
     """Invalid continuation bytes spanning >1 chunk must still terminate/progress.
 
     A run of bare continuation bytes (``0x80``) is never a structurally valid code
@@ -358,11 +353,9 @@ def test_plan_chunks_makes_progress_through_invalid_continuation_run(tmp_path: P
     deterministic ``pg_safe_decode`` of each byte range. This guards against the
     regression where a ``while`` scan walked the whole run and stalled.
     """
-    path = tmp_path / "s"
     # Longer than one chunk on purpose; the invalid run spans multiple boundaries.
     content = b"\x80" * (OUTPUT_CHUNK_MAX_BYTES * 3 + 100)
-    path.write_bytes(content)
-    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    stream = _stream(content, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     chunks, archived_upto, _last, _seq = worker._plan_chunks(
         uuid.UUID(int=3), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
     )
@@ -383,42 +376,40 @@ def test_plan_chunks_makes_progress_through_invalid_continuation_run(tmp_path: P
 
 
 def test_output_window_text_uses_bounded_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Live-tail decoding must read only a bounded tail, not the whole spool."""
-    path = tmp_path / "s"
-    # The spool dwarfs the bounded tail so a whole-file read would be huge.
-    path.write_bytes(b"x" * (OUTPUT_TAIL_MAX_BYTES + 5000))
+    # The spool dwarfs the bounded tail so a whole-buffer read would be huge.
+    stream = _stream(b"x" * (OUTPUT_TAIL_MAX_BYTES + 5000))
     seen: list[int] = []
     real_read_range = worker.read_range
 
-    def spy(p: Path, start: int, end: int) -> bytes:
+    def spy(s: OutputStream, start: int, end: int) -> bytes:
         seen.append(end - start)
-        return real_read_range(p, start, end)
+        return real_read_range(s, start, end)
 
     monkeypatch.setattr(worker, "read_range", spy)
-    output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+    # Window through the production seam so the spy observes the real reads.
+    worker.output_window_text(stream, OUTPUT_TAIL_MAX_BYTES)
     assert seen, "read_range must be the read seam used"
-    # At most the tail plus three lookahead bytes for code-point classification.
+    # At most the tail plus three prefix bytes for code-point classification.
     assert max(seen) <= OUTPUT_TAIL_MAX_BYTES + 3
     # The entire spool is never materialized in a single read.
     assert max(seen) < OUTPUT_TAIL_MAX_BYTES + 5000
 
 
-def test_plan_chunks_uses_bounded_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_plan_chunks_uses_bounded_reads(monkeypatch: pytest.MonkeyPatch) -> None:
     """Archive planning must read only bounded neighborhoods, not the whole spool."""
-    path = tmp_path / "s"
     content = b"x" * 100 + b"y" * (OUTPUT_CHUNK_MAX_BYTES * 3 + 100)
-    path.write_bytes(content)
     seen: list[int] = []
     real_read_range = worker.read_range
 
-    def spy(p: Path, start: int, end: int) -> bytes:
+    def spy(s: OutputStream, start: int, end: int) -> bytes:
         seen.append(end - start)
-        return real_read_range(p, start, end)
+        return real_read_range(s, start, end)
 
     monkeypatch.setattr(worker, "read_range", spy)
-    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    stream = _stream(content, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     worker._plan_chunks(
         uuid.UUID(int=5), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
     )
@@ -445,28 +436,30 @@ def test_semantically_invalid_sequences_do_not_move_boundaries() -> None:
         assert align_code_point_start(data, candidate) == candidate
 
 
-def test_semantically_invalid_sequences_stay_within_pg_safe_decode(tmp_path: Path) -> None:
+def test_semantically_invalid_sequences_stay_within_pg_safe_decode() -> None:
     """Invalid sequences spanning boundaries match the canonical decode exactly."""
     cases = [b"\xe0\x80\x80", b"\xed\xa0\x80", b"\xf0\x80\x80\x80", b"\xf4\x90\x80\x80"]
     for seq in cases:
-        path = tmp_path / "s"
         # Place the invalid sequence so a chunk boundary would otherwise cut it.
         content = b"x" * (OUTPUT_CHUNK_MAX_BYTES - 1) + seq + b"y" * (OUTPUT_TAIL_MAX_BYTES + 5)
-        path.write_bytes(content)
-        text, start, end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+        stream = _stream(content)
+        text, start, end = output_window_text(stream, OUTPUT_TAIL_MAX_BYTES)
         assert text == pg_safe_decode(content[start:end])
-        stream = OutputStream(
-            path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0
-        )
+        plan_stream = _stream(content, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
         chunks, _archived, _last, _seq = worker._plan_chunks(
-            uuid.UUID(int=7), "stdout", stream, len(content), "server", version=PROTOCOL_VERSION
+            uuid.UUID(int=7),
+            "stdout",
+            plan_stream,
+            len(content),
+            "server",
+            version=PROTOCOL_VERSION,
         )
         for _cid, payload in chunks:
             parsed = json.loads(payload)
             assert parsed["value"] == pg_safe_decode(content[parsed["start"] : parsed["end"]])
 
 
-def test_invalid_utf8_4000_bytes_leave_no_gap(tmp_path: Path) -> None:
+def test_invalid_utf8_4000_bytes_leave_no_gap() -> None:
     """Exactly 4000 invalid raw bytes leave no uncovered gap before the tail.
 
     A 4000-byte invalid stream decodes to ~12000 UTF-8 bytes, so the live-tail
@@ -475,16 +468,15 @@ def test_invalid_utf8_4000_bytes_leave_no_gap(tmp_path: Path) -> None:
     archive must still reach ``tail_start`` or the 2667-byte prefix is trimmed
     away as an uncovered gap.
     """
-    path = tmp_path / "s"
     content = b"\x80" * OUTPUT_TAIL_MAX_BYTES
-    path.write_bytes(content)
+    stream = _stream(content)
     # The live tail head is where archiving must reach (no gap).
-    _tail_text, tail_start, _tail_end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
-    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    _tail_text, tail_start, _tail_end = output_window_text(stream, OUTPUT_TAIL_MAX_BYTES)
+    plan_stream = _stream(content, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     chunks, archived_upto, _last, _seq = worker._plan_chunks(
         uuid.UUID(int=10),
         "stdout",
-        stream,
+        plan_stream,
         len(content),
         "server",
         version=PROTOCOL_VERSION,
@@ -502,11 +494,11 @@ def test_invalid_utf8_4000_bytes_leave_no_gap(tmp_path: Path) -> None:
         prev_end = parsed["end"]
     assert prev_end == archived_upto == tail_start
     # The live tail is the exact canonical decode of its own window.
-    tail_text, start, end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
+    tail_text, start, end = output_window_text(_stream(content), OUTPUT_TAIL_MAX_BYTES)
     assert tail_text == pg_safe_decode(content[start:end])
 
 
-def test_larger_invalid_stream_archive_meets_live_tail(tmp_path: Path) -> None:
+def test_larger_invalid_stream_archive_meets_live_tail() -> None:
     """A longer invalid stream leaves no gap between chunks and the tail.
 
     With 12000 invalid bytes the live tail head advances past the
@@ -514,15 +506,14 @@ def test_larger_invalid_stream_archive_meets_live_tail(tmp_path: Path) -> None:
     plan would leave a gap between the last archived chunk and the live tail that
     a subsequent trim could drop. Coverage must reach ``tail_start`` itself.
     """
-    path = tmp_path / "s"
     content = b"\x80" * (OUTPUT_TAIL_MAX_BYTES * 3)
-    path.write_bytes(content)
-    _tail_text, tail_start, _tail_end = output_window_text(path, OUTPUT_TAIL_MAX_BYTES)
-    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    stream = _stream(content)
+    _tail_text, tail_start, _tail_end = output_window_text(stream, OUTPUT_TAIL_MAX_BYTES)
+    plan_stream = _stream(content, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
     chunks, archived_upto, _last, _seq = worker._plan_chunks(
         uuid.UUID(int=11),
         "stdout",
-        stream,
+        plan_stream,
         len(content),
         "server",
         version=PROTOCOL_VERSION,
@@ -540,29 +531,23 @@ def test_larger_invalid_stream_archive_meets_live_tail(tmp_path: Path) -> None:
     assert prev_end == archived_upto == tail_start
 
 
-def test_repeated_trim_cycles_keep_continuous_invalid_coverage(tmp_path: Path) -> None:
+def test_repeated_trim_cycles_keep_continuous_invalid_coverage() -> None:
     """Append/plan/trim with invalid bytes never drops a covered prefix.
 
     Each cycle appends more invalid (U+FFFD) bytes, advancing the live-tail head
     past the archive margin; every publication must archive up to ``tail_start``
-    so no chunk range is left as an uncovered gap before the next trim rewrites
+    so no chunk range is left as an uncovered gap before the next trim discards
     the spool head.
     """
-    path = tmp_path / "stdout"
-    path.write_bytes(b"")
     job = cast(
         "Any",
-        SimpleNamespace(
-            id=uuid.UUID(int=0), stdout=OutputStream(path=path), version=PROTOCOL_VERSION
-        ),
+        SimpleNamespace(id=uuid.UUID(int=0), stdout=_stream(b""), version=PROTOCOL_VERSION),
     )
     full = bytearray()
     for cycle in range(8):
         delta = b"\x80" * (700 + (cycle % 5) * 211)
         full += delta
-        with path.open("r+b") as fh:
-            fh.seek(0, 2)
-            fh.write(delta)
+        job.stdout.data += delta
         plans = worker._plan_streams(job, ["stdout"], server="server", force=True)
         plan = plans["stdout"]
         # No gap: the archive end meets (or passes) the live tail head.

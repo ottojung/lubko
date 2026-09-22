@@ -1,4 +1,4 @@
-"""Temporary gated-spool cleanup is best-effort after exact convergence."""
+"""Aborted gated starts converge without any filesystem use."""
 
 from __future__ import annotations
 
@@ -11,11 +11,16 @@ import psycopg
 import pytest
 
 from lubko import worker
-from lubko.worker import GatedSpawn, Supervisor, abort_gated_start, await_gated_group_gone
+from lubko.worker import (
+    GatedSpawn,
+    OutputStream,
+    Supervisor,
+    abort_gated_start,
+    await_gated_group_gone,
+)
 
 if TYPE_CHECKING:
     import subprocess
-    from pathlib import Path
 
     from lubko.worker import JobsConnection, Settings
 
@@ -38,25 +43,25 @@ class _TerminalProc:
         return self.returncode
 
 
-def _gated(tmp_path: Path) -> tuple[GatedSpawn, _TerminalProc]:
-    """Create an already-terminal gated start with one unremovable spool.
+def _gated() -> tuple[GatedSpawn, _TerminalProc]:
+    """Create an already-terminal gated start with in-memory capture buffers.
 
     Returns:
         The gated-start record and its test process stand-in.
     """
-    stdout_path = tmp_path / "stdout"
-    stdout_path.mkdir()
-    stderr_path = tmp_path / "stderr"
-    stderr_path.write_bytes(b"stderr")
     read_fd, gate_fd = os.pipe()
     os.close(read_fd)
+    stdout_read, _stdout_write = os.pipe()
+    stderr_read, _stderr_write = os.pipe()
     proc = _TerminalProc()
     gated = GatedSpawn(
         proc=cast("subprocess.Popen[bytes]", proc),
         pgid=proc.pid,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
+        stdout=OutputStream(data=bytearray(b"stdout")),
+        stderr=OutputStream(data=bytearray(b"stderr")),
         gate_fd=gate_fd,
+        stdout_read_fd=stdout_read,
+        stderr_read_fd=stderr_read,
     )
     return gated, proc
 
@@ -68,33 +73,39 @@ def _assert_gate_closed(gate_fd: int) -> None:
     assert caught.value.errno == errno.EBADF
 
 
-def test_abort_cleanup_failure_does_not_mask_convergence(tmp_path: Path) -> None:
-    """One failed gated-spool unlink does not block sibling cleanup."""
-    gated, proc = _gated(tmp_path)
+def test_abort_converges_without_filesystem_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Aborting a terminal gated start converges and closes the gate only."""
+    gated, proc = _gated()
+    monkeypatch.setattr("os.unlink", _forbid_unlink)
+    monkeypatch.setattr("pathlib.Path.unlink", _forbid_unlink)
 
-    assert abort_gated_start(
-        gated.proc,
-        gated.pgid,
-        gated.stdout_path,
-        gated.stderr_path,
-        gated.gate_fd,
-    )
+    assert abort_gated_start(gated.proc, gated.pgid, gated.gate_fd)
 
-    assert gated.stdout_path.is_dir()
-    assert not gated.stderr_path.exists()
     assert proc.wait_calls == 1
     _assert_gate_closed(gated.gate_fd)
 
 
-def test_blocking_convergence_cleanup_is_best_effort(tmp_path: Path) -> None:
-    """Blocking convergence also isolates each temporary-spool cleanup."""
-    gated, proc = _gated(tmp_path)
+def _forbid_unlink(*_args: object, **_kwargs: object) -> None:
+    """Fail any filesystem unlink attempted during gated abort.
+
+    Raises:
+        AssertionError: Always; gated abort must not touch the filesystem.
+    """
+    msg = "gated abort must not touch the filesystem"
+    raise AssertionError(msg)
+
+
+def test_blocking_convergence_closes_capture_fds() -> None:
+    """Blocking convergence closes the capture pipe read ends."""
+    gated, proc = _gated()
 
     await_gated_group_gone(gated)
 
-    assert gated.stdout_path.is_dir()
-    assert not gated.stderr_path.exists()
     assert proc.wait_calls == 1
+    for capture_fd in (gated.stdout_read_fd, gated.stderr_read_fd):
+        assert capture_fd is not None
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(capture_fd)
     os.close(gated.gate_fd)
 
 
@@ -110,11 +121,10 @@ def _supervisor() -> Supervisor:
 
 
 def test_failed_identity_persistence_keeps_job_local_outcome(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cleanup failure cannot replace a normal fail-closed start result."""
-    gated, proc = _gated(tmp_path)
+    """Convergence cannot replace a normal fail-closed start result."""
+    gated, proc = _gated()
     monkeypatch.setattr(worker, "proc_start_ticks", lambda _pid: 123)
     monkeypatch.setattr(worker, "_persist_process", lambda *_args, **_kwargs: False)
 
@@ -125,16 +135,14 @@ def test_failed_identity_persistence_keeps_job_local_outcome(
     assert failure == "unable to record process identity; job not started"
     assert ticks == 0
     assert proc.wait_calls == 1
-    assert not gated.stderr_path.exists()
     _assert_gate_closed(gated.gate_fd)
 
 
 def test_cleanup_failure_preserves_connectivity_exception(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cleanup failure cannot mask the database connectivity exception."""
-    gated, proc = _gated(tmp_path)
+    """Convergence cannot mask the database connectivity exception."""
+    gated, proc = _gated()
     supervisor = _supervisor()
     monkeypatch.setattr(worker, "proc_start_ticks", lambda _pid: 123)
 
@@ -151,5 +159,4 @@ def test_cleanup_failure_preserves_connectivity_exception(
 
     assert caught.value is db_error
     assert proc.wait_calls == 1
-    assert not gated.stderr_path.exists()
     _assert_gate_closed(gated.gate_fd)
