@@ -14,30 +14,24 @@ import errno
 import io
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 import pytest
 
-from lubko import cli, lifecycle, supervise, supervisor, worker
+from lubko import cli, lifecycle, lifecycle_authority, supervise, supervisor, worker
 from lubko import deployctl as dc
 from lubko import durable as _durable
 from lubko import startup_contract as sc
 from lubko import state as _state_mod
-from lubko._exact_signal import proc_start_ticks
 from lubko.config import DatabaseConfig
-from lubko.durable import (
-    DurabilityError,
-    SlotError,
-    encode_fixed_slot,
-    is_fixed_slot,
-    read_fixed_slot,
-    rewrite_fixed_slot,
-    write_bytes_durable,
-)
+from tests._fake_authority_db import FakeAuthorityConnection
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from lubko.worker import JobsConnection
 
 
 def _no_space(*_args: object, **_kwargs: object) -> None:
@@ -412,8 +406,8 @@ def _prepare_deployed_tree(bin_home: Path) -> None:
     """Prepare an already-deployed tree while storage is still available.
 
     Installs launchers, the startup contract/definition, the required state
-    directories, the ownership lock file, and the secured identity slot, so a
-    later restart under exhausted storage exercises only pre-secured capacity.
+    directories, and the pre-created lock files, so a later restart under
+    exhausted storage exercises only reads, kernel state, and the database.
 
     Args:
         bin_home: Directory holding the installed launchers.
@@ -427,8 +421,7 @@ def _prepare_deployed_tree(bin_home: Path) -> None:
     sc.write_startup_launcher(bin_home)
     supervise.supervisor_lock_path().touch(mode=0o600, exist_ok=True)
     (supervise.supervisor_dir() / ".pending-request.lock").touch(exist_ok=True)
-    supervise.write_supervisor_pid(os.getpid(), proc_start_ticks(os.getpid()) or 0)
-    assert is_fixed_slot(supervise.supervisor_pid_path(), size=supervise.SUPERVISOR_PID_SLOT_SIZE)
+    (supervise.supervisor_dir() / ".consumer.lock").touch(exist_ok=True)
 
 
 def _deployed_files(root: Path) -> set[str]:
@@ -443,6 +436,25 @@ def _deployed_files(root: Path) -> set[str]:
     return {str(path.relative_to(root)) for path in root.rglob("*")}
 
 
+def _authority_daemon(
+    monkeypatch: pytest.MonkeyPatch, table: FakeAuthorityConnection, server: str = "srv-test"
+) -> supervisor.SupervisorDaemon:
+    """Build a daemon whose lifecycle authority rides on the fake database.
+
+    Args:
+        monkeypatch: Active monkeypatch fixture.
+        table: Fake authority connection backing every row read and write.
+        server: Execution-server identity the daemon claims.
+
+    Returns:
+        A daemon wired to the fake authority table.
+    """
+    monkeypatch.setattr(supervisor, "load_worker_server", lambda: server)
+    daemon = _supervisor_daemon()
+    daemon._authority_conn_factory = lambda: cast("JobsConnection", table)
+    return daemon
+
+
 @pytest.mark.usefixtures("supervisor_token")
 def test_prepared_restart_needs_no_new_blocks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, zero_allocation: Callable[..., None]
@@ -451,9 +463,15 @@ def test_prepared_restart_needs_no_new_blocks(
     state_root = _state_mod.state_root()
     bin_home = tmp_path / "bin"
     _prepare_deployed_tree(bin_home)
+    table = FakeAuthorityConnection()
+    first = _authority_daemon(monkeypatch, table)
+    first._write_pidfile()
+    assert first._authority is not None
+    assert first._authority.epoch == 1
+
+    supervise.supervisor_pid_path().write_bytes(b"torn [[[")
     launcher = bin_home / sc.STARTUP_LAUNCHER_NAME
     launcher_before = launcher.read_bytes()
-    pid_path = supervise.supervisor_pid_path()
     tree_before = _deployed_files(state_root)
     zero_allocation(str(state_root), str(bin_home))
 
@@ -463,24 +481,16 @@ def test_prepared_restart_needs_no_new_blocks(
 
     lock_fd = supervise.acquire_supervisor_lock()
     try:
-        daemon = _supervisor_daemon()
+        daemon = _authority_daemon(monkeypatch, table)
         daemon._write_pidfile()
     finally:
         os.close(lock_fd)
-    recorded = supervise.read_supervisor_pid()
-    assert recorded is not None
-    assert recorded[0] == os.getpid()
-    assert pid_path.stat().st_size == supervise.SUPERVISOR_PID_SLOT_SIZE
+    assert daemon._authority is not None
+    assert daemon._authority.epoch == 1
+    assert daemon._authority.pid == os.getpid()
 
-    daemon = _supervisor_daemon()
     daemon._next_db_check_at = float("inf")
-    monkeypatch.setattr(supervisor, "read_worker_health", lambda: None)
     monkeypatch.setattr(lifecycle, "_resolve_bin_home", lambda: bin_home)
-    monkeypatch.setattr(daemon, "_ensure_worker", lambda _commit: None)
-    monkeypatch.setattr(daemon, "_maybe_reset_backoff", lambda _state, _now: None)
-    monkeypatch.setattr(daemon, "_record_mission_progress", lambda _commit: None)
-    monkeypatch.setattr(daemon, "_probe_readiness", lambda _now: None)
-    monkeypatch.setattr(daemon, "_complete_cold_migration", lambda: None)
     daemon.reconcile(0.0)
     assert "no explicit" in (daemon._message or "")
     daemon._write_status()
@@ -491,53 +501,98 @@ def test_prepared_restart_needs_no_new_blocks(
 
 
 @pytest.mark.usefixtures("supervisor_token")
-def test_first_start_without_a_slot_fails_closed(
-    zero_allocation: Callable[..., None],
+def test_first_start_needs_no_new_blocks(
+    monkeypatch: pytest.MonkeyPatch, zero_allocation: Callable[..., None]
 ) -> None:
-    """Authority is never faked: securing capacity without space refuses loudly."""
-    zero_allocation(str(_state_mod.state_root()))
-    daemon = _supervisor_daemon()
-    with pytest.raises(SystemExit):
-        daemon._write_pidfile()
-    assert supervise.read_supervisor_pid() is None
+    """Even first contact secures authority in the row, never in new files."""
+    state_root = _state_mod.state_root()
+    (state_root / "supervisor").mkdir(mode=0o700, parents=True, exist_ok=True)
+    tree_before = _deployed_files(state_root)
+    zero_allocation(str(state_root))
+    table = FakeAuthorityConnection()
+    daemon = _authority_daemon(monkeypatch, table)
+    daemon._write_pidfile()
+    assert daemon._authority is not None
+    assert daemon._authority.epoch == 1
+    assert daemon._authority.pid == os.getpid()
+    assert not supervise.supervisor_pid_path().exists()
+    assert _deployed_files(state_root) == tree_before
 
 
 @pytest.mark.usefixtures("supervisor_token")
-def test_torn_identity_slot_never_reads_as_another_daemon() -> None:
-    """A partially overwritten identity record fails closed, never mismatched."""
-    supervise.write_supervisor_pid(os.getpid(), proc_start_ticks(os.getpid()) or 0)
-    path = supervise.supervisor_pid_path()
-    raw = bytearray(path.read_bytes())
-    assert len(raw) == supervise.SUPERVISOR_PID_SLOT_SIZE
-    raw[10] = (raw[10] + 1) % 256
-    path.write_bytes(bytes(raw))
-    with pytest.raises(supervise.MalformedSupervisorIdentityError):
-        supervise.read_supervisor_pid()
-    daemon = _supervisor_daemon()
-    with pytest.raises(SystemExit):
-        daemon._write_pidfile()
-
-
-def test_fixed_slot_rewrite_needs_no_new_blocks(
-    tmp_path: Path, zero_allocation: Callable[..., None]
+def test_unreachable_authority_holds_without_action(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prepared slots update in place; unprepared paths fail loudly, not silently."""
-    slot = tmp_path / "authority.slot"
-    assert read_fixed_slot(slot, size=256) is None
-    assert not is_fixed_slot(slot, size=256)
-    with pytest.raises(SlotError):
-        rewrite_fixed_slot(slot, b"v1", size=256)
-    write_bytes_durable(slot, encode_fixed_slot(b"v1", size=256))
-    assert read_fixed_slot(slot, size=256) == b"v1"
-    with pytest.raises(DurabilityError):
-        encode_fixed_slot(b"x" * 256, size=256)
+    """A partitioned incarnation is limited to observation until reconnect."""
+    table = FakeAuthorityConnection()
+    table.unreachable = True
+    daemon = _authority_daemon(monkeypatch, table)
+    with pytest.raises(lifecycle_authority.AuthorityUnavailableError):
+        daemon._write_pidfile()
+    assert daemon._authority is None
 
-    zero_allocation(str(tmp_path))
-    tree_before = {path.name for path in tmp_path.iterdir()}
-    rewrite_fixed_slot(slot, b"v2", size=256)
-    assert read_fixed_slot(slot, size=256) == b"v2"
-    assert slot.stat().st_size == 256
-    assert {path.name for path in tmp_path.iterdir()} == tree_before
+    owner = lifecycle_authority.AuthorityOwner(pid=1, start_time_ticks=2, boot_id="boot-1")
+    daemon._authority = lifecycle_authority.AuthorityClaim(
+        server="srv-test",
+        epoch=1,
+        pid=owner.pid,
+        start_time_ticks=owner.start_time_ticks,
+        boot_id=owner.boot_id,
+    )
+    assert daemon._confirm_authority() is False
+
+    def _forbidden_spawn(_commit: str) -> None:
+        msg = "spawn must not follow a failed authority confirmation"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(daemon, "_spawn_worker", _forbidden_spawn)
+    monkeypatch.setattr(supervisor, "read_state", lambda: supervise.SupervisorState.from_dict({}))
+    daemon._ensure_consumer_locked("c" * 40)
+    assert "unavailable or superseded" in (daemon._message or "")
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_live_row_owner_refuses_a_second_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fencing epoch held by a live supervisor is never stolen."""
+    table = FakeAuthorityConnection()
+    authority_daemon = _authority_daemon(monkeypatch, table)
+    authority_daemon._write_pidfile()
+    assert authority_daemon._authority is not None
+    recorded_ticks = authority_daemon._authority.start_time_ticks
+    monkeypatch.setattr(supervisor, "proc_start_ticks", lambda _pid: recorded_ticks + 1)
+    monkeypatch.setattr(supervise, "supervisor_owner_live", lambda _pid, _ticks: True)
+    contender = _authority_daemon(monkeypatch, table)
+    with pytest.raises(SystemExit):
+        contender._write_pidfile()
+    assert contender._authority is None
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_retire_without_fresh_authority_signals_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A superseded incarnation never signals a child from stale ownership."""
+    table = FakeAuthorityConnection()
+    daemon = _authority_daemon(monkeypatch, table)
+    owner = lifecycle_authority.AuthorityOwner(pid=1, start_time_ticks=2, boot_id="boot-1")
+    daemon._authority = lifecycle_authority.AuthorityClaim(
+        server="srv-test",
+        epoch=1,
+        pid=owner.pid,
+        start_time_ticks=owner.start_time_ticks,
+        boot_id=owner.boot_id,
+    )
+
+    def _forbidden_stop(_meta: object, _grace: float) -> bool:
+        msg = "stop must not follow a failed authority confirmation"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(lifecycle, "stop_worker", _forbidden_stop)
+    monkeypatch.setattr(supervisor, "read_state", lambda: SimpleNamespace(child=object()))
+    assert daemon._retire_child() is False
+    assert "unavailable or superseded" in (daemon._message or "")
 
 
 def test_worker_startup_prefix_needs_no_new_blocks(
