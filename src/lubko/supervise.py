@@ -637,6 +637,15 @@ class SupervisorStatus:
     #: supervisor daemon.  Used as a stability marker for cross-daemon
     #: durable state transitions.
     supervisor_runtime_contract_version: int | None = None
+    #: Wall-clock time the snapshot was published. ``0.0`` means the writer
+    #: predates publication timestamps (unknown age; accepted on identity
+    #: match for backward compatibility).
+    published_at: float = 0.0
+    #: In-memory count of observation-only diagnostic writes the publishing
+    #: daemon had dropped due to exhausted persistent-storage capacity at
+    #: publication time. Lets readers distinguish a fresh snapshot from one
+    #: published across a capacity outage.
+    diagnostic_drops: int = 0
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -670,6 +679,8 @@ class SupervisorStatus:
             "holding": self.holding,
             "supervisor_runtime_commit": self.supervisor_runtime_commit,
             "supervisor_runtime_contract_version": self.supervisor_runtime_contract_version,
+            "published_at": self.published_at,
+            "diagnostic_drops": self.diagnostic_drops,
         }
 
     @classmethod
@@ -751,6 +762,8 @@ class SupervisorStatus:
             supervisor_runtime_contract_version=_parse_diagnostic_nullable_int(
                 data, "supervisor_runtime_contract_version"
             ),
+            published_at=_parse_diagnostic_float(data, "published_at"),
+            diagnostic_drops=_parse_diagnostic_non_negative_int(data, "diagnostic_drops"),
         )
 
 
@@ -1748,7 +1761,14 @@ def write_status(status: SupervisorStatus) -> None:
     _write_json(status_path(), status.to_dict())
 
 
-def read_status() -> SupervisorStatus | None:
+#: Maximum age (seconds) of a timestamped status snapshot before readers
+#: treat it as stale. Snapshots that predate publication timestamps
+#: (``published_at <= 0``) carry unknown age and are accepted on identity
+#: match for backward compatibility.
+STATUS_MAX_AGE_SECONDS: Final = 30.0
+
+
+def read_status(max_age_seconds: float = STATUS_MAX_AGE_SECONDS) -> SupervisorStatus | None:
     """Load the machine-readable status.
 
     The status is only returned when its persisted identity matches the current
@@ -1758,22 +1778,31 @@ def read_status() -> SupervisorStatus | None:
     prevents stale, dead, replaced, or PID-reused snapshots from ever
     appearing ready.
 
+    Timestamped snapshots additionally expire: when ``published_at`` is
+    positive and older than ``max_age_seconds`` (for example because
+    observation writes were dropped during a capacity outage), ``None`` is
+    returned so readers honestly report unavailable rather than stale data.
+
+    Args:
+        max_age_seconds: Maximum accepted age of a timestamped snapshot.
+
     Returns:
-        The parsed status, or ``None`` when absent, malformed, or stale.
+        The parsed status, or ``None`` when absent, malformed, stale, or
+        expired.
     """
     data = _read_json(status_path())
-    if data is None:
-        return None
-    try:
-        status = SupervisorStatus.from_dict(data)
-    except (KeyError, TypeError, ValueError):
-        return None
-    if status.schema_version != SCHEMA_VERSION:
-        return None
-    if status.supervisor_pid == 0:
-        return None
-    if not _status_identity_matches(status):
-        return None
+    status: SupervisorStatus | None = None
+    if data is not None:
+        with suppress(KeyError, TypeError, ValueError):
+            parsed = SupervisorStatus.from_dict(data)
+            if parsed.schema_version == SCHEMA_VERSION and parsed.supervisor_pid != 0:
+                status = parsed
+    if status is not None and not _status_identity_matches(status):
+        status = None
+    if status is not None and status.published_at > 0:
+        age = time.time() - status.published_at
+        if age < 0 or age > max_age_seconds:
+            status = None
     return status
 
 
@@ -2926,6 +2955,33 @@ def _parse_diagnostic_nullable_float(data: dict[str, object], key: str) -> float
     """
     if key not in data or data[key] is None:
         return None
+    raw = data[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    value = _strict_finite_float(raw)
+    if value is None:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_diagnostic_float(data: dict[str, object], key: str) -> float:
+    """Parse a diagnostic timestamp, defaulting only genuine absence to zero.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        A finite float, or ``0.0`` for absence or explicit null (unknown age).
+
+    Raises:
+        TypeError: If a present non-null value is not a JSON number.
+        ValueError: If a present number is non-finite or unrepresentable.
+    """
+    if key not in data or data[key] is None:
+        return 0.0
     raw = data[key]
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         msg = "supervisor diagnostic is malformed"
