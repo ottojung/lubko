@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -759,3 +760,168 @@ def remove_durable(path: Path) -> None:
                 with contextlib.suppress(DurabilityError):
                     write_bytes_durable(destination, previous, _restore=False)
             raise
+
+
+class SlotError(RuntimeError):
+    """A preallocated fixed-size slot is absent, oversized, or fails verification.
+
+    Raising this error means the slot content was *not* confirmed: a torn,
+    truncated, or checksum-mismatched slot never reads as valid authority,
+    and a failed slot rewrite never reads as committed. Callers must fail
+    closed exactly as for :class:`DurabilityError`.
+    """
+
+
+def is_fixed_slot(path: Path, *, size: int) -> bool:
+    """Return whether ``path`` is an existing regular file of exactly ``size`` bytes.
+
+    Args:
+        path: Candidate slot path.
+        size: Exact fixed slot size in bytes.
+
+    Returns:
+        ``True`` only when ``path`` is a non-symlink regular file whose size
+        is exactly ``size``. Reads need no allocation.
+    """
+    destination = Path(path)
+    try:
+        st = destination.stat()
+    except OSError:
+        return False
+    return not destination.is_symlink() and st.st_size == size and destination.is_file()
+
+
+def encode_fixed_slot(payload: bytes, *, size: int) -> bytes:
+    """Encode ``payload`` as fixed-size slot bytes with a checksum envelope.
+
+    The envelope records the payload length and SHA-256 over the exact
+    payload bytes; the encoded record is padded with spaces to exactly
+    ``size`` bytes. A torn or partially overwritten slot therefore fails
+    verification instead of parsing as a different valid value.
+
+    Args:
+        payload: Exact authority bytes to store.
+        size: Exact fixed slot size in bytes.
+
+    Returns:
+        ``size`` bytes ready to write over a prepared slot.
+
+    Raises:
+        DurabilityError: If the enveloped payload does not fit in ``size``.
+            The oversize value is refused before any irreversible action.
+    """
+    envelope = (
+        json.dumps(
+            {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+                "payload_hex": payload.hex(),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if len(envelope) > size:
+        msg = f"payload of {len(payload)} bytes does not fit in a {size}-byte slot"
+        raise DurabilityError(msg)
+    return envelope + b" " * (size - len(envelope))
+
+
+def read_fixed_slot(path: Path, *, size: int) -> bytes | None:
+    """Read and verify the payload of a preallocated fixed-size slot.
+
+    Args:
+        path: Slot path.
+        size: Exact fixed slot size in bytes.
+
+    Returns:
+        The verified payload bytes, or ``None`` when the slot is genuinely
+        absent.
+
+    Raises:
+        SlotError: If the slot is present but is not exactly ``size`` bytes,
+            carries non-space padding, is not valid JSON, or fails the
+            length/checksum verification. A present-but-invalid slot never
+            reads as authority.
+    """
+    destination = Path(path)
+    try:
+        raw = destination.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        msg = f"cannot read slot {destination}: {exc}"
+        raise SlotError(msg) from exc
+    if len(raw) != size:
+        msg = f"slot {destination} has size {len(raw)}, expected {size}"
+        raise SlotError(msg)
+    stripped = raw.rstrip(b" ")
+    padding = raw[len(stripped) :]
+    if padding and set(padding) != {0x20}:
+        msg = f"slot {destination} carries invalid padding"
+        raise SlotError(msg)
+    try:
+        decoded = json.loads(stripped)
+    except ValueError as exc:
+        msg = f"slot {destination} is not valid JSON"
+        raise SlotError(msg) from exc
+    if not isinstance(decoded, dict):
+        msg = f"slot {destination} envelope must be an object"
+        raise SlotError(msg)
+    try:
+        payload = bytes.fromhex(str(decoded["payload_hex"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        msg = f"slot {destination} envelope is malformed"
+        raise SlotError(msg) from exc
+    if decoded.get("size") != len(payload):
+        msg = f"slot {destination} length verification failed"
+        raise SlotError(msg)
+    expected = str(decoded.get("sha256"))
+    if hashlib.sha256(payload).hexdigest() != expected:
+        msg = f"slot {destination} checksum verification failed"
+        raise SlotError(msg)
+    return payload
+
+
+def rewrite_fixed_slot(path: Path, payload: bytes, *, size: int) -> None:
+    """Rewrite a prepared fixed-size slot in place without new allocation.
+
+    The slot file must already exist with exactly ``size`` bytes (secured at
+    installation/deployment time, when free space is an operator concern):
+    the rewrite opens it without ``O_CREAT``, overwrites every byte, fsyncs,
+    and verifies the content by reading it back. No temporary file, rename,
+    or directory update is involved, so no new persistent-filesystem block
+    is required.
+
+    Args:
+        path: Prepared slot path.
+        payload: Exact authority bytes to store.
+        size: Exact fixed slot size in bytes.
+
+    Raises:
+        SlotError: If no prepared slot exists at ``path`` or the read-back
+            verification fails. The value is *not* confirmed.
+        DurabilityError: If the payload does not fit in ``size`` or the
+            in-place write cannot be completed.
+    """
+    destination = Path(path)
+    if not is_fixed_slot(destination, size=size):
+        msg = f"no prepared {size}-byte slot at {destination}"
+        raise SlotError(msg)
+    encoded = encode_fixed_slot(payload, size=size)
+    with _serialized(destination):
+        fd = None
+        try:
+            fd = os.open(str(destination), os.O_WRONLY)
+            _write_all(fd, encoded)
+            os.fsync(fd)
+        except OSError as exc:
+            msg = f"cannot rewrite slot {destination} in place: {exc}"
+            raise DurabilityError(msg) from exc
+        finally:
+            if fd is not None:
+                os.close(fd)
+        verified = read_fixed_slot(destination, size=size)
+        if verified != payload:
+            msg = f"slot {destination} verification failed after rewrite"
+            raise SlotError(msg)

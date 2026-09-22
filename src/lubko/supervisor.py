@@ -101,7 +101,7 @@ from lubko.control_socket import (
     bind_abstract_socket,
     validate_peercred,
 )
-from lubko.durable import DurabilityError, remove_durable, write_json_durable
+from lubko.durable import DurabilityError, SlotError, remove_durable, write_json_durable
 from lubko.health import (
     interpret_worker_health,
     prune_old_incarnation_artifacts,
@@ -4058,8 +4058,15 @@ class SupervisorDaemon:
         race a concurrent start.  The recorded-pid liveness check stays as
         defense in depth against a legacy flock-less daemon instance.
 
+        The identity record lives in a preallocated fixed-size slot: on an
+        already-deployed host the rewrite needs no new
+        persistent-filesystem block, while securing the slot itself (first
+        start) still fails closed when storage is exhausted.
+
         Raises:
-            SystemExit: If another live supervisor daemon is already running.
+            SystemExit: If another live supervisor daemon is already running,
+                the identity record is malformed, or the identity write
+                cannot be confirmed durable.
         """
         try:
             recorded = read_supervisor_pid()
@@ -4076,7 +4083,11 @@ class SupervisorDaemon:
             LOGGER.error(msg)
             raise SystemExit(1)
         self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
-        write_supervisor_pid(os.getpid(), self._start_time_ticks)
+        try:
+            write_supervisor_pid(os.getpid(), self._start_time_ticks)
+        except (DurabilityError, SlotError):
+            LOGGER.exception("cannot confirm the supervisor identity record")
+            raise SystemExit(1) from None
 
     def _write_status(self, message: str | None = None) -> None:
         """Publish the machine-readable status snapshot, best-effort.

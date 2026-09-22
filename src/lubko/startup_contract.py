@@ -222,8 +222,12 @@ def write_contract(contract: StartupContract = CURRENT_CONTRACT) -> None:
     Note:
         Fails closed: the write raises :class:`DurabilityError` from
         :func:`lubko.durable.write_json_durable` when it cannot be confirmed
-        durable.
+        durable. A contract that already equals the current contract exactly
+        is left untouched, so converging an already-valid deployment performs
+        no persistent-filesystem writes at all.
     """
+    if assess_recorded_contract().state == "current":
+        return
     write_json_durable(contract_path(), contract.to_dict())
 
 
@@ -364,6 +368,10 @@ def generate_startup_launcher_content() -> str:
 def write_startup_launcher(bin_home: Path) -> None:
     """Install the versioned startup launcher, verifying the write exactly.
 
+    A launcher that already matches the versioned generated source (content
+    and executable mode) is left untouched, so converging an already-valid
+    deployment performs no persistent-filesystem writes at all.
+
     Args:
         bin_home: Directory containing the launcher scripts.
 
@@ -374,6 +382,8 @@ def write_startup_launcher(bin_home: Path) -> None:
     if not bin_home.is_dir():
         msg = f"bin directory {bin_home} does not exist"
         raise OSError(msg)
+    if validate_startup_launcher(bin_home):
+        return
     target = bin_home / STARTUP_LAUNCHER_NAME
     expected = generate_startup_launcher_content().encode("utf-8")
     # Crash-durable, atomic install: write the bytes (temp + fsync + rename +
@@ -564,7 +574,12 @@ def write_startup_definition() -> None:
     The definition is deployment authority: the supported install/bootstrap path
     installs it and the verifier requires it to match exactly, so the write must
     be confirmed durable before the definition it asserts is treated as active.
+    A definition that already matches the current contract exactly is left
+    untouched, so converging an already-valid deployment performs no
+    persistent-filesystem writes at all.
     """
+    if validate_startup_definition().ok:
+        return
     write_json_durable(startup_definition_path(), generate_startup_definition())
 
 
