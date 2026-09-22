@@ -5,6 +5,15 @@
 - **Deciders:** Lubko maintainers
 - **Related issue:** #797
 - **Supersedes / Superseded by:** none
+- **Revision note:** An earlier revision of this ADR made crash-durable
+  authority bounded preallocated filesystem slots rewritten in place. That
+  design was rejected in review of PR #803: in-place `pwrite` + `fsync` is
+  not a portable guarantee at zero free space (metadata/journal/CoW
+  allocation can still fail), and the resulting fail-closed hold would block
+  job execution — contradicting #797. This revision moves crash-durable
+  lifecycle authority off the local persistent filesystem entirely, into the
+  already-required Supabase/PostgreSQL protocol, so steady-state progress
+  requires no successful persistent-filesystem mutation.
 
 ## Context
 
@@ -104,83 +113,124 @@ holds only the unpublished tail and is lost on reboot by design.
 
 ## Decision
 
-### Principle 1 — Steady-state operation performs no persistent-filesystem allocation
+### Principle 1 — Steady-state progress requires no successful persistent-filesystem mutation
 
 After deployment, every action on the supervisor/worker hot path — daemon
 start, crash recovery, child spawn and supervision, queue polling, job
 execution, result publication, status/health publication — must be able to
-complete with zero free persistent blocks. Concretely, the implementation
-issues must ensure each of these paths does one of the following, in
-preference order:
+complete with zero free persistent blocks **even when every local
+filesystem mutation attempted on that path fails**. Concretely, no
+lifecycle decision and no job-execution step may depend on a local file
+write succeeding. Local filesystem writes on these paths are permitted
+only as opportunistic caches whose failure is ignored (see Principle 2).
+The mechanisms that carry progress are, in preference order:
 
-1. **No filesystem write at all.** Prefer kernel or memory mechanisms:
-   abstract socket (already used for control), pipes, `pidfd`, in-memory
-   counters, `flock` holdings on pre-created rendezvous files opened without
-   `O_CREAT`.
-2. **Bounded in-place rewrite of pre-reserved capacity.** Where a durable
-   transition genuinely needs crash-durable bytes after exhaustion, that
-   capacity is reserved *before* exhaustion (see Principle 2) and the
-   steady-state write overwrites already-allocated blocks in place
-   (fixed-size slot rewrite + `fsync`), requiring no new block allocation.
-3. **Best-effort diagnostic write that degrades silently.** Class 4 writes
+1. **The Supabase/PostgreSQL protocol** for all crash-durable lifecycle
+   authority (Principle 2). The worker already requires the database for
+   queue claiming and result publication, so authority over the database
+   adds no new availability dependency to the job path: whenever the
+   worker can execute and publish jobs, it can also confirm lifecycle
+   transitions.
+2. **Kernel or memory mechanisms** needing no filesystem bytes: the
+   abstract control socket (already used for control), pipes, `pidfd`,
+   in-memory counters, `memfd` capture buffers, and `flock` holdings on
+   pre-created rendezvous files opened without `O_CREAT`.
+3. **Best-effort diagnostic writes that degrade silently.** Class 4 writes
    that fail with `ENOSPC` are dropped (with an in-memory drop counter
    exposed over the control socket) and must never fail, block, or alter a
    lifecycle decision.
-4. **Fail-closed per-job degradation.** If a Class 5 spool cannot be
-   created or extended, exactly the offending job fails closed; the worker
-   itself stays alive and keeps serving other jobs.
+4. **Fail-closed per-job degradation.** If a Class 5 capture buffer cannot
+   be created or extended, exactly the offending job fails closed; the
+   worker itself stays alive and keeps serving other jobs.
 
 No path may assume any pathname is tmpfs, RAM-backed, on a separate
 filesystem, or has spare blocks (per `$id-3157892460835174`). In particular,
 no path may require the operator to mount `/tmp`, `/run`, or anything else
 as tmpfs.
 
-### Principle 2 — Durable authority uses bounded preallocated slots
+### Principle 2 — Crash-durable lifecycle authority lives in the existing database protocol
 
-For each Class 2 file that can be rewritten during already-deployed
-steady-state operation, the implementation must, at install/deploy time
-(when free space is an operator precondition, not a runtime assumption):
+All Class 2 state that can change during already-deployed steady-state
+operation moves from local files into the existing `lubko.jobs` table as a
+new application payload kind (for example `lifecycle_authority`), one
+current-state row per execution server. The table's PostgreSQL metadata is
+frozen (`docs/SKILL.md`, `docs/protocol_upgrades.md`): `payload` stays
+opaque text, and the new kind is a pure application-protocol evolution —
+no new tables, columns, indexes, roles, grants, triggers, or functions.
+Server isolation reuses the existing exact application-level server
+predicates, and the row kind is permanently exempt from worker GC (GC
+predicates match only job/output types; the authority row is never
+terminal).
 
-- preallocate a fixed-size slot (e.g. a 4 KiB record: generation counter +
-  bounded payload + checksum) sized to the file's documented maximum;
-- perform steady-state transitions as whole-slot in-place rewrites
-  (`pwrite` of the full slot + `fsync`), never as create/rename sequences
-  that allocate new directory entries and inodes.
+The local Class 2 files (`worker/meta.json`, `supervisor/<token>/…`,
+`supervisor.pid`, `cli/current`, deployment snapshots, sidecars) become
+**read-through caches, never authority**. Writers commit the database
+transaction first and then attempt the local cache write, ignoring local
+failure entirely (no `fsync`, no error propagation). Readers treat the
+database row as the source of truth: a cache entry is usable only when its
+embedded generation/epoch matches the row just read; on any disagreement
+the row wins. Torn or stale caches are therefore fail-closed by
+construction, and a host with zero free blocks operates correctly with an
+absent or outdated cache.
 
-Each slot's logical capacity is bounded and documented. When a transition
-would exceed its slot (for example a rollback snapshot larger than the
-reserved bound), the transition is refused with an explicit error to the
-operator *before* any irreversible lifecycle action — it is never silently
-truncated and never partially applied. Refusal behavior per file:
+**Ordering.** The linearization point of every lifecycle transition is the
+commit of a single database transaction against the authority row. Mutations
+use compare-and-swap predicates on the row's contents (`UPDATE … WHERE id
+= … AND generation/epoch/state = expected`), with `SELECT … FOR UPDATE`
+serialization for multi-step transitions — the same transactional
+discipline the worker already uses for queue claiming (`FOR UPDATE SKIP
+LOCKED`). Generation allocation is an atomic increment inside the row
+update; the pre-spawn obligation is a committed row state *before* the
+spawn syscall; desired-state and mission transitions are row CAS operations
+performed by deployctl through the same database connection it already
+requires.
 
-- `worker/rollback.json` / deployment snapshots: refuse the deployment or
-  confirmation; the previous mission stays authoritative.
-- `supervisor/<token>/state.json` / `desired.json` / `reserved_generation` /
-  `supervisor.pid`: these have fixed small schemas by construction; any
-  growth beyond the slot is a programming error and must fail closed (hold
-  the previous value, take no lifecycle action).
-- One-shot handoff files (`pending-request.json`, `pending-ack/`) belong to
-  installation, not steady state; they keep create/rename semantics and may
-  fail loudly to the installer under `ENOSPC`.
+**Crash recovery.** A restarted daemon reads the authority row (reads need
+no local allocation), re-proves liveness from `pidfd` / `/proc` start-time
+evidence, and reconciles: a committed pre-spawn obligation with no live
+child resolves deterministically (complete the adoption or roll it back,
+exactly as the current state machine prescribes); a live child matching
+the row's exact `{pid, start-time-ticks, incarnation epoch}` is adopted;
+anything else is fenced, never adopted. A `boot_id` / incarnation epoch in
+the row invalidates all pre-crash claims after a host reboot.
 
-If a slot rewrite cannot be confirmed for any reason (including `ENOSPC`
-from filesystem metadata/journal pressure despite preallocation), the
-existing `durable.py` contract already governs: the value is *not* written,
-the previous destination is untouched, and the caller must not advance any
-irreversible lifecycle action that depended on it. That contract is
-unchanged; this ADR only removes the *need* for allocation on paths where
-the intents forbid depending on it.
+**Network-unavailable behavior.** Losing the database never causes unsafe
+action, and never causes more harm than the status quo: without the
+database the worker can neither claim jobs nor publish results today, so
+holding lifecycle transitions adds no new outage. While disconnected, the
+daemons hold (no spawn, no retire, no reconcile, no generation allocation),
+keep supervising already-owned children (signal decisions need no
+authority), buffer unpublished results in bounded memory, and retry with
+bounded backoff. Destructive actions additionally require a fresh row read;
+cached authority older than the decision is never sufficient. On reconnect,
+the first act is a row read; any local incarnation whose epoch no longer
+matches the row stands down immediately (fencing), so a partitioned old
+supervisor can never contradict the new authority.
 
-### Principle 3 — Recovery is read-only plus kernel state
+**Boundedness.** The authority row has a fixed small schema (generations,
+epochs, exact-identity tuples, phase flags, bounded mission descriptor);
+application code rejects payloads above a documented byte bound, and
+transitions that would exceed it are refused before any irreversible
+action, exactly as deployments are refused today. No history accumulates:
+the row holds current state only (history remains in job outputs and
+diagnostics). The bounded in-memory result buffer degrades per-job
+fail-closed when full. One-shot install-handoff state keeps local-file
+semantics — installation has network, database, and free-space
+preconditions and may fail loudly — and bootstraps the row with an
+idempotent insert at install time.
 
-Crash recovery with zero free blocks must work because recovery:
+### Principle 3 — Recovery needs reads plus kernel state, never local writes
 
-- **reads** Class 1 and Class 2 files (reads need no allocation);
+Crash recovery with zero free blocks works because recovery:
+
+- **reads** the authority row from the database and Class 1 files locally
+  (reads need no allocation);
 - re-verifies liveness from `pidfd` / `/proc` start-time evidence, never
   from files it must first write;
-- re-establishes mutual exclusion by opening *existing* rendezvous lock
-  files without `O_CREAT` and taking `flock` (kernel state, no
-  allocation);
+- re-establishes local mutual exclusion by opening *existing* rendezvous
+  lock files without `O_CREAT` and taking `flock` (kernel state, no
+  allocation) — kept only as a local fast path; cross-incarnation
+  exclusion comes from the row's fencing epoch;
 - rebinds the abstract control socket (kernel memory, no pathname);
 - treats a missing drain sentinel as "not drained" (conservative,
   fail-closed) rather than requiring sentinel creation during recovery.
@@ -188,8 +238,8 @@ Crash recovery with zero free blocks must work because recovery:
 No recovery path may create files, create directories, rotate logs, or
 publish health/status as a precondition for resuming supervision. Deferred
 maintenance (directory creation for new incarnation artifacts, log rotation,
-health publication) happens opportunistically when writes succeed and is
-skipped without effect on authority when they do not.
+health publication, cache rewrite) happens opportunistically when writes
+succeed and is skipped without effect on authority when they do not.
 
 ### Principle 4 — Job capture leaves the persistent filesystem
 
@@ -212,28 +262,32 @@ semantics and may fail loudly.
 
 ### Principle 5 — Fail-closed lifecycle invariants are preserved exactly
 
-- **No duplicate maintained worker:** worker identity still resolves from
-  `worker/meta.json` plus live-process evidence; when the identity write
-  cannot be confirmed, no spawn proceeds (unchanged `DurabilityError`
-  semantics).
-- **No unowned spawned user process:** the pre-spawn spawning obligation in
-  `supervisor/<token>/state.json` is a Class 2 slot rewrite *before* spawn;
-  if it cannot be confirmed, the spawn does not happen.
-- **No unsafe PID/PGID reuse decisions:** reuse decisions still require the
-  exact `{pid, start-time-ticks}` match against live kernel evidence; a
-  missing or unconfirmable file never reads as "reusable".
-- **No false durable transition after a crash:** readers still treat absent,
-  torn (checksum/generation mismatch), or superseded slot contents as
-  "no value", and every writer still treats an unconfirmed write as "not
-  written". Slot checksums/generations replace the current torn-write
-  protection lost by moving from rename-atomicity to in-place rewrite:
-  a torn slot is detectable and therefore fail-closed.
+- **No duplicate maintained worker:** at most one incarnation holds the
+  authority row's fencing epoch. A contender commits a CAS epoch bump;
+  exactly one commit wins, and the loser observes the mismatch and stands
+  down without spawning. Worker identity in the row plus live-process
+  proof replaces `worker/meta.json` as the ownership decision.
+- **No unowned spawned user process:** the pre-spawn obligation is a
+  committed row state *before* the spawn syscall; if the commit fails
+  (database unreachable), the spawn does not happen. A crash between
+  commit and spawn leaves a deterministic recovery obligation in the row.
+- **No unsafe PID/PGID reuse decisions:** reuse decisions still require
+  the exact `{pid, start-time-ticks}` match against live kernel evidence,
+  now cross-checked with the row's claimed identity and epoch; a missing
+  row, an epoch mismatch, or a failed proof never reads as "reusable".
+- **No false durable transition after a crash:** the durable transition
+  is the database commit. An uncommitted transaction is invisible to every
+  recoverer; a committed one is visible to all of them. Local caches can
+  be absent, stale, or torn without effect because readers validate them
+  against the row generation/epoch and the row always wins.
 
 ## Non-goals
 
 This ADR specifies semantics only. It does not change any call site, split
 work into child issues, or alter the `durable.py` API. Implementation
-issues own: slot layout and per-file bounds, the `memfd` capture rewrite,
-opening rendezvous files without `O_CREAT`, Fahrenheit-scale audit of every
-steady-state write path, and tests expressing these invariants within the
-repository's sub-ten-second deterministic suite.
+issues own: the authority-row payload schema and CAS helpers, GC exemption
+and server predicates for the new row kind, the `memfd` capture rewrite,
+demoting local authority files to validated caches, opening rendezvous
+files without `O_CREAT`, the disconnect hold/reconnect fencing behavior,
+and tests expressing these invariants within the repository's
+sub-ten-second deterministic suite.
