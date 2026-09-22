@@ -173,6 +173,34 @@ the row wins. Torn or stale caches are therefore fail-closed by
 construction, and a host with zero free blocks operates correctly with an
 absent or outdated cache.
 
+**Identity, bootstrap, and discovery.** Uniqueness is mechanical and needs
+no new database constraint: the authority row's `id` is a deterministic
+UUID derived in application code from the execution-server name (UUIDv5
+over a fixed Lubko namespace UUID plus the exact server string), and the
+frozen `id uuid primary key` already rejects a second row with that `id`.
+Concurrent or retried bootstraps therefore converge: each attempts
+`INSERT … ON CONFLICT (id) DO NOTHING` with the neutral initial payload
+(no owner, generation and epoch zero), then reads the row; exactly one
+insert wins and every contender proceeds on the same row, so two daemons
+can never CAS different rows and both believe they own the fencing epoch.
+(A UUIDv5 collision between distinct server names is cryptographically
+negligible; identical server names denote the same authority domain by
+definition.)
+
+Every fresh daemon discovers and verifies the canonical authority with no
+mutable local state and no local allocation: it reads its server name from
+the read-only operator-installed worker config (Class 1; reads need no
+allocation), derives the authority `id` in memory, and `SELECT`s that `id`.
+It then verifies, fail-closed, that the row exists (else it runs the
+bootstrap insert above and re-reads), that `payload.server` equals its own
+server name, that the payload kind is `lifecycle_authority` at a supported
+protocol version, and that the schema validates — any mismatch means "no
+usable authority": hold, never act. Destructive decisions additionally
+re-read the row inside the decision transaction, so a cache or an early
+read can never authorize killing, spawning, or retiring. At zero free
+blocks this path performs zero local writes: config read, in-memory UUID
+derivation, database reads, kernel liveness proof.
+
 **Ordering.** The linearization point of every lifecycle transition is the
 commit of a single database transaction against the authority row. Mutations
 use compare-and-swap predicates on the row's contents (`UPDATE … WHERE id
@@ -216,8 +244,9 @@ the row holds current state only (history remains in job outputs and
 diagnostics). The bounded in-memory result buffer degrades per-job
 fail-closed when full. One-shot install-handoff state keeps local-file
 semantics — installation has network, database, and free-space
-preconditions and may fail loudly — and bootstraps the row with an
-idempotent insert at install time.
+preconditions and may fail loudly — and performs the bootstrap insert
+described above at install time (safe to repeat: it converges by primary
+key).
 
 ### Principle 3 — Recovery needs reads plus kernel state, never local writes
 
