@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import math
 import os
 import resource
@@ -52,17 +53,7 @@ from lubko._exact_signal import open_pidfd as _open_supervisor_pidfd
 from lubko._exact_signal import pidfd_send_signal as _pidfd_send_signal
 from lubko._exact_signal import proc_start_ticks as _shared_proc_start_ticks
 from lubko._exact_signal import process_is_zombie as _shared_process_is_zombie
-from lubko.durable import (
-    DurabilityError,
-    SlotError,
-    encode_fixed_slot,
-    is_fixed_slot,
-    read_fixed_slot,
-    remove_durable,
-    rewrite_fixed_slot,
-    write_bytes_durable,
-    write_json_durable,
-)
+from lubko.durable import DurabilityError, remove_durable, write_json_durable
 from lubko.health import validate_incarnation_token
 from lubko.state import (
     SupervisorStateTokenError,
@@ -75,6 +66,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
 SCHEMA_VERSION: Final = 1
+
+LOGGER: Final = logging.getLogger("lubko.supervise")
 
 BOOT_ID_PATH: Final = Path("/proc/sys/kernel/random/boot_id")
 
@@ -1136,63 +1129,6 @@ def supervisor_pid_path() -> Path:
     return supervisor_dir() / "supervisor.pid"
 
 
-#: Bounded size of the preallocated ``supervisor.pid`` slot. The identity
-#: record is rewritten in place inside these bytes on every daemon start, so
-#: an already-deployed restart needs no new persistent-filesystem block. The
-#: capacity is secured (via a crash-durable write) the first time the daemon
-#: starts with free space available — installation, first deployment, and
-#: staging of new artifacts all happen while the operator still has free
-#: space — and every later restart only overwrites the secured bytes.
-SUPERVISOR_PID_SLOT_SIZE: Final = 4096
-
-
-def _supervisor_pid_record(pid: int, start_time_ticks: int) -> bytes:
-    """Return the canonical identity record bytes for a daemon incarnation.
-
-    Args:
-        pid: The daemon's process ID.
-        start_time_ticks: The daemon's start time in clock ticks.
-
-    Returns:
-        Canonical sorted-key JSON bytes.
-    """
-    return (
-        json.dumps(
-            {"schema_version": SCHEMA_VERSION, "pid": pid, "start_time_ticks": start_time_ticks},
-            sort_keys=True,
-        ).encode("utf-8")
-        + b"\n"
-    )
-
-
-def _parse_supervisor_pid_record(raw: bytes) -> tuple[int, int]:
-    """Parse canonical identity record bytes into an exact identity pair.
-
-    Args:
-        raw: Canonical record bytes.
-
-    Returns:
-        The ``(pid, start_time_ticks)`` pair.
-
-    Raises:
-        MalformedSupervisorIdentityError: If the record has an unsupported
-            schema or a malformed exact process identity. A torn or foreign
-            value never parses as a different valid identity.
-    """
-    try:
-        decoded = json.loads(raw)
-    except ValueError as exc:
-        raise MalformedSupervisorIdentityError from exc
-    if not isinstance(decoded, dict):
-        raise MalformedSupervisorIdentityError
-    schema_version = _strict_int(decoded.get("schema_version"))
-    pid = _strict_non_negative_int(decoded.get("pid"))
-    ticks = _strict_non_negative_int(decoded.get("start_time_ticks"))
-    if schema_version != SCHEMA_VERSION or pid is None or pid <= 0 or ticks is None:
-        raise MalformedSupervisorIdentityError
-    return pid, ticks
-
-
 class ConsumerLockTimeoutError(Exception):
     """The consumer-establishment lock could not be acquired in time."""
 
@@ -1895,35 +1831,36 @@ def _status_identity_matches(status: SupervisorStatus) -> bool:
 
 
 def write_supervisor_pid(pid: int, start_time_ticks: int) -> None:
-    """Crash-durably persist the daemon's exact identity for detection by the CLIs.
+    """Refresh the daemon identity cache without allocating on failure.
 
-    The identity file is recovery authority: it is the exact live supervisor
-    incarnation that every status/health reader binds against, so the write
-    must be confirmed durable.
-
-    When a prepared fixed-size slot already exists at the identity path, the
-    record is rewritten in place inside the secured bytes (no temporary file,
-    rename, or directory update), so an already-deployed restart needs no new
-    persistent-filesystem block. Otherwise the slot itself is secured first
-    with one crash-durable write — installation and first deployment happen
-    while the operator still has free space — and every later restart only
-    overwrites the secured bytes.
+    The identity file is a read-through cache, never authority: crash-durable
+    lifecycle authority lives in the database row (see
+    :mod:`lubko.lifecycle_authority`), and readers use a cache entry only
+    when it matches a freshly read row. The cache write is therefore attempted
+    best-effort and any local failure is ignored entirely — no ``fsync``, no
+    error propagation — so an already-deployed restart never needs a new
+    persistent-filesystem block for it. A torn or stale cache fails closed by
+    construction because the row always wins.
 
     Args:
         pid: The daemon's process ID.
         start_time_ticks: The daemon's start time in clock ticks.
-
-    Note:
-        Fails closed: the write raises :class:`DurabilityError` (or
-        :class:`SlotError` from the in-place rewrite) when it cannot be
-        confirmed durable. The authority is never faked best-effort.
     """
     path = supervisor_pid_path()
-    record = _supervisor_pid_record(pid, start_time_ticks)
-    if is_fixed_slot(path, size=SUPERVISOR_PID_SLOT_SIZE):
-        rewrite_fixed_slot(path, record, size=SUPERVISOR_PID_SLOT_SIZE)
-        return
-    write_bytes_durable(path, encode_fixed_slot(record, size=SUPERVISOR_PID_SLOT_SIZE))
+    payload = (
+        json.dumps(
+            {"schema_version": SCHEMA_VERSION, "pid": pid, "start_time_ticks": start_time_ticks},
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        LOGGER.debug("supervisor identity cache write dropped", exc_info=True)
 
 
 class MalformedSupervisorIdentityError(ValueError):
@@ -1933,9 +1870,10 @@ class MalformedSupervisorIdentityError(ValueError):
 def read_supervisor_pid() -> tuple[int, int] | None:
     """Load the recorded daemon identity without normalizing malformed authority.
 
-    A slot-sized file is always parsed as a checksummed preallocated slot: a
-    torn slot fails verification instead of parsing as legacy content, so a
-    partially overwritten identity never reads as a different valid daemon.
+    The identity file is a cache, never authority: callers making lifecycle
+    decisions must validate any entry against a fresh database row read (see
+    :mod:`lubko.lifecycle_authority`) and let the row win on disagreement. A
+    torn cache therefore fails here instead of authorizing anything.
 
     Returns:
         The ``(pid, start_time_ticks)`` pair, or ``None`` when the identity
@@ -1946,21 +1884,25 @@ def read_supervisor_pid() -> tuple[int, int] | None:
             unsupported schema or malformed exact process identity.
     """
     path = supervisor_pid_path()
-    if is_fixed_slot(path, size=SUPERVISOR_PID_SLOT_SIZE):
-        try:
-            raw = read_fixed_slot(path, size=SUPERVISOR_PID_SLOT_SIZE)
-        except SlotError as exc:
-            raise MalformedSupervisorIdentityError from exc
-        if raw is None:
-            return None
-        return _parse_supervisor_pid_record(raw)
     try:
-        raw_text = path.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise MalformedSupervisorIdentityError from exc
-    return _parse_supervisor_pid_record(raw_text.encode("utf-8"))
+    try:
+        decoded = json.loads(raw)
+    except ValueError as exc:
+        raise MalformedSupervisorIdentityError from exc
+    if not isinstance(decoded, dict):
+        raise MalformedSupervisorIdentityError
+    data: dict[str, object] = decoded
+    schema_version = _strict_int(data.get("schema_version"))
+    pid = _strict_non_negative_int(data.get("pid"))
+    ticks = _strict_non_negative_int(data.get("start_time_ticks"))
+    if schema_version != SCHEMA_VERSION or pid is None or pid <= 0 or ticks is None:
+        raise MalformedSupervisorIdentityError
+    return pid, ticks
 
 
 class PidfileIdentityMismatchError(Exception):
@@ -2003,13 +1945,22 @@ def restore_supervisor_pid(pid: int, start_time_ticks: int) -> None:
     """Restore a previously retired supervisor pidfile.
 
     Called by A when the TRANSFER write fails: the exact identity that was
-    removed is written back so A remains discoverable by CLIs.
+    removed is written back so A remains discoverable by CLIs. The handoff
+    protocol runs as an explicit deployment transition with free-space
+    preconditions, so the restoration stays a confirmed durable write.
 
     Args:
         pid: The daemon's process ID.
         start_time_ticks: The daemon's start time in clock ticks.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` when it
+        cannot be confirmed durable.
     """
-    write_supervisor_pid(pid, start_time_ticks)
+    write_json_durable(
+        supervisor_pid_path(),
+        {"schema_version": SCHEMA_VERSION, "pid": pid, "start_time_ticks": start_time_ticks},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2642,6 +2593,32 @@ def supervisor_running() -> bool:
     if proc_start_ticks(pid) != ticks:
         return False
     return "lubko-supervisor" in _read_cmdline(pid) or "lubko.supervisor" in _read_cmdline(pid)
+
+
+def supervisor_owner_live(pid: int, ticks: int) -> bool:
+    """Return whether an authority-row owner identity is a live supervisor.
+
+    Read-only kernel evidence with the same standard as
+    :func:`supervisor_running` but for an explicit identity rather than the
+    local cache: exact ``{pid, start-time-ticks}`` match against a live
+    non-zombie process whose command line names the supervisor. A missing
+    row owner, an epoch mismatch, or a failed proof never reads as live.
+
+    Args:
+        pid: Owner process ID from the authority row.
+        ticks: Owner start time in clock ticks from the authority row.
+
+    Returns:
+        ``True`` only for a live supervisor process with the exact identity.
+    """
+    if pid <= 0 or ticks == 0:
+        return False
+    if _process_is_zombie(pid):
+        return False
+    if proc_start_ticks(pid) != ticks:
+        return False
+    cmdline = _read_cmdline(pid)
+    return "lubko-supervisor" in cmdline or "lubko.supervisor" in cmdline
 
 
 # ---------------------------------------------------------------------------
