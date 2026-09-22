@@ -19,6 +19,7 @@ health snapshot or the operational log.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import math
@@ -31,7 +32,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, override
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -73,6 +74,52 @@ LIFECYCLE_MARKER_VAR: Final = "LUBKO_LIFECYCLE_TOKEN"
 
 #: Regex matching safe filename components (hex tokens, alphanumerics, hyphens).
 _SAFE_FILENAME_RE: Final = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+#: Errnos reporting exhausted persistent-storage capacity. Observation-only
+#: diagnostic writes suffering these failures are dropped silently (counted
+#: in memory) so they can never fail, block, or alter a lifecycle decision.
+_CAPACITY_ERRNOS: Final = frozenset({errno.ENOSPC, errno.EDQUOT})
+
+
+@dataclass(slots=True)
+class _DiagnosticDropCounters:
+    """In-memory counts of observation-only writes dropped for capacity reasons."""
+
+    health_writes: int = 0
+    worker_log_records: int = 0
+
+
+_drop_counters = _DiagnosticDropCounters()
+
+
+def _is_capacity_error(exc: BaseException) -> bool:
+    """Return whether a failure reports exhausted persistent-storage capacity.
+
+    Args:
+        exc: The failure to classify.
+
+    Returns:
+        ``True`` for ``OSError`` with ``ENOSPC``/``EDQUOT`` only.
+    """
+    return isinstance(exc, OSError) and exc.errno in _CAPACITY_ERRNOS
+
+
+def health_write_drops() -> int:
+    """Return the in-memory count of dropped worker health snapshots.
+
+    Returns:
+        The number of health snapshots dropped due to exhausted capacity.
+    """
+    return _drop_counters.health_writes
+
+
+def worker_log_drops() -> int:
+    """Return the in-memory count of dropped worker log records.
+
+    Returns:
+        The number of worker log emissions dropped due to exhausted capacity.
+    """
+    return _drop_counters.worker_log_records
 
 
 def validate_incarnation_token(token: str) -> None:
@@ -695,36 +742,64 @@ def _optional_str(value: object) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def write_worker_health(health: WorkerHealth) -> None:
+def write_worker_health(health: WorkerHealth) -> bool:
     """Atomically persist a worker health snapshot for its incarnation.
 
     The worker writes **only** to its own per-incarnation file.  It never
     touches the stable ``health.json`` symlink: the supervisor is the sole
     authority that publishes the stable read surface.
 
-    On failure the temporary file is cleaned up so a partial write never
-    poisons the directory.
+    The snapshot is observation-only diagnostics, never lifecycle authority:
+    exhausted-capacity failures (``ENOSPC``/``EDQUOT``) are dropped silently
+    — counted in memory via :func:`health_write_drops` — and reported as
+    ``False`` so they can never fail, block, or alter a lifecycle decision.
+    Any other failure still propagates. On failure the temporary file is
+    cleaned up so a partial write never poisons the directory.
 
     Args:
         health: Health snapshot to store.
+
+    Returns:
+        ``True`` when the snapshot was published, ``False`` when it was
+        dropped due to exhausted persistent-storage capacity.
+
+    Raises:
+        OSError: If the write fails for a reason other than exhausted
+            persistent-storage capacity.
     """
     validate_incarnation_token(health.worker_incarnation)
     inc_path = health_incarnation_path(health.worker_incarnation)
-    inc_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(inc_path.parent),
-        prefix=f"health-{health.worker_incarnation}",
-        suffix=".tmp",
-    )
+    try:
+        inc_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(inc_path.parent),
+            prefix=f"health-{health.worker_incarnation}",
+            suffix=".tmp",
+        )
+    except OSError as exc:
+        if _is_capacity_error(exc):
+            _drop_counters.health_writes += 1
+            LOGGER.debug("worker health snapshot dropped: exhausted storage")
+            return False
+        raise
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(health.to_dict(), fh, sort_keys=True)
             fh.write("\n")
         Path(tmp_name).replace(inc_path)
+    except OSError as exc:
+        with suppress(OSError):
+            Path(tmp_name).unlink()
+        if _is_capacity_error(exc):
+            _drop_counters.health_writes += 1
+            LOGGER.debug("worker health snapshot dropped: exhausted storage")
+            return False
+        raise
     except BaseException:
         with suppress(OSError):
             Path(tmp_name).unlink()
         raise
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +1004,10 @@ def _prune_dir(directory: Path, keep_prefix: str, pattern: str) -> None:
         try:
             entry.unlink()
         except OSError:
-            LOGGER.warning("could not prune old artifact %s", entry, exc_info=True)
+            # Pruning is deferred maintenance, never lifecycle authority:
+            # report at debug level so a prolonged capacity outage cannot
+            # amplify into unbounded error logging.
+            LOGGER.debug("could not prune old artifact %s", entry, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1372,6 +1450,30 @@ def proc_start_ticks(pid: int) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+class _QuietWorkerLogHandler(RotatingFileHandler):
+    """A bounded worker log handler that never escapes filesystem failures.
+
+    Log emission is observation-only: ``RotatingFileHandler`` routes write
+    and rotation failures to :meth:`handleError`, which counts
+    exhausted-capacity failures (``ENOSPC``/``EDQUOT``) in memory via
+    :func:`worker_log_drops` and suppresses everything, so logging can
+    never fail, block, or alter worker supervision. Exactly one attempt is
+    made per record; there is no retry loop.
+    """
+
+    @override
+    def emit(self, record: logging.LogRecord) -> None:
+        """Write one record; failures route to :meth:`handleError`."""
+        super().emit(record)
+
+    @override
+    def handleError(self, record: logging.LogRecord) -> None:
+        """Count capacity failures and keep logging outside lifecycle decisions."""
+        exc = sys.exception()
+        if exc is not None and _is_capacity_error(exc):
+            _drop_counters.worker_log_records += 1
+
+
 def configure_worker_logging(incarnation: str) -> logging.Logger:
     """Configure the ``lubko.worker`` logger with a per-incarnation handler.
 
@@ -1380,6 +1482,11 @@ def configure_worker_logging(incarnation: str) -> logging.Logger:
     ``lubko.worker`` logger (not the root logger), so unrelated library
     loggers cannot leak sentinel secrets or operational noise into the
     worker log.
+
+    Log storage is observation-only: when the log file cannot be created
+    (for example under exhausted persistent storage) a ``NullHandler`` is
+    attached instead, so worker startup and supervision proceed unaffected
+    and resume file logging on the next start after capacity returns.
 
     This is the **only** place a ``RotatingFileHandler`` for any worker log
     is created in the worker process: the parent process (supervisor,
@@ -1391,19 +1498,29 @@ def configure_worker_logging(incarnation: str) -> logging.Logger:
 
     Returns:
         The configured ``lubko.worker`` logger.
+
+    Raises:
+        OSError: If the log file cannot be created for a reason other than
+            exhausted persistent-storage capacity.
     """
     validate_incarnation_token(incarnation)
-    log_path = worker_log_incarnation_path(incarnation)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
-        str(log_path),
-        maxBytes=WORKER_LOG_MAX_BYTES,
-        backupCount=WORKER_LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger = logging.getLogger("lubko.worker")
     logger.setLevel(logging.INFO)
+    try:
+        log_path = worker_log_incarnation_path(incarnation)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler: logging.Handler = _QuietWorkerLogHandler(
+            str(log_path),
+            maxBytes=WORKER_LOG_MAX_BYTES,
+            backupCount=WORKER_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    except OSError as exc:
+        if not _is_capacity_error(exc):
+            raise
+        LOGGER.debug("worker file logging unavailable: exhausted storage; using NullHandler")
+        handler = logging.NullHandler()
     logger.addHandler(handler)
     return logger
 
