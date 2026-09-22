@@ -754,6 +754,7 @@ class SupervisorDaemon:
         self._runtime_commit: str | None = capture_supervisor_runtime_commit()
         self._handoff_target_commit: str | None = None
         self._handoff_completed: bool = False
+        self._status_write_drops: int = 0
 
     def _write_state_authority_safe(self, state: SupervisorState) -> bool:
         """Publish a supervisor transition without erasing newer consumer authority.
@@ -4078,7 +4079,14 @@ class SupervisorDaemon:
         write_supervisor_pid(os.getpid(), self._start_time_ticks)
 
     def _write_status(self, message: str | None = None) -> None:
-        """Publish the machine-readable status snapshot.
+        """Publish the machine-readable status snapshot, best-effort.
+
+        The status snapshot is observation-only diagnostics: it is never
+        recovery authority (readers already fail closed on absence), so a
+        persistent-filesystem write failure — including exhausted free
+        space — is dropped rather than propagated. Dropped snapshots are
+        counted in memory in ``_status_write_drops`` and never fail,
+        block, or alter a lifecycle decision.
 
         Args:
             message: Optional human-facing diagnostic.
@@ -4103,30 +4111,37 @@ class SupervisorDaemon:
         if rollback is not None:
             mission = rollback.status
         worker_health = worker_health_payload(read_worker_health())
-        write_status(
-            SupervisorStatus(
-                schema_version=SCHEMA_VERSION,
-                supervisor_pid=os.getpid(),
-                supervisor_start_time_ticks=self._start_time_ticks,
-                started_at=self._started_at,
-                applied_generation=state.applied_generation,
-                mode=state.mode,
-                commit=state.commit,
-                child=state.child,
-                intent=state.intent,
-                restart_count=state.restart_count,
-                next_attempt_at=state.next_attempt_at,
-                last_exit=state.last_exit,
-                mission=mission,
-                db_ready=db_ready,
-                ready=state.ready if state.child is not None else None,
-                message=effective_message,
-                worker_health=worker_health,
-                holding=is_holding(state),
-                supervisor_runtime_commit=self._runtime_commit,
-                supervisor_runtime_contract_version=contract_schema_version(),
+        try:
+            write_status(
+                SupervisorStatus(
+                    schema_version=SCHEMA_VERSION,
+                    supervisor_pid=os.getpid(),
+                    supervisor_start_time_ticks=self._start_time_ticks,
+                    started_at=self._started_at,
+                    applied_generation=state.applied_generation,
+                    mode=state.mode,
+                    commit=state.commit,
+                    child=state.child,
+                    intent=state.intent,
+                    restart_count=state.restart_count,
+                    next_attempt_at=state.next_attempt_at,
+                    last_exit=state.last_exit,
+                    mission=mission,
+                    db_ready=db_ready,
+                    ready=state.ready if state.child is not None else None,
+                    message=effective_message,
+                    worker_health=worker_health,
+                    holding=is_holding(state),
+                    supervisor_runtime_commit=self._runtime_commit,
+                    supervisor_runtime_contract_version=contract_schema_version(),
+                )
             )
-        )
+        except OSError:
+            self._status_write_drops += 1
+            LOGGER.debug(
+                "status snapshot dropped (%d total); lifecycle decisions unaffected",
+                self._status_write_drops,
+            )
 
 
 def _status_cmd() -> int:
