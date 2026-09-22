@@ -6603,6 +6603,12 @@ class Supervisor:
     def _publish_health(self, *, force: bool = False) -> None:
         """Write an atomic health snapshot, throttled unless forced.
 
+        The snapshot is observation-only: a dropped write (exhausted
+        capacity) never escapes into lifecycle logic, and the throttle
+        deadline still advances so the next attempt waits a full interval
+        — bounded retries, no busy loop. Recovery after capacity returns
+        is automatic on the next publish.
+
         Args:
             force: Publish regardless of the throttle interval.
         """
@@ -6611,9 +6617,12 @@ class Supervisor:
             return
         health = self._build_health()
         try:
-            write_worker_health(health)
+            published = write_worker_health(health)
         except OSError:
             LOGGER.debug("failed to write health snapshot", exc_info=True)
+        else:
+            if not published:
+                LOGGER.debug("health snapshot dropped; supervision unaffected")
         interval = self.settings.health_publish_interval_seconds
         self._next_health_publish_at = now + interval
         self._health_force = False

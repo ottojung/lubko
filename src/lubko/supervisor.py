@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import functools
 import json
 import logging
@@ -159,6 +160,11 @@ _SUPERVISOR_LOG_MAX_BYTES: Final = 4 * 1024 * 1024
 _SUPERVISOR_LOG_BACKUP_COUNT: Final = 2
 _PERSISTENT_DIAGNOSTIC_REPEAT_INTERVAL: Final = 256
 
+#: Errnos reporting exhausted persistent-storage capacity. Observation-only
+#: diagnostic log emissions suffering these failures are counted in memory
+#: and suppressed so they can never fail, block, or alter a lifecycle decision.
+_CAPACITY_ERRNOS: Final = frozenset({errno.ENOSPC, errno.EDQUOT})
+
 #: Default timeout for server-side control socket accept/recv (seconds).
 _SERVER_TIMEOUT_SECONDS: Final = 5.0
 
@@ -197,6 +203,7 @@ class _BoundedSupervisorLogHandler(RotatingFileHandler):
         self._failure_key: tuple[int, str, str, str, tuple[str, ...]] | None = None
         self._failure_repeats = 0
         self._cycle_saw_failure = False
+        self.write_drops = 0
 
     @staticmethod
     def _failure_fingerprint(
@@ -251,7 +258,19 @@ class _BoundedSupervisorLogHandler(RotatingFileHandler):
 
     @override
     def emit(self, record: logging.LogRecord) -> None:
-        """Write one record, coalescing unchanged exception diagnostics."""
+        """Write one record, coalescing unchanged exception diagnostics.
+
+        Emission is observation-only: ``RotatingFileHandler`` routes
+        filesystem failures while writing or rotating to
+        :meth:`handleError`, which counts exhausted-capacity failures and
+        suppresses everything — exactly one attempt per record, never
+        retried — so logging can never fail, block, or alter a lifecycle
+        decision.
+        """
+        self._emit_guarded(record)
+
+    def _emit_guarded(self, record: logging.LogRecord) -> None:
+        """Emit one record, coalescing unchanged exception diagnostics."""
         fingerprint = self._failure_fingerprint(record)
         if fingerprint is None:
             super().emit(record)
@@ -278,8 +297,10 @@ class _BoundedSupervisorLogHandler(RotatingFileHandler):
 
     @override
     def handleError(self, record: logging.LogRecord) -> None:
-        """Keep logging failures outside lifecycle authority decisions."""
-        del record
+        """Count capacity failures and keep logging outside lifecycle decisions."""
+        exc = sys.exception()
+        if exc is not None and isinstance(exc, OSError) and exc.errno in _CAPACITY_ERRNOS:
+            self.write_drops += 1
 
 
 def _durable_log_handlers() -> list[_BoundedSupervisorLogHandler]:
@@ -760,6 +781,7 @@ class SupervisorDaemon:
         self._handoff_target_commit: str | None = None
         self._handoff_completed: bool = False
         self._status_write_drops: int = 0
+        self._surface_write_drops: int = 0
         self._authority: authority.AuthorityClaim | None = None
         self._authority_conn: JobsConnection | None = None
         self._authority_conn_factory: Callable[[], JobsConnection] | None = None
@@ -1739,7 +1761,11 @@ class SupervisorDaemon:
         The stable health/log symlinks are published only after the queue
         roundtrip succeeds and the identity cross-check passes — so a
         retiring old worker or a stale candidate can never move the
-        stable read surface.
+        stable read surface. Symlink publication itself is observation-only:
+        when it fails (for example under exhausted storage) readiness is
+        still recorded — the worker provably consumes the queue — and the
+        publication is retried on a later tick, so a stale symlink never
+        blocks supervision. Readers fail closed on a dangling symlink.
 
         Args:
             now: Monotonic time.
@@ -1758,8 +1784,11 @@ class SupervisorDaemon:
         try:
             publish_current_surfaces(child.token)
         except OSError:
-            self._record_not_ready(state, now, child.pid, "stable symlink publication failed")
-            return
+            self._surface_write_drops += 1
+            LOGGER.debug(
+                "stable symlink publication dropped (%d total); readiness unaffected",
+                self._surface_write_drops,
+            )
         if not self._write_state_authority_safe(replace(state, ready=True, next_readiness_at=None)):
             # Readiness was proven but its durable publication was deferred:
             # no success may be reported or recorded until ``ready=True``
@@ -1769,7 +1798,8 @@ class SupervisorDaemon:
         lifecycle.append_deploy_log(
             f"supervisor verified worker pid={child.pid} consumes the queue"
         )
-        prune_old_incarnation_artifacts(child.token)
+        with suppress(OSError):
+            prune_old_incarnation_artifacts(child.token)
 
     def _check_readiness(
         self,
@@ -3381,7 +3411,10 @@ class SupervisorDaemon:
                 if raw is None:
                     continue
                 request = ControlRequest.from_dict(raw)
-                response = SupervisorDaemon._handle_control_request(request)
+                if request.request_type == "status":
+                    response = self._control_status_response()
+                else:
+                    response = SupervisorDaemon._handle_control_request(request)
                 _send_message(conn, response)
             except PermissionError:
                 LOGGER.warning("control socket peer UID mismatch; rejecting")
@@ -4286,18 +4319,36 @@ class SupervisorDaemon:
             return False
         return True
 
-    def _write_status(self, message: str | None = None) -> None:
-        """Publish the machine-readable status snapshot, best-effort.
+    @property
+    def _diagnostic_drops(self) -> int:
+        """Total observation-only writes dropped for capacity reasons.
 
-        The status snapshot is observation-only diagnostics: it is never
-        recovery authority (readers already fail closed on absence), so a
-        persistent-filesystem write failure — including exhausted free
-        space — is dropped rather than propagated. Dropped snapshots are
-        counted in memory in ``_status_write_drops`` and never fail,
-        block, or alter a lifecycle decision.
+        Sums the in-memory drop counters for status snapshots, stable-surface
+        publications, and supervisor log emissions. Lifecycle decisions never
+        consult this value; it is published inside snapshots and over the
+        control socket so readers can tell fresh observation from observation
+        that survived a capacity outage.
+
+        Returns:
+            The total dropped-diagnostic count.
+        """
+        log_drops = sum(handler.write_drops for handler in _durable_log_handlers())
+        return self._status_write_drops + self._surface_write_drops + log_drops
+
+    def _build_status_snapshot(self, message: str | None = None) -> SupervisorStatus:
+        """Build the current machine-readable status snapshot in memory.
+
+        Performs only reads (durable-state, health, deployment mission):
+        no filesystem mutation, so snapshot construction itself needs no
+        persistent-storage capacity.
 
         Args:
-            message: Optional human-facing diagnostic.
+            message: Optional human-facing diagnostic (defaults to the
+                daemon's current message).
+
+        Returns:
+            The in-memory status snapshot, stamped with the current time
+            and the in-memory dropped-diagnostic count.
         """
         state = read_state()
         now = time.monotonic()
@@ -4319,31 +4370,72 @@ class SupervisorDaemon:
         if rollback is not None:
             mission = rollback.status
         worker_health = worker_health_payload(read_worker_health())
+        return SupervisorStatus(
+            schema_version=SCHEMA_VERSION,
+            supervisor_pid=os.getpid(),
+            supervisor_start_time_ticks=self._start_time_ticks,
+            started_at=self._started_at,
+            applied_generation=state.applied_generation,
+            mode=state.mode,
+            commit=state.commit,
+            child=state.child,
+            intent=state.intent,
+            restart_count=state.restart_count,
+            next_attempt_at=state.next_attempt_at,
+            last_exit=state.last_exit,
+            mission=mission,
+            db_ready=db_ready,
+            ready=state.ready if state.child is not None else None,
+            message=effective_message,
+            worker_health=worker_health,
+            holding=is_holding(state),
+            supervisor_runtime_commit=self._runtime_commit,
+            supervisor_runtime_contract_version=contract_schema_version(),
+            published_at=time.time(),
+            diagnostic_drops=self._diagnostic_drops,
+        )
+
+    def _control_status_response(self) -> dict[str, object]:
+        """Serve a live status snapshot over the control socket.
+
+        The snapshot is built in memory (reads only, no filesystem
+        mutation) and carries the live in-memory dropped-diagnostic count,
+        so control-socket readers observe honest current state even while
+        ``status.json`` file publication is being dropped for capacity
+        reasons.
+
+        Returns:
+            A JSON-serializable control response.
+        """
         try:
-            write_status(
-                SupervisorStatus(
-                    schema_version=SCHEMA_VERSION,
-                    supervisor_pid=os.getpid(),
-                    supervisor_start_time_ticks=self._start_time_ticks,
-                    started_at=self._started_at,
-                    applied_generation=state.applied_generation,
-                    mode=state.mode,
-                    commit=state.commit,
-                    child=state.child,
-                    intent=state.intent,
-                    restart_count=state.restart_count,
-                    next_attempt_at=state.next_attempt_at,
-                    last_exit=state.last_exit,
-                    mission=mission,
-                    db_ready=db_ready,
-                    ready=state.ready if state.child is not None else None,
-                    message=effective_message,
-                    worker_health=worker_health,
-                    holding=is_holding(state),
-                    supervisor_runtime_commit=self._runtime_commit,
-                    supervisor_runtime_contract_version=contract_schema_version(),
-                )
-            )
+            snapshot = self._build_status_snapshot()
+        except Exception:
+            LOGGER.exception("control status request failed")
+            return ControlResponse.error("failed to read status")
+        return ControlResponse.ok(status=snapshot.to_dict())
+
+    def _write_status(self, message: str | None = None) -> None:
+        """Publish the machine-readable status snapshot, best-effort.
+
+        The status snapshot is observation-only diagnostics: it is never
+        recovery authority (readers already fail closed on absence, identity
+        mismatch, and expiry), so a persistent-filesystem write failure —
+        including exhausted free space — is dropped rather than propagated.
+        Dropped snapshots are counted in memory in ``_status_write_drops``
+        (surfaced via ``diagnostic_drops`` and the control socket) and never
+        fail, block, or alter a lifecycle decision. The next tick retries
+        the publication, so recovery after capacity returns is automatic.
+
+        Args:
+            message: Optional human-facing diagnostic.
+        """
+        try:
+            snapshot = self._build_status_snapshot(message)
+        except Exception:
+            LOGGER.debug("status snapshot build failed; lifecycle decisions unaffected")
+            return
+        try:
+            write_status(snapshot)
         except OSError:
             self._status_write_drops += 1
             LOGGER.debug(
