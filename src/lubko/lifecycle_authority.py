@@ -519,19 +519,28 @@ def take_authority(conn: JobsConnection, server: str, owner: AuthorityOwner) -> 
 def confirm_authority(conn: JobsConnection, claim: AuthorityClaim) -> bool:
     """Confirm an in-memory claim against a fresh canonical row read.
 
+    A mismatch, a corrupt row, or an absent row reads as ``False``: without
+    a fresh match the action does not happen. An unreachable database is
+    deliberately *not* folded into ``False`` so callers can tell a
+    connection-level outage (discard the connection, retry on a fresh one)
+    apart from a genuine fencing mismatch (stand down on the same
+    connection).
+
     Args:
         conn: Open database connection.
         claim: In-memory fencing-epoch holding to confirm.
 
     Returns:
         ``True`` only when a fresh row read names the same server, epoch,
-        and exact owner as the claim. Any mismatch, corruption, absence, or
-        connectivity loss reads as ``False``: without a fresh match the
-        action does not happen.
+        and exact owner as the claim.
+
+    Note:
+        A corrupt row fails closed via :class:`AuthorityError` from
+        :func:`read_authority`, which is absorbed here into ``False``.
     """
     try:
         row = read_authority(conn, claim.server)
-    except (AuthorityError, AuthorityUnavailableError):
+    except AuthorityError:
         return False
     if row is None:
         return False

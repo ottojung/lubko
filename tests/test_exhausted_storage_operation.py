@@ -455,6 +455,20 @@ def _authority_daemon(
     return daemon
 
 
+def _cached_authority_conn(
+    daemon: supervisor.SupervisorDaemon,
+) -> object:
+    """Return the daemon's cached authority connection, if any.
+
+    Args:
+        daemon: Daemon under test.
+
+    Returns:
+        The cached connection object, or ``None`` when discarded.
+    """
+    return daemon._authority_conn
+
+
 @pytest.mark.usefixtures("supervisor_token")
 def test_prepared_restart_needs_no_new_blocks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, zero_allocation: Callable[..., None]
@@ -549,6 +563,47 @@ def test_unreachable_authority_holds_without_action(
     monkeypatch.setattr(supervisor, "read_state", lambda: supervise.SupervisorState.from_dict({}))
     daemon._ensure_consumer_locked("c" * 40)
     assert "unavailable or superseded" in (daemon._message or "")
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_transient_confirmation_outage_reopens_a_fresh_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An outage discards the connection and the next confirm reopens; a mismatch keeps it."""
+    rows: dict[str, str] = {}
+    down = FakeAuthorityConnection()
+    down.rows = rows
+    down.unreachable = True
+    up = FakeAuthorityConnection()
+    up.rows = rows
+    opened: list[FakeAuthorityConnection] = []
+    daemon = _supervisor_daemon()
+    monkeypatch.setattr(supervisor, "load_worker_server", lambda: "srv-test")
+
+    def _open() -> JobsConnection:
+        table = down if not opened else up
+        opened.append(table)
+        return cast("JobsConnection", table)
+
+    daemon._authority_conn_factory = lambda: cast("JobsConnection", up)
+    daemon._write_pidfile()
+    assert daemon._authority is not None
+    daemon._authority_conn = None
+    daemon._authority_conn_factory = _open
+
+    assert daemon._confirm_authority() is False
+    assert opened == [down]
+    assert _cached_authority_conn(daemon) is None
+
+    assert daemon._confirm_authority() is True
+    assert opened == [down, up]
+    assert _cached_authority_conn(daemon) is not None
+
+    foreign = lifecycle_authority.AuthorityOwner(pid=999, start_time_ticks=888, boot_id="boot-9")
+    assert lifecycle_authority.take_authority(cast("JobsConnection", up), "srv-test", foreign)
+    assert daemon._confirm_authority() is False
+    assert opened == [down, up]
+    assert _cached_authority_conn(daemon) is not None
 
 
 @pytest.mark.usefixtures("supervisor_token")

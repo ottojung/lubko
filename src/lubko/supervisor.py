@@ -4253,8 +4253,11 @@ class SupervisorDaemon:
         Returns:
             ``True`` only when no claim was established yet (legacy path) or
             a fresh canonical row read matches the claim's server, epoch,
-            and exact owner. Any mismatch or connectivity loss reads as
-            ``False``: without that match the action does not happen.
+            and exact owner. A fencing mismatch reads as ``False`` on the
+            same connection and stands down; a connection-level outage
+            discards the cached connection so the next confirmation opens a
+            fresh one, and also reads as ``False``: without a fresh match
+            the action does not happen.
         """
         claim = self._authority
         if claim is None:

@@ -236,8 +236,8 @@ def test_confirm_matches_only_fresh_epoch_and_exact_owner() -> None:
     assert authority.confirm_authority(_conn(table), foreign) is False
 
 
-def test_confirm_treats_corruption_and_outage_as_no_authority() -> None:
-    """Absence, corruption, and unreachable databases never authorize action."""
+def test_confirm_treats_corruption_as_no_authority_but_outage_as_unavailable() -> None:
+    """Absence and corruption read as False; outages stay distinguishable."""
     table = FakeAuthorityConnection()
     claim = _claim()
     row_id = str(authority.authority_row_id("srv-test"))
@@ -246,7 +246,8 @@ def test_confirm_treats_corruption_and_outage_as_no_authority() -> None:
     table.rows[row_id] = json.dumps({"v": 1, "type": "command"})
     assert authority.confirm_authority(_conn(table), claim) is False
     table.unreachable = True
-    assert authority.confirm_authority(_conn(table), claim) is False
+    with pytest.raises(authority.AuthorityUnavailableError):
+        authority.confirm_authority(_conn(table), claim)
 
 
 def test_worker_collection_never_touches_non_job_rows() -> None:
