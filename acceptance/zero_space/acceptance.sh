@@ -687,18 +687,28 @@ fi
 # an established degradation class, not an incident:
 # - status.json.tmp / supervisor.pid.tmp: Class 4/accounting snapshot
 #   staging (best-effort status/pid publication; readers fail closed).
-# - supervisor.log growth and worker/logs/*: Class 4 bounded logs (emission
-#   degrades to in-memory drop counters, worker falls back to NullHandler).
-# - worker/health*.json: Class 4 health snapshots (silently dropped).
-# - .lubko-durable-*-state.json: durable staging temporaries, garbage by
-#   definition when their create fails (ADR 0003, Class 3).
+# - supervisor.log growth, worker/deploy.log growth, and worker/logs/*:
+#   Class 4 bounded logs (emission degrades to in-memory drop counters,
+#   deploy-event appends suppress OSError, worker falls back to
+#   NullHandler).
+# - worker/health*.json and worker/health/health-*.tmp: Class 4 health
+#   snapshots (staging via mkstemp, capacity drops counted, silently
+#   dropped).
+# - worker/drain/*.tmp: drain-acknowledgement staging (the worker's
+#   shutdown proof that every owned group is gone); the write failure is
+#   caught and shutdown retires fail-closed, which the clean shutdowns
+#   above demonstrate.
+# - .lubko-durable-*-state.json and .lubko-durable-*-meta.json: durable
+#   staging temporaries (supervisor state plus the worker meta
+#   read-through cache), garbage by definition when their create fails
+#   (ADR 0003, Class 3).
 # - .lubko-durable-lock-*: Class 3 flock rendezvous sidecars (holdings are
 #   kernel state; creation is a one-time setup act).
 # - __pycache__: interpreter bytecode caches, never Lubko authority.
 DENIED_TOTAL="$(grep -c "^DENY " "${DENIAL_LOG}" || true)"
 note "total denied Lubko-owned writes survived: ${DENIED_TOTAL}"
 ESC_ROOTS="$(printf '%s' "${ZERO_ROOTS}" | sed 's/[][\.*^$]/\\&/g; s/:/|/g')"
-UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ (${ESC_ROOTS})/(supervisor/status\.json\.tmp|supervisor/supervisor\.pid\.tmp|supervisor/supervisor\.log|worker/logs/[^ ]*|worker/health[^ /]*\.json|.*__pycache__/[^ ]*|.*\.lubko-durable-lock-[^ ]*|.*\.lubko-durable-[^ /]*-state\.json)" || true)"
+UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ (${ESC_ROOTS})/(supervisor/status\.json\.tmp|supervisor/supervisor\.pid\.tmp|supervisor/supervisor\.log|worker/deploy\.log|worker/logs/[^ ]*|worker/health[^ /]*\.json|worker/health/health-[^ /]*\.tmp|worker/drain/[^ /]*\.tmp|.*__pycache__/[^ ]*|.*\.lubko-durable-lock-[^ ]*|.*\.lubko-durable-[^ /]*-(state|meta)\.json)" || true)"
 if [ -n "${UNEXPECTED}" ]; then
   fail "unexpected Lubko-owned writes attempted under zero allocation:"
   printf '%s\n' "${UNEXPECTED}"
