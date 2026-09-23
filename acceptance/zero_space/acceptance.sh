@@ -674,8 +674,8 @@ else
   # so exactly this one removal is known-degraded expiry, not an
   # allocation. Tolerate precisely it; any other diff still fails.
   ESC_STATE="$(printf '%s' "${STATE_ROOT}" | sed 's/[][\.*^$]/\\&/g')"
-  REMAINING_DIFF="$(grep -E "^[<>]" "${SCRATCH}/manifest.diff" \
-    | grep -v -E "^< F ${ESC_STATE}/supervisor/status\.json [0-7]+ [0-9a-f]+$" || true)"
+  REMAINING_DIFF="$(grep -E "^[-+][^-+]" "${SCRATCH}/manifest.diff" \
+    | grep -v -E "^-F ${ESC_STATE}/supervisor/status\.json [0-7]+ [0-9a-f]+$" || true)"
   if [ -n "${REMAINING_DIFF}" ]; then
     fail "Lubko-owned tree changed under zero allocation:"
     cat "${SCRATCH}/manifest.diff"

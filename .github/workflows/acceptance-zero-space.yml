@@ -100,14 +100,46 @@ jobs:
             OUT="$(printf 'reached:%s; %s %s' "${STAGE}" "${HITS}" "${TAIL}" | sed -E 's/^\.+//; s/ \.+//g; s/ +/ /g')"
             printf '%s' "${OUT}" | sed -E 's/(password|passwd|secret|token)(=|:)[^ ;]*/\1\2***/gi' | cut -c1-140
           }
+          verdict_details() {
+            if [ -z "$1" ] || [ ! -d "$1" ]; then
+              printf 'no-scratch-tree-found'
+              return 0
+            fi
+            STATE_ROOT="$1/home/.local/state/lubko"
+            BIN_HOME="$1/home/.local/bin"
+            CONFIG_HOME="$1/home/.config/lubko"
+            ZERO_ROOTS="${STATE_ROOT}:${BIN_HOME}:${CONFIG_HOME}"
+            ESC_ROOTS="$(printf '%s' "${ZERO_ROOTS}" | sed 's/[][\.*^$]/\\&/g; s/:/|/g')"
+            DENIAL_LOG="$1/logs/denials.log"
+            if [ ! -f "${DENIAL_LOG}" ]; then
+              UNEXPECTED="no-denials-log"
+            else
+              UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ (${ESC_ROOTS})/(supervisor/status\\.json\\.tmp|supervisor/supervisor\\.pid\\.tmp|supervisor/supervisor\\.log|worker/deploy\\.log|worker/logs/[^ ]*|worker/health[^ /]*\\.json|worker/health/health-[^ /]*\\.tmp|worker/drain/[^ /]*\\.tmp|.*__pycache__/[^ ]*|.*\\.lubko-durable-lock-[^ ]*|.*\\.lubko-durable-[^ /]*-(state|meta)\\.json)" | head -n 2 | sed "s:$1:ROOT:g" | tr '\n' '; ')"
+              if [ -z "${UNEXPECTED}" ]; then
+                UNEXPECTED="all-denied-writes-classified"
+              fi
+            fi
+            if [ ! -f "$1/manifest.diff" ]; then
+              DIFF="no-manifest-diff"
+            else
+              DIFF="$(grep -E "^[-+][^-+]" "$1/manifest.diff" | head -n 3 | sed "s:$1:ROOT:g" | tr '\n' '; ')"
+              if [ -z "${DIFF}" ]; then
+                DIFF="manifest-identical"
+              fi
+            fi
+            printf 'unexpected:%s manifest:%s' "${UNEXPECTED}" "${DIFF}" | sed -E 's/(password|passwd|secret|token)(=|:)[^ ;]*/\1\2***/gi' | cut -c1-140
+          }
           if [ "${{ job.status }}" = "success" ]; then
             STATE="success"
             FP="acceptance passed"
+            VD="verdict clean"
           else
             STATE="failure"
             FP="$(fingerprint "${SCRATCH}")"
+            VD="$(verdict_details "${SCRATCH}")"
           fi
           FP="$(printf '%s' "${FP}" | cut -c1-140)"
+          VD="$(printf '%s' "${VD}" | cut -c1-140)"
           SHA="${{ github.event.pull_request.head.sha }}"
           if [ -z "${SHA}" ]; then
             SHA="${{ github.sha }}"
@@ -116,5 +148,10 @@ jobs:
             -f state="${STATE}" \
             -f context="zero-space-fingerprint (temporary)" \
             -f description="${FP}" \
+            --silent || true
+          gh api "repos/${{ github.repository }}/statuses/${SHA}" \
+            -f state="${STATE}" \
+            -f context="zero-space-verdict (temporary)" \
+            -f description="${VD}" \
             --silent || true
           exit 0
