@@ -120,6 +120,31 @@ class AuthorityOwner:
 
 
 @dataclass(frozen=True, slots=True)
+class SpawnObligation:
+    """A database-backed fenced pre-spawn obligation.
+
+    This is the crash-durable authority that forbids a successor from
+    starting a second maintained consumer beside a possibly-live first
+    spawn. It is committed to the authority row *before* the spawn
+    syscall; a crash between commit and spawn leaves this deterministic
+    recovery obligation in the row. A ``pid`` of ``None`` names a spawn
+    whose child identity was never published (resolved via the kernel
+    parent-death guarantee and boot identity); a present ``pid`` names
+    the exact first-spawn instance to converge by pinned single-PID
+    signals only.
+    """
+
+    token: str
+    commit: str
+    creator_pid: int
+    creator_start_time_ticks: int
+    boot_id: str | None
+    pid: int | None
+    start_time_ticks: int | None
+    parent_death_signal: bool
+
+
+@dataclass(frozen=True, slots=True)
 class AuthorityRow:
     """A parsed and validated lifecycle authority row."""
 
@@ -127,6 +152,7 @@ class AuthorityRow:
     epoch: int
     generation: int
     owner: AuthorityOwner | None
+    spawn: SpawnObligation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +213,7 @@ def build_authority_payload(
     epoch: int,
     generation: int,
     owner: AuthorityOwner | None,
+    spawn: SpawnObligation | None = None,
 ) -> dict[str, object]:
     """Build a canonical authority payload mapping.
 
@@ -196,6 +223,8 @@ def build_authority_payload(
         generation: Lifecycle generation counter carried by the row.
         owner: Exact incarnation holding the epoch, or ``None`` when the
             epoch is unowned.
+        spawn: Fenced pre-spawn obligation, or ``None`` when no spawn is
+            outstanding.
 
     Returns:
         The versioned payload mapping.
@@ -228,7 +257,124 @@ def build_authority_payload(
         "epoch": epoch,
         "generation": generation,
         "owner": owner_mapping,
+        "spawn": _build_spawn_mapping(spawn),
     }
+
+
+def _build_spawn_mapping(spawn: SpawnObligation | None) -> dict[str, object] | None:
+    """Serialize an optional spawn obligation, validating its binding.
+
+    Args:
+        spawn: The obligation to serialize, or ``None``.
+
+    Returns:
+        The mapping, or ``None`` when no spawn is outstanding.
+
+    Raises:
+        AuthorityError: If any field violates the binding.
+    """
+    if spawn is None:
+        return None
+    token: object = spawn.token
+    if not isinstance(token, str) or not token:
+        msg = "authority spawn obligation must carry a lifecycle token"
+        raise AuthorityError(msg)
+    commit: object = spawn.commit
+    if not isinstance(commit, str) or not commit:
+        msg = "authority spawn obligation must carry an exact commit"
+        raise AuthorityError(msg)
+    creator_pid = _check_non_negative_int("spawn.creator_pid", spawn.creator_pid)
+    creator_ticks = _check_non_negative_int(
+        "spawn.creator_start_time_ticks", spawn.creator_start_time_ticks
+    )
+    boot_id: str | None = None
+    boot_raw: object = spawn.boot_id
+    if boot_raw is not None:
+        if not isinstance(boot_raw, str) or not boot_raw:
+            msg = "authority spawn obligation must carry a host boot identity or null"
+            raise AuthorityError(msg)
+        boot_id = boot_raw
+    pid: int | None = None
+    if spawn.pid is not None:
+        pid = _check_non_negative_int("spawn.pid", spawn.pid)
+    ticks: int | None = None
+    if spawn.start_time_ticks is not None:
+        ticks = _check_non_negative_int("spawn.start_time_ticks", spawn.start_time_ticks)
+    flag: object = spawn.parent_death_signal
+    if not isinstance(flag, bool):
+        msg = "authority spawn obligation parent-death-signal flag must be a boolean"
+        raise AuthorityError(msg)
+    return {
+        "token": token,
+        "commit": commit,
+        "creator_pid": creator_pid,
+        "creator_start_time_ticks": creator_ticks,
+        "boot_id": boot_id,
+        "pid": pid,
+        "start_time_ticks": ticks,
+        "parent_death_signal": flag,
+    }
+
+
+def _parse_spawn(raw: object) -> SpawnObligation | None:
+    """Parse an optional spawn obligation from a payload mapping.
+
+    Args:
+        raw: The raw ``spawn`` value.
+
+    Returns:
+        The validated obligation, or ``None`` for explicit null.
+
+    Raises:
+        AuthorityError: If the value is neither null nor an exact spawn
+            obligation. A partial obligation never parses as usable.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        msg = "authority payload spawn must be an object or null"
+        raise AuthorityError(msg)
+    token = raw.get("token")
+    if not isinstance(token, str) or not token:
+        msg = "authority spawn obligation must carry a lifecycle token"
+        raise AuthorityError(msg)
+    commit = raw.get("commit")
+    if not isinstance(commit, str) or not commit:
+        msg = "authority spawn obligation must carry an exact commit"
+        raise AuthorityError(msg)
+    creator_pid = _check_non_negative_int("spawn.creator_pid", raw.get("creator_pid"))
+    creator_ticks = _check_non_negative_int(
+        "spawn.creator_start_time_ticks", raw.get("creator_start_time_ticks")
+    )
+    boot_raw = raw.get("boot_id")
+    boot_id: str | None = None
+    if boot_raw is not None:
+        if not isinstance(boot_raw, str) or not boot_raw:
+            msg = "authority spawn obligation must carry a host boot identity or null"
+            raise AuthorityError(msg)
+        boot_id = boot_raw
+    pid_raw = raw.get("pid")
+    pid: int | None = None
+    if pid_raw is not None:
+        pid = _check_non_negative_int("spawn.pid", pid_raw)
+    ticks_raw = raw.get("start_time_ticks")
+    ticks: int | None = None
+    if ticks_raw is not None:
+        ticks = _check_non_negative_int("spawn.start_time_ticks", ticks_raw)
+    flag = raw.get("parent_death_signal", True)
+    if not isinstance(flag, bool):
+        msg = "authority spawn obligation parent-death-signal flag must be a boolean"
+        raise AuthorityError(msg)
+    return SpawnObligation(
+        token=token,
+        commit=commit,
+        creator_pid=creator_pid,
+        creator_start_time_ticks=creator_ticks,
+        boot_id=boot_id,
+        pid=pid,
+        start_time_ticks=ticks,
+        parent_death_signal=flag,
+    )
 
 
 def serialize_authority_payload(payload: dict[str, object]) -> str:
@@ -297,7 +443,8 @@ def parse_authority_payload(data: object, *, server: str) -> AuthorityRow:
     epoch = _check_non_negative_int("epoch", data.get("epoch"))
     generation = _check_non_negative_int("generation", data.get("generation"))
     owner = _parse_owner(data.get("owner"))
-    return AuthorityRow(server=server, epoch=epoch, generation=generation, owner=owner)
+    spawn = _parse_spawn(data.get("spawn"))
+    return AuthorityRow(server=server, epoch=epoch, generation=generation, owner=owner, spawn=spawn)
 
 
 def _parse_owner(raw: object) -> AuthorityOwner | None:
@@ -458,7 +605,9 @@ def take_authority(conn: JobsConnection, server: str, owner: AuthorityOwner) -> 
     idempotent adoption. Otherwise the epoch is bumped exactly when the row
     still carries the observed epoch: the guard predicate makes a concurrent
     bump fail the update, so exactly one contender's commit wins and the
-    loser observes the mismatch and stands down without spawning.
+    loser observes the mismatch and stands down without spawning. A
+    committed pre-spawn obligation survives the take so the new owner must
+    still resolve the first spawn's fate before spawning a replacement.
 
     Args:
         conn: Open database connection.
@@ -489,6 +638,7 @@ def take_authority(conn: JobsConnection, server: str, owner: AuthorityOwner) -> 
             epoch=current.epoch + 1,
             generation=current.generation,
             owner=owner,
+            spawn=current.spawn,
         )
     )
     try:
@@ -513,7 +663,138 @@ def take_authority(conn: JobsConnection, server: str, owner: AuthorityOwner) -> 
         epoch=current.epoch + 1,
         generation=current.generation,
         owner=owner,
+        spawn=current.spawn,
     )
+
+
+def commit_spawn_obligation(
+    conn: JobsConnection, claim: AuthorityClaim, spawn: SpawnObligation
+) -> bool:
+    """Commit a fenced pre-spawn obligation before the spawn syscall.
+
+    The obligation is the crash-durable authority forbidding any successor
+    from starting a second consumer beside a possibly-live first spawn. The
+    update is guarded by the claim's fencing epoch plus exact kind, server,
+    and owner predicates, so a superseded incarnation's commit fails the
+    update and it never spawns. When the commit fails (database
+    unreachable), the spawn does not happen.
+
+    Args:
+        conn: Open database connection.
+        claim: In-memory fencing-epoch holding authorizing the spawn.
+        spawn: The pre-spawn obligation to commit.
+
+    Returns:
+        ``True`` when the obligation committed, ``False`` when a
+        concurrent contender won the epoch first (the caller stands down
+        without spawning).
+
+    Raises:
+        AuthorityError: If no authority row exists or the claim no longer
+            matches the row.
+        AuthorityUnavailableError: If the database cannot be reached.
+    """
+    current = read_authority(conn, claim.server)
+    if current is None:
+        msg = f"no lifecycle authority row for server {claim.server!r}; bootstrap first"
+        raise AuthorityError(msg)
+    if current.epoch != claim.epoch or current.owner is None:
+        msg = "lifecycle authority fencing epoch no longer matches the claim; holding"
+        raise AuthorityError(msg)
+    owner = current.owner
+    if (
+        owner.pid != claim.pid
+        or owner.start_time_ticks != claim.start_time_ticks
+        or owner.boot_id != claim.boot_id
+    ):
+        msg = "lifecycle authority fencing epoch no longer matches the claim; holding"
+        raise AuthorityError(msg)
+    if current.spawn is not None:
+        return False
+    candidate = serialize_authority_payload(
+        build_authority_payload(
+            server=claim.server,
+            epoch=current.epoch,
+            generation=current.generation,
+            owner=owner,
+            spawn=spawn,
+        )
+    )
+    try:
+        with conn.transaction(), conn.cursor() as cursor:
+            cursor.execute(
+                _TAKE_ROW_SQL,
+                {
+                    "id": str(authority_row_id(claim.server)),
+                    "payload": candidate,
+                    "server": claim.server,
+                    "expected_epoch": str(current.epoch),
+                },
+            )
+            won = cursor.rowcount == 1
+    except psycopg.Error as exc:
+        msg = f"lifecycle authority for server {claim.server!r} is unreachable"
+        raise AuthorityUnavailableError(msg) from exc
+    return won
+
+
+def clear_spawn_obligation(conn: JobsConnection, claim: AuthorityClaim) -> bool:
+    """Clear a committed pre-spawn obligation under the fencing epoch.
+
+    Args:
+        conn: Open database connection.
+        claim: In-memory fencing-epoch holding owning the obligation.
+
+    Returns:
+        ``True`` when the obligation cleared, ``False`` when the epoch
+        no longer matches (the caller stands down without touching any
+        child process).
+
+    Raises:
+        AuthorityUnavailableError: If the database cannot be reached.
+    """
+    try:
+        current = read_authority(conn, claim.server)
+    except AuthorityError:
+        return False
+    if current is None:
+        return False
+    if current.epoch != claim.epoch or current.spawn is None:
+        return current.epoch == claim.epoch and current.spawn is None
+    owner = current.owner
+    if owner is None:
+        return False
+    if (
+        owner.pid != claim.pid
+        or owner.start_time_ticks != claim.start_time_ticks
+        or owner.boot_id != claim.boot_id
+    ):
+        return False
+    candidate = serialize_authority_payload(
+        build_authority_payload(
+            server=claim.server,
+            epoch=current.epoch,
+            generation=current.generation,
+            owner=owner,
+            spawn=None,
+        )
+    )
+    try:
+        with conn.transaction(), conn.cursor() as cursor:
+            cursor.execute(
+                _TAKE_ROW_SQL,
+                {
+                    "id": str(authority_row_id(claim.server)),
+                    "payload": candidate,
+                    "server": claim.server,
+                    "expected_epoch": str(current.epoch),
+                },
+            )
+            won = cursor.rowcount == 1
+    except psycopg.Error as exc:
+        msg = f"lifecycle authority for server {claim.server!r} is unreachable"
+        raise AuthorityUnavailableError(msg) from exc
+    return won
 
 
 def confirm_authority(conn: JobsConnection, claim: AuthorityClaim) -> bool:
