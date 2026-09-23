@@ -416,17 +416,6 @@ def test_own_dead_inflight_spawn_resolves_for_retry(
     assert row.spawn is None
 
 
-def test_capacity_failure_classification() -> None:
-    """Only exhausted-storage errnos count as capacity failures."""
-    assert supervisor._capacity_failure(OSError(errno.ENOSPC, "x")) is True
-    assert supervisor._capacity_failure(OSError(errno.EDQUOT, "x")) is True
-    assert supervisor._capacity_failure(OSError(errno.EIO, "x")) is False
-    chained = DurabilityError("y")
-    chained.__cause__ = OSError(errno.ENOSPC, "x")
-    assert supervisor._capacity_failure(chained) is True
-    assert supervisor._capacity_failure(ValueError("z")) is False
-
-
 class _LiveStubProc:
     """Minimal live ``Popen`` stand-in that never exits on its own."""
 
@@ -449,6 +438,18 @@ def _enospc_durable(_state: object) -> None:
     """
     msg = "No space left on device"
     raise DurabilityError(msg) from OSError(errno.ENOSPC, msg)
+
+
+def _eio_durable(_state: object) -> None:
+    """Simulate a local durable write failing with a non-capacity I/O error.
+
+    Args:
+        _state: The state that could not be cached.
+
+    Raises:
+        OSError: Always, with bare ``EIO`` and no chained cause.
+    """
+    raise OSError(errno.EIO, "Input/output error")
 
 
 @pytest.mark.usefixtures("supervisor_token")
@@ -493,6 +494,71 @@ def test_zero_space_success_path_publishes_usable_worker(
     daemon._spawn_and_publish(COMMIT)
     assert pops == [4242]
     assert converged == []
+    assert daemon._active_child is not None
+    assert daemon._active_child.pid == 4242
+    row = authority.read_authority(_conn(table), SERVER)
+    assert row is not None
+    assert row.spawn is None
+    assert row.worker is not None
+    assert row.worker.pid == 4242
+    assert row.worker.start_time_ticks == 777
+
+    daemon._ensure_consumer_locked(COMMIT)
+    assert pops == [4242]
+    assert converged == []
+    assert daemon._active_child is not None
+    assert daemon._active_child.pid == 4242
+    stayed = authority.read_authority(_conn(table), SERVER)
+    assert stayed is not None
+    assert stayed.worker is not None
+    assert stayed.worker.pid == 4242
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_eio_success_path_publishes_usable_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A full spawn publishes while every local write fails with bare EIO.
+
+    Unlike exhausted storage, a non-capacity I/O error carries no signal
+    that the failure is benign, yet after the database publication has
+    committed every local cache projection is still diagnostic-only: the
+    worker must reach a usable published state exactly as on the
+    zero-space path — not converged, no replacement attempted, and a
+    later decision still sees exactly one published worker.
+    """
+    _patch_spawn_env(monkeypatch, tmp_path)
+    _clear_local_spawning()
+    table = FakeAuthorityConnection()
+    daemon = _claim_daemon(monkeypatch, table)
+    monkeypatch.setattr(supervisor, "write_state", _eio_durable)
+    monkeypatch.setattr(lifecycle, "write_meta", _eio_durable)
+    monkeypatch.setattr(supervisor, "proc_start_ticks", lambda _pid: 777)
+    monkeypatch.setattr(
+        daemon,
+        "_wait_for_identity",
+        lambda _pid: lifecycle.ProcessIdentity(pid=4242, pgid=4242, sid=4242, start_time_ticks=777),
+    )
+    monkeypatch.setattr(daemon, "_derive_action", lambda _state: ("run", COMMIT))
+    pops: list[int] = []
+
+    def _fake_popen(*_args: object, **_kwargs: object) -> _LiveStubProc:
+        pops.append(4242)
+        return _LiveStubProc(pid=4242)
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", _fake_popen)  # type: ignore[attr-defined]
+    converged: list[int] = []
+
+    def _forbidden_converge(proc: object) -> bool:
+        del proc
+        msg = "published worker must never be converged"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(daemon, "_converge_direct_child", _forbidden_converge)
+    daemon._spawn_and_publish(COMMIT)
+    assert pops == [4242]
+    assert converged == []
+    assert daemon._message is None
     assert daemon._active_child is not None
     assert daemon._active_child.pid == 4242
     row = authority.read_authority(_conn(table), SERVER)
