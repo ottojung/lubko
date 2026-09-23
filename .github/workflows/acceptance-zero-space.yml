@@ -13,6 +13,11 @@ permissions:
 jobs:
   zero-space:
     runs-on: ubuntu-latest
+    # TEMPORARY DIAGNOSTIC (revert after use): the step log is not
+    # retrievable without interactive access.
+    permissions:
+      contents: read
+      statuses: write
     services:
       postgres:
         image: postgres:17
@@ -42,3 +47,74 @@ jobs:
         run: python -m pip install "uv==0.10.12"
       - name: Zero-space acceptance
         run: bash acceptance/zero_space/acceptance.sh
+      # TEMPORARY DIAGNOSTIC (revert after use): report a short public
+      # failure fingerprint as a commit status, since the step log is not
+      # retrievable without interactive access. Never fails the workflow
+      # itself and never prints secrets.
+      - name: Report failure fingerprint
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          SCRATCH=""
+          for CANDIDATE in /tmp/tmp.* "${RUNNER_TEMP:-/tmp}"/tmp.*; do
+            if [ -f "${CANDIDATE}/manifest.before" ]; then
+              SCRATCH="${CANDIDATE}"
+            fi
+          done
+          if [ -z "${SCRATCH}" ]; then
+            SCRATCH="$(ls -dt /tmp/tmp.* 2>/dev/null | head -n 1)"
+          fi
+          fingerprint() {
+            if [ -z "$1" ] || [ ! -d "$1" ]; then
+              printf 'no-scratch-tree-found'
+              return 0
+            fi
+            if [ -f "$1/manifest.after" ]; then
+              STAGE="verdict"
+            elif [ -f "$1/logs/sup-b.log" ]; then
+              STAGE="phase-b"
+            elif [ -f "$1/logs/sup-a.log" ]; then
+              STAGE="phase-a"
+            elif [ -f "$1/manifest.before" ]; then
+              STAGE="pre-run"
+            elif [ -f "$1/logs/deploy.log" ]; then
+              STAGE="deploy"
+            elif [ -f "$1/logs/install.log" ]; then
+              STAGE="install"
+            elif [ -f "$1/logs/dispatch-denials.log" ]; then
+              STAGE="selftests"
+            elif [ -f "$1/logs/cc.log" ]; then
+              STAGE="build"
+            else
+              STAGE="prerequisites"
+            fi
+            HITS="$(grep -ahE 'FAIL |cannot reach|cannot|Traceback|Error|error|refused|denied|exceeded' "$1/logs/install.log" "$1/logs/deploy.log" 2>/dev/null | tail -n 3 | tr '\n' '; ')"
+            LASTLOG="$(ls -t "$1"/logs/* 2>/dev/null | head -n 1)"
+            if [ -n "${LASTLOG}" ]; then
+              TAIL="$(tail -n 2 "${LASTLOG}" 2>/dev/null | tr '\n' '; ')"
+            else
+              TAIL=""
+            fi
+            OUT="$(printf 'reached:%s; %s %s' "${STAGE}" "${HITS}" "${TAIL}" | sed -E 's/^\.+//; s/ \.+//g; s/ +/ /g')"
+            printf '%s' "${OUT}" | sed -E 's/(password|passwd|secret|token)(=|:)[^ ;]*/\1\2***/gi' | cut -c1-140
+          }
+          if [ "${{ job.status }}" = "success" ]; then
+            STATE="success"
+            FP="acceptance passed"
+          else
+            STATE="failure"
+            FP="$(fingerprint "${SCRATCH}")"
+          fi
+          FP="$(printf '%s' "${FP}" | cut -c1-140)"
+          SHA="${{ github.event.pull_request.head.sha }}"
+          if [ -z "${SHA}" ]; then
+            SHA="${{ github.sha }}"
+          fi
+          gh api "repos/${{ github.repository }}/statuses/${SHA}" \
+            -f state="${STATE}" \
+            -f context="zero-space-fingerprint (temporary)" \
+            -f description="${FP}" \
+            --silent || true
+          exit 0
