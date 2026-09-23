@@ -23,11 +23,23 @@ import pytest
 from lubko import cli, lifecycle, supervise, supervisor
 from lubko.durable import DurabilityError
 from lubko.supervise import SpawningObligation, WorkerChild, read_state
+from tests._fake_authority_db import claim_every_daemon
 
 if TYPE_CHECKING:
     from lubko.supervise import SupervisorState
 
 COMMIT = "a" * 40
+_DB_CLAIM_SERVER = "srv-spawn-publication-test"
+
+
+@pytest.fixture(autouse=True)
+def _db_fencing_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Establish a fake-database fencing claim on every daemon under test.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action.
+    """
+    claim_every_daemon(monkeypatch, supervisor, _DB_CLAIM_SERVER)
 
 
 @pytest.fixture(autouse=True)
@@ -118,14 +130,16 @@ def _in_progress_state(child: WorkerChild, commit: str = COMMIT) -> None:
 def _fake_spawn(daemon: supervisor.SupervisorDaemon, commit: str) -> WorkerChild:
     """Stand-in ``_spawn_worker`` that records the pid-bearing obligation.
 
+    The obligation commits to the fake database exactly as the real spawn
+    does before ``Popen``; the local write is only its read-through cache.
+
     Args:
-        daemon: The daemon requesting the spawn (unused by the stub).
+        daemon: The daemon requesting the spawn.
         commit: The exact commit the worker must run.
 
     Returns:
         The spawned child identity.
     """
-    del daemon
     child = _published_child()
     obligation = SpawningObligation(
         token=child.token,
@@ -137,6 +151,7 @@ def _fake_spawn(daemon: supervisor.SupervisorDaemon, commit: str) -> WorkerChild
         created_at=0.0,
         boot_id=supervise.current_boot_id(),
     )
+    assert daemon._commit_spawn_authority(obligation) is True
     supervise.write_state(replace(read_state(), spawning=obligation))
     return child
 
@@ -161,10 +176,14 @@ def _patch_recovery(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
 @pytest.mark.parametrize("raw_meta", ["{", "[]"])
 @pytest.mark.usefixtures("supervisor_token")
-def test_supervisor_holds_on_invalid_maintained_worker_metadata(
+def test_supervisor_ignores_corrupt_maintained_worker_cache(
     monkeypatch: pytest.MonkeyPatch, raw_meta: str
 ) -> None:
-    """Corrupt maintained-worker authority must block replacement spawn."""
+    """A corrupt local worker cache never blocks a database-authorized spawn.
+
+    ``worker/meta.json`` is a read-through cache, never authority: steady
+    state never reads it, so torn bytes cannot hold replacement.
+    """
     path = lifecycle.meta_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(raw_meta)
@@ -176,9 +195,7 @@ def test_supervisor_holds_on_invalid_maintained_worker_metadata(
 
     monkeypatch.setattr(daemon, "_spawn_and_publish", record_spawn)
     daemon._ensure_consumer_locked(COMMIT)
-    assert spawned == []
-    assert daemon._message is not None
-    assert "holding without starting a worker" in daemon._message
+    assert spawned == [COMMIT]
     assert path.read_text() == raw_meta
 
 

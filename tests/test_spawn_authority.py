@@ -23,11 +23,23 @@ import pytest
 
 from lubko import cli, lifecycle, supervise, supervisor
 from lubko.supervise import SpawningObligation, proc_start_ticks, read_state
+from tests._fake_authority_db import claim_every_daemon
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 COMMIT = "a" * 40
+_DB_CLAIM_SERVER = "srv-spawn-authority-test"
+
+
+@pytest.fixture(autouse=True)
+def _db_fencing_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Establish a fake-database fencing claim on every daemon under test.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action.
+    """
+    claim_every_daemon(monkeypatch, supervisor, _DB_CLAIM_SERVER)
 
 
 @pytest.fixture(autouse=True)

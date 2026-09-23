@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from lubko import lifecycle, supervise, supervisor
+from lubko import lifecycle, lifecycle_authority, supervise, supervisor
 from lubko import worker as worker_mod
 from lubko.supervise import (
     INTENT_RUN,
@@ -28,6 +28,7 @@ from lubko.supervise import (
     read_state,
     write_state,
 )
+from tests._fake_authority_db import claim_every_daemon, seed_db_worker
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,6 +37,17 @@ if TYPE_CHECKING:
 
 COMMIT = "a" * 40
 TOKEN = "c" * 32
+_DB_CLAIM_SERVER = "srv-authority-preservation-test"
+
+
+@pytest.fixture(autouse=True)
+def _db_fencing_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Establish a fake-database fencing claim on every daemon under test.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action.
+    """
+    claim_every_daemon(monkeypatch, supervisor, _DB_CLAIM_SERVER)
 
 
 @pytest.fixture(autouse=True)
@@ -569,6 +581,18 @@ def test_deferred_out_of_lock_retirement_is_not_reported_converged(
     _dead_child_state()
     daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
     daemon.proc = None
+    seed_db_worker(
+        daemon,
+        lifecycle_authority.WorkerRecord(
+            token=TOKEN,
+            commit=COMMIT,
+            pid=4_100_000,
+            pgid=4_100_000,
+            sid=4_100_000,
+            start_time_ticks=42,
+            worker_id="host",
+        ),
+    )
     monkeypatch.setattr(lifecycle, "stop_worker", lambda *_a, **_k: True)
     monkeypatch.setattr(worker_mod, "drain_sentinel_matches", lambda _token: True)
 

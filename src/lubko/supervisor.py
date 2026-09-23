@@ -1457,12 +1457,23 @@ class SupervisorDaemon:
             LOGGER.error("refusing a run intent without an exact commit")
             return
         state = read_state()
-        already_running = (
-            not desired.restart
-            and state.commit == desired.commit
-            and state.child is not None
-            and self._child_alive(state)
-        )
+        if self._authority is not None:
+            db_running = self._db_worker_running(desired.commit)
+            if db_running is None:
+                self._message = (
+                    "fresh lifecycle authority is unavailable or superseded; "
+                    "holding without applying generation "
+                    f"{desired.generation}"
+                )
+                return
+            already_running = db_running
+        else:
+            self._message = (
+                "lifecycle authority is not established; holding without applying generation "
+                f"{desired.generation}"
+            )
+            LOGGER.error("%s", self._message)
+            return
         if not already_running:
             state = read_state()
             if not self._retire_child():
@@ -1555,12 +1566,15 @@ class SupervisorDaemon:
 
         Holds during the in-memory crash backoff so a crash loop cannot
         hammer replacements while local bookkeeping is unwritable.
+        Missing database authority also holds fail-closed: without a
+        fencing claim no spawn may proceed.
 
         Returns:
             ``True`` when the spawn decision may proceed.
         """
         if self._authority is None:
-            return True
+            self._message = "lifecycle authority is not established; holding without spawning"
+            return False
         if self._mem_next_attempt_at is not None and time.monotonic() < self._mem_next_attempt_at:
             self._message = "backing off after a worker exit before any replacement spawn"
             return False
@@ -1599,76 +1613,20 @@ class SupervisorDaemon:
         self._ensure_local_consumer_locked(commit)
 
     def _ensure_local_consumer_locked(self, commit: str) -> None:
-        """Run the local worker-ownership decision under the consumer lock.
+        """Spawn the worker when canonical database authority allows it.
 
-        This is the legacy local-only half of the gate-to-spawn decision,
-        reached only after database fencing, obligations, holds, and the
-        published worker record all allow a spawn.
+        Local files (``supervisor`` state ``child``, ``worker/meta.json``)
+        are read-through caches only, never authority: they are not
+        consulted here at all. No signal, adoption, retirement, or group
+        recovery is authorized from a cache. Destructive maintained-worker
+        actions happen only in :meth:`_reconcile_db_worker`,
+        :meth:`_retire_db_worker`, and the spawn-obligation resolvers, each
+        gated on the canonical ``WorkerRecord`` plus exact kernel liveness
+        proof under a fresh fencing-epoch match.
 
         Args:
             commit: Exact commit the worker must run.
         """
-        state = read_state()
-        if state.child is not None and self._child_alive(state) and state.commit == commit:
-            return
-        if state.child is not None and not self._retire_child(authority_locked=True):
-            now = time.monotonic()
-            write_state(
-                replace(
-                    read_state(),
-                    next_attempt_at=now + self._backoff_seconds(read_state().restart_count),
-                )
-            )
-            self._message = (
-                f"could not stop recorded worker pid {state.child.pid}; "
-                "holding without starting a worker"
-            )
-            LOGGER.error(
-                "could not stop recorded worker pid %d; holding",
-                state.child.pid,
-            )
-            return
-        state = read_state()
-        try:
-            meta = lifecycle.read_meta_strict()
-        except lifecycle.WorkerMetadataError as exc:
-            self._message = (
-                f"maintained-worker metadata is invalid; holding without starting a worker: {exc}"
-            )
-            LOGGER.exception("%s", self._message)
-            return
-        if meta is not None and lifecycle.worker_alive(meta):
-            is_our_child = (
-                state.child is not None
-                and meta.pid == state.child.pid
-                and meta.start_time_ticks == state.child.start_time_ticks
-            )
-            if not is_our_child:
-                LOGGER.info(
-                    "adopting ownership: stopping the recorded maintained worker pid %d by exact "
-                    "identity before starting our own child",
-                    meta.pid,
-                )
-                if not lifecycle.stop_worker(meta, self.settings.stop_grace_seconds):
-                    now = time.monotonic()
-                    next_backoff = now + self._backoff_seconds(read_state().restart_count)
-                    write_state(replace(read_state(), next_attempt_at=next_backoff))
-                    self._message = (
-                        f"could not stop the recorded maintained worker pid {meta.pid}; "
-                        "holding without starting a worker"
-                    )
-                    LOGGER.error(
-                        "could not stop the recorded maintained worker pid %d; holding",
-                        meta.pid,
-                    )
-                    return
-                # The adopted worker may have left command groups alive. If it
-                # proved a clean drain the groups are already gone and no
-                # emergency recovery is required; otherwise recovery is a durable
-                # blocking obligation — a DB/config/SQL failure must not let us
-                # spawn a replacement alongside stale groups.
-                if not (meta.token and worker_mod.drain_sentinel_matches(meta.token)):
-                    recover_owned_groups(meta.token or "")
         self._spawn_and_publish(commit)
 
     def _record_spawn_failure(self, commit: str, now: float) -> None:
@@ -1887,7 +1845,7 @@ class SupervisorDaemon:
         try:
             write_state(published)
         except (OSError, DurabilityError) as exc:
-            if self._authority is None or not _capacity_failure(exc):
+            if not _capacity_failure(exc):
                 raise
             LOGGER.debug(
                 "child publication cache write dropped under exhausted storage; "
@@ -1897,7 +1855,7 @@ class SupervisorDaemon:
         try:
             lifecycle.write_meta(meta)
         except (OSError, DurabilityError) as exc:
-            if self._authority is None or not _capacity_failure(exc):
+            if not _capacity_failure(exc):
                 self._message = (
                     "worker child published but lifecycle meta could not be written; "
                     "keeping the spawning obligation durable until the next tick"
@@ -2086,6 +2044,19 @@ class SupervisorDaemon:
         if not self._confirm_authority():
             self._message = (
                 "fresh lifecycle authority is unavailable or superseded; "
+                "preserving child identity and holding without signalling"
+            )
+            LOGGER.error("%s", self._message)
+            return False
+        # Canonical DB authority gate: a cached child identity alone never
+        # authorizes a signal or retirement. Only the canonical row's
+        # WorkerRecord naming this exact token authorizes destructive
+        # action; a stale cache beside an empty or foreign row holds
+        # without touching any process.
+        ok, record = self._read_worker_authority()
+        if not ok or record is None or record.token != child.token:
+            self._message = (
+                "canonical lifecycle authority does not name the cached worker; "
                 "preserving child identity and holding without signalling"
             )
             LOGGER.error("%s", self._message)
@@ -2415,19 +2386,21 @@ class SupervisorDaemon:
 
         The database commit is the linearization point of the spawn: it
         happens before the spawn syscall, and when it fails the spawn does
-        not happen. Daemons without an established fencing claim keep the
-        legacy local-only obligation.
+        not happen. Without an established fencing claim the spawn must
+        not happen either: hold fail-closed.
 
         Args:
             obligation: The pre-spawn obligation to commit.
 
         Returns:
-            ``True`` when the obligation is committed (or no fencing claim
-            is established), ``False`` when the spawn must not happen.
+            ``True`` when the obligation is committed, ``False`` when the
+            spawn must not happen.
         """
         claim = self._authority
         if claim is None:
-            return True
+            self._message = "lifecycle authority is not established; holding without spawning"
+            LOGGER.warning("%s", self._message)
+            return False
         conn = self._spawn_authority_connection()
         if conn is None:
             self._message = "lifecycle authority is unreachable; holding without spawning"
@@ -2466,13 +2439,15 @@ class SupervisorDaemon:
         """Clear the committed pre-spawn obligation from the authority row.
 
         Returns:
-            ``True`` when no database obligation remains (or no fencing
-            claim is established), ``False`` when the obligation must stay
-            blocking.
+            ``True`` when no database obligation remains, ``False`` when
+            the obligation must stay blocking (including when no fencing
+            claim is established: without authority nothing may be
+            treated as resolved).
         """
         claim = self._authority
         if claim is None:
-            return True
+            self._message = "lifecycle authority is not established; keeping the spawn obligation"
+            return False
         conn = self._spawn_authority_connection()
         if conn is None:
             self._message = (
@@ -2512,13 +2487,15 @@ class SupervisorDaemon:
 
         Returns:
             A ``(ok, obligation)`` pair: ``ok`` is ``False`` when the
-            database is unreachable and the caller must hold; otherwise
+            database is unreachable, untrusted, or no fencing claim is
+            established and the caller must hold; otherwise
             ``obligation`` is the committed obligation, or ``None`` when
-            no fencing claim is established or no obligation is committed.
+            no obligation is committed.
         """
         claim = self._authority
         if claim is None:
-            return True, None
+            self._message = "lifecycle authority is not established; holding without spawning"
+            return False, None
         conn = self._spawn_authority_connection()
         if conn is None:
             self._message = "lifecycle authority is unreachable; holding without spawning"
@@ -2558,7 +2535,8 @@ class SupervisorDaemon:
             parent_death_signal=spawn.parent_death_signal,
         )
 
-    def _cache_spawn_local(self, state: SupervisorState) -> None:
+    @staticmethod
+    def _cache_spawn_local(state: SupervisorState) -> None:
         """Publish a spawn transition to the local read-through cache.
 
         The database row is the authority; this local write is only a
@@ -2575,7 +2553,7 @@ class SupervisorDaemon:
         try:
             write_state(state)
         except (OSError, DurabilityError) as exc:
-            if self._authority is None or not _capacity_failure(exc):
+            if not _capacity_failure(exc):
                 raise
             LOGGER.debug(
                 "spawn cache write dropped under exhausted storage; "
@@ -2628,8 +2606,8 @@ class SupervisorDaemon:
 
         Publication and obligation clearance commit in one row update, so
         the worker is usable the instant the commit lands even when every
-        local filesystem mutation fails. Daemons without an established
-        fencing claim keep the legacy local-only publication.
+        local filesystem mutation fails. Without an established fencing
+        claim the publication must not be treated as durable.
 
         Args:
             child: The exact proven child identity to publish.
@@ -2637,13 +2615,14 @@ class SupervisorDaemon:
             token: Lifecycle token of the obligation being published.
 
         Returns:
-            ``True`` when the worker is published (or no fencing claim is
-            established), ``False`` when the publication must not be
-            treated as durable.
+            ``True`` when the worker is published, ``False`` when the
+            publication must not be treated as durable.
         """
         claim = self._authority
         if claim is None:
-            return True
+            self._message = "lifecycle authority is not established; holding without publishing"
+            LOGGER.warning("%s", self._message)
+            return False
         conn = self._spawn_authority_connection()
         if conn is None:
             self._message = "lifecycle authority is unreachable; holding without publishing"
@@ -2687,13 +2666,14 @@ class SupervisorDaemon:
             token: Lifecycle token of the published worker to clear.
 
         Returns:
-            ``True`` when no worker record remains (or no fencing claim is
-            established), ``False`` when the record must stay until the
-            row can be re-observed.
+            ``True`` when no worker record remains, ``False`` when the
+            record must stay until the row can be re-observed (including
+            when no fencing claim is established).
         """
         claim = self._authority
         if claim is None:
-            return True
+            self._message = "lifecycle authority is not established; keeping the published worker"
+            return False
         conn = self._spawn_authority_connection()
         if conn is None:
             self._message = (
@@ -2733,13 +2713,15 @@ class SupervisorDaemon:
 
         Returns:
             A ``(ok, record)`` pair: ``ok`` is ``False`` when the database
-            is unreachable or untrusted and the caller must hold; otherwise
-            ``record`` is the published worker, or ``None`` when no fencing
-            claim is established or no worker is published.
+            is unreachable or untrusted, or no fencing claim is
+            established, and the caller must hold; otherwise ``record``
+            is the published worker, or ``None`` when no worker is
+            published.
         """
         claim = self._authority
         if claim is None:
-            return True, None
+            self._message = "lifecycle authority is not established; holding without action"
+            return False, None
         conn = self._spawn_authority_connection()
         if conn is None:
             self._message = "lifecycle authority is unreachable; holding without action"
@@ -2858,8 +2840,8 @@ class SupervisorDaemon:
         When the published worker is ours and live, there is nothing to do.
         Otherwise the recorded worker is retired by exact identity (or its
         groups recovered when already dead) and its record cleared before
-        any replacement may spawn. Daemons without an established fencing
-        claim skip this gate and keep the legacy local-only decision.
+        any replacement may spawn. Without an established fencing claim
+        the gate holds: no spawn may proceed.
 
         Args:
             commit: Exact commit the worker must run.
@@ -2869,7 +2851,8 @@ class SupervisorDaemon:
             our exact worker already runs).
         """
         if self._authority is None:
-            return True
+            self._message = "lifecycle authority is not established; holding without spawning"
+            return False
         ok, record = self._read_worker_authority()
         if not ok:
             return False
@@ -2908,11 +2891,11 @@ class SupervisorDaemon:
         Returns:
             ``True`` when the authority row publishes a worker matching the
             live view for ``commit`` (no spawn needed), ``False`` when no
-            such worker runs, ``None`` when the row cannot be read and the
-            caller must hold.
+            such worker runs, ``None`` when the row cannot be read — or no
+            fencing claim is established — and the caller must hold.
         """
         if self._authority is None:
-            return False
+            return None
         ok, record = self._read_worker_authority()
         if not ok:
             return None
@@ -3137,7 +3120,7 @@ class SupervisorDaemon:
                 )
             )
         except (OSError, DurabilityError) as exc:
-            if self._authority is None or not _capacity_failure(exc):
+            if not _capacity_failure(exc):
                 return self._recover_unpublished_spawn(proc, obligation, child_ticks)
             LOGGER.debug(
                 "pid-upgrade cache write dropped under exhausted storage; "
@@ -5230,21 +5213,21 @@ class SupervisorDaemon:
         """Confirm the in-memory fencing claim against a fresh row read.
 
         Every ownership-dependent or destructive child action requires this
-        fresh match inside the decision. Daemons constructed without an
-        established claim retain their legacy file-based guards.
+        fresh match inside the decision. Without an established claim there
+        is no authority at all: hold fail-closed.
 
         Returns:
-            ``True`` only when no claim was established yet (legacy path) or
-            a fresh canonical row read matches the claim's server, epoch,
-            and exact owner. A fencing mismatch reads as ``False`` on the
-            same connection and stands down; a connection-level outage
-            discards the cached connection so the next confirmation opens a
-            fresh one, and also reads as ``False``: without a fresh match
-            the action does not happen.
+            ``True`` only when a fresh canonical row read matches the
+            claim's server, epoch, and exact owner. A fencing mismatch
+            reads as ``False`` on the same connection and stands down; a
+            connection-level outage discards the cached connection so the
+            next confirmation opens a fresh one, and also reads as
+            ``False``: without a fresh match the action does not happen.
         """
         claim = self._authority
         if claim is None:
-            return True
+            self._message = "lifecycle authority is not established; holding without action"
+            return False
         try:
             if self._authority_conn is None:
                 self._authority_conn = self._open_authority_connection()

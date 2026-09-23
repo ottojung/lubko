@@ -11,12 +11,22 @@ silently passing against an unprepared double.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, cast
 
 import psycopg
 
+from lubko import lifecycle_authority as authority
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from types import ModuleType
+
+    import pytest
+
+    from lubko.lifecycle_authority import WorkerRecord
+    from lubko.supervisor import Settings, SupervisorDaemon
+    from lubko.worker import JobsConnection
 
 
 class FakeAuthorityCursor:
@@ -134,3 +144,54 @@ class FakeAuthorityConnection:
 
     def close(self) -> None:
         """Discard the fake connection."""
+
+
+def claim_every_daemon(
+    monkeypatch: pytest.MonkeyPatch, supervisor_module: ModuleType, server: str
+) -> None:
+    """Give every daemon under test a fake-database fencing claim on build.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action. The wrapped constructor points
+    the daemon at a private fake authority table and runs the real
+    fencing-establishment path, so each daemon holds a fresh claim that
+    matches the row at construction time.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        supervisor_module: The ``lubko.supervisor`` module the daemon
+            class is constructed from.
+        server: Execution-server identity the fake row governs.
+    """
+    table = FakeAuthorityConnection()
+    monkeypatch.setattr(supervisor_module, "load_worker_server", lambda: server)
+    original_init = supervisor_module.SupervisorDaemon.__init__
+
+    def _claimed_init(self: SupervisorDaemon, settings: Settings) -> None:
+        original_init(self, settings)
+        self._authority_conn_factory = lambda: cast("JobsConnection", table)
+        self._write_pidfile()
+
+    monkeypatch.setattr(supervisor_module.SupervisorDaemon, "__init__", _claimed_init)
+
+
+def seed_db_worker(daemon: SupervisorDaemon, record: WorkerRecord) -> None:
+    """CAS a published worker record onto the daemon's fake authority row.
+
+    Tests proving DB-authorized retirement or settlement seed the canonical
+    record first; the daemon's own fencing claim authorizes the update.
+
+    Args:
+        daemon: A daemon holding a fencing claim from :func:`claim_every_daemon`.
+        record: The exact published worker identity to commit.
+    """
+    conn = daemon._spawn_authority_connection()
+    claim = daemon._authority
+    assert conn is not None
+    assert claim is not None
+    expected, current = authority._read_observed(conn, claim.server)
+    assert current is not None
+    updated = replace(current, worker=record)
+    assert authority._compare_and_swap(
+        conn, claim.server, expected, authority.canonical_row_text(updated)
+    )
