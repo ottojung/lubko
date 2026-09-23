@@ -263,8 +263,12 @@ pass "tracer built with ${CC_BIN}"
 
 note ''
 note '--- Transport setup ---'
-if ! uv sync --frozen --project "${REPO}" >/dev/null 2>&1; then
-  fail "uv sync --frozen failed for ${REPO}"
+# Deploy validation runs `uv sync --frozen --extra dev` itself; sync the same
+# full environment up front so the driver below can already import psycopg
+# and lubko. Using --extra dev (rather than bare --frozen) keeps this step
+# additive: it never strips a developer checkout's dev dependencies.
+if ! uv sync --frozen --extra dev --project "${REPO}" >/dev/null 2>&1; then
+  fail "uv sync --frozen --extra dev failed for ${REPO}"
   printf 'ACCEPTANCE FAILED\n'
   exit 1
 fi

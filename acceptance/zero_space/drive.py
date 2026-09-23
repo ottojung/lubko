@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Final, cast
 
 import psycopg
 
-from lubko import lifecycle_authority
+from lubko import lifecycle_authority as authority
 from lubko.protocol import PROTOCOL_VERSION, build_payload
 
 if TYPE_CHECKING:
@@ -72,9 +72,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
         with conn.cursor() as cursor:
             cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (app_role,))
             if cursor.fetchone() is None:
+                # DDL takes no bound parameters: interpolate quoted literals.
                 cursor.execute(
-                    f"CREATE ROLE {_quote_ident(app_role)} WITH LOGIN PASSWORD %s",
-                    (app_password,),
+                    f"CREATE ROLE {_quote_ident(app_role)} WITH LOGIN "
+                    f"PASSWORD {_quote_literal(app_password)}"
                 )
             cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (app_db,))
             if cursor.fetchone() is None:
@@ -118,6 +119,24 @@ def _quote_ident(name: str) -> str:
         msg = "identifier contains a NUL byte"
         raise ValueError(msg)
     return '"' + name.replace('"', '""') + '"'
+
+
+def _quote_literal(value: str) -> str:
+    """Quote a string literal for the setup DDL statements.
+
+    Args:
+        value: Raw literal text.
+
+    Returns:
+        The single-quoted literal.
+
+    Raises:
+        ValueError: If the value contains a NUL byte.
+    """
+    if "\x00" in value:
+        msg = "literal contains a NUL byte"
+        raise ValueError(msg)
+    return "'" + value.replace("'", "''") + "'"
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
@@ -206,7 +225,7 @@ def cmd_ready(args: argparse.Namespace) -> int:
         "user": args.pg_user,
         "password": args.pg_password,
     }
-    row_id = str(lifecycle_authority.authority_row_id(args.server))
+    row_id = str(authority.authority_row_id(args.server))
     deadline = time.monotonic() + READY_TIMEOUT_SECONDS
     with _connect(settings) as conn:
         while time.monotonic() < deadline:
@@ -214,8 +233,8 @@ def cmd_ready(args: argparse.Namespace) -> int:
                 payload = _read_payload(cursor, row_id)
             if payload is not None:
                 try:
-                    row = lifecycle_authority.parse_authority_payload(payload, server=args.server)
-                except lifecycle_authority.AuthorityError:
+                    row = authority.parse_authority_payload(payload, server=args.server)
+                except authority.AuthorityError:
                     row = None
                 if row is not None and row.owner is not None and _pid_live(row.owner.pid):
                     sys.stdout.write(
