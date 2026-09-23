@@ -658,13 +658,13 @@ static void handle_entry(struct tracee *tr, struct user_regs_struct *regs) {
         gate_new_entry(tr, AT_FDCWD, regs->rsi, "symlink");
         break;
     case __NR_symlinkat:
-        gate_new_entry(tr, (int)regs->rdi, regs->rdx, "symlinkat");
+        gate_new_entry(tr, (int)regs->rsi, regs->rdx, "symlinkat");
         break;
     case __NR_link:
         gate_new_entry(tr, AT_FDCWD, regs->rsi, "link");
         break;
     case __NR_linkat:
-        gate_new_entry(tr, (int)regs->rdx, regs->rsi, "linkat");
+        gate_new_entry(tr, (int)regs->rdx, regs->r10, "linkat");
         break;
     case __NR_rename:
         gate_rename(tr, AT_FDCWD, regs->rdi, AT_FDCWD, regs->rsi, 0,
@@ -685,7 +685,7 @@ static void handle_entry(struct tracee *tr, struct user_regs_struct *regs) {
         gate_ftruncate(tr, (int)regs->rdi, regs->rsi);
         break;
     case __NR_fallocate:
-        gate_fallocate(tr, (int)regs->rdi, regs->rsi, regs->rdx);
+        gate_fallocate(tr, (int)regs->rdi, regs->rsi, regs->r10);
         break;
     case __NR_close:
         table_untrack(tr->table, (int)regs->rdi);
@@ -759,15 +759,32 @@ static void handle_entry(struct tracee *tr, struct user_regs_struct *regs) {
         }
         break;
     }
-    case __NR_splice:
-    case __NR_tee: {
+    case __NR_splice: {
         int out = (int)regs->rdx;
         if (table_index(tr->table, out) >= 0) {
             off_t off = 0;
             unsigned long long off_addr = regs->r10;
-            const char *op = tr->sysno == __NR_splice ? "splice" : "tee";
             if (output_offset(tr, out, off_addr, off_addr != 0, &off) == 0) {
-                gate_output(tr, out, off, (size_t)regs->r8, op);
+                gate_output(tr, out, off, (size_t)regs->r8, "splice");
+            }
+        }
+        break;
+    }
+    case __NR_tee: {
+        /* tee(fd_in, fd_out, len, flags): output is args[1], length is
+         * args[2]; there is no output-offset pointer, so growth is judged
+         * at the live offset. Sharing splice's (out=args[2], len=args[4])
+         * decoding would police the wrong fd with the wrong length. */
+        int out = (int)regs->rsi;
+        if (table_index(tr->table, out) >= 0) {
+            off_t off = 0;
+            if (current_offset(tr->tid, out, &off) != 0) {
+                log_line("offset-unreadable",
+                    tr->table->entries[table_index(tr->table, out)].path,
+                    "fails-closed");
+                deny_here(tr);
+            } else {
+                gate_output(tr, out, off, (size_t)regs->rdx, "tee");
             }
         }
         break;
