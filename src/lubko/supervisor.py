@@ -3744,11 +3744,7 @@ class SupervisorDaemon:
         if record is None or record.token != obligation.token:
             return False
         self._active_child = self._db_worker_to_child(record)
-        try:
-            self._cache_spawn_local(replace(read_state(), spawning=None))
-        except (OSError, DurabilityError):
-            LOGGER.exception("could not clear the stale cached pre-spawn obligation; holding")
-            return False
+        self._cache_spawn_local(replace(read_state(), spawning=None))
         LOGGER.info(
             "adopted database-published worker pid=%d for commit %s",
             record.pid,
@@ -3786,14 +3782,10 @@ class SupervisorDaemon:
         if not resolved:
             return False
         # The database obligation clears first (it is the authority); the
-        # local cache clear is best-effort under exhausted storage.
+        # local cache clear is best-effort and never holds the decision.
         if not self._clear_spawn_authority():
             return False
-        try:
-            self._cache_spawn_local(replace(read_state(), spawning=None))
-        except (OSError, DurabilityError):
-            LOGGER.exception("could not clear the cached pre-spawn obligation; holding")
-            return False
+        self._cache_spawn_local(replace(read_state(), spawning=None))
         LOGGER.info("resolved prior pre-spawn recovery obligation for commit %s", obligation.commit)
         return True
 
