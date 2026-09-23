@@ -34,7 +34,7 @@ only authority-independent observation until fresh authority is available.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final
 from uuid import UUID, uuid5
 
@@ -62,12 +62,6 @@ AUTHORITY_MAX_BYTES: Final = 4096
 #: ``id`` deterministically in application code.
 AUTHORITY_NAMESPACE: Final = UUID("24b16c63-7210-4b87-9bc6-09583150835d")
 
-#: Totalizing payload-to-JSONB boundary mirroring
-#: :func:`lubko.worker._safe_payload_sql`. Kept local so this module stays
-#: free of the worker's import weight; the two expressions must stay
-#: textually equivalent.
-_AUTHORITY_JSON_SQL: Final = "((CASE WHEN payload IS JSON THEN payload END)::jsonb)"
-
 #: Bootstrap insert converging concurrent first writers onto one row.
 _BOOTSTRAP_INSERT_SQL: Final = (
     "INSERT INTO lubko.jobs (id, payload)\n"
@@ -78,16 +72,17 @@ _BOOTSTRAP_INSERT_SQL: Final = (
 #: Canonical row read by deterministic id.
 _READ_ROW_SQL: Final = "SELECT payload FROM lubko.jobs\nWHERE id = %(id)s"
 
-#: Ownership take guarded by a fencing-epoch compare-and-swap plus exact
-#: kind and server predicates, so two contenders can never CAS different
-#: rows and both believe they own the epoch.
-_TAKE_ROW_SQL: Final = (
+#: Every authority mutation is a true compare-and-swap over the exact
+#: observed payload text: the update commits only when the row still holds
+#: byte-for-byte the state the decision was based on. An epoch-only guard
+#: would let a stale contender clobber a concurrently committed spawn
+#: obligation while moving the epoch; the full-state guard makes any such
+#: interleaving fail the update so the loser stands down without acting.
+_CAS_ROW_SQL: Final = (
     "UPDATE lubko.jobs\n"
     "SET payload = %(payload)s\n"
     "WHERE id = %(id)s\n"
-    f"    AND {_AUTHORITY_JSON_SQL}->>'type' = 'lifecycle_authority'\n"
-    f"    AND {_AUTHORITY_JSON_SQL}->>'server' = %(server)s\n"
-    f"    AND {_AUTHORITY_JSON_SQL}->>'epoch' = %(expected_epoch)s"
+    "    AND payload = %(expected)s"
 )
 
 
@@ -145,6 +140,27 @@ class SpawnObligation:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkerRecord:
+    """The database-authoritative published maintained worker.
+
+    This is the crash-durable publication record: once committed, the
+    named exact process instance is the maintained consumer, even when
+    every local filesystem mutation fails and no local cache names it.
+    Publication and pre-spawn-obligation clearance commit atomically, so
+    no observer ever sees a published worker beside an outstanding
+    obligation for it, and no successor ever spawns beside it.
+    """
+
+    token: str
+    commit: str
+    pid: int
+    pgid: int
+    sid: int
+    start_time_ticks: int
+    worker_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class AuthorityRow:
     """A parsed and validated lifecycle authority row."""
 
@@ -153,6 +169,7 @@ class AuthorityRow:
     generation: int
     owner: AuthorityOwner | None
     spawn: SpawnObligation | None = None
+    worker: WorkerRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,9 +230,11 @@ def build_authority_payload(
     epoch: int,
     generation: int,
     owner: AuthorityOwner | None,
-    spawn: SpawnObligation | None = None,
 ) -> dict[str, object]:
     """Build a canonical authority payload mapping.
+
+    The lifecycle sections (``spawn``, ``worker``) default to absent; use
+    :func:`canonical_row_text` to serialize a complete row.
 
     Args:
         server: Exact execution-server identity the row governs.
@@ -223,8 +242,6 @@ def build_authority_payload(
         generation: Lifecycle generation counter carried by the row.
         owner: Exact incarnation holding the epoch, or ``None`` when the
             epoch is unowned.
-        spawn: Fenced pre-spawn obligation, or ``None`` when no spawn is
-            outstanding.
 
     Returns:
         The versioned payload mapping.
@@ -257,8 +274,28 @@ def build_authority_payload(
         "epoch": epoch,
         "generation": generation,
         "owner": owner_mapping,
-        "spawn": _build_spawn_mapping(spawn),
     }
+
+
+def canonical_row_text(row: AuthorityRow) -> str:
+    """Serialize a complete authority row to canonical guarded text.
+
+    Args:
+        row: The parsed row to serialize.
+
+    Returns:
+        Canonical sorted-key JSON text within the documented byte bound.
+
+    Note:
+        Field violations and bound overruns surface as
+        :class:`AuthorityError` from the section builders.
+    """
+    payload = build_authority_payload(
+        server=row.server, epoch=row.epoch, generation=row.generation, owner=row.owner
+    )
+    payload["spawn"] = _build_spawn_mapping(row.spawn)
+    payload["worker"] = _build_worker_mapping(row.worker)
+    return serialize_authority_payload(payload)
 
 
 def _build_spawn_mapping(spawn: SpawnObligation | None) -> dict[str, object] | None:
@@ -361,9 +398,9 @@ def _parse_spawn(raw: object) -> SpawnObligation | None:
     ticks: int | None = None
     if ticks_raw is not None:
         ticks = _check_non_negative_int("spawn.start_time_ticks", ticks_raw)
-    flag = raw.get("parent_death_signal", True)
+    flag = raw.get("parent_death_signal")
     if not isinstance(flag, bool):
-        msg = "authority spawn obligation parent-death-signal flag must be a boolean"
+        msg = "authority spawn obligation must carry an explicit boolean parent-death-signal flag"
         raise AuthorityError(msg)
     return SpawnObligation(
         token=token,
@@ -374,6 +411,88 @@ def _parse_spawn(raw: object) -> SpawnObligation | None:
         pid=pid,
         start_time_ticks=ticks,
         parent_death_signal=flag,
+    )
+
+
+def _build_worker_mapping(worker: WorkerRecord | None) -> dict[str, object] | None:
+    """Serialize an optional published-worker record, validating its binding.
+
+    Args:
+        worker: The record to serialize, or ``None``.
+
+    Returns:
+        The mapping, or ``None`` when no worker is published.
+
+    Raises:
+        AuthorityError: If any field violates the binding.
+    """
+    if worker is None:
+        return None
+    token: object = worker.token
+    if not isinstance(token, str) or not token:
+        msg = "authority worker record must carry a lifecycle token"
+        raise AuthorityError(msg)
+    commit: object = worker.commit
+    if not isinstance(commit, str) or not commit:
+        msg = "authority worker record must carry an exact commit"
+        raise AuthorityError(msg)
+    worker_id: object = worker.worker_id
+    if not isinstance(worker_id, str) or not worker_id:
+        msg = "authority worker record must carry a worker identity"
+        raise AuthorityError(msg)
+    return {
+        "token": token,
+        "commit": commit,
+        "pid": _check_positive_int("worker.pid", worker.pid),
+        "pgid": _check_non_negative_int("worker.pgid", worker.pgid),
+        "sid": _check_non_negative_int("worker.sid", worker.sid),
+        "start_time_ticks": _check_non_negative_int(
+            "worker.start_time_ticks", worker.start_time_ticks
+        ),
+        "worker_id": worker_id,
+    }
+
+
+def _parse_worker(raw: object) -> WorkerRecord | None:
+    """Parse an optional published-worker record from a payload mapping.
+
+    Args:
+        raw: The raw ``worker`` value.
+
+    Returns:
+        The validated record, or ``None`` for explicit null.
+
+    Raises:
+        AuthorityError: If the value is neither null nor an exact worker
+            record. A partial record never parses as a published worker.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        msg = "authority payload worker must be an object or null"
+        raise AuthorityError(msg)
+    token = raw.get("token")
+    if not isinstance(token, str) or not token:
+        msg = "authority worker record must carry a lifecycle token"
+        raise AuthorityError(msg)
+    commit = raw.get("commit")
+    if not isinstance(commit, str) or not commit:
+        msg = "authority worker record must carry an exact commit"
+        raise AuthorityError(msg)
+    worker_id = raw.get("worker_id")
+    if not isinstance(worker_id, str) or not worker_id:
+        msg = "authority worker record must carry a worker identity"
+        raise AuthorityError(msg)
+    return WorkerRecord(
+        token=token,
+        commit=commit,
+        pid=_check_positive_int("worker.pid", raw.get("pid")),
+        pgid=_check_non_negative_int("worker.pgid", raw.get("pgid")),
+        sid=_check_non_negative_int("worker.sid", raw.get("sid")),
+        start_time_ticks=_check_non_negative_int(
+            "worker.start_time_ticks", raw.get("start_time_ticks")
+        ),
+        worker_id=worker_id,
     )
 
 
@@ -444,7 +563,13 @@ def parse_authority_payload(data: object, *, server: str) -> AuthorityRow:
     generation = _check_non_negative_int("generation", data.get("generation"))
     owner = _parse_owner(data.get("owner"))
     spawn = _parse_spawn(data.get("spawn"))
-    return AuthorityRow(server=server, epoch=epoch, generation=generation, owner=owner, spawn=spawn)
+    worker = _parse_worker(data.get("worker"))
+    if spawn is not None and worker is not None:
+        msg = "authority row cannot carry both a spawn obligation and a published worker"
+        raise AuthorityError(msg)
+    return AuthorityRow(
+        server=server, epoch=epoch, generation=generation, owner=owner, spawn=spawn, worker=worker
+    )
 
 
 def _parse_owner(raw: object) -> AuthorityOwner | None:
@@ -521,8 +646,8 @@ def _neutral_payload(server: str) -> str:
     Returns:
         Canonical payload text.
     """
-    return serialize_authority_payload(
-        build_authority_payload(server=server, epoch=0, generation=0, owner=None)
+    return canonical_row_text(
+        AuthorityRow(server=_require_server_identity(server), epoch=0, generation=0, owner=None)
     )
 
 
@@ -599,15 +724,17 @@ def bootstrap_authority(conn: JobsConnection, server: str) -> AuthorityRow:
 
 
 def take_authority(conn: JobsConnection, server: str, owner: AuthorityOwner) -> AuthorityRow | None:
-    """Take fencing-epoch ownership with a compare-and-swap row update.
+    """Take fencing-epoch ownership with a true compare-and-swap row update.
 
     When the row already names this exact incarnation the take is an
     idempotent adoption. Otherwise the epoch is bumped exactly when the row
-    still carries the observed epoch: the guard predicate makes a concurrent
-    bump fail the update, so exactly one contender's commit wins and the
-    loser observes the mismatch and stands down without spawning. A
-    committed pre-spawn obligation survives the take so the new owner must
-    still resolve the first spawn's fate before spawning a replacement.
+    still holds byte-for-byte the observed state: the full-state guard
+    makes a stale contender's update fail, so exactly one contender's
+    commit wins and the loser observes the mismatch and stands down
+    without spawning — and no interleaving can clobber a concurrently
+    committed spawn obligation. A committed pre-spawn obligation survives
+    the take so the new owner must still resolve the first spawn's fate
+    before spawning a replacement.
 
     Args:
         conn: Open database connection.
@@ -616,88 +743,115 @@ def take_authority(conn: JobsConnection, server: str, owner: AuthorityOwner) -> 
 
     Returns:
         The updated row on success, or ``None`` when a concurrent contender
-        won the epoch first.
+        won the race first.
 
     Raises:
         AuthorityError: If no authority row exists to take.
-        AuthorityUnavailableError: If the database cannot be reached.
 
     Note:
         A corrupt or untrusted row fails closed via :class:`AuthorityError`
-        from :func:`read_authority`.
+        from :func:`read_authority`. Database outages surface as
+        :class:`AuthorityUnavailableError` from the row helpers.
     """
-    current = read_authority(conn, server)
+    expected, current = _read_observed(conn, server)
     if current is None:
         msg = f"no lifecycle authority row for server {server!r}; bootstrap first"
         raise AuthorityError(msg)
     if current.owner == owner:
         return current
-    candidate = serialize_authority_payload(
-        build_authority_payload(
-            server=server,
-            epoch=current.epoch + 1,
-            generation=current.generation,
-            owner=owner,
-            spawn=current.spawn,
-        )
-    )
+    updated = replace(current, epoch=current.epoch + 1, owner=owner)
+    if not _compare_and_swap(conn, server, expected, canonical_row_text(updated)):
+        return None
+    return updated
+
+
+def _read_observed(conn: JobsConnection, server: str) -> tuple[str, AuthorityRow | None]:
+    """Read the stored payload text and the parsed row together.
+
+    The stored text verbatim is the exact-state guard for a later
+    compare-and-swap: any concurrent mutation changes it, while an
+    unchanged row guards byte-identically regardless of which code
+    revision wrote it, so rows predating a schema extension never wedge
+    upgrades — the first mutation simply rewrites them canonically.
+
+    Args:
+        conn: Open database connection.
+        server: Exact execution-server identity.
+
+    Returns:
+        The ``(stored text, parsed row)`` pair; the text is ``""`` and
+        the row ``None`` when no row exists yet.
+
+    Raises:
+        AuthorityUnavailableError: If the database cannot be reached.
+
+    Note:
+        A present but corrupt or untrusted row fails closed via
+        :class:`AuthorityError` from :func:`parse_authority_payload`.
+    """
+    row_id = authority_row_id(server)
+    try:
+        with conn.transaction(), conn.cursor() as cursor:
+            cursor.execute(_READ_ROW_SQL, {"id": str(row_id)})
+            fetched = cursor.fetchone()
+    except psycopg.Error as exc:
+        msg = f"lifecycle authority for server {server!r} is unreachable"
+        raise AuthorityUnavailableError(msg) from exc
+    if fetched is None:
+        return "", None
+    stored = fetched[0]
+    if not isinstance(stored, str):
+        stored = json.dumps(stored, sort_keys=True)
+    return stored, parse_authority_payload(stored, server=server)
+
+
+def _compare_and_swap(conn: JobsConnection, server: str, expected: str, candidate: str) -> bool:
+    """Commit a candidate payload only when the row is still the observed state.
+
+    Args:
+        conn: Open database connection.
+        server: Exact execution-server identity, for error context.
+        expected: Exact payload text the decision was based on.
+        candidate: Payload text to commit.
+
+    Returns:
+        ``True`` when the update committed, ``False`` when a concurrent
+        mutation won the race first.
+
+    Raises:
+        AuthorityUnavailableError: If the database cannot be reached.
+    """
     try:
         with conn.transaction(), conn.cursor() as cursor:
             cursor.execute(
-                _TAKE_ROW_SQL,
+                _CAS_ROW_SQL,
                 {
                     "id": str(authority_row_id(server)),
                     "payload": candidate,
-                    "server": server,
-                    "expected_epoch": str(current.epoch),
+                    "expected": expected,
                 },
             )
             won = cursor.rowcount == 1
     except psycopg.Error as exc:
         msg = f"lifecycle authority for server {server!r} is unreachable"
         raise AuthorityUnavailableError(msg) from exc
-    if not won:
-        return None
-    return AuthorityRow(
-        server=server,
-        epoch=current.epoch + 1,
-        generation=current.generation,
-        owner=owner,
-        spawn=current.spawn,
-    )
+    return won
 
 
-def commit_spawn_obligation(
-    conn: JobsConnection, claim: AuthorityClaim, spawn: SpawnObligation
-) -> bool:
-    """Commit a fenced pre-spawn obligation before the spawn syscall.
-
-    The obligation is the crash-durable authority forbidding any successor
-    from starting a second consumer beside a possibly-live first spawn. The
-    update is guarded by the claim's fencing epoch plus exact kind, server,
-    and owner predicates, so a superseded incarnation's commit fails the
-    update and it never spawns. When the commit fails (database
-    unreachable), the spawn does not happen.
+def _claim_owner(claim: AuthorityClaim, current: AuthorityRow) -> AuthorityOwner:
+    """Verify a fencing claim against an observed row and return its owner.
 
     Args:
-        conn: Open database connection.
-        claim: In-memory fencing-epoch holding authorizing the spawn.
-        spawn: The pre-spawn obligation to commit.
+        claim: In-memory fencing-epoch holding to verify.
+        current: The freshly observed row.
 
     Returns:
-        ``True`` when the obligation committed, ``False`` when a
-        concurrent contender won the epoch first (the caller stands down
-        without spawning).
+        The row's exact owner.
 
     Raises:
-        AuthorityError: If no authority row exists or the claim no longer
-            matches the row.
-        AuthorityUnavailableError: If the database cannot be reached.
+        AuthorityError: If the row's epoch or owner no longer matches the
+            claim: without a fresh match the action does not happen.
     """
-    current = read_authority(conn, claim.server)
-    if current is None:
-        msg = f"no lifecycle authority row for server {claim.server!r}; bootstrap first"
-        raise AuthorityError(msg)
     if current.epoch != claim.epoch or current.owner is None:
         msg = "lifecycle authority fencing epoch no longer matches the claim; holding"
         raise AuthorityError(msg)
@@ -709,33 +863,48 @@ def commit_spawn_obligation(
     ):
         msg = "lifecycle authority fencing epoch no longer matches the claim; holding"
         raise AuthorityError(msg)
-    if current.spawn is not None:
+    return owner
+
+
+def commit_spawn_obligation(
+    conn: JobsConnection, claim: AuthorityClaim, spawn: SpawnObligation
+) -> bool:
+    """Commit a fenced pre-spawn obligation before the spawn syscall.
+
+    The obligation is the crash-durable authority forbidding any successor
+    from starting a second consumer beside a possibly-live first spawn. The
+    update commits only when the row still holds byte-for-byte the observed
+    state, so a superseded incarnation's commit — or any commit racing a
+    concurrent mutation — fails and the spawn does not happen. When the
+    commit fails (database unreachable), the spawn does not happen.
+
+    Args:
+        conn: Open database connection.
+        claim: In-memory fencing-epoch holding authorizing the spawn.
+        spawn: The pre-spawn obligation to commit.
+
+    Returns:
+        ``True`` when the obligation committed, ``False`` when a
+        concurrent contender won the race first (the caller stands down
+        without spawning).
+
+    Raises:
+        AuthorityError: If no authority row exists or the claim no longer
+            matches the row.
+
+    Note:
+        Database outages surface as :class:`AuthorityUnavailableError`
+        from the row helpers.
+    """
+    expected, current = _read_observed(conn, claim.server)
+    if current is None:
+        msg = f"no lifecycle authority row for server {claim.server!r}; bootstrap first"
+        raise AuthorityError(msg)
+    owner = _claim_owner(claim, current)
+    if current.spawn is not None or current.worker is not None:
         return False
-    candidate = serialize_authority_payload(
-        build_authority_payload(
-            server=claim.server,
-            epoch=current.epoch,
-            generation=current.generation,
-            owner=owner,
-            spawn=spawn,
-        )
-    )
-    try:
-        with conn.transaction(), conn.cursor() as cursor:
-            cursor.execute(
-                _TAKE_ROW_SQL,
-                {
-                    "id": str(authority_row_id(claim.server)),
-                    "payload": candidate,
-                    "server": claim.server,
-                    "expected_epoch": str(current.epoch),
-                },
-            )
-            won = cursor.rowcount == 1
-    except psycopg.Error as exc:
-        msg = f"lifecycle authority for server {claim.server!r} is unreachable"
-        raise AuthorityUnavailableError(msg) from exc
-    return won
+    updated = replace(current, owner=owner, spawn=spawn, worker=None)
+    return _compare_and_swap(conn, claim.server, expected, canonical_row_text(updated))
 
 
 def clear_spawn_obligation(conn: JobsConnection, claim: AuthorityClaim) -> bool:
@@ -746,55 +915,116 @@ def clear_spawn_obligation(conn: JobsConnection, claim: AuthorityClaim) -> bool:
         claim: In-memory fencing-epoch holding owning the obligation.
 
     Returns:
-        ``True`` when the obligation cleared, ``False`` when the epoch
-        no longer matches (the caller stands down without touching any
-        child process).
+        ``True`` when no database obligation remains (including when the
+        row already holds none), ``False`` when the row changed under the
+        decision and the caller must re-observe instead of assuming.
 
-    Raises:
-        AuthorityUnavailableError: If the database cannot be reached.
+    Note:
+        Database outages surface as :class:`AuthorityUnavailableError`
+        from the row helpers.
     """
     try:
-        current = read_authority(conn, claim.server)
+        expected, current = _read_observed(conn, claim.server)
     except AuthorityError:
         return False
     if current is None:
         return False
-    if current.epoch != claim.epoch or current.spawn is None:
-        return current.epoch == claim.epoch and current.spawn is None
-    owner = current.owner
-    if owner is None:
-        return False
-    if (
-        owner.pid != claim.pid
-        or owner.start_time_ticks != claim.start_time_ticks
-        or owner.boot_id != claim.boot_id
-    ):
-        return False
-    candidate = serialize_authority_payload(
-        build_authority_payload(
-            server=claim.server,
-            epoch=current.epoch,
-            generation=current.generation,
-            owner=owner,
-            spawn=None,
-        )
-    )
     try:
-        with conn.transaction(), conn.cursor() as cursor:
-            cursor.execute(
-                _TAKE_ROW_SQL,
-                {
-                    "id": str(authority_row_id(claim.server)),
-                    "payload": candidate,
-                    "server": claim.server,
-                    "expected_epoch": str(current.epoch),
-                },
-            )
-            won = cursor.rowcount == 1
-    except psycopg.Error as exc:
-        msg = f"lifecycle authority for server {claim.server!r} is unreachable"
-        raise AuthorityUnavailableError(msg) from exc
-    return won
+        owner = _claim_owner(claim, current)
+    except AuthorityError:
+        return False
+    if current.spawn is None:
+        return True
+    updated = replace(current, owner=owner, spawn=None)
+    return _compare_and_swap(conn, claim.server, expected, canonical_row_text(updated))
+
+
+def publish_worker(
+    conn: JobsConnection,
+    claim: AuthorityClaim,
+    *,
+    spawn_token: str,
+    worker: WorkerRecord,
+) -> bool:
+    """Atomically publish the maintained worker and clear its obligation.
+
+    Publication and obligation clearance commit in one row update over the
+    exact observed state: no observer ever sees a published worker beside
+    an outstanding obligation for it, and no concurrent mutation — a stale
+    takeover, a second commit, a fencing supersession — can slip between
+    the two. The update commits only when the row still names the claim's
+    epoch and owner and the outstanding obligation carries ``spawn_token``.
+
+    Args:
+        conn: Open database connection.
+        claim: In-memory fencing-epoch holding owning the obligation.
+        spawn_token: Lifecycle token of the obligation being published.
+        worker: The exact published worker identity.
+
+    Returns:
+        ``True`` when the worker published, ``False`` when the row changed
+        under the decision (the caller must re-observe and, with a live
+        unpublished child in hand, converge it rather than assume).
+
+    Raises:
+        AuthorityError: If no authority row exists.
+
+    Note:
+        Database outages surface as :class:`AuthorityUnavailableError`
+        from the row helpers.
+    """
+    expected, current = _read_observed(conn, claim.server)
+    if current is None:
+        msg = f"no lifecycle authority row for server {claim.server!r}; bootstrap first"
+        raise AuthorityError(msg)
+    try:
+        owner = _claim_owner(claim, current)
+    except AuthorityError:
+        return False
+    if current.spawn is None or current.spawn.token != spawn_token:
+        return False
+    if current.worker is not None:
+        return False
+    if worker.token != spawn_token:
+        msg = "published worker identity must name the obligated incarnation"
+        raise AuthorityError(msg)
+    updated = replace(current, owner=owner, spawn=None, worker=worker)
+    return _compare_and_swap(conn, claim.server, expected, canonical_row_text(updated))
+
+
+def clear_worker(conn: JobsConnection, claim: AuthorityClaim, token: str) -> bool:
+    """Clear a published worker record under the fencing epoch.
+
+    Args:
+        conn: Open database connection.
+        claim: In-memory fencing-epoch holding owning the record.
+        token: Lifecycle token of the published worker to clear.
+
+    Returns:
+        ``True`` when no worker record remains (including when the row
+        already holds none), ``False`` when the row changed under the
+        decision and the caller must re-observe instead of assuming.
+
+    Note:
+        Database outages surface as :class:`AuthorityUnavailableError`
+        from the row helpers.
+    """
+    try:
+        expected, current = _read_observed(conn, claim.server)
+    except AuthorityError:
+        return False
+    if current is None:
+        return False
+    try:
+        owner = _claim_owner(claim, current)
+    except AuthorityError:
+        return False
+    if current.worker is None:
+        return True
+    if current.worker.token != token:
+        return False
+    updated = replace(current, owner=owner, worker=None)
+    return _compare_and_swap(conn, claim.server, expected, canonical_row_text(updated))
 
 
 def confirm_authority(conn: JobsConnection, claim: AuthorityClaim) -> bool:

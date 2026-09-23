@@ -10,7 +10,6 @@ silently passing against an unprepared double.
 
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
@@ -66,24 +65,20 @@ class FakeAuthorityCursor:
         raise AssertionError(msg)
 
     def _apply_take(self, arguments: dict[str, object]) -> int:
-        """Apply a fencing-epoch compare-and-swap update.
+        """Apply an exact-state compare-and-swap update.
 
         Args:
-            arguments: Bound ``id``/``payload``/``server``/``expected_epoch``.
+            arguments: Bound ``id``/``payload``/``expected``.
 
         Returns:
-            ``1`` when the guarded update committed, ``0`` on a lost race.
+            ``1`` when the row still held the exact observed state and the
+            candidate committed, ``0`` on any concurrent change.
         """
         row_id = str(arguments["id"])
         stored = self._table.rows.get(row_id)
-        current = _decode_take_row(stored)
-        if current is None:
+        if stored is None:
             return 0
-        if current.get("type") != "lifecycle_authority":
-            return 0
-        if current.get("server") != arguments["server"]:
-            return 0
-        if str(current.get("epoch")) != str(arguments["expected_epoch"]):
+        if stored != arguments["expected"]:
             return 0
         self._table.rows[row_id] = str(arguments["payload"])
         return 1
@@ -107,24 +102,6 @@ class FakeAuthorityCursor:
         remaining = list(self._result)
         self._result.clear()
         return remaining
-
-
-def _decode_take_row(stored: str | None) -> dict[str, object] | None:
-    """Decode a stored row for compare-and-swap validation.
-
-    Args:
-        stored: Raw stored payload text, or ``None`` when absent.
-
-    Returns:
-        The decoded mapping, or ``None`` when absent or undecodable.
-    """
-    if stored is None:
-        return None
-    try:
-        current = json.loads(stored)
-    except ValueError:
-        return None
-    return current if isinstance(current, dict) else None
 
 
 class FakeAuthorityConnection:
