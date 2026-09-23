@@ -1078,6 +1078,40 @@ def confirm_authority(conn: JobsConnection, claim: AuthorityClaim) -> bool:
     )
 
 
+def read_stored_payload(conn: JobsConnection, server: str) -> str | None:
+    """Read the stored authority payload text without parsing it.
+
+    This is the startup migration boundary's detector: it distinguishes an
+    absent row (bootstrap v2), a v1 row (migrate once), and a v2 row
+    (proceed) without passing any of them through the strict v2 parser
+    first, so an existing v1 row never fails closed before migration runs.
+
+    Args:
+        conn: Open database connection.
+        server: Exact execution-server identity.
+
+    Returns:
+        The stored payload text verbatim, or ``None`` when no row exists.
+
+    Raises:
+        AuthorityUnavailableError: If the database cannot be reached.
+    """
+    row_id = authority_row_id(server)
+    try:
+        with conn.transaction(), conn.cursor() as cursor:
+            cursor.execute(_READ_ROW_SQL, {"id": str(row_id)})
+            fetched = cursor.fetchone()
+    except psycopg.Error as exc:
+        msg = f"lifecycle authority for server {server!r} is unreachable"
+        raise AuthorityUnavailableError(msg) from exc
+    if fetched is None:
+        return None
+    stored = fetched[0]
+    if not isinstance(stored, str):
+        stored = json.dumps(stored, sort_keys=True)
+    return stored
+
+
 @dataclass(frozen=True, slots=True)
 class V1LegacyEvidence:
     """Legacy local state transferred into v2 before the migration CAS.

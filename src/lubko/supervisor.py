@@ -1813,18 +1813,19 @@ class SupervisorDaemon:
         """Publish cache copies of a database-published worker.
 
         The database record committed by :meth:`_publish_worker_authority`
-        is the publication; these local writes are read-through caches
-        dropped silently under exhausted storage.
+        is the publication; these local writes are read-through caches.
+        Once the database publication has committed, every cache write
+        below is best-effort for correctness: failures are logged and
+        dropped, never raised, so a cache projection failure cannot
+        revoke, kill, or hold an otherwise valid database-published
+        worker. A leftover local spawning residue is adopted by the
+        normal reconciler on a later tick.
 
         Args:
             child: The exact published worker child.
             commit: Exact commit the worker runs.
             now: Monotonic time of the publication.
             obligation: The pre-Popen obligation being published.
-
-        Raises:
-            OSError: If a non-capacity local write fails outside fencing.
-            DurabilityError: If a non-capacity local write fails outside fencing.
         """
         published = replace(
             read_state(),
@@ -1845,11 +1846,10 @@ class SupervisorDaemon:
         try:
             write_state(published)
         except (OSError, DurabilityError) as exc:
-            if not _capacity_failure(exc):
-                raise
-            LOGGER.debug(
-                "child publication cache write dropped under exhausted storage; "
-                "the database worker record holds the publication"
+            LOGGER.warning(
+                "child publication cache write dropped (%s); "
+                "the database worker record holds the publication",
+                exc,
             )
         meta = replace(_child_to_meta(child, _runtime_dir(commit)), git_commit=commit)
         try:
@@ -1867,18 +1867,11 @@ class SupervisorDaemon:
                 "the database worker record holds the publication"
             )
         # The database obligation clears first (it is the authority); the
-        # local cache clear is best-effort under exhausted storage.
+        # local cache clear is best-effort and never raises.
         if not self._clear_spawn_authority():
             LOGGER.error("could not clear the pre-spawn obligation; holding")
             return
-        try:
-            self._cache_spawn_local(replace(read_state(), spawning=None))
-        except (OSError, DurabilityError):
-            LOGGER.exception(
-                "could not clear the cached pre-spawn obligation; "
-                "the database obligation is cleared and the worker is published"
-            )
-            return
+        self._cache_spawn_local(replace(read_state(), spawning=None))
         lifecycle.append_deploy_log(
             f"supervisor started worker pid={child.pid} commit={commit} "
             f"incarnation={child.worker_id}"
@@ -2050,11 +2043,13 @@ class SupervisorDaemon:
             return False
         # Canonical DB authority gate: a cached child identity alone never
         # authorizes a signal or retirement. Only the canonical row's
-        # WorkerRecord naming this exact token authorizes destructive
-        # action; a stale cache beside an empty or foreign row holds
-        # without touching any process.
+        # WorkerRecord naming the full exact identity — token, pid, pgid,
+        # sid, start-time ticks, worker id, and commit binding — authorizes
+        # destructive action; a stale cache beside an empty, foreign, or
+        # partially mismatched row (same token but recycled PID or start
+        # time) holds without touching any process.
         ok, record = self._read_worker_authority()
-        if not ok or record is None or record.token != child.token:
+        if not ok or not self._db_record_matches_child(record, child, state.commit):
             self._message = (
                 "canonical lifecycle authority does not name the cached worker; "
                 "preserving child identity and holding without signalling"
@@ -2540,24 +2535,20 @@ class SupervisorDaemon:
         """Publish a spawn transition to the local read-through cache.
 
         The database row is the authority; this local write is only a
-        cache. Under exhausted storage the cache write is dropped and the
-        database record keeps the spawn fenced and published.
+        cache. Once DB spawn authority has committed, the cache write is
+        best-effort for correctness: any local failure is logged and
+        dropped, never propagated, so a cache projection failure cannot
+        revoke or hold an otherwise valid database-published transition.
 
         Args:
             state: The transition to publish locally.
-
-        Raises:
-            DurabilityError: If the write fails for a non-capacity reason.
-            OSError: If the write fails for a non-capacity reason.
         """
         try:
             write_state(state)
         except (OSError, DurabilityError) as exc:
-            if not _capacity_failure(exc):
-                raise
-            LOGGER.debug(
-                "spawn cache write dropped under exhausted storage; "
-                "the database record holds the spawn fenced and published"
+            LOGGER.warning(
+                "spawn cache write dropped (%s); the database record holds the spawn",
+                exc,
             )
 
     @staticmethod
@@ -2790,6 +2781,39 @@ class SupervisorDaemon:
             log_path=str(lifecycle.worker_log_path(record.token)),
             started_at=None,
             stopped_at=None,
+        )
+
+    @staticmethod
+    def _db_record_matches_child(
+        record: authority.WorkerRecord | None, child: WorkerChild, commit: str | None
+    ) -> bool:
+        """Return whether a published record names the full cached identity.
+
+        A token match alone never authorizes action: PID reuse with a
+        recycled start time (or any other partial mismatch) must not
+        authorize a signal or a clear.
+
+        Args:
+            record: The published worker record, if any.
+            child: The cached worker identity.
+            commit: The cached commit binding, if any.
+
+        Returns:
+            ``True`` only when the record names the child's exact token,
+            PID, group, session, start-time ticks, and worker id, with the
+            commit binding matching whenever the cache names one.
+        """
+        if record is None:
+            return False
+        if commit is not None and record.commit != commit:
+            return False
+        return (
+            record.token == child.token
+            and record.pid == child.pid
+            and record.pgid == child.pgid
+            and record.sid == child.sid
+            and record.start_time_ticks == child.start_time_ticks
+            and record.worker_id == child.worker_id
         )
 
     def _retire_db_worker(self, record: authority.WorkerRecord) -> bool:
@@ -3694,11 +3718,7 @@ class SupervisorDaemon:
             # the authority, so materialize the committed obligation into the
             # cache and resolve it deterministically below.
             obligation = db_obligation
-            try:
-                self._cache_spawn_local(replace(read_state(), spawning=obligation))
-            except (OSError, DurabilityError):
-                LOGGER.exception("could not cache the committed pre-spawn obligation; holding")
-                return False
+            self._cache_spawn_local(replace(read_state(), spawning=obligation))
         elif self._adopt_db_published(obligation):
             return True
         return self._settle_spawning_obligation(state, obligation)
@@ -3840,17 +3860,9 @@ class SupervisorDaemon:
             )
             LOGGER.exception("%s", self._message)
             return False
-        try:
-            if not self._clear_spawn_authority():
-                return False
-            self._cache_spawn_local(replace(read_state(), spawning=None))
-        except (OSError, DurabilityError):
-            self._message = (
-                "deferred worker publication cleared the obligation in memory but "
-                "could not durably persist it; keeping it blocking until the next tick"
-            )
-            LOGGER.exception("%s", self._message)
+        if not self._clear_spawn_authority():
             return False
+        self._cache_spawn_local(replace(read_state(), spawning=None))
         LOGGER.info("finished deferred publication of worker pid=%d", child.pid)
         return True
 
@@ -5052,6 +5064,202 @@ class SupervisorDaemon:
             )
             return False
 
+    @staticmethod
+    def _v1_migration_evidence() -> authority.V1LegacyEvidence:
+        """Build exact legacy evidence for a one-time v1→v2 row migration.
+
+        Transfers only positively proven identity: a kernel-live
+        maintained worker from ``worker/meta.json``, or a blocking
+        pre-spawn/unresolved incarnation from durable supervisor state.
+        Anything malformed, unreadable, or ambiguous fails closed so the
+        v1 row is left untouched.
+
+        Returns:
+            The proven legacy evidence (possibly empty for a neutral row).
+
+        Raises:
+            AuthorityError: If legacy state is malformed or safety cannot
+                be proved from it.
+        """
+        try:
+            state = read_state()
+        except Exception as exc:
+            msg = "legacy supervisor state is unreadable; leaving v1 authority untouched"
+            raise authority.AuthorityError(msg) from exc
+        if (
+            state.ownership_hold_malformed
+            or state.unresolved_hold_malformed
+            or state.spawning_hold_malformed
+        ):
+            msg = "legacy local authority holds are malformed; leaving v1 authority untouched"
+            raise authority.AuthorityError(msg)
+        try:
+            meta = lifecycle.read_meta_strict()
+        except lifecycle.WorkerMetadataError as exc:
+            msg = "legacy maintained-worker metadata is malformed; leaving v1 untouched"
+            raise authority.AuthorityError(msg) from exc
+        live_worker: authority.WorkerRecord | None = None
+        if meta is not None and lifecycle.worker_alive(meta):
+            live_worker = SupervisorDaemon._proven_legacy_worker(meta)
+        spawn: authority.SpawnObligation | None = None
+        if state.spawning is not None:
+            spawn = SupervisorDaemon._db_spawn_record(state.spawning)
+        elif state.unresolved_child is not None:
+            hold = state.unresolved_child
+            if not state.commit:
+                msg = "legacy unresolved hold names no commit; leaving v1 untouched"
+                raise authority.AuthorityError(msg)
+            # The hold carries the exact blocking identity (pid, ticks,
+            # token) but no pre-spawn creation proof: without the kernel
+            # parent-death guarantee the v2 reconciler must resolve it by
+            # exact convergence or manual recovery, never by assumption.
+            spawn = authority.SpawnObligation(
+                token=hold.token,
+                commit=state.commit,
+                creator_pid=0,
+                creator_start_time_ticks=0,
+                boot_id=None,
+                pid=hold.pid,
+                start_time_ticks=hold.start_time_ticks,
+                parent_death_signal=False,
+            )
+        if state.child is not None and not SupervisorDaemon._migration_covers_child(
+            state.child, live_worker, spawn
+        ):
+            if state.commit:
+                probe = _child_to_meta(state.child, _runtime_dir(state.commit))
+                if lifecycle.worker_alive(probe):
+                    msg = (
+                        "a live cached worker has no proven legacy identity; "
+                        "leaving v1 authority untouched"
+                    )
+                    raise authority.AuthorityError(msg)
+            else:
+                msg = "a cached worker names no commit; leaving v1 authority untouched"
+                raise authority.AuthorityError(msg)
+        return authority.V1LegacyEvidence(live_worker=live_worker, spawn=spawn)
+
+    @staticmethod
+    def _proven_legacy_worker(meta: lifecycle.WorkerMeta) -> authority.WorkerRecord:
+        """Encode a kernel-live legacy worker as an exact v2 record.
+
+        Args:
+            meta: Live maintained-worker metadata.
+
+        Returns:
+            The exact published-worker identity to transfer.
+
+        Raises:
+            AuthorityError: If any exact identity field is missing.
+        """
+        if not meta.token or not meta.git_commit or not meta.worker_id:
+            msg = "legacy live worker lacks an exact identity; leaving v1 untouched"
+            raise authority.AuthorityError(msg)
+        if (
+            meta.pid is None
+            or meta.pid <= 0
+            or meta.pgid is None
+            or meta.sid is None
+            or meta.start_time_ticks is None
+        ):
+            msg = "legacy live worker lacks an exact identity; leaving v1 untouched"
+            raise authority.AuthorityError(msg)
+        return authority.WorkerRecord(
+            token=meta.token,
+            commit=meta.git_commit,
+            pid=meta.pid,
+            pgid=meta.pgid,
+            sid=meta.sid,
+            start_time_ticks=meta.start_time_ticks,
+            worker_id=meta.worker_id,
+        )
+
+    @staticmethod
+    def _migration_covers_child(
+        child: WorkerChild,
+        worker: authority.WorkerRecord | None,
+        spawn: authority.SpawnObligation | None,
+    ) -> bool:
+        """Return whether transferred evidence names the exact cached child.
+
+        Args:
+            child: The cached worker identity.
+            worker: The proven live worker to transfer, if any.
+            spawn: The blocking spawn identity to transfer, if any.
+
+        Returns:
+            ``True`` when either evidence names the child's exact
+            token, PID, and start-time ticks.
+        """
+        if (
+            worker is not None
+            and worker.token == child.token
+            and worker.pid == child.pid
+            and worker.start_time_ticks == child.start_time_ticks
+        ):
+            return True
+        return (
+            spawn is not None
+            and spawn.token == child.token
+            and spawn.pid == child.pid
+            and spawn.start_time_ticks == child.start_time_ticks
+        )
+
+    def _ensure_v2_authority_row(self, conn: JobsConnection, server: str) -> None:
+        """Migrate an existing v1 row to canonical v2 once, before strict parsing.
+
+        Detects the stored row without passing it through the strict v2
+        parser first: an absent row bootstraps v2 normally, a v2 row
+        proceeds untouched, and a v1 row migrates atomically with legacy
+        evidence transferred beforehand. After this returns, only strict
+        v2 APIs touch the row.
+
+        Args:
+            conn: Open database connection.
+            server: Exact execution-server identity.
+
+        Raises:
+            SystemExit: If the row is v1 but cannot be migrated safely
+                (the v1 row is left untouched) or a concurrent mutation
+                left a non-v2 row behind.
+        """
+        stored = authority.read_stored_payload(conn, server)
+        if stored is None:
+            return
+        try:
+            authority.parse_authority_payload(stored, server=server)
+        except authority.AuthorityError:
+            pass
+        else:
+            return
+        try:
+            evidence = self._v1_migration_evidence()
+        except authority.AuthorityError:
+            LOGGER.exception(
+                "legacy v1 lifecycle authority cannot be migrated safely; "
+                "refusing startup without touching v1"
+            )
+            raise SystemExit(1) from None
+        try:
+            migrated = authority.migrate_v1_to_v2(conn, server, evidence)
+        except authority.AuthorityError:
+            LOGGER.exception(
+                "legacy v1 lifecycle authority cannot be migrated safely; "
+                "refusing startup without touching v1"
+            )
+            raise SystemExit(1) from None
+        if migrated:
+            return
+        LOGGER.error("lost the v1 migration race; re-reading the authority row")
+        stored = authority.read_stored_payload(conn, server)
+        if stored is None:
+            return
+        try:
+            authority.parse_authority_payload(stored, server=server)
+        except authority.AuthorityError:
+            LOGGER.exception("the authority row is still not v2 after the migration race")
+            raise SystemExit(1) from None
+
     def _write_pidfile(self) -> None:
         """Establish fencing-epoch ownership of this execution server.
 
@@ -5077,9 +5285,10 @@ class SupervisorDaemon:
 
         Raises:
             SystemExit: If another live supervisor daemon is already running,
-                the authority row is corrupt or untrusted, the fencing epoch
-                was lost to a concurrent contender, or the server identity
-                cannot be established.
+                the authority row is corrupt or untrusted, a legacy v1 row
+                cannot be migrated safely, the fencing epoch was lost to a
+                concurrent contender, or the server identity cannot be
+                established.
 
         Note:
             An unreachable database surfaces as
@@ -5115,6 +5324,7 @@ class SupervisorDaemon:
             LOGGER.error("cannot establish ownership without a host boot identity")
             raise SystemExit(1)
         conn = self._open_authority_connection()
+        self._ensure_v2_authority_row(conn, server)
         row = authority.bootstrap_authority(conn, server)
         if row.owner != owner:
             current = row.owner
