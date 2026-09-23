@@ -217,7 +217,7 @@ if [ -n "$(git -C "${REPO}" status --porcelain)" ]; then
   fail "repo checkout is dirty; deploy requires the exact committed code"
 fi
 command -v uv >/dev/null 2>&1 || fail "uv is not on PATH"
-if [ ! -f "${HERE}/zerospace.c" ] || [ ! -f "${HERE}/drive.py" ]; then
+if [ ! -f "${HERE}/zerospace.c" ] || [ ! -f "${HERE}/zsprobe.c" ] || [ ! -f "${HERE}/drive.py" ]; then
   fail "acceptance sources missing under ${HERE}"
 fi
 if [ "${FAILED}" != "0" ]; then
@@ -265,6 +265,7 @@ CONFIG_HOME="${HOME}/.config/lubko"
 ZERO_ROOTS="${STATE_ROOT}:${BIN_HOME}:${CONFIG_HOME}"
 DENIAL_LOG="${SCRATCH}/logs/denials.log"
 ZEROSPACE="${SCRATCH}/zerospace"
+ZSPROBE="${SCRATCH}/zsprobe"
 # The constrained environment inherited by every traced process.
 ZERO_ENV="HOME=${HOME} LUBKO_SUPERVISOR_STATE_TOKEN="
 
@@ -300,7 +301,133 @@ if ! [ -x "${ZEROSPACE}" ]; then
   printf 'ACCEPTANCE FAILED\n'
   exit 1
 fi
+if ! "${CC_BIN}" -O2 -Wall -Wextra -o "${ZSPROBE}" "${HERE}/zsprobe.c" 2>>"${SCRATCH}/logs/cc.log"; then
+  fail "probe build failed:"
+  cat "${SCRATCH}/logs/cc.log"
+  printf 'ACCEPTANCE FAILED\n'
+  exit 1
+fi
+if ! [ -x "${ZSPROBE}" ]; then
+  fail "probe binary not executable"
+  printf 'ACCEPTANCE FAILED\n'
+  exit 1
+fi
 pass "tracer built with ${CC_BIN}"
+
+# -- 1b. Tracer dispatch self-tests --------------------------------------------
+#
+# The dispatch table maps each register to the wrong path/length easily and
+# silently (linkat, symlinkat, fallocate, and tee each had such a mixup), so
+# every one of them is pinned here: constrained-root use must fail with
+# ENOSPC and leave no mutation, while the same call outside the roots must
+# pass through and behave exactly as without the tracer. This runs before
+# any database scenario, using only SCRATCH (already proven exec-capable
+# above), and never touches the deployed roots.
+
+note ''
+note '--- Tracer dispatch self-tests ---'
+ST_BASE="${SCRATCH}/dispatch-selftest"
+ST_ROOT="${ST_BASE}/root"
+ST_OUT="${ST_BASE}/outside"
+mkdir -p "${ST_ROOT}" "${ST_OUT}"
+ST_LOG="${SCRATCH}/logs/dispatch-denials.log"
+rm -f "${ST_LOG}"
+# Linux ENOSPC; the tracer itself is Linux-ptrace-only, so this is stable.
+ENOSPC_NUM=28
+
+traced_probe() {
+  # traced_probe LOG OUTFILE -- PROBEARGS...: run zsprobe under enforcement
+  # against ST_ROOT, capturing its report line. Never aborts the harness:
+  # a dead tracer yields empty output, which the expectation below reports.
+  ST_PLOG="$1"
+  ST_POUT="$2"
+  shift 2
+  "${ZEROSPACE}" --roots "${ST_ROOT}" --log "${ST_PLOG}" -- "${ZSPROBE}" "$@" >"${ST_POUT}" 2>&1 || true
+}
+
+probe_errno() {
+  # probe_errno OUTFILE OP: errno from the "OP rc=.. errno=.." report line.
+  sed -n "s/^$2 rc=[^ ]* errno=\([0-9][0-9]*\)$/\1/p" "$1" | head -n 1
+}
+
+expect_probe() {
+  # expect_probe LABEL OUTFILE OP WANT_ERRNO
+  ST_GOT="$(probe_errno "$2" "$3")"
+  if [ "${ST_GOT}" != "$4" ]; then
+    fail "dispatch self-test $1: expected errno $4 for $3, got '${ST_GOT}' (output: $(cat "$2" 2>/dev/null))"
+  fi
+}
+
+printf 'x' >"${ST_OUT}/src"
+rm -f "${ST_ROOT}/linked"
+traced_probe "${ST_LOG}" "${ST_BASE}/linkat-in.out" linkat "${ST_OUT}/src" "${ST_ROOT}/linked"
+expect_probe "linkat/inside" "${ST_BASE}/linkat-in.out" "linkat" "${ENOSPC_NUM}"
+if [ -e "${ST_ROOT}/linked" ]; then
+  fail "dispatch self-test linkat/inside: denied call still created ${ST_ROOT}/linked"
+fi
+if ! grep -q "DENY linkat ${ST_ROOT}/linked" "${ST_LOG}" 2>/dev/null; then
+  fail "dispatch self-test linkat/inside: denial log records no linkat denial"
+fi
+printf 'x' >"${ST_OUT}/src2"
+traced_probe "${ST_LOG}" "${ST_BASE}/linkat-out.out" linkat "${ST_OUT}/src2" "${ST_OUT}/linked-ok"
+expect_probe "linkat/outside" "${ST_BASE}/linkat-out.out" "linkat" "0"
+if [ ! -e "${ST_OUT}/linked-ok" ]; then
+  fail "dispatch self-test linkat/outside: permitted call created no link"
+fi
+
+rm -f "${ST_ROOT}/alias"
+traced_probe "${ST_LOG}" "${ST_BASE}/symlinkat-in.out" symlinkat target "${ST_ROOT}" alias
+expect_probe "symlinkat/inside" "${ST_BASE}/symlinkat-in.out" "symlinkat" "${ENOSPC_NUM}"
+if [ -e "${ST_ROOT}/alias" ] || [ -L "${ST_ROOT}/alias" ]; then
+  fail "dispatch self-test symlinkat/inside: denied call still created ${ST_ROOT}/alias"
+fi
+if ! grep -q "DENY symlinkat ${ST_ROOT}/alias" "${ST_LOG}" 2>/dev/null; then
+  fail "dispatch self-test symlinkat/inside: denial log records no symlinkat denial"
+fi
+traced_probe "${ST_LOG}" "${ST_BASE}/symlinkat-out.out" symlinkat target "${ST_OUT}" alias-ok
+expect_probe "symlinkat/outside" "${ST_BASE}/symlinkat-out.out" "symlinkat" "0"
+if [ ! -L "${ST_OUT}/alias-ok" ]; then
+  fail "dispatch self-test symlinkat/outside: permitted call created no symlink"
+fi
+
+: >"${ST_ROOT}/file"
+traced_probe "${ST_LOG}" "${ST_BASE}/fallocate-in.out" fallocate "${ST_ROOT}/file"
+expect_probe "fallocate/inside" "${ST_BASE}/fallocate-in.out" "fallocate" "${ENOSPC_NUM}"
+if [ "$(stat -c %s "${ST_ROOT}/file")" != "0" ]; then
+  fail "dispatch self-test fallocate/inside: denied call still grew ${ST_ROOT}/file"
+fi
+: >"${ST_OUT}/file"
+traced_probe "${ST_LOG}" "${ST_BASE}/fallocate-out.out" fallocate "${ST_OUT}/file"
+expect_probe "fallocate/outside" "${ST_BASE}/fallocate-out.out" "fallocate" "0"
+if [ "$(stat -c %s "${ST_OUT}/file")" != "4096" ]; then
+  fail "dispatch self-test fallocate/outside: permitted call did not allocate (size $(stat -c %s "${ST_OUT}/file"))"
+fi
+
+: >"${ST_ROOT}/sink"
+traced_probe "${ST_LOG}" "${ST_BASE}/tee-in.out" tee "${ST_ROOT}/sink"
+expect_probe "tee/inside" "${ST_BASE}/tee-in.out" "tee" "${ENOSPC_NUM}"
+if [ "$(stat -c %s "${ST_ROOT}/sink")" != "0" ]; then
+  fail "dispatch self-test tee/inside: denied call still grew ${ST_ROOT}/sink"
+fi
+: >"${ST_OUT}/sink"
+# tee to a regular file is rejected by the kernel itself (both ends must be
+# pipes), so "behaves normally outside" means byte-identical passthrough:
+# the traced errno must equal the untraced errno.
+NATIVE_TEE_OUT="${ST_BASE}/tee-native.out"
+"${ZSPROBE}" tee "${ST_OUT}/sink" >"${NATIVE_TEE_OUT}" 2>&1
+NATIVE_TEE_ERRNO="$(probe_errno "${NATIVE_TEE_OUT}" "tee")"
+if [ -z "${NATIVE_TEE_ERRNO}" ] || [ "${NATIVE_TEE_ERRNO}" = "${ENOSPC_NUM}" ]; then
+  fail "dispatch self-test tee/outside: native probe gave '${NATIVE_TEE_ERRNO}' (output: $(cat "${NATIVE_TEE_OUT}"))"
+fi
+traced_probe "${ST_LOG}" "${ST_BASE}/tee-out.out" tee "${ST_OUT}/sink"
+expect_probe "tee/outside" "${ST_BASE}/tee-out.out" "tee" "${NATIVE_TEE_ERRNO}"
+if [ "${FAILED}" != "0" ]; then
+  note "dispatch denial log:"
+  cat "${ST_LOG}" 2>/dev/null || true
+  printf 'ACCEPTANCE FAILED\n'
+  exit 1
+fi
+pass "tracer dispatch denies ENOSPC inside, passes through outside"
 
 # -- 2. Transport setup (real PostgreSQL, outside the roots) -----------------
 
