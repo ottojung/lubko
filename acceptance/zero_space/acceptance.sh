@@ -442,8 +442,9 @@ note '--- Transport setup ---'
 # full environment up front so the driver below can already import psycopg
 # and lubko. Using --extra dev (rather than bare --frozen) keeps this step
 # additive: it never strips a developer checkout's dev dependencies.
-if ! uv sync --frozen --extra dev --project "${REPO}" >/dev/null 2>&1; then
-  fail "uv sync --frozen --extra dev failed for ${REPO}"
+if ! uv sync --frozen --extra dev --project "${REPO}" >"${SCRATCH}/logs/transport-sync.log" 2>&1; then
+  fail "uv sync --frozen --extra dev failed for ${REPO} (see logs/transport-sync.log):"
+  tail -20 "${SCRATCH}/logs/transport-sync.log" || true
   printf 'ACCEPTANCE FAILED\n'
   exit 1
 fi

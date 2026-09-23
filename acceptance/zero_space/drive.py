@@ -32,6 +32,9 @@ POLL_INTERVAL_SECONDS: Final = 0.5
 AWAIT_TIMEOUT_SECONDS: Final = 240.0
 READY_TIMEOUT_SECONDS: Final = 90.0
 
+SETUP_CONNECT_ATTEMPTS: Final = 30
+SETUP_CONNECT_INTERVAL_SECONDS: Final = 2.0
+
 _JOB_PROCESS_PREFIX: Final = ["sh"]
 _JOB_SHELL_FLAG: Final = "-c"
 
@@ -46,6 +49,40 @@ def _connect(settings: dict[str, str]) -> psycopg.Connection[object]:
         An open connection.
     """
     return psycopg.connect(**settings)  # type: ignore[arg-type]
+
+
+def _connect_setup(settings: dict[str, str]) -> psycopg.Connection[object]:
+    """Open a setup connection, tolerating service publication lag.
+
+    The acceptance transport is a containerized PostgreSQL service whose
+    published port can still refuse connections right after the container
+    health gate passes. Only connection-level failures are retried; anything
+    else (authentication, SQL errors) propagates immediately so genuine
+    defects stay loud. The setup DDL below is idempotent, so a retry never
+    double-applies.
+
+    Args:
+        settings: Keyword arguments for :func:`psycopg.connect`.
+
+    Returns:
+        An open connection.
+
+    Raises:
+        psycopg.OperationalError: If the server stays unreachable.
+    """
+    for attempt in range(1, SETUP_CONNECT_ATTEMPTS + 1):
+        try:
+            return _connect(settings)
+        except psycopg.OperationalError as exc:
+            if attempt >= SETUP_CONNECT_ATTEMPTS:
+                raise
+            sys.stderr.write(
+                f"setup: PostgreSQL unreachable "
+                f"(attempt {attempt}/{SETUP_CONNECT_ATTEMPTS}): {exc}; retrying\n"
+            )
+            time.sleep(SETUP_CONNECT_INTERVAL_SECONDS)
+    msg = "PostgreSQL stayed unreachable during setup"
+    raise psycopg.OperationalError(msg)
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -67,7 +104,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     app_role = args.app_user
     app_password = args.app_password
     app_db = args.app_dbname
-    with _connect(setup_settings) as conn:
+    with _connect_setup(setup_settings) as conn:
         conn.autocommit = True
         with conn.cursor() as cursor:
             cursor.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (app_role,))
@@ -89,7 +126,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         "password": args.setup_password,
         "dbname": app_db,
     }
-    with _connect(app_settings) as conn:
+    with _connect_setup(app_settings) as conn:
         conn.autocommit = True
         migration = MIGRATION_FILE.read_text(encoding="utf-8")
         with conn.cursor() as cursor:
