@@ -63,7 +63,7 @@ class _BackendFailureRule:
 
 
 # Implementation details (hidden from the user-facing interface).
-AGENT_MODEL: Final = "opencode-go/muse-spark-1.3-contributor"
+AGENT_MODEL: Final = "opencode/space-bunny-free"
 DEFAULT_VARIANT: Final = "low"
 OPENCODE_TITLE_PREFIX: Final = "lubko-"  # native session title prefix used for discovery
 TERMINAL_STATES: Final = ("succeeded", "failed", "stopped", "killed")
