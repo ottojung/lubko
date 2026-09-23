@@ -1855,16 +1855,10 @@ class SupervisorDaemon:
         try:
             lifecycle.write_meta(meta)
         except (OSError, DurabilityError) as exc:
-            if not _capacity_failure(exc):
-                self._message = (
-                    "worker child published but lifecycle meta could not be written; "
-                    "keeping the spawning obligation durable until the next tick"
-                )
-                LOGGER.exception("%s", self._message)
-                return
-            LOGGER.debug(
-                "lifecycle meta cache write dropped under exhausted storage; "
-                "the database worker record holds the publication"
+            LOGGER.warning(
+                "lifecycle meta cache write dropped (%s); "
+                "the database worker record holds the publication",
+                exc,
             )
         # The database obligation clears first (it is the authority); the
         # local cache clear is best-effort and never raises.

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from lubko import cli, lifecycle, supervise, supervisor
+from lubko import lifecycle_authority as authority
 from lubko.durable import DurabilityError
 from lubko.supervise import SpawningObligation, WorkerChild, read_state
 from tests._fake_authority_db import claim_every_daemon
@@ -265,8 +266,14 @@ def test_child_published_with_spawning_then_meta_then_spawning_cleared(
 
 
 @pytest.mark.usefixtures("supervisor_token")
-def test_meta_write_failure_keeps_spawning_durable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failed meta write leaves spawning durable (replacement-blocking)."""
+def test_meta_write_failure_keeps_db_published_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed meta write after DB publication changes nothing authoritative.
+
+    The database publication is the durability boundary, so even a
+    non-capacity meta failure is dropped as a cache miss: no hold is set,
+    the child stays published, the obligation clears, and the canonical
+    row still names the exact worker while no meta was ever persisted.
+    """
     monkeypatch.setattr(cli, "runtime_is_usable", lambda _commit: True)
     monkeypatch.setattr(cli, "cli_commit_dir", lambda _commit: FAKE_RUNTIME_ROOT)
     monkeypatch.setattr(lifecycle, "worker_env", lambda _token: {})
@@ -289,10 +296,21 @@ def test_meta_write_failure_keeps_spawning_durable(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(daemon, "_spawn_worker", lambda c: _fake_spawn(daemon, c))
     daemon._ensure_consumer_locked(COMMIT)
 
-    assert read_state().spawning is not None, "the obligation survived the meta failure"
-    assert read_state().child is not None, "the child was still published"
-    assert all(s.spawning is not None for s in events), "spawning never cleared"
+    assert daemon._message is None, "no hold follows a cache-only meta failure"
+    final = read_state()
+    assert final.child is not None, "the child was still published"
+    assert final.spawning is None, "the published obligation cleared"
     assert lifecycle.read_meta() is None, "no meta was published on failure"
+    conn = daemon._spawn_authority_connection()
+    claim = daemon._authority
+    assert conn is not None
+    assert claim is not None
+    row = authority.read_authority(conn, claim.server)
+    assert row is not None
+    assert row.spawn is None
+    assert row.worker is not None
+    assert row.worker.token == final.child.token
+    assert row.worker.pid == final.child.pid
 
 
 @pytest.mark.usefixtures("supervisor_token")

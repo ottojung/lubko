@@ -529,12 +529,18 @@ def test_retire_child_holds_on_partial_identity_mismatch(
     assert supervise.read_state().child == cached
 
 
-@pytest.mark.parametrize("cache", ["state", "meta"])
+@pytest.mark.parametrize("cache", ["state", "meta", "both"])
 @pytest.mark.usefixtures("supervisor_token")
 def test_eio_cache_failure_after_db_publication_keeps_worker(
     monkeypatch: pytest.MonkeyPatch, cache: str
 ) -> None:
-    """A non-capacity cache failure cannot revoke a DB-published worker."""
+    """A non-capacity cache failure cannot revoke a DB-published worker.
+
+    Every local write in the publication path may fail — including with a
+    non-capacity error such as EIO — without altering control flow: no
+    hold message is set, the spawn-obligation clear still runs, and the
+    database-published worker stays usable.
+    """
     table = FakeAuthorityConnection()
     daemon = _claim_daemon(monkeypatch, table)
     conn = daemon._spawn_authority_connection()
@@ -565,11 +571,21 @@ def test_eio_cache_failure_after_db_publication_keeps_worker(
     def _eio(_payload: object) -> None:
         raise OSError(errno.EIO, "I/O error")
 
-    if cache == "state":
+    if cache in {"state", "both"}:
         monkeypatch.setattr(supervisor, "write_state", _eio)
-        monkeypatch.setattr(lifecycle, "write_meta", lambda _meta: None)
-    else:
+    if cache in {"meta", "both"}:
         monkeypatch.setattr(lifecycle, "write_meta", _eio)
+    else:
+        monkeypatch.setattr(lifecycle, "write_meta", lambda _meta: None)
+    cleared: list[bool] = []
+    real_clear = daemon._clear_spawn_authority
+
+    def _record_clear() -> bool:
+        result = real_clear()
+        cleared.append(result)
+        return result
+
+    monkeypatch.setattr(daemon, "_clear_spawn_authority", _record_clear)
     obligation = supervise.SpawningObligation(
         token=SPAWN_TOKEN,
         commit=COMMIT,
@@ -582,6 +598,8 @@ def test_eio_cache_failure_after_db_publication_keeps_worker(
         parent_death_signal=True,
     )
     daemon._cache_published_child(child, COMMIT, 0.0, obligation)
+    assert daemon._message is None
+    assert cleared == [True]
     row = authority.read_authority(_conn(table), SERVER)
     assert row is not None
     assert row.worker == worker
