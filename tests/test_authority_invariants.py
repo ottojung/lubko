@@ -35,6 +35,7 @@ from lubko import (
     cli,
     deployctl,
     lifecycle,
+    lifecycle_authority,
     lifecycle_state,
     startup_contract,
     supervise,
@@ -63,8 +64,20 @@ from lubko.lifecycle_state import (
     phase_from_facts,
     reconcile_authority_facts,
 )
+from tests._fake_authority_db import claim_every_daemon, seed_db_worker
 
 COMMIT = "a" * 40
+_DB_CLAIM_SERVER = "srv-authority-invariants-test"
+
+
+@pytest.fixture(autouse=True)
+def _db_fencing_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Establish a fake-database fencing claim on every daemon under test.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action.
+    """
+    claim_every_daemon(monkeypatch, supervisor, _DB_CLAIM_SERVER)
 
 
 def _fake_entry(_commit: str, _name: str) -> Path:
@@ -970,7 +983,11 @@ def test_retirement_gate_refuses_unproven_live_child(monkeypatch: pytest.MonkeyP
 
 @pytest.mark.usefixtures("supervisor_token")
 def test_retirement_gate_allows_proven_live_child(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_retire_child signals and clears a provably-our-direct-child worker."""
+    """_retire_child signals and clears a DB-published live worker by exact identity.
+
+    The cached child alone authorizes nothing: retirement additionally
+    requires the canonical row's WorkerRecord naming the same token.
+    """
     monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: True)
     monkeypatch.setattr(
         lifecycle_state,
@@ -993,6 +1010,18 @@ def test_retirement_gate_allows_proven_live_child(monkeypatch: pytest.MonkeyPatc
         )
     )
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    seed_db_worker(
+        daemon,
+        lifecycle_authority.WorkerRecord(
+            token="tok" + "a" * 20,
+            commit=COMMIT,
+            pid=1,
+            pgid=1,
+            sid=1,
+            start_time_ticks=1,
+            worker_id="w",
+        ),
+    )
     monkeypatch.setattr(lifecycle, "stop_worker", lambda _m, _g: True)
     monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _t: None)
     assert daemon._retire_child() is True
@@ -1000,7 +1029,11 @@ def test_retirement_gate_allows_proven_live_child(monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.usefixtures("supervisor_token")
 def test_retirement_gate_clears_dead_recorded_child(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A dead recorded child is cleared (no destructive signal) despite the gate."""
+    """A dead DB-published child clears without a destructive signal.
+
+    Even when no signal is needed, the cached identity alone clears
+    nothing: the canonical row's WorkerRecord must name the same token.
+    """
     monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: False)
     monkeypatch.setattr(
         lifecycle_state,
@@ -1023,6 +1056,18 @@ def test_retirement_gate_clears_dead_recorded_child(monkeypatch: pytest.MonkeyPa
         )
     )
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    seed_db_worker(
+        daemon,
+        lifecycle_authority.WorkerRecord(
+            token="tok" + "a" * 20,
+            commit=COMMIT,
+            pid=1,
+            pgid=1,
+            sid=1,
+            start_time_ticks=1,
+            worker_id="w",
+        ),
+    )
     monkeypatch.setattr(lifecycle, "stop_worker", lambda _m, _g: True)
     monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _t: None)
     assert daemon._retire_child() is True

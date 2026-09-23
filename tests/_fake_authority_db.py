@@ -10,14 +10,23 @@ silently passing against an unprepared double.
 
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, cast
 
 import psycopg
 
+from lubko import lifecycle_authority as authority
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from types import ModuleType
+
+    import pytest
+
+    from lubko.lifecycle_authority import WorkerRecord
+    from lubko.supervisor import Settings, SupervisorDaemon
+    from lubko.worker import JobsConnection
 
 
 class FakeAuthorityCursor:
@@ -66,24 +75,20 @@ class FakeAuthorityCursor:
         raise AssertionError(msg)
 
     def _apply_take(self, arguments: dict[str, object]) -> int:
-        """Apply a fencing-epoch compare-and-swap update.
+        """Apply an exact-state compare-and-swap update.
 
         Args:
-            arguments: Bound ``id``/``payload``/``server``/``expected_epoch``.
+            arguments: Bound ``id``/``payload``/``expected``.
 
         Returns:
-            ``1`` when the guarded update committed, ``0`` on a lost race.
+            ``1`` when the row still held the exact observed state and the
+            candidate committed, ``0`` on any concurrent change.
         """
         row_id = str(arguments["id"])
         stored = self._table.rows.get(row_id)
-        current = _decode_take_row(stored)
-        if current is None:
+        if stored is None:
             return 0
-        if current.get("type") != "lifecycle_authority":
-            return 0
-        if current.get("server") != arguments["server"]:
-            return 0
-        if str(current.get("epoch")) != str(arguments["expected_epoch"]):
+        if stored != arguments["expected"]:
             return 0
         self._table.rows[row_id] = str(arguments["payload"])
         return 1
@@ -107,24 +112,6 @@ class FakeAuthorityCursor:
         remaining = list(self._result)
         self._result.clear()
         return remaining
-
-
-def _decode_take_row(stored: str | None) -> dict[str, object] | None:
-    """Decode a stored row for compare-and-swap validation.
-
-    Args:
-        stored: Raw stored payload text, or ``None`` when absent.
-
-    Returns:
-        The decoded mapping, or ``None`` when absent or undecodable.
-    """
-    if stored is None:
-        return None
-    try:
-        current = json.loads(stored)
-    except ValueError:
-        return None
-    return current if isinstance(current, dict) else None
 
 
 class FakeAuthorityConnection:
@@ -157,3 +144,54 @@ class FakeAuthorityConnection:
 
     def close(self) -> None:
         """Discard the fake connection."""
+
+
+def claim_every_daemon(
+    monkeypatch: pytest.MonkeyPatch, supervisor_module: ModuleType, server: str
+) -> None:
+    """Give every daemon under test a fake-database fencing claim on build.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action. The wrapped constructor points
+    the daemon at a private fake authority table and runs the real
+    fencing-establishment path, so each daemon holds a fresh claim that
+    matches the row at construction time.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        supervisor_module: The ``lubko.supervisor`` module the daemon
+            class is constructed from.
+        server: Execution-server identity the fake row governs.
+    """
+    table = FakeAuthorityConnection()
+    monkeypatch.setattr(supervisor_module, "load_worker_server", lambda: server)
+    original_init = supervisor_module.SupervisorDaemon.__init__
+
+    def _claimed_init(self: SupervisorDaemon, settings: Settings) -> None:
+        original_init(self, settings)
+        self._authority_conn_factory = lambda: cast("JobsConnection", table)
+        self._write_pidfile()
+
+    monkeypatch.setattr(supervisor_module.SupervisorDaemon, "__init__", _claimed_init)
+
+
+def seed_db_worker(daemon: SupervisorDaemon, record: WorkerRecord) -> None:
+    """CAS a published worker record onto the daemon's fake authority row.
+
+    Tests proving DB-authorized retirement or settlement seed the canonical
+    record first; the daemon's own fencing claim authorizes the update.
+
+    Args:
+        daemon: A daemon holding a fencing claim from :func:`claim_every_daemon`.
+        record: The exact published worker identity to commit.
+    """
+    conn = daemon._spawn_authority_connection()
+    claim = daemon._authority
+    assert conn is not None
+    assert claim is not None
+    expected, current = authority._read_observed(conn, claim.server)
+    assert current is not None
+    updated = replace(current, worker=record)
+    assert authority._compare_and_swap(
+        conn, claim.server, expected, authority.canonical_row_text(updated)
+    )
