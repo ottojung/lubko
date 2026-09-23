@@ -810,6 +810,8 @@ class SupervisorDaemon:
         self._authority: authority.AuthorityClaim | None = None
         self._authority_conn: JobsConnection | None = None
         self._authority_conn_factory: Callable[[], JobsConnection] | None = None
+        self._active_child: WorkerChild | None = None
+        self._mem_next_attempt_at: float | None = None
 
     def _write_state_authority_safe(self, state: SupervisorState) -> bool:
         """Publish a supervisor transition without erasing newer consumer authority.
@@ -976,6 +978,8 @@ class SupervisorDaemon:
                 self._handle_crash(state, now)
                 if self._in_backoff(now):
                     return
+        elif self._db_crash_blocks(now):
+            return
         else:
             self._maybe_reset_backoff(state, now)
         if action == "hold":
@@ -991,6 +995,22 @@ class SupervisorDaemon:
         self._probe_readiness(now)
         self._complete_cold_migration()
         self._converge_startup_artifacts()
+
+    def _db_crash_blocks(self, now: float) -> bool:
+        """Handle a dead database-published worker and report whether to stop.
+
+        Args:
+            now: Monotonic time of the observation.
+
+        Returns:
+            ``True`` when reconciliation must stop for a backoff deadline.
+        """
+        if self._active_child is None or self._active_worker_live():
+            return False
+        self._handle_db_crash(now)
+        if self._mem_next_attempt_at is not None and now < self._mem_next_attempt_at:
+            return True
+        return self._in_backoff(now)
 
     def _apply_newer_desired(
         self,
@@ -1530,6 +1550,22 @@ class SupervisorDaemon:
             )
             LOGGER.warning("%s", self._message)
 
+    def _gate_db_spawn(self) -> bool:
+        """Decide whether the spawn decision may proceed this tick.
+
+        Holds during the in-memory crash backoff so a crash loop cannot
+        hammer replacements while local bookkeeping is unwritable.
+
+        Returns:
+            ``True`` when the spawn decision may proceed.
+        """
+        if self._authority is None:
+            return True
+        if self._mem_next_attempt_at is not None and time.monotonic() < self._mem_next_attempt_at:
+            self._message = "backing off after a worker exit before any replacement spawn"
+            return False
+        return True
+
     def _ensure_consumer_locked(self, commit: str) -> None:
         """Run the worker-ownership decision while holding the consumer lock.
 
@@ -1547,10 +1583,31 @@ class SupervisorDaemon:
                 "holding without signalling, adopting, retiring, or spawning"
             )
             return
+        if not self._gate_db_spawn():
+            return
         if not self._resolve_spawning_obligation():
             return
         if not self._resolve_unresolved_child():
             return
+        if not self._reconcile_db_worker(commit):
+            return
+        already_running = self._db_worker_running(commit)
+        if already_running is None:
+            return
+        if already_running:
+            return
+        self._ensure_local_consumer_locked(commit)
+
+    def _ensure_local_consumer_locked(self, commit: str) -> None:
+        """Run the local worker-ownership decision under the consumer lock.
+
+        This is the legacy local-only half of the gate-to-spawn decision,
+        reached only after database fencing, obligations, holds, and the
+        published worker record all allow a spawn.
+
+        Args:
+            commit: Exact commit the worker must run.
+        """
         state = read_state()
         if state.child is not None and self._child_alive(state) and state.commit == commit:
             return
@@ -1614,6 +1671,117 @@ class SupervisorDaemon:
                     recover_owned_groups(meta.token or "")
         self._spawn_and_publish(commit)
 
+    def _record_spawn_failure(self, commit: str, now: float) -> None:
+        """Record a failed spawn attempt with bounded backoff.
+
+        Args:
+            commit: Exact commit whose worker could not be started.
+            now: Monotonic time of the decision.
+        """
+        state = replace(
+            read_state(),
+            mode=MODE_RUN,
+            commit=commit,
+            intent=INTENT_RUN,
+            ready=False,
+            next_readiness_at=None,
+            next_attempt_at=now + self._backoff_seconds(read_state().restart_count),
+        )
+        write_state(state)
+        LOGGER.error("could not start a worker for commit %s; backing off", commit)
+
+    def _spawn_obligation_for(self, child: WorkerChild) -> SpawningObligation | None:
+        """Return the durable pre-Popen obligation for a fresh spawn.
+
+        The local cache is consulted first; when it dropped the write
+        under exhausted storage, the committed database obligation for
+        this spawn satisfies the durability boundary without fabricating
+        anything.
+
+        Args:
+            child: The freshly spawned worker child.
+
+        Returns:
+            The obligation, or ``None`` when none durably exists.
+        """
+        obligation = read_state().spawning
+        if obligation is not None:
+            return obligation
+        ok, db_obligation = self._read_spawn_authority()
+        if ok and db_obligation is not None and db_obligation.token == child.token:
+            return db_obligation
+        return None
+
+    def _converge_spawn_without_obligation(self, child: WorkerChild, now: float) -> None:
+        """Converge a live spawn that has no durable pre-Popen obligation.
+
+        Synthesizing a fresh obligation now cannot prove the required
+        pre-Popen durability boundary, so it would defeat the entire
+        crash-safety protocol. Fail closed instead: converge our own
+        direct child by exact single-PID signalling and hold with backoff.
+        No child is published and no replacement obligation is fabricated,
+        so no second consumer can be authorized and no orphan is left
+        running. The next spawn attempt (if still required) writes the
+        obligation correctly before Popen.
+
+        Args:
+            child: The live but unpublished worker child.
+            now: Monotonic time of the decision.
+        """
+        self._message = (
+            "spawned worker has no durable pre-Popen obligation; "
+            "converging it and holding without publishing authority"
+        )
+        LOGGER.error("%s", self._message)
+        backoff = self._backoff_seconds(read_state().restart_count)
+        next_attempt_at = now + backoff
+
+        def _persist_missing_obligation_hold() -> None:
+            # The returned child already carries the exact lifecycle token and
+            # start-time identity, so the durable blocking hold names the
+            # exact incarnation: a later tick converges the possibly-live
+            # instance by pinned single-PID signals and recovers any owned
+            # command groups under the exact token. A retroactive fake
+            # pre-Popen obligation is deliberately not fabricated.
+            write_state(
+                replace(
+                    read_state(),
+                    unresolved_child=UnresolvedChild(
+                        pid=child.pid,
+                        start_time_ticks=child.start_time_ticks,
+                        token=child.token,
+                        spawned_at=time.time(),
+                    ),
+                    next_attempt_at=next_attempt_at,
+                )
+            )
+
+        if self.proc is not None and self._converge_direct_child(self.proc):
+            # The direct child was positively reaped by exact single-PID
+            # signalling. A returned worker may already have launched
+            # independent command groups under its lifecycle token, so the
+            # exact-incarnation owned-group recovery must also succeed before
+            # any authority is released; otherwise a durable token-bearing
+            # blocking hold is kept so no replacement can start.
+            self.proc = None
+            if self._recover_spawn_owned_groups(child.token):
+                write_state(replace(read_state(), next_attempt_at=next_attempt_at))
+                return
+            self._message = (
+                "spawned worker reaped but its owned command groups could not "
+                "be recovered; holding a token-bearing blocking authority "
+                "without publishing a replacement"
+            )
+            LOGGER.error("%s", self._message)
+            _persist_missing_obligation_hold()
+            return
+        # Convergence failed (or the direct handle is unexpectedly
+        # unavailable): the possibly-live child must not be forgotten and no
+        # replacement may be authorized. Persist the durable exact-identity
+        # blocking hold and retain the direct handle when present so the next
+        # tick can re-prove and converge it.
+        _persist_missing_obligation_hold()
+
     def _spawn_and_publish(self, commit: str) -> None:
         """Spawn the worker and run the fail-closed child+meta publication.
 
@@ -1625,6 +1793,10 @@ class SupervisorDaemon:
 
         Args:
             commit: Exact commit the worker must run.
+
+        Note:
+            Local write failures surface as :class:`OSError` or
+            :class:`DurabilityError` from the publication helpers.
         """
         # Product intent writers serialize generation allocation and durable
         # desired/mission publication through this lock. Hold it across the
@@ -1648,100 +1820,54 @@ class SupervisorDaemon:
             child = self._spawn_worker(commit)
         now = time.monotonic()
         if child is None:
-            state = replace(
-                read_state(),
-                mode=MODE_RUN,
-                commit=commit,
-                intent=INTENT_RUN,
-                ready=False,
-                next_readiness_at=None,
-                next_attempt_at=now + self._backoff_seconds(read_state().restart_count),
-            )
-            write_state(state)
-            LOGGER.error("could not start a worker for commit %s; backing off", commit)
+            self._record_spawn_failure(commit, now)
             return
         # Publication protocol (fail-closed against manual recovery):
-        #   1) publish state.child WHILE the exact pid-bearing spawning
-        #      obligation stays durable, so a concurrent manual recovery reads a
-        #      blocking authority and cannot authorize a second consumer;
-        #   2) write the maintained lifecycle meta.json;
-        #   3) only then clear spawning in a final durable state write.
-        # A crash or a meta write failure between steps leaves the durable
-        # obligation intact (replacement-blocking) for a later tick/restart to
-        # finish, never a silently duplicated consumer.
-        obligation = read_state().spawning
+        #   1) atomically publish the worker record and clear the exact
+        #      pid-bearing spawning obligation in the database, so the
+        #      worker is usable the instant the commit lands even when
+        #      every local filesystem mutation below fails, and so a
+        #      concurrent manual recovery reads a blocking authority and
+        #      cannot authorize a second consumer;
+        #   2) publish state.child plus the lifecycle meta.json as
+        #      read-through caches, dropped silently under exhausted
+        #      storage while the database record holds the publication.
+        # A crash between steps leaves either the durable obligation
+        # intact (replacement-blocking, for a later tick/restart to
+        # finish) or the published worker record (for a later tick to
+        # adopt) — never a silently duplicated consumer.
+        obligation = self._spawn_obligation_for(child)
+        published_ok = True
+        if obligation is not None and self._authority is not None:
+            published_ok = self._publish_worker_authority(child, commit, obligation.token)
+        if not published_ok:
+            obligation = None
         if obligation is None:
-            # The local cache may have dropped the write under exhausted
-            # storage while the database obligation holds. The database is
-            # the authority: a committed obligation for this spawn satisfies
-            # the pre-Popen durability boundary without fabricating anything.
-            ok, db_obligation = self._read_spawn_authority()
-            if ok and db_obligation is not None and db_obligation.token == child.token:
-                obligation = db_obligation
-        if obligation is None:
-            # The live child exists but the durable pre-Popen obligation is
-            # missing. Synthesizing a fresh obligation now cannot prove the
-            # required pre-Popen durability boundary, so it would defeat the
-            # entire crash-safety protocol. Fail closed instead: converge our own
-            # direct child by exact single-PID signalling and hold with backoff.
-            # No child is published and no replacement obligation is fabricated,
-            # so no second consumer can be authorized and no orphan is left
-            # running. The next spawn attempt (if still required) writes the
-            # obligation correctly before Popen.
-            self._message = (
-                "spawned worker has no durable pre-Popen obligation; "
-                "converging it and holding without publishing authority"
-            )
-            LOGGER.error("%s", self._message)
-            backoff = self._backoff_seconds(read_state().restart_count)
-            next_attempt_at = now + backoff
-
-            def _persist_missing_obligation_hold() -> None:
-                # The returned child already carries the exact lifecycle token and
-                # start-time identity, so the durable blocking hold names the
-                # exact incarnation: a later tick converges the possibly-live
-                # instance by pinned single-PID signals and recovers any owned
-                # command groups under the exact token. A retroactive fake
-                # pre-Popen obligation is deliberately not fabricated.
-                write_state(
-                    replace(
-                        read_state(),
-                        unresolved_child=UnresolvedChild(
-                            pid=child.pid,
-                            start_time_ticks=child.start_time_ticks,
-                            token=child.token,
-                            spawned_at=time.time(),
-                        ),
-                        next_attempt_at=next_attempt_at,
-                    )
-                )
-
-            if self.proc is not None and self._converge_direct_child(self.proc):
-                # The direct child was positively reaped by exact single-PID
-                # signalling. A returned worker may already have launched
-                # independent command groups under its lifecycle token, so the
-                # exact-incarnation owned-group recovery must also succeed before
-                # any authority is released; otherwise a durable token-bearing
-                # blocking hold is kept so no replacement can start.
-                self.proc = None
-                if self._recover_spawn_owned_groups(child.token):
-                    write_state(replace(read_state(), next_attempt_at=next_attempt_at))
-                    return
-                self._message = (
-                    "spawned worker reaped but its owned command groups could not "
-                    "be recovered; holding a token-bearing blocking authority "
-                    "without publishing a replacement"
-                )
-                LOGGER.error("%s", self._message)
-                _persist_missing_obligation_hold()
-                return
-            # Convergence failed (or the direct handle is unexpectedly
-            # unavailable): the possibly-live child must not be forgotten and no
-            # replacement may be authorized. Persist the durable exact-identity
-            # blocking hold and retain the direct handle when present so the next
-            # tick can re-prove and converge it.
-            _persist_missing_obligation_hold()
+            self._converge_spawn_without_obligation(child, now)
             return
+        self._active_child = child
+        self._mem_next_attempt_at = None
+        self._cache_published_child(child, commit, now, obligation)
+
+    def _cache_published_child(
+        self, child: WorkerChild, commit: str, now: float, obligation: SpawningObligation
+    ) -> None:
+        """Publish cache copies of a database-published worker.
+
+        The database record committed by :meth:`_publish_worker_authority`
+        is the publication; these local writes are read-through caches
+        dropped silently under exhausted storage.
+
+        Args:
+            child: The exact published worker child.
+            commit: Exact commit the worker runs.
+            now: Monotonic time of the publication.
+            obligation: The pre-Popen obligation being published.
+
+        Raises:
+            OSError: If a non-capacity local write fails outside fencing.
+            DurabilityError: If a non-capacity local write fails outside fencing.
+        """
         published = replace(
             read_state(),
             mode=MODE_RUN,
@@ -1758,17 +1884,30 @@ class SupervisorDaemon:
                 start_time_ticks=child.start_time_ticks,
             ),
         )
-        write_state(published)
+        try:
+            write_state(published)
+        except (OSError, DurabilityError) as exc:
+            if self._authority is None or not _capacity_failure(exc):
+                raise
+            LOGGER.debug(
+                "child publication cache write dropped under exhausted storage; "
+                "the database worker record holds the publication"
+            )
         meta = replace(_child_to_meta(child, _runtime_dir(commit)), git_commit=commit)
         try:
             lifecycle.write_meta(meta)
-        except (OSError, DurabilityError):
-            self._message = (
-                "worker child published but lifecycle meta could not be written; "
-                "keeping the spawning obligation durable until the next tick"
+        except (OSError, DurabilityError) as exc:
+            if self._authority is None or not _capacity_failure(exc):
+                self._message = (
+                    "worker child published but lifecycle meta could not be written; "
+                    "keeping the spawning obligation durable until the next tick"
+                )
+                LOGGER.exception("%s", self._message)
+                return
+            LOGGER.debug(
+                "lifecycle meta cache write dropped under exhausted storage; "
+                "the database worker record holds the publication"
             )
-            LOGGER.exception("%s", self._message)
-            return
         # The database obligation clears first (it is the authority); the
         # local cache clear is best-effort under exhausted storage.
         if not self._clear_spawn_authority():
@@ -2006,6 +2145,8 @@ class SupervisorDaemon:
                 child.pid,
             )
             return False
+        if self._active_child is not None and self._active_child.token == child.token:
+            self._active_child = None
         LOGGER.info("retired worker child pid=%d", child.pid)
         return True
 
@@ -2016,6 +2157,13 @@ class SupervisorDaemon:
             _now: Monotonic time (unused).
         """
         self.proc = None
+        cleared = read_state()
+        if (
+            self._active_child is not None
+            and cleared.child is not None
+            and self._active_child.token == cleared.child.token
+        ):
+            self._active_child = None
         self._write_state_authority_safe(replace(read_state(), child=None))
 
     @staticmethod
@@ -2112,6 +2260,12 @@ class SupervisorDaemon:
             # republish, and never report the crash as recorded.
             return
         self.proc = None
+        if (
+            self._active_child is not None
+            and child is not None
+            and self._active_child.token == child.token
+        ):
+            self._active_child = None
         lifecycle.append_deploy_log(
             f"supervisor detected unexpected worker exit pid="
             f"{state.child.pid if state.child is not None else 'unknown'} "
@@ -2409,7 +2563,7 @@ class SupervisorDaemon:
 
         The database row is the authority; this local write is only a
         cache. Under exhausted storage the cache write is dropped and the
-        database obligation keeps the spawn fenced.
+        database record keeps the spawn fenced and published.
 
         Args:
             state: The transition to publish locally.
@@ -2425,8 +2579,416 @@ class SupervisorDaemon:
                 raise
             LOGGER.debug(
                 "spawn cache write dropped under exhausted storage; "
-                "the database obligation holds the spawn fenced"
+                "the database record holds the spawn fenced and published"
             )
+
+    @staticmethod
+    def _db_worker_record(child: WorkerChild, commit: str) -> authority.WorkerRecord:
+        """Convert a proven worker child to its database authority form.
+
+        Args:
+            child: The exact proven child identity.
+            commit: The exact commit the worker runs.
+
+        Returns:
+            The database-backed published-worker record.
+        """
+        return authority.WorkerRecord(
+            token=child.token,
+            commit=commit,
+            pid=child.pid,
+            pgid=child.pgid,
+            sid=child.sid,
+            start_time_ticks=child.start_time_ticks,
+            worker_id=child.worker_id,
+        )
+
+    @staticmethod
+    def _db_worker_to_child(record: authority.WorkerRecord) -> WorkerChild:
+        """Convert a published database worker record to a child identity.
+
+        Args:
+            record: The published worker record.
+
+        Returns:
+            The child identity named by the record.
+        """
+        return WorkerChild(
+            pid=record.pid,
+            pgid=record.pgid,
+            sid=record.sid,
+            start_time_ticks=record.start_time_ticks,
+            token=record.token,
+            worker_id=record.worker_id,
+            spawned_at=time.time(),
+        )
+
+    def _publish_worker_authority(self, child: WorkerChild, commit: str, token: str) -> bool:
+        """Atomically publish the worker and clear its spawn obligation.
+
+        Publication and obligation clearance commit in one row update, so
+        the worker is usable the instant the commit lands even when every
+        local filesystem mutation fails. Daemons without an established
+        fencing claim keep the legacy local-only publication.
+
+        Args:
+            child: The exact proven child identity to publish.
+            commit: The exact commit the worker runs.
+            token: Lifecycle token of the obligation being published.
+
+        Returns:
+            ``True`` when the worker is published (or no fencing claim is
+            established), ``False`` when the publication must not be
+            treated as durable.
+        """
+        claim = self._authority
+        if claim is None:
+            return True
+        conn = self._spawn_authority_connection()
+        if conn is None:
+            self._message = "lifecycle authority is unreachable; holding without publishing"
+            LOGGER.warning("%s", self._message)
+            return False
+        try:
+            won = authority.publish_worker(
+                conn, claim, spawn_token=token, worker=self._db_worker_record(child, commit)
+            )
+        except authority.AuthorityUnavailableError:
+            self._message = "lifecycle authority is unreachable; holding without publishing"
+            LOGGER.warning("%s", self._message)
+            self._discard_authority_connection()
+            return False
+        except authority.AuthorityError:
+            self._message = (
+                "fresh lifecycle authority is unavailable or superseded; holding without publishing"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        except psycopg.Error:
+            LOGGER.warning(
+                "lifecycle authority connection failed; holding without publishing",
+                exc_info=True,
+            )
+            self._discard_authority_connection()
+            return False
+        if not won:
+            self._message = (
+                "the authority row changed under the publication decision; "
+                "holding without publishing"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        return True
+
+    def _clear_worker_authority(self, token: str) -> bool:
+        """Clear a published worker record from the authority row.
+
+        Args:
+            token: Lifecycle token of the published worker to clear.
+
+        Returns:
+            ``True`` when no worker record remains (or no fencing claim is
+            established), ``False`` when the record must stay until the
+            row can be re-observed.
+        """
+        claim = self._authority
+        if claim is None:
+            return True
+        conn = self._spawn_authority_connection()
+        if conn is None:
+            self._message = (
+                "lifecycle authority is unreachable; keeping the published "
+                "worker record until the database is reachable"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        try:
+            cleared = authority.clear_worker(conn, claim, token)
+        except authority.AuthorityUnavailableError:
+            self._message = (
+                "lifecycle authority is unreachable; keeping the published "
+                "worker record until the database is reachable"
+            )
+            LOGGER.warning("%s", self._message)
+            self._discard_authority_connection()
+            return False
+        except psycopg.Error:
+            LOGGER.warning(
+                "lifecycle authority connection failed; keeping the published worker record",
+                exc_info=True,
+            )
+            self._discard_authority_connection()
+            return False
+        if not cleared:
+            self._message = (
+                "fencing epoch no longer matches the authority row; "
+                "standing down without touching any child process"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        return True
+
+    def _read_worker_authority(self) -> tuple[bool, authority.WorkerRecord | None]:
+        """Read the published worker record from the authority row.
+
+        Returns:
+            A ``(ok, record)`` pair: ``ok`` is ``False`` when the database
+            is unreachable or untrusted and the caller must hold; otherwise
+            ``record`` is the published worker, or ``None`` when no fencing
+            claim is established or no worker is published.
+        """
+        claim = self._authority
+        if claim is None:
+            return True, None
+        conn = self._spawn_authority_connection()
+        if conn is None:
+            self._message = "lifecycle authority is unreachable; holding without action"
+            return False, None
+        try:
+            row = authority.read_authority(conn, claim.server)
+        except authority.AuthorityUnavailableError:
+            self._message = "lifecycle authority is unreachable; holding without action"
+            self._discard_authority_connection()
+            return False, None
+        except authority.AuthorityError:
+            self._message = (
+                "the lifecycle authority row is missing, corrupt, or untrusted; "
+                "holding without starting any worker until it is repaired"
+            )
+            LOGGER.exception("%s", self._message)
+            return False, None
+        except psycopg.Error:
+            LOGGER.warning(
+                "lifecycle authority connection failed; holding without action",
+                exc_info=True,
+            )
+            self._discard_authority_connection()
+            return False, None
+        if row is None:
+            return False, None
+        return True, row.worker
+
+    def _active_worker_live(self) -> bool:
+        """Return whether the published live view names our live direct child.
+
+        Returns:
+            ``True`` only when the published record matches the live direct
+            ``Popen`` handle by exact PID with matching start-time ticks, so
+            a recycled PID can never extend supervision.
+        """
+        child = self._active_child
+        proc = self.proc
+        if child is None or proc is None or proc.pid != child.pid:
+            return False
+        if proc.poll() is not None:
+            return False
+        return proc_start_ticks(child.pid) == child.start_time_ticks
+
+    @staticmethod
+    def _db_worker_meta(record: authority.WorkerRecord) -> WorkerMeta:
+        """Build maintained-worker metadata for a database-published worker.
+
+        Args:
+            record: The published worker record.
+
+        Returns:
+            Running metadata for the exact recorded instance.
+        """
+        return lifecycle.WorkerMeta(
+            schema_version=lifecycle.SCHEMA_VERSION,
+            state=lifecycle.STATE_RUNNING,
+            pid=record.pid,
+            pgid=record.pgid,
+            sid=record.sid,
+            start_time_ticks=record.start_time_ticks,
+            token=record.token,
+            repo=_runtime_dir(record.commit),
+            git_commit=record.commit,
+            worker_id=record.worker_id,
+            log_path=str(lifecycle.worker_log_path(record.token)),
+            started_at=None,
+            stopped_at=None,
+        )
+
+    def _retire_db_worker(self, record: authority.WorkerRecord) -> bool:
+        """Retire the exact database-published worker and clear its record.
+
+        A live recorded worker is stopped by exact identity first; a dead
+        one still owes owned-group recovery under its token. Only then is
+        the record cleared, so no replacement can start beside a live
+        worker or its command groups.
+
+        Args:
+            record: The published worker record to retire.
+
+        Returns:
+            ``True`` when the worker retired and its record cleared.
+        """
+        meta = self._db_worker_meta(record)
+        worker_live = lifecycle.worker_alive(meta)
+        if worker_live and not lifecycle.stop_worker(meta, self.settings.stop_grace_seconds):
+            self._message = (
+                f"could not stop the recorded published worker pid {record.pid}; "
+                "holding without starting a worker"
+            )
+            LOGGER.error(
+                "could not stop the recorded published worker pid %d; holding",
+                record.pid,
+            )
+            return False
+        if not (record.token and worker_mod.drain_sentinel_matches(record.token)):
+            try:
+                recover_owned_groups(record.token)
+            except OwnedGroupRecoveryError:
+                self._message = (
+                    f"owned-group recovery for published incarnation {record.token} "
+                    "is incomplete; holding without a replacement worker"
+                )
+                LOGGER.exception("%s", self._message)
+                return False
+        if not self._clear_worker_authority(record.token):
+            return False
+        if self._active_child is not None and self._active_child.token == record.token:
+            self._active_child = None
+        return True
+
+    def _reconcile_db_worker(self, commit: str) -> bool:
+        """Gate spawning on the database-published worker, if any.
+
+        When the published worker is ours and live, there is nothing to do.
+        Otherwise the recorded worker is retired by exact identity (or its
+        groups recovered when already dead) and its record cleared before
+        any replacement may spawn. Daemons without an established fencing
+        claim skip this gate and keep the legacy local-only decision.
+
+        Args:
+            commit: Exact commit the worker must run.
+
+        Returns:
+            ``True`` when spawning may proceed (or is unnecessary because
+            our exact worker already runs).
+        """
+        if self._authority is None:
+            return True
+        ok, record = self._read_worker_authority()
+        if not ok:
+            return False
+        if record is None:
+            return True
+        active = self._active_child
+        if (
+            active is not None
+            and active.token == record.token
+            and record.commit == commit
+            and self._active_worker_live()
+        ):
+            return True
+        if record.commit != commit and proc_start_ticks(record.pid) == record.start_time_ticks:
+            LOGGER.info(
+                "published worker pid=%d runs superseded commit %s; retiring by exact "
+                "identity before starting commit %s",
+                record.pid,
+                record.commit,
+                commit,
+            )
+        elif active is not None and active.token == record.token:
+            self._message = (
+                "the published worker is no longer our live direct child; "
+                "retiring its exact recorded identity before any replacement"
+            )
+            LOGGER.warning("%s", self._message)
+        return self._retire_db_worker(record)
+
+    def _db_worker_running(self, commit: str) -> bool | None:
+        """Return whether the published worker is already ours and live.
+
+        Args:
+            commit: Exact commit the worker must run.
+
+        Returns:
+            ``True`` when the authority row publishes a worker matching the
+            live view for ``commit`` (no spawn needed), ``False`` when no
+            such worker runs, ``None`` when the row cannot be read and the
+            caller must hold.
+        """
+        if self._authority is None:
+            return False
+        ok, record = self._read_worker_authority()
+        if not ok:
+            return None
+        if record is None:
+            return False
+        active = self._active_child
+        return (
+            active is not None
+            and active.token == record.token
+            and record.commit == commit
+            and self._active_worker_live()
+        )
+
+    def _handle_db_crash(self, now: float) -> None:
+        """Handle the death of a database-published worker with no local child.
+
+        The published record clears first (it is the authority), then owned
+        groups recover, then crash bookkeeping publishes best-effort: under
+        exhausted storage the local record drops and an in-memory backoff
+        keeps crash-loop protection until the cache can be rewritten.
+
+        Args:
+            now: Monotonic time of the crash.
+        """
+        child = self._active_child
+        if child is None:
+            return
+        try:
+            recover_owned_groups(child.token)
+        except OwnedGroupRecoveryError:
+            LOGGER.exception(
+                "owned-group recovery for crashed published incarnation %s is incomplete; "
+                "preserving the published record and withholding any replacement",
+                child.token,
+            )
+            self._message = (
+                f"owned-group recovery for crashed published incarnation {child.token} "
+                "is incomplete; holding without a replacement worker"
+            )
+            return
+        if not self._clear_worker_authority(child.token):
+            return
+        self._active_child = None
+        if self.proc is not None:
+            with suppress(Exception):
+                self.proc.wait(timeout=self.settings.stop_grace_seconds)
+            self.proc = None
+        backoff = self._backoff_seconds(read_state().restart_count + 1)
+        self._mem_next_attempt_at = now + backoff
+        try:
+            self._write_state_authority_safe(
+                replace(
+                    read_state(),
+                    restart_count=read_state().restart_count + 1,
+                    next_attempt_at=now + backoff,
+                    last_exit=LastExit(returncode=self._last_proc_returncode(), at=time.time()),
+                    intent=INTENT_RUN,
+                    child=None,
+                )
+            )
+        except (OSError, DurabilityError, ConsumerLockTimeoutError):
+            LOGGER.debug("crash bookkeeping cache write dropped; in-memory backoff holds the retry")
+            return
+        lifecycle.append_deploy_log(f"supervisor detected unexpected worker exit pid={child.pid}")
+
+    def _last_proc_returncode(self) -> int | None:
+        """Return the last observed return code of the direct child, if any.
+
+        Returns:
+            The return code, or ``None`` when no direct child handle exists.
+        """
+        if self.proc is None:
+            return None
+        with suppress(Exception):
+            return self.proc.poll()
+        return None
 
     def _spawn_worker(self, commit: str) -> WorkerChild | None:
         """Spawn the worker for ``commit`` as a direct child from the sealed runtime.
@@ -2574,8 +3136,13 @@ class SupervisorDaemon:
                     spawning=replace(obligation, pid=proc.pid, start_time_ticks=child_ticks),
                 )
             )
-        except DurabilityError:
-            return self._recover_unpublished_spawn(proc, obligation, child_ticks)
+        except (OSError, DurabilityError) as exc:
+            if self._authority is None or not _capacity_failure(exc):
+                return self._recover_unpublished_spawn(proc, obligation, child_ticks)
+            LOGGER.debug(
+                "pid-upgrade cache write dropped under exhausted storage; "
+                "the database obligation holds the spawn fenced"
+            )
         identity = self._wait_for_identity(proc.pid)
         if identity is None:
             return self._settle_unproven_spawn(obligation.commit, proc, token, worker_id)
@@ -3149,6 +3716,55 @@ class SupervisorDaemon:
             except (OSError, DurabilityError):
                 LOGGER.exception("could not cache the committed pre-spawn obligation; holding")
                 return False
+        elif self._adopt_db_published(obligation):
+            return True
+        return self._settle_spawning_obligation(state, obligation)
+
+    def _adopt_db_published(self, obligation: SpawningObligation) -> bool:
+        """Adopt a database-published worker over a stale local spawn cache.
+
+        Args:
+            obligation: The stale cached pre-spawn obligation.
+
+        Returns:
+            ``True`` when the published worker was adopted and no blocking
+            obligation remains.
+        """
+        if self._authority is None:
+            return False
+        # The obligation was already published to the database while the
+        # local cache still holds its stale residue: adopt the published
+        # worker instead of converging the very child being published.
+        ok, record = self._read_worker_authority()
+        if not ok:
+            return False
+        if record is None or record.token != obligation.token:
+            return False
+        self._active_child = self._db_worker_to_child(record)
+        try:
+            self._cache_spawn_local(replace(read_state(), spawning=None))
+        except (OSError, DurabilityError):
+            LOGGER.exception("could not clear the stale cached pre-spawn obligation; holding")
+            return False
+        LOGGER.info(
+            "adopted database-published worker pid=%d for commit %s",
+            record.pid,
+            record.commit,
+        )
+        return True
+
+    def _settle_spawning_obligation(
+        self, state: supervise.SupervisorState, obligation: SpawningObligation
+    ) -> bool:
+        """Resolve one outstanding pre-spawn obligation deterministically.
+
+        Args:
+            state: Current durable state.
+            obligation: The pre-spawn obligation to resolve.
+
+        Returns:
+            ``True`` when no blocking obligation remains.
+        """
         if self._publication_in_progress(state, obligation):
             # The durable state already carries both the published child and the
             # exact pid-bearing obligation: this is the in-flight child+meta
@@ -4026,6 +4642,13 @@ class SupervisorDaemon:
         """Perform the shutdown convergence while holding the consumer lock."""
         if read_state().child is not None:
             self._retire_child(authority_locked=True)
+        ok, record = self._read_worker_authority()
+        if ok and record is not None and not self._retire_db_worker(record):
+            LOGGER.error(
+                "shutting down with published worker pid=%s still held; "
+                "the next start must resolve it before any replacement",
+                record.pid,
+            )
         if not self._resolve_spawning_obligation():
             # The obligation survives shutdown on purpose: a possibly live
             # spawned child must never be abandoned to make room for a
