@@ -209,12 +209,13 @@ def test_stale_take_loses_and_stands_down(
     authority.bootstrap_authority(_conn(table), "srv-test")
     authority.take_authority(_conn(table), "srv-test", _owner(pid=100))
     stale = authority.AuthorityRow(server="srv-test", epoch=0, generation=0, owner=None)
-    real_read = authority.read_authority
-    monkeypatch.setattr(authority, "read_authority", lambda _conn, _server: stale)
+    stale_text = authority.canonical_row_text(stale)
+    real_observed = authority._read_observed
+    monkeypatch.setattr(authority, "_read_observed", lambda _conn, _server: (stale_text, stale))
     try:
         assert authority.take_authority(_conn(table), "srv-test", _owner(pid=200)) is None
     finally:
-        monkeypatch.setattr(authority, "read_authority", real_read)
+        monkeypatch.setattr(authority, "_read_observed", real_observed)
     current = authority.read_authority(_conn(table), "srv-test")
     assert current is not None
     assert current.owner == _owner(pid=100)

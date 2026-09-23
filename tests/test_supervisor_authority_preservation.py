@@ -386,11 +386,14 @@ def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
     source = Path(supervisor.__file__).read_text(encoding="utf-8")
     locked_methods = {
         "_ensure_consumer_locked",
+        "_ensure_local_consumer_locked",
         "_spawn_worker",
         # Publishes spawn transitions to the local read-through cache only on
         # behalf of the locked scopes above; the database row stays the
         # authority and every call site runs under ``consumer_lock``.
         "_cache_spawn_local",
+        "_record_spawn_failure",
+        "_cache_published_child",
         "_publish_spawned_child",
         "_settle_unproven_spawn",
         "_recover_unpublished_spawn",

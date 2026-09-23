@@ -1,16 +1,22 @@
 """Database-backed fenced pre-spawn obligation invariants.
 
-Steady-state worker spawn must not require a successful local persistent
-write: the crash-durable authority is a committed row state *before* the
-spawn syscall, and local files are only a read-through cache. These tests
-prove, deterministically and without any tmpfs dependence:
+Steady-state worker spawn and publication must not require a successful
+local persistent write: the crash-durable authority is a committed row
+state *before* the spawn syscall, and local files are only a read-through
+cache. These tests prove, deterministically and without any tmpfs
+dependence:
 
 - the commit precedes ``Popen`` and a crash in between leaves a resolvable
   deterministic recovery obligation (no duplicate or unowned worker);
-- an ``ENOSPC`` local cache failure never blocks the spawn;
+- an ``ENOSPC`` local cache failure never blocks the spawn, and a fully
+  zero-space success path still reaches a usable published worker that is
+  neither killed nor retried;
 - a transient database outage fails closed and recovers on reconnect;
 - fencing loss or an already-committed obligation blocks the spawn;
-- an epoch take preserves a committed obligation for the new owner.
+- an epoch take preserves a committed obligation for the new owner, and a
+  stale takeover racing a commit can never erase it;
+- the safety-critical parent-death flag is never defaulted: omission or a
+  non-boolean fails closed.
 """
 
 from __future__ import annotations
@@ -418,3 +424,238 @@ def test_capacity_failure_classification() -> None:
     chained.__cause__ = OSError(errno.ENOSPC, "x")
     assert supervisor._capacity_failure(chained) is True
     assert supervisor._capacity_failure(ValueError("z")) is False
+
+
+class _LiveStubProc:
+    """Minimal live ``Popen`` stand-in that never exits on its own."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    @staticmethod
+    def poll() -> None:
+        """Report the child as still running."""
+
+
+def _enospc_durable(_state: object) -> None:
+    """Simulate a local durable write refused with exhausted storage.
+
+    Args:
+        _state: The state that could not be cached.
+
+    Raises:
+        DurabilityError: Always, chained from ``ENOSPC``.
+    """
+    msg = "No space left on device"
+    raise DurabilityError(msg) from OSError(errno.ENOSPC, msg)
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_zero_space_success_path_publishes_usable_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A full spawn publishes while every local write fails with ENOSPC.
+
+    ``Popen`` succeeds and the database publication commits, but no local
+    state or meta write succeeds. The worker must reach a usable published
+    state: it is not converged, no replacement is attempted, and a later
+    decision still sees exactly one published worker.
+    """
+    _patch_spawn_env(monkeypatch, tmp_path)
+    _clear_local_spawning()
+    table = FakeAuthorityConnection()
+    daemon = _claim_daemon(monkeypatch, table)
+    monkeypatch.setattr(supervisor, "write_state", _enospc_durable)
+    monkeypatch.setattr(lifecycle, "write_meta", _enospc_durable)
+    monkeypatch.setattr(supervisor, "proc_start_ticks", lambda _pid: 777)
+    monkeypatch.setattr(
+        daemon,
+        "_wait_for_identity",
+        lambda _pid: lifecycle.ProcessIdentity(pid=4242, pgid=4242, sid=4242, start_time_ticks=777),
+    )
+    monkeypatch.setattr(daemon, "_derive_action", lambda _state: ("run", COMMIT))
+    pops: list[int] = []
+
+    def _fake_popen(*_args: object, **_kwargs: object) -> _LiveStubProc:
+        pops.append(4242)
+        return _LiveStubProc(pid=4242)
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", _fake_popen)  # type: ignore[attr-defined]
+    converged: list[int] = []
+
+    def _forbidden_converge(proc: object) -> bool:
+        del proc
+        msg = "published worker must never be converged"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(daemon, "_converge_direct_child", _forbidden_converge)
+    daemon._spawn_and_publish(COMMIT)
+    assert pops == [4242]
+    assert converged == []
+    assert daemon._active_child is not None
+    assert daemon._active_child.pid == 4242
+    row = authority.read_authority(_conn(table), SERVER)
+    assert row is not None
+    assert row.spawn is None
+    assert row.worker is not None
+    assert row.worker.pid == 4242
+    assert row.worker.start_time_ticks == 777
+
+    daemon._ensure_consumer_locked(COMMIT)
+    assert pops == [4242]
+    assert converged == []
+    assert daemon._active_child is not None
+    assert daemon._active_child.pid == 4242
+    stayed = authority.read_authority(_conn(table), SERVER)
+    assert stayed is not None
+    assert stayed.worker is not None
+    assert stayed.worker.pid == 4242
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_stale_takeover_cannot_erase_committed_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A takeover racing a spawn commit loses without touching the row.
+
+    Owner A and contender B both observe epoch N with no spawn; A commits
+    its obligation; B then takes on its stale observation. The stale take
+    must fail and A's obligation must survive intact, so A may Popen while
+    B stands down instead of both spawning.
+    """
+    table = FakeAuthorityConnection()
+    authority.bootstrap_authority(_conn(table), SERVER)
+    first = authority.AuthorityOwner(pid=1, start_time_ticks=2, boot_id="boot-1")
+    assert authority.take_authority(_conn(table), SERVER, first) is not None
+    stale = authority.read_authority(_conn(table), SERVER)
+    assert stale is not None
+    assert stale.spawn is None
+    stale_text = table.rows[str(authority.authority_row_id(SERVER))]
+    claim_a = authority.AuthorityClaim(
+        server=SERVER, epoch=1, pid=1, start_time_ticks=2, boot_id="boot-1"
+    )
+    assert authority.commit_spawn_obligation(_conn(table), claim_a, _spawn_record()) is True
+    monkeypatch.setattr(authority, "_read_observed", lambda _conn, _server: (stale_text, stale))
+    try:
+        lost = authority.take_authority(
+            _conn(table), SERVER, authority.AuthorityOwner(pid=9, start_time_ticks=9, boot_id="b9")
+        )
+    finally:
+        monkeypatch.undo()
+    assert lost is None
+    row = authority.read_authority(_conn(table), SERVER)
+    assert row is not None
+    assert row.epoch == 1
+    assert row.owner == first
+    assert row.spawn == _spawn_record()
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_stale_takeover_cannot_erase_published_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale take racing a publication loses with the worker intact."""
+    table = FakeAuthorityConnection()
+    authority.bootstrap_authority(_conn(table), SERVER)
+    first = authority.AuthorityOwner(pid=1, start_time_ticks=2, boot_id="boot-1")
+    assert authority.take_authority(_conn(table), SERVER, first) is not None
+    stale = authority.read_authority(_conn(table), SERVER)
+    assert stale is not None
+    assert stale.spawn is None
+    stale_text = table.rows[str(authority.authority_row_id(SERVER))]
+    claim_a = authority.AuthorityClaim(
+        server=SERVER, epoch=1, pid=1, start_time_ticks=2, boot_id="boot-1"
+    )
+    assert authority.commit_spawn_obligation(_conn(table), claim_a, _spawn_record()) is True
+    published = authority.WorkerRecord(
+        token=OBLIGATION_TOKEN,
+        commit=COMMIT,
+        pid=4242,
+        pgid=4242,
+        sid=4242,
+        start_time_ticks=777,
+        worker_id="w-test",
+    )
+    won = authority.publish_worker(
+        _conn(table), claim_a, spawn_token=OBLIGATION_TOKEN, worker=published
+    )
+    assert won is True
+    monkeypatch.setattr(authority, "_read_observed", lambda _conn, _server: (stale_text, stale))
+    try:
+        lost = authority.take_authority(
+            _conn(table), SERVER, authority.AuthorityOwner(pid=9, start_time_ticks=9, boot_id="b9")
+        )
+    finally:
+        monkeypatch.undo()
+    assert lost is None
+    row = authority.read_authority(_conn(table), SERVER)
+    assert row is not None
+    assert row.worker == published
+    assert row.spawn is None
+
+
+def _spawn_section(**overrides: object) -> dict[str, object]:
+    """Build a complete spawn section with field overrides.
+
+    Args:
+        overrides: Fields to replace in the canonical section.
+
+    Returns:
+        The spawn mapping.
+    """
+    section: dict[str, object] = {
+        "token": OBLIGATION_TOKEN,
+        "commit": COMMIT,
+        "creator_pid": 424242,
+        "creator_start_time_ticks": 4242,
+        "boot_id": "boot-test",
+        "pid": None,
+        "start_time_ticks": None,
+        "parent_death_signal": True,
+    }
+    section.update(overrides)
+    return section
+
+
+def _authority_envelope(spawn: object) -> dict[str, object]:
+    """Wrap a raw spawn section in a minimal authority envelope.
+
+    Args:
+        spawn: The raw ``spawn`` value under test.
+
+    Returns:
+        The payload mapping.
+    """
+    return {
+        "v": 1,
+        "type": "lifecycle_authority",
+        "server": SERVER,
+        "epoch": 0,
+        "generation": 0,
+        "owner": None,
+        "spawn": spawn,
+    }
+
+
+def test_parent_death_signal_explicit_booleans_round_trip() -> None:
+    """An explicit boolean flag parses; anything else fails closed."""
+    for flag in (True, False):
+        section = _spawn_section()
+        section["parent_death_signal"] = flag
+        parsed = authority.parse_authority_payload(_authority_envelope(section), server=SERVER)
+        assert parsed.spawn is not None
+        assert parsed.spawn.parent_death_signal is flag
+
+
+def test_parent_death_signal_omission_and_non_bool_fail_closed() -> None:
+    """A missing or non-boolean flag never parses as usable authority."""
+    bad_flags: tuple[object, ...] = (None, "yes", "true", 1, 0, [], {})
+    for flag in bad_flags:
+        section = _spawn_section()
+        section["parent_death_signal"] = flag
+        with pytest.raises(authority.AuthorityError):
+            authority.parse_authority_payload(_authority_envelope(section), server=SERVER)
+    omitted = _spawn_section()
+    del omitted["parent_death_signal"]
+    with pytest.raises(authority.AuthorityError):
+        authority.parse_authority_payload(_authority_envelope(omitted), server=SERVER)
