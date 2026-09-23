@@ -236,6 +236,12 @@ pass "prerequisites"
 unset LUBKO_JOB_ID LUBKO_AGENT_ID LUBKO_INVOCATION_ID LUBKO_RUNNER_GEN \
   LUBKO_WORKER_ID LUBKO_PROMPT LUBKO_LIFECYCLE_TOKEN || true
 
+# Bytecode writes must follow the same path everywhere: an ambient
+# PYTHONDONTWRITEBYTECODE would suppress interpreter cache pressure that
+# a clean environment (like CI) exerts, hiding denial shapes the verdict
+# must classify. The worker pins its own value separately at spawn.
+unset PYTHONDONTWRITEBYTECODE || true
+
 SCRATCH="${ZERO_SPACE_SCRATCH:-}"
 if [ -z "${SCRATCH}" ]; then
   SCRATCH="$(mktemp -d)"
@@ -715,11 +721,13 @@ fi
 #   (ADR 0003, Class 3).
 # - .lubko-durable-lock-*: Class 3 flock rendezvous sidecars (holdings are
 #   kernel state; creation is a one-time setup act).
-# - __pycache__: interpreter bytecode caches, never Lubko authority.
+# - __pycache__ anywhere: interpreter bytecode caches, never Lubko
+#   authority. Both the directory creation itself and the file writes
+#   inside it are denied and survived.
 DENIED_TOTAL="$(grep -c "^DENY " "${DENIAL_LOG}" || true)"
 note "total denied Lubko-owned writes survived: ${DENIED_TOTAL}"
 ESC_ROOTS="$(printf '%s' "${ZERO_ROOTS}" | sed 's/[][\.*^$]/\\&/g; s/:/|/g')"
-UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ (${ESC_ROOTS})/(supervisor/status\.json\.tmp|supervisor/supervisor\.pid\.tmp|supervisor/supervisor\.log|worker/deploy\.log|worker/logs/[^ ]*|worker/health[^ /]*\.json|worker/health/health-[^ /]*\.tmp|worker/drain/[^ /]*\.tmp|.*__pycache__/[^ ]*|.*\.lubko-durable-lock-[^ ]*|.*\.lubko-durable-[^ /]*-(state|meta)\.json)" || true)"
+UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ (${ESC_ROOTS})/(supervisor/status\.json\.tmp|supervisor/supervisor\.pid\.tmp|supervisor/supervisor\.log|worker/deploy\.log|worker/logs/[^ ]*|worker/health[^ /]*\.json|worker/health/health-[^ /]*\.tmp|worker/drain/[^ /]*\.tmp|.*__pycache__|.*\.lubko-durable-lock-[^ ]*|.*\.lubko-durable-[^ /]*-(state|meta)\.json)" || true)"
 if [ -n "${UNEXPECTED}" ]; then
   fail "unexpected Lubko-owned writes attempted under zero allocation:"
   printf '%s\n' "${UNEXPECTED}"

@@ -114,7 +114,7 @@ jobs:
             if [ ! -f "${DENIAL_LOG}" ]; then
               UNEXPECTED="no-denials-log"
             else
-              UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ (${ESC_ROOTS})/(supervisor/status\\.json\\.tmp|supervisor/supervisor\\.pid\\.tmp|supervisor/supervisor\\.log|worker/deploy\\.log|worker/logs/[^ ]*|worker/health[^ /]*\\.json|worker/health/health-[^ /]*\\.tmp|worker/drain/[^ /]*\\.tmp|.*__pycache__/[^ ]*|.*\\.lubko-durable-lock-[^ ]*|.*\\.lubko-durable-[^ /]*-(state|meta)\\.json)" | head -n 2 | sed "s:$1:ROOT:g" | tr '\n' '; ')"
+              UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ (${ESC_ROOTS})/(supervisor/status\\.json\\.tmp|supervisor/supervisor\\.pid\\.tmp|supervisor/supervisor\\.log|worker/deploy\\.log|worker/logs/[^ ]*|worker/health[^ /]*\\.json|worker/health/health-[^ /]*\\.tmp|worker/drain/[^ /]*\\.tmp|.*__pycache__|.*\\.lubko-durable-lock-[^ ]*|.*\\.lubko-durable-[^ /]*-(state|meta)\\.json)" | head -n 2 | sed "s:$1:ROOT:g" | tr '\n' '; ')"
               if [ -z "${UNEXPECTED}" ]; then
                 UNEXPECTED="all-denied-writes-classified"
               fi
