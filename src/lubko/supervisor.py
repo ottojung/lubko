@@ -166,30 +166,6 @@ _PERSISTENT_DIAGNOSTIC_REPEAT_INTERVAL: Final = 256
 _CAPACITY_ERRNOS: Final = frozenset({errno.ENOSPC, errno.EDQUOT})
 
 
-def _capacity_failure(exc: BaseException) -> bool:
-    """Return whether a failure was caused by exhausted persistent storage.
-
-    Walks the exception cause/context chain for an ``OSError`` carrying a
-    capacity errno, so cache-write failures under zero free blocks can be
-    told apart from genuine durability faults.
-
-    Args:
-        exc: The failure to classify.
-
-    Returns:
-        ``True`` only when exhausted storage caused the failure.
-    """
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, OSError) and current.errno in _CAPACITY_ERRNOS:
-            return True
-        nxt = current.__cause__ or current.__context__
-        current = nxt if isinstance(nxt, BaseException) else None
-    return False
-
-
 #: Default timeout for server-side control socket accept/recv (seconds).
 _SERVER_TIMEOUT_SECONDS: Final = 5.0
 
@@ -3107,9 +3083,14 @@ class SupervisorDaemon:
         After a successful ``Popen`` this finishes the fail-closed publication
         protocol: it upgrades the durable obligation with the exact child
         identity, proves the queue identity, and returns the exact worker child.
-        Any authority-invariant refusal or durability failure converges the live
-        child through :meth:`_recover_unpublished_spawn` rather than forgetting
-        it, so no orphan is left running and no replacement is authorized.
+        Any authority-invariant refusal converges the live child through
+        :meth:`_recover_unpublished_spawn` rather than forgetting it, so no
+        orphan is left running and no replacement is authorized. The
+        pid-upgrade write itself is only a cache projection of the already
+        committed database obligation (publication keys on the token, and a
+        crash beforehand resolves through the designed pid-less path), so
+        any local failure there is logged and dropped without touching the
+        child.
 
         Args:
             proc: The live direct ``Popen`` handle of the spawned child.
@@ -3138,11 +3119,10 @@ class SupervisorDaemon:
                 )
             )
         except (OSError, DurabilityError) as exc:
-            if not _capacity_failure(exc):
-                return self._recover_unpublished_spawn(proc, obligation, child_ticks)
-            LOGGER.debug(
-                "pid-upgrade cache write dropped under exhausted storage; "
-                "the database obligation holds the spawn fenced"
+            LOGGER.warning(
+                "pid-upgrade cache write dropped (%s); "
+                "the database obligation holds the spawn fenced",
+                exc,
             )
         identity = self._wait_for_identity(proc.pid)
         if identity is None:
