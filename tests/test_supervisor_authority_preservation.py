@@ -387,6 +387,10 @@ def test_all_out_of_lock_writers_route_through_the_protected_writer() -> None:
     locked_methods = {
         "_ensure_consumer_locked",
         "_spawn_worker",
+        # Publishes spawn transitions to the local read-through cache only on
+        # behalf of the locked scopes above; the database row stays the
+        # authority and every call site runs under ``consumer_lock``.
+        "_cache_spawn_local",
         "_publish_spawned_child",
         "_settle_unproven_spawn",
         "_recover_unpublished_spawn",
