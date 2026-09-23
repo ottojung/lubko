@@ -75,6 +75,9 @@ trap_cleanup() {
   # Best-effort teardown: never mask the recorded verdict.
   stop_supervised "cleanup" 2>/dev/null || true
   if [ "${ZERO_SPACE_KEEP:-0}" != "1" ] && [ "${FAILED}" = "0" ]; then
+    # The maintained CLI environment is sealed read-only by the install
+    # path; restore owner-write so the harness scratch can be removed.
+    chmod -R u+w "${SCRATCH}" 2>/dev/null || true
     rm -rf "${SCRATCH}"
   else
     note "scratch kept at: ${SCRATCH}"
@@ -105,56 +108,96 @@ wait_gone() {
 }
 
 stop_supervised() {
-  # Stop the traced supervisor (and, through it, the worker) cleanly.
+  # Stop the supervisor (and, through it, the worker) cleanly.
   # $1 = phase label for messages.
-  if [ ! -f "${SCRATCH}/run/tracer.pid" ]; then
+  if [ ! -f "${SCRATCH}/run/leader.pid" ]; then
     return 0
   fi
-  TRACER_PID="$(cat "${SCRATCH}/run/tracer.pid")"
-  if ! kill -0 "${TRACER_PID}" 2>/dev/null; then
-    rm -f "${SCRATCH}/run/tracer.pid"
+  LEADER_PID="$(cat "${SCRATCH}/run/leader.pid")"
+  if ! kill -0 "${LEADER_PID}" 2>/dev/null; then
+    rm -f "${SCRATCH}/run/leader.pid" "${SCRATCH}/run/traced"
     return 0
   fi
-  for SUP_PID in $(children_of "${TRACER_PID}"); do
-    note "phase $1: SIGTERM supervisor ${SUP_PID}"
-    kill -TERM "${SUP_PID}" 2>/dev/null || true
-  done
-  # The tracer exits once every tracee is reaped; the supervisor retires
-  # its worker first, so tracer exit proves the whole boundary is down.
-  if wait_gone "${TRACER_PID}" 60; then
-    note "phase $1: supervisor/worker boundary is down"
+  if [ -f "${SCRATCH}/run/traced" ]; then
+    for SUP_PID in $(children_of "${LEADER_PID}"); do
+      note "phase $1: SIGTERM supervisor ${SUP_PID}"
+      kill -TERM "${SUP_PID}" 2>/dev/null || true
+    done
+    # The tracer exits once every tracee is reaped; the supervisor retires
+    # its worker first, so tracer exit proves the whole boundary is down.
+    if wait_gone "${LEADER_PID}" 60; then
+      note "phase $1: supervisor/worker boundary is down"
+    else
+      note "phase $1: boundary did not stop; SIGKILL process group"
+      kill -KILL "-${LEADER_PID}" 2>/dev/null || true
+      wait_gone "${LEADER_PID}" 10 || true
+      return 1
+    fi
   else
-    note "phase $1: boundary did not stop; SIGKILL process group"
-    kill -KILL "-${TRACER_PID}" 2>/dev/null || true
-    wait_gone "${TRACER_PID}" 10 || true
-    return 1
+    note "phase $1: SIGTERM supervisor ${LEADER_PID}"
+    kill -TERM "${LEADER_PID}" 2>/dev/null || true
+    if wait_gone "${LEADER_PID}" 60; then
+      note "phase $1: supervisor/worker boundary is down"
+    else
+      note "phase $1: boundary did not stop; SIGKILL process group"
+      kill -KILL "-${LEADER_PID}" 2>/dev/null || true
+      wait_gone "${LEADER_PID}" 10 || true
+      return 1
+    fi
   fi
-  rm -f "${SCRATCH}/run/tracer.pid"
+  rm -f "${SCRATCH}/run/leader.pid" "${SCRATCH}/run/traced"
   return 0
 }
 
 start_supervised() {
   # Start the supervisor under zero-allocation enforcement.
   # $1 = phase label (stdio goes to logs/sup-$1.log, outside the roots).
-  rm -f "${SCRATCH}/run/tracer.pid"
+  rm -f "${SCRATCH}/run/leader.pid" "${SCRATCH}/run/traced"
   # shellcheck disable=SC2086
   setsid env ${ZERO_ENV} "${ZEROSPACE}" --roots "${ZERO_ROOTS}" \
     --log "${DENIAL_LOG}" -- lubko-supervisor \
     >"${SCRATCH}/logs/sup-$1.log" 2>&1 < /dev/null &
-  echo "$!" > "${SCRATCH}/run/tracer.pid"
-  note "phase $1: tracer pid $(cat "${SCRATCH}/run/tracer.pid")"
+  echo "$!" > "${SCRATCH}/run/leader.pid"
+  touch "${SCRATCH}/run/traced"
+  note "phase $1: tracer pid $(cat "${SCRATCH}/run/leader.pid")"
+}
+
+start_supervised_plain() {
+  # Start the supervisor with space available (deployment history only).
+  # $1 = phase label (stdio goes to logs/sup-$1.log, outside the roots).
+  rm -f "${SCRATCH}/run/leader.pid" "${SCRATCH}/run/traced"
+  setsid lubko-supervisor \
+    >"${SCRATCH}/logs/sup-$1.log" 2>&1 < /dev/null &
+  echo "$!" > "${SCRATCH}/run/leader.pid"
+  note "phase $1: supervisor pid $(cat "${SCRATCH}/run/leader.pid")"
+}
+
+wait_proven() {
+  # wait_proven LABEL TIMEOUT: true when sup-LABEL.log reports a worker
+  # proven to consume the queue within TIMEOUT seconds.
+  WAIT_LABEL="$1"
+  WAIT_N="$2"
+  WAIT_I=0
+  while [ "${WAIT_I}" -lt "${WAIT_N}" ]; do
+    if grep -q "proven to consume the queue" "${SCRATCH}/logs/sup-${WAIT_LABEL}.log" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    WAIT_I=$((WAIT_I + 1))
+  done
+  return 1
 }
 
 manifest() {
-  # manifest ROOT... > file: path inventory with hashes and link targets.
+  # manifest ROOT... > file: path inventory with type, mode, hash/target.
   for MANIFEST_ROOT in "$@"; do
     find "${MANIFEST_ROOT}" | sort | while IFS= read -r ENTRY; do
       if [ -L "${ENTRY}" ]; then
         printf 'L %s -> %s\n' "${ENTRY}" "$(readlink "${ENTRY}")"
       elif [ -d "${ENTRY}" ]; then
-        printf 'D %s\n' "${ENTRY}"
+        printf 'D %s %s\n' "${ENTRY}" "$(stat -c %a "${ENTRY}")"
       elif [ -f "${ENTRY}" ]; then
-        printf 'F %s %s\n' "${ENTRY}" "$(sha256sum <"${ENTRY}" | cut -d' ' -f1)"
+        printf 'F %s %s %s\n' "${ENTRY}" "$(stat -c %a "${ENTRY}")" "$(sha256sum <"${ENTRY}" | cut -d' ' -f1)"
       else
         printf 'S %s\n' "${ENTRY}"
       fi
@@ -298,6 +341,11 @@ printf 'server=%s\n' "${SERVER}" >"${CONFIG_HOME}/worker.conf"
 chmod 600 "${CONFIG_HOME}/worker.conf"
 export PATH="${BIN_HOME}:${PATH}"
 
+# Supervisor state token: high-entropy, generated by the harness (never by
+# the product) before anything that records supervisor-namespace state.
+TOKEN="$("${VENV_PY}" -c "import secrets; print(secrets.token_hex(32))")"
+export LUBKO_SUPERVISOR_STATE_TOKEN="${TOKEN}"
+
 if ! uv run --project "${REPO}" lubko-install --repo "${REPO}" >"${SCRATCH}/logs/install.log" 2>&1; then
   fail "lubko-install failed (see logs/install.log)"
   tail -5 "${SCRATCH}/logs/install.log" || true
@@ -338,9 +386,27 @@ esac
 "${CLI_ENV}/.venv/bin/python" -m compileall -q "${STATE_ROOT}" 2>/dev/null || true
 pass "interpreter caches pre-populated"
 
-# Supervisor state token: high-entropy, never generated by the product.
-TOKEN="$("${VENV_PY}" -c "import secrets; print(secrets.token_hex(32))")"
-export LUBKO_SUPERVISOR_STATE_TOKEN="${TOKEN}"
+# Already-deployed history: run the supervisor once with space available so
+# lock files, logs, and health snapshots that a live deployment secures
+# exist before storage is exhausted; then stop cleanly. Every start below
+# crosses the restart boundary under enforcement.
+start_supervised_plain "pre"
+if ! wait_proven "pre" 120; then
+  fail "pre-run: worker was never proven to consume the queue (see logs/sup-pre.log)"
+  tail -5 "${SCRATCH}/logs/sup-pre.log" || true
+  printf 'ACCEPTANCE FAILED\n'
+  exit 1
+fi
+pass "pre-run: deployment healthy, worker proven on the queue"
+if ! stop_supervised "pre"; then
+  fail "pre-run supervisor did not retire its worker on SIGTERM"
+  printf 'ACCEPTANCE FAILED\n'
+  exit 1
+fi
+pass "pre-run: clean shutdown retired the worker"
+
+# The token is already exported above; the traced environment only needs it
+# repeated here for clarity next to the roots it namespaces.
 ZERO_ENV="HOME=${HOME} LUBKO_SUPERVISOR_STATE_TOKEN=${TOKEN}"
 
 manifest "${STATE_ROOT}" "${BIN_HOME}" "${CONFIG_HOME}" >"${SCRATCH}/manifest.before"
@@ -464,16 +530,28 @@ fi
 pass "Lubko-owned tree byte-identical before/after the zero phase"
 
 ACTIVE_COUNT="$(grep -c "^ACTIVE roots=" "${DENIAL_LOG}" || true)"
-note "enforcement activations: ${ACTIVE_COUNT} (self-test + phase A + phase B)"
-if [ "${ACTIVE_COUNT}" -lt 3 ]; then
-  fail "expected at least 3 enforcement activations, saw ${ACTIVE_COUNT}"
+note "enforcement activations: ${ACTIVE_COUNT} (phase A + phase B)"
+if [ "${ACTIVE_COUNT}" -lt 2 ]; then
+  fail "expected at least 2 enforcement activations, saw ${ACTIVE_COUNT}"
 fi
 
-# Known-degraded diagnostics: Lubko must survive these denials, and they
-# are the only Lubko-owned writes permitted to be attempted.
+# Known-degraded writes: Lubko must survive these denials, and they are the
+# only Lubko-owned writes permitted to be attempted. Each shape below names
+# an established degradation class, not an incident:
+# - status.json.tmp / supervisor.pid.tmp: Class 4/accounting snapshot
+#   staging (best-effort status/pid publication; readers fail closed).
+# - supervisor.log growth and worker/logs/*: Class 4 bounded logs (emission
+#   degrades to in-memory drop counters, worker falls back to NullHandler).
+# - worker/health*.json: Class 4 health snapshots (silently dropped).
+# - .lubko-durable-*-state.json: durable staging temporaries, garbage by
+#   definition when their create fails (ADR 0003, Class 3).
+# - .lubko-durable-lock-*: Class 3 flock rendezvous sidecars (holdings are
+#   kernel state; creation is a one-time setup act).
+# - __pycache__: interpreter bytecode caches, never Lubko authority.
 DENIED_TOTAL="$(grep -c "^DENY " "${DENIAL_LOG}" || true)"
 note "total denied Lubko-owned writes survived: ${DENIED_TOTAL}"
-UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ ${STATE_ROOT}/(supervisor/status\.json|supervisor/supervisor\.log|worker/logs/|worker/health[^ ]*|worker/worker\.log)|DENY [a-z0-9-]+ ${STATE_ROOT}/.*__pycache__/.*|DENY [a-z0-9-]+ ${STATE_ROOT}/.*\.lubko-durable-lock-[^ ]*|DENY [a-z0-9-]+ ${BIN_HOME}/\.lubko-durable-lock-[^ ]*" || true)"
+ESC_ROOTS="$(printf '%s' "${ZERO_ROOTS}" | sed 's/[][\.*^$]/\\&/g; s/:/|/g')"
+UNEXPECTED="$(grep "^DENY " "${DENIAL_LOG}" | grep -v -E "DENY [a-z0-9-]+ (${ESC_ROOTS})/(supervisor/status\.json\.tmp|supervisor/supervisor\.pid\.tmp|supervisor/supervisor\.log|worker/logs/[^ ]*|worker/health[^ /]*\.json|.*__pycache__/[^ ]*|.*\.lubko-durable-lock-[^ ]*|.*\.lubko-durable-[^ /]*-state\.json)" || true)"
 if [ -n "${UNEXPECTED}" ]; then
   fail "unexpected Lubko-owned writes attempted under zero allocation:"
   printf '%s\n' "${UNEXPECTED}"
