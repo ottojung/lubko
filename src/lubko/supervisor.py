@@ -165,6 +165,31 @@ _PERSISTENT_DIAGNOSTIC_REPEAT_INTERVAL: Final = 256
 #: and suppressed so they can never fail, block, or alter a lifecycle decision.
 _CAPACITY_ERRNOS: Final = frozenset({errno.ENOSPC, errno.EDQUOT})
 
+
+def _capacity_failure(exc: BaseException) -> bool:
+    """Return whether a failure was caused by exhausted persistent storage.
+
+    Walks the exception cause/context chain for an ``OSError`` carrying a
+    capacity errno, so cache-write failures under zero free blocks can be
+    told apart from genuine durability faults.
+
+    Args:
+        exc: The failure to classify.
+
+    Returns:
+        ``True`` only when exhausted storage caused the failure.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno in _CAPACITY_ERRNOS:
+            return True
+        nxt = current.__cause__ or current.__context__
+        current = nxt if isinstance(nxt, BaseException) else None
+    return False
+
+
 #: Default timeout for server-side control socket accept/recv (seconds).
 _SERVER_TIMEOUT_SECONDS: Final = 5.0
 
@@ -1646,6 +1671,14 @@ class SupervisorDaemon:
         # finish, never a silently duplicated consumer.
         obligation = read_state().spawning
         if obligation is None:
+            # The local cache may have dropped the write under exhausted
+            # storage while the database obligation holds. The database is
+            # the authority: a committed obligation for this spawn satisfies
+            # the pre-Popen durability boundary without fabricating anything.
+            ok, db_obligation = self._read_spawn_authority()
+            if ok and db_obligation is not None and db_obligation.token == child.token:
+                obligation = db_obligation
+        if obligation is None:
             # The live child exists but the durable pre-Popen obligation is
             # missing. Synthesizing a fresh obligation now cannot prove the
             # required pre-Popen durability boundary, so it would defeat the
@@ -1736,7 +1769,19 @@ class SupervisorDaemon:
             )
             LOGGER.exception("%s", self._message)
             return
-        write_state(replace(read_state(), spawning=None))
+        # The database obligation clears first (it is the authority); the
+        # local cache clear is best-effort under exhausted storage.
+        if not self._clear_spawn_authority():
+            LOGGER.error("could not clear the pre-spawn obligation; holding")
+            return
+        try:
+            self._cache_spawn_local(replace(read_state(), spawning=None))
+        except (OSError, DurabilityError):
+            LOGGER.exception(
+                "could not clear the cached pre-spawn obligation; "
+                "the database obligation is cleared and the worker is published"
+            )
+            return
         lifecycle.append_deploy_log(
             f"supervisor started worker pid={child.pid} commit={commit} "
             f"incarnation={child.worker_id}"
@@ -2166,6 +2211,223 @@ class SupervisorDaemon:
             return None
         return executable
 
+    @staticmethod
+    def _db_spawn_record(obligation: SpawningObligation) -> authority.SpawnObligation:
+        """Convert a local pre-spawn obligation to its database authority form.
+
+        Args:
+            obligation: The local obligation committed before ``Popen``.
+
+        Returns:
+            The database-backed fenced obligation.
+        """
+        return authority.SpawnObligation(
+            token=obligation.token,
+            commit=obligation.commit,
+            creator_pid=obligation.creator_pid,
+            creator_start_time_ticks=obligation.creator_start_time_ticks,
+            boot_id=obligation.boot_id,
+            pid=obligation.pid,
+            start_time_ticks=obligation.start_time_ticks,
+            parent_death_signal=obligation.parent_death_signal,
+        )
+
+    def _spawn_authority_connection(self) -> JobsConnection | None:
+        """Return the cached authority connection, opening it on first use.
+
+        Returns:
+            The open connection, or ``None`` when the database is
+            unreachable (the cached connection is discarded so a
+            partitioned incarnation can never act on a stale epoch).
+        """
+        try:
+            if self._authority_conn is None:
+                self._authority_conn = self._open_authority_connection()
+        except authority.AuthorityUnavailableError:
+            self._discard_authority_connection()
+            return None
+        except psycopg.Error:
+            LOGGER.warning(
+                "lifecycle authority connection failed; holding without spawning",
+                exc_info=True,
+            )
+            self._discard_authority_connection()
+            return None
+        else:
+            return self._authority_conn
+
+    def _commit_spawn_authority(self, obligation: SpawningObligation) -> bool:
+        """Commit the fenced pre-spawn obligation to the authority row.
+
+        The database commit is the linearization point of the spawn: it
+        happens before the spawn syscall, and when it fails the spawn does
+        not happen. Daemons without an established fencing claim keep the
+        legacy local-only obligation.
+
+        Args:
+            obligation: The pre-spawn obligation to commit.
+
+        Returns:
+            ``True`` when the obligation is committed (or no fencing claim
+            is established), ``False`` when the spawn must not happen.
+        """
+        claim = self._authority
+        if claim is None:
+            return True
+        conn = self._spawn_authority_connection()
+        if conn is None:
+            self._message = "lifecycle authority is unreachable; holding without spawning"
+            LOGGER.warning("%s", self._message)
+            return False
+        try:
+            won = authority.commit_spawn_obligation(conn, claim, self._db_spawn_record(obligation))
+        except authority.AuthorityUnavailableError:
+            self._message = "lifecycle authority is unreachable; holding without spawning"
+            LOGGER.warning("%s", self._message)
+            self._discard_authority_connection()
+            return False
+        except authority.AuthorityError:
+            self._message = (
+                "fresh lifecycle authority is unavailable or superseded; holding without spawning"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        except psycopg.Error:
+            LOGGER.warning(
+                "lifecycle authority connection failed; holding without spawning",
+                exc_info=True,
+            )
+            self._discard_authority_connection()
+            return False
+        if not won:
+            self._message = (
+                "a concurrent supervisor won the fencing epoch or a spawn "
+                "obligation is already committed; holding without spawning"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        return True
+
+    def _clear_spawn_authority(self) -> bool:
+        """Clear the committed pre-spawn obligation from the authority row.
+
+        Returns:
+            ``True`` when no database obligation remains (or no fencing
+            claim is established), ``False`` when the obligation must stay
+            blocking.
+        """
+        claim = self._authority
+        if claim is None:
+            return True
+        conn = self._spawn_authority_connection()
+        if conn is None:
+            self._message = (
+                "lifecycle authority is unreachable; keeping the spawn "
+                "obligation blocking until the database is reachable"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        try:
+            cleared = authority.clear_spawn_obligation(conn, claim)
+        except authority.AuthorityUnavailableError:
+            self._message = (
+                "lifecycle authority is unreachable; keeping the spawn "
+                "obligation blocking until the database is reachable"
+            )
+            LOGGER.warning("%s", self._message)
+            self._discard_authority_connection()
+            return False
+        except psycopg.Error:
+            LOGGER.warning(
+                "lifecycle authority connection failed; keeping the spawn obligation blocking",
+                exc_info=True,
+            )
+            self._discard_authority_connection()
+            return False
+        if not cleared:
+            self._message = (
+                "fencing epoch no longer matches the authority row; "
+                "standing down without touching any child process"
+            )
+            LOGGER.warning("%s", self._message)
+            return False
+        return True
+
+    def _read_spawn_authority(self) -> tuple[bool, SpawningObligation | None]:
+        """Read the committed pre-spawn obligation from the authority row.
+
+        Returns:
+            A ``(ok, obligation)`` pair: ``ok`` is ``False`` when the
+            database is unreachable and the caller must hold; otherwise
+            ``obligation`` is the committed obligation, or ``None`` when
+            no fencing claim is established or no obligation is committed.
+        """
+        claim = self._authority
+        if claim is None:
+            return True, None
+        conn = self._spawn_authority_connection()
+        if conn is None:
+            self._message = "lifecycle authority is unreachable; holding without spawning"
+            return False, None
+        try:
+            row = authority.read_authority(conn, claim.server)
+        except authority.AuthorityUnavailableError:
+            self._message = "lifecycle authority is unreachable; holding without spawning"
+            self._discard_authority_connection()
+            return False, None
+        except authority.AuthorityError:
+            self._message = (
+                "the lifecycle authority row is missing, corrupt, or untrusted; "
+                "holding without starting any worker until it is repaired"
+            )
+            LOGGER.exception("%s", self._message)
+            return False, None
+        except psycopg.Error:
+            LOGGER.warning(
+                "lifecycle authority connection failed; holding without spawning",
+                exc_info=True,
+            )
+            self._discard_authority_connection()
+            return False, None
+        if row is None or row.spawn is None:
+            return True, None
+        spawn = row.spawn
+        return True, SpawningObligation(
+            token=spawn.token,
+            commit=spawn.commit,
+            creator_pid=spawn.creator_pid,
+            creator_start_time_ticks=spawn.creator_start_time_ticks,
+            pid=spawn.pid,
+            start_time_ticks=spawn.start_time_ticks,
+            created_at=time.time(),
+            boot_id=spawn.boot_id,
+            parent_death_signal=spawn.parent_death_signal,
+        )
+
+    def _cache_spawn_local(self, state: SupervisorState) -> None:
+        """Publish a spawn transition to the local read-through cache.
+
+        The database row is the authority; this local write is only a
+        cache. Under exhausted storage the cache write is dropped and the
+        database obligation keeps the spawn fenced.
+
+        Args:
+            state: The transition to publish locally.
+
+        Raises:
+            DurabilityError: If the write fails for a non-capacity reason.
+            OSError: If the write fails for a non-capacity reason.
+        """
+        try:
+            write_state(state)
+        except (OSError, DurabilityError) as exc:
+            if self._authority is None or not _capacity_failure(exc):
+                raise
+            LOGGER.debug(
+                "spawn cache write dropped under exhausted storage; "
+                "the database obligation holds the spawn fenced"
+            )
+
     def _spawn_worker(self, commit: str) -> WorkerChild | None:
         """Spawn the worker for ``commit`` as a direct child from the sealed runtime.
 
@@ -2222,7 +2484,18 @@ class SupervisorDaemon:
                 "consumer present); holding without starting a worker"
             )
             return None
-        write_state(replace(read_state(), spawning=obligation))
+        # Fenced database-backed pre-spawn obligation, committed BEFORE the
+        # Popen: from this instant until the child identity (or an equivalent
+        # replacement-blocking hold) is durably published, this record is the
+        # fail-closed authority that forbids any successor supervisor from
+        # starting a second maintained consumer beside a possibly-live first
+        # spawn. When the commit fails (database unreachable or fencing
+        # lost), the spawn does not happen. The local write below is only a
+        # read-through cache: under exhausted storage it is dropped and the
+        # database obligation keeps the spawn fenced.
+        if not self._commit_spawn_authority(obligation):
+            return None
+        self._cache_spawn_local(replace(read_state(), spawning=obligation))
         preexec = functools.partial(_child_preexec, os.getpid())
         try:
             proc = subprocess.Popen(
@@ -2245,7 +2518,13 @@ class SupervisorDaemon:
             # raised before exec (e.g. PR_SET_PDEATHSIG could not be
             # installed), so no worker code ran and nothing needs
             # converging — clearing the obligation keeps the retry path open.
-            write_state(replace(read_state(), spawning=None))
+            # The database obligation clears first (it is the authority); the
+            # local cache clear is best-effort under exhausted storage.
+            if not self._clear_spawn_authority():
+                self._message = "could not clear the pre-spawn obligation; holding"
+                LOGGER.warning("%s", self._message)
+                return None
+            self._cache_spawn_local(replace(read_state(), spawning=None))
             LOGGER.exception("could not start the worker for commit %s", commit)
             return None
         self.proc = proc
@@ -2855,7 +3134,21 @@ class SupervisorDaemon:
             return False
         obligation = state.spawning
         if obligation is None:
-            return True
+            ok, db_obligation = self._read_spawn_authority()
+            if not ok:
+                return False
+            if db_obligation is None:
+                return True
+            # Crash between the database commit and the local cache write (or
+            # a dropped cache write under exhausted storage): the database is
+            # the authority, so materialize the committed obligation into the
+            # cache and resolve it deterministically below.
+            obligation = db_obligation
+            try:
+                self._cache_spawn_local(replace(read_state(), spawning=obligation))
+            except (OSError, DurabilityError):
+                LOGGER.exception("could not cache the committed pre-spawn obligation; holding")
+                return False
         if self._publication_in_progress(state, obligation):
             # The durable state already carries both the published child and the
             # exact pid-bearing obligation: this is the in-flight child+meta
@@ -2873,7 +3166,15 @@ class SupervisorDaemon:
             resolved = self._resolve_identified_spawn(obligation)
         if not resolved:
             return False
-        write_state(replace(read_state(), spawning=None))
+        # The database obligation clears first (it is the authority); the
+        # local cache clear is best-effort under exhausted storage.
+        if not self._clear_spawn_authority():
+            return False
+        try:
+            self._cache_spawn_local(replace(read_state(), spawning=None))
+        except (OSError, DurabilityError):
+            LOGGER.exception("could not clear the cached pre-spawn obligation; holding")
+            return False
         LOGGER.info("resolved prior pre-spawn recovery obligation for commit %s", obligation.commit)
         return True
 
@@ -2941,8 +3242,10 @@ class SupervisorDaemon:
             LOGGER.exception("%s", self._message)
             return False
         try:
-            write_state(replace(read_state(), spawning=None))
-        except DurabilityError:
+            if not self._clear_spawn_authority():
+                return False
+            self._cache_spawn_local(replace(read_state(), spawning=None))
+        except (OSError, DurabilityError):
             self._message = (
                 "deferred worker publication cleared the obligation in memory but "
                 "could not durably persist it; keeping it blocking until the next tick"
@@ -2970,14 +3273,38 @@ class SupervisorDaemon:
             and obligation.creator_pid == os.getpid()
             and proc_start_ticks(os.getpid()) == obligation.creator_start_time_ticks
         ):
-            # Defensive: an in-flight record of THIS very incarnation must
-            # never be auto-resolved while it could still be mid-spawn.
-            self._message = (
-                "a pre-spawn recovery obligation of this supervisor incarnation is "
-                "outstanding; holding without starting another worker"
-            )
-            LOGGER.error("%s", self._message)
-            return False
+            # An in-flight record of THIS very incarnation must never be
+            # auto-resolved while its child could still be alive: the spawn
+            # already happened (or is happening) under our own direct
+            # handle, and resolving would authorize a duplicate consumer.
+            proc = self.proc
+            if proc is not None and proc.poll() is None:
+                self._message = (
+                    "a pre-spawn recovery obligation of this supervisor incarnation is "
+                    "outstanding; holding without starting another worker"
+                )
+                LOGGER.error("%s", self._message)
+                return False
+            # Our own in-flight spawn is provably gone (its direct handle is
+            # absent or reaped): no live first consumer can remain. Reap the
+            # handle when present, recover the exact incarnation's owned
+            # command groups, and report resolved so a later tick can retry
+            # the spawn instead of wedging behind a dead record.
+            if proc is not None:
+                with suppress(Exception):
+                    proc.wait(timeout=self.settings.stop_grace_seconds)
+                self.proc = None
+            try:
+                recover_owned_groups(obligation.token)
+            except OwnedGroupRecoveryError:
+                self._message = (
+                    "our own in-flight spawn is gone, but its owned command "
+                    "groups could not be recovered; holding without clearing "
+                    "the obligation or spawning a replacement"
+                )
+                LOGGER.exception("%s", self._message)
+                return False
+            return True
         if not obligation.parent_death_signal:
             # This spawn carried no kernel parent-death guarantee (a manually
             # started recovery worker), so the pid-less record cannot be
