@@ -191,13 +191,14 @@ def test_malformed_spawn_payloads_fail_closed() -> None:
         with pytest.raises(authority.AuthorityError):
             authority.parse_authority_payload(
                 {
-                    "v": 1,
+                    "v": authority.AUTHORITY_VERSION,
                     "type": "lifecycle_authority",
                     "server": SERVER,
                     "epoch": 0,
                     "generation": 0,
                     "owner": None,
                     "spawn": raw,
+                    "worker": None,
                 },
                 server=SERVER,
             )
@@ -627,13 +628,14 @@ def _authority_envelope(spawn: object) -> dict[str, object]:
         The payload mapping.
     """
     return {
-        "v": 1,
+        "v": authority.AUTHORITY_VERSION,
         "type": "lifecycle_authority",
         "server": SERVER,
         "epoch": 0,
         "generation": 0,
         "owner": None,
         "spawn": spawn,
+        "worker": None,
     }
 
 

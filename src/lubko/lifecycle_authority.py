@@ -49,7 +49,14 @@ if TYPE_CHECKING:
 AUTHORITY_TYPE: Final = "lifecycle_authority"
 
 #: Supported authority payload version. Any other version fails closed.
-AUTHORITY_VERSION: Final = 1
+#: Version 2 is the single canonical schema: ``spawn`` and ``worker`` keys
+#: must be present explicitly (null when absent). Version 1 rows are never
+#: parsed by normal runtime code; they are converted once by
+#: :func:`migrate_v1_to_v2`.
+AUTHORITY_VERSION: Final = 2
+
+#: Previous schema version, accepted only inside :func:`migrate_v1_to_v2`.
+LEGACY_AUTHORITY_VERSION: Final = 1
 
 #: Strict maximum size of the serialized authority payload in UTF-8 bytes.
 #: Transitions that would exceed the bound are refused before any
@@ -274,6 +281,8 @@ def build_authority_payload(
         "epoch": epoch,
         "generation": generation,
         "owner": owner_mapping,
+        "spawn": None,
+        "worker": None,
     }
 
 
@@ -559,6 +568,9 @@ def parse_authority_payload(data: object, *, server: str) -> AuthorityRow:
     if data.get("server") != server:
         msg = "lifecycle authority row governs a different server; holding"
         raise AuthorityError(msg)
+    if "spawn" not in data or "worker" not in data:
+        msg = "authority payload must carry explicit spawn and worker keys"
+        raise AuthorityError(msg)
     epoch = _check_non_negative_int("epoch", data.get("epoch"))
     generation = _check_non_negative_int("generation", data.get("generation"))
     owner = _parse_owner(data.get("owner"))
@@ -769,10 +781,9 @@ def _read_observed(conn: JobsConnection, server: str) -> tuple[str, AuthorityRow
     """Read the stored payload text and the parsed row together.
 
     The stored text verbatim is the exact-state guard for a later
-    compare-and-swap: any concurrent mutation changes it, while an
-    unchanged row guards byte-identically regardless of which code
-    revision wrote it, so rows predating a schema extension never wedge
-    upgrades — the first mutation simply rewrites them canonically.
+    compare-and-swap. Only exact canonical v2 rows parse here; a v1 or
+    otherwise non-canonical row fails closed via :class:`AuthorityError`
+    and must go through :func:`migrate_v1_to_v2` first.
 
     Args:
         conn: Open database connection.
@@ -1065,3 +1076,198 @@ def confirm_authority(conn: JobsConnection, claim: AuthorityClaim) -> bool:
         and owner.start_time_ticks == claim.start_time_ticks
         and owner.boot_id == claim.boot_id
     )
+
+
+@dataclass(frozen=True, slots=True)
+class V1LegacyEvidence:
+    """Legacy local state transferred into v2 before the migration CAS.
+
+    Only exact, unambiguous evidence is transferred; anything malformed or
+    ambiguous fails closed and leaves the v1 row untouched.
+
+    Attributes:
+        live_worker: Exact live maintained-worker identity to publish, or
+            ``None`` when no legacy meta proves one.
+        worker_ambiguous: ``True`` when legacy worker evidence exists but
+            cannot be proved exact and safe.
+        spawn: Blocking pre-spawn/unresolved obligation identity to carry,
+            or ``None`` when none is proved.
+        spawn_ambiguous: ``True`` when legacy blocking evidence exists but
+            cannot be proved exact and safe.
+    """
+
+    live_worker: WorkerRecord | None = None
+    worker_ambiguous: bool = False
+    spawn: SpawnObligation | None = None
+    spawn_ambiguous: bool = False
+
+
+def _parse_v1_payload(data: object, *, server: str) -> AuthorityRow:
+    """Parse an exact v1 payload. Migration boundary only.
+
+    Accepts the legacy shape where ``spawn``/``worker`` keys may be absent;
+    every other field validates exactly as v2.
+
+    Args:
+        data: Stored payload text or decoded mapping at version 1.
+        server: Exact execution-server identity the row must govern.
+
+    Returns:
+        The parsed authority row.
+
+    Raises:
+        AuthorityError: If the payload is not an exact v1 row.
+    """
+    if isinstance(data, str):
+        if len(data.encode("utf-8")) > AUTHORITY_MAX_BYTES:
+            msg = "authority payload exceeds the documented byte bound"
+            raise AuthorityError(msg)
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError as exc:
+            msg = f"authority payload is not valid JSON: {exc}"
+            raise AuthorityError(msg) from exc
+    if not isinstance(data, dict):
+        msg = "authority payload must be a JSON object"
+        raise AuthorityError(msg)
+    version = data.get("v")
+    if version != LEGACY_AUTHORITY_VERSION or isinstance(version, bool):
+        msg = f"not a v1 lifecycle authority row: {version!r}"
+        raise AuthorityError(msg)
+    if data.get("type") != AUTHORITY_TYPE:
+        msg = f"payload is not lifecycle authority: {data.get('type')!r}"
+        raise AuthorityError(msg)
+    if data.get("server") != server:
+        msg = "lifecycle authority row governs a different server; holding"
+        raise AuthorityError(msg)
+    epoch = _check_non_negative_int("epoch", data.get("epoch"))
+    generation = _check_non_negative_int("generation", data.get("generation"))
+    owner = _parse_owner(data.get("owner"))
+    spawn = _parse_spawn(data.get("spawn"))
+    worker = _parse_worker(data.get("worker"))
+    if spawn is not None and worker is not None:
+        msg = "authority row cannot carry both a spawn obligation and a published worker"
+        raise AuthorityError(msg)
+    return AuthorityRow(
+        server=server, epoch=epoch, generation=generation, owner=owner, spawn=spawn, worker=worker
+    )
+
+
+def _check_migration_evidence(proven: V1LegacyEvidence) -> None:
+    """Reject malformed or ambiguous legacy evidence before any row read.
+
+    Args:
+        proven: Legacy local evidence to transfer.
+
+    Raises:
+        AuthorityError: If safety cannot be proved from the evidence.
+    """
+    if proven.worker_ambiguous or proven.spawn_ambiguous:
+        msg = "legacy local authority is malformed or ambiguous; holding on v1"
+        raise AuthorityError(msg)
+    if proven.live_worker is not None and proven.spawn is not None:
+        msg = "legacy local authority names both a live worker and a blocking spawn; holding on v1"
+        raise AuthorityError(msg)
+
+
+def _resolve_migration_sections(
+    legacy: AuthorityRow, proven: V1LegacyEvidence
+) -> tuple[SpawnObligation | None, WorkerRecord | None]:
+    """Combine a v1 row with proven legacy evidence into v2 sections.
+
+    Args:
+        legacy: The parsed v1 row.
+        proven: Validated legacy local evidence.
+
+    Returns:
+        The ``(spawn, worker)`` pair for the v2 candidate.
+
+    Raises:
+        AuthorityError: If the row and the evidence disagree or both
+            sections would be set.
+    """
+    spawn = legacy.spawn if legacy.spawn is not None else proven.spawn
+    worker = legacy.worker if legacy.worker is not None else proven.live_worker
+    if legacy.spawn is not None and proven.spawn is not None and legacy.spawn != proven.spawn:
+        msg = "legacy row and local evidence disagree on the blocking spawn; holding on v1"
+        raise AuthorityError(msg)
+    if (
+        legacy.worker is not None
+        and proven.live_worker is not None
+        and legacy.worker != proven.live_worker
+    ):
+        msg = "legacy row and local evidence disagree on the published worker; holding on v1"
+        raise AuthorityError(msg)
+    if spawn is not None and worker is not None:
+        msg = "migration cannot carry both a spawn obligation and a published worker"
+        raise AuthorityError(msg)
+    return spawn, worker
+
+
+def migrate_v1_to_v2(
+    conn: JobsConnection, server: str, evidence: V1LegacyEvidence | None = None
+) -> bool:
+    """Migrate one exact v1 row to canonical v2 atomically. Startup boundary only.
+
+    Normal runtime code must never call this: it is the single one-time
+    compatibility boundary. It parses v1 only here, transfers unambiguous
+    legacy local blocking/ownership identity into the v2 candidate, then
+    compare-and-swaps the exact observed v1 text to v2. No local file is
+    modified and no child is signalled; after the CAS the normal v2
+    reconciler retires or recovers whatever was transferred.
+
+    Crash semantics: a crash before the CAS leaves v1 untouched; a crash
+    after the CAS leaves enough v2 DB state to prevent any duplicate spawn.
+
+    Args:
+        conn: Open database connection.
+        server: Exact execution-server identity.
+        evidence: Unambiguous legacy local evidence to transfer. ``None``
+            means no legacy state (neutral migration).
+
+    Returns:
+        ``True`` when the row is v2 afterwards (already v2 or just
+        migrated), ``False`` when a concurrent mutation won the race and
+        the caller must re-observe.
+
+    Raises:
+        AuthorityError: If the stored row is neither exact v2 nor exact v1,
+            or the legacy evidence is malformed/ambiguous and safety cannot
+            be proved. The v1 row is left untouched in every failure.
+        AuthorityUnavailableError: If the database cannot be reached.
+    """
+    proven = evidence if evidence is not None else V1LegacyEvidence()
+    _check_migration_evidence(proven)
+    row_id = authority_row_id(server)
+    try:
+        with conn.transaction(), conn.cursor() as cursor:
+            cursor.execute(_READ_ROW_SQL, {"id": str(row_id)})
+            fetched = cursor.fetchone()
+    except psycopg.Error as exc:
+        msg = f"lifecycle authority for server {server!r} is unreachable"
+        raise AuthorityUnavailableError(msg) from exc
+    if fetched is None:
+        msg = f"no lifecycle authority row for server {server!r}; bootstrap first"
+        raise AuthorityError(msg)
+    stored = fetched[0]
+    if not isinstance(stored, str):
+        stored = json.dumps(stored, sort_keys=True)
+    try:
+        parse_authority_payload(stored, server=server)
+    except AuthorityError:
+        pass
+    else:
+        return True
+    legacy = _parse_v1_payload(stored, server=server)
+    spawn, worker = _resolve_migration_sections(legacy, proven)
+    candidate = canonical_row_text(
+        AuthorityRow(
+            server=server,
+            epoch=legacy.epoch,
+            generation=legacy.generation,
+            owner=legacy.owner,
+            spawn=spawn,
+            worker=worker,
+        )
+    )
+    return _compare_and_swap(conn, server, stored, candidate)
