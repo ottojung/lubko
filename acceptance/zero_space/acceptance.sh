@@ -486,7 +486,10 @@ if ! uv run --project "${REPO}" lubko-install --repo "${REPO}" >"${SCRATCH}/logs
   exit 1
 fi
 pass "lubko-install"
-if ! lubko-deploy deploy --bootstrap --repo "${REPO}" >"${SCRATCH}/logs/deploy.log" 2>&1; then
+# A generous per-attempt database timeout: the replacement-worker
+# verification retries transient transport failures with bounded backoff,
+# and each attempt deserves headroom on a busy container host.
+if ! lubko-deploy deploy --bootstrap --repo "${REPO}" --db-timeout 15 >"${SCRATCH}/logs/deploy.log" 2>&1; then
   fail "lubko-deploy deploy --bootstrap failed (see logs/deploy.log)"
   tail -5 "${SCRATCH}/logs/deploy.log" || true
   printf 'ACCEPTANCE FAILED\n'

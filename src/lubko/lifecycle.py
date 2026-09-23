@@ -1026,6 +1026,77 @@ def check_postgres(timeout_seconds: float) -> bool:
         return False
 
 
+POSTGRES_VERIFY_DEADLINE_SECONDS: Final = 60.0
+POSTGRES_VERIFY_RETRY_INTERVAL_SECONDS: Final = 2.0
+
+
+def _is_transient_postgres_state(sqlstate: object) -> bool:
+    """Return whether a SQLSTATE denotes a transient connection failure.
+
+    SQLSTATE class 08 covers connection exceptions; a missing state means
+    the failure happened before the server responded at all (refused,
+    reset, or timed out). Anything else (authentication, missing database,
+    syntax) is a deterministic defect that retrying cannot fix.
+
+    Args:
+        sqlstate: The SQLSTATE from a PostgreSQL error, or ``None``.
+
+    Returns:
+        ``True`` when waiting and retrying may help.
+    """
+    return sqlstate is None or (isinstance(sqlstate, str) and sqlstate.startswith("08"))
+
+
+def await_postgres(timeout_seconds: float) -> str | None:
+    """Wait for PostgreSQL verification, tolerating transient transport loss.
+
+    A freshly started replacement worker shares a busy container host with
+    the deployer; a connection refused or reset in that window says nothing
+    about the deployment itself. Only transport-level failures (SQLSTATE
+    class 08, or no response at all) are retried within a bounded deadline.
+    Deterministic failures (unreadable configuration, authentication, an
+    answered-but-empty query) return immediately so genuine defects stay
+    loud. The returned reason never contains credentials: libpq error text
+    names the host, port, user, and database, never the password.
+
+    Args:
+        timeout_seconds: Bounded connect timeout for each attempt.
+
+    Returns:
+        ``None`` when a trivial query succeeds, otherwise a short reason.
+    """
+    deadline = time.monotonic() + POSTGRES_VERIFY_DEADLINE_SECONDS
+    last_detail = "PostgreSQL verification never ran"
+    while True:
+        try:
+            config = load_database_config()
+        except (OSError, ValueError) as exc:
+            return f"database configuration unreadable: {exc}"
+        try:
+            with (
+                psycopg.connect(
+                    config.conninfo(),
+                    connect_timeout=int(timeout_seconds),
+                    row_factory=tuple_row,
+                ) as conn,
+                conn.cursor() as cursor,
+            ):
+                cursor.execute("SELECT 1")
+                if cursor.fetchone() is not None:
+                    return None
+                return "PostgreSQL answered but returned no row"
+        except psycopg.Error as exc:
+            last_detail = f"{type(exc).__name__} (sqlstate {exc.sqlstate}): {exc}"
+            if not _is_transient_postgres_state(exc.sqlstate):
+                return last_detail
+        except OSError as exc:
+            last_detail = f"{type(exc).__name__}: {exc}"
+        if time.monotonic() >= deadline:
+            return last_detail
+        LOGGER.debug("PostgreSQL verification retrying: %s", last_detail)
+        time.sleep(POSTGRES_VERIFY_RETRY_INTERVAL_SECONDS)
+
+
 # ---------------------------------------------------------------------------
 # Worker start and stop
 # ---------------------------------------------------------------------------
@@ -2138,8 +2209,12 @@ def _verify_replacement(new_meta: WorkerMeta, options: DeployOptions) -> bool:
         _err("replacement worker did not stay alive")
         stop_worker(new_meta, options.stop_grace_seconds)
         return False
-    if not check_postgres(options.postgres_timeout_seconds):
-        _err("replacement worker cannot reach PostgreSQL; leaving the current worker untouched")
+    detail = await_postgres(options.postgres_timeout_seconds)
+    if detail is not None:
+        _err(
+            "replacement worker cannot reach PostgreSQL "
+            f"({detail}); leaving the current worker untouched"
+        )
         stop_worker(new_meta, options.stop_grace_seconds)
         return False
     return True

@@ -6,12 +6,14 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import cast
+from typing import Final, Self, cast
 
+import psycopg
 import pytest
 
 from lubko import deployctl as dc
 from lubko import lifecycle
+from lubko.config import DatabaseConfig
 from lubko.lifecycle import (
     DeployAbortedError,
     DeployOptions,
@@ -457,3 +459,286 @@ def test_bootstrap_refuses_untrustworthy_maintained_metadata(
 
     assert prepared == []
     assert path.read_text() == contents
+
+
+class _FakeCursor:
+    """Recorded cursor returning one scripted row."""
+
+    def __init__(self, row: tuple[int] | None) -> None:
+        """Remember the row to return.
+
+        Args:
+            row: The single row ``fetchone`` reports.
+        """
+        self._row = row
+
+    def __enter__(self) -> Self:
+        """Return this cursor for the context manager.
+
+        Returns:
+            This cursor.
+        """
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        """Close the cursor without effect."""
+        del self
+
+    def execute(self, _statement: object) -> None:
+        """Accept one statement without effect.
+
+        Args:
+            _statement: The ignored statement.
+        """
+        del self
+
+    def fetchone(self) -> tuple[int] | None:
+        """Report the scripted row.
+
+        Returns:
+            The scripted row.
+        """
+        return self._row
+
+
+class _FakeConnection:
+    """Context-managed connection serving one scripted cursor."""
+
+    def __init__(self, row: tuple[int] | None) -> None:
+        """Remember the row the cursor reports.
+
+        Args:
+            row: The single row ``fetchone`` reports.
+        """
+        self._cursor = _FakeCursor(row)
+
+    def __enter__(self) -> Self:
+        """Return this connection for the context manager.
+
+        Returns:
+            This connection.
+        """
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        """Close the connection without effect."""
+        del self
+
+    def cursor(self) -> _FakeCursor:
+        """Serve the scripted cursor.
+
+        Returns:
+            The scripted cursor.
+        """
+        return self._cursor
+
+
+_DUMMY_VALUE: Final = "dummy-value"
+
+
+def _database_config() -> DatabaseConfig:
+    """Build an offline database configuration for verification tests.
+
+    Returns:
+        A syntactically valid configuration that is never dialed.
+    """
+    return DatabaseConfig(host="host", port=5432, dbname="db", user="user", password=_DUMMY_VALUE)
+
+
+def _refused() -> psycopg.OperationalError:
+    """Build a connection-refused error without a SQLSTATE.
+
+    Returns:
+        An error shaped like a refused TCP connection.
+    """
+    return psycopg.OperationalError("connection to server failed: Connection refused")
+
+
+def _reset() -> psycopg.OperationalError:
+    """Build a connection-reset error with a class-08 SQLSTATE.
+
+    Returns:
+        An error shaped like a reset transport connection.
+    """
+    error = psycopg.OperationalError("connection reset by peer")
+    error.sqlstate = "08006"
+    return error
+
+
+def _auth_rejected() -> psycopg.OperationalError:
+    """Build an authentication error with a deterministic SQLSTATE.
+
+    Returns:
+        An error shaped like a rejected password.
+    """
+    error = psycopg.OperationalError("password authentication failed")
+    error.sqlstate = "28P01"
+    return error
+
+
+def test_await_postgres_succeeds_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reachable server verifies without sleeping."""
+    clock = FakeClock(step=1.0)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    monkeypatch.setattr(lifecycle, "load_database_config", _database_config)
+    calls: list[dict[str, object]] = []
+
+    def connect(*args: object, **kwargs: object) -> _FakeConnection:
+        """Serve one successful connection.
+
+        Returns:
+            A connection reporting one row.
+        """
+        del args
+        calls.append(kwargs)
+        return _FakeConnection((1,))
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+
+    assert lifecycle.await_postgres(5.0) is None
+    assert len(calls) == 1
+    assert clock.now <= 0.0
+
+
+def test_await_postgres_rides_out_transient_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refused then reset connections still verify once the server answers."""
+    clock = FakeClock(step=1.0)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    monkeypatch.setattr(lifecycle, "load_database_config", _database_config)
+    outcomes: list[object] = [_refused(), _reset(), _FakeConnection((1,))]
+
+    def connect(*args: object, **kwargs: object) -> _FakeConnection:
+        """Replay one scripted outcome per attempt.
+
+        Returns:
+            The next scripted connection.
+
+        Raises:
+            AssertionError: When the scripted outcome has an unknown shape.
+        """
+        del args, kwargs
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, _FakeConnection):
+            return outcome
+        if isinstance(outcome, psycopg.OperationalError):
+            raise outcome
+        raise AssertionError
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+
+    assert lifecycle.await_postgres(5.0) is None
+    assert outcomes == []
+    assert clock.now >= 2.0
+
+
+def test_await_postgres_fails_fast_on_rejected_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deterministic authentication error never retries."""
+    clock = FakeClock(step=1000.0)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    monkeypatch.setattr(lifecycle, "load_database_config", _database_config)
+    calls = 0
+
+    def connect(*args: object, **kwargs: object) -> _FakeConnection:
+        """Reject the password on every attempt.
+
+        Raises:
+            _auth_rejected: The rejected password.
+        """
+        del args, kwargs
+        nonlocal calls
+        calls += 1
+        raise _auth_rejected()
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+
+    detail = lifecycle.await_postgres(5.0)
+    assert detail is not None
+    assert "28P01" in detail
+    assert calls == 1
+    assert clock.now <= 0.0
+
+
+def test_await_postgres_reports_persistent_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A never-answering server yields its last reason at the deadline."""
+    clock = FakeClock(step=1000.0)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    monkeypatch.setattr(lifecycle, "load_database_config", _database_config)
+    calls = 0
+
+    def connect(*args: object, **kwargs: object) -> _FakeConnection:
+        """Refuse every attempt.
+
+        Raises:
+            _refused: The refused connection.
+        """
+        del args, kwargs
+        nonlocal calls
+        calls += 1
+        raise _refused()
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+
+    detail = lifecycle.await_postgres(5.0)
+    assert detail is not None
+    assert "Connection refused" in detail
+    assert calls == 2
+    assert clock.now >= lifecycle.POSTGRES_VERIFY_DEADLINE_SECONDS
+
+
+def test_await_postgres_reports_unreadable_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing configuration file fails without dialing."""
+    clock = FakeClock(step=1000.0)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+
+    def missing() -> DatabaseConfig:
+        """Pretend the configuration file is absent.
+
+        Raises:
+            FileNotFoundError: The absent configuration file.
+        """
+        raise FileNotFoundError
+
+    monkeypatch.setattr(lifecycle, "load_database_config", missing)
+
+    def connect(*args: object, **kwargs: object) -> _FakeConnection:
+        """Fail the test when dialing despite no configuration.
+
+        Raises:
+            AssertionError: Dialing without configuration.
+        """
+        del args, kwargs
+        raise AssertionError
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+
+    detail = lifecycle.await_postgres(5.0)
+    assert detail is not None
+    assert "unreadable" in detail
+    assert clock.now <= 0.0
+
+
+@pytest.mark.parametrize("sqlstate", [None, "08000", "08006", "08P01"])
+def test_transient_postgres_states_retry(sqlstate: object) -> None:
+    """Connection-exception states qualify for verification retries."""
+    assert lifecycle._is_transient_postgres_state(sqlstate) is True
+
+
+@pytest.mark.parametrize("sqlstate", ["", "28P01", "3D000", "42602", 123])
+def test_deterministic_postgres_states_fail_fast(sqlstate: object) -> None:
+    """Definitive failures never qualify for verification retries."""
+    assert lifecycle._is_transient_postgres_state(sqlstate) is False
