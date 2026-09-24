@@ -509,7 +509,7 @@ class BoardClient:
         Returns:
             The committed issue.
         """
-        return self._update_issue(number, lambda issue: {**issue, "state": "closed"})
+        return self._set_state(number, "closed")
 
     def reopen(self, number: int) -> BoardIssue:
         """Reopen one issue.
@@ -520,7 +520,15 @@ class BoardClient:
         Returns:
             The committed issue.
         """
-        return self._update_issue(number, lambda issue: {**issue, "state": "open"})
+        return self._set_state(number, "open")
+
+    def _set_state(self, number: int, state: IssueState) -> BoardIssue:
+        def update(issue: BoardIssue) -> BoardIssue:
+            changed = copy.deepcopy(issue)
+            changed["state"] = state
+            return changed
+
+        return self._update_issue(number, update)
 
     def _require_issue(self, board: Board, number: int) -> BoardIssue:
         for issue in board["issues"]:
