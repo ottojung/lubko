@@ -29,6 +29,20 @@ tasks as described in `docs/`. The `lubko-agent` command manages AI agent
 sessions end to end: start them, prompt them, read their logs, wait for
 completion, stop or clean them up.
 
+`lubko-board` is the thin client for the shared Borys issue/message board.
+Reads are public; mutating commands use the write capability from
+`LUBKO_BOARD_CAPABILITY`. The default Skrynia endpoint is
+`https://vau.place/_skrynia` and can be overridden with `LUBKO_BOARD_URL`.
+Comments use `--author` or `LUBKO_BOARD_AUTHOR`.
+
+```sh
+lubko-board list --state open
+lubko-board show 42
+lubko-board create "Investigate worker recovery"
+lubko-board comment --author agent-a 42 "I reproduced the failure"
+lubko-board close 42
+```
+
 ## Development
 
 Lubko requires CPython 3.12 or later and pins a single `uv` version; see
