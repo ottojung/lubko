@@ -9,18 +9,32 @@ the requested commit merely by rewriting state first.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from lubko import supervise
+from lubko import lifecycle_authority, supervise, supervisor
 from lubko.supervisor import Settings, SupervisorDaemon
+from tests._fake_authority_db import claim_every_daemon, seed_db_worker
 
 if TYPE_CHECKING:
+    import subprocess
     from pathlib import Path
 
 OLD = "1" * 40
 NEW = "2" * 40
+_DB_CLAIM_SERVER = "srv-apply-desired-test"
+
+
+@pytest.fixture(autouse=True)
+def _db_fencing_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Establish a fake-database fencing claim on every daemon under test.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action.
+    """
+    claim_every_daemon(monkeypatch, supervisor, _DB_CLAIM_SERVER)
 
 
 def child(pid: int) -> supervise.WorkerChild:
@@ -76,6 +90,41 @@ def live_old_worker() -> None:
     )
 
 
+def publish_live_old_worker(monkeypatch: pytest.MonkeyPatch, daemon: SupervisorDaemon) -> None:
+    """Publish the canonical DB record and live direct-child view for the worker.
+
+    Same-commit settlement keeps the worker only when the canonical row's
+    WorkerRecord names the exact live direct child.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        daemon: The daemon under test.
+    """
+    seed_db_worker(
+        daemon,
+        lifecycle_authority.WorkerRecord(
+            token=f"token-{4242}",
+            commit=OLD,
+            pid=4242,
+            pgid=4242,
+            sid=4242,
+            start_time_ticks=4242,
+            worker_id="w",
+        ),
+    )
+    daemon._active_child = supervise.WorkerChild(
+        pid=4242,
+        pgid=4242,
+        sid=4242,
+        start_time_ticks=4242,
+        token=f"token-{4242}",
+        worker_id="w",
+        spawned_at=0.0,
+    )
+    daemon.proc = cast("subprocess.Popen[bytes]", SimpleNamespace(pid=4242, poll=lambda: None))
+    monkeypatch.setattr(supervisor, "proc_start_ticks", lambda pid: 4242 if pid == 4242 else None)
+
+
 @pytest.mark.usefixtures("supervisor_token")
 def test_failed_retirement_holds_authority_and_spawns_nothing(
     daemon: tuple[SupervisorDaemon, list[str]],
@@ -128,6 +177,7 @@ def test_same_commit_non_restart_settlement_keeps_live_worker(
     """A same-commit non-restart intent settles without retiring or spawning."""
     dc, spawns = daemon
     live_old_worker()
+    publish_live_old_worker(monkeypatch, dc)
     retire_calls: list[bool] = []
     monkeypatch.setattr(type(dc), "_child_alive", staticmethod(lambda _state: True))
 

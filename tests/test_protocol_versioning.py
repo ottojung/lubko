@@ -1,7 +1,6 @@
 """Current application protocol-version invariants."""
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
@@ -138,12 +137,12 @@ def test_worker_reaper_leaves_future_versions_for_newer_binaries(
     fail_unsupported_job.assert_not_called()
 
 
-def test_chunk_emission_preserves_root_version(tmp_path: Path) -> None:
+def test_chunk_emission_preserves_root_version() -> None:
     """Every emitted chunk carries the current root command version."""
     content = b"x" * (OUTPUT_CHUNK_MAX_BYTES + OUTPUT_TAIL_MAX_BYTES + 200)
-    path = tmp_path / "stdout"
-    path.write_bytes(content)
-    stream = OutputStream(path=path, spool_start=0, archived_upto=0, last_chunk=None, sequence=0)
+    stream = OutputStream(
+        data=bytearray(content), spool_start=0, archived_upto=0, last_chunk=None, sequence=0
+    )
     chunks, _archived, _last, _seq = worker._plan_chunks(
         UUID(int=1), "stdout", stream, len(content), "server", version=4
     )

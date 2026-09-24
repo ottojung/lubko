@@ -863,7 +863,10 @@ def launcher_source(entry: str) -> str:
 def install_launchers(bin_dir: Path) -> None:
     """Write every stable launcher into a bin directory.
 
-    Each launcher is written atomically and never changed by deployments.
+    Each launcher is written atomically and never changed by deployments. A
+    launcher whose installed bytes and executable mode already match the
+    generated source is left untouched, so reinstalling an already-valid
+    deployment performs no persistent-filesystem writes at all.
 
     Args:
         bin_dir: Directory to install the launchers into.
@@ -871,10 +874,34 @@ def install_launchers(bin_dir: Path) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)
     for entry in ENTRY_POINTS:
         target = bin_dir / entry
+        expected = launcher_source(entry)
+        if _launcher_current(target, expected):
+            continue
         temporary = bin_dir / f"{entry}.tmp"
-        temporary.write_text(launcher_source(entry), encoding="utf-8")
+        temporary.write_text(expected, encoding="utf-8")
         temporary.chmod(0o755)
         temporary.replace(target)
+
+
+def _launcher_current(target: Path, expected: str) -> bool:
+    """Return whether an installed launcher already matches the source.
+
+    Args:
+        target: Installed launcher path.
+        expected: Generated launcher source.
+
+    Returns:
+        ``True`` only when the launcher exists as a regular file, is
+        executable, and carries exactly the expected bytes. Reads only.
+    """
+    try:
+        if target.is_symlink() or not target.is_file():
+            return False
+        if not os.access(target, os.X_OK):
+            return False
+        return target.read_text(encoding="utf-8") == expected
+    except OSError:
+        return False
 
 
 def git_commit(repo: Path, timeout_seconds: float) -> str | None:

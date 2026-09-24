@@ -126,6 +126,41 @@ else
   fail "lubko-deploy startup-contract"
 fi
 
+# The supervisor is database-authoritative and fail-closed: with no
+# reachable PostgreSQL it holds without writing the pidfile. The official
+# termux-docker environment cannot reliably host a PostgreSQL server itself
+# (its Android shared-memory emulation is intentionally incomplete), so this
+# acceptance connects to the external PostgreSQL service supplied by the
+# GitHub Actions runner. That matches Lubko's production architecture: the
+# transport is external infrastructure, not a service Termux must host.
+printf '%s\n' '  external acceptance PostgreSQL transport reachable'
+if REPO="$REPO" uv run --project "$REPO" python - <<'PY'
+import os
+from pathlib import Path
+
+import psycopg
+
+schema = (Path(os.environ["REPO"]) / "migrations" / "0001_two_column_protocol.sql").read_text(
+    encoding="utf-8"
+)
+with psycopg.connect(
+    host="127.0.0.1",
+    port=5432,
+    dbname="lubko",
+    user="lubko",
+    password="lubko",
+    connect_timeout=5,
+) as connection:
+    with connection.cursor() as cursor:
+        cursor.execute(schema)
+print("acceptance PostgreSQL transport ready")
+PY
+then
+  pass "acceptance PostgreSQL transport ready"
+else
+  fail "acceptance PostgreSQL transport setup failed"
+fi
+
 # A minimal tini-static shim so the installed lubko-startup launcher can
 # execute its canonical `exec tini-static -- lubko-supervisor` chain.
 TINI_DIR="${HOME}/.lubko-acceptance-tini"
@@ -144,10 +179,16 @@ printf '%s\n' '  valid token: lubko-startup crosses startup boundary'
 VALID_TOKEN="aabbccddee00112233445566778899aabbccddee00112233445566778899aabb"
 export LUBKO_SUPERVISOR_STATE_TOKEN="${VALID_TOKEN}"
 lubko-startup &
-# Wait up to 8 seconds for pidfile to appear as readiness proof.
+STARTUP_PID=$!
+# Wait up to 8 seconds for pidfile to appear as readiness proof. Stop
+# early if the startup job itself exits (fail-closed), so a missing
+# database can never wedge this wait past one extra poll.
 WAIT=0
 while [ "$WAIT" -lt 8 ]; do
   if [ -f "${STATE_ROOT}/supervisor/supervisor.pid" ]; then
+    break
+  fi
+  if ! kill -0 "$STARTUP_PID" 2>/dev/null; then
     break
   fi
   sleep 1
@@ -155,7 +196,9 @@ while [ "$WAIT" -lt 8 ]; do
 done
 PIDFILE="${STATE_ROOT}/supervisor/supervisor.pid"
 STATUSFILE="${STATE_ROOT}/supervisor/status.json"
+PIDFILE_OK=1
 if [ ! -f "$PIDFILE" ]; then
+  PIDFILE_OK=0
   fail "supervisor pidfile not created within 8 s"
 else
   pass "supervisor pidfile created"
@@ -165,27 +208,47 @@ if [ ! -f "$STATUSFILE" ]; then
 else
   pass "supervisor status.json created"
 fi
-# Clean shutdown: read the supervisor-recorded PID from the pidfile and
-# SIGTERM that process, then remove the supervisor state tree.
-SVPID=$(sed -n 's/.*"pid": \([0-9]*\).*/\1/p' "$PIDFILE" 2>/dev/null) || true
-if [ -n "$SVPID" ]; then
+# Bounded fail-loud teardown: SIGTERM the supervisor-recorded PID (when
+# the pidfile exists) and the startup job itself, wait at most 5 s, then
+# SIGKILL survivors. A missing pidfile stays a failure: it must never be
+# reported as a clean exit, and the startup job must not outlive this block.
+SVPID=$(sed -n 's/.*"pid": \([0-9]*\).*/\1/p' "$PIDFILE" 2>/dev/null || true)
+if [ -n "${SVPID:-}" ]; then
   kill -TERM "$SVPID" 2>/dev/null || true
 fi
+kill -TERM "$STARTUP_PID" 2>/dev/null || true
 WAIT=0
 while [ "$WAIT" -lt 5 ]; do
-  if [ -n "$SVPID" ] && ! kill -0 "$SVPID" 2>/dev/null; then
+  ALIVE=0
+  if [ -n "${SVPID:-}" ] && kill -0 "$SVPID" 2>/dev/null; then
+    ALIVE=1
+  fi
+  if kill -0 "$STARTUP_PID" 2>/dev/null; then
+    ALIVE=1
+  fi
+  if [ "$ALIVE" -eq 0 ]; then
     break
   fi
   sleep 1
   WAIT=$((WAIT + 1))
 done
-if [ -n "$SVPID" ] && kill -0 "$SVPID" 2>/dev/null; then
+if [ -n "${SVPID:-}" ] && kill -0 "$SVPID" 2>/dev/null; then
   kill -KILL "$SVPID" 2>/dev/null || true
-  wait 2>/dev/null || true
   fail "supervisor did not exit within 5 s of SIGTERM"
+fi
+if kill -0 "$STARTUP_PID" 2>/dev/null; then
+  kill -KILL "$STARTUP_PID" 2>/dev/null || true
+  wait "$STARTUP_PID" 2>/dev/null || true
+  fail "startup job did not exit within 5 s of SIGTERM"
 else
-  wait 2>/dev/null || true
-  pass "supervisor exited cleanly after SIGTERM"
+  wait "$STARTUP_PID" 2>/dev/null || true
+  if [ "$PIDFILE_OK" -eq 1 ]; then
+    if [ -n "${SVPID:-}" ] && kill -0 "$SVPID" 2>/dev/null; then
+      :
+    else
+      pass "supervisor exited cleanly after SIGTERM"
+    fi
+  fi
 fi
 rm -rf "${STATE_ROOT}/supervisor"
 unset LUBKO_SUPERVISOR_STATE_TOKEN

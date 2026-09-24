@@ -82,7 +82,7 @@ def _make_job(tmp_path: Path, job_id: uuid.UUID) -> ActiveJob:
     """Build a structurally complete registry entry without spawning a process.
 
     Args:
-        tmp_path: Test scratch directory for the capture spool files.
+        tmp_path: Test scratch directory for the job working directory.
         job_id: Unique job identifier.
 
     Returns:
@@ -103,8 +103,8 @@ def _make_job(tmp_path: Path, job_id: uuid.UUID) -> ActiveJob:
     job.started_mono = 0.0
     job.claimed_at = 0.0
     job.version = 1
-    job.stdout = OutputStream(tmp_path / f"out-{job_id}")
-    job.stderr = OutputStream(tmp_path / f"err-{job_id}")
+    job.stdout = OutputStream(data=bytearray(b"out"))
+    job.stderr = OutputStream(data=bytearray(b"err"))
     job.completed = True
     job.term_sent = True
     return job
@@ -125,11 +125,11 @@ def _build_supervisor(_tmp_path: Path) -> Supervisor:
 
 
 def _seed_jobs(supervisor: Supervisor, tmp_path: Path, *, count: int) -> list[ActiveJob]:
-    """Seed ``count`` completed active jobs with on-disk capture spools.
+    """Seed ``count`` completed active jobs with in-memory capture buffers.
 
     Args:
         supervisor: The supervisor whose registry is populated.
-        tmp_path: Test scratch directory for the spool files.
+        tmp_path: Test scratch directory for the job working directories.
         count: Number of jobs to seed.
 
     Returns:
@@ -138,8 +138,6 @@ def _seed_jobs(supervisor: Supervisor, tmp_path: Path, *, count: int) -> list[Ac
     jobs: list[ActiveJob] = []
     for _ in range(count):
         job = _make_job(tmp_path, uuid.uuid4())
-        job.stdout.path.touch()
-        job.stderr.path.touch()
         supervisor.active[job.id] = job
         jobs.append(job)
     return jobs
@@ -177,8 +175,8 @@ def test_shutdown_finalizes_locally_when_db_deadline_breaches(
     supervisor._shutdown()
 
     # Local convergence + cleanup completed despite the remote failure.
-    assert not jobs[0].stdout.path.exists(), "local capture spool was not cleaned"
-    assert not jobs[1].stdout.path.exists(), "local capture spool was not cleaned"
+    assert jobs[0].stdout.data == b"", "local capture buffer was not cleaned"
+    assert jobs[1].stdout.data == b"", "local capture buffer was not cleaned"
     # The connection was discarded: no second remote attempt on a dead handle.
     assert calls == [jobs[0].id], "remote finalization was retried on a dead connection"
     assert supervisor.conn is None, "the failed connection was not discarded"
@@ -215,7 +213,7 @@ def test_shutdown_finalizes_locally_when_db_connectivity_lost(
     assert supervisor.conn is None, "the failed connection was not discarded"
     assert jobs[0].id in supervisor.active, "first job row was not retained as recoverable"
     assert jobs[1].id in supervisor.active, "second job row was not retained as recoverable"
-    assert not jobs[0].stdout.path.exists(), "local capture spool was not cleaned"
+    assert not jobs[0].stdout.data, "local capture buffer was not cleaned"
     assert worker_mod.drain_sentinel_path(INCARNATION).exists(), "clean-drain sentinel missing"
     health = read_worker_health_by_incarnation(INCARNATION)
     assert health is not None
@@ -276,7 +274,7 @@ def test_shutdown_succeeds_and_publishes_final_health(
     supervisor._shutdown()
 
     assert jobs[0].id not in supervisor.active, "successful job was not finalized"
-    assert not jobs[0].stdout.path.exists(), "local capture spool was not cleaned"
+    assert not jobs[0].stdout.data, "local capture buffer was not cleaned"
     assert worker_mod.drain_sentinel_path(INCARNATION).exists(), "clean-drain sentinel missing"
     assert supervisor.conn is None
     health = read_worker_health_by_incarnation(INCARNATION)

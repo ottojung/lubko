@@ -14,6 +14,7 @@ import pytest
 from lubko import cli, lifecycle, supervise, supervisor
 from lubko.durable import DurabilityError
 from lubko.lifecycle import DeployOptions, ProcessIdentity
+from tests._fake_authority_db import claim_every_daemon
 
 COMMIT = "c" * 40
 PID = 4242
@@ -21,6 +22,17 @@ TOKEN = "a" * 64
 PRIVATE = ProcessIdentity(pid=PID, pgid=PID, sid=PID, start_time_ticks=555)
 NON_PRIVATE = ProcessIdentity(pid=PID, pgid=1, sid=9000, start_time_ticks=555)
 PIN_BASE = 20000
+_DB_CLAIM_SERVER = "srv-recover-unproven-test"
+
+
+@pytest.fixture(autouse=True)
+def _db_fencing_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Establish a fake-database fencing claim on every daemon under test.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action.
+    """
+    claim_every_daemon(monkeypatch, supervisor, _DB_CLAIM_SERVER)
 
 
 @pytest.mark.usefixtures("supervisor_token")

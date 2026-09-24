@@ -271,8 +271,8 @@ def make_active_job(tmp_path: Path, *, heartbeat_at: float) -> ActiveJob:
     job.pgid = os.getpid()
     job.started_mono = 0.0
     job.claimed_at = 0.0
-    job.stdout = worker.OutputStream(tmp_path / "out")
-    job.stderr = worker.OutputStream(tmp_path / "err")
+    job.stdout = worker.OutputStream()
+    job.stderr = worker.OutputStream()
     job.completed = False
     job.term_sent = False
     job.last_heartbeat_at = heartbeat_at
@@ -362,10 +362,6 @@ def test_run_converges_to_outage_and_lease_enforcement_on_deadline_breach(
         DatabaseConfig(host="h", port=1, dbname="d", user="u", password=str(uuid4())),
     )
     job = make_active_job(tmp_path, heartbeat_at=time.monotonic() - settings.lease_duration_seconds)
-    # The turn under test must reach the database phase: give both capture
-    # spools their expected on-disk state so no earlier fail-closed path fires.
-    job.stdout.path.touch()
-    job.stderr.path.touch()
     supervisor.active[job.id] = job
     monkeypatch.setattr(supervisor, "_service_processes", lambda: None)
 

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import math
 import os
 import resource
@@ -65,6 +66,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
 SCHEMA_VERSION: Final = 1
+
+LOGGER: Final = logging.getLogger("lubko.supervise")
 
 BOOT_ID_PATH: Final = Path("/proc/sys/kernel/random/boot_id")
 
@@ -634,6 +637,15 @@ class SupervisorStatus:
     #: supervisor daemon.  Used as a stability marker for cross-daemon
     #: durable state transitions.
     supervisor_runtime_contract_version: int | None = None
+    #: Wall-clock time the snapshot was published. ``0.0`` means the writer
+    #: predates publication timestamps (unknown age; accepted on identity
+    #: match for backward compatibility).
+    published_at: float = 0.0
+    #: In-memory count of observation-only diagnostic writes the publishing
+    #: daemon had dropped due to exhausted persistent-storage capacity at
+    #: publication time. Lets readers distinguish a fresh snapshot from one
+    #: published across a capacity outage.
+    diagnostic_drops: int = 0
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the status for the CLIs and operators.
@@ -667,6 +679,8 @@ class SupervisorStatus:
             "holding": self.holding,
             "supervisor_runtime_commit": self.supervisor_runtime_commit,
             "supervisor_runtime_contract_version": self.supervisor_runtime_contract_version,
+            "published_at": self.published_at,
+            "diagnostic_drops": self.diagnostic_drops,
         }
 
     @classmethod
@@ -748,6 +762,8 @@ class SupervisorStatus:
             supervisor_runtime_contract_version=_parse_diagnostic_nullable_int(
                 data, "supervisor_runtime_contract_version"
             ),
+            published_at=_parse_diagnostic_float(data, "published_at"),
+            diagnostic_drops=_parse_diagnostic_non_negative_int(data, "diagnostic_drops"),
         )
 
 
@@ -1745,7 +1761,14 @@ def write_status(status: SupervisorStatus) -> None:
     _write_json(status_path(), status.to_dict())
 
 
-def read_status() -> SupervisorStatus | None:
+#: Maximum age (seconds) of a timestamped status snapshot before readers
+#: treat it as stale. Snapshots that predate publication timestamps
+#: (``published_at <= 0``) carry unknown age and are accepted on identity
+#: match for backward compatibility.
+STATUS_MAX_AGE_SECONDS: Final = 30.0
+
+
+def read_status(max_age_seconds: float = STATUS_MAX_AGE_SECONDS) -> SupervisorStatus | None:
     """Load the machine-readable status.
 
     The status is only returned when its persisted identity matches the current
@@ -1755,22 +1778,31 @@ def read_status() -> SupervisorStatus | None:
     prevents stale, dead, replaced, or PID-reused snapshots from ever
     appearing ready.
 
+    Timestamped snapshots additionally expire: when ``published_at`` is
+    positive and older than ``max_age_seconds`` (for example because
+    observation writes were dropped during a capacity outage), ``None`` is
+    returned so readers honestly report unavailable rather than stale data.
+
+    Args:
+        max_age_seconds: Maximum accepted age of a timestamped snapshot.
+
     Returns:
-        The parsed status, or ``None`` when absent, malformed, or stale.
+        The parsed status, or ``None`` when absent, malformed, stale, or
+        expired.
     """
     data = _read_json(status_path())
-    if data is None:
-        return None
-    try:
-        status = SupervisorStatus.from_dict(data)
-    except (KeyError, TypeError, ValueError):
-        return None
-    if status.schema_version != SCHEMA_VERSION:
-        return None
-    if status.supervisor_pid == 0:
-        return None
-    if not _status_identity_matches(status):
-        return None
+    status: SupervisorStatus | None = None
+    if data is not None:
+        with suppress(KeyError, TypeError, ValueError):
+            parsed = SupervisorStatus.from_dict(data)
+            if parsed.schema_version == SCHEMA_VERSION and parsed.supervisor_pid != 0:
+                status = parsed
+    if status is not None and not _status_identity_matches(status):
+        status = None
+    if status is not None and status.published_at > 0:
+        age = time.time() - status.published_at
+        if age < 0 or age > max_age_seconds:
+            status = None
     return status
 
 
@@ -1828,25 +1860,36 @@ def _status_identity_matches(status: SupervisorStatus) -> bool:
 
 
 def write_supervisor_pid(pid: int, start_time_ticks: int) -> None:
-    """Crash-durably persist the daemon's exact identity for detection by the CLIs.
+    """Refresh the daemon identity cache without allocating on failure.
 
-    The identity file is recovery authority: it is the exact live supervisor
-    incarnation that every status/health reader binds against, so the write
-    must be confirmed durable.
+    The identity file is a read-through cache, never authority: crash-durable
+    lifecycle authority lives in the database row (see
+    :mod:`lubko.lifecycle_authority`), and readers use a cache entry only
+    when it matches a freshly read row. The cache write is therefore attempted
+    best-effort and any local failure is ignored entirely — no ``fsync``, no
+    error propagation — so an already-deployed restart never needs a new
+    persistent-filesystem block for it. A torn or stale cache fails closed by
+    construction because the row always wins.
 
     Args:
         pid: The daemon's process ID.
         start_time_ticks: The daemon's start time in clock ticks.
-
-    Note:
-        Fails closed: the write raises :class:`DurabilityError` from
-        :func:`lubko.durable.write_json_durable` when it cannot be confirmed
-        durable.
     """
-    write_json_durable(
-        supervisor_pid_path(),
-        {"schema_version": SCHEMA_VERSION, "pid": pid, "start_time_ticks": start_time_ticks},
+    path = supervisor_pid_path()
+    payload = (
+        json.dumps(
+            {"schema_version": SCHEMA_VERSION, "pid": pid, "start_time_ticks": start_time_ticks},
+            sort_keys=True,
+        )
+        + "\n"
     )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        LOGGER.debug("supervisor identity cache write dropped", exc_info=True)
 
 
 class MalformedSupervisorIdentityError(ValueError):
@@ -1855,6 +1898,11 @@ class MalformedSupervisorIdentityError(ValueError):
 
 def read_supervisor_pid() -> tuple[int, int] | None:
     """Load the recorded daemon identity without normalizing malformed authority.
+
+    The identity file is a cache, never authority: callers making lifecycle
+    decisions must validate any entry against a fresh database row read (see
+    :mod:`lubko.lifecycle_authority`) and let the row win on disagreement. A
+    torn cache therefore fails here instead of authorizing anything.
 
     Returns:
         The ``(pid, start_time_ticks)`` pair, or ``None`` when the identity
@@ -1926,13 +1974,22 @@ def restore_supervisor_pid(pid: int, start_time_ticks: int) -> None:
     """Restore a previously retired supervisor pidfile.
 
     Called by A when the TRANSFER write fails: the exact identity that was
-    removed is written back so A remains discoverable by CLIs.
+    removed is written back so A remains discoverable by CLIs. The handoff
+    protocol runs as an explicit deployment transition with free-space
+    preconditions, so the restoration stays a confirmed durable write.
 
     Args:
         pid: The daemon's process ID.
         start_time_ticks: The daemon's start time in clock ticks.
+
+    Note:
+        Fails closed: the write raises :class:`DurabilityError` when it
+        cannot be confirmed durable.
     """
-    write_supervisor_pid(pid, start_time_ticks)
+    write_json_durable(
+        supervisor_pid_path(),
+        {"schema_version": SCHEMA_VERSION, "pid": pid, "start_time_ticks": start_time_ticks},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2567,6 +2624,32 @@ def supervisor_running() -> bool:
     return "lubko-supervisor" in _read_cmdline(pid) or "lubko.supervisor" in _read_cmdline(pid)
 
 
+def supervisor_owner_live(pid: int, ticks: int) -> bool:
+    """Return whether an authority-row owner identity is a live supervisor.
+
+    Read-only kernel evidence with the same standard as
+    :func:`supervisor_running` but for an explicit identity rather than the
+    local cache: exact ``{pid, start-time-ticks}`` match against a live
+    non-zombie process whose command line names the supervisor. A missing
+    row owner, an epoch mismatch, or a failed proof never reads as live.
+
+    Args:
+        pid: Owner process ID from the authority row.
+        ticks: Owner start time in clock ticks from the authority row.
+
+    Returns:
+        ``True`` only for a live supervisor process with the exact identity.
+    """
+    if pid <= 0 or ticks == 0:
+        return False
+    if _process_is_zombie(pid):
+        return False
+    if proc_start_ticks(pid) != ticks:
+        return False
+    cmdline = _read_cmdline(pid)
+    return "lubko-supervisor" in cmdline or "lubko.supervisor" in cmdline
+
+
 # ---------------------------------------------------------------------------
 # Optional value coercion
 # ---------------------------------------------------------------------------
@@ -2872,6 +2955,33 @@ def _parse_diagnostic_nullable_float(data: dict[str, object], key: str) -> float
     """
     if key not in data or data[key] is None:
         return None
+    raw = data[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        msg = "supervisor diagnostic is malformed"
+        raise TypeError(msg)
+    value = _strict_finite_float(raw)
+    if value is None:
+        msg = "supervisor diagnostic is malformed"
+        raise ValueError(msg)
+    return value
+
+
+def _parse_diagnostic_float(data: dict[str, object], key: str) -> float:
+    """Parse a diagnostic timestamp, defaulting only genuine absence to zero.
+
+    Args:
+        data: Decoded diagnostic mapping.
+        key: Field name.
+
+    Returns:
+        A finite float, or ``0.0`` for absence or explicit null (unknown age).
+
+    Raises:
+        TypeError: If a present non-null value is not a JSON number.
+        ValueError: If a present number is non-finite or unrepresentable.
+    """
+    if key not in data or data[key] is None:
+        return 0.0
     raw = data[key]
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         msg = "supervisor diagnostic is malformed"

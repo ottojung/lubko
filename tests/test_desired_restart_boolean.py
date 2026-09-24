@@ -4,17 +4,31 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from lubko import supervise, supervisor
+from lubko import lifecycle_authority, supervise, supervisor
+from tests._fake_authority_db import claim_every_daemon, seed_db_worker
 
 if TYPE_CHECKING:
+    import subprocess
     from collections.abc import Callable
     from pathlib import Path
 
 COMMIT = "a" * 40
+_DB_CLAIM_SERVER = "srv-desired-restart-test"
+
+
+@pytest.fixture(autouse=True)
+def _db_fencing_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Establish a fake-database fencing claim on every daemon under test.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action.
+    """
+    claim_every_daemon(monkeypatch, supervisor, _DB_CLAIM_SERVER)
 
 
 def intent_payload(**overrides: object) -> dict[str, object]:
@@ -97,6 +111,43 @@ def settled_state(
     return supervise.read_state
 
 
+def _publish_live_worker(
+    monkeypatch: pytest.MonkeyPatch, daemon: supervisor.SupervisorDaemon
+) -> None:
+    """Publish the canonical DB record and live direct-child view for the worker.
+
+    Same-commit settlement keeps the worker only when the canonical row's
+    WorkerRecord names the exact live direct child.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        daemon: The daemon under test.
+    """
+    seed_db_worker(
+        daemon,
+        lifecycle_authority.WorkerRecord(
+            token=f"token-{4242}",
+            commit=COMMIT,
+            pid=4242,
+            pgid=4242,
+            sid=4242,
+            start_time_ticks=99,
+            worker_id="w",
+        ),
+    )
+    daemon._active_child = supervise.WorkerChild(
+        pid=4242,
+        pgid=4242,
+        sid=4242,
+        start_time_ticks=99,
+        token=f"token-{4242}",
+        worker_id="w",
+        spawned_at=1.0,
+    )
+    daemon.proc = cast("subprocess.Popen[bytes]", SimpleNamespace(pid=4242, poll=lambda: None))
+    monkeypatch.setattr(supervisor, "proc_start_ticks", lambda pid: 99 if pid == 4242 else None)
+
+
 @pytest.mark.usefixtures("supervisor_token")
 def test_malformed_restart_is_never_a_settlement(
     settled_state: Callable[[], supervise.SupervisorState],
@@ -146,6 +197,7 @@ def test_same_commit_settlement_advances_without_retirement(
     del settled_state
     _write_intent(intent_payload() if restart is None else intent_payload(restart=restart))
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    _publish_live_worker(monkeypatch, daemon)
     monkeypatch.setattr(daemon, "_child_alive", lambda _state: True)
     monkeypatch.setattr(
         daemon,

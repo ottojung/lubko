@@ -5,6 +5,19 @@ from __future__ import annotations
 import pytest
 
 from lubko import cli, deployctl, lifecycle, supervise, supervisor
+from tests._fake_authority_db import claim_every_daemon
+
+_DB_CLAIM_SERVER = "srv-supervisor-desired-test"
+
+
+@pytest.fixture(autouse=True)
+def _db_fencing_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Establish a fake-database fencing claim on every daemon under test.
+
+    Steady-state decisions require canonical database authority; local
+    caches alone never authorize action.
+    """
+    claim_every_daemon(monkeypatch, supervisor, _DB_CLAIM_SERVER)
 
 
 def _malformed_desired() -> supervise.SupervisorDesired | None:

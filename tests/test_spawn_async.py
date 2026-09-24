@@ -32,7 +32,6 @@ from lubko.worker import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
     from uuid import UUID
 
     import pytest
@@ -101,8 +100,8 @@ def _active_job(job_id: UUID | None = None) -> ActiveJob:
         claimed_at=time.monotonic(),
         version=1,
     )
-    job.stdout = OutputStream(path=MagicMock(), fd=None, eof=True)
-    job.stderr = OutputStream(path=MagicMock(), fd=None, eof=True)
+    job.stdout = OutputStream(fd=None, eof=True)
+    job.stderr = OutputStream(fd=None, eof=True)
     job.last_heartbeat_at = time.monotonic()
     return job
 
@@ -129,8 +128,8 @@ class _BlockingSpawn:
         fake_proc.pid = 99999
         return (
             fake_proc,
-            MagicMock(),
-            MagicMock(),
+            OutputStream(),
+            OutputStream(),
             99999,
             -1,
             -1,
@@ -364,7 +363,6 @@ def test_cleanup_pending_starts_does_not_join_blocked_threads(
 
 def test_activate_gated_job_initializes_capture_streams(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """A successfully activated gated job immediately owns both capture streams."""
     supervisor = _supervisor()
@@ -372,13 +370,13 @@ def test_activate_gated_job_initializes_capture_streams(
     job_id = uuid4()
     proc = MagicMock()
     proc.pid = 12345
-    stdout_path = tmp_path / "stdout"
-    stderr_path = tmp_path / "stderr"
+    stdout = OutputStream()
+    stderr = OutputStream()
     gated = GatedSpawn(
         proc=proc,
         pgid=12345,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
+        stdout=stdout,
+        stderr=stderr,
         gate_fd=99,
         stdout_read_fd=100,
         stderr_read_fd=101,
@@ -398,15 +396,14 @@ def test_activate_gated_job_initializes_capture_streams(
     )
 
     assert job is not None
-    assert job.stdout.path == stdout_path
+    assert job.stdout is stdout
     assert job.stdout.fd == 100
-    assert job.stderr.path == stderr_path
+    assert job.stderr is stderr
     assert job.stderr.fd == 101
 
 
 def test_poll_pending_starts_activates_completed_attempt(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """A completed spawn attempt is activated: identity persisted, gate released."""
     supervisor = _supervisor(_settings(spawn_deadline_seconds=300.0))
@@ -415,8 +412,8 @@ def test_poll_pending_starts_activates_completed_attempt(
     fake_proc.pid = 12345
     spawn_tuple: _SpawnTuple = (
         fake_proc,
-        tmp_path / "stdout",
-        tmp_path / "stderr",
+        OutputStream(),
+        OutputStream(),
         12345,
         99,
         -1,
@@ -478,7 +475,7 @@ def test_repeated_blocked_starts_cannot_grow_threads_without_bound() -> None:
         blocker._gate.wait()
         fake_proc = MagicMock()
         fake_proc.pid = 99999
-        return (fake_proc, MagicMock(), MagicMock(), 99999, -1, -1, -1)
+        return (fake_proc, OutputStream(), OutputStream(), 99999, -1, -1, -1)
 
     pool_threads_before = len(pool._threads)
     max_admitted = lanes + qsize
@@ -519,7 +516,7 @@ def test_spawn_result_from_tuple_roundtrip() -> None:
     """_spawn_result_from_tuple correctly wraps a spawn_job return tuple."""
     fake_proc = MagicMock()
     fake_proc.pid = 42
-    t: _SpawnTuple = (fake_proc, MagicMock(), MagicMock(), 42, 7, 8, 9)
+    t: _SpawnTuple = (fake_proc, OutputStream(), OutputStream(), 42, 7, 8, 9)
     result = _spawn_result_from_tuple(t)
     assert result.proc is fake_proc
     assert result.pgid == 42
@@ -547,8 +544,8 @@ def test_callback_installation_atomic_with_completion() -> None:
         fake_proc.pid = 1
         result = _SpawnResult(
             proc=fake_proc,
-            stdout_path=MagicMock(),
-            stderr_path=MagicMock(),
+            stdout=OutputStream(),
+            stderr=OutputStream(),
             pgid=1,
             gate_fd=-1,
             stdout_read_fd=-1,
@@ -583,8 +580,8 @@ def test_install_callback_already_done_invokes_immediately() -> None:
     future.set_result(
         _SpawnResult(
             proc=fake_proc,
-            stdout_path=MagicMock(),
-            stderr_path=MagicMock(),
+            stdout=OutputStream(),
+            stderr=OutputStream(),
             pgid=1,
             gate_fd=-1,
             stdout_read_fd=-1,
@@ -615,8 +612,8 @@ def test_install_callback_result_reading_callback_does_not_deadlock() -> None:
     fake_proc.pid = 1
     result = _SpawnResult(
         proc=fake_proc,
-        stdout_path=MagicMock(),
-        stderr_path=MagicMock(),
+        stdout=OutputStream(),
+        stderr=OutputStream(),
         pgid=1,
         gate_fd=-1,
         stdout_read_fd=-1,
@@ -653,8 +650,8 @@ def test_set_result_result_reading_callback_does_not_deadlock() -> None:
     fake_proc.pid = 1
     result = _SpawnResult(
         proc=fake_proc,
-        stdout_path=MagicMock(),
-        stderr_path=MagicMock(),
+        stdout=OutputStream(),
+        stderr=OutputStream(),
         pgid=1,
         gate_fd=-1,
         stdout_read_fd=-1,
@@ -690,7 +687,7 @@ def test_timed_out_callable_skipped_without_execution() -> None:
         gate.wait()
         fake_proc = MagicMock()
         fake_proc.pid = 99999
-        return (fake_proc, MagicMock(), MagicMock(), 99999, -1, -1, -1)
+        return (fake_proc, OutputStream(), OutputStream(), 99999, -1, -1, -1)
 
     for _ in range(2):
         pool.submit(uuid4(), lane_spawn, _SpawnFuture(callback=None))
@@ -703,7 +700,7 @@ def test_timed_out_callable_skipped_without_execution() -> None:
         queue_executed.set()
         fake_proc = MagicMock()
         fake_proc.pid = 88888
-        return (fake_proc, MagicMock(), MagicMock(), 88888, -1, -1, -1)
+        return (fake_proc, OutputStream(), OutputStream(), 88888, -1, -1, -1)
 
     timed_out_future = _SpawnFuture(callback=None)
     pool.submit(uuid4(), queue_spawn, timed_out_future)
@@ -826,7 +823,7 @@ def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
         cancelled_ran.set()
         fake_proc = MagicMock()
         fake_proc.pid = 11111
-        return (fake_proc, MagicMock(), MagicMock(), 11111, -1, -1, -1)
+        return (fake_proc, OutputStream(), OutputStream(), 11111, -1, -1, -1)
 
     def sibling_callable() -> _SpawnTuple:
         sibling_ran.set()
@@ -834,7 +831,7 @@ def test_cancel_between_dequeue_and_claim_skips_callable() -> None:
         sibling_done.set()
         fake_proc = MagicMock()
         fake_proc.pid = 22222
-        return (fake_proc, MagicMock(), MagicMock(), 22222, -1, -1, -1)
+        return (fake_proc, OutputStream(), OutputStream(), 22222, -1, -1, -1)
 
     cancelled_future = _SpawnFuture(callback=None)
     pool.submit(uuid4(), cancelled_callable, cancelled_future)
@@ -945,7 +942,7 @@ def _make_active_job(job_id: UUID) -> ActiveJob:
         claimed_at=time.monotonic(),
         version=1,
     )
-    job.stdout = OutputStream(path=MagicMock(), fd=None, eof=True)
-    job.stderr = OutputStream(path=MagicMock(), fd=None, eof=True)
+    job.stdout = OutputStream(fd=None, eof=True)
+    job.stderr = OutputStream(fd=None, eof=True)
     job.last_heartbeat_at = time.monotonic()
     return job
