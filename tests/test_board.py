@@ -16,6 +16,7 @@ from lubko.board import (
     BoardError,
     BoardIssue,
     HttpResponse,
+    MAX_SAFE_INTEGER,
     StandardHttpClient,
     parse_board,
 )
@@ -156,6 +157,25 @@ def test_schema_is_strict_and_rejects_assignment() -> None:
     raw_issue["assignee"] = "agent-a"
     with pytest.raises(BoardError, match="malformed issue"):
         parse_board(raw)
+
+
+def test_schema_matches_javascript_scalar_semantics() -> None:
+    """Boolean, unsafe-integer, and non-string fields are rejected like the UI."""
+    boolean_version = cast("dict[str, object]", json.loads(json.dumps(board())))
+    boolean_version["schemaVersion"] = True
+    with pytest.raises(BoardError, match="malformed board"):
+        parse_board(boolean_version)
+
+    unsafe_counter = cast("dict[str, object]", json.loads(json.dumps(board())))
+    unsafe_counter["nextIssueNumber"] = MAX_SAFE_INTEGER + 1
+    with pytest.raises(BoardError, match="malformed board"):
+        parse_board(unsafe_counter)
+
+    invalid_state = cast("dict[str, object]", json.loads(json.dumps(board())))
+    raw_issue = cast("dict[str, object]", cast("list[object]", invalid_state["issues"])[0])
+    raw_issue["state"] = []
+    with pytest.raises(BoardError, match="malformed issue"):
+        parse_board(invalid_state)
 
 
 def test_schema_missing_required_issue_field_is_controlled_error() -> None:
