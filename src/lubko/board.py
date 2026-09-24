@@ -222,11 +222,7 @@ def _timestamp_seconds(value: object) -> float | None:
 
 def _is_positive_int(value: object) -> bool:
     """Return whether a JSON value is a positive JavaScript-safe integer."""
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and 0 < value <= MAX_SAFE_INTEGER
-    )
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= MAX_SAFE_INTEGER
 
 
 def _parse_message(value: object) -> BoardMessage:
