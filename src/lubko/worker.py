@@ -479,9 +479,7 @@ GC_FINISHED_AT_PATTERN: Final = (
     r"|(?:[02468][048]|[13579][26])00)-02-29)"
     r")T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
 )
-GC_THREAD_UUID_PATTERN: Final = (
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
+GC_THREAD_UUID_PATTERN: Final = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 CANCEL_REQUESTED_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 LEASE_EXPIRES_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 CANCEL_REQUESTED_SQL: Final = (
