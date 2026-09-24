@@ -136,15 +136,17 @@ fi
 printf '%s\n' '  acceptance PostgreSQL transport reachable'
 if [ "$(id -u)" -eq 0 ] && [ "$(id -un)" != "system" ] && id system >/dev/null 2>&1; then
   # PostgreSQL refuses to run as root; provision as the unprivileged user.
-  if su system -c "REPO='$REPO' sh '$REPO/acceptance/termux/ensure-postgres.sh'" >/dev/null 2>&1; then
+  if PG_SETUP_OUTPUT=$(su system -c "REPO='$REPO' sh '$REPO/acceptance/termux/ensure-postgres.sh'" 2>&1); then
     pass "acceptance PostgreSQL transport ready"
   else
+    printf '%s\n' "$PG_SETUP_OUTPUT"
     fail "acceptance PostgreSQL transport setup failed"
   fi
 else
-  if REPO="$REPO" sh "$REPO/acceptance/termux/ensure-postgres.sh" >/dev/null 2>&1; then
+  if PG_SETUP_OUTPUT=$(REPO="$REPO" sh "$REPO/acceptance/termux/ensure-postgres.sh" 2>&1); then
     pass "acceptance PostgreSQL transport ready"
   else
+    printf '%s\n' "$PG_SETUP_OUTPUT"
     fail "acceptance PostgreSQL transport setup failed"
   fi
 fi
