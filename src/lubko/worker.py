@@ -4609,28 +4609,24 @@ def collect_transport(
     # uppercase canonical UUIDs. Keeping root.id bare lets PostgreSQL use the
     # existing primary-key index for each ownership probe instead of scanning
     # every root row for every chunk.
+    chunk_payload = _safe_payload_sql("chunk.payload")
+    root_payload = _safe_payload_sql("root.payload")
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT chunk.id\n"
             "FROM lubko.jobs AS chunk\n"
-            "WHERE " + _safe_payload_sql("chunk.payload") + "->>'type' = 'output_chunk'\n"
-            "    AND jsonb_typeof("
-            + _safe_payload_sql("chunk.payload")
-            + "->'server') = 'string'\n"
-            "    AND " + _safe_payload_sql("chunk.payload") + "->>'server' = %(server)s\n"
+            f"WHERE {chunk_payload}->>'type' = 'output_chunk'\n"
+            f"    AND jsonb_typeof({chunk_payload}->'server') = 'string'\n"
+            f"    AND {chunk_payload}->>'server' = %(server)s\n"
             "    AND NOT EXISTS (\n"
             "        SELECT 1\n"
             "        FROM lubko.jobs AS root\n"
             "        WHERE root.id = CASE\n"
-            "            WHEN "
-            + _safe_payload_sql("chunk.payload")
-            + "->>'thread' ~* %(gc_thread_uuid_pattern)s\n"
-            "            THEN ("
-            + _safe_payload_sql("chunk.payload")
-            + "->>'thread')::uuid\n"
+            f"            WHEN {chunk_payload}->>'thread' ~* %(gc_thread_uuid_pattern)s\n"
+            f"            THEN ({chunk_payload}->>'thread')::uuid\n"
             "            ELSE NULL\n"
             "        END\n"
-            "            AND " + _safe_payload_sql("root.payload") + "->>'type' = 'command'\n"
+            f"            AND {root_payload}->>'type' = 'command'\n"
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
