@@ -16,6 +16,7 @@ set -eu
 REPO="${REPO:-/workspace}"
 PGDATA="${HOME}/.lubko-acceptance-pgdata"
 PGLOG="${PGDATA}/acceptance-postgres.log"
+PGSOCKET="${HOME}/.lubko-acceptance-pg-socket"
 SCHEMA="${REPO}/migrations/0001_two_column_protocol.sql"
 
 if pg_isready -h 127.0.0.1 -p 5432 >/dev/null 2>&1; then
@@ -28,7 +29,8 @@ if [ ! -f "${PGDATA}/PG_VERSION" ]; then
   initdb -D "$PGDATA" -E UTF8 >/dev/null 2>&1
 fi
 
-pg_ctl -D "$PGDATA" -l "$PGLOG" -o "-p 5432 -k /tmp" start >/dev/null 2>&1 || true
+mkdir -p "$PGSOCKET"
+pg_ctl -D "$PGDATA" -l "$PGLOG" -o "-p 5432 -k $PGSOCKET" start >/dev/null 2>&1 || true
 
 READY=0
 i=0
