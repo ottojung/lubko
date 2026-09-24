@@ -63,7 +63,7 @@ printf '%s\n' '--- Runtime package install ---'
 apt-get update -qq
 apt-get -qq -y -o Dpkg::Options::=--force-confnew upgrade
 apt-get install -qq -y -o Dpkg::Options::=--force-confnew \
-    python uv git libpq postgresql
+    python uv git libpq
 
 printf '%s\n' '--- Runtime versions ---'
 python --version
@@ -127,28 +127,38 @@ else
 fi
 
 # The supervisor is database-authoritative and fail-closed: with no
-# reachable PostgreSQL it holds without writing the pidfile, which used
-# to wedge this script in an unbounded teardown wait. Provide the
-# intended local PostgreSQL transport (role/db from database.conf plus
-# the frozen transport schema) so the boundary crossing has something to
-# reach. Supervisor semantics are untouched: without the database it
-# still holds.
-printf '%s\n' '  acceptance PostgreSQL transport reachable'
-if [ "$(id -u)" -eq 0 ] && [ "$(id -un)" != "system" ] && id system >/dev/null 2>&1; then
-  # PostgreSQL refuses to run as root; provision as the unprivileged user.
-  if PG_SETUP_OUTPUT=$(su system -c "REPO='$REPO' sh '$REPO/acceptance/termux/ensure-postgres.sh'" 2>&1); then
-    pass "acceptance PostgreSQL transport ready"
-  else
-    printf '%s\n' "$PG_SETUP_OUTPUT"
-    fail "acceptance PostgreSQL transport setup failed"
-  fi
+# reachable PostgreSQL it holds without writing the pidfile. The official
+# termux-docker environment cannot reliably host a PostgreSQL server itself
+# (its Android shared-memory emulation is intentionally incomplete), so this
+# acceptance connects to the external PostgreSQL service supplied by the
+# GitHub Actions runner. That matches Lubko's production architecture: the
+# transport is external infrastructure, not a service Termux must host.
+printf '%s\n' '  external acceptance PostgreSQL transport reachable'
+if REPO="$REPO" uv run --project "$REPO" python - <<'PY'
+import os
+from pathlib import Path
+
+import psycopg
+
+schema = (Path(os.environ["REPO"]) / "migrations" / "0001_two_column_protocol.sql").read_text(
+    encoding="utf-8"
+)
+with psycopg.connect(
+    host="127.0.0.1",
+    port=5432,
+    dbname="lubko",
+    user="lubko",
+    password="lubko",
+    connect_timeout=5,
+) as connection:
+    with connection.cursor() as cursor:
+        cursor.execute(schema)
+print("acceptance PostgreSQL transport ready")
+PY
+then
+  pass "acceptance PostgreSQL transport ready"
 else
-  if PG_SETUP_OUTPUT=$(REPO="$REPO" sh "$REPO/acceptance/termux/ensure-postgres.sh" 2>&1); then
-    pass "acceptance PostgreSQL transport ready"
-  else
-    printf '%s\n' "$PG_SETUP_OUTPUT"
-    fail "acceptance PostgreSQL transport setup failed"
-  fi
+  fail "acceptance PostgreSQL transport setup failed"
 fi
 
 # A minimal tini-static shim so the installed lubko-startup launcher can
