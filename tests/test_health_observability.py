@@ -38,20 +38,15 @@ def _bare_supervisor() -> Supervisor:
 def test_gc_phase_bound_hit_true_when_one_phase_saturates() -> None:
     """A single phase reaching the limit of 4 saturates the bound (true hit)."""
     assert worker._gc_phase_bound_hit(marked=4, gc_roots=0, chunk_counts=[], orphans=0, limit=4)
-    assert worker._gc_phase_bound_hit(marked=0, gc_roots=4, chunk_counts=[], orphans=0, limit=4)
+    assert worker._gc_phase_bound_hit(marked=0, gc_roots=1, chunk_counts=[], orphans=0, limit=4)
     assert worker._gc_phase_bound_hit(marked=0, gc_roots=0, chunk_counts=[4], orphans=0, limit=4)
     assert worker._gc_phase_bound_hit(marked=0, gc_roots=0, chunk_counts=[], orphans=4, limit=4)
 
 
-def test_gc_phase_bound_hit_false_when_sum_exceeds_but_no_phase_saturates() -> None:
-    """Summed rows can exceed the limit without a true per-phase saturation.
-
-    This is the false-positive case the summed-count heuristic would misreport:
-    two roots each drain one chunk, plus one marked root and one orphan — the
-    total is 5, above limit 4, yet no single phase reached its bound.
-    """
+def test_gc_phase_bound_hit_false_when_each_phase_stays_below_its_bound() -> None:
+    """Independent below-bound work does not create a saturation signal."""
     assert (
-        worker._gc_phase_bound_hit(marked=1, gc_roots=2, chunk_counts=[1, 1], orphans=1, limit=4)
+        worker._gc_phase_bound_hit(marked=1, gc_roots=0, chunk_counts=[1], orphans=1, limit=4)
         is False
     )
 
@@ -59,7 +54,7 @@ def test_gc_phase_bound_hit_false_when_sum_exceeds_but_no_phase_saturates() -> N
 def test_gc_phase_bound_hit_false_when_under_limit() -> None:
     """Below-limit per-phase counts are not a saturation."""
     assert (
-        worker._gc_phase_bound_hit(marked=2, gc_roots=2, chunk_counts=[2, 2], orphans=2, limit=4)
+        worker._gc_phase_bound_hit(marked=2, gc_roots=0, chunk_counts=[2], orphans=2, limit=4)
         is False
     )
 

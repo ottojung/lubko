@@ -479,6 +479,7 @@ GC_FINISHED_AT_PATTERN: Final = (
     r"|(?:[02468][048]|[13579][26])00)-02-29)"
     r")T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
 )
+GC_THREAD_UUID_PATTERN: Final = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 CANCEL_REQUESTED_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 LEASE_EXPIRES_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 CANCEL_REQUESTED_SQL: Final = (
@@ -4388,26 +4389,24 @@ def _gc_phase_bound_hit(
 ) -> bool:
     """Return whether any GC phase saturated its per-phase batch bound.
 
-    Each GC phase selects/deletes through an independent ``LIMIT``.  A bound is
-    hit only when one phase's own capped selection reached ``limit`` (a
-    saturation-pressure signal).  This is deliberately *not* the summed row
-    count: the phases are independently capped, so their total can equal or
-    exceed ``limit`` even when no single phase was saturated, which would be a
-    false-positive saturation signal.
+    Phase 2 intentionally selects at most one root per pass, independent of the
+    configurable chunk/mark/orphan batch limit. Selecting that one root reaches
+    the phase-2 bound and is therefore a saturation-pressure signal. The other
+    phases saturate when their own capped row count reaches ``limit``.
 
     Args:
         marked: Phase-1 marked-root count.
-        gc_roots: Phase-2 selected GC-root count.
+        gc_roots: Phase-2 selected GC-root count (zero or one).
         chunk_counts: Per-root phase-2 chunk-deletion counts.
         orphans: Phase-3 orphan-deletion count.
         limit: The configured ``gc_batch_limit``.
 
     Returns:
-        ``True`` when at least one phase reached its bound (saturated).
+        ``True`` when at least one phase reached its own bound.
     """
     if limit <= 0:
         return False
-    if marked >= limit or gc_roots >= limit or orphans >= limit:
+    if marked >= limit or gc_roots >= 1 or orphans >= limit:
         return True
     return any(count >= limit for count in chunk_counts)
 
@@ -4446,12 +4445,13 @@ def collect_transport(
 
     **Phase 3 — Orphan cleanup** (one transaction): A bounded anti-join
     ``SELECT`` (with ``LIMIT`` and ``FOR UPDATE ... SKIP LOCKED``) finds
-    ``output_chunk`` rows whose owning root ``command`` row is absent.  The
-    comparison is cast-free and case-normalized (``lower(root.id::text) =
-    lower(thread)``), so malformed, empty, or non-UUID thread text never
-    causes a cast error regardless of planner predicate reordering, and
-    uppercase canonical UUIDs match correctly.  Matched rows are deleted in
-    one bounded ``DELETE``.  This pass is safe without root-first ordering:
+    ``output_chunk`` rows whose owning root ``command`` row is absent.  A
+    canonical-UUID regex guards conversion of ``thread`` to ``uuid``, so
+    malformed, empty, or non-UUID text becomes NULL without a cast error while
+    uppercase canonical UUIDs remain valid.  The resulting ``root.id = uuid``
+    predicate uses the primary-key index instead of rescanning every root for
+    each chunk.  Matched rows are deleted in one bounded ``DELETE``.  This
+    pass is safe without root-first ordering:
     the owning root is already gone, so no concurrent publication can create
     new chunks for it.
 
@@ -4550,12 +4550,11 @@ def collect_transport(
             "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->'gc' = 'true'::jsonb\n"
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
-            "LIMIT %(limit)s\n",
+            "LIMIT 1\n",
             {
                 "server": settings.server,
                 "gc_retention_seconds": settings.gc_retention_seconds,
                 "gc_finished_at_pattern": GC_FINISHED_AT_PATTERN,
-                "limit": limit,
             },
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
@@ -4605,30 +4604,37 @@ def collect_transport(
             roots_deleted += cursor.rowcount
 
     # --- Phase 3: bounded orphan cleanup ---
-    # Cast-free, case-normalized comparison: lower(root.id::text) = lower(thread).
-    # No ::uuid cast is attempted on the thread value, and lower() normalises
-    # case so uppercase canonical UUIDs match.  Malformed, empty, or non-UUID
-    # text simply never matches any root.id text.  This is intrinsically safe
-    # regardless of planner predicate reordering.
+    # Convert only canonical UUID-shaped thread text. CASE guards the ::uuid
+    # conversion so malformed text never reaches the cast, while ~* accepts
+    # uppercase canonical UUIDs. Keeping root.id bare lets PostgreSQL use the
+    # existing primary-key index for each ownership probe instead of scanning
+    # every root row for every chunk.
+    chunk_payload = _safe_payload_sql("chunk.payload")
+    root_payload = _safe_payload_sql("root.payload")
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT chunk.id\n"
             "FROM lubko.jobs AS chunk\n"
-            "WHERE " + _safe_payload_sql("chunk.payload") + "->>'type' = 'output_chunk'\n"
-            "    AND jsonb_typeof("
-            + _safe_payload_sql("chunk.payload")
-            + "->'server') = 'string'\n"
-            "    AND " + _safe_payload_sql("chunk.payload") + "->>'server' = %(server)s\n"
+            f"WHERE {chunk_payload}->>'type' = 'output_chunk'\n"
+            f"    AND jsonb_typeof({chunk_payload}->'server') = 'string'\n"
+            f"    AND {chunk_payload}->>'server' = %(server)s\n"
             "    AND NOT EXISTS (\n"
             "        SELECT 1\n"
             "        FROM lubko.jobs AS root\n"
-            "        WHERE lower(root.id::text) =\n"
-            "            lower(" + _safe_payload_sql("chunk.payload") + "->>'thread')\n"
-            "            AND " + _safe_payload_sql("root.payload") + "->>'type' = 'command'\n"
+            "        WHERE root.id = CASE\n"
+            f"            WHEN {chunk_payload}->>'thread' ~* %(gc_thread_uuid_pattern)s\n"
+            f"            THEN ({chunk_payload}->>'thread')::uuid\n"
+            "            ELSE NULL\n"
+            "        END\n"
+            f"            AND {root_payload}->>'type' = 'command'\n"
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
-            {"server": settings.server, "limit": limit},
+            {
+                "server": settings.server,
+                "limit": limit,
+                "gc_thread_uuid_pattern": GC_THREAD_UUID_PATTERN,
+            },
         )
         orphan_ids = [row[0] for row in cursor.fetchall()]
         if orphan_ids:
@@ -4887,11 +4893,17 @@ class Supervisor:
         # opportunity in this turn. Retired/malformed protocol work is reaped on
         # the recovery cadence; the pass itself is bounded by LEASE_RECOVERY_LIMIT.
         if now >= self._next_reaper_at:
-            self._run_reaper()
-            self._next_reaper_at = time.monotonic() + self.settings.lease_recovery_interval_seconds
+            try:
+                self._run_reaper()
+            finally:
+                self._next_reaper_at = (
+                    time.monotonic() + self.settings.lease_recovery_interval_seconds
+                )
         if now >= self._next_gc_at:
-            self._run_gc()
-            self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
+            try:
+                self._run_gc()
+            finally:
+                self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
 
     def _drain_captures(self, bound: int | None = None) -> None:
         """Drain every active job's capture pipes into their bounded spools.
