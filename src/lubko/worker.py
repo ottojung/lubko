@@ -4391,26 +4391,24 @@ def _gc_phase_bound_hit(
 ) -> bool:
     """Return whether any GC phase saturated its per-phase batch bound.
 
-    Each GC phase selects/deletes through an independent ``LIMIT``.  A bound is
-    hit only when one phase's own capped selection reached ``limit`` (a
-    saturation-pressure signal).  This is deliberately *not* the summed row
-    count: the phases are independently capped, so their total can equal or
-    exceed ``limit`` even when no single phase was saturated, which would be a
-    false-positive saturation signal.
+    Phase 2 intentionally selects at most one root per pass, independent of the
+    configurable chunk/mark/orphan batch limit. Selecting that one root reaches
+    the phase-2 bound and is therefore a saturation-pressure signal. The other
+    phases saturate when their own capped row count reaches ``limit``.
 
     Args:
         marked: Phase-1 marked-root count.
-        gc_roots: Phase-2 selected GC-root count.
+        gc_roots: Phase-2 selected GC-root count (zero or one).
         chunk_counts: Per-root phase-2 chunk-deletion counts.
         orphans: Phase-3 orphan-deletion count.
         limit: The configured ``gc_batch_limit``.
 
     Returns:
-        ``True`` when at least one phase reached its bound (saturated).
+        ``True`` when at least one phase reached its own bound.
     """
     if limit <= 0:
         return False
-    if marked >= limit or gc_roots >= limit or orphans >= limit:
+    if marked >= limit or gc_roots >= 1 or orphans >= limit:
         return True
     return any(count >= limit for count in chunk_counts)
 
