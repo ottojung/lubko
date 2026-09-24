@@ -11,12 +11,12 @@ import pytest
 
 import lubko.board as board_module
 from lubko.board import (
+    MAX_SAFE_INTEGER,
     Board,
     BoardClient,
     BoardError,
     BoardIssue,
     HttpResponse,
-    MAX_SAFE_INTEGER,
     StandardHttpClient,
     parse_board,
 )
