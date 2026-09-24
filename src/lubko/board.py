@@ -7,6 +7,7 @@ import copy
 import http.client
 import json
 import os
+import re
 import sys
 import uuid
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ BOARD_KEY: Final = "board-v1"
 BOARD_SCHEMA_VERSION: Final = 1
 DEFAULT_MAX_ATTEMPTS: Final = 6
 HTTP_TIMEOUT_SECONDS: Final = 30.0
+CAPABILITY_RE: Final = re.compile(r"[0-9a-fA-F]{64}")
 
 IssueState = Literal["open", "closed"]
 
@@ -171,7 +173,11 @@ def _connection(
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         msg = "LUBKO_BOARD_URL must be an absolute http:// or https:// URL"
         raise BoardError(msg)
-    port = parsed.port
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        msg = "LUBKO_BOARD_URL contains an invalid port"
+        raise BoardError(msg) from exc
     if parsed.scheme == "https":
         return http.client.HTTPSConnection(parsed.hostname, port=port, timeout=timeout)
     return http.client.HTTPConnection(parsed.hostname, port=port, timeout=timeout)
@@ -257,9 +263,11 @@ def _parse_issue(value: object) -> BoardIssue:
         raise BoardError(msg)
     issue = cast("dict[str, object]", value)
     expected = frozenset({"number", "title", "state", "createdAt", "updatedAt", "messages"})
+    if not _exact_keys(issue, expected):
+        msg = "Borys board contains an incompatible or malformed issue"
+        raise BoardError(msg)
     valid_identity = (
-        _exact_keys(issue, expected)
-        and _is_positive_int(issue["number"])
+        _is_positive_int(issue["number"])
         and _is_non_empty_text(issue["title"])
         and issue["state"] in {"open", "closed"}
     )
@@ -605,10 +613,13 @@ class BoardClient:
         return self._require_issue(committed, number)
 
     def _require_capability(self) -> str:
-        if self._capability:
-            return self._capability
-        msg = "A Borys write capability is required"
-        raise BoardError(msg)
+        if not self._capability:
+            msg = "A Borys write capability is required"
+            raise BoardError(msg)
+        if CAPABILITY_RE.fullmatch(self._capability) is None:
+            msg = "The Borys write capability must be 64 hexadecimal characters"
+            raise BoardError(msg)
+        return self._capability
 
     def _mutate(self, mutate: Callable[[Board], Board]) -> Board:
         capability = self._require_capability()
@@ -694,6 +705,22 @@ def _parser() -> argparse.ArgumentParser:
 
     reopen_parser = subparsers.add_parser("reopen")
     reopen_parser.add_argument("number", type=int)
+
+    for command_parser in (
+        list_parser,
+        show_parser,
+        create_parser,
+        comment_parser,
+        close_parser,
+        reopen_parser,
+    ):
+        command_parser.add_argument(
+            "--json",
+            action="store_true",
+            dest="json_output",
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
     return parser
 
 
