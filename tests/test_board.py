@@ -16,6 +16,7 @@ from lubko.board import (
     BoardError,
     BoardIssue,
     HttpResponse,
+    StandardHttpClient,
     parse_board,
 )
 
@@ -155,6 +156,38 @@ def test_schema_is_strict_and_rejects_assignment() -> None:
     raw_issue["assignee"] = "agent-a"
     with pytest.raises(BoardError, match="malformed issue"):
         parse_board(raw)
+
+
+def test_schema_missing_required_issue_field_is_controlled_error() -> None:
+    """Missing issue keys fail as schema errors rather than raw mapping errors."""
+    raw = cast("dict[str, object]", json.loads(json.dumps(board())))
+    raw_issue = cast("dict[str, object]", cast("list[object]", raw["issues"])[0])
+    del raw_issue["updatedAt"]
+    with pytest.raises(BoardError, match="malformed issue"):
+        parse_board(raw)
+
+
+def test_invalid_capability_fails_before_network() -> None:
+    """Malformed bearer capabilities never reach Skrynia."""
+    fake = FakeHttp([])
+    client = BoardClient(http=fake, capability="not-a-capability")
+
+    with pytest.raises(BoardError, match="64 hexadecimal"):
+        client.close(1)
+    assert fake.requests == []
+
+
+def test_invalid_board_url_port_is_controlled_error() -> None:
+    """Malformed URL ports fail as board errors before opening a connection."""
+    client = StandardHttpClient()
+
+    with pytest.raises(BoardError, match="invalid port"):
+        client.request(
+            "GET",
+            "https://example.invalid:not-a-port/store/borys/board-v1",
+            headers={},
+            body=None,
+        )
 
 
 def test_read_only_load_requires_no_capability() -> None:
@@ -385,7 +418,7 @@ def test_cli_json_output_is_stable(
     client = BoardClient(http=fake)
     monkeypatch.setattr(board_module, "_client_from_environment", lambda: client)
 
-    assert board_module.main(["--json", "list"]) == 0
+    assert board_module.main(["list", "--json"]) == 0
 
     captured = capsys.readouterr()
     assert json.loads(captured.out) == [issue(1)]
