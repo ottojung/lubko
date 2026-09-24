@@ -141,7 +141,7 @@ class StandardHttpClient:
                 headers=response_headers,
                 body=response_body,
             )
-        except OSError as exc:
+        except (OSError, http.client.HTTPException) as exc:
             msg = f"Skrynia request failed: {exc}"
             raise BoardError(msg) from exc
         finally:
@@ -207,7 +207,7 @@ def _timestamp_seconds(value: object) -> float | None:
 
 def _is_positive_int(value: object) -> bool:
     """Return whether a JSON value is a positive non-boolean integer."""
-    return type(value) is int and cast(int, value) > 0
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _parse_message(value: object) -> BoardMessage:
@@ -609,19 +609,7 @@ class BoardClient:
         return StoredBoard(board=parse_board(value), etag=etag)
 
     def _raise_http_error(self, method: str, response: HttpResponse) -> None:
-        error_name = ""
-        try:
-            value = _decode_json(response.body, "Skrynia error response")
-        except BoardError:
-            value = None
-        if isinstance(value, dict):
-            raw_error = cast(dict[str, object], value).get("error")
-            if isinstance(raw_error, str) and raw_error:
-                error_name = f": {raw_error}"
-        msg = (
-            f"Skrynia {method} {BORYS_NAMESPACE}/{BOARD_KEY} failed "
-            f"({response.status}){error_name}"
-        )
+        msg = f"Skrynia {method} {BORYS_NAMESPACE}/{BOARD_KEY} failed ({response.status})"
         raise BoardError(msg)
 
 
