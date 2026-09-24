@@ -337,12 +337,14 @@ the marking snapshot are gone.
 
 **Phase 3 — Orphan cleanup** (one transaction): A bounded anti-join `SELECT`
 (with `LIMIT` and `FOR UPDATE ... SKIP LOCKED`) finds `output_chunk` rows
-whose owning root `command` row is absent. The comparison is cast-free
-(`root.id::text = thread`), so malformed, empty, or non-UUID thread text
-never causes a cast error regardless of planner predicate reordering. Matched
-rows are deleted in one bounded `DELETE`. This pass is safe without root-first
-ordering: the owning root is already gone, so no concurrent publication can
-create new chunks for it.
+whose owning root `command` row is absent. A canonical-UUID regex guards the
+conversion of `thread` to `uuid`: malformed, empty, or non-UUID text becomes
+NULL without reaching the cast, while uppercase canonical UUIDs remain valid.
+The resulting `root.id = uuid` predicate uses the existing primary-key index
+instead of rescanning all root rows for every chunk. Matched rows are deleted
+in one bounded `DELETE`. This pass is safe without root-first ordering: the
+owning root is already gone, so no concurrent publication can create new chunks
+for it.
 
 Claiming runs before these optional phases, so a GC backlog cannot prevent a
 pending job from receiving a claim opportunity. All three phases run every
