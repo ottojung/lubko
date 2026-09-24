@@ -9,11 +9,15 @@ import json
 import os
 import sys
 import uuid
-from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final, Literal, Protocol, TypedDict, cast
-from urllib.parse import SplitResult, urlsplit
+from operator import itemgetter
+from typing import TYPE_CHECKING, Final, Literal, Protocol, TypedDict, cast
+from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping, Sequence
+    from urllib.parse import SplitResult
 
 BOARD_BASE_URL_ENV: Final = "LUBKO_BOARD_URL"
 BOARD_CAPABILITY_ENV: Final = "LUBKO_BOARD_CAPABILITY"
@@ -135,7 +139,7 @@ class StandardHttpClient:
             connection.request(method, target, body=body, headers=dict(headers))
             response = connection.getresponse()
             response_body = response.read()
-            response_headers = {name: value for name, value in response.getheaders()}
+            response_headers = dict(response.getheaders())
             return HttpResponse(
                 status=response.status,
                 headers=response_headers,
@@ -192,7 +196,11 @@ def _is_non_empty_text(value: object) -> bool:
 
 
 def _timestamp_seconds(value: object) -> float | None:
-    """Parse a Borys timestamp to seconds since the epoch."""
+    """Parse a Borys timestamp to seconds since the epoch.
+
+    Returns:
+        Parsed epoch seconds, or None for an invalid timestamp.
+    """
     if not isinstance(value, str) or not value:
         return None
     normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
@@ -211,11 +219,18 @@ def _is_positive_int(value: object) -> bool:
 
 
 def _parse_message(value: object) -> BoardMessage:
-    """Validate and return one Borys message."""
+    """Validate and return one Borys message.
+
+    Returns:
+        The validated message.
+
+    Raises:
+        BoardError: If the value is not a Borys v1 message.
+    """
     if not isinstance(value, dict):
         msg = "Borys board contains an incompatible or malformed message"
         raise BoardError(msg)
-    message = cast(dict[str, object], value)
+    message = cast("dict[str, object]", value)
     if (
         not _exact_keys(message, frozenset({"id", "author", "body", "createdAt"}))
         or not _is_non_empty_text(message["id"])
@@ -225,29 +240,38 @@ def _parse_message(value: object) -> BoardMessage:
     ):
         msg = "Borys board contains an incompatible or malformed message"
         raise BoardError(msg)
-    return cast(BoardMessage, message)
+    return cast("BoardMessage", message)
 
 
 def _parse_issue(value: object) -> BoardIssue:
-    """Validate and return one Borys issue."""
+    """Validate and return one Borys issue.
+
+    Returns:
+        The validated issue.
+
+    Raises:
+        BoardError: If the value is not a Borys v1 issue.
+    """
     if not isinstance(value, dict):
         msg = "Borys board contains an incompatible or malformed issue"
         raise BoardError(msg)
-    issue = cast(dict[str, object], value)
+    issue = cast("dict[str, object]", value)
     expected = frozenset({"number", "title", "state", "createdAt", "updatedAt", "messages"})
-    if (
-        not _exact_keys(issue, expected)
-        or not _is_positive_int(issue["number"])
-        or not _is_non_empty_text(issue["title"])
-        or issue["state"] not in {"open", "closed"}
-        or _timestamp_seconds(issue["createdAt"]) is None
-        or _timestamp_seconds(issue["updatedAt"]) is None
-        or not isinstance(issue["messages"], list)
-    ):
+    valid_identity = (
+        _exact_keys(issue, expected)
+        and _is_positive_int(issue["number"])
+        and _is_non_empty_text(issue["title"])
+        and issue["state"] in {"open", "closed"}
+    )
+    valid_times = (
+        _timestamp_seconds(issue["createdAt"]) is not None
+        and _timestamp_seconds(issue["updatedAt"]) is not None
+    )
+    if not valid_identity or not valid_times or not isinstance(issue["messages"], list):
         msg = "Borys board contains an incompatible or malformed issue"
         raise BoardError(msg)
-    parsed = cast(BoardIssue, issue)
-    messages = [_parse_message(message) for message in cast(list[object], issue["messages"])]
+    parsed = cast("BoardIssue", issue)
+    messages = [_parse_message(message) for message in cast("list[object]", issue["messages"])]
     previous: float | None = None
     for message in messages:
         created = _timestamp_seconds(message["createdAt"])
@@ -277,7 +301,7 @@ def parse_board(value: object) -> Board:
     if not isinstance(value, dict):
         msg = "Skrynia object borys/board-v1 contains an incompatible or malformed board"
         raise BoardError(msg)
-    raw = cast(dict[str, object], value)
+    raw = cast("dict[str, object]", value)
     expected = frozenset({"schemaVersion", "nextIssueNumber", "issues"})
     if (
         not _exact_keys(raw, expected)
@@ -287,12 +311,12 @@ def parse_board(value: object) -> Board:
     ):
         msg = "Skrynia object borys/board-v1 contains an incompatible or malformed board"
         raise BoardError(msg)
-    issues = [_parse_issue(issue) for issue in cast(list[object], raw["issues"])]
+    issues = [_parse_issue(issue) for issue in cast("list[object]", raw["issues"])]
     numbers = [issue["number"] for issue in issues]
     if len(numbers) != len(set(numbers)):
         msg = "Borys board contains duplicate issue numbers"
         raise BoardError(msg)
-    next_issue_number = cast(int, raw["nextIssueNumber"])
+    next_issue_number = cast("int", raw["nextIssueNumber"])
     if numbers and next_issue_number <= max(numbers):
         msg = "Borys board issue number counter is inconsistent with its issues"
         raise BoardError(msg)
@@ -313,21 +337,36 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
 
 
 def _json_bytes(value: object) -> bytes:
-    """Serialize compact UTF-8 JSON bytes."""
+    """Serialize compact UTF-8 JSON bytes.
+
+    Returns:
+        Compact encoded JSON.
+    """
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()
 
 
 def _decode_json(body: bytes, context: str) -> object:
-    """Decode response JSON without exposing response contents in errors."""
+    """Decode response JSON without exposing response contents in errors.
+
+    Returns:
+        The decoded JSON value.
+
+    Raises:
+        BoardError: If the bytes are not valid JSON.
+    """
     try:
-        return cast(object, json.loads(body))
+        return cast("object", json.loads(body))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         msg = f"{context} returned invalid JSON"
         raise BoardError(msg) from exc
 
 
 def _iso_timestamp(value: datetime) -> str:
-    """Format one timestamp like JavaScript Date.toISOString()."""
+    """Format one timestamp like JavaScript Date.toISOString().
+
+    Returns:
+        A UTC ISO timestamp with millisecond precision.
+    """
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -354,7 +393,6 @@ class BoardClient:
         capability: str | None = None,
         http: HttpClient | None = None,
         now: Callable[[], datetime] | None = None,
-        new_id: Callable[[], str] | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     ) -> None:
         """Initialize the client.
@@ -364,7 +402,6 @@ class BoardClient:
             capability: Optional Borys write capability.
             http: Optional injectable HTTP transport.
             now: Optional clock used by mutations.
-            new_id: Optional message-ID generator.
             max_attempts: Maximum compare-and-swap attempts.
 
         Raises:
@@ -377,7 +414,6 @@ class BoardClient:
         self._capability = capability.strip() if capability else None
         self._http = http if http is not None else StandardHttpClient()
         self._now = now if now is not None else lambda: datetime.now(tz=UTC)
-        self._new_id = new_id if new_id is not None else lambda: str(uuid.uuid4())
         self._max_attempts = max_attempts
 
     def load_board(self) -> Board:
@@ -408,7 +444,7 @@ class BoardClient:
         filtered = (
             issues if state is None else [issue for issue in issues if issue["state"] == state]
         )
-        return sorted(filtered, key=lambda issue: issue["number"])
+        return sorted(filtered, key=itemgetter("number"))
 
     def get_issue(self, number: int) -> BoardIssue:
         """Return one issue by number.
@@ -419,8 +455,6 @@ class BoardClient:
         Returns:
             The requested issue.
 
-        Raises:
-            BoardError: If the issue does not exist.
         """
         return self._require_issue(self.load_board(), number)
 
@@ -484,7 +518,7 @@ class BoardClient:
         if not clean_body:
             msg = "Message body is required"
             raise BoardError(msg)
-        message_id = self._new_id()
+        message_id = str(uuid.uuid4())
 
         def update(issue: BoardIssue) -> BoardIssue:
             updated = copy.deepcopy(issue)
@@ -532,7 +566,8 @@ class BoardClient:
 
         return self._update_issue(number, update)
 
-    def _require_issue(self, board: Board, number: int) -> BoardIssue:
+    @staticmethod
+    def _require_issue(board: Board, number: int) -> BoardIssue:
         for issue in board["issues"]:
             if issue["number"] == number:
                 return issue
@@ -617,13 +652,18 @@ class BoardClient:
         value = _decode_json(response.body, "Skrynia GET borys/board-v1")
         return StoredBoard(board=parse_board(value), etag=etag)
 
-    def _raise_http_error(self, method: str, response: HttpResponse) -> None:
+    @staticmethod
+    def _raise_http_error(method: str, response: HttpResponse) -> None:
         msg = f"Skrynia {method} {BORYS_NAMESPACE}/{BOARD_KEY} failed ({response.status})"
         raise BoardError(msg)
 
 
 def _parser() -> argparse.ArgumentParser:
-    """Build the command-line parser."""
+    """Build the command-line parser.
+
+    Returns:
+        The configured argument parser.
+    """
     parser = argparse.ArgumentParser(prog="lubko-board")
     parser.add_argument("--json", action="store_true", dest="json_output")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -651,21 +691,32 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _issue_json(issue: BoardIssue) -> str:
-    """Return stable compact JSON for one issue."""
+    """Return stable compact JSON for one issue.
+
+    Returns:
+        Serialized issue JSON.
+    """
     return json.dumps(issue, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
 def _issues_json(issues: list[BoardIssue]) -> str:
-    """Return stable compact JSON for an issue list."""
+    """Return stable compact JSON for an issue list.
+
+    Returns:
+        Serialized issue-list JSON.
+    """
     return json.dumps(issues, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
 def _human_issue(issue: BoardIssue) -> str:
-    """Render one complete issue for a terminal."""
+    """Render one complete issue for a terminal.
+
+    Returns:
+        Human-readable issue text.
+    """
     lines = [f"#{issue['number']} [{issue['state']}] {issue['title']}"]
     for message in issue["messages"]:
-        lines.append(f"{message['author']} @ {message['createdAt']}")
-        lines.append(message["body"])
+        lines.extend((f"{message['author']} @ {message['createdAt']}", message["body"]))
     return "\n".join(lines)
 
 
@@ -680,7 +731,11 @@ def _write_stderr(text: str) -> None:
 
 
 def _client_from_environment() -> BoardClient:
-    """Construct a client from environment settings."""
+    """Construct a client from environment settings.
+
+    Returns:
+        A configured board client.
+    """
     return BoardClient(
         base_url=os.environ.get(BOARD_BASE_URL_ENV, DEFAULT_BOARD_BASE_URL),
         capability=os.environ.get(BOARD_CAPABILITY_ENV),
@@ -688,26 +743,33 @@ def _client_from_environment() -> BoardClient:
 
 
 def _run_command(args: argparse.Namespace, client: BoardClient) -> BoardIssue | list[BoardIssue]:
-    """Execute one parsed CLI command."""
-    command = cast(str, args.command)
+    """Execute one parsed CLI command.
+
+    Returns:
+        The selected or mutated issue, or an issue list.
+
+    Raises:
+        BoardError: If the command is invalid or cannot be completed.
+    """
+    command = cast("str", args.command)
     if command == "list":
-        raw_state = cast(str, args.state)
-        state = None if raw_state == "all" else cast(IssueState, raw_state)
+        raw_state = cast("str", args.state)
+        state = None if raw_state == "all" else cast("IssueState", raw_state)
         return client.list_issues(state)
     if command == "show":
-        return client.get_issue(cast(int, args.number))
+        return client.get_issue(cast("int", args.number))
     if command == "create":
-        return client.create_issue(cast(str, args.title))
+        return client.create_issue(cast("str", args.title))
     if command == "comment":
-        author = cast(str | None, args.author) or os.environ.get(BOARD_AUTHOR_ENV)
+        author = cast("str | None", args.author) or os.environ.get(BOARD_AUTHOR_ENV)
         if not author:
             msg = f"Message author is required; use --author or {BOARD_AUTHOR_ENV}"
             raise BoardError(msg)
-        return client.comment(cast(int, args.number), author, cast(str, args.body))
+        return client.comment(cast("int", args.number), author, cast("str", args.body))
     if command == "close":
-        return client.close(cast(int, args.number))
+        return client.close(cast("int", args.number))
     if command == "reopen":
-        return client.reopen(cast(int, args.number))
+        return client.reopen(cast("int", args.number))
     msg = f"unsupported lubko-board command: {command}"
     raise BoardError(msg)
 
@@ -728,7 +790,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_stderr(f"lubko-board: {exc}")
         return 1
 
-    if cast(bool, args.json_output):
+    if cast("bool", args.json_output):
         if isinstance(result, list):
             _write_stdout(_issues_json(result))
         else:
