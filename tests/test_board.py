@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -17,9 +16,13 @@ from lubko.board import (
     BoardError,
     BoardIssue,
     HttpResponse,
-    IssueState,
     parse_board,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from lubko.board import IssueState
 
 
 @dataclass(slots=True)
@@ -48,7 +51,14 @@ class FakeHttp:
         headers: Mapping[str, str],
         body: bytes | None,
     ) -> HttpResponse:
-        """Record a request and return the next queued response."""
+        """Record a request and return the next queued response.
+
+        Returns:
+            The next queued response.
+
+        Raises:
+            AssertionError: If the response queue is exhausted.
+        """
         self.requests.append(
             RecordedRequest(
                 method=method,
@@ -71,14 +81,18 @@ def issue(
     updated_at: str = "2026-09-24T10:00:00.000Z",
     messages: list[dict[str, str]] | None = None,
 ) -> BoardIssue:
-    """Build one valid issue for tests."""
+    """Build one valid issue for tests.
+
+    Returns:
+        A valid issue.
+    """
     return BoardIssue(
         number=number,
         title=title or f"Issue {number}",
         state=state,
         createdAt="2026-09-24T10:00:00.000Z",
         updatedAt=updated_at,
-        messages=cast(list[board_module.BoardMessage], messages or []),
+        messages=cast("list[board_module.BoardMessage]", messages or []),
     )
 
 
@@ -87,7 +101,11 @@ def board(
     next_issue: int = 2,
     issues: list[BoardIssue] | None = None,
 ) -> Board:
-    """Build one valid board for tests."""
+    """Build one valid board for tests.
+
+    Returns:
+        A valid board.
+    """
     return Board(
         schemaVersion=1,
         nextIssueNumber=next_issue,
@@ -96,29 +114,44 @@ def board(
 
 
 def response(status: int, value: object | None = None, *, etag: str | None = None) -> HttpResponse:
-    """Build a fake JSON HTTP response."""
+    """Build a fake JSON HTTP response.
+
+    Returns:
+        The fake response.
+    """
     headers = {} if etag is None else {"ETag": etag}
     body_bytes = b"" if value is None else json.dumps(value).encode()
     return HttpResponse(status=status, headers=headers, body=body_bytes)
 
 
 def decode_request_body(request: RecordedRequest) -> Board:
-    """Decode one captured PUT body as a board."""
+    """Decode one captured PUT body as a board.
+
+    Returns:
+        The decoded board.
+
+    Raises:
+        AssertionError: If the request has no body.
+    """
     if request.body is None:
         msg = "expected request body"
         raise AssertionError(msg)
-    return parse_board(cast(object, json.loads(request.body)))
+    return parse_board(cast("object", json.loads(request.body)))
 
 
 def fixed_now() -> datetime:
-    """Return a deterministic clock value before the test messages."""
+    """Return a deterministic clock value before the test messages.
+
+    Returns:
+        The fixed UTC datetime.
+    """
     return datetime(2026, 9, 24, 9, 0, tzinfo=UTC)
 
 
 def test_schema_is_strict_and_rejects_assignment() -> None:
     """Unknown issue fields, including assignment, are incompatible with Borys v1."""
-    raw = cast(dict[str, object], json.loads(json.dumps(board())))
-    raw_issue = cast(dict[str, object], cast(list[object], raw["issues"])[0])
+    raw = cast("dict[str, object]", json.loads(json.dumps(board())))
+    raw_issue = cast("dict[str, object]", cast("list[object]", raw["issues"])[0])
     raw_issue["assignee"] = "agent-a"
     with pytest.raises(BoardError, match="malformed issue"):
         parse_board(raw)
@@ -214,7 +247,9 @@ def test_create_replays_against_latest_counter_after_conflict() -> None:
     assert second_candidate["issues"][1]["title"] == "Winner"
 
 
-def test_comment_replay_preserves_winner_and_clock_order() -> None:
+def test_comment_replay_preserves_winner_and_clock_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Comment replay keeps the concurrent message and clamps its timestamp."""
     original = issue(
         1,
@@ -269,8 +304,8 @@ def test_comment_replay_preserves_winner_and_clock_order() -> None:
         capability="c" * 64,
         http=fake,
         now=fixed_now,
-        new_id=lambda: "stable-id",
     )
+    monkeypatch.setattr(board_module.uuid, "uuid4", lambda: "stable-id")
 
     result = client.comment(1, "agent", "mine")
 
@@ -354,4 +389,4 @@ def test_cli_json_output_is_stable(
 
     captured = capsys.readouterr()
     assert json.loads(captured.out) == [issue(1)]
-    assert captured.err == ""
+    assert not captured.err
