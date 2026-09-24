@@ -89,6 +89,28 @@ def test_gc_timestamp_authority_accepts_only_canonical_worker_shape() -> None:
     assert not any(_canonical(value) for value in malformed)
 
 
+def test_gc_keeps_phase_two_constant_and_indexes_orphan_root_lookup() -> None:
+    """GC processes one root and probes orphan ownership through the UUID PK."""
+    conn = _Conn()
+    settings = Settings.from_environment(server="test-server")
+
+    collect_transport(cast("JobsConnection", conn), settings)
+
+    phase_two_query, _phase_two_params = conn.queries[1]
+    orphan_query, orphan_params = conn.queries[2]
+
+    assert "LIMIT 1\n" in phase_two_query
+    assert "root.id = CASE" in orphan_query
+    assert "lower(root.id::text)" not in orphan_query
+    assert "->>'thread')::uuid" in orphan_query
+    assert "~* %(gc_thread_uuid_pattern)s" in orphan_query
+    assert isinstance(orphan_params, dict)
+    pattern = orphan_params["gc_thread_uuid_pattern"]
+    assert isinstance(pattern, str)
+    assert re.fullmatch(pattern, "DEADBEEF-DEAD-BEEF-DEAD-BEEFDEADBEEF", re.IGNORECASE)
+    assert re.fullmatch(pattern, "not-a-uuid", re.IGNORECASE) is None
+
+
 def test_gc_revalidates_timestamp_authority_before_phase_two_deletion() -> None:
     """A stale GC mark cannot bypass timestamp validation during deletion."""
     conn = _Conn()
