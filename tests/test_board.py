@@ -22,7 +22,7 @@ from lubko.board import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from lubko.board import IssueState
+    from lubko.board import BoardMessage, IssueState
 
 
 @dataclass(slots=True)
@@ -79,7 +79,7 @@ def issue(
     title: str | None = None,
     state: IssueState = "open",
     updated_at: str = "2026-09-24T10:00:00.000Z",
-    messages: list[dict[str, str]] | None = None,
+    messages: list[BoardMessage] | None = None,
 ) -> BoardIssue:
     """Build one valid issue for tests.
 
@@ -92,7 +92,7 @@ def issue(
         state=state,
         createdAt="2026-09-24T10:00:00.000Z",
         updatedAt=updated_at,
-        messages=cast("list[board_module.BoardMessage]", messages or []),
+        messages=list(messages or []),
     )
 
 
@@ -305,7 +305,7 @@ def test_comment_replay_preserves_winner_and_clock_order(
         http=fake,
         now=fixed_now,
     )
-    monkeypatch.setattr(board_module.uuid, "uuid4", lambda: "stable-id")
+    monkeypatch.setattr(board_module, "_new_message_id", lambda: "stable-id")
 
     result = client.comment(1, "agent", "mine")
 
