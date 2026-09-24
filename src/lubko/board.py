@@ -29,6 +29,7 @@ BOARD_KEY: Final = "board-v1"
 BOARD_SCHEMA_VERSION: Final = 1
 DEFAULT_MAX_ATTEMPTS: Final = 6
 HTTP_TIMEOUT_SECONDS: Final = 30.0
+MAX_SAFE_INTEGER: Final = (1 << 53) - 1
 CAPABILITY_RE: Final = re.compile(r"[0-9a-fA-F]{64}")
 
 IssueState = Literal["open", "closed"]
@@ -220,8 +221,12 @@ def _timestamp_seconds(value: object) -> float | None:
 
 
 def _is_positive_int(value: object) -> bool:
-    """Return whether a JSON value is a positive non-boolean integer."""
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+    """Return whether a JSON value is a positive JavaScript-safe integer."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 < value <= MAX_SAFE_INTEGER
+    )
 
 
 def _parse_message(value: object) -> BoardMessage:
@@ -269,6 +274,7 @@ def _parse_issue(value: object) -> BoardIssue:
     valid_identity = (
         _is_positive_int(issue["number"])
         and _is_non_empty_text(issue["title"])
+        and isinstance(issue["state"], str)
         and issue["state"] in {"open", "closed"}
     )
     valid_times = (
@@ -313,6 +319,7 @@ def parse_board(value: object) -> Board:
     expected = frozenset({"schemaVersion", "nextIssueNumber", "issues"})
     if (
         not _exact_keys(raw, expected)
+        or not _is_positive_int(raw["schemaVersion"])
         or raw["schemaVersion"] != BOARD_SCHEMA_VERSION
         or not _is_positive_int(raw["nextIssueNumber"])
         or not isinstance(raw["issues"], list)
@@ -494,6 +501,9 @@ class BoardClient:
         def mutate(board: Board) -> Board:
             nonlocal created_number
             created_number = board["nextIssueNumber"]
+            if created_number >= MAX_SAFE_INTEGER:
+                msg = "Borys issue number space is exhausted"
+                raise BoardError(msg)
             timestamp = _iso_timestamp(self._now())
             issue = BoardIssue(
                 number=created_number,
