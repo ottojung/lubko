@@ -1,8 +1,8 @@
 """Reproducible installation of the Lubko command line tools.
 
 The ``lubko-install`` command makes the maintained entry points
-(``lubko-agent``, ``lubko-worker``, ``lubko-deploy``, ``lubko-deploy-ctl``,
-``lubko-install``, and ``my-lubko-agent``) resolve on PATH to the code of one
+(``lubko-agent``, ``lubko-board``, ``lubko-worker``, ``lubko-deploy``,
+``lubko-deploy-ctl``, ``lubko-install``, and ``my-lubko-agent``) resolve on PATH to the code of one
 exact Lubko checkout commit.
 
 Instead of rewriting a ``uv`` tool environment in place, every global entry

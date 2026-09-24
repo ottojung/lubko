@@ -19,6 +19,7 @@ lubko-deploy-ctl = "lubko.deployctl:main"
 lubko-agent = "lubko.agent:main"
 my-lubko-agent = "lubko.agent:main"
 lubko-install = "lubko.install:main"
+lubko-board = "lubko.board:main"
 
 [project.optional-dependencies]
 dev = [
