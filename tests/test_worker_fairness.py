@@ -7,12 +7,12 @@ import time
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
+import pytest
+
 from lubko.config import DatabaseConfig
 from lubko.worker import DbOperationDeadlineError, Settings, Supervisor
 
 if TYPE_CHECKING:
-    import pytest
-
     from lubko.worker import JobsConnection
 
 
@@ -72,18 +72,15 @@ def test_gc_failure_still_advances_its_schedule(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(supervisor, "_claim_batch", lambda: None)
     monkeypatch.setattr(time, "monotonic", lambda: 50.0)
 
+    failure = DbOperationDeadlineError("deadline")
+
     def fail_gc() -> None:
-        raise DbOperationDeadlineError("deadline")
+        raise failure
 
     monkeypatch.setattr(supervisor, "_run_gc", fail_gc)
 
-    try:
+    with pytest.raises(DbOperationDeadlineError):
         supervisor._db_phase(1.0)
-    except DbOperationDeadlineError:
-        pass
-    else:
-        msg = "expected GC deadline failure"
-        raise AssertionError(msg)
 
     assert math.isclose(supervisor._next_gc_at, 110.0)
 
