@@ -4901,11 +4901,17 @@ class Supervisor:
         # opportunity in this turn. Retired/malformed protocol work is reaped on
         # the recovery cadence; the pass itself is bounded by LEASE_RECOVERY_LIMIT.
         if now >= self._next_reaper_at:
-            self._run_reaper()
-            self._next_reaper_at = time.monotonic() + self.settings.lease_recovery_interval_seconds
+            try:
+                self._run_reaper()
+            finally:
+                self._next_reaper_at = (
+                    time.monotonic() + self.settings.lease_recovery_interval_seconds
+                )
         if now >= self._next_gc_at:
-            self._run_gc()
-            self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
+            try:
+                self._run_gc()
+            finally:
+                self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
 
     def _drain_captures(self, bound: int | None = None) -> None:
         """Drain every active job's capture pipes into their bounded spools.
