@@ -13,9 +13,23 @@ permissions:
 jobs:
   termux-install:
     runs-on: ubuntu-24.04-arm
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: lubko
+          POSTGRES_PASSWORD: lubko
+          POSTGRES_DB: lubko
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lubko -d lubko"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v7
       - name: Build acceptance image
         run: docker build --no-cache -f acceptance/termux/Dockerfile -t lubko-acceptance-termux .
       - name: Run acceptance
-        run: docker run --rm --security-opt seccomp=unconfined lubko-acceptance-termux
+        run: docker run --rm --network host --security-opt seccomp=unconfined lubko-acceptance-termux
