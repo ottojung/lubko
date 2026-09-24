@@ -405,7 +405,9 @@ class BoardClient:
             Matching issues sorted by issue number.
         """
         issues = self.load_board()["issues"]
-        filtered = issues if state is None else [issue for issue in issues if issue["state"] == state]
+        filtered = (
+            issues if state is None else [issue for issue in issues if issue["state"] == state]
+        )
         return sorted(filtered, key=lambda issue: issue["number"])
 
     def get_issue(self, number: int) -> BoardIssue:
@@ -553,8 +555,7 @@ class BoardClient:
             )
             candidate = copy.deepcopy(board)
             candidate["issues"] = [
-                changed if issue["number"] == number else issue
-                for issue in candidate["issues"]
+                changed if issue["number"] == number else issue for issue in candidate["issues"]
             ]
             return candidate
 
