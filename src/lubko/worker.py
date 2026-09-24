@@ -479,6 +479,9 @@ GC_FINISHED_AT_PATTERN: Final = (
     r"|(?:[02468][048]|[13579][26])00)-02-29)"
     r")T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{6}Z$"
 )
+GC_THREAD_UUID_PATTERN: Final = (
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 CANCEL_REQUESTED_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 LEASE_EXPIRES_AT_PATTERN: Final = GC_FINISHED_AT_PATTERN
 CANCEL_REQUESTED_SQL: Final = (
@@ -4446,12 +4449,13 @@ def collect_transport(
 
     **Phase 3 — Orphan cleanup** (one transaction): A bounded anti-join
     ``SELECT`` (with ``LIMIT`` and ``FOR UPDATE ... SKIP LOCKED``) finds
-    ``output_chunk`` rows whose owning root ``command`` row is absent.  The
-    comparison is cast-free and case-normalized (``lower(root.id::text) =
-    lower(thread)``), so malformed, empty, or non-UUID thread text never
-    causes a cast error regardless of planner predicate reordering, and
-    uppercase canonical UUIDs match correctly.  Matched rows are deleted in
-    one bounded ``DELETE``.  This pass is safe without root-first ordering:
+    ``output_chunk`` rows whose owning root ``command`` row is absent.  A
+    canonical-UUID regex guards conversion of ``thread`` to ``uuid``, so
+    malformed, empty, or non-UUID text becomes NULL without a cast error while
+    uppercase canonical UUIDs remain valid.  The resulting ``root.id = uuid``
+    predicate uses the primary-key index instead of rescanning every root for
+    each chunk.  Matched rows are deleted in one bounded ``DELETE``.  This
+    pass is safe without root-first ordering:
     the owning root is already gone, so no concurrent publication can create
     new chunks for it.
 
@@ -4550,12 +4554,11 @@ def collect_transport(
             "    AND " + _SAFE_PAYLOAD_SQL + "->'state'->'gc' = 'true'::jsonb\n"
             "ORDER BY id\n"
             "FOR UPDATE SKIP LOCKED\n"
-            "LIMIT %(limit)s\n",
+            "LIMIT 1\n",
             {
                 "server": settings.server,
                 "gc_retention_seconds": settings.gc_retention_seconds,
                 "gc_finished_at_pattern": GC_FINISHED_AT_PATTERN,
-                "limit": limit,
             },
         )
         gc_roots = [row[0] for row in cursor.fetchall()]
@@ -4605,11 +4608,11 @@ def collect_transport(
             roots_deleted += cursor.rowcount
 
     # --- Phase 3: bounded orphan cleanup ---
-    # Cast-free, case-normalized comparison: lower(root.id::text) = lower(thread).
-    # No ::uuid cast is attempted on the thread value, and lower() normalises
-    # case so uppercase canonical UUIDs match.  Malformed, empty, or non-UUID
-    # text simply never matches any root.id text.  This is intrinsically safe
-    # regardless of planner predicate reordering.
+    # Convert only canonical UUID-shaped thread text. CASE guards the ::uuid
+    # conversion so malformed text never reaches the cast, while ~* accepts
+    # uppercase canonical UUIDs. Keeping root.id bare lets PostgreSQL use the
+    # existing primary-key index for each ownership probe instead of scanning
+    # every root row for every chunk.
     with conn.transaction(), conn.cursor(row_factory=tuple_row) as cursor:
         cursor.execute(
             "SELECT chunk.id\n"
@@ -4622,13 +4625,24 @@ def collect_transport(
             "    AND NOT EXISTS (\n"
             "        SELECT 1\n"
             "        FROM lubko.jobs AS root\n"
-            "        WHERE lower(root.id::text) =\n"
-            "            lower(" + _safe_payload_sql("chunk.payload") + "->>'thread')\n"
+            "        WHERE root.id = CASE\n"
+            "            WHEN "
+            + _safe_payload_sql("chunk.payload")
+            + "->>'thread' ~* %(gc_thread_uuid_pattern)s\n"
+            "            THEN ("
+            + _safe_payload_sql("chunk.payload")
+            + "->>'thread')::uuid\n"
+            "            ELSE NULL\n"
+            "        END\n"
             "            AND " + _safe_payload_sql("root.payload") + "->>'type' = 'command'\n"
             "    )\n"
             "LIMIT %(limit)s\n"
             "FOR UPDATE OF chunk SKIP LOCKED\n",
-            {"server": settings.server, "limit": limit},
+            {
+                "server": settings.server,
+                "limit": limit,
+                "gc_thread_uuid_pattern": GC_THREAD_UUID_PATTERN,
+            },
         )
         orphan_ids = [row[0] for row in cursor.fetchall()]
         if orphan_ids:
