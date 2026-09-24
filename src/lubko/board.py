@@ -374,6 +374,8 @@ def _iso_timestamp(value: datetime) -> str:
 
 def _latest_timestamp(now: datetime, *floors: str | None) -> str:
     """Return an ISO timestamp no earlier than any supplied floor."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
     candidates = [now.timestamp()]
     for floor in floors:
         if floor is not None:
@@ -381,6 +383,11 @@ def _latest_timestamp(now: datetime, *floors: str | None) -> str:
             if parsed is not None:
                 candidates.append(parsed)
     return _iso_timestamp(datetime.fromtimestamp(max(candidates), tz=UTC))
+
+
+def _new_message_id() -> str:
+    """Return a new opaque message identifier."""
+    return str(uuid.uuid4())
 
 
 class BoardClient:
@@ -518,7 +525,7 @@ class BoardClient:
         if not clean_body:
             msg = "Message body is required"
             raise BoardError(msg)
-        message_id = str(uuid.uuid4())
+        message_id = _new_message_id()
 
         def update(issue: BoardIssue) -> BoardIssue:
             updated = copy.deepcopy(issue)
