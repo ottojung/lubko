@@ -81,8 +81,8 @@ A wrong commit, candidate failure, expired deadline, malformed durable authority
 
 ## Global CLI coherence
 
-The maintained commands on PATH (`lubko-agent`, `lubko-board`, `lubko-worker`,
-`lubko-deploy`, `lubko-deploy-ctl`, `lubko-install`, `my-lubko-agent`) are stable launchers that
+The maintained commands on PATH (`lubko-board`, `lubko-worker`, `lubko-supervisor`,
+`lubko-deploy`, `lubko-deploy-ctl`, and `lubko-install`) are stable launchers that
 resolve one `current` symlink (`$XDG_STATE_HOME/lubko/cli/current`) to the
 immutable per-commit CLI environment of the commit they should run. The
 supervised protocol keeps that pointer coherent with the *confirmed* worker:

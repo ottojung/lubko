@@ -1,7 +1,7 @@
-$id-5831047296612840
-title: Deployment excludes lubko-agent health
-date: 2026/09/08
-source: @ottojung
+$id-5571830469726140
+title: Deployment excludes optional external consumers
+date: 2026/09/25
+source: issue-824
 kind: constraint
 
-`lubko-agent` health must not be verified as part of deployment. Deployment confirmation and deployment health must not depend on a `lubko-agent` prompt, the configured agent model, OpenCode model availability, or external agent-provider health. Agent health may be investigated or verified separately from deployment.
+Deployment confirmation and deployment health must not depend on an optional external command consumer or runtime. Those concerns may be investigated separately and must not block or alter the deployment protocol.

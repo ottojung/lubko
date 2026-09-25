@@ -441,7 +441,7 @@ worker crashes or is restarted, its jobs stop being heartbeated; once their
 lease truly expires, any worker's recovery pass atomically marks them `failed`
 with a clear `result.recovery_note` instead of re-executing them. Re-executing
 an abandoned job is deliberately avoided: a job may have already performed
-side effects (git pushes, agent launches, deployments) that must not run twice.
+side effects (git pushes, external process launches, deployments) that must not run twice.
 
 During a database outage the supervisor stops claiming new jobs, keeps the
 in-memory active registry, keeps reaping/observing child processes locally, and

@@ -302,11 +302,6 @@ and `$id-3157892460835174` (no tmpfs assumption for correctness — the
 current `/tmp` spool placement is the one existing tmpfs dependence and it
 is removed rather than relied upon).
 
-The `agents/<id>/output.log` capture is per-agent-session state outside
-supervisor/worker lifecycle authority; agent sessions are operator-invoked
-while free space is an operator concern, so it keeps ordinary file
-semantics and may fail loudly.
-
 ### Principle 5 — Fail-closed lifecycle invariants are preserved exactly
 
 - **No duplicate maintained worker:** at most one incarnation holds the

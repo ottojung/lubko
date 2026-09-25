@@ -41,7 +41,7 @@ The canonical CI job is named `test`. Renaming it is a version-controlled govern
 
 # Release-branch integrity contract
 
-Scheduled Lubko development integrates through the active `release/*` branch as described by `docs/skills/itenerary-lubko.md`. The release branch follows the same version-controlled integrity policy as `main`.
+Scheduled Lubko development integrates through the active `release/*` branch according to the repository workflow. The release branch follows the same version-controlled integrity policy as `main`.
 
 1. **Use pull requests for advancement.** After an active release branch has been created from `main`, subsequent changes reach it through pull requests.
 2. **Canonical CI must pass on current integration.** The same `test` job must succeed on an integration that includes the current release-branch state before an issue PR is merged.
