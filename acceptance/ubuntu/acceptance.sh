@@ -16,7 +16,7 @@ printf '=== Lubko Ubuntu acceptance ===\n\n'
 # -- 1. Installed launcher existence and executability ----------------------
 
 printf '%s\n' '--- Installed launchers ---'
-for entry in lubko-board lubko-worker lubko-supervisor lubko-deploy \
+for entry in lubko-worker lubko-supervisor lubko-deploy \
              lubko-deploy-ctl lubko-install lubko-startup; do
   path="${BIN_HOME}/${entry}"
   if [ ! -f "$path" ]; then
@@ -40,18 +40,6 @@ if lubko-install --repo "${REPO}" --dry-run >/dev/null 2>&1; then
   pass "lubko-install --dry-run"
 else
   fail "lubko-install --dry-run"
-fi
-
-if lubko-board --help >/dev/null 2>&1; then
-  pass "lubko-board --help"
-else
-  fail "lubko-board --help"
-fi
-
-if lubko-board --help >/dev/null 2>&1; then
-  pass "lubko-board --help"
-else
-  fail "lubko-board --help"
 fi
 
 # -- 3. Startup boundary invocation via installed lubko-startup launcher ----

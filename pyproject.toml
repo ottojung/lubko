@@ -17,7 +17,6 @@ lubko-supervisor = "lubko.supervisor:main"
 lubko-deploy = "lubko.lifecycle:main"
 lubko-deploy-ctl = "lubko.deployctl:main"
 lubko-install = "lubko.install:main"
-lubko-board = "lubko.board:main"
 
 [project.optional-dependencies]
 dev = [

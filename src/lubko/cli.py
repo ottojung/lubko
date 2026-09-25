@@ -1,7 +1,7 @@
 """Coherent resolution of the maintained Lubko command line tools.
 
-The global entry points (``lubko-board``, ``lubko-worker``, ``lubko-supervisor``,
-``lubko-deploy``, ``lubko-deploy-ctl``, and ``lubko-install``) must always
+The global entry points (``lubko-worker``, ``lubko-supervisor``, ``lubko-deploy``,
+``lubko-deploy-ctl``, and ``lubko-install``) must always
 resolve to code from the *confirmed* maintained commit. A supervised
 deployment checks out a provisional candidate and may roll back to the
 previous commit at any time before confirmation, so the global CLIs must never
@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 ENTRY_POINTS: Final = (
-    "lubko-board",
     "lubko-worker",
     "lubko-supervisor",
     "lubko-deploy",
