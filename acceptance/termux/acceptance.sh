@@ -85,7 +85,7 @@ else
 fi
 
 printf '\n%s\n' '--- Installed launchers ---'
-for entry in lubko-board lubko-worker lubko-supervisor lubko-deploy \
+for entry in lubko-worker lubko-supervisor lubko-deploy \
              lubko-deploy-ctl lubko-install lubko-startup; do
   path="${BIN_HOME}/${entry}"
   if [ ! -f "$path" ]; then
@@ -106,18 +106,6 @@ if lubko-install --repo "$REPO" --dry-run >/dev/null 2>&1; then
   pass "lubko-install --dry-run"
 else
   fail "lubko-install --dry-run"
-fi
-
-if lubko-board --help >/dev/null 2>&1; then
-  pass "lubko-board --help"
-else
-  fail "lubko-board --help"
-fi
-
-if lubko-board --help >/dev/null 2>&1; then
-  pass "lubko-board --help"
-else
-  fail "lubko-board --help"
 fi
 
 printf '\n%s\n' '--- Startup boundary invocation ---'
