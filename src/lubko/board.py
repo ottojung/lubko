@@ -26,7 +26,7 @@ BOARD_AUTHOR_ENV: Final = "LUBKO_BOARD_AUTHOR"
 DEFAULT_BOARD_BASE_URL: Final = "https://vau.place/_skrynia"
 BORYS_NAMESPACE: Final = "borys"
 BOARD_KEY: Final = "board-v1"
-BOARD_SCHEMA_VERSION: Final = 1
+BOARD_SCHEMA_VERSION: Final = 2
 DEFAULT_MAX_ATTEMPTS: Final = 6
 HTTP_TIMEOUT_SECONDS: Final = 30.0
 MAX_SAFE_INTEGER: Final = (1 << 53) - 1
@@ -49,18 +49,30 @@ class BoardIssue(TypedDict):
 
     number: int
     title: str
+    body: str
     state: IssueState
     createdAt: str
     updatedAt: str
     messages: list[BoardMessage]
 
 
-class Board(TypedDict):
-    """The complete Borys board document."""
+class BoardResource(TypedDict):
+    """One canonical resource and its dependent issues."""
 
-    schemaVersion: Literal[1]
+    host: str
+    path: str
+    issueNumbers: list[int]
+    createdAt: str
+    updatedAt: str
+
+
+class Board(TypedDict):
+    """The complete canonical Borys v2 board document."""
+
+    schemaVersion: Literal[2]
     nextIssueNumber: int
     issues: list[BoardIssue]
+    resources: list[BoardResource]
 
 
 class BoardError(RuntimeError):
@@ -250,91 +262,147 @@ def _parse_message(value: object) -> BoardMessage:
     return cast("BoardMessage", message)
 
 
-def _parse_issue(value: object) -> BoardIssue:
-    """Validate and return one Borys issue.
+def _parse_issue(value: object, *, legacy: bool = False) -> BoardIssue:
+    """Validate one issue, accepting only the deployed v1 shape during migration.
 
     Returns:
         The validated issue.
 
     Raises:
-        BoardError: If the value is not a Borys v1 issue.
+        BoardError: If the issue is malformed or incompatible.
     """
+    error = "Borys board contains an incompatible or malformed issue"
     if not isinstance(value, dict):
-        msg = "Borys board contains an incompatible or malformed issue"
-        raise BoardError(msg)
-    issue = cast("dict[str, object]", value)
+        raise BoardError(error)
+    raw = cast("dict[str, object]", value)
     expected = frozenset({"number", "title", "state", "createdAt", "updatedAt", "messages"})
-    if not _exact_keys(issue, expected):
-        msg = "Borys board contains an incompatible or malformed issue"
-        raise BoardError(msg)
-    valid_identity = (
-        _is_positive_int(issue["number"])
-        and _is_non_empty_text(issue["title"])
-        and isinstance(issue["state"], str)
-        and issue["state"] in {"open", "closed"}
+    if not legacy:
+        expected |= {"body"}
+    if not _exact_keys(raw, expected):
+        raise BoardError(error)
+    valid = (
+        _is_positive_int(raw["number"])
+        and _is_non_empty_text(raw["title"])
+        and (legacy or isinstance(raw["body"], str))
+        and isinstance(raw["state"], str)
+        and raw["state"] in {"open", "closed"}
+        and _timestamp_seconds(raw["createdAt"]) is not None
+        and _timestamp_seconds(raw["updatedAt"]) is not None
+        and isinstance(raw["messages"], list)
     )
-    valid_times = (
-        _timestamp_seconds(issue["createdAt"]) is not None
-        and _timestamp_seconds(issue["updatedAt"]) is not None
-    )
-    if not valid_identity or not valid_times or not isinstance(issue["messages"], list):
-        msg = "Borys board contains an incompatible or malformed issue"
-        raise BoardError(msg)
-    parsed = cast("BoardIssue", issue)
-    messages = [_parse_message(message) for message in cast("list[object]", issue["messages"])]
+    if not valid:
+        raise BoardError(error)
+    issue = cast("BoardIssue", {**raw, "body": "" if legacy else raw["body"]})
+    issue["messages"] = [
+        _parse_message(message) for message in cast("list[object]", raw["messages"])
+    ]
     previous: float | None = None
-    for message in messages:
+    for message in issue["messages"]:
         created = _timestamp_seconds(message["createdAt"])
         if created is None:
             msg = "Borys board contains an incompatible message timestamp"
             raise BoardError(msg)
         if previous is not None and created < previous:
-            msg = f"Borys issue {parsed['number']} has messages out of chronological order"
+            msg = f"Borys issue {issue['number']} has messages out of chronological order"
             raise BoardError(msg)
         previous = created
-    parsed["messages"] = messages
-    return parsed
+    return issue
+
+
+def _valid_host(host: object) -> bool:
+    if not isinstance(host, str) or not host.startswith("lubko://"):
+        return False
+    server = host.removeprefix("lubko://")
+    return bool(server) and not any(character in server for character in "/?#\\")
+
+
+def _valid_path(path: object) -> bool:
+    if not isinstance(path, str) or not path.startswith("/") or "//" in path:
+        return False
+    if path != "/" and path.endswith("/"):
+        return False
+    return not any(part in {".", ".."} for part in path.split("/") if part)
+
+
+def _parse_resource(value: object, issue_numbers: set[int]) -> BoardResource:
+    """Validate one resource and its existing issue dependencies.
+
+    Returns:
+        The validated resource.
+
+    Raises:
+        BoardError: If the resource is malformed or incompatible.
+    """
+    error = "Borys board contains an incompatible or malformed resource"
+    if not isinstance(value, dict):
+        raise BoardError(error)
+    raw = cast("dict[str, object]", value)
+    if not _exact_keys(raw, frozenset({"host", "path", "issueNumbers", "createdAt", "updatedAt"})):
+        raise BoardError(error)
+    numbers = raw["issueNumbers"]
+    valid = (
+        _valid_host(raw["host"])
+        and _valid_path(raw["path"])
+        and isinstance(numbers, list)
+        and bool(numbers)
+        and all(_is_positive_int(number) for number in cast("list[object]", numbers))
+        and cast("list[int]", numbers) == sorted(set(cast("list[int]", numbers)))
+        and set(cast("list[int]", numbers)) <= issue_numbers
+        and _timestamp_seconds(raw["createdAt"]) is not None
+        and _timestamp_seconds(raw["updatedAt"]) is not None
+    )
+    if not valid:
+        raise BoardError(error)
+    return cast("BoardResource", raw)
 
 
 def parse_board(value: object) -> Board:
-    """Validate a Borys v1 board document.
-
-    Args:
-        value: Decoded JSON value.
+    """Parse and normalize the deployed v1 board or canonical v2 board.
 
     Returns:
-        The validated board.
+        The canonical v2 board.
 
     Raises:
-        BoardError: If the document is incompatible or malformed.
+        BoardError: If the board is malformed or incompatible.
     """
+    error = "Skrynia object borys/board-v1 contains an incompatible or malformed board"
     if not isinstance(value, dict):
-        msg = "Skrynia object borys/board-v1 contains an incompatible or malformed board"
-        raise BoardError(msg)
+        raise BoardError(error)
     raw = cast("dict[str, object]", value)
-    expected = frozenset({"schemaVersion", "nextIssueNumber", "issues"})
+    version = raw.get("schemaVersion")
+    legacy = version == 1
+    expected = (
+        frozenset({"schemaVersion", "nextIssueNumber", "issues", "resources"})
+        if version == BOARD_SCHEMA_VERSION
+        else frozenset({"schemaVersion", "nextIssueNumber", "issues"})
+    )
     if (
         not _exact_keys(raw, expected)
-        or not _is_positive_int(raw["schemaVersion"])
-        or raw["schemaVersion"] != BOARD_SCHEMA_VERSION
+        or version not in {1, 2}
         or not _is_positive_int(raw["nextIssueNumber"])
         or not isinstance(raw["issues"], list)
     ):
-        msg = "Skrynia object borys/board-v1 contains an incompatible or malformed board"
-        raise BoardError(msg)
-    issues = [_parse_issue(issue) for issue in cast("list[object]", raw["issues"])]
-    numbers = [issue["number"] for issue in issues]
-    if len(numbers) != len(set(numbers)):
-        msg = "Borys board contains duplicate issue numbers"
-        raise BoardError(msg)
+        raise BoardError(error)
+    issues = [_parse_issue(issue, legacy=legacy) for issue in cast("list[object]", raw["issues"])]
+    numbers = {item["number"] for item in issues}
     next_issue_number = cast("int", raw["nextIssueNumber"])
-    if numbers and next_issue_number <= max(numbers):
+    if len(numbers) != len(issues) or next_issue_number <= (max(numbers) if numbers else 0):
         msg = "Borys board issue number counter is inconsistent with its issues"
         raise BoardError(msg)
+    resources = (
+        [_parse_resource(item, numbers) for item in cast("list[object]", raw["resources"])]
+        if version == BOARD_SCHEMA_VERSION
+        else []
+    )
+    keys = [(item["host"], item["path"]) for item in resources]
+    if len(keys) != len(set(keys)):
+        msg = "Borys board contains duplicate resources"
+        raise BoardError(msg)
     return Board(
-        schemaVersion=1,
+        schemaVersion=BOARD_SCHEMA_VERSION,
         nextIssueNumber=next_issue_number,
         issues=issues,
+        resources=sorted(resources, key=itemgetter("host", "path")),
     )
 
 
@@ -476,11 +544,12 @@ class BoardClient:
         """
         return self._require_issue(self.load_board(), number)
 
-    def create_issue(self, title: str) -> BoardIssue:
+    def create_issue(self, title: str, body: str = "") -> BoardIssue:
         """Create an open issue using the current board counter.
 
         Args:
             title: Human-readable issue title.
+            body: Initial issue body.
 
         Returns:
             The committed issue.
@@ -504,6 +573,7 @@ class BoardClient:
             issue = BoardIssue(
                 number=created_number,
                 title=clean_title,
+                body=body.strip(),
                 state="open",
                 createdAt=timestamp,
                 updatedAt=timestamp,
@@ -516,6 +586,155 @@ class BoardClient:
 
         committed = self._mutate(mutate)
         return self._require_issue(committed, created_number)
+
+    def edit_issue(self, number: int, body: str) -> BoardIssue:
+        """Edit an open issue body.
+
+        Args:
+            number: Issue number.
+            body: Replacement issue body.
+
+        Returns:
+            The committed issue.
+
+        """
+        clean_body = body.strip()
+
+        def mutate(board: Board) -> Board:
+            current = self._require_issue(board, number)
+            if current["state"] != "open":
+                msg = f"Borys issue {number} is closed"
+                raise BoardError(msg)
+            changed = copy.deepcopy(current)
+            changed["body"] = clean_body
+            changed["updatedAt"] = _latest_timestamp(self._now(), current["updatedAt"])
+            candidate = copy.deepcopy(board)
+            candidate["issues"] = [
+                changed if issue["number"] == number else issue for issue in candidate["issues"]
+            ]
+            return candidate
+
+        return self._require_issue(self._mutate(mutate), number)
+
+    def add_resource(self, number: int, host: str, path: str) -> BoardResource:
+        """Attach an open issue to a canonical resource.
+
+        Args:
+            number: Dependent issue number.
+            host: Canonical Lubko host.
+            path: Canonical absolute POSIX path.
+
+        Returns:
+            The committed resource.
+
+        Raises:
+            BoardError: If validation fails or the mutation cannot commit.
+        """
+        if not _valid_host(host) or not _valid_path(path):
+            msg = "Resource host or path is not canonical"
+            raise BoardError(msg)
+
+        def mutate(board: Board) -> Board:
+            issue = self._require_issue(board, number)
+            if issue["state"] != "open":
+                msg = f"Borys issue {number} is closed"
+                raise BoardError(msg)
+            candidate = copy.deepcopy(board)
+            timestamp = _iso_timestamp(self._now())
+            for resource in candidate["resources"]:
+                if (resource["host"], resource["path"]) == (host, path):
+                    if number not in resource["issueNumbers"]:
+                        resource["issueNumbers"].append(number)
+                        resource["issueNumbers"].sort()
+                        resource["updatedAt"] = timestamp
+                    return candidate
+            candidate["resources"].append(
+                BoardResource(
+                    host=host,
+                    path=path,
+                    issueNumbers=[number],
+                    createdAt=timestamp,
+                    updatedAt=timestamp,
+                )
+            )
+            candidate["resources"].sort(key=itemgetter("host", "path"))
+            return candidate
+
+        committed = self._mutate(mutate)
+        return next(
+            item for item in committed["resources"] if (item["host"], item["path"]) == (host, path)
+        )
+
+    def remove_resource(self, number: int, host: str, path: str) -> list[BoardResource]:
+        """Remove one issue dependency, deleting an empty resource.
+
+        Args:
+            number: Dependent issue number.
+            host: Canonical Lubko host.
+            path: Canonical absolute POSIX path.
+
+        Returns:
+            The remaining resources in deterministic order.
+
+        Raises:
+            BoardError: If validation fails or the dependency does not exist.
+        """
+        if not _valid_host(host) or not _valid_path(path):
+            msg = "Resource host or path is not canonical"
+            raise BoardError(msg)
+
+        def mutate(board: Board) -> Board:
+            candidate = copy.deepcopy(board)
+            for resource in candidate["resources"]:
+                if (resource["host"], resource["path"]) == (host, path):
+                    if number not in resource["issueNumbers"]:
+                        msg = "Borys resource dependency does not exist"
+                        raise BoardError(msg)
+                    resource["issueNumbers"].remove(number)
+                    if not resource["issueNumbers"]:
+                        candidate["resources"].remove(resource)
+                    else:
+                        resource["updatedAt"] = _latest_timestamp(
+                            self._now(), resource["updatedAt"]
+                        )
+                    return candidate
+            msg = "Borys resource dependency does not exist"
+            raise BoardError(msg)
+
+        return self._mutate(mutate)["resources"]
+
+    def list_resources(
+        self, host: str | None = None, issue: int | None = None
+    ) -> list[dict[str, object]]:
+        """List deterministic resource views for automation and terminals.
+
+        Args:
+            host: Optional exact host filter.
+            issue: Optional dependent issue filter.
+
+        Returns:
+            Resource views with dependent states and protection status.
+        """
+        board = self.load_board()
+        issues = {item["number"]: item for item in board["issues"]}
+        views = []
+        for resource in board["resources"]:
+            if host is not None and resource["host"] != host:
+                continue
+            if issue is not None and issue not in resource["issueNumbers"]:
+                continue
+            dependent = [
+                {"number": number, "state": issues[number]["state"]}
+                for number in resource["issueNumbers"]
+            ]
+            views.append({
+                "host": resource["host"],
+                "path": resource["path"],
+                "issues": dependent,
+                "protected": any(item["state"] == "open" for item in dependent),
+                "collectible": all(item["state"] == "closed" for item in dependent),
+            })
+        return views
 
     def comment(self, number: int, author: str, body: str) -> BoardIssue:
         """Append one message to an issue.
@@ -700,6 +919,25 @@ def _parser() -> argparse.ArgumentParser:
 
     create_parser = subparsers.add_parser("create")
     create_parser.add_argument("title")
+    create_parser.add_argument("--body", default="")
+
+    edit_parser = subparsers.add_parser("edit")
+    edit_parser.add_argument("number", type=int)
+    edit_parser.add_argument("--body", required=True)
+
+    resource_parser = subparsers.add_parser("resource")
+    resource_commands = resource_parser.add_subparsers(dest="resource_command", required=True)
+    resource_list = resource_commands.add_parser("list")
+    resource_list.add_argument("--host")
+    resource_list.add_argument("--issue", type=int)
+    resource_add = resource_commands.add_parser("add")
+    resource_add.add_argument("issue", type=int)
+    resource_add.add_argument("host")
+    resource_add.add_argument("path")
+    resource_remove = resource_commands.add_parser("remove")
+    resource_remove.add_argument("issue", type=int)
+    resource_remove.add_argument("host")
+    resource_remove.add_argument("path")
 
     comment_parser = subparsers.add_parser("comment")
     comment_parser.add_argument("number", type=int)
@@ -716,6 +954,10 @@ def _parser() -> argparse.ArgumentParser:
         list_parser,
         show_parser,
         create_parser,
+        edit_parser,
+        resource_list,
+        resource_add,
+        resource_remove,
         comment_parser,
         close_parser,
         reopen_parser,
@@ -782,7 +1024,49 @@ def _client_from_environment() -> BoardClient:
     )
 
 
-def _run_command(args: argparse.Namespace, client: BoardClient) -> BoardIssue | list[BoardIssue]:
+def _run_resource_command(
+    args: argparse.Namespace, client: BoardClient
+) -> BoardResource | list[BoardResource] | list[dict[str, object]]:
+    """Execute one parsed resource command.
+
+    Args:
+        args: Parsed resource arguments.
+        client: Configured board client.
+
+    Returns:
+        The selected resource view or committed resource state.
+    """
+    resource_command = cast("str", args.resource_command)
+    if resource_command == "list":
+        return client.list_resources(cast("str | None", args.host), cast("int | None", args.issue))
+    if resource_command == "add":
+        return client.add_resource(
+            cast("int", args.issue), cast("str", args.host), cast("str", args.path)
+        )
+    return client.remove_resource(
+        cast("int", args.issue), cast("str", args.host), cast("str", args.path)
+    )
+
+
+def _run_issue_write(args: argparse.Namespace, client: BoardClient) -> BoardIssue:
+    """Execute a create or edit command.
+
+    Args:
+        args: Parsed issue arguments.
+        client: Configured board client.
+
+    Returns:
+        The committed issue.
+    """
+    body = cast("str", args.body)
+    if cast("str", args.command) == "create":
+        return client.create_issue(cast("str", args.title), body)
+    return client.edit_issue(cast("int", args.number), body)
+
+
+def _run_command(
+    args: argparse.Namespace, client: BoardClient
+) -> BoardIssue | list[BoardIssue] | BoardResource | list[BoardResource] | list[dict[str, object]]:
     """Execute one parsed CLI command.
 
     Returns:
@@ -798,18 +1082,19 @@ def _run_command(args: argparse.Namespace, client: BoardClient) -> BoardIssue | 
         return client.list_issues(state)
     if command == "show":
         return client.get_issue(cast("int", args.number))
-    if command == "create":
-        return client.create_issue(cast("str", args.title))
+    if command in {"create", "edit"}:
+        return _run_issue_write(args, client)
+    if command == "resource":
+        return _run_resource_command(args, client)
     if command == "comment":
         author = cast("str | None", args.author) or os.environ.get(BOARD_AUTHOR_ENV)
         if not author:
             msg = f"Message author is required; use --author or {BOARD_AUTHOR_ENV}"
             raise BoardError(msg)
         return client.comment(cast("int", args.number), author, cast("str", args.body))
-    if command == "close":
-        return client.close(cast("int", args.number))
-    if command == "reopen":
-        return client.reopen(cast("int", args.number))
+    if command in {"close", "reopen"}:
+        number = cast("int", args.number)
+        return client.close(number) if command == "close" else client.reopen(number)
     msg = f"unsupported lubko-board command: {command}"
     raise BoardError(msg)
 
@@ -831,18 +1116,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     if cast("bool", args.json_output):
-        if isinstance(result, list):
-            _write_stdout(_issues_json(result))
-        else:
-            _write_stdout(_issue_json(result))
+        _write_stdout(json.dumps(result, separators=(",", ":"), ensure_ascii=False, sort_keys=True))
         return 0
 
     if isinstance(result, list):
-        for issue in result:
-            _write_stdout(f"#{issue['number']} [{issue['state']}] {issue['title']}")
+        for raw_item in cast("list[object]", result):
+            item = cast("dict[str, object]", raw_item)
+            if "host" in item and "path" in item and "issues" in item:
+                states = ", ".join(
+                    f"#{entry['number']} [{entry['state']}]"
+                    for entry in cast("list[dict[str, object]]", item["issues"])
+                )
+                status = "protected" if item["protected"] else "collectible"
+                _write_stdout(f"{item['host']} {item['path']} {states} {status}")
+            else:
+                _write_stdout(f"#{item['number']} [{item['state']}] {item['title']}")
         return 0
 
-    _write_stdout(_human_issue(result))
+    _write_stdout(_human_issue(cast("BoardIssue", result)))
     return 0
 
 

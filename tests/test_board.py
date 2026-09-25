@@ -16,6 +16,7 @@ from lubko.board import (
     BoardClient,
     BoardError,
     BoardIssue,
+    BoardResource,
     HttpResponse,
     StandardHttpClient,
     parse_board,
@@ -91,6 +92,7 @@ def issue(
     return BoardIssue(
         number=number,
         title=title or f"Issue {number}",
+        body="",
         state=state,
         createdAt="2026-09-24T10:00:00.000Z",
         updatedAt=updated_at,
@@ -102,6 +104,7 @@ def board(
     *,
     next_issue: int = 2,
     issues: list[BoardIssue] | None = None,
+    resources: list[BoardResource] | None = None,
 ) -> Board:
     """Build one valid board for tests.
 
@@ -109,9 +112,10 @@ def board(
         A valid board.
     """
     return Board(
-        schemaVersion=1,
+        schemaVersion=2,
         nextIssueNumber=next_issue,
         issues=list(issues) if issues is not None else [issue(1)],
+        resources=list(resources or []),
     )
 
 
@@ -427,6 +431,173 @@ def test_capability_is_never_reflected_in_http_errors() -> None:
     with pytest.raises(BoardError) as raised:
         client.close(1)
     assert capability not in str(raised.value)
+
+
+def test_v1_board_is_normalized_to_v2_in_memory() -> None:
+    """A deployed v1 board is normalized in memory to the v2 schema."""
+    raw = cast("dict[str, object]", json.loads(json.dumps(board())))
+    raw["schemaVersion"] = 1
+    raw.pop("resources")
+    for raw_issue in cast("list[dict[str, object]]", raw["issues"]):
+        raw_issue.pop("body")
+
+    parsed = parse_board(raw)
+
+    assert parsed["schemaVersion"] == 2
+    assert parsed["resources"] == []
+    assert not parsed["issues"][0]["body"]
+
+
+def test_resource_schema_rejects_noncanonical_or_invalid_dependencies() -> None:
+    """Resources require canonical identities and existing unique dependencies."""
+    valid = BoardResource(
+        host="lubko://server",
+        path="/workspace/project",
+        issueNumbers=[1],
+        createdAt="2026-09-24T10:00:00.000Z",
+        updatedAt="2026-09-24T10:00:00.000Z",
+    )
+    assert parse_board(board(resources=[valid]))["resources"] == [valid]
+    mutations: tuple[dict[str, object], ...] = (
+        {"host": "lubko://server/"},
+        {"path": "/workspace//project"},
+        {"path": "/workspace/../project"},
+        {"path": "/workspace/./project"},
+        {"path": "/workspace/"},
+        {"issueNumbers": []},
+        {"issueNumbers": [1, 1]},
+        {"issueNumbers": [2]},
+    )
+    for mutation in mutations:
+        raw = cast("dict[str, object]", json.loads(json.dumps(board(resources=[valid]))))
+        raw_resource = cast("dict[str, object]", cast("list[object]", raw["resources"])[0])
+        raw_resource.update(mutation)
+        with pytest.raises(BoardError, match="malformed resource"):
+            parse_board(raw)
+
+
+def test_resource_add_is_idempotent_and_remove_deletes_last_dependency() -> None:
+    """Duplicate dependencies are stable and an empty resource is deleted."""
+    initial = board()
+    first = board(
+        resources=[
+            BoardResource(
+                host="lubko://server",
+                path="/workspace/project",
+                issueNumbers=[1],
+                createdAt="2026-09-24T10:05:00.000Z",
+                updatedAt="2026-09-24T10:05:00.000Z",
+            )
+        ]
+    )
+    duplicate = board(
+        resources=[
+            BoardResource(
+                host="lubko://server",
+                path="/workspace/project",
+                issueNumbers=[1],
+                createdAt="2026-09-24T10:05:00.000Z",
+                updatedAt="2026-09-24T10:05:00.000Z",
+            )
+        ]
+    )
+    fake = FakeHttp([
+        response(200, initial, etag='"v1"'),
+        response(200),
+        response(200, first, etag='"v2"'),
+        response(200, first, etag='"v2"'),
+        response(200),
+        response(200, duplicate, etag='"v3"'),
+        response(200, duplicate, etag='"v3"'),
+        response(200),
+        response(200, board(), etag='"v4"'),
+    ])
+    client = BoardClient(
+        capability="1" * 64,
+        http=fake,
+        now=lambda: datetime(2026, 9, 24, 10, 5, tzinfo=UTC),
+    )
+
+    assert client.add_resource(1, "lubko://server", "/workspace/project") == first["resources"][0]
+    assert (
+        client.add_resource(1, "lubko://server", "/workspace/project") == duplicate["resources"][0]
+    )
+    assert client.remove_resource(1, "lubko://server", "/workspace/project") == []
+
+
+def test_closed_issue_cannot_gain_resource_and_state_preserves_dependency() -> None:
+    """Open issues alone may gain dependencies, and state changes retain them."""
+    resource = BoardResource(
+        host="lubko://server",
+        path="/workspace/project",
+        issueNumbers=[1],
+        createdAt="2026-09-24T10:00:00.000Z",
+        updatedAt="2026-09-24T10:00:00.000Z",
+    )
+    current = board(resources=[resource])
+    closed = board(issues=[issue(1, state="closed")], resources=[resource])
+    fake = FakeHttp([
+        response(200, closed, etag='"v1"'),
+        response(200, current, etag='"v1"'),
+        response(200),
+        response(200, closed, etag='"v2"'),
+    ])
+    client = BoardClient(capability="2" * 64, http=fake)
+
+    with pytest.raises(BoardError, match="closed"):
+        client.add_resource(1, "lubko://server", "/workspace/project")
+    assert client.close(1)["state"] == "closed"
+    assert decode_request_body(fake.requests[2])["resources"][0] == resource
+
+
+def test_resource_list_reports_dependent_states_and_filters() -> None:
+    """Resource views expose dependent states, status, and deterministic filters."""
+    resource = BoardResource(
+        host="lubko://server",
+        path="/workspace/project",
+        issueNumbers=[1, 2],
+        createdAt="2026-09-24T10:00:00.000Z",
+        updatedAt="2026-09-24T10:00:00.000Z",
+    )
+    current = board(
+        next_issue=3,
+        issues=[issue(1), issue(2, state="closed")],
+        resources=[resource],
+    )
+    fake = FakeHttp([
+        response(200, current, etag='"v1"'),
+        response(200, current, etag='"v1"'),
+        response(200, current, etag='"v1"'),
+        response(200, current, etag='"v1"'),
+        response(200, current, etag='"v1"'),
+    ])
+    client = BoardClient(http=fake)
+
+    expected = client.list_resources()
+    assert expected == [
+        {
+            "host": "lubko://server",
+            "path": "/workspace/project",
+            "issues": [{"number": 1, "state": "open"}, {"number": 2, "state": "closed"}],
+            "protected": True,
+            "collectible": False,
+        }
+    ]
+    assert client.list_resources(issue=2) == expected
+    assert client.list_resources(issue=3) == []
+    assert client.list_resources(host="lubko://other") == []
+
+
+def test_edit_rejects_closed_issue_before_writing() -> None:
+    """Closed issue bodies are immutable."""
+    fake = FakeHttp([response(200, board(issues=[issue(1, state="closed")]), etag='"v1"')])
+    client = BoardClient(capability="3" * 64, http=fake)
+
+    with pytest.raises(BoardError, match="closed"):
+        client.edit_issue(1, "replacement")
+
+    assert len(fake.requests) == 1
+    assert fake.requests[0].method == "GET"
 
 
 def test_cli_json_output_is_stable(
