@@ -560,7 +560,7 @@ def test_install_fails_closed_when_deploy_lock_is_busy(
     assert code == install.EXIT_ERROR
     assert "deployment lock" in capsys.readouterr().err
     assert cli.current_commit() is None
-    assert (bin_dir / "lubko-agent").is_file()
+    assert (bin_dir / "lubko-board").is_file()
 
 
 @pytest.mark.usefixtures("supervisor_token")
@@ -635,7 +635,7 @@ def test_launcher_source_resolves_shell_from_path(
     fake_sh.write_text("", encoding="utf-8")
     fake_sh.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
-    source = cli.launcher_source("lubko-agent")
+    source = cli.launcher_source("lubko-board")
     assert source.startswith(f"#!{fake_sh}\n")
 
 
@@ -644,7 +644,7 @@ def test_launcher_source_fails_without_sh(tmp_path: Path, monkeypatch: pytest.Mo
     """Missing sh on PATH raises CliError, never silently emits /bin/sh."""
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(cli.CliError, match="sh not found"):
-        cli.launcher_source("lubko-agent")
+        cli.launcher_source("lubko-board")
 
 
 @pytest.mark.usefixtures("supervisor_token")

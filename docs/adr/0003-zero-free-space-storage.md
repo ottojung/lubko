@@ -303,7 +303,7 @@ current `/tmp` spool placement is the one existing tmpfs dependence and it
 is removed rather than relied upon).
 
 The `agents/<id>/output.log` capture is per-agent-session state outside
-supervisor/worker lifecycle authority; agent sessions are operator-invoked
+supervisor/worker lifecycle authority; external jobs are operator-invoked
 while free space is an operator concern, so it keeps ordinary file
 semantics and may fail loudly.
 
