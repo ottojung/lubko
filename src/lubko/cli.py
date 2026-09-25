@@ -35,12 +35,14 @@ start, restart, probe, or crash recovery.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+import tarfile
 from contextlib import suppress
 from operator import itemgetter
 from pathlib import Path
@@ -553,7 +555,7 @@ def _extract_archive(repo: Path, commit: str, destination: Path, timeout_seconds
         repo: Repository checkout that contains the commit.
         commit: Exact commit hash to extract.
         destination: Directory to receive the extracted tree.
-        timeout_seconds: Bounded timeout.
+        timeout_seconds: Bounded timeout for creating the Git archive.
 
     Raises:
         CliError: If the archive or extraction fails.
@@ -575,22 +577,11 @@ def _extract_archive(repo: Path, commit: str, destination: Path, timeout_seconds
         msg = f"git archive of commit {commit} failed: {detail}"
         raise CliError(msg)
     try:
-        extracted = subprocess.run(
-            ["tar", "-x", "-C", str(destination)],
-            input=archived.stdout,
-            capture_output=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as archive:
+            archive.extractall(destination, filter="data")
+    except (OSError, tarfile.TarError) as exc:
         msg = f"could not extract commit {commit}: {exc}"
         raise CliError(msg) from exc
-    if extracted.returncode != 0:
-        detail = (
-            extracted.stderr or extracted.stdout
-        ).decode().strip() or f"exit code {extracted.returncode}"
-        msg = f"extraction of commit {commit} failed: {detail}"
-        raise CliError(msg)
 
 
 def _sync_venv(uv_path: str, root: Path, timeout_seconds: float) -> None:
