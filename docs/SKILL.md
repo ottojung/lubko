@@ -5,7 +5,7 @@ description: Submit and observe commands through the Lubko connector and executi
 
 # Lubko
 
-Lubko is an agent-agnostic connector and execution transport. ChatGPT submits a versioned command row to the `lubko.jobs` queue; a worker claims the row, executes the requested process in the selected working directory, and publishes output and a terminal result to the same row.
+Lubko is the connector and execution transport. ChatGPT submits a versioned command row to the `lubko.jobs` queue; a worker claims the row, executes the requested process in the selected working directory, and publishes output and a terminal result to the same row.
 
 ## Transport flow
 
@@ -36,7 +36,7 @@ The worker executes `request.process` directly, without a shell. Select a shell 
 - Continue bounded polling while work is nonterminal; never silently end with outstanding work.
 - Cancel only pending or running jobs, then poll until cancellation reaches a terminal state.
 - Do not infer one job's result from another similar-looking row.
-- Keep repository review, agent selection, and agent-specific instructions outside Lubko.
+- Keep higher-level orchestration policy, including work selection and repository review, outside Lubko.
 
 ## Cancellation
 

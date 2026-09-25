@@ -1,6 +1,6 @@
 # Lubko
 
-Lubko is the agent-agnostic connector and execution transport for remote development commands. ChatGPT submits commands through the `lubko.jobs` queue, a Lubko worker executes them in the requested working directory, and the worker publishes bounded output and a terminal result to the same job row.
+Lubko is the connector and execution transport for remote development commands. ChatGPT submits commands through the `lubko.jobs` queue, a Lubko worker executes them in the requested working directory, and the worker publishes bounded output and a terminal result to the same job row.
 
 ## Getting started
 
