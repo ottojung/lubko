@@ -53,6 +53,25 @@ def fake_extract_archive(
     """Skip real ``git archive``/``tar`` extraction; ``fake_uv_sync`` populates the tree."""
 
 
+def test_archive_extraction_needs_no_external_extractor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Maintained runtime extraction depends only on Git and the Python runtime."""
+    repo, _first = make_repo_with_pyproject(tmp_path / "repo")
+    commit = head_commit(repo)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "git").symlink_to(GIT_BIN)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    destination = tmp_path / "extracted"
+    destination.mkdir()
+
+    cli._extract_archive(repo, commit, destination, 60.0)
+
+    assert (destination / "marker.txt").read_text(encoding="utf-8") == "B\n"
+    assert (destination / "pyproject.toml").is_file()
+
+
 def git(*args: str, cwd: Path) -> str:
     """Run one git command and return its trimmed stdout.
 
