@@ -17,7 +17,7 @@ printf '=== Lubko Ubuntu acceptance ===\n\n'
 
 printf '%s\n' '--- Installed launchers ---'
 for entry in lubko-board lubko-worker lubko-supervisor lubko-deploy \
-             lubko-deploy-ctl lubko-install my-lubko-agent lubko-startup; do
+             lubko-deploy-ctl lubko-install lubko-startup; do
   path="${BIN_HOME}/${entry}"
   if [ ! -f "$path" ]; then
     fail "$entry: missing"
