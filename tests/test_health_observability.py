@@ -83,12 +83,12 @@ def test_gc_bound_hit_propagates_from_collect_transport() -> None:
     sup.conn = cast("JobsConnection", object())  # non-None so _run_gc proceeds
 
     with patch.object(worker, "collect_transport", return_value=([], 0, 0, True)):
-        sup._run_gc()
+        assert sup._run_gc() is True
     assert sup._gc_batch_bound_hit is True
     assert isinstance(sup._last_gc_at, float)
 
     with patch.object(worker, "collect_transport", return_value=([], 0, 0, False)):
-        sup._run_gc()
+        assert sup._run_gc() is False
     assert sup._gc_batch_bound_hit is False
 
 
