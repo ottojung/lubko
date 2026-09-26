@@ -59,7 +59,7 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     Returns:
         The completed process result.
     """
-    return _run(["git", *args], cwd=cwd)
+    return _run(["git", "-c", "commit.gpgsign=false", *args], cwd=cwd)
 
 
 def _init_repo(path: Path) -> None:
