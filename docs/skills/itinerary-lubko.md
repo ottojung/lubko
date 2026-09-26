@@ -1,9 +1,10 @@
 # Lubko scheduled-work itinerary
 
-This itinerary is the entry point for scheduled ChatGPT tasks that maintain the Lubko repository.
+This itinerary is the Lubko-specific execution, integration, and completion policy for work selected through the Antonina board.
 
 Before acting, study and obey:
 
+- Antonina's canonical board-orchestrator skill: <https://github.com/ottojung/antonina/blob/main/docs/skills/orchestrator.md>;
 - `AGENTS.md`;
 - `docs/GOVERNANCE.md`;
 - `docs/SKILL.md`;
@@ -12,15 +13,15 @@ Before acting, study and obey:
 - the current intent records under `docs/intent-records/`;
 - the protocol, lifecycle, startup, and deployment documents relevant to the selected work.
 
+The Antonina board is the coordination authority. Queue selection, claims, recovery, progress, blockers, and handoff are governed by the canonical orchestrator skill. GitHub issues and pull requests are execution/specification artifacts, not a second scheduler.
+
 ## Work selection
 
-Recover useful abandoned work before inventing duplicate work. Prefer, in order:
+Use the Antonina board selection algorithm. For Lubko work, prefer recoverable ongoing work before starting duplicate work; otherwise the highest-priority actionable Lubko board issue wins.
 
-1. an existing open pull request that can be advanced or repaired;
-2. an actionable open issue whose dependencies are satisfied and which is not actively owned;
-3. repository-wide audit or cleanup work only when it addresses a concrete current risk or inconsistency.
+An existing open pull request may be the objective durable state of the selected board issue and should be advanced when useful. Do not create repository-wide audit or cleanup work merely to keep the scheduler busy; such work needs a concrete board issue or a concrete current risk worth recording as one.
 
-Do not let one blocked issue terminate the recurring workflow. Record durable recovery state and continue with another useful item.
+Do not let one blocked issue terminate recurring orchestration. Append the blocker to the board and continue with another actionable issue.
 
 ## Integration
 
@@ -36,7 +37,7 @@ Use the validation requirements from `AGENTS.md`, `docs/GOVERNANCE.md`, `docs/TE
 
 In particular, preserve the single canonical `uv run pytest` suite and its under-ten-second requirement, together with formatting, lint, strict typing, and frozen dependency validation.
 
-A scheduled work item is complete when:
+A Lubko board issue is complete when:
 
 - its requested repository result is implemented;
 - required review has been completed;
@@ -44,4 +45,4 @@ A scheduled work item is complete when:
 - no unresolved correctness or review blocker remains;
 - the work is integrated into the active release branch, or deliberately left in a clearly recoverable reviewed PR state when there is a concrete reason not to merge yet.
 
-After completion, continue future scheduled invocations with the next useful Lubko work item.
+When the completion predicate is actually satisfied, append the completed board comment, close the Antonina board issue, and verify that it has left the queue.
