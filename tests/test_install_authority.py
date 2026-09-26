@@ -85,6 +85,8 @@ def git(*args: str, cwd: Path) -> str:
             "user.name=lubko-test",
             "-c",
             "user.email=lubko-test@example.com",
+            "-c",
+            "commit.gpgsign=false",
             *args,
         ],
         cwd=cwd,

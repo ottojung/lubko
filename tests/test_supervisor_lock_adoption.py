@@ -13,6 +13,7 @@ import errno
 import fcntl
 import json
 import os
+import resource
 from typing import TYPE_CHECKING, Final
 
 import pytest
@@ -88,10 +89,11 @@ def test_adoption_rejects_negative_fd(lock_dir: Path) -> None:
 
 
 @pytest.mark.usefixtures("supervisor_token")
-def test_adoption_rejects_huge_fd(lock_dir: Path) -> None:
-    """Fd numbers beyond RLIMIT_NOFILE fail closed."""
+def test_adoption_rejects_huge_fd(lock_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fd numbers at RLIMIT_NOFILE fail closed independent of host limits."""
+    monkeypatch.setattr(resource, "getrlimit", lambda _which: (256, 256))
     with pytest.raises(OSError, match="outside the open-fd limit"):
-        supervise.adopt_supervisor_lock(999999, HANDOFF_LOCK_PATH)
+        supervise.adopt_supervisor_lock(256, HANDOFF_LOCK_PATH)
 
 
 @pytest.mark.usefixtures("supervisor_token")
