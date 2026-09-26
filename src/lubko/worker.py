@@ -4900,10 +4900,16 @@ class Supervisor:
                     time.monotonic() + self.settings.lease_recovery_interval_seconds
                 )
         if now >= self._next_gc_at:
+            # GC is cooperative with the worker loop: one bounded pass per
+            # turn, then always yield back to normal supervision. A saturated
+            # pass is scheduled again for the next worker turn; once caught
+            # up, GC returns to its configured idle cadence.
+            next_gc_delay = self.settings.gc_interval_seconds
             try:
-                self._run_gc()
+                if self._run_gc():
+                    next_gc_delay = self.settings.process_poll_interval_seconds
             finally:
-                self._next_gc_at = time.monotonic() + self.settings.gc_interval_seconds
+                self._next_gc_at = time.monotonic() + next_gc_delay
 
     def _drain_captures(self, bound: int | None = None) -> None:
         """Drain every active job's capture pipes into their bounded spools.
@@ -5116,17 +5122,21 @@ class Supervisor:
                 "reaped %d pending job(s) at an unsupported protocol version", len(reaped)
             )
 
-    def _run_gc(self) -> None:
+    def _run_gc(self) -> bool:
         """Run the transport garbage collection pass.
 
         Three-phase staged GC: mark terminal roots, drain one root's chunks in
         a bounded batch, finalize that root when empty, then clean orphan chunks.
         Abandoned ``running`` rows go through lease recovery first.
         ``pending`` and ``running`` rows are never collected.
+
+        Returns:
+            Whether the pass hit a GC batch bound and should therefore be
+            scheduled again on the next worker turn.
         """
         conn = self.conn
         if conn is None:
-            return
+            return False
         self._last_gc_at = time.time()
         roots, chunks, orphans, bound_hit = collect_transport(conn, self.settings)
         self._gc_batch_bound_hit = bound_hit
@@ -5138,6 +5148,7 @@ class Supervisor:
                 orphans,
                 "; batch bound hit (saturated)" if bound_hit else "",
             )
+        return bound_hit
 
     def _heartbeat_root_ids(self) -> set[UUID]:
         """Return the root IDs whose lease is refreshed this turn.
