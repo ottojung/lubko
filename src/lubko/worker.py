@@ -350,6 +350,43 @@ def operation_deadline_at(
     return limit
 
 
+def _scan_schedule_overdue(
+    now_mono: float,
+    scheduled_at: float,
+    *,
+    db_operation_timeout_seconds: float,
+    process_poll_interval_seconds: float,
+) -> bool:
+    """Return whether a maintenance scan is genuinely late.
+
+    Maintenance runs cooperatively in the same single worker loop as bounded
+    database work. A preceding established DB operation may legitimately use
+    its entire hard client deadline before the loop reaches a due scan, then
+    the loop may sleep for one process-poll quantum. That bounded scheduling
+    jitter is healthy; lateness beyond it means the maintenance loop has
+    missed work for longer than any one permitted DB operation.
+
+    A non-positive schedule means the scan has not yet received its first
+    scheduling timestamp. It is due immediately, but not itself evidence of a
+    stalled loop; other liveness/DB signals still fail closed if startup does
+    not progress.
+
+    Args:
+        now_mono: Current monotonic time.
+        scheduled_at: Nominal monotonic time at which the scan became due.
+        db_operation_timeout_seconds: Hard client deadline for one established
+            database operation.
+        process_poll_interval_seconds: Normal worker-loop yield interval.
+
+    Returns:
+        True only when the scan is late beyond the bounded scheduling budget.
+    """
+    if scheduled_at <= 0.0:
+        return False
+    lateness_budget = db_operation_timeout_seconds + process_poll_interval_seconds
+    return now_mono > scheduled_at + lateness_budget
+
+
 def install_operation_deadline(conn: JobsConnection | None, deadline: float) -> None:
     """Install the hard client deadline on the supervisor's live connection.
 
@@ -6607,9 +6644,24 @@ class Supervisor:
             min_lease_safety_remaining_seconds=min_lease_safety_remaining,
             capture_streams_open=capture_open,
             spool_held_bytes=spool_held,
-            cancellation_scan_overdue=now_mono > getattr(self, "_next_cancel_scan_at", 0.0),
-            recovery_overdue=now_mono > getattr(self, "_next_recovery_at", 0.0),
-            gc_overdue=now_mono > getattr(self, "_next_gc_at", 0.0),
+            cancellation_scan_overdue=_scan_schedule_overdue(
+                now_mono,
+                getattr(self, "_next_cancel_scan_at", 0.0),
+                db_operation_timeout_seconds=self.settings.db_operation_timeout_seconds,
+                process_poll_interval_seconds=self.settings.process_poll_interval_seconds,
+            ),
+            recovery_overdue=_scan_schedule_overdue(
+                now_mono,
+                getattr(self, "_next_recovery_at", 0.0),
+                db_operation_timeout_seconds=self.settings.db_operation_timeout_seconds,
+                process_poll_interval_seconds=self.settings.process_poll_interval_seconds,
+            ),
+            gc_overdue=_scan_schedule_overdue(
+                now_mono,
+                getattr(self, "_next_gc_at", 0.0),
+                db_operation_timeout_seconds=self.settings.db_operation_timeout_seconds,
+                process_poll_interval_seconds=self.settings.process_poll_interval_seconds,
+            ),
         )
 
     def _record_db_deadline_breach(self) -> None:

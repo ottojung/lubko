@@ -196,6 +196,58 @@ def test_lease_safety_remaining_zero_at_exact_margin_boundary() -> None:
     assert agg.min_lease_safety_remaining_seconds == pytest.approx(0.0)
 
 
+def test_scan_schedule_jitter_within_db_deadline_is_not_overdue() -> None:
+    """Ordinary single-loop DB scheduling jitter must not degrade readiness."""
+    sup = _bare_supervisor()
+    sup.settings = replace(
+        sup.settings,
+        db_operation_timeout_seconds=5.0,
+        process_poll_interval_seconds=0.1,
+    )
+    sup._next_cancel_scan_at = 100.0
+    sup._next_recovery_at = 100.0
+    sup._next_gc_at = 100.0
+
+    agg = sup._collect_health_aggregates(now_mono=105.1)
+
+    assert agg.cancellation_scan_overdue is False
+    assert agg.recovery_overdue is False
+    assert agg.gc_overdue is False
+
+
+def test_scan_schedule_beyond_db_deadline_and_poll_is_overdue() -> None:
+    """A genuinely stalled maintenance loop remains visible and not ready."""
+    sup = _bare_supervisor()
+    sup.settings = replace(
+        sup.settings,
+        db_operation_timeout_seconds=5.0,
+        process_poll_interval_seconds=0.1,
+    )
+    sup._next_cancel_scan_at = 100.0
+    sup._next_recovery_at = 100.0
+    sup._next_gc_at = 100.0
+
+    agg = sup._collect_health_aggregates(now_mono=105.100001)
+
+    assert agg.cancellation_scan_overdue is True
+    assert agg.recovery_overdue is True
+    assert agg.gc_overdue is True
+
+
+def test_initial_due_scans_are_not_reported_stalled_before_first_turn() -> None:
+    """The pre-first-turn zero schedule is due, not evidence of a stalled loop."""
+    sup = _bare_supervisor()
+    sup._next_cancel_scan_at = 0.0
+    sup._next_recovery_at = 0.0
+    sup._next_gc_at = 0.0
+
+    agg = sup._collect_health_aggregates(now_mono=1_000_000.0)
+
+    assert agg.cancellation_scan_overdue is False
+    assert agg.recovery_overdue is False
+    assert agg.gc_overdue is False
+
+
 def test_cancellation_batch_bound_hit_below_and_at_limit() -> None:
     """Cancellation saturation is set from the actual returned count."""
     sup = _bare_supervisor()
