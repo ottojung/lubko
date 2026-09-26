@@ -1,29 +1,35 @@
----
-name: lubko
-description: Submit and observe commands through the Lubko connector and execution transport.
----
+"fname        | lubko                                                                            |
+| ----------- | ------------------------------------------------------------------------------- |
+| description | Submit and observe commands through the Lubko connector and execution transport. |
 
 # Lubko
 
-Lubko is the connector and execution transport. ChatGPT submits a versioned command row to the `lubko.jobs` queue; a worker claims the row, executes the requested process in the selected working directory, and publishes output and a terminal result to the same row.
+Lubko is the connector and execution transport. An AI agent submits a versioned command row to the `lubko.jobs` queue at its operator's request; a worker claims the row, executes the requested process in the selected working directory, and publishes output and a terminal result to the same row.
+
+Jobs only run on hosts where a worker has been explicitly deployed and configured to poll the queue for a given server name. `marceline-dev` and `phoebe-dev` are the two hosts currently configured this way — submitting a job addressed to an unconfigured server name simply leaves it unclaimed. Job submission follows the operator's request in the live conversation.
+
+## Servers
+
+- `marceline-dev` (default — use this when no server is specified)
+- `phoebe-dev`
 
 ## Transport flow
 
-```text
-ChatGPT -> Supabase connector -> lubko.jobs -> worker -> command result -> ChatGPT
+```
+Agent -> Supabase connector -> lubko.jobs -> worker -> command result -> Agent
 ```
 
 Insert a protocol-v4 command addressed to the execution server and retain the returned UUID:
 
-```sql
+```
 insert into lubko.jobs (payload)
-values ('{"v":4,"type":"command","server":"alpha-server","request":{"cwd":"/workspace/project","process":["git","status","--short"]},"state":{"status":"pending"}}')
+values ('{"v":4,"type":"command","server":"marceline-dev","request":{"cwd":"<working-directory>","process":["git","status","--short"]},"state":{"status":"pending"}}')
 returning id;
 ```
 
 Poll the same root row until terminal:
 
-```sql
+```
 select id, payload from lubko.jobs where id = '<root-job-uuid>';
 ```
 
@@ -48,4 +54,4 @@ If a job needs a utility missing from the Lubko host and `guix` is available, ru
 
 ## Protocol
 
-The complete protocol and compatibility rules are in [`protocol.md`](protocol.md), with deployment and lifecycle details in the other documents under `docs/`. PostgreSQL table metadata remains frozen; protocol semantics live in the payload and application code.
+The complete protocol and compatibility rules are in [`protocol.md`](https://github.com/ottojung/lubko/blob/main/docs/protocol.md), with deployment and lifecycle details in the other documents under `docs/`. PostgreSQL table metadata remains frozen; protocol semantics live in the payload and application code.
