@@ -184,8 +184,6 @@ else
 fi
 unset LUBKO_SUPERVISOR_STATE_TOKEN
 
-rm -rf "${TINI_DIR}"
-
 # -- 4. cli/current points to exact source HEAD ----------------------------
 
 printf '\n%s\n' '--- cli/current points to source HEAD ---'
