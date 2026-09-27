@@ -1447,6 +1447,28 @@ class SupervisorDaemon:
             )
             LOGGER.error("%s", self._message)
             return
+        if not already_running and not self._candidate_is_launchable(desired.commit):
+            # Compatibility is decided before the known-good worker retires.
+            # Retiring first would let a supervisor that has already proven it
+            # cannot instantiate the requested runtime hold without a worker:
+            # a predecessor whose own entry-point set is a superset of the
+            # candidate's would strand the host instead of upgrading, because
+            # the candidate is rejected only after its worker is gone.
+            now = time.monotonic()
+            self._write_state_authority_safe(
+                replace(
+                    read_state(),
+                    next_attempt_at=now + self._backoff_seconds(state.restart_count),
+                )
+            )
+            pid = state.child.pid if state.child is not None else None
+            LOGGER.error(
+                "cannot instantiate the requested runtime for commit %s; keeping the recorded "
+                "worker (pid %s)",
+                desired.commit,
+                pid,
+            )
+            return
         if not already_running:
             state = read_state()
             if not self._retire_child():
@@ -1500,6 +1522,34 @@ class SupervisorDaemon:
     # ------------------------------------------------------------------
     # Worker ownership
     # ------------------------------------------------------------------
+
+    def _candidate_is_launchable(self, commit: str) -> bool:
+        """Return whether this supervisor process can instantiate ``commit``.
+
+        The answer comes from this process's own requirements, never from the
+        candidate's declared entry-point set: the running supervisor must be
+        able to provide every entry point the candidate runtime needs to be
+        launched. A candidate that omits an entry point a predecessor still
+        requires therefore bridges it, and a candidate that cannot be launched
+        at all is refused here -- before the live worker retires -- so a failed
+        compatibility check always leaves the previous worker consuming. The
+        relation is a strict refinement of the spawn-time usability gate, so
+        the retirement gate is the earliest place the answer is established.
+
+        Args:
+            commit: Exact commit the worker is requested to run.
+
+        Returns:
+            ``True`` when this supervisor can launch a worker from ``commit``.
+        """
+        if cli.runtime_satisfies(commit, frozenset(cli.ENTRY_POINTS)):
+            return True
+        self._message = (
+            f"runtime for commit {commit} is not instantiable by this supervisor; "
+            "no worker is replaced"
+        )
+        LOGGER.error("%s", self._message)
+        return False
 
     def _ensure_worker(self, commit: str) -> None:
         """Ensure exactly one worker child owned by us runs ``commit``.
