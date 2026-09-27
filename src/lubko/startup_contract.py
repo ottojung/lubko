@@ -11,8 +11,10 @@ The supported service command is::
 
     lubko-supervisor
 
-The caller chooses whether and how to supervise Lubko. The supervisor may run at
-any PID and may be launched directly or under any external init/service manager.
+The deployment must arrange for Lubko to be restarted whenever the supervisor
+dies or exits, unless an operator intentionally disables it. The deployment
+chooses how to provide that guarantee. The supervisor may run at any PID and may
+be launched under any external init/service manager or equivalent restart loop.
 Only the stable environment variables named by the versioned contract are
 required, including ``LUBKO_SUPERVISOR_STATE_TOKEN``. Lubko records only required
 variable names, never their values. Other external setup remains outside this
