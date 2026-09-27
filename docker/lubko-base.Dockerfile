@@ -35,6 +35,9 @@ COPY --from=s6 /rootfs /
 COPY --from=shell /bin/dash /bin/sh
 COPY --from=uv /uv /usr/local/bin/uv
 
+RUN ["/command/s6-rmrf", "/var/run"]
+RUN ["/command/s6-ln", "-s", "/run", "/var/run"]
+
 ENV USER="lubko"
 ENV HOME="/home/lubko"
 ENV S6_KEEP_ENV="1"
