@@ -73,9 +73,10 @@ the live process topology or anything outside the Lubko environment.
 ## External supervision
 
 `docker/lubko-base.Dockerfile` intentionally has no init-system entrypoint.
-Deployments choose how to launch the image and whether to supervise
-`lubko-supervisor`. Tini, s6, Docker `--init`, systemd, and direct execution
-are all external deployment choices rather than Lubko requirements.
+Deployments choose how to launch the image and how to satisfy the required
+restart-on-death guarantee. Tini, s6, systemd, runit, Docker/container restart
+policies, and equivalent mechanisms are all external deployment choices rather
+than Lubko requirements.
 
 The deployment must provide automatic restart after supervisor death or exit
 unless intentionally disabled by an operator. That restart mechanism is outside
