@@ -6,7 +6,7 @@ kind: constraint
 
 Lubko must never inspect, validate, infer, report, or depend on the runtime startup process topology. In particular, the external init/service-manager → Lubko supervisor → worker parent/child chain is not part of Lubko's runtime contract. The external host/container startup environment is trusted, opaque infrastructure and is out of scope.
 
-Lubko must not require `lubko-supervisor` to be PID 1 or to run under Tini, s6, Docker `--init`, systemd, or any other particular init or service manager. The published base image must not impose a mandatory init-system entrypoint. A caller may launch Lubko directly or place it under any external supervision appropriate to that deployment.
+Lubko must not require `lubko-supervisor` to be PID 1 or to run under Tini, s6, Docker `--init`, systemd, or any other particular init or service manager. The published base image must not impose a mandatory init-system entrypoint. The deployment remains responsible for the separate restart-on-death requirement, using whatever external mechanism is appropriate for that environment.
 
 No deployment, restart, reset, recovery, readiness, health, status, installation, migration, or test path may require or perform a runtime process-topology proof. A topology mismatch must never block starting or recovering a worker, and topology observations must not appear as health or status failures.
 
