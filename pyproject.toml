@@ -17,6 +17,12 @@ lubko-supervisor = "lubko.supervisor:main"
 lubko-deploy = "lubko.lifecycle:main"
 lubko-deploy-ctl = "lubko.deployctl:main"
 lubko-install = "lubko.install:main"
+# Retired names remain inert package entry points solely so supported
+# predecessor deploy controllers can validate a newer runtime immediately
+# after uv sync. They are not part of the maintained CLI surface.
+lubko-agent = "lubko.cli:retired_entry_point_main"
+my-lubko-agent = "lubko.cli:retired_entry_point_main"
+lubko-board = "lubko.cli:retired_entry_point_main"
 
 [project.optional-dependencies]
 dev = [
