@@ -32,7 +32,7 @@ Python PEP 446 makes file descriptors non-inheritable by default, so the ownersh
 | A sends transfer | A writes `T\n`, closes lock fd, exits | New holds flock | Worker alive (same PID) | New code runs, lock never released |
 | Spawn failure | No state mutation | Old holds flock | Worker alive | Old catches OSError, continues |
 | B startup failure | No state mutation | Old holds flock | Worker alive | Old catches failure, continues |
-| Tini restart (after crash) | Reads state.json | Opens/acquires new flock | Worker may be dead (PDEATHSIG) | Fresh start, resolves cli/current |
+| Service-supervisor restart (after crash) | Reads state.json | Opens/acquires new flock | Worker may be dead (PDEATHSIG) | Fresh start, resolves cli/current |
 
 ## GC semantics
 

@@ -22,8 +22,8 @@ from lubko.state import SUPERVISOR_STATE_TOKEN_ENV
 
 
 def test_canonical_startup_command() -> None:
-    """The canonical versioned startup command is tini-static -- lubko-supervisor."""
-    assert sc.canonical_startup_command() == ["tini-static", "--", "lubko-supervisor"]
+    """The canonical versioned startup command is the supervisor service itself."""
+    assert sc.canonical_startup_command() == ["lubko-supervisor"]
 
 
 def test_startup_launcher_round_trip(tmp_path: Path) -> None:
@@ -102,9 +102,9 @@ def test_contract_legacy_keys_ignored(tmp_path: Path, monkeypatch: pytest.Monkey
     config_files_json = json.dumps(list(CURRENT_CONTRACT.required_config_files))
     environment_json = json.dumps(list(CURRENT_CONTRACT.required_environment))
     (tmp_path / "startup-contract.json").write_text(
-        '{"schema_version": 2, '
+        '{"schema_version": 3, '
         '"init_markers": ["tini-static", "tini"], '
-        '"init_command": ["tini-static", "--"], '
+        '"init_command": [], '
         '"supervisor_markers": ["lubko-supervisor", "lubko.supervisor"], '
         '"supervisor_command": ["lubko-supervisor"], '
         '"worker_relationship": "direct-child", '
@@ -157,7 +157,7 @@ def test_startup_definition_round_trip(tmp_path: Path, monkeypatch: pytest.Monke
     definition = sc.read_startup_definition()
     assert definition == sc.generate_startup_definition()
     assert definition is not None
-    assert definition["command"] == ["tini-static", "--", "lubko-supervisor"]
+    assert definition["command"] == ["lubko-supervisor"]
     assert definition["schema_version"] == sc.STARTUP_DEFINITION_SCHEMA_VERSION
     (tmp_path / "deploy" / sc.STARTUP_DEFINITION_NAME).write_text(
         '{"schema_version": 1, "command": ["sleep", "infinity"]}', encoding="utf-8"
@@ -219,7 +219,7 @@ def test_contract_is_frozen_and_current_matches_version() -> None:
     """The shipped contract is frozen and carries the current schema version."""
     assert isinstance(CURRENT_CONTRACT, StartupContract)
     assert CURRENT_CONTRACT.schema_version == CONTRACT_SCHEMA_VERSION
-    assert "tini-static" in CURRENT_CONTRACT.init_command
+    assert CURRENT_CONTRACT.init_command == ()
     assert "lubko-supervisor" in CURRENT_CONTRACT.supervisor_command
 
 
@@ -232,11 +232,11 @@ def test_contract_requires_supervisor_state_token_env() -> None:
 def test_contract_missing_required_environment_is_malformed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A schema-v2 contract missing required_environment fails to parse."""
+    """A schema-v3 contract missing required_environment fails to parse."""
     monkeypatch.setattr(sc, "contract_path", lambda: tmp_path / "startup-contract.json")
     (tmp_path / "startup-contract.json").write_text(
-        '{"schema_version": 2, '
-        '"init_command": ["tini-static", "--"], '
+        '{"schema_version": 3, '
+        '"init_command": [], '
         '"supervisor_command": ["lubko-supervisor"], '
         '"required_state_dirs": ["supervisor", "worker", "deploy"], '
         '"required_config_files": []'

@@ -86,10 +86,15 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: docker pull ghcr.io/ottojung/lubko-base:latest
 
-      - name: Smoke test
+      - name: Smoke test s6 init
         run: |
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            docker run --rm ghcr.io/ottojung/lubko-base:latest uv --version
+            IMAGE=ghcr.io/ottojung/lubko-base:latest
           else
-            docker run --rm ghcr.io/ottojung/lubko-base:${{ steps.gitver.outputs.version }} uv --version
+            IMAGE=ghcr.io/ottojung/lubko-base:${{ steps.gitver.outputs.version }}
           fi
+          docker run --rm \
+            --read-only \
+            --tmpfs /run:rw,nosuid,nodev,exec,mode=0700,uid=65532,gid=65532 \
+            --env S6_READ_ONLY_ROOT=1 \
+            "$IMAGE" uv --version
