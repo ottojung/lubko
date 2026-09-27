@@ -138,11 +138,10 @@ def retired_entry_point_main() -> int:
         Exit status 127, matching an unavailable command.
     """
     entry = Path(sys.argv[0]).name
-    print(f"{entry}: this entry point was removed from the maintained CLIs.", file=sys.stderr)
-    print(
+    sys.stderr.write(f"{entry}: this entry point was removed from the maintained CLIs.\n")
+    sys.stderr.write(
         "It remains installed only so an older Lubko deployment can validate "
-        "and upgrade to this runtime.",
-        file=sys.stderr,
+        "and upgrade to this runtime.\n"
     )
     return 127
 
