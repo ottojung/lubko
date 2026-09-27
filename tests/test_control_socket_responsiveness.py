@@ -28,6 +28,9 @@ def test_readiness_wait_services_control_requests(
 ) -> None:
     """A long readiness probe must not starve the supervisor control socket."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("LUBKO_SUPERVISOR_STATE_TOKEN", "f" * 64)
+    supervise.supervisor_private_dir().mkdir(parents=True, exist_ok=True)
+    supervise.write_state(supervise.fresh_state())
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
     listener = bind_abstract_socket()
     daemon._control_sock = listener
@@ -41,7 +44,7 @@ def test_readiness_wait_services_control_requests(
         try:
             conn = connect_abstract_socket(timeout=0.25)
             conn.settimeout(0.25)
-            _send_message(conn, {"type": "ping"})
+            _send_message(conn, {"type": "authority_snapshot"})
             responses.append(_recv_message(conn))
         except (OSError, TypeError, ValueError) as exc:  # pragma: no cover - asserted below
             failures.append(exc)
@@ -87,4 +90,9 @@ def test_readiness_wait_services_control_requests(
     assert ready is False
     assert reason == "queue consumption not proven"
     assert failures == []
-    assert responses == [{"ok": True}]
+    assert len(responses) == 1
+    response = responses[0]
+    assert response is not None
+    assert response["ok"] is True
+    assert response["desired"] is None
+    assert isinstance(response["state"], dict)
