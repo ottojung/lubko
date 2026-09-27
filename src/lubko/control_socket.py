@@ -86,7 +86,12 @@ _SO_PEERCRED: Final = 17
 _UCRED_SIZE: Final = 12
 
 #: Default timeout for client connect/send/recv operations (seconds).
-_CLIENT_TIMEOUT_SECONDS: Final = 5.0
+#:
+#: Readiness probes service control requests cooperatively, but a single
+#: bounded PostgreSQL operation can still occupy the lifecycle thread. Keep
+#: the client window above that legal per-operation bound so a live daemon is
+#: never misreported as absent merely because one DB operation is in flight.
+_CLIENT_TIMEOUT_SECONDS: Final = 20.0
 
 #: Default timeout for server accept/recv operations (seconds).
 _SERVER_TIMEOUT_SECONDS: Final = 5.0

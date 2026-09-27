@@ -2984,9 +2984,9 @@ def _read_probe_sentinel(conn: JobsConnection, probe_id: UUID) -> bool:
 def _wait_for_probe_claim(
     conn: JobsConnection,
     probe_id: UUID,
-    expected_worker_id: str,
-    recovery_worker_pid: int,
+    expected_worker: tuple[str, int],
     timeout_seconds: float,
+    progress_callback: Callable[[], None] | None = None,
 ) -> bool:
     """Wait until the exact recovery worker claims and successfully executes the probe.
 
@@ -3006,9 +3006,9 @@ def _wait_for_probe_claim(
     Args:
         conn: Open PostgreSQL connection.
         probe_id: Probe job identifier.
-        expected_worker_id: Worker identifier the recovery worker records.
-        recovery_worker_pid: Exact PID of the worker being adopted.
+        expected_worker: Pair of worker identifier and exact recovery-worker PID.
         timeout_seconds: Maximum seconds to wait.
+        progress_callback: Optional cooperative callback invoked between probe polls.
 
     Returns:
         ``True`` only when the exact recovery worker claimed and executed the
@@ -3016,8 +3016,11 @@ def _wait_for_probe_claim(
         a claim whose process was not spawned by the recovery worker, or a
         claim whose payload never produced positive execution evidence.
     """
+    expected_worker_id, recovery_worker_pid = expected_worker
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        if progress_callback is not None:
+            progress_callback()
         with conn.cursor(row_factory=tuple_row) as cursor:
             cursor.execute(
                 "SELECT (payload::jsonb)->'state' FROM lubko.jobs WHERE id = %s",
@@ -3050,6 +3053,7 @@ def _wait_for_probe_terminal(
     conn: JobsConnection,
     probe_id: UUID,
     timeout_seconds: float,
+    progress_callback: Callable[[], None] | None = None,
 ) -> None:
     """Wait until the probe job reaches a terminal state or is deleted.
 
@@ -3061,9 +3065,12 @@ def _wait_for_probe_terminal(
         conn: Open PostgreSQL connection.
         probe_id: Probe job identifier.
         timeout_seconds: Maximum seconds to wait.
+        progress_callback: Optional cooperative callback invoked between terminal polls.
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        if progress_callback is not None:
+            progress_callback()
         with conn.cursor(row_factory=tuple_row) as cursor:
             cursor.execute(
                 "SELECT (payload::jsonb)->'state'->>'status' FROM lubko.jobs WHERE id = %s",
@@ -3082,6 +3089,7 @@ def verify_worker_consumes_queue(
     cwd: str,
     worker_pid: int,
     timeout_seconds: float,
+    progress_callback: Callable[[], None] | None = None,
 ) -> bool:
     """Prove an exact worker process consumes the queue through a real roundtrip.
 
@@ -3098,12 +3106,19 @@ def verify_worker_consumes_queue(
         cwd: Working directory for the probe job.
         worker_pid: Exact PID of the worker process to prove.
         timeout_seconds: Maximum seconds to wait for the probe to be claimed.
+        progress_callback: Optional cooperative callback invoked while waiting.
 
     Returns:
         ``True`` only when the exact worker consumed the probe and the payload
         produced positive execution evidence.
     """
-    return _verify_queue_roundtrip(worker_id, cwd, worker_pid, timeout_seconds)
+    return _verify_queue_roundtrip(
+        worker_id,
+        cwd,
+        worker_pid,
+        timeout_seconds,
+        progress_callback=progress_callback,
+    )
 
 
 def _verify_queue_roundtrip(
@@ -3111,6 +3126,7 @@ def _verify_queue_roundtrip(
     cwd: str,
     recovery_worker_pid: int,
     timeout_seconds: float,
+    progress_callback: Callable[[], None] | None = None,
 ) -> bool:
     """Verify the exact recovery worker really consumes the queue.
 
@@ -3129,6 +3145,7 @@ def _verify_queue_roundtrip(
         cwd: Working directory for the probe job.
         recovery_worker_pid: Exact PID of the worker being adopted.
         timeout_seconds: Maximum seconds to wait for the probe to be claimed.
+        progress_callback: Optional cooperative callback invoked while waiting.
 
     Returns:
         ``True`` only when the exact worker consumed the probe.
@@ -3148,12 +3165,21 @@ def _verify_queue_roundtrip(
             return False
         try:
             outcome = _wait_for_probe_claim(
-                conn, probe_id, worker_id, recovery_worker_pid, timeout_seconds
+                conn,
+                probe_id,
+                (worker_id, recovery_worker_pid),
+                timeout_seconds,
+                progress_callback=progress_callback,
             )
         finally:
             with suppress(psycopg.Error):
                 request_cancel(conn, probe_id, server=_probe_server())
-            _wait_for_probe_terminal(conn, probe_id, timeout_seconds)
+            _wait_for_probe_terminal(
+                conn,
+                probe_id,
+                timeout_seconds,
+                progress_callback=progress_callback,
+            )
             with suppress(psycopg.Error):
                 delete_job_and_chunks(conn, probe_id, server=_probe_server())
         return outcome
