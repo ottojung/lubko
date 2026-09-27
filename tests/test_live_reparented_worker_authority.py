@@ -77,11 +77,26 @@ def _parent_pid(pid: int) -> int | None:
     return int(fields[1])
 
 
+def _converge(pid: int) -> None:
+    """Terminate a reparented process, which can no longer be reaped.
+
+    Args:
+        pid: Process to terminate.
+    """
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + _CONVERGE_TIMEOUT_SECONDS
+    while _parent_pid(pid) is not None and time.monotonic() < deadline:
+        time.sleep(_POLL_SECONDS)
+
+
 def _start_reparented() -> int:
     """Start a real live process that is provably not our direct child.
 
     The intermediate is spawned in its own session and reaped normally; the
-    grandchild is orphaned on purpose.
+    grandchild is orphaned on purpose. Every path out of this function that runs
+    after the grandchild exists terminates it, so a failure here leaks no
+    process.
 
     Returns:
         The PID of the live, reparented process.
@@ -97,36 +112,32 @@ def _start_reparented() -> int:
         start_new_session=True,
         env=lifecycle.worker_env(INCARNATION),
     )
+    pid: int | None = None
+    became_non_child = False
     try:
         pipe = intermediate.stdout
         assert pipe is not None
-        line = pipe.readline()
-    finally:
+        pid = int(pipe.readline())
         if intermediate.stdout is not None:
             intermediate.stdout.close()
         intermediate.wait(timeout=_CONVERGE_TIMEOUT_SECONDS)
-    pid = int(line)
-    deadline = time.monotonic() + _CONVERGE_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        ppid = _parent_pid(pid)
-        if ppid is not None and ppid != os.getpid() and lifecycle.process_identity(pid) is not None:
-            return pid
-        time.sleep(_POLL_SECONDS)
-    msg = f"process {pid} never became a live process that is not our direct child"
-    raise AssertionError(msg)
-
-
-def _converge(pid: int) -> None:
-    """Terminate a reparented process, which can no longer be reaped.
-
-    Args:
-        pid: Process to terminate.
-    """
-    with suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
-    deadline = time.monotonic() + _CONVERGE_TIMEOUT_SECONDS
-    while _parent_pid(pid) is not None and time.monotonic() < deadline:
-        time.sleep(_POLL_SECONDS)
+        deadline = time.monotonic() + _CONVERGE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            ppid = _parent_pid(pid)
+            is_child = ppid == os.getpid()
+            if ppid is not None and not is_child and lifecycle.process_identity(pid) is not None:
+                became_non_child = True
+                break
+            time.sleep(_POLL_SECONDS)
+        if not became_non_child:
+            msg = f"process {pid} never became a live process that is not our direct child"
+            raise AssertionError(msg)
+        return pid
+    finally:
+        # The grandchild is deliberately un-reapable, so every path that can
+        # fail after its PID is known must terminate it here.
+        if pid is not None and not became_non_child:
+            _converge(pid)
 
 
 def _retirement_daemon(monkeypatch: pytest.MonkeyPatch) -> tuple[SupervisorDaemon, AuthorityCalls]:
@@ -160,26 +171,29 @@ def _retirement_daemon(monkeypatch: pytest.MonkeyPatch) -> tuple[SupervisorDaemo
 def reparented_record() -> object:
     """Yield a real, live published-worker record that is not our child.
 
+    The whole body after the spawn is inside the cleanup ``try``, so every
+    failure path terminates the reparented process instead of leaking it.
+
     Yields:
         The published record naming the live reparented process.
     """
     pid = _start_reparented()
-    identity = lifecycle.process_identity(pid)
-    assert identity is not None
-    record = authority.WorkerRecord(
-        token=INCARNATION,
-        commit=COMMIT,
-        pid=identity.pid,
-        pgid=identity.pgid,
-        sid=identity.sid,
-        start_time_ticks=identity.start_time_ticks,
-        worker_id="reparented",
-    )
-    published_meta = supervisor.SupervisorDaemon._db_worker_meta(record)
-    assert lifecycle.worker_alive(published_meta), (
-        "the reproduction must be a live process matching every exact identity field"
-    )
     try:
+        identity = lifecycle.process_identity(pid)
+        assert identity is not None
+        record = authority.WorkerRecord(
+            token=INCARNATION,
+            commit=COMMIT,
+            pid=identity.pid,
+            pgid=identity.pgid,
+            sid=identity.sid,
+            start_time_ticks=identity.start_time_ticks,
+            worker_id="reparented",
+        )
+        published_meta = supervisor.SupervisorDaemon._db_worker_meta(record)
+        assert lifecycle.worker_alive(published_meta), (
+            "the reproduction must be a live process matching every exact identity field"
+        )
         yield record
     finally:
         _converge(pid)
