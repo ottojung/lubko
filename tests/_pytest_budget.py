@@ -27,7 +27,8 @@ positions in pytest's own source, so it does not move between pytest versions:
   ordering pytest can produce.
 
 The module is importable and testable in isolation: callers can supply a
-custom clock for deterministic unit tests.
+custom clock for deterministic unit tests. ``sessionfinish`` returns the line
+it reported, so the wording can be asserted without capturing a terminal.
 """
 
 from __future__ import annotations
@@ -42,6 +43,18 @@ if TYPE_CHECKING:
 
 BUDGET_SECONDS: float = 10.0
 """Hard wall-clock ceiling for the pytest *execution* phase (seconds)."""
+
+
+def _report_line(session: pytest.Session, line: str) -> str:
+    """Write *line* to the terminal reporter, and return it for testing.
+
+    Returns:
+        *line*, unchanged, so callers and tests see what would have been shown.
+    """
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(line)
+    return line
 
 
 class _BudgetGate:
@@ -77,22 +90,56 @@ class _BudgetGate:
         self,
         session: pytest.Session,
         exitstatus: pytest.ExitCode,
-    ) -> None:
-        """Fail the session when the execution phase exceeded *and* no tests failed."""
-        elapsed = self.elapsed()
-        if elapsed is None or exitstatus != pytest.ExitCode.OK:
-            return
+    ) -> str:
+        """Report the budget verdict for every run, and enforce it when it can.
 
-        if elapsed >= self._budget:
-            self.budget_exceeded = True
+        The verdict is always reported. A run that is already red for unrelated
+        reasons must not hide the budget figure: silence there is the most
+        expensive kind, because the least healthy run is then the one that says
+        least about the budget.
+
+        Enforcement stays narrow. The exit status is changed to ``TESTS_FAILED``
+        only when the session would otherwise have been green, so a budget
+        breach can never overwrite or reinterpret an existing failure, and an
+        over-budget red run says so in terms that name it as informational
+        rather than as the cause of the red.
+
+        Returns:
+            The verdict line that was reported.
+        """
+        elapsed = self.elapsed()
+        if elapsed is None:
+            return _report_line(
+                session,
+                "test-budget: NOT MEASURED — no execution phase ran (collection"
+                " never finished), so no budget verdict is available and the"
+                " budget was not enforced",
+            )
+
+        self.budget_exceeded = elapsed >= self._budget
+        figure = f"{elapsed:.2f}s execution of the {self._budget:.1f}s budget"
+        scope = "(collection excluded, per AGENTS.md)"
+
+        if not self.budget_exceeded:
+            return _report_line(
+                session,
+                f"test-budget: OK — {figure} {scope}",
+            )
+
+        if exitstatus == pytest.ExitCode.OK:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
-            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-            if reporter is not None:
-                reporter.write_line(
-                    f"FAIL: test-budget: {elapsed:.2f}s execution (limit"
-                    f" {self._budget:.1f}s) — session exceeded the"
-                    f" {self._budget:.1f}s budget",
-                )
+            return _report_line(
+                session,
+                f"test-budget: FAIL — {figure} {scope}. The budget is the reason"
+                " this session exits non-zero.",
+            )
+
+        return _report_line(
+            session,
+            f"test-budget: FAIL — {figure} {scope}. Reported for information only:"
+            " this session was already non-zero before the budget was checked, so"
+            " the budget was not enforced and is not the cause of that status.",
+        )
 
 
 _gate = _BudgetGate()

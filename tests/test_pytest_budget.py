@@ -54,13 +54,18 @@ def test_over_budget_fails() -> None:
 
 
 def test_existing_failure_not_overridden() -> None:
-    """When tests already failed the budget gate must not change exitstatus."""
+    """When tests already failed the budget gate must not change exitstatus.
+
+    The breach is still *reported* as a fact; only the exit status is left
+    alone. Before issue 65 this test also asserted ``not gate.budget_exceeded``,
+    which pinned the inverted behaviour this front removed.
+    """
     gate = _gate_at(999.0)
     session = _fake_session(exitstatus=pytest.ExitCode.TESTS_FAILED)
     gate.execution_start()
     gate.sessionfinish(session, pytest.ExitCode.TESTS_FAILED)
     assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
-    assert not gate.budget_exceeded
+    assert gate.budget_exceeded
 
 
 def test_existing_nonzero_exit_preserved() -> None:
@@ -70,7 +75,7 @@ def test_existing_nonzero_exit_preserved() -> None:
     gate.execution_start()
     gate.sessionfinish(session, pytest.ExitCode.INTERRUPTED)
     assert session.exitstatus == pytest.ExitCode.INTERRUPTED
-    assert not gate.budget_exceeded
+    assert gate.budget_exceeded
 
 
 def test_budget_constant_is_ten_seconds() -> None:
@@ -126,3 +131,84 @@ def test_live_gate_clock_is_running_while_tests_execute() -> None:
     than left unstarted.
     """
     assert budget_plugin._gate.elapsed() is not None
+
+
+# --- The gate reports its verdict on every run ----------------------------
+#
+# A gate that is silent on a red run is the worst kind: the least healthy run
+# reports least. These tests pin that a verdict is always produced, and that it
+# is worded so it cannot be misread as claiming blame for an unrelated failure.
+
+
+def test_green_run_reports_ok() -> None:
+    """An under-budget green run says so instead of printing nothing."""
+    gate = _gate_at(3.28)
+    session = _fake_session()
+    gate.execution_start()
+    line = gate.sessionfinish(session, pytest.ExitCode.OK)
+    assert "OK" in line
+    assert "3.28s execution" in line
+    assert not gate.budget_exceeded
+
+
+def test_red_run_still_reports_its_budget_verdict() -> None:
+    """A run that already failed tests still reports the budget figure."""
+    gate = _gate_at(1.0)
+    session = _fake_session(exitstatus=pytest.ExitCode.TESTS_FAILED)
+    gate.execution_start()
+    line = gate.sessionfinish(session, pytest.ExitCode.TESTS_FAILED)
+    assert "1.00s execution" in line
+    assert "OK" in line
+
+
+def test_over_budget_red_run_reports_fail_without_claiming_blame() -> None:
+    """Over budget *and* red: report the breach, disown the exit status."""
+    gate = _gate_at(12.5)
+    session = _fake_session(exitstatus=pytest.ExitCode.TESTS_FAILED)
+    gate.execution_start()
+    line = gate.sessionfinish(session, pytest.ExitCode.TESTS_FAILED)
+    assert gate.budget_exceeded
+    assert "FAIL" in line
+    assert "12.50s execution" in line
+    assert "Reported for information only" in line
+    assert "not the cause of that status" in line
+
+
+def test_over_budget_green_run_takes_credit_for_the_exit_status() -> None:
+    """Over budget with an otherwise green session: the gate is the cause."""
+    gate = _gate_at(11.0)
+    session = _fake_session()
+    gate.execution_start()
+    line = gate.sessionfinish(session, pytest.ExitCode.OK)
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+    assert "the reason this session exits non-zero" in line
+
+
+def test_verdict_is_written_to_the_terminal_reporter() -> None:
+    """The line reaches the terminal, not just the return value."""
+    gate = _gate_at(0.5)
+    session = _fake_session()
+    gate.execution_start()
+    gate.sessionfinish(session, pytest.ExitCode.OK)
+    session.config.pluginmanager.get_plugin.assert_called_once_with("terminalreporter")
+    session.config.pluginmanager.get_plugin.return_value.write_line.assert_called_once()
+
+
+def test_reported_figure_is_execution_not_session() -> None:
+    """The reported number is the execution interval, not the whole session."""
+    gate = _gate_at(3.28, budget=100.0)
+    session = _fake_session()
+    gate.execution_start()
+    line = gate.sessionfinish(session, pytest.ExitCode.OK)
+    assert "3.28s execution" in line
+    assert "collection excluded" in line
+
+
+def test_missing_execution_phase_is_reported_not_silently_ignored() -> None:
+    """A session that never reached execution says so instead of implying OK."""
+    gate = _BudgetGate(clock=lambda: 0.0)
+    session = _fake_session(exitstatus=pytest.ExitCode.INTERRUPTED)
+    line = gate.sessionfinish(session, pytest.ExitCode.INTERRUPTED)
+    assert "NOT MEASURED" in line
+    assert not gate.budget_exceeded
+    assert session.exitstatus == pytest.ExitCode.INTERRUPTED
