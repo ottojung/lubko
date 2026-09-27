@@ -13,8 +13,9 @@ service command:
 
     lubko-supervisor
 
-The external PID 1 and restart mechanism are deliberately opaque to Lubko. On
-every service start the supervisor reconstructs the intended maintained worker
+The external restart mechanism and surrounding process topology are deliberately
+opaque to Lubko. On every service start the supervisor reconstructs the intended
+maintained worker
 deterministically from durable state under
 ``$XDG_STATE_HOME/lubko/supervisor/`` and from the existing deployment
 authorities (``worker/meta.json`` and ``worker/rollback.json``). The outer
@@ -2109,9 +2110,9 @@ class SupervisorDaemon:
         A worker is only ever trusted when it is our **direct child**: the
         exact identity (PID, group, session, start time, token) must match a
         live process whose parent is this supervisor process.  After a
-        supervisor restart an orphaned worker that was reparented to the
-        container's PID 1 is therefore never mistaken for our child, and the
-        takeover path stops it by exact identity before spawning a fresh one.
+        supervisor restart a surviving worker that is no longer our direct
+        child is therefore never mistaken for our child, and the takeover path
+        stops it by exact identity before spawning a fresh one.
 
         Args:
             state: Daemon state holding the child identity.
