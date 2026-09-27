@@ -1,0 +1,87 @@
+"""Runtime instantiability across a change of the maintained entry-point set.
+
+The entry-point requirements that matter during an upgrade belong to the
+process that has to launch the candidate runtime, not to the candidate's own
+declared set. A predecessor whose requirement set is a strict superset of the
+maintained one is therefore safe to upgrade from only when the candidate
+runtime still provides the names the predecessor insists on; a candidate that
+merely declares fewer entry points is not a smaller requirement, it is a
+runtime the predecessor cannot launch.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Final
+
+from lubko import cli
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pytest
+
+TARGET: Final = "b" * 40
+PREDECESSOR_REQUIREMENTS: Final = frozenset(cli.ENTRY_POINTS) | frozenset(cli.RETIRED_ENTRY_POINTS)
+
+
+def build_target_runtime(monkeypatch: pytest.MonkeyPatch, repo: Path, commit: str) -> None:
+    """Materialize one sealed runtime exposing only the maintained entry points.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        repo: Stand-in repository path; extraction is faked.
+        commit: Exact commit hash to materialize.
+    """
+
+    def fake_sync(_uv_path: str, root: Path, _timeout_seconds: float) -> None:
+        """Create only the entry points the target's own tree declares."""
+        bin_dir = root / ".venv" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for entry in cli.ENTRY_POINTS:
+            script = bin_dir / entry
+            script.write_text(f"#!/bin/sh\necho {entry}\n", encoding="utf-8")
+            script.chmod(0o755)
+
+    monkeypatch.setattr(cli, "_sync_venv", fake_sync)
+    monkeypatch.setattr(
+        cli,
+        "_extract_archive",
+        lambda _repo, _commit, _destination, _timeout_seconds: None,
+    )
+    cli.build_cli_root(repo, commit, "uv", 60.0)
+
+
+def test_maintained_set_is_a_strict_subset_of_a_predecessor_requirement_set() -> None:
+    """The maintained set is smaller, so it can never stand in for a predecessor's."""
+    assert frozenset(cli.ENTRY_POINTS) < PREDECESSOR_REQUIREMENTS
+    assert not cli.satisfies_entry_points(frozenset(cli.ENTRY_POINTS), PREDECESSOR_REQUIREMENTS), (
+        "the target's declared set must not be treated as a predecessor's capability"
+    )
+
+
+def test_built_runtime_satisfies_a_predecessor_entry_point_superset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A built runtime stays instantiable for a predecessor needing more names."""
+    build_target_runtime(monkeypatch, tmp_path / "repo", TARGET)
+
+    assert cli.runtime_is_usable(TARGET)
+    assert cli.runtime_satisfies(TARGET, PREDECESSOR_REQUIREMENTS), (
+        "a runtime that omits an entry point a predecessor still requires cannot be "
+        "launched by that predecessor, so the upgrade must not be attempted"
+    )
+
+
+def test_bridged_retired_entry_point_runs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bridge keeps a retired name resolvable without resurrecting its command."""
+    build_target_runtime(monkeypatch, tmp_path / "repo", TARGET)
+
+    for entry in cli.RETIRED_ENTRY_POINTS:
+        executable = cli.cli_entry_executable(TARGET, entry)
+        assert executable is not None, f"{entry} is not bridged into the runtime"
+        script = executable.read_text(encoding="utf-8")
+        assert script.startswith("#!/bin/sh")
+        assert "exit 127" in script, "a bridged entry point must refuse to run a command"
+        assert entry not in cli.ENTRY_POINTS, "a retired name is never maintained again"
