@@ -12,7 +12,10 @@ import json
 import os
 import secrets
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -27,7 +30,50 @@ from lubko.state import (
 )
 from lubko.supervise import SupervisorDesired as SupervisedDesired
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 VALID_TOKEN = secrets.token_hex(32)
+
+
+def _pending_request_lock_is_free() -> bool:
+    """Report whether the pending-request lock can be taken right now.
+
+    Uses a zero timeout, so a held lock is detected on the first ``flock``
+    attempt: the function costs one syscall and never waits.  ``flock`` is per
+    open file description, so this contends with the promoter even though
+    both are threads of this process.
+
+    Returns:
+        True if the lock was acquired, False if it is held.
+    """
+    try:
+        with supervise.pending_request_lock(timeout_seconds=0):
+            return True
+    except supervise.PendingRequestLockTimeoutError:
+        return False
+
+
+def _wait_for(event: threading.Event, timeout: float) -> bool:
+    """Bounded spin for an event, so a test never waits out a fixed window.
+
+    Returns as soon as the event is set, which on the healthy path is as soon
+    as the relevant thread has been scheduled.  The timeout is a failure-path
+    bound and is not elapsed when the product behaves correctly.
+
+    Args:
+        event: Event to wait for.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        True if the event was set within the timeout, False otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.0005)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1318,6 +1364,55 @@ def test_pending_ack_sanitizes_private_authority_error(
     assert error_text  # must have *some* generic error
 
 
+class _InstrumentedWriter:
+    """A concurrent pending-request writer that reports where it got to.
+
+    ``supervise.pending_request_lock`` is wrapped so the writer announces its
+    arrival at the lock before delegating to the real one, and ``progress`` is
+    set by whichever happens first: that arrival, or the write completing.  A
+    test can then wait for the writer to make *some* observable progress
+    instead of waiting out a fixed window to discover that nothing happened.
+    """
+
+    def __init__(self, commit: str, request_id: str) -> None:
+        self.reached_lock = threading.Event()
+        self.finished = threading.Event()
+        self.progress = threading.Event()
+        self._commit = commit
+        self._request_id = request_id
+
+    def instrument(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Announce lock arrival, then use the real lock unchanged.
+
+        Args:
+            monkeypatch: Patch fixture bound to the calling test.
+        """
+        real_lock = supervise.pending_request_lock
+
+        @contextmanager
+        def announcing(*args: object, **kwargs: object) -> Iterator[None]:
+            self.reached_lock.set()
+            self.progress.set()
+            with real_lock(*args, **kwargs):  # type: ignore[arg-type]
+                yield
+
+        monkeypatch.setattr(supervise, "pending_request_lock", announcing)
+
+    def run(self) -> None:
+        """Write the pending request, recording completion either way."""
+        try:
+            supervise.write_pending_request(
+                self._commit,
+                repo="/r",
+                uv_path="uv",
+                worker_id=None,
+                request_id=self._request_id,
+            )
+        finally:
+            self.finished.set()
+            self.progress.set()
+
+
 # ---------------------------------------------------------------------------
 # Regression: pending-request lock serializes promoter and new writer
 # ---------------------------------------------------------------------------
@@ -1331,6 +1426,29 @@ def test_pending_request_lock_serializes_promoter_and_new_writer(
 
     The promoter must not delete a newer pending request written after it
     loaded the old one.
+
+    Why this needs no waiting: ``promote_pending_request`` holds
+    ``pending_request_lock`` for its entire body, and the ``ensure_run_intent``
+    call this test blocks sits deep inside that body.  So from the moment
+    ``promoter_entered`` is set until ``promoter_blocker`` is released, the
+    lock is held *unconditionally* - a property of the promoter's control
+    flow, not a measurement.  Every assertion below is therefore a theorem
+    about that interval rather than a race, and none of them has to wait out a
+    window to discover that nothing happened.
+
+    The three things that must be established are each observed positively:
+
+    * the promoter really holds the lock - checked with a zero-timeout
+      acquisition, which fails on its first ``flock`` attempt;
+    * the writer really reached the lock - observed by wrapping the lock
+      context manager, so the writer announces its arrival before delegating
+      to the real lock;
+    * the writer really was blocked - observed in the durable state it would
+      have changed, not inferred from the absence of a thread event.
+
+    The previous version of this test waited a fixed second for the writer to
+    *fail* to finish, which cost a second on every run and could not tell
+    "blocked on the lock" apart from "thread never got scheduled".
     """
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.setenv(SUPERVISOR_STATE_TOKEN_ENV, VALID_TOKEN)
@@ -1352,7 +1470,6 @@ def test_pending_request_lock_serializes_promoter_and_new_writer(
 
     promoter_entered = threading.Event()
     promoter_blocker = threading.Event()
-    writer_finished = threading.Event()
 
     def _blocking_ensure(_commit: str, **_kwargs: object) -> int:
         promoter_entered.set()
@@ -1361,28 +1478,57 @@ def test_pending_request_lock_serializes_promoter_and_new_writer(
 
     monkeypatch.setattr(supervise, "ensure_run_intent", _blocking_ensure)
 
-    def _blocking_writer() -> None:
-        supervise.write_pending_request(
-            commit_b,
-            repo="/r",
-            uv_path="uv",
-            worker_id=None,
-            request_id=rid_b,
-        )
-        writer_finished.set()
+    # PENDING_REQUEST_LOCK_POLL_SECONDS is the lock's retry *latency* knob, not
+    # part of the serialization invariant: it only sets how long a waiter
+    # sleeps between flock attempts.  Leaving it at the shipped 0.05s would
+    # make this test pay that latency on the release path, so it is shrunk to
+    # keep the wake-up prompt.  Serialization is unaffected - a waiter is
+    # still refused the lock for exactly as long as the holder keeps it.
+    monkeypatch.setattr(supervise, "PENDING_REQUEST_LOCK_POLL_SECONDS", 0.001)
 
     promoter_thread = threading.Thread(target=supervise.promote_pending_request)
     promoter_thread.start()
     assert promoter_entered.wait(timeout=2.0), "promoter did not enter"
 
-    writer_thread = threading.Thread(target=_blocking_writer)
+    # Positive: the promoter is holding the lock right now.  A zero timeout
+    # makes pending_request_lock give up after its first failed flock, so this
+    # costs one syscall and never waits.
+    assert not _pending_request_lock_is_free(), "promoter did not take the lock"
+
+    # Instrumented only now, once the promoter is already inside the real lock,
+    # so the wrapper can only ever be entered by the writer.
+    writer = _InstrumentedWriter(commit_b, rid_b)
+    writer.instrument(monkeypatch)
+    writer_thread = threading.Thread(target=writer.run, daemon=True)
     writer_thread.start()
-    writer_thread.join(timeout=1.0)
-    assert not writer_finished.is_set(), "writer must not finish while promoter holds lock"
+
+    # Wait for the writer to make *some* observable progress: either it entered
+    # the lock (so it is blocked) or it finished (so the invariant is already
+    # broken).  Whichever happens first, the assertions below state the right
+    # thing, so a writer that never touches the lock is reported as having
+    # bypassed it rather than as an unexplained missing event.
+    assert _wait_for(writer.progress, timeout=2.0), "writer neither reached the lock nor finished"
+    assert not writer.finished.is_set(), (
+        "writer completed its pending request while the promoter held the lock, "
+        "so the pending-request lock did not serialize them"
+    )
+    assert writer.reached_lock.is_set(), "writer finished without taking the lock"
+
+    # The writer is at the lock and the lock is held, so it is blocked.  Assert
+    # the consequence in the durable state a completed write would have
+    # changed, which is a positive observation rather than the absence of a
+    # thread event.
+    still_a = json.loads(supervise.pending_request_path().read_text(encoding="utf-8"))
+    assert still_a["request_id"] == rid_a, "writer overwrote the pending request early"
+    assert not supervise.pending_request_ack_path(rid_b).exists(), (
+        "writer produced an ack while the promoter held the lock"
+    )
 
     promoter_blocker.set()
-    writer_thread.join(timeout=2.0)
-    promoter_thread.join(timeout=2.0)
+    writer_thread.join(timeout=3.0)
+    promoter_thread.join(timeout=3.0)
+    assert not writer_thread.is_alive(), "writer never completed after the lock was released"
+    assert not promoter_thread.is_alive(), "promoter never completed"
 
     raw = supervise.pending_request_path().read_text(encoding="utf-8")
     data = json.loads(raw)
