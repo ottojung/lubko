@@ -257,8 +257,6 @@ else
 fi
 unset LUBKO_SUPERVISOR_STATE_TOKEN
 
-rm -rf "${TINI_DIR}"
-
 printf '\n%s\n' '--- cli/current points to source HEAD ---'
 CURRENT="${STATE_ROOT}/cli/current"
 if [ ! -L "$CURRENT" ]; then
