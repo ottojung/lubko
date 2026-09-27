@@ -840,12 +840,11 @@ class SupervisorDaemon:
         When a version-skew handoff is triggered, the old supervisor A
         spawns a **non-authoritative preflight probe** that validates the
         target executable can start and adopt the ownership lock, then A
-        **execs in place** into the target.  The exec replaces A's process
-        image while preserving its PID, so Tini (the direct-parent init)
-        never sees its child exit and the container stays alive.  The probe
-        never receives lifecycle authority and exits before A's exec.  If
-        exec fails, the process exits, letting Tini restart from durable
-        state.
+        **execs in place** into the target. The exec replaces A's process
+        image while preserving its PID and lifecycle authority independently
+        of any external init/service-manager topology. The probe never
+        receives lifecycle authority and exits before A's exec. If exec
+        fails, A restores its pidfile and continues in the current runtime.
 
         Probe mode (``LUBKO_SUPERVISOR_HANDOFF_PREPARE=1``):
             The process was spawned by A as a non-authoritative preflight
@@ -4746,15 +4745,14 @@ class SupervisorDaemon:
         A execs the target image, which adopts the inherited lock fd via
         the environment and becomes the sole lifecycle authority.
 
-        No authority overlap and no authority gap:  A holds the flock
-        throughout the probe.  The exec atomically replaces A's process
-        image; the new image inherits the lock fd and adopts it.  If exec
-        fails, the process exits, letting the external service supervisor restart
-        from durable state.
+        No authority overlap and no authority gap: A holds the flock
+        throughout the probe. The exec atomically replaces A's process
+        image; the new image inherits the lock fd and adopts it. If exec
+        fails, the old image restores its pidfile and continues.
 
-        External supervision contract:  The exec preserves A's PID.  The outer
-        service supervisor never observes a service exit, so the container stays alive.  The
-        worker child survives because its parent PID does not change.
+        The exec preserves A's PID so the worker child remains directly owned
+        across the handoff. This is an internal lifecycle-safety property; no
+        assumption is made about A's parent process or any external supervisor.
         """
         handoff = self._resolve_handoff_target()
         if handoff is None:
@@ -4986,8 +4984,8 @@ class SupervisorDaemon:
         2. Makes the ownership fd inheritable so the exec'd target inherits it.
         3. Sets the lock fd adoption env vars so the exec'd target can adopt
            the inherited lock without entering handoff/probe mode.
-        4. Execs into the target via ``os.execve``, preserving A's PID for
-           the external service supervisor.  The confirmed target commit is passed
+        4. Execs into the target via ``os.execve``, preserving A's PID so
+           Lubko's own worker parentage remains continuous. The confirmed target commit is passed
            through the env so
            the exec'd image can bind its immutable runtime identity (#767).
         5. On exec failure, restores the pidfile and returns ``False`` so
