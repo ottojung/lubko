@@ -326,7 +326,7 @@ def test_supervisor_check_readiness_rejects_operational_degradation(
 
     monkeypatch.setattr(
         "lubko.supervisor.lifecycle.verify_worker_consumes_queue",
-        lambda _wid, _cwd, _pid, _timeout: True,
+        lambda *_args, **_kwargs: True,
     )
     # Health snapshot: live but cancellation_scan_overdue => operational not ready
     snapshot = _snapshot(
@@ -370,7 +370,7 @@ def test_supervisor_check_readiness_accepts_fully_healthy(
 
     monkeypatch.setattr(
         "lubko.supervisor.lifecycle.verify_worker_consumes_queue",
-        lambda _wid, _cwd, _pid, _timeout: True,
+        lambda *_args, **_kwargs: True,
     )
     snapshot = _snapshot(
         pid=child.pid,
