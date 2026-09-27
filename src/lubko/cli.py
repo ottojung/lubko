@@ -265,19 +265,17 @@ def known_entry_points() -> frozenset[str]:
 
 
 def root_entry_points(commit: str) -> frozenset[str]:
-    """Return the known entry points actually usable in one commit runtime.
+    """Return the known entry-point names present in one commit runtime.
 
     This is a capability probe of the runtime itself, never of what some
-    caller declares: a name counts only when this module can resolve it as a
-    usable entry point in the runtime's own virtualenv.
+    caller declares: a name counts when this module can resolve its script in
+    the runtime's own virtualenv. The probe intentionally matches predecessor
+    completeness checks, which establish compatibility from script presence;
+    executability proper is enforced at the actual launch boundary.
 
-    The usability test lives in :func:`cli_entry_executable` alone and this
-    probe is defined in terms of it, so the set of names a runtime reports and
-    the set of names the rest of the module can actually resolve can never
-    diverge. A disagreement here would be silent and severe: the runtime would
-    pass the usability gate, be declared unusable for every upgrade, and never
-    be retired. Executability proper is enforced where a launch really happens,
-    by the launcher's own ``-x`` test.
+    Keeping this probe defined in terms of :func:`cli_entry_executable` makes
+    runtime capability reporting and per-entry resolution answer the same
+    presence question.
 
     Args:
         commit: Exact commit hash.
@@ -292,21 +290,19 @@ def root_entry_points(commit: str) -> frozenset[str]:
 
 
 def satisfies_entry_points(present: frozenset[str], required: frozenset[str]) -> bool:
-    """Return whether a runner can satisfy every entry point a runtime requires.
+    """Return whether a runtime provides every entry point a caller requires.
 
-    The relation is directional on purpose: a runner is compatible with a
-    target when the runner provides at least everything the target declares.
-    A runner with a strict superset of the target's requirements is therefore
-    safe, while a target that would need something the runner lacks is not.
-    The reverse question -- whether the target still satisfies a larger,
-    older requirement set -- is answered by the target runtime bridging those
-    names, never by comparing the two declared sets against each other.
+    The relation is directional on purpose: compatibility requires the
+    candidate runtime's present names to cover the caller's requirement set.
+    A supported predecessor may require a strict superset of the currently
+    maintained names, so newer runtimes preserve retired names as inert
+    compatibility entries.
 
     It fails closed: an empty or unknown side is never compatible.
 
     Args:
-        present: Entry points a runner can actually launch.
-        required: Entry points the runtime needs.
+        present: Entry-point names present in the candidate runtime.
+        required: Entry-point names the calling runtime still requires.
 
     Returns:
         ``True`` only when ``required`` is non-empty and fully covered.
