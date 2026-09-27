@@ -5,10 +5,13 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections.abc import Callable
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-import pytest
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    import pytest
 
 from lubko import lifecycle, supervise, supervisor
 from lubko.control_socket import (
@@ -40,7 +43,7 @@ def test_readiness_wait_services_control_requests(
             conn.settimeout(0.25)
             _send_message(conn, {"type": "ping"})
             responses.append(_recv_message(conn))
-        except Exception as exc:  # pragma: no cover - asserted below
+        except (OSError, TypeError, ValueError) as exc:  # pragma: no cover - asserted below
             failures.append(exc)
         finally:
             if conn is not None:
