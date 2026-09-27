@@ -79,20 +79,6 @@ if [ "$FAILED" -eq 0 ]; then
   fi
 fi
 
-# A minimal tini-static shim so the installed lubko-startup launcher can
-# execute its canonical `exec tini-static -- lubko-supervisor` chain.
-TINI_DIR="${HOME}/.lubko-acceptance-tini"
-mkdir -p "${TINI_DIR}"
-cat > "${TINI_DIR}/tini-static" << 'SHIM'
-#!/bin/sh
-# Tini shim: consume the leading -- separator (tini static convention)
-# then exec the remaining command and arguments.
-shift
-exec "$@"
-SHIM
-chmod 755 "${TINI_DIR}/tini-static"
-export PATH="${TINI_DIR}:${PATH}"
-
 printf '%s\n' '  valid token: lubko-startup crosses startup boundary'
 VALID_TOKEN="aabbccddee00112233445566778899aabbccddee00112233445566778899aabb"
 export LUBKO_SUPERVISOR_STATE_TOKEN="${VALID_TOKEN}"
