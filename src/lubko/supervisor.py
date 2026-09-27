@@ -7,21 +7,18 @@ unexpected worker exit.  It is deliberately independent of the worker and of
 the Lubko job queue: it never needs a queue roundtrip to notice or repair
 worker death.
 
-The daemon is designed to be the container's long-lived main process.  The
-production container currently runs ``tini-static -- sleep infinity``; the
-supported startup contract replaces the ``sleep infinity`` child of Tini with
-the supervisor:
+The daemon is designed to be a long-lived service owned by the external
+host/container supervisor. Lubko's supported startup contract names only the
+service command:
 
-    tini-static -- lubko-supervisor
+    lubko-supervisor
 
-On every container start Tini launches the supervisor, which reconstructs the
-intended maintained worker deterministically from durable state under
+The external PID 1 and restart mechanism are deliberately opaque to Lubko. On
+every service start the supervisor reconstructs the intended maintained worker
+deterministically from durable state under
 ``$XDG_STATE_HOME/lubko/supervisor/`` and from the existing deployment
-authorities (``worker/meta.json`` and ``worker/rollback.json``).  The exact
-runtime requirement (switching the container command from ``sleep infinity``
-to ``lubko-supervisor``) is configured in the container image, which is outside
-this repository; all repository-side pieces required by that contract are
-implemented here.
+authorities (``worker/meta.json`` and ``worker/rollback.json``). The outer
+container or service configuration is trusted to keep this service running.
 
 Ownership model
 ---------------
@@ -4154,7 +4151,7 @@ class SupervisorDaemon:
     def _install_signal_handlers(self) -> None:
         """Install graceful-shutdown handlers for the container runtime.
 
-        As the container's main process, the supervisor must turn Tini's
+        As the container's main process, the supervisor must turn the outer service supervisor's
         ``SIGTERM`` into a graceful worker stop and a clean exit.
         """
 
@@ -4742,7 +4739,7 @@ class SupervisorDaemon:
         2. Waits for B's READY signal on the readiness pipe.
         3. Retires A's own pidfile.
         4. **Execs in place** into the target executable, preserving A's PID
-           so Tini (the direct-parent init) never sees its child exit.
+           so the external service supervisor does not observe a service exit.
 
         The probe never receives TRANSFER and never enters the reconcile
         loop.  It validates readiness and exits.  After the probe exits,
@@ -4752,10 +4749,11 @@ class SupervisorDaemon:
         No authority overlap and no authority gap:  A holds the flock
         throughout the probe.  The exec atomically replaces A's process
         image; the new image inherits the lock fd and adopts it.  If exec
-        fails, the process exits, letting Tini restart from durable state.
+        fails, the process exits, letting the external service supervisor restart
+        from durable state.
 
-        Tini direct-child contract:  The exec preserves A's PID.  Tini
-        never observes a child exit, so the container stays alive.  The
+        External supervision contract:  The exec preserves A's PID.  The outer
+        service supervisor never observes a service exit, so the container stays alive.  The
         worker child survives because its parent PID does not change.
         """
         handoff = self._resolve_handoff_target()
@@ -4989,7 +4987,8 @@ class SupervisorDaemon:
         3. Sets the lock fd adoption env vars so the exec'd target can adopt
            the inherited lock without entering handoff/probe mode.
         4. Execs into the target via ``os.execve``, preserving A's PID for
-           Tini.  The confirmed target commit is passed through the env so
+           the external service supervisor.  The confirmed target commit is passed
+           through the env so
            the exec'd image can bind its immutable runtime identity (#767).
         5. On exec failure, restores the pidfile and returns ``False`` so
            A continues with its current runtime (fail-closed availability:

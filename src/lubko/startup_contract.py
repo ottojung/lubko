@@ -1,17 +1,18 @@
 """Versioned, repository-owned supervisor startup contract.
 
-The production reliability guarantee depends on ``lubko-supervisor`` being the
-container's long-lived process owner, restored after a container or host
-restart. That guarantee is only end-to-end when the deployment actually starts
+The production reliability guarantee depends on ``lubko-supervisor`` running as a
+long-lived supervised service, restored after a container or host restart. That
+guarantee is only end-to-end when the deployment actually starts
 the supervisor that way; this module makes the contract an authoritative,
 versioned, repository-owned definition (including a generated, installable
 startup launcher).
 
-The supported startup definition is::
+The supported service command is::
 
-    tini-static -- lubko-supervisor
+    lubko-supervisor
 
-The outer host/container environment is trusted to restart Lubko appropriately and
+The outer host/container environment is trusted to provide PID 1 supervision and
+restart Lubko appropriately. It may use s6, systemd, or another supervisor, and
 must supply the stable environment variables named by the versioned contract,
 including ``LUBKO_SUPERVISOR_STATE_TOKEN``.  Lubko records only required variable
 names, never their values.  Other external setup remains outside this contract and
@@ -40,7 +41,7 @@ from lubko.durable import (
 )
 from lubko.state import SUPERVISOR_STATE_TOKEN_ENV, state_root
 
-CONTRACT_SCHEMA_VERSION: Final = 2
+CONTRACT_SCHEMA_VERSION: Final = 3
 
 #: Name of the generated, versioned startup launcher the container should run.
 STARTUP_LAUNCHER_NAME: Final = "lubko-startup"
@@ -49,7 +50,7 @@ STARTUP_LAUNCHER_NAME: Final = "lubko-startup"
 STARTUP_DEFINITION_NAME: Final = "lubko-startup-definition.json"
 
 #: Schema version of the startup definition artifact.
-STARTUP_DEFINITION_SCHEMA_VERSION: Final = 2
+STARTUP_DEFINITION_SCHEMA_VERSION: Final = 3
 
 
 #: Required permission mode for the contract's state directories: private to
@@ -96,7 +97,7 @@ class StartupContract:
     """Authoritative, versioned supervisor startup contract.
 
     The contract is the repository-owned definition of how the container must
-    start the supervisor.  It names the exact ``tini-static -- lubko-supervisor``
+    start the supervisor.  It names the exact ``lubko-supervisor`` service
     command, the state directories the deployment must mount with the required
     permissions, and the names of environment variables the external launcher must
     supply.  Environment values are deliberately not part of the artifact.  A version change
@@ -172,7 +173,7 @@ class StartupContract:
 #: The canonical supported startup contract shipped with the code.
 CURRENT_CONTRACT: Final = StartupContract(
     schema_version=CONTRACT_SCHEMA_VERSION,
-    init_command=("tini-static", "--"),
+    init_command=(),
     supervisor_command=("lubko-supervisor",),
     required_state_dirs=("supervisor", "worker", "deploy"),
     required_config_files=DEFAULT_CONFIG_FILES,
@@ -330,7 +331,7 @@ def canonical_startup_command() -> list[str]:
     """Return the exact, versioned container startup command.
 
     Returns:
-        The ``tini-static -- lubko-supervisor`` argv.
+        The ``lubko-supervisor`` argv. The external PID 1 is intentionally not part of it.
     """
     return [*CURRENT_CONTRACT.init_command, *CURRENT_CONTRACT.supervisor_command]
 
@@ -338,10 +339,10 @@ def canonical_startup_command() -> list[str]:
 def generate_startup_launcher_content() -> str:
     """Return the versioned startup launcher script source.
 
-    The launcher execs the canonical ``tini-static -- lubko-supervisor`` command
-    (resolving ``lubko-supervisor`` via the installed bin launcher), so the
-    container entrypoint can be pointed at this single repository-owned file
-    instead of ``sleep infinity``.
+    The launcher execs the canonical ``lubko-supervisor`` command, resolving it
+    through the installed bin launcher. The external container/service supervisor
+    can run this launcher as a supervised service without becoming part of Lubko's
+    own runtime contract.
 
     The shebang resolves ``sh`` at generation time for portability across
     GNU Linux and Termux.
@@ -551,7 +552,7 @@ def generate_startup_definition() -> dict[str, object]:
 
     The definition is the authoritative, versioned description of how the
     supported deployment must start the supervisor: the exact
-    ``tini-static -- lubko-supervisor`` command, required state mounts, private
+    ``lubko-supervisor`` service command, required state mounts, private
     config path expectations, and required external environment-variable names. It is
     consumed by the supported install/bootstrap/deploy path and validated exactly
     by the maintained verifier — unlike a prose instruction, it controls startup.
