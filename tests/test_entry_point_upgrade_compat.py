@@ -24,13 +24,16 @@ TARGET: Final = "b" * 40
 PREDECESSOR_REQUIREMENTS: Final = frozenset(cli.ENTRY_POINTS) | frozenset(cli.RETIRED_ENTRY_POINTS)
 
 
-def build_target_runtime(monkeypatch: pytest.MonkeyPatch, repo: Path, commit: str) -> None:
+def build_target_runtime(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, commit: str, mode: int = 0o755
+) -> None:
     """Materialize one sealed runtime exposing only the maintained entry points.
 
     Args:
         monkeypatch: The active monkeypatch fixture.
         repo: Stand-in repository path; extraction is faked.
         commit: Exact commit hash to materialize.
+        mode: Permission bits of the materialized entry-point scripts.
     """
 
     def fake_sync(_uv_path: str, root: Path, _timeout_seconds: float) -> None:
@@ -40,7 +43,7 @@ def build_target_runtime(monkeypatch: pytest.MonkeyPatch, repo: Path, commit: st
         for entry in cli.ENTRY_POINTS:
             script = bin_dir / entry
             script.write_text(f"#!/bin/sh\necho {entry}\n", encoding="utf-8")
-            script.chmod(0o755)
+            script.chmod(mode)
 
     monkeypatch.setattr(cli, "_sync_venv", fake_sync)
     monkeypatch.setattr(
@@ -85,3 +88,29 @@ def test_bridged_retired_entry_point_runs_nothing(
         assert script.startswith("#!/bin/sh")
         assert "exit 127" in script, "a bridged entry point must refuse to run a command"
         assert entry not in cli.ENTRY_POINTS, "a retired name is never maintained again"
+
+
+def test_runtime_capability_probe_agrees_with_entry_point_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runtime's reported entry-point set is exactly what it can resolve.
+
+    The capability probe and the per-entry lookup answer the same question, so
+    a runtime must never pass the usability gate while reporting no usable entry
+    point: that combination makes the supervisor refuse every upgrade to the
+    commit forever. Entry-point files that are not executable are still
+    resolvable, and must therefore still be reported.
+    """
+    build_target_runtime(monkeypatch, tmp_path / "repo", TARGET, mode=0o644)
+
+    reported = cli.root_entry_points(TARGET)
+    resolved = frozenset(
+        entry
+        for entry in cli.known_entry_points()
+        if cli.cli_entry_executable(TARGET, entry) is not None
+    )
+    assert reported == resolved == cli.known_entry_points()
+    assert cli.runtime_is_usable(TARGET)
+    assert cli.runtime_satisfies(TARGET, frozenset(cli.ENTRY_POINTS)), (
+        "a runtime whose entries are all resolvable must stay instantiable"
+    )
