@@ -11,12 +11,12 @@ The supported service command is::
 
     lubko-supervisor
 
-The outer host/container environment is trusted to provide PID 1 supervision and
-restart Lubko appropriately. It may use s6, systemd, or another supervisor, and
-must supply the stable environment variables named by the versioned contract,
-including ``LUBKO_SUPERVISOR_STATE_TOKEN``.  Lubko records only required variable
-names, never their values.  Other external setup remains outside this contract and
-is not inspected by Lubko.
+The caller chooses whether and how to supervise Lubko. The supervisor may run at
+any PID and may be launched directly or under any external init/service manager.
+Only the stable environment variables named by the versioned contract are
+required, including ``LUBKO_SUPERVISOR_STATE_TOKEN``. Lubko records only required
+variable names, never their values. Other external setup remains outside this
+contract and is not inspected by Lubko.
 """
 
 from __future__ import annotations
@@ -331,7 +331,7 @@ def canonical_startup_command() -> list[str]:
     """Return the exact, versioned container startup command.
 
     Returns:
-        The ``lubko-supervisor`` argv. The external PID 1 is intentionally not part of it.
+        The ``lubko-supervisor`` argv. External process topology is intentionally not part of it.
     """
     return [*CURRENT_CONTRACT.init_command, *CURRENT_CONTRACT.supervisor_command]
 
