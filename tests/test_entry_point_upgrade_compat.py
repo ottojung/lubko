@@ -11,6 +11,7 @@ runtime the predecessor cannot launch.
 
 from __future__ import annotations
 
+from importlib import metadata
 from typing import TYPE_CHECKING, Final
 
 from lubko import cli
@@ -53,6 +54,39 @@ def build_target_runtime(
     )
     cli.build_cli_root(repo, commit, "uv", 60.0)
 
+
+
+
+def test_retired_names_are_package_entry_points_for_predecessor_builders() -> None:
+    """An old builder sees every retired name immediately after ``uv sync``.
+
+    Predecessor deploy controllers run their own completeness check directly
+    after syncing the target package, before any target-version post-processing
+    can execute. The compatibility names therefore have to be package console
+    scripts, not only bridges installed by the new builder.
+    """
+    distribution = metadata.distribution("lubko")
+    scripts = {
+        entry.name: entry.value
+        for entry in distribution.entry_points
+        if entry.group == "console_scripts"
+    }
+    for entry in cli.RETIRED_ENTRY_POINTS:
+        assert scripts.get(entry) == "lubko.cli:retired_entry_point_main", (
+            f"{entry} is not installed by target package metadata, so a supported "
+            "predecessor builder will reject the runtime before bridge installation"
+        )
+
+
+def test_retired_package_entry_point_is_inert(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The package compatibility entry point does not resurrect retired behavior."""
+    monkeypatch.setattr("sys.argv", ["lubko-agent"])
+    assert cli.retired_entry_point_main() == 127
+    err = capsys.readouterr().err
+    assert "removed from the maintained CLIs" in err
+    assert "upgrade to this runtime" in err
 
 def test_maintained_set_is_a_strict_subset_of_a_predecessor_requirement_set() -> None:
     """The maintained set is smaller, so it can never stand in for a predecessor's."""
