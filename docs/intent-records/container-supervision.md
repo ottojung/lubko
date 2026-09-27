@@ -1,15 +1,19 @@
 $id-9992381141995964
-title: Use s6 as the Lubko container supervisor
+title: Restart Lubko whenever it dies
 date: 2026/09/26
 source: @ottojung
 kind: requirement
 
-The Lubko container image must use s6 as its PID 1 and process supervisor rather
-than relying on Docker `--init` / Tini. Lubko itself is one supervised service:
-if `lubko-supervisor` exits unexpectedly, s6 is responsible for starting it
-again.
+Every Lubko deployment must arrange for `lubko-supervisor` to be restarted
+whenever it dies or exits, unless an operator has intentionally disabled or
+stopped the deployment.
 
-The outer s6 service topology remains infrastructure rather than Lubko runtime
-authority. Lubko's own startup contract should name the `lubko-supervisor`
-service command and must not inspect or require a particular live parent/child
-process topology.
+The restart mechanism is an infrastructure choice, not part of Lubko's runtime
+contract. A deployment may use s6, systemd, runit, Docker or container restart
+policy, another service manager, or any other mechanism that provides the same
+restart guarantee. Lubko may run inside or outside a container. No particular
+init system is required, and `lubko-supervisor` does not need to be PID 1.
+
+Lubko must remain agnostic to that external supervision topology: it should not
+inspect which restart mechanism is present or depend on a particular parent
+process arrangement for correctness.

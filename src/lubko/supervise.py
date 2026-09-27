@@ -2555,7 +2555,7 @@ def child_is_our_direct_child(child: WorkerChild) -> bool:
 
     Combines the liveness check of :func:`child_alive` with an exact parent
     proof: the recorded child must be live *and* its parent PID must be this
-    process, so a child reparented to PID 1 after a supervisor restart is
+    process, so a surviving child reparented away from this supervisor is
     never mistaken for our own.  This is the exact identity proof the
     retirement authority requires before any signal is delivered.
 

@@ -79,7 +79,7 @@ def test_contract_version_mismatch_fails_closed(
     """An unsupported contract version fails closed on the strict reader."""
     monkeypatch.setattr(sc, "contract_path", lambda: tmp_path / "startup-contract.json")
     (tmp_path / "startup-contract.json").write_text(
-        '{"schema_version": 999, "init_command": ["tini-static", "--"], '
+        '{"schema_version": 999, "init_command": ["legacy-init", "--"], '
         '"supervisor_command": ["lubko-supervisor"], '
         '"required_state_dirs": ["supervisor"]}',
         encoding="utf-8",
@@ -103,7 +103,7 @@ def test_contract_legacy_keys_ignored(tmp_path: Path, monkeypatch: pytest.Monkey
     environment_json = json.dumps(list(CURRENT_CONTRACT.required_environment))
     (tmp_path / "startup-contract.json").write_text(
         '{"schema_version": 3, '
-        '"init_markers": ["tini-static", "tini"], '
+        '"init_markers": ["legacy-init", "legacy-init-alias"], '
         '"init_command": [], '
         '"supervisor_markers": ["lubko-supervisor", "lubko.supervisor"], '
         '"supervisor_command": ["lubko-supervisor"], '

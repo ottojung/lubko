@@ -6,11 +6,11 @@ Lubko requires a simple supervised service command:
 lubko-supervisor
 ```
 
-The external host/container environment owns PID 1, process supervision, and
-restart policy. Lubko deliberately does not prescribe or inspect that topology.
-For the published `lubko-base` container image, s6-overlay is provided as PID 1;
-deployments register Lubko as an s6 service and must not add Docker's
-`--init`/Tini layer on top.
+Lubko does not require any particular PID, init system, or service manager.
+Every deployment must arrange for `lubko-supervisor` to be restarted whenever
+it dies or exits, unless an operator intentionally stops or disables the
+deployment. How that restart guarantee is implemented is external
+infrastructure. Lubko deliberately does not prescribe or inspect that topology.
 
 Lubko validates only its repository-owned startup artifacts, state directories,
 private config permissions, and required environment variable names. The outer
@@ -70,13 +70,14 @@ must not publish an envelope the already-running recovery supervisor cannot pars
 `lubko-deploy startup-contract` validates those artifacts. It does not inspect
 the live process topology or anything outside the Lubko environment.
 
-## Container supervision
+## External supervision
 
-`docker/lubko-base.Dockerfile` installs a pinned s6-overlay and uses `/init`
-as the image entrypoint. A deployment supplies its own service definitions, so
-the image does not hard-code site-specific paths or credentials.
+`docker/lubko-base.Dockerfile` intentionally has no init-system entrypoint.
+Deployments choose how to launch the image and how to satisfy the required
+restart-on-death guarantee. Tini, s6, systemd, runit, Docker/container restart
+policies, and equivalent mechanisms are all external deployment choices rather
+than Lubko requirements.
 
-For a read-only container, s6-overlay requires a writable `/run`. Mount `/run`
-as tmpfs, set `S6_READ_ONLY_ROOT=1`, and register `lubko-supervisor` (or the
-deployment's bootstrap wrapper that ultimately execs it) as a supervised service.
-Do not also use Docker `--init`; s6 is already PID 1.
+The deployment must provide automatic restart after supervisor death or exit
+unless intentionally disabled by an operator. That restart mechanism is outside
+Lubko's startup contract and is never inspected by Lubko.
