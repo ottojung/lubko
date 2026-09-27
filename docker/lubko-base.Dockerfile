@@ -25,11 +25,14 @@ RUN set -eux; \
     tar -C /rootfs -Jxpf /tmp/s6-overlay-noarch.tar.xz; \
     tar -C /rootfs -Jxpf "/tmp/s6-overlay-${s6_arch}.tar.xz"
 
+FROM debian:13-slim AS shell
+
 FROM ghcr.io/astral-sh/uv:0.10.12 AS uv
 
 FROM gcr.io/distroless/cc-debian13
 
 COPY --from=s6 /rootfs /
+COPY --from=shell /bin/dash /bin/sh
 COPY --from=uv /uv /usr/local/bin/uv
 
 ENV USER="lubko"
