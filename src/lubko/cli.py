@@ -69,17 +69,19 @@ RETIRED_ENTRY_POINTS: Final = (
     "my-lubko-agent",
     "lubko-board",
 )
-"""Entry points removed from the maintained set but still bridged in every runtime.
+"""Entry points removed from the maintained set but retained as inert compatibility names.
 
-An already-deployed supervisor validated each candidate runtime against its
-own, larger, entry-point set. Dropping a maintained entry point without
-bridging it therefore made a newer runtime unlaunchable for a predecessor that
-is still running the confirmed worker, which strands the host instead of
-upgrading it. Every retired name is therefore still materialized inside each
-built runtime, so a predecessor's requirement set stays satisfiable and the
-supervisor upgrade can happen while the previous worker is still consuming.
-The bridged scripts deliberately run nothing: they only keep the predecessor's
-capability probe true for the names it still insists on.
+An already-deployed deploy controller or supervisor can validate each candidate
+runtime against its own, larger entry-point set. Dropping a maintained entry
+point without preserving its name therefore makes a newer runtime unbuildable
+or unlaunchable for that predecessor.
+
+Every retired name is installed by package metadata as an inert console script,
+so even an old builder sees it immediately after ``uv sync`` and before that
+builder runs its own completeness check. Fresh builders also keep the fallback
+bridge materialization below. The compatibility entry points deliberately run
+nothing; they exist only to keep supported predecessor requirement sets
+satisfiable while the real maintained CLI surface remains smaller.
 """
 CURRENT_LINK_NAME: Final = "current"
 CURRENT_TMP_NAME: Final = "current.tmp"
@@ -743,17 +745,16 @@ def _sync_venv(uv_path: str, root: Path, timeout_seconds: float) -> None:
 
 
 def install_entry_point_bridges(commit: str) -> None:
-    """Bridge every retired entry point into one freshly built runtime.
+    """Bridge every retired entry point missing from one freshly built runtime.
 
-    This runs while the runtime is still unsealed and before the binding
-    manifest is written, so the bridges are part of the manifest-bound content
-    identity of this exact commit. A runtime that carries them stays
-    instantiable for an already-deployed predecessor whose entry-point set is a
-    strict superset of the maintained one, which is what lets that predecessor
-    be upgraded while its previous worker is still consuming the queue.
+    Retired names are normally installed by package metadata during ``uv sync``
+    so even a predecessor builder sees them before its own completeness check.
+    This post-sync materialization is defense in depth for fresh builders and
+    runs before the binding manifest is written, so any fallback bridge is part
+    of the manifest-bound content identity.
 
-    A name that already exists is left untouched: the tree just came from
-    ``uv sync`` and the runtime's real entry points always win.
+    A name that already exists is left untouched: package-installed
+    compatibility scripts and any real entry point always win.
 
     Args:
         commit: Exact commit hash of the runtime being built.
