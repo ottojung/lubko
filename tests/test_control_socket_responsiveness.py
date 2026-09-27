@@ -22,6 +22,14 @@ from lubko.control_socket import (
 )
 
 
+def _assert_authority_snapshot(response: dict[str, object] | None) -> None:
+    """Require one successful authority-snapshot response."""
+    assert response is not None
+    assert response["ok"] is True
+    assert response["desired"] is None
+    assert isinstance(response["state"], dict)
+
+
 def test_readiness_wait_services_control_requests(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -91,8 +99,4 @@ def test_readiness_wait_services_control_requests(
     assert reason == "queue consumption not proven"
     assert failures == []
     assert len(responses) == 1
-    response = responses[0]
-    assert response is not None
-    assert response["ok"] is True
-    assert response["desired"] is None
-    assert isinstance(response["state"], dict)
+    _assert_authority_snapshot(responses[0])
