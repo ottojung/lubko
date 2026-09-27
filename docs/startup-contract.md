@@ -6,10 +6,11 @@ Lubko requires a simple supervised service command:
 lubko-supervisor
 ```
 
-Lubko does not require any particular PID, init system, service manager, or
-restart topology. `lubko-supervisor` may be launched directly or by any external
-supervisor chosen by the deployment. Lubko deliberately does not prescribe or
-inspect that topology.
+Lubko does not require any particular PID, init system, or service manager.
+Every deployment must arrange for `lubko-supervisor` to be restarted whenever
+it dies or exits, unless an operator intentionally stops or disables the
+deployment. How that restart guarantee is implemented is external
+infrastructure. Lubko deliberately does not prescribe or inspect that topology.
 
 Lubko validates only its repository-owned startup artifacts, state directories,
 private config permissions, and required environment variable names. The outer
@@ -76,6 +77,6 @@ Deployments choose how to launch the image and whether to supervise
 `lubko-supervisor`. Tini, s6, Docker `--init`, systemd, and direct execution
 are all external deployment choices rather than Lubko requirements.
 
-Automatic restart after an external process/container failure can be provided by
-the deployment when desired, but that mechanism is outside Lubko's startup
-contract and is never inspected by Lubko.
+The deployment must provide automatic restart after supervisor death or exit
+unless intentionally disabled by an operator. That restart mechanism is outside
+Lubko's startup contract and is never inspected by Lubko.
