@@ -1921,7 +1921,11 @@ class SupervisorDaemon:
             A ``(ready, reason)`` tuple.
         """
         if not lifecycle.verify_worker_consumes_queue(
-            child.worker_id, probe_cwd, child.pid, self.settings.probe_timeout_seconds
+            child.worker_id,
+            probe_cwd,
+            child.pid,
+            self.settings.probe_timeout_seconds,
+            progress_callback=self._accept_control_requests,
         ):
             return False, "queue consumption not proven"
         snapshot = read_worker_health_by_incarnation(child.token)
