@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from lubko import lifecycle, lifecycle_authority, supervise, supervisor
+from lubko import cli, lifecycle, lifecycle_authority, supervise, supervisor
 from lubko import worker as worker_mod
 from lubko.supervise import (
     INTENT_RUN,
@@ -470,6 +470,7 @@ def test_deferred_desired_publication_spawns_and_applies_nothing(
     write_state(fresh_state())
     supervise.request_run(COMMIT, repo="repo", uv_path="uv", worker_id=None)
     daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
+    monkeypatch.setattr(cli, "runtime_satisfies", lambda _commit, _required: True)
     monkeypatch.setattr(
         daemon,
         "_spawn_worker",

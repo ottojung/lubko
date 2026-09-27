@@ -42,6 +42,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 from contextlib import suppress
 from operator import itemgetter
@@ -63,6 +64,25 @@ ENTRY_POINTS: Final = (
     "lubko-deploy-ctl",
     "lubko-install",
 )
+RETIRED_ENTRY_POINTS: Final = (
+    "lubko-agent",
+    "my-lubko-agent",
+    "lubko-board",
+)
+"""Entry points removed from the maintained set but retained as inert compatibility names.
+
+An already-deployed deploy controller or supervisor can validate each candidate
+runtime against its own, larger entry-point set. Dropping a maintained entry
+point without preserving its name therefore makes a newer runtime unbuildable
+or unlaunchable for that predecessor.
+
+Every retired name is installed by package metadata as an inert console script,
+so even an old builder sees it immediately after ``uv sync`` and before that
+builder runs its own completeness check. Fresh builders also keep the fallback
+bridge materialization below. The compatibility entry points deliberately run
+nothing; they exist only to keep supported predecessor requirement sets
+satisfiable while the real maintained CLI surface remains smaller.
+"""
 CURRENT_LINK_NAME: Final = "current"
 CURRENT_TMP_NAME: Final = "current.tmp"
 DEFAULT_BUILD_TIMEOUT_SECONDS: Final = 600.0
@@ -101,6 +121,29 @@ if [ ! -x "$BIN" ]; then
 fi
 exec "$BIN" "$@"
 """
+
+_BRIDGE_TEMPLATE: Final = """#!/bin/sh
+# Retired Lubko entry point, bridged for supervisor upgrade compatibility.
+printf '%s: this entry point was removed from the maintained CLIs.\\n' "{entry}" >&2
+printf 'It is bridged only so an already-deployed supervisor can still validate\\n' >&2
+printf 'and launch this runtime; use a maintained entry point instead.\\n' >&2
+exit 127
+"""
+
+
+def retired_entry_point_main() -> int:
+    """Refuse execution of a retired CLI name kept only for upgrade compatibility.
+
+    Returns:
+        Exit status 127, matching an unavailable command.
+    """
+    entry = Path(sys.argv[0]).name
+    sys.stderr.write(f"{entry}: this entry point was removed from the maintained CLIs.\n")
+    sys.stderr.write(
+        "It remains installed only so an older Lubko deployment can validate "
+        "and upgrade to this runtime.\n"
+    )
+    return 127
 
 
 class CliError(RuntimeError):
@@ -196,17 +239,95 @@ def cli_entry_executable(commit: str, entry: str) -> Path | None:
 def _root_is_usable(commit: str) -> bool:
     """Return whether a commit's CLI environment looks fully built.
 
-    Every maintained entry point must exist: older commits may predate one of
-    the seven entry points, and activating such a root would leave that global
-    command broken.
+    Every maintained entry point must exist: a root that predates one of them
+    would leave that command broken for whoever resolves this runtime.
 
     Args:
         commit: Exact commit hash.
 
     Returns:
-        ``True`` when the per-commit environment has every entry point.
+        ``True`` when the per-commit environment has every maintained entry
+        point.
     """
     return all(cli_entry_executable(commit, entry) is not None for entry in ENTRY_POINTS)
+
+
+def known_entry_points() -> frozenset[str]:
+    """Return every entry point name any supported runtime may be asked for.
+
+    Args:
+        None.
+
+    Returns:
+        The maintained names plus the bridged retired names.
+    """
+    return frozenset(ENTRY_POINTS) | frozenset(RETIRED_ENTRY_POINTS)
+
+
+def root_entry_points(commit: str) -> frozenset[str]:
+    """Return the known entry-point names present in one commit runtime.
+
+    This is a capability probe of the runtime itself, never of what some
+    caller declares: a name counts when this module can resolve its script in
+    the runtime's own virtualenv. The probe intentionally matches predecessor
+    completeness checks, which establish compatibility from script presence;
+    executability proper is enforced at the actual launch boundary.
+
+    Keeping this probe defined in terms of :func:`cli_entry_executable` makes
+    runtime capability reporting and per-entry resolution answer the same
+    presence question.
+
+    Args:
+        commit: Exact commit hash.
+
+    Returns:
+        The entry points this runtime can really launch, empty when the root is
+        missing or unreadable.
+    """
+    return frozenset(
+        name for name in known_entry_points() if cli_entry_executable(commit, name) is not None
+    )
+
+
+def satisfies_entry_points(present: frozenset[str], required: frozenset[str]) -> bool:
+    """Return whether a runtime provides every entry point a caller requires.
+
+    The relation is directional on purpose: compatibility requires the
+    candidate runtime's present names to cover the caller's requirement set.
+    A supported predecessor may require a strict superset of the currently
+    maintained names, so newer runtimes preserve retired names as inert
+    compatibility entries.
+
+    It fails closed: an empty or unknown side is never compatible.
+
+    Args:
+        present: Entry-point names present in the candidate runtime.
+        required: Entry-point names the calling runtime still requires.
+
+    Returns:
+        ``True`` only when ``required`` is non-empty and fully covered.
+    """
+    if not present or not required:
+        return False
+    return required <= present
+
+
+def runtime_satisfies(commit: str, required: frozenset[str]) -> bool:
+    """Return whether one commit runtime can be launched by a given runner.
+
+    A usable runtime is not enough on its own: the runner's own entry-point
+    requirements must all be resolvable inside this runtime, so a runtime built
+    by a newer tree stays launchable for an already-deployed predecessor whose
+    requirement set is a superset of the maintained one.
+
+    Args:
+        commit: Exact commit hash of the runtime to launch.
+        required: Entry points the running runner insists on.
+
+    Returns:
+        ``True`` only when the runtime is usable and provides ``required``.
+    """
+    return runtime_is_usable(commit) and satisfies_entry_points(root_entry_points(commit), required)
 
 
 def manifest_path(commit: str) -> Path:
@@ -617,15 +738,47 @@ def _sync_venv(uv_path: str, root: Path, timeout_seconds: float) -> None:
         raise CliError(msg)
 
 
+def install_entry_point_bridges(commit: str) -> None:
+    """Bridge every retired entry point missing from one freshly built runtime.
+
+    Retired names are normally installed by package metadata during ``uv sync``
+    so even a predecessor builder sees them before its own completeness check.
+    This post-sync materialization is defense in depth for fresh builders and
+    runs before the binding manifest is written, so any fallback bridge is part
+    of the manifest-bound content identity.
+
+    A name that already exists is left untouched: package-installed
+    compatibility scripts and any real entry point always win.
+
+    Args:
+        commit: Exact commit hash of the runtime being built.
+
+    Raises:
+        CliError: If a bridge script cannot be materialized.
+    """
+    bin_dir = cli_commit_dir(commit) / ".venv" / "bin"
+    for entry in RETIRED_ENTRY_POINTS:
+        script = bin_dir / entry
+        if script.exists():
+            continue
+        try:
+            script.write_text(_BRIDGE_TEMPLATE.format(entry=entry), encoding="utf-8")
+            script.chmod(0o755)
+        except OSError as exc:
+            msg = f"could not bridge the retired entry point {entry} for commit {commit}: {exc}"
+            raise CliError(msg) from exc
+
+
 def build_cli_root(repo: Path, commit: str, uv_path: str, timeout_seconds: float) -> Path:
     """Build or reuse the immutable CLI environment for one exact commit.
 
     The environment is extracted with ``git archive`` and synchronized with
     ``uv sync`` directly at its final location, so entry-point shebangs stay
-    valid. Building the same commit twice is idempotent and never rewrites an
-    already-sealed usable environment. Once materialized and verified it is
-    sealed read-only; an unsealed/corrupt/wrong-commit tree is unsealed,
-    removed, and rebuilt rather than trusted.
+    valid, and the retired entry points are bridged in before the tree is
+    manifest-bound and sealed. Building the same commit twice is idempotent and
+    never rewrites an already-sealed usable environment. Once materialized and
+    verified it is sealed read-only; an unsealed/corrupt/wrong-commit tree is
+    unsealed, removed, and rebuilt rather than trusted.
 
     Args:
         repo: Repository checkout that contains the commit.
@@ -663,6 +816,7 @@ def build_cli_root(repo: Path, commit: str, uv_path: str, timeout_seconds: float
         shutil.rmtree(destination, ignore_errors=True)
         msg = f"CLI environment for commit {commit} is incomplete after build"
         raise CliError(msg)
+    install_entry_point_bridges(commit)
     _write_runtime_manifest(commit)
     seal_runtime(commit)
     if not runtime_is_usable(commit):

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from lubko import lifecycle_authority, supervise, supervisor
+from lubko import cli, lifecycle_authority, supervise, supervisor
 from lubko.supervisor import Settings, SupervisorDaemon
 from tests._fake_authority_db import claim_every_daemon, seed_db_worker
 
@@ -150,10 +150,12 @@ def test_failed_retirement_holds_authority_and_spawns_nothing(
 @pytest.mark.usefixtures("supervisor_token")
 def test_retry_after_transient_retirement_failure_applies_normally(
     daemon: tuple[SupervisorDaemon, list[str]],
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Once retirement converges, a later reconciliation applies the intent."""
     dc, spawns = daemon
+    build_runtime_with_maintained_entry_points(monkeypatch, tmp_path, NEW)
     live_old_worker()
     outcomes = iter([False, True])
     monkeypatch.setattr(dc, "_retire_child", lambda: next(outcomes))
@@ -196,3 +198,106 @@ def test_same_commit_non_restart_settlement_keeps_live_worker(
     assert state.commit == OLD
     assert state.child is not None, "worker untouched"
     assert state.child.pid == 4242
+
+
+def build_runtime_with_maintained_entry_points(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, commit: str
+) -> None:
+    """Materialize a sealed runtime exposing only the maintained entry points.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        tmp_path: Per-test temporary directory.
+        commit: Exact commit hash to materialize.
+    """
+
+    def fake_sync(_uv_path: str, root: Path, _timeout_seconds: float) -> None:
+        """Create only the entry points the target's own tree declares."""
+        bin_dir = root / ".venv" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for entry in cli.ENTRY_POINTS:
+            script = bin_dir / entry
+            script.write_text(f"#!/bin/sh\necho {entry}\n", encoding="utf-8")
+            script.chmod(0o755)
+
+    monkeypatch.setattr(cli, "_sync_venv", fake_sync)
+    monkeypatch.setattr(
+        cli,
+        "_extract_archive",
+        lambda _repo, _commit, _destination, _timeout_seconds: None,
+    )
+    cli.build_cli_root(tmp_path / "repo", commit, "uv", 60.0)
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_uninstantiable_runtime_never_retires_the_live_worker(
+    daemon: tuple[SupervisorDaemon, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate this supervisor cannot launch leaves the worker consuming."""
+    dc, spawns = daemon
+    live_old_worker()
+    retire_calls: list[bool] = []
+    monkeypatch.setattr(type(dc), "_child_alive", staticmethod(lambda _state: True))
+
+    def record_retire() -> bool:
+        retire_calls.append(True)
+        return True
+
+    monkeypatch.setattr(dc, "_retire_child", record_retire)
+
+    dc._apply_desired(desired(2, NEW))
+
+    assert retire_calls == [], "the known-good worker must not be retired first"
+    assert spawns == [], "no replacement was authorized"
+    state = supervise.read_state()
+    assert state.applied_generation == 1, "generation did not advance"
+    assert state.commit == OLD, "maintained commit kept its authority"
+    assert state.child is not None, "the previous worker keeps consuming"
+    assert state.child.pid == 4242
+    assert state.next_attempt_at is not None, "a retry hold was recorded"
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_predecessor_entry_point_superset_upgrades_without_workerless_interval(
+    daemon: tuple[SupervisorDaemon, list[str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A predecessor requiring extra entry points upgrades after a pre-handoff check.
+
+    The running supervisor's own requirements are a strict superset of the
+    maintained set, so the candidate must be validated against that superset --
+    and the known-good worker must still be alive when that answer is sought.
+    """
+    dc, spawns = daemon
+    build_runtime_with_maintained_entry_points(monkeypatch, tmp_path, NEW)
+    # The running supervisor is a deployed predecessor: its own requirement set
+    # is the maintained set plus the names it was deployed with.
+    monkeypatch.setattr(cli, "ENTRY_POINTS", (*cli.ENTRY_POINTS, *cli.RETIRED_ENTRY_POINTS))
+    live_old_worker()
+    events: list[str] = []
+    real_satisfies = cli.runtime_satisfies
+    monkeypatch.setattr(type(dc), "_child_alive", staticmethod(lambda _state: True))
+
+    def record_retire() -> bool:
+        events.append("retire")
+        return True
+
+    def record_compatibility(commit: str, required: frozenset[str]) -> bool:
+        events.append("pre-handoff-check")
+        return real_satisfies(commit, required)
+
+    monkeypatch.setattr(dc, "_retire_child", record_retire)
+    monkeypatch.setattr(cli, "runtime_satisfies", record_compatibility)
+
+    dc._apply_desired(desired(2, NEW))
+
+    assert events == ["pre-handoff-check", "retire"], (
+        "compatibility must be established before the known-good worker retires"
+    )
+    assert spawns == [NEW], "the upgrade proceeds without a workerless interval"
+    state = supervise.read_state()
+    assert state.applied_generation == 2
+    assert state.commit == NEW
+    assert state.next_attempt_at is None
