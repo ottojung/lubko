@@ -42,6 +42,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 from contextlib import suppress
 from operator import itemgetter
@@ -127,6 +128,23 @@ printf 'and launch this runtime; use a maintained entry point instead.\\n' >&2
 exit 127
 """
 
+
+
+
+def retired_entry_point_main() -> int:
+    """Refuse execution of a retired CLI name kept only for upgrade compatibility.
+
+    Returns:
+        Exit status 127, matching an unavailable command.
+    """
+    entry = Path(sys.argv[0]).name
+    print(f"{entry}: this entry point was removed from the maintained CLIs.", file=sys.stderr)
+    print(
+        "It remains installed only so an older Lubko deployment can validate "
+        "and upgrade to this runtime.",
+        file=sys.stderr,
+    )
+    return 127
 
 class CliError(RuntimeError):
     """Raised when a maintained CLI environment cannot be built or switched."""
