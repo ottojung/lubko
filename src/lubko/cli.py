@@ -131,8 +131,6 @@ exit 127
 """
 
 
-
-
 def retired_entry_point_main() -> int:
     """Refuse execution of a retired CLI name kept only for upgrade compatibility.
 
@@ -147,6 +145,7 @@ def retired_entry_point_main() -> int:
         file=sys.stderr,
     )
     return 127
+
 
 class CliError(RuntimeError):
     """Raised when a maintained CLI environment cannot be built or switched."""

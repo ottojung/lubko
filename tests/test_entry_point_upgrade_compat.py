@@ -55,8 +55,6 @@ def build_target_runtime(
     cli.build_cli_root(repo, commit, "uv", 60.0)
 
 
-
-
 def test_retired_names_are_package_entry_points_for_predecessor_builders() -> None:
     """An old builder sees every retired name immediately after ``uv sync``.
 
@@ -87,6 +85,7 @@ def test_retired_package_entry_point_is_inert(
     err = capsys.readouterr().err
     assert "removed from the maintained CLIs" in err
     assert "upgrade to this runtime" in err
+
 
 def test_maintained_set_is_a_strict_subset_of_a_predecessor_requirement_set() -> None:
     """The maintained set is smaller, so it can never stand in for a predecessor's."""
