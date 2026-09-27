@@ -1527,9 +1527,9 @@ class SupervisorDaemon:
         """Return whether this supervisor process can instantiate ``commit``.
 
         The answer comes from this process's own requirements, never from the
-        candidate's declared entry-point set: the running supervisor must be
-        able to provide every entry point the candidate runtime needs to be
-        launched. A candidate that omits an entry point a predecessor still
+        candidate's smaller maintained-entry-point declaration: the candidate
+        runtime must provide every entry point this running supervisor still
+        requires. A candidate that omits an entry point a predecessor still
         requires therefore bridges it, and a candidate that cannot be launched
         at all is refused here -- before the live worker retires -- so a failed
         compatibility check always leaves the previous worker consuming. The
