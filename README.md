@@ -1,22 +1,14 @@
 # Lubko
 
-Lubko is the connector and execution transport for remote development commands. ChatGPT submits commands through the `lubko.jobs` queue, a Lubko worker executes them in the requested working directory, and the worker publishes bounded output and a terminal result to the same job row.
+Lubko is the safe connector and safe execution transport for remote development commands. A (possibly untrusted) compatible agent submits commands through the `lubko.jobs` queue, a Lubko worker safely executes them in the requested working directory, and the worker publishes bounded output and a terminal result to the same job row.
 
 ## Getting started
 
-Install the maintained transport commands with `lubko-install`, start Lubko, and submit commands as described in [`docs/SKILL.md`](docs/SKILL.md). The transport preserves pending, running, succeeded, failed, and cancelled job states, bounded output, cancellation, worker recovery, and deployment behavior.
+Install the maintained transport commands with `lubko-install`, start Lubko, and submit commands as described in [`docs/SKILL.md`](docs/SKILL.md).
 
 ## Development
 
 Lubko requires CPython 3.12 or later. See [`docs/TOOLCHAIN.md`](docs/TOOLCHAIN.md) and [`docs/GOVERNANCE.md`](docs/GOVERNANCE.md).
-
-```sh
-uv sync --frozen --extra dev
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy .
-uv run pytest
-```
 
 ## License
 
