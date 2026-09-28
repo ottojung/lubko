@@ -942,7 +942,7 @@ class SupervisorDaemon:
             if lifecycle.worker_alive(child_meta):
                 LOGGER.info(
                     "worker pid=%d alive but reparented (not our direct child); "
-                    "proceeding to exact retirement",
+                    "deferring to the retirement authority, which will not signal it",
                     state.child.pid,
                 )
             elif state.intent != INTENT_RUN:
@@ -2845,6 +2845,20 @@ class SupervisorDaemon:
         the record cleared, so no replacement can start beside a live
         worker or its command groups.
 
+        A live recorded worker is signalled only when the published record
+        names *our own live direct child*. Exact identity alone (PID, group,
+        session, start time, token) does not prove ownership: a worker
+        reparented away from this supervisor — because the process that
+        spawned it exited, or because a subreaper/init re-adopted it, or
+        because of PID-namespace behaviour — matches every identity field
+        while no longer being ours to stop. Signalling such a process is
+        forbidden by the same fail-closed rule
+        :func:`lifecycle_state.authorize_retirement` states and
+        :meth:`_retire_child` enforces, so the daemon holds with the record
+        intact instead: the durable record still names the live worker, and
+        ``authorize_spawn`` already refuses a replacement while a supervisor
+        child is recorded, so holding can never produce a second consumer.
+
         Args:
             record: The published worker record to retire.
 
@@ -2853,6 +2867,15 @@ class SupervisorDaemon:
         """
         meta = self._db_worker_meta(record)
         worker_live = lifecycle.worker_alive(meta)
+        if worker_live and not supervise.child_is_our_direct_child(
+            self._db_worker_to_child(record)
+        ):
+            self._message = (
+                f"the recorded published worker pid {record.pid} is live but not proven to be "
+                "our direct child; holding without signalling, clearing, or starting a replacement"
+            )
+            LOGGER.error("%s", self._message)
+            return False
         if worker_live and not lifecycle.stop_worker(meta, self.settings.stop_grace_seconds):
             self._message = (
                 f"could not stop the recorded published worker pid {record.pid}; "
@@ -2922,7 +2945,7 @@ class SupervisorDaemon:
         elif active is not None and active.token == record.token:
             self._message = (
                 "the published worker is no longer our live direct child; "
-                "retiring its exact recorded identity before any replacement"
+                "the retirement authority will not signal it and no replacement may start"
             )
             LOGGER.warning("%s", self._message)
         return self._retire_db_worker(record)
