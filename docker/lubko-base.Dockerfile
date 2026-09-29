@@ -37,6 +37,7 @@ COPY --from=s6 /rootfs /
 COPY --from=runtime-tools /bin/dash /bin/sh
 COPY --from=runtime-tools /uidmap-rootfs/usr/ /usr/
 COPY --from=uv /uv /usr/local/bin/uv
+COPY docker/containers-policy.json /etc/containers/policy.json
 
 RUN ["/command/s6-rmrf", "/var/run"]
 RUN ["/command/s6-ln", "-s", "/run", "/var/run"]
