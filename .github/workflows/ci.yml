@@ -94,3 +94,9 @@ jobs:
             IMAGE=ghcr.io/ottojung/lubko-base:${{ steps.gitver.outputs.version }}
           fi
           docker run --rm "$IMAGE" uv --version
+          docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
+            uidcap=$(/usr/local/bin/getcap /usr/local/bin/newuidmap)
+            gidcap=$(/usr/local/bin/getcap /usr/local/bin/newgidmap)
+            case "$uidcap" in *cap_setuid=ep*) ;; *) echo "missing cap_setuid: $uidcap" >&2; exit 1 ;; esac
+            case "$gidcap" in *cap_setgid=ep*) ;; *) echo "missing cap_setgid: $gidcap" >&2; exit 1 ;; esac
+          '
