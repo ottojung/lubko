@@ -68,9 +68,11 @@ def test_claiming_precedes_output_publication_failure(monkeypatch: pytest.Monkey
     calls: list[str] = []
     monkeypatch.setattr(supervisor, "_claim_batch", lambda: calls.append("claim"))
 
+    failure = DbOperationDeadlineError("deadline")
+
     def fail_publication(_now: float) -> None:
         calls.append("publish")
-        raise DbOperationDeadlineError("deadline")
+        raise failure
 
     monkeypatch.setattr(supervisor, "_publish_all", fail_publication)
     monkeypatch.setattr(supervisor, "_finalize_completed", lambda: calls.append("finalize"))
