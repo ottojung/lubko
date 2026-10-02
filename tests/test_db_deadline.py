@@ -349,7 +349,7 @@ def test_tick_evicts_expired_lease_before_installing_db_deadline(
     assert job.lease_evicted
     assert job.term_sent
     assert observed["term_sent"] is True
-    assert cast(float, observed["deadline"]) > cast(float, observed["now"])
+    assert cast("float", observed["deadline"]) > cast("float", observed["now"])
 
 
 def test_connect_selects_the_production_deadline_connection(
