@@ -1439,7 +1439,10 @@ class SupervisorDaemon:
                     f"{desired.generation}"
                 )
                 return
-            already_running = db_running
+            # A restart intent deliberately replaces even the exact
+            # same-commit worker. Plain same-commit run intents are settlement
+            # operations and preserve the existing worker.
+            already_running = db_running and not desired.restart
         else:
             self._message = (
                 "lifecycle authority is not established; holding without applying generation "
@@ -1498,16 +1501,28 @@ class SupervisorDaemon:
                     desired.generation,
                 )
                 return
+        current = read_state()
+        preserve_readiness = (
+            already_running
+            and current.commit == desired.commit
+            and current.child is not None
+            and self._child_alive(current)
+        )
         state = replace(
-            read_state(),
+            current,
             applied_generation=desired.generation,
             mode=MODE_RUN,
             commit=desired.commit,
             intent=INTENT_RUN,
             restart_count=0,
             next_attempt_at=None,
-            ready=False,
-            next_readiness_at=None,
+            # A plain same-commit settlement advances durable generation
+            # authority around the exact already-running worker. Its readiness
+            # proof belongs to that worker identity, not to the generation
+            # number, so preserve it instead of forcing a redundant queue probe.
+            # A real replacement still starts unready and must prove itself.
+            ready=current.ready if preserve_readiness else False,
+            next_readiness_at=current.next_readiness_at if preserve_readiness else None,
         )
         if not self._write_state_authority_safe(state):
             # The desired-state publication was deferred: the applied

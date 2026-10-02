@@ -442,9 +442,10 @@ def _generation_monotonic_violations(facts: AuthorityFacts) -> list[str]:
     supervised mission is a valid active generation authority: its generation is
     a trusted source alongside ``desired_generation``, so an applied generation
     equal to the pending mission generation (even with an absent or older
-    ``desired``) is accepted rather than flagged. Applied must never exceed
-    *every* trusted generation source, and a stale mission below the applied
-    generation remains a violation.
+    ``desired``) is accepted rather than flagged. A newer desired generation
+    may also deliberately supersede an older still-pending mission while
+    confirmation or rollback terminalization is in progress. Applied must never
+    exceed *every* trusted generation source.
 
     Args:
         facts: The reconciled authority snapshot to check.
@@ -460,12 +461,6 @@ def _generation_monotonic_violations(facts: AuthorityFacts) -> list[str]:
     if facts.mission_status == "pending" and facts.mission_generation is not None:
         trusted_generation = max(trusted_generation, facts.mission_generation)
     if facts.applied_generation > trusted_generation:
-        violations.append(INVARIANT_GENERATION_MONOTONIC)
-    if (
-        facts.mission_status == "pending"
-        and facts.mission_generation is not None
-        and facts.mission_generation < facts.applied_generation
-    ):
         violations.append(INVARIANT_GENERATION_MONOTONIC)
     return violations
 

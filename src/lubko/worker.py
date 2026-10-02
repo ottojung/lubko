@@ -452,6 +452,11 @@ DEFAULT_OUTPUT_SPOOL_MAX_BYTES: Final = 4 * 1024 * 1024
 # command can therefore wait at most this bounded idle interval before the next
 # claim scan; any successful claim resets the gate immediately.
 EMPTY_CLAIM_SCAN_INTERVAL_SECONDS: Final = 1.0
+# A saturated GC batch can itself consume several seconds on the frozen opaque
+# transport table. Never schedule another saturated pass at the 100 ms process
+# poll cadence: leave a bounded service window for pending starts, capture
+# draining, output publication, lease refresh, and readiness probes first.
+SATURATED_GC_RETRY_SECONDS: Final = 1.0
 LEASE_RECOVERY_LIMIT: Final = 100
 CANCEL_DISCOVERY_LIMIT: Final = 100
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
@@ -4962,14 +4967,17 @@ class Supervisor:
                     time.monotonic() + self.settings.lease_recovery_interval_seconds
                 )
         if now >= self._next_gc_at:
-            # GC is cooperative with the worker loop: one bounded pass per
-            # turn, then always yield back to normal supervision. A saturated
-            # pass is scheduled again for the next worker turn; once caught
-            # up, GC returns to its configured idle cadence.
+            # A saturated GC pass can take several seconds. Give the normal
+            # worker loop a real service window before retrying instead of
+            # scheduling the next pass at the 100 ms process-poll cadence.
+            # The intervening ticks poll gated starts, drain captures, claim,
+            # publish output, and refresh leases before GC runs again. This
+            # keeps readiness-sensitive commands responsive without allowing a
+            # continuous stream of pending starts to starve GC indefinitely.
             next_gc_delay = self.settings.gc_interval_seconds
             try:
                 if self._run_gc():
-                    next_gc_delay = self.settings.process_poll_interval_seconds
+                    next_gc_delay = SATURATED_GC_RETRY_SECONDS
             finally:
                 self._next_gc_at = time.monotonic() + next_gc_delay
 

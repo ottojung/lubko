@@ -10,7 +10,12 @@ from uuid import uuid4
 import pytest
 
 from lubko.config import DatabaseConfig
-from lubko.worker import DbOperationDeadlineError, Settings, Supervisor
+from lubko.worker import (
+    SATURATED_GC_RETRY_SECONDS,
+    DbOperationDeadlineError,
+    Settings,
+    Supervisor,
+)
 
 if TYPE_CHECKING:
     from lubko.worker import JobsConnection
@@ -115,8 +120,8 @@ def test_empty_claim_scan_is_backed_off(monkeypatch: pytest.MonkeyPatch) -> None
     assert len(scans) == 2
 
 
-def test_saturated_gc_retries_on_next_worker_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A saturated GC pass yields, then retries on the next worker turn."""
+def test_saturated_gc_leaves_service_window_before_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A saturated GC pass leaves time for normal worker service before retry."""
     settings = Settings(
         worker_id="worker",
         server="server",
@@ -143,7 +148,7 @@ def test_saturated_gc_retries_on_next_worker_turn(monkeypatch: pytest.MonkeyPatc
 
     supervisor._db_phase(1.0)
 
-    assert math.isclose(supervisor._next_gc_at, 50.1)
+    assert math.isclose(supervisor._next_gc_at, 50.0 + SATURATED_GC_RETRY_SECONDS)
 
 
 def test_caught_up_gc_returns_to_idle_cadence(monkeypatch: pytest.MonkeyPatch) -> None:

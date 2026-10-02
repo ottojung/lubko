@@ -184,9 +184,10 @@ def test_invariant_generation_monotonic_pending_mission_authority() -> None:
     """A pending supervised mission is itself a trusted generation authority.
 
     applied_generation equal to the pending mission generation is accepted even
-    when desired is absent or older, but applied above every trusted source and
-    a stale mission below applied stay violations. Only a pending mission grants
-    this authority; a terminal mission does not.
+    when desired is absent or older. A newer desired generation may supersede
+    the still-pending mission during confirmation or rollback settlement, while
+    applied above every trusted generation source remains invalid. Only a
+    pending mission grants generation authority; a terminal mission does not.
     """
     # Pending mission == applied, absent/older desired (no desired.json -> 0).
     assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(
@@ -215,13 +216,16 @@ def test_invariant_generation_monotonic_pending_mission_authority() -> None:
             desired_generation=4,
         )
     )
-    # Stale mission below applied remains a violation even with a higher desired.
-    assert INVARIANT_GENERATION_MONOTONIC in check_authority_invariants(
+    # A newer desired authority may deliberately supersede the still-pending
+    # mission while confirmation/rollback terminalization converges. This is the
+    # exact rollback state in which the replacement worker must be publishable.
+    assert INVARIANT_GENERATION_MONOTONIC not in check_authority_invariants(
         _facts(
             mission_status="pending",
             mission_generation=3,
             applied_generation=5,
             desired_generation=8,
+            pre_spawn_obligation=True,
         )
     )
     # A non-pending (terminal) mission does NOT grant authority: applied above
