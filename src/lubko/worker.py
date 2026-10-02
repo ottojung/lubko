@@ -452,6 +452,11 @@ DEFAULT_OUTPUT_SPOOL_MAX_BYTES: Final = 4 * 1024 * 1024
 # command can therefore wait at most this bounded idle interval before the next
 # claim scan; any successful claim resets the gate immediately.
 EMPTY_CLAIM_SCAN_INTERVAL_SECONDS: Final = 1.0
+# A saturated GC batch can itself consume several seconds on the frozen opaque
+# transport table. Never schedule another saturated pass at the 100 ms process
+# poll cadence: leave a bounded service window for pending starts, capture
+# draining, output publication, lease refresh, and readiness probes first.
+SATURATED_GC_RETRY_SECONDS: Final = 1.0
 LEASE_RECOVERY_LIMIT: Final = 100
 CANCEL_DISCOVERY_LIMIT: Final = 100
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
@@ -4962,16 +4967,22 @@ class Supervisor:
                     time.monotonic() + self.settings.lease_recovery_interval_seconds
                 )
         if now >= self._next_gc_at:
-            # GC is cooperative with the worker loop: one bounded pass per
-            # turn, then always yield back to normal supervision. A saturated
-            # pass is scheduled again for the next worker turn; once caught
-            # up, GC returns to its configured idle cadence.
-            next_gc_delay = self.settings.gc_interval_seconds
-            try:
-                if self._run_gc():
-                    next_gc_delay = self.settings.process_poll_interval_seconds
-            finally:
-                self._next_gc_at = time.monotonic() + next_gc_delay
+            # Process activation has a stricter latency budget than transport
+            # cleanup (notably the supervisor's 15 s readiness roundtrip).
+            # A saturated GC pass can take several seconds, so never begin one
+            # while a claimed command is still waiting for its gated spawn to
+            # activate. Likewise, a saturated pass gets a real service window
+            # before its next retry instead of running at the 100 ms process
+            # poll cadence and monopolizing successive DB turns.
+            if self._pending_starts:
+                self._next_gc_at = time.monotonic() + SATURATED_GC_RETRY_SECONDS
+            else:
+                next_gc_delay = self.settings.gc_interval_seconds
+                try:
+                    if self._run_gc():
+                        next_gc_delay = SATURATED_GC_RETRY_SECONDS
+                finally:
+                    self._next_gc_at = time.monotonic() + next_gc_delay
 
     def _drain_captures(self, bound: int | None = None) -> None:
         """Drain every active job's capture pipes into their bounded spools.
