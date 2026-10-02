@@ -179,9 +179,7 @@ def test_same_commit_non_restart_settlement_keeps_live_worker(
     """A same-commit non-restart intent settles without retiring or spawning."""
     dc, spawns = daemon
     live_old_worker()
-    supervise.write_state(
-        replace(supervise.read_state(), ready=True, next_readiness_at=None)
-    )
+    supervise.write_state(replace(supervise.read_state(), ready=True, next_readiness_at=None))
     publish_live_old_worker(monkeypatch, dc)
     retire_calls: list[bool] = []
     monkeypatch.setattr(type(dc), "_child_alive", staticmethod(lambda _state: True))
@@ -213,9 +211,7 @@ def test_same_commit_settlement_preserves_existing_not_ready_retry(
     """Settlement never fabricates readiness for an unready same-commit worker."""
     dc, spawns = daemon
     live_old_worker()
-    supervise.write_state(
-        replace(supervise.read_state(), ready=False, next_readiness_at=123.0)
-    )
+    supervise.write_state(replace(supervise.read_state(), ready=False, next_readiness_at=123.0))
     publish_live_old_worker(monkeypatch, dc)
     monkeypatch.setattr(type(dc), "_child_alive", staticmethod(lambda _state: True))
 
