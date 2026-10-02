@@ -222,8 +222,10 @@ exercised by the deterministic crash tests in
    proven owned worker, an unresolved child, and a ready recovery worker are
    mutually exclusive; their sum is `≤ 1`.
 2. **`GENERATION_MONOTONIC`** — generations never move backward and never silently
-   reuse authority: `0 ≤ applied_generation ≤ desired_generation`, and a pending
-   mission's generation is not below the applied generation.
+   reuse authority: the applied generation may not exceed every current trusted
+   generation source. A pending mission contributes its generation as authority,
+   while a newer desired generation may supersede that still-pending mission
+   during confirmation or rollback settlement.
 3. **`MALFORMED_NEVER_ERASED`** — malformed durable authority (`durable_malformed`)
    is never implicitly erased or trusted; the authority must fail closed rather
    than grant or remove authority. When corrupt with no remaining block, it is
