@@ -84,6 +84,12 @@ class _FakeCursor:
         elif "UPDATE lubko.jobs" in query:
             self._recorder.updates.append(params)
 
+    def executemany(self, query: str, params_seq: object) -> None:
+        assert query.lstrip().startswith("INSERT")
+        self._recorder.insert_statements += 1
+        assert isinstance(params_seq, list)
+        self._recorder.inserts.extend(params_seq)
+
     @staticmethod
     def fetchone() -> tuple[str] | None:
         return ("row",)
@@ -94,6 +100,7 @@ class _Recorder:
 
     def __init__(self) -> None:
         self.inserts: list[Any] = []
+        self.insert_statements = 0
         self.updates: list[Any] = []
 
 
@@ -205,6 +212,7 @@ def test_capture_publish_trim_cycle_needs_no_filesystem(
     assert published
     assert recorder.updates, "the root live-tail update was not issued"
     assert recorder.inserts, "historical output was not archived into chunks"
+    assert recorder.insert_statements == 1, "chunks must be archived in one DB round-trip"
 
     payloads = [json.loads(params[1]) for params in recorder.inserts]
     sequences = [parsed["sequence"] for parsed in payloads]
