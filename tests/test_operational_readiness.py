@@ -351,6 +351,43 @@ def test_supervisor_check_readiness_rejects_operational_degradation(
     assert "not live" not in reason
 
 
+def test_ready_supervisor_retires_operationally_unhealthy_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale durable ready bit cannot mask a live but wedged worker."""
+    child = supervise.WorkerChild(
+        pid=os.getpid(),
+        pgid=os.getpid(),
+        sid=os.getpid(),
+        start_time_ticks=proc_start_ticks(os.getpid()),  # type: ignore[arg-type]
+        token="c" * 32,
+        worker_id="test-worker",
+        spawned_at=time.time(),
+    )
+    state = type(
+        "State",
+        (),
+        {"child": child, "ready": True, "next_readiness_at": None, "commit": "deadbeef"},
+    )()
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    retired: list[bool] = []
+
+    monkeypatch.setattr("lubko.supervisor.read_state", lambda: state)
+    monkeypatch.setattr(daemon, "_child_alive", lambda _state: True)
+    monkeypatch.setattr(
+        daemon,
+        "_check_worker_health",
+        lambda _child: (False, "worker operational not ready: lease safety negative: -1.0s"),
+    )
+    monkeypatch.setattr(daemon, "_retire_child", lambda: retired.append(True) or True)
+
+    daemon._probe_readiness(time.monotonic())
+
+    assert retired == [True]
+    assert daemon._message is not None
+    assert "operationally unhealthy" in daemon._message
+
+
 def test_supervisor_check_readiness_accepts_fully_healthy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
