@@ -51,9 +51,7 @@ def child(pid: int) -> supervise.WorkerChild:
     )
 
 
-def desired(
-    generation: int, commit: str, *, restart: bool = False
-) -> supervise.SupervisorDesired:
+def desired(generation: int, commit: str, *, restart: bool = False) -> supervise.SupervisorDesired:
     """Return a run intent for the commit with optional forced replacement."""
     return supervise.SupervisorDesired(
         schema_version=supervise.SCHEMA_VERSION,
