@@ -8,6 +8,7 @@ the requested commit merely by rewriting state first.
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -220,7 +221,8 @@ def test_same_commit_settlement_preserves_existing_not_ready_retry(
     state = supervise.read_state()
     assert spawns == []
     assert state.ready is False
-    assert state.next_readiness_at == 123.0
+    assert state.next_readiness_at is not None
+    assert math.isclose(state.next_readiness_at, 123.0)
 
 
 def build_runtime_with_maintained_entry_points(
