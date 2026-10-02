@@ -4862,6 +4862,12 @@ class Supervisor:
         if self.conn is None:
             self._outage_phase()
             return
+        # A worker can be descheduled long enough for an owned job's lease-safety
+        # instant to pass while the process itself remains alive. Converge stale
+        # local ownership before deriving the database deadline; otherwise an
+        # already-expired job can install a deadline in the past and prevent this
+        # turn from ever reaching unrelated pending work.
+        self._enforce_lease_safety()
         install_operation_deadline(self.conn, self._operation_deadline(now))
         self._db_phase(now)
 
