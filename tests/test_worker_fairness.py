@@ -10,7 +10,12 @@ from uuid import uuid4
 import pytest
 
 from lubko.config import DatabaseConfig
-from lubko.worker import DbOperationDeadlineError, Settings, Supervisor
+from lubko.worker import (
+    SATURATED_GC_RETRY_SECONDS,
+    DbOperationDeadlineError,
+    Settings,
+    Supervisor,
+)
 
 if TYPE_CHECKING:
     from lubko.worker import JobsConnection
@@ -115,8 +120,8 @@ def test_empty_claim_scan_is_backed_off(monkeypatch: pytest.MonkeyPatch) -> None
     assert len(scans) == 2
 
 
-def test_saturated_gc_retries_on_next_worker_turn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A saturated GC pass yields, then retries on the next worker turn."""
+def test_saturated_gc_leaves_service_window_before_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A saturated GC pass leaves time for normal worker service before retry."""
     settings = Settings(
         worker_id="worker",
         server="server",
@@ -143,7 +148,42 @@ def test_saturated_gc_retries_on_next_worker_turn(monkeypatch: pytest.MonkeyPatc
 
     supervisor._db_phase(1.0)
 
-    assert math.isclose(supervisor._next_gc_at, 50.1)
+    assert math.isclose(supervisor._next_gc_at, 50.0 + SATURATED_GC_RETRY_SECONDS)
+
+
+def test_pending_spawn_defers_due_gc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A claimed command awaiting activation takes precedence over due GC."""
+    settings = Settings(
+        worker_id="worker",
+        server="server",
+        poll_interval_seconds=0.1,
+        process_poll_interval_seconds=0.1,
+        cancel_grace_seconds=1.0,
+        gc_interval_seconds=60.0,
+    )
+    supervisor = Supervisor(
+        settings,
+        DatabaseConfig(host="host", port=5432, dbname="db", user="user", password=str(uuid4())),
+    )
+    supervisor.conn = cast("JobsConnection", object())
+    supervisor._next_recovery_at = 2.0
+    supervisor._next_cancel_scan_at = 2.0
+    supervisor._next_reaper_at = 2.0
+    supervisor._next_gc_at = 0.0
+    pending = cast("dict[object, object]", supervisor._pending_starts)
+    pending[uuid4()] = object()
+    monkeypatch.setattr(supervisor, "_publish_all", lambda _now: None)
+    monkeypatch.setattr(supervisor, "_finalize_completed", lambda: None)
+    monkeypatch.setattr(supervisor, "_retry_terminalizations", lambda: None)
+    monkeypatch.setattr(supervisor, "_claim_batch", lambda: None)
+    gc_calls: list[bool] = []
+    monkeypatch.setattr(supervisor, "_run_gc", lambda: gc_calls.append(True))
+    monkeypatch.setattr(time, "monotonic", lambda: 50.0)
+
+    supervisor._db_phase(1.0)
+
+    assert gc_calls == []
+    assert math.isclose(supervisor._next_gc_at, 50.0 + SATURATED_GC_RETRY_SECONDS)
 
 
 def test_caught_up_gc_returns_to_idle_cadence(monkeypatch: pytest.MonkeyPatch) -> None:
