@@ -380,7 +380,12 @@ def test_ready_supervisor_retires_operationally_unhealthy_worker(
         lambda _child: (False, "worker operational not ready: lease safety negative: -1.0s"),
     )
     monkeypatch.setattr(daemon, "_worker_health_requires_retirement", lambda _child: True)
-    monkeypatch.setattr(daemon, "_retire_child", lambda: retired.append(True) or True)
+
+    def retire() -> bool:
+        retired.append(True)
+        return True
+
+    monkeypatch.setattr(daemon, "_retire_child", retire)
 
     daemon._probe_readiness(time.monotonic())
 
@@ -419,7 +424,12 @@ def test_ready_supervisor_does_not_restart_for_recoverable_db_health(
         lambda _child: (False, "worker operational not ready: unrecovered DB error"),
     )
     monkeypatch.setattr(daemon, "_worker_health_requires_retirement", lambda _child: False)
-    monkeypatch.setattr(daemon, "_retire_child", lambda: retired.append(True) or True)
+
+    def retire() -> bool:
+        retired.append(True)
+        return True
+
+    monkeypatch.setattr(daemon, "_retire_child", retire)
     monkeypatch.setattr(
         daemon,
         "_record_not_ready",
