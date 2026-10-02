@@ -1499,6 +1499,12 @@ class SupervisorDaemon:
                 )
                 return
         current = read_state()
+        preserve_readiness = (
+            already_running
+            and current.commit == desired.commit
+            and current.child is not None
+            and self._child_alive(current)
+        )
         state = replace(
             current,
             applied_generation=desired.generation,
@@ -1512,8 +1518,8 @@ class SupervisorDaemon:
             # proof belongs to that worker identity, not to the generation
             # number, so preserve it instead of forcing a redundant queue probe.
             # A real replacement still starts unready and must prove itself.
-            ready=current.ready if already_running else False,
-            next_readiness_at=current.next_readiness_at if already_running else None,
+            ready=current.ready if preserve_readiness else False,
+            next_readiness_at=current.next_readiness_at if preserve_readiness else None,
         )
         if not self._write_state_authority_safe(state):
             # The desired-state publication was deferred: the applied
