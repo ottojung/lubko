@@ -2098,15 +2098,15 @@ def publish_output(  # ruff: ignore[too-many-arguments] -- server and force comp
             for chunk_id, chunk_payload in plan.chunks
         ]
         if chunk_rows:
-            # One round-trip per publication, rather than one INSERT per 2 KiB
-            # output chunk. A completed 4 MiB spool can contain thousands of
-            # chunks; issuing them individually can exhaust the worker's shared
-            # DB-turn deadline and roll the whole transaction back forever.
-            placeholders = ", ".join(["(%s, %s)"] * len(chunk_rows))
-            params = tuple(value for row in chunk_rows for value in row)
-            cursor.execute(
-                "INSERT INTO lubko.jobs (id, payload) VALUES " + placeholders,
-                params,
+            # One pipelined batch per publication, rather than one synchronous
+            # INSERT round-trip per 2 KiB output chunk. A completed 4 MiB spool
+            # can contain thousands of chunks; issuing them individually can
+            # exhaust the worker's shared DB-turn deadline and roll the whole
+            # transaction back forever. executemany also avoids building a
+            # size-dependent SQL statement with two bind parameters per chunk.
+            cursor.executemany(
+                "INSERT INTO lubko.jobs (id, payload) VALUES (%s, %s)",
+                chunk_rows,
             )
         cursor.execute(
             _output_update_sql(),
