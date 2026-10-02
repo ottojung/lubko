@@ -239,6 +239,7 @@ def test_same_commit_restart_replaces_live_worker(
     assert state.commit == OLD
     assert state.ready is False
 
+
 @pytest.mark.usefixtures("supervisor_token")
 def test_same_commit_settlement_preserves_existing_not_ready_retry(
     daemon: tuple[SupervisorDaemon, list[str]],
