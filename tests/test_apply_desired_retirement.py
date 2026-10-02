@@ -226,7 +226,6 @@ def test_same_commit_restart_replaces_live_worker(
         retire_calls.append(True)
         state = supervise.read_state()
         supervise.write_state(replace(state, child=None, ready=False))
-        seed_db_worker(dc, None)
         return True
 
     monkeypatch.setattr(dc, "_retire_child", record_retire)
