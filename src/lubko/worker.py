@@ -447,6 +447,11 @@ SPAWN_LANE_QUEUE_SIZE: Final = NUM_START_LANES
 # faster than the bound) only that job is deterministically failed rather than
 # letting the spool grow without limit.
 DEFAULT_OUTPUT_SPOOL_MAX_BYTES: Final = 4 * 1024 * 1024
+# Empty queues are common. Avoid reparsing/scanning the frozen opaque payload
+# table at process-poll frequency after a scan proves there is no work. A new
+# command can therefore wait at most this bounded idle interval before the next
+# claim scan; any successful claim resets the gate immediately.
+EMPTY_CLAIM_SCAN_INTERVAL_SECONDS: Final = 1.0
 LEASE_RECOVERY_LIMIT: Final = 100
 CANCEL_DISCOVERY_LIMIT: Final = 100
 SESSION_ESTABLISH_TIMEOUT_SECONDS: Final = 1.0
@@ -2087,12 +2092,22 @@ def publish_output(  # ruff: ignore[too-many-arguments] -- server and force comp
         )
         if cursor.fetchone() is None:
             return False
-        for plan in plans.values():
-            for chunk_id, chunk_payload in plan.chunks:
-                cursor.execute(
-                    "INSERT INTO lubko.jobs (id, payload) VALUES (%s, %s)",
-                    (chunk_id, chunk_payload),
-                )
+        chunk_rows = [
+            (chunk_id, chunk_payload)
+            for plan in plans.values()
+            for chunk_id, chunk_payload in plan.chunks
+        ]
+        if chunk_rows:
+            # One round-trip per publication, rather than one INSERT per 2 KiB
+            # output chunk. A completed 4 MiB spool can contain thousands of
+            # chunks; issuing them individually can exhaust the worker's shared
+            # DB-turn deadline and roll the whole transaction back forever.
+            placeholders = ", ".join(["(%s, %s)"] * len(chunk_rows))
+            params = tuple(value for row in chunk_rows for value in row)
+            cursor.execute(
+                "INSERT INTO lubko.jobs (id, payload) VALUES " + placeholders,
+                params,
+            )
         cursor.execute(
             _output_update_sql(),
             _output_update_params(job.id, output, server),
@@ -4765,6 +4780,7 @@ class Supervisor:
         self._next_reconnect_at = 0.0
         self._next_gc_at = 0.0
         self._next_reaper_at = 0.0
+        self._next_claim_scan_at = 0.0
         self._started_at = time.time()
         self._start_time_ticks = proc_start_ticks(os.getpid()) or 0
         self._db_connected_at: float | None = None
@@ -4925,11 +4941,14 @@ class Supervisor:
             self._next_cancel_scan_at = time.monotonic() + max(
                 self.settings.poll_interval_seconds, 0.5
             )
+        # Claim before potentially bulky output publication/finalization.
+        # Pending work must get one bounded opportunity in every eligible DB
+        # turn even when a completed noisy job has megabytes left to archive.
+        if not self._stopping:
+            self._claim_batch()
         self._publish_all(now)
         self._finalize_completed()
         self._retry_terminalizations()
-        if not self._stopping:
-            self._claim_batch()
         # Optional maintenance follows claiming. Even if the connection fails
         # or its lease-safe deadline is reached during a maintenance pass,
         # pending current-version work has already received its bounded
@@ -5979,8 +5998,15 @@ class Supervisor:
         if conn is None or self._stopping:
             return
         claim_mono = time.monotonic()
+        if claim_mono < self._next_claim_scan_at:
+            self._last_claim_batch = 0
+            return
         claimed = claim_jobs(conn, self.settings, self.settings.claim_batch_limit)
         self._last_claim_batch = len(claimed)
+        if claimed:
+            self._next_claim_scan_at = 0.0
+        else:
+            self._next_claim_scan_at = claim_mono + EMPTY_CLAIM_SCAN_INTERVAL_SECONDS
         for claimed_job in claimed:
             self._start_job(claimed_job, claim_mono)
 
@@ -6625,7 +6651,10 @@ class Supervisor:
                 ):
                     oldest_age = age
                     oldest_job_id = candidate_id
-            if job.last_heartbeat_at > 0.0:
+            if not job.completed and not job.term_sent and job.last_heartbeat_at > 0.0:
+                # Only live lease-owned work contributes. Completed/stopping
+                # jobs no longer need a safe future heartbeat and must not make
+                # an otherwise healthy worker look hours past lease safety.
                 # Safety remaining, not full-lease remaining: subtract the
                 # configured safety margin so a negative value means the
                 # lease-safety deadline (expiry minus margin) has passed.
