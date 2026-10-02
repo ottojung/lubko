@@ -127,6 +127,7 @@ def _fake_active(last_heartbeat_at: float, *, claimed_at: float = 0.0) -> worker
         An ActiveJob whose lease/stream fields are wired for the aggregator.
     """
     job: worker.ActiveJob = object.__new__(worker.ActiveJob)
+    job.completed = False
     job.term_sent = False
     job.kill_sent = False
     job.stop_started = None
@@ -176,6 +177,22 @@ def test_lease_safety_remaining_subtracts_margin_and_passes_negative() -> None:
     sup.active = {uuid4(): _fake_active(900.0)}  # 900 + 60 - 10 - 1000 = -50
     agg = sup._collect_health_aggregates(now_mono=1000.0)
     assert agg.min_lease_safety_remaining_seconds == pytest.approx(-50.0)
+
+
+def test_completed_or_stopping_jobs_do_not_poison_lease_health() -> None:
+    """Terminal work no longer reports a stale negative lease budget."""
+    sup = _bare_supervisor()
+    _set_lease_timing(sup, 60.0, 10.0)
+    completed = _fake_active(100.0)
+    completed.completed = True
+    stopping = _fake_active(100.0)
+    stopping.term_sent = True
+    live = _fake_active(1000.0)
+    sup.active = {uuid4(): completed, uuid4(): stopping, uuid4(): live}
+
+    agg = sup._collect_health_aggregates(now_mono=1000.0)
+
+    assert agg.min_lease_safety_remaining_seconds == pytest.approx(50.0)
 
 
 def test_lease_safety_remaining_positive_when_margin_not_exceeded() -> None:
