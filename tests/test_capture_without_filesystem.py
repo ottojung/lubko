@@ -84,8 +84,7 @@ class _FakeCursor:
             assert isinstance(params, tuple)
             assert len(params) % 2 == 0
             self._recorder.inserts.extend(
-                (params[index], params[index + 1])
-                for index in range(0, len(params), 2)
+                (params[index], params[index + 1]) for index in range(0, len(params), 2)
             )
         elif "UPDATE lubko.jobs" in query:
             self._recorder.updates.append(params)
