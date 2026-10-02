@@ -80,14 +80,15 @@ class _FakeCursor:
 
     def execute(self, query: str, params: object = None) -> None:
         if query.lstrip().startswith("INSERT"):
-            self._recorder.insert_statements += 1
-            assert isinstance(params, tuple)
-            assert len(params) % 2 == 0
-            self._recorder.inserts.extend(
-                (params[index], params[index + 1]) for index in range(0, len(params), 2)
-            )
+            self._recorder.inserts.append(params)
         elif "UPDATE lubko.jobs" in query:
             self._recorder.updates.append(params)
+
+    def executemany(self, query: str, params_seq: object) -> None:
+        assert query.lstrip().startswith("INSERT")
+        self._recorder.insert_statements += 1
+        assert isinstance(params_seq, list)
+        self._recorder.inserts.extend(params_seq)
 
     @staticmethod
     def fetchone() -> tuple[str] | None:
