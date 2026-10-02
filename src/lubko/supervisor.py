@@ -1439,7 +1439,10 @@ class SupervisorDaemon:
                     f"{desired.generation}"
                 )
                 return
-            already_running = db_running
+            # A restart intent deliberately replaces even the exact
+            # same-commit worker. Plain same-commit run intents are settlement
+            # operations and preserve the existing worker.
+            already_running = db_running and not desired.restart
         else:
             self._message = (
                 "lifecycle authority is not established; holding without applying generation "
