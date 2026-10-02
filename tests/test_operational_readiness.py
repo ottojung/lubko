@@ -379,13 +379,57 @@ def test_ready_supervisor_retires_operationally_unhealthy_worker(
         "_check_worker_health",
         lambda _child: (False, "worker operational not ready: lease safety negative: -1.0s"),
     )
+    monkeypatch.setattr(daemon, "_worker_health_requires_retirement", lambda _child: True)
     monkeypatch.setattr(daemon, "_retire_child", lambda: retired.append(True) or True)
 
     daemon._probe_readiness(time.monotonic())
 
     assert retired == [True]
     assert daemon._message is not None
-    assert "operationally unhealthy" in daemon._message
+    assert "operationally unsafe" in daemon._message
+
+
+def test_ready_supervisor_does_not_restart_for_recoverable_db_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient DB degradation revokes readiness without killing the worker."""
+    child = supervise.WorkerChild(
+        pid=os.getpid(),
+        pgid=os.getpid(),
+        sid=os.getpid(),
+        start_time_ticks=proc_start_ticks(os.getpid()),  # type: ignore[arg-type]
+        token="d" * 32,
+        worker_id="test-worker",
+        spawned_at=time.time(),
+    )
+    state = type(
+        "State",
+        (),
+        {"child": child, "ready": True, "next_readiness_at": None, "commit": "deadbeef"},
+    )()
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    retired: list[bool] = []
+    not_ready: list[str] = []
+
+    monkeypatch.setattr("lubko.supervisor.read_state", lambda: state)
+    monkeypatch.setattr(daemon, "_child_alive", lambda _state: True)
+    monkeypatch.setattr(
+        daemon,
+        "_check_worker_health",
+        lambda _child: (False, "worker operational not ready: unrecovered DB error"),
+    )
+    monkeypatch.setattr(daemon, "_worker_health_requires_retirement", lambda _child: False)
+    monkeypatch.setattr(daemon, "_retire_child", lambda: retired.append(True) or True)
+    monkeypatch.setattr(
+        daemon,
+        "_record_not_ready",
+        lambda _state, _now, _pid, reason: not_ready.append(reason),
+    )
+
+    daemon._probe_readiness(time.monotonic())
+
+    assert retired == []
+    assert not_ready == ["worker operational not ready: unrecovered DB error"]
 
 
 def test_supervisor_check_readiness_accepts_fully_healthy(
