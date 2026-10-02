@@ -1926,7 +1926,29 @@ class SupervisorDaemon:
         child = state.child
         if child is None or not self._child_alive(state):
             return
-        if state.ready or (state.next_readiness_at is not None and now < state.next_readiness_at):
+        if state.ready:
+            healthy, reason = self._check_worker_health(child)
+            if healthy:
+                return
+            if reason.startswith("worker operational not ready:"):
+                # A worker that was once queue-ready can later wedge while the
+                # process remains perfectly alive. Operational health is the
+                # worker's own safety signal; do not let durable ready=True
+                # permanently mask a negative lease budget, missed critical
+                # scans, or an unrecovered DB deadline/error.
+                self._message = (
+                    f"ready worker pid={child.pid} became operationally unhealthy: {reason}; "
+                    "retiring the exact incarnation"
+                )
+                LOGGER.error("%s", self._message)
+                self._retire_child()
+                return
+            # Missing/stale/mismatched health is observation failure rather
+            # than proof that the exact worker is unsafe. Withdraw readiness
+            # and require a fresh queue+health proof instead of signalling.
+            self._record_not_ready(state, now, child.pid, reason)
+            return
+        if state.next_readiness_at is not None and now < state.next_readiness_at:
             return
         probe_cwd = _runtime_dir(state.commit)
         ready, reason = self._check_readiness(child, probe_cwd)
@@ -1975,6 +1997,23 @@ class SupervisorDaemon:
             progress_callback=self._accept_control_requests,
         ):
             return False, "queue consumption not proven"
+        return self._check_worker_health(child)
+
+    @staticmethod
+    def _check_worker_health(child: supervise.WorkerChild) -> tuple[bool, str]:
+        """Validate the exact child's current health snapshot.
+
+        This check is cheap enough to run after initial readiness, unlike the
+        queue roundtrip. It lets the supervisor revoke stale durable readiness
+        when a previously healthy worker becomes operationally unsafe while its
+        process stays alive.
+
+        Args:
+            child: Exact maintained-worker identity.
+
+        Returns:
+            A healthy/reason tuple.
+        """
         snapshot = read_worker_health_by_incarnation(child.token)
         if snapshot is None:
             return False, f"no health snapshot for incarnation {child.token}"
@@ -2119,9 +2158,15 @@ class SupervisorDaemon:
             with suppress(Exception):
                 self.proc.wait(timeout=self.settings.stop_grace_seconds)
             self.proc = None
+        retired_state = replace(
+            read_state() if authority_locked else state,
+            child=None,
+            ready=False,
+            next_readiness_at=None,
+        )
         if authority_locked:
-            write_state(replace(read_state(), child=None))
-        elif not self._write_state_authority_safe(replace(state, child=None)):
+            write_state(retired_state)
+        elif not self._write_state_authority_safe(retired_state):
             # The retirement could not be durably published: the child
             # identity stays recorded and the caller must treat the
             # retirement as not converged rather than proceeding on an
