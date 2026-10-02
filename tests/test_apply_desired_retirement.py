@@ -51,8 +51,10 @@ def child(pid: int) -> supervise.WorkerChild:
     )
 
 
-def desired(generation: int, commit: str) -> supervise.SupervisorDesired:
-    """Return a plain (non-restart) run intent for ``commit``."""
+def desired(
+    generation: int, commit: str, *, restart: bool = False
+) -> supervise.SupervisorDesired:
+    """Return a run intent for the commit with optional forced replacement."""
     return supervise.SupervisorDesired(
         schema_version=supervise.SCHEMA_VERSION,
         generation=generation,
@@ -60,6 +62,7 @@ def desired(generation: int, commit: str) -> supervise.SupervisorDesired:
         repo="/workspace/repo",
         uv_path="uv",
         worker_id=None,
+        restart=restart,
     )
 
 
@@ -203,6 +206,39 @@ def test_same_commit_non_restart_settlement_keeps_live_worker(
     assert state.ready is True, "same-worker settlement preserves the proven readiness"
     assert state.next_readiness_at is None
 
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_same_commit_restart_replaces_live_worker(
+    daemon: tuple[SupervisorDaemon, list[str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit restart replaces even an exact same-commit live worker."""
+    dc, spawns = daemon
+    build_runtime_with_maintained_entry_points(monkeypatch, tmp_path, OLD)
+    live_old_worker()
+    supervise.write_state(replace(supervise.read_state(), ready=True))
+    publish_live_old_worker(monkeypatch, dc)
+    retire_calls: list[bool] = []
+    monkeypatch.setattr(type(dc), "_child_alive", staticmethod(lambda _state: True))
+
+    def record_retire() -> bool:
+        retire_calls.append(True)
+        state = supervise.read_state()
+        supervise.write_state(replace(state, child=None, ready=False))
+        seed_db_worker(dc, None)
+        return True
+
+    monkeypatch.setattr(dc, "_retire_child", record_retire)
+
+    dc._apply_desired(desired(3, OLD, restart=True))
+
+    state = supervise.read_state()
+    assert retire_calls == [True]
+    assert spawns == [OLD]
+    assert state.applied_generation == 3
+    assert state.commit == OLD
+    assert state.ready is False
 
 @pytest.mark.usefixtures("supervisor_token")
 def test_same_commit_settlement_preserves_existing_not_ready_retry(
