@@ -1930,22 +1930,24 @@ class SupervisorDaemon:
             healthy, reason = self._check_worker_health(child)
             if healthy:
                 return
-            if reason.startswith("worker operational not ready:"):
-                # A worker that was once queue-ready can later wedge while the
-                # process remains perfectly alive. Operational health is the
-                # worker's own safety signal; do not let durable ready=True
-                # permanently mask a negative lease budget, missed critical
-                # scans, or an unrecovered DB deadline/error.
+            if reason.startswith(
+                "worker operational not ready:"
+            ) and self._worker_health_requires_retirement(child):
+                # Negative lease safety or a genuinely overdue critical scan
+                # proves the worker loop has fallen behind its safety contract.
+                # Retire that exact incarnation. Transient DB error/deadline
+                # recovery is deliberately not fatal here: readiness is
+                # withdrawn below and the same worker may recover in place.
                 self._message = (
-                    f"ready worker pid={child.pid} became operationally unhealthy: {reason}; "
+                    f"ready worker pid={child.pid} became operationally unsafe: {reason}; "
                     "retiring the exact incarnation"
                 )
                 LOGGER.error("%s", self._message)
                 self._retire_child()
                 return
-            # Missing/stale/mismatched health is observation failure rather
-            # than proof that the exact worker is unsafe. Withdraw readiness
-            # and require a fresh queue+health proof instead of signalling.
+            # Missing/stale/mismatched health and recoverable operational
+            # degradation are not authority to signal a process. Withdraw
+            # readiness and require a fresh queue+health proof.
             self._record_not_ready(state, now, child.pid, reason)
             return
         if state.next_readiness_at is not None and now < state.next_readiness_at:
@@ -1998,6 +2000,32 @@ class SupervisorDaemon:
         ):
             return False, "queue consumption not proven"
         return self._check_worker_health(child)
+
+    @staticmethod
+    def _worker_health_requires_retirement(child: supervise.WorkerChild) -> bool:
+        """Return whether current health proves the live worker is unsafe.
+
+        Database errors and deadline breaches can recover in place and only
+        revoke readiness. Negative lease safety and overdue critical scans are
+        stronger: they prove the supervision loop missed its safety budget and
+        justify exact-incarnation retirement.
+
+        Args:
+            child: Exact maintained-worker identity.
+
+        Returns:
+            True only for a matching snapshot with a hard safety breach.
+        """
+        snapshot = read_worker_health_by_incarnation(child.token)
+        if (
+            snapshot is None
+            or snapshot.pid != child.pid
+            or snapshot.start_time_ticks != child.start_time_ticks
+            or snapshot.worker_incarnation != child.token
+        ):
+            return False
+        operational = interpret_worker_health(snapshot).operational
+        return operational.lease_safety_negative or operational.any_scan_overdue
 
     @staticmethod
     def _check_worker_health(child: supervise.WorkerChild) -> tuple[bool, str]:
