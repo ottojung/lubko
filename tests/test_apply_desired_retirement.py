@@ -179,6 +179,9 @@ def test_same_commit_non_restart_settlement_keeps_live_worker(
     """A same-commit non-restart intent settles without retiring or spawning."""
     dc, spawns = daemon
     live_old_worker()
+    supervise.write_state(
+        replace(supervise.read_state(), ready=True, next_readiness_at=None)
+    )
     publish_live_old_worker(monkeypatch, dc)
     retire_calls: list[bool] = []
     monkeypatch.setattr(type(dc), "_child_alive", staticmethod(lambda _state: True))
@@ -198,6 +201,30 @@ def test_same_commit_non_restart_settlement_keeps_live_worker(
     assert state.commit == OLD
     assert state.child is not None, "worker untouched"
     assert state.child.pid == 4242
+    assert state.ready is True, "same-worker settlement preserves the proven readiness"
+    assert state.next_readiness_at is None
+
+
+@pytest.mark.usefixtures("supervisor_token")
+def test_same_commit_settlement_preserves_existing_not_ready_retry(
+    daemon: tuple[SupervisorDaemon, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Settlement never fabricates readiness for an unready same-commit worker."""
+    dc, spawns = daemon
+    live_old_worker()
+    supervise.write_state(
+        replace(supervise.read_state(), ready=False, next_readiness_at=123.0)
+    )
+    publish_live_old_worker(monkeypatch, dc)
+    monkeypatch.setattr(type(dc), "_child_alive", staticmethod(lambda _state: True))
+
+    dc._apply_desired(desired(3, OLD))
+
+    state = supervise.read_state()
+    assert spawns == []
+    assert state.ready is False
+    assert state.next_readiness_at == 123.0
 
 
 def build_runtime_with_maintained_entry_points(
