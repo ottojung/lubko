@@ -312,6 +312,46 @@ class _CapableConn:
         self.queries.append(query)
 
 
+def test_tick_evicts_expired_lease_before_installing_db_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An expired old job cannot poison the DB turn or block unrelated claims."""
+    settings = make_settings(process_poll_interval_seconds=0.0)
+    supervisor = Supervisor(
+        settings,
+        DatabaseConfig(host="h", port=1, dbname="d", user="u", password=str(uuid4())),
+    )
+    job = make_active_job(
+        tmp_path,
+        heartbeat_at=time.monotonic() - settings.lease_duration_seconds,
+    )
+    supervisor.active[job.id] = job
+    conn = _CapableConn()
+    supervisor.conn = cast("worker.JobsConnection", conn)
+
+    monkeypatch.setattr(supervisor, "_service_processes", lambda: None)
+    monkeypatch.setattr(supervisor, "_drain_captures", lambda: None)
+    monkeypatch.setattr(supervisor, "_enforce_spool_bounds", lambda: None)
+    monkeypatch.setattr(supervisor, "_poll_pending_starts", lambda _now: None)
+
+    observed: dict[str, float | bool] = {}
+
+    def db_phase(now: float) -> None:
+        observed["deadline"] = conn.operation_deadline
+        observed["term_sent"] = job.term_sent
+        observed["now"] = now
+
+    monkeypatch.setattr(supervisor, "_db_phase", db_phase)
+
+    now = time.monotonic()
+    supervisor._tick(now)
+
+    assert job.lease_evicted
+    assert job.term_sent
+    assert observed["term_sent"] is True
+    assert cast(float, observed["deadline"]) > cast(float, observed["now"])
+
+
 def test_connect_selects_the_production_deadline_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
