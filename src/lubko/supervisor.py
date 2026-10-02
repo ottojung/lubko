@@ -1498,16 +1498,22 @@ class SupervisorDaemon:
                     desired.generation,
                 )
                 return
+        current = read_state()
         state = replace(
-            read_state(),
+            current,
             applied_generation=desired.generation,
             mode=MODE_RUN,
             commit=desired.commit,
             intent=INTENT_RUN,
             restart_count=0,
             next_attempt_at=None,
-            ready=False,
-            next_readiness_at=None,
+            # A plain same-commit settlement advances durable generation
+            # authority around the exact already-running worker. Its readiness
+            # proof belongs to that worker identity, not to the generation
+            # number, so preserve it instead of forcing a redundant queue probe.
+            # A real replacement still starts unready and must prove itself.
+            ready=current.ready if already_running else False,
+            next_readiness_at=current.next_readiness_at if already_running else None,
         )
         if not self._write_state_authority_safe(state):
             # The desired-state publication was deferred: the applied
