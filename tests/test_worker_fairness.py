@@ -101,10 +101,11 @@ def test_empty_claim_scan_is_backed_off(monkeypatch: pytest.MonkeyPatch) -> None
     scans: list[float] = []
     clock = iter((10.0, 10.1, 11.1))
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    monkeypatch.setattr(
-        "lubko.worker.claim_jobs",
-        lambda *_args, **_kwargs: scans.append(1.0) or [],
-    )
+    def empty_claims(*_args: object, **_kwargs: object) -> list[object]:
+        scans.append(1.0)
+        return []
+
+    monkeypatch.setattr("lubko.worker.claim_jobs", empty_claims)
 
     supervisor._claim_batch()
     supervisor._claim_batch()
