@@ -4803,7 +4803,7 @@ class _GcRunner:
 
     @property
     def snapshot(self) -> _GcSnapshot:
-        """Return the latest observation without waiting for GC."""
+        """Latest GC observation, available without waiting."""
         return self._snapshot
 
     def start(self) -> None:
@@ -4819,7 +4819,11 @@ class _GcRunner:
         self._stop.set()
 
     def _connect(self) -> DeadlineConnection:
-        """Open a GC-private connection with finite statement/lock waits."""
+        """Open a GC-private connection with finite statement/lock waits.
+
+        Returns:
+            A connection owned exclusively by the GC thread.
+        """
         timeout_ms = int(GC_PASS_TIMEOUT_SECONDS * 1000)
         conn = DeadlineConnection.connect(
             self.database.conninfo(),
@@ -4835,7 +4839,11 @@ class _GcRunner:
         return conn
 
     def _run_once(self) -> bool:
-        """Run one finite GC pass on a private connection."""
+        """Run one finite GC pass on a private connection.
+
+        Returns:
+            Whether the pass saturated a bounded GC batch.
+        """
         conn = self._connect()
         try:
             _roots, _chunks, _orphans, bound_hit = collect_transport(conn, self.settings)
@@ -4857,9 +4865,7 @@ class _GcRunner:
                 last_error_at = now_wall
                 LOGGER.exception("background transport GC pass failed")
             delay = (
-                SATURATED_GC_RETRY_SECONDS
-                if batch_bound_hit
-                else self.settings.gc_interval_seconds
+                SATURATED_GC_RETRY_SECONDS if batch_bound_hit else self.settings.gc_interval_seconds
             )
             self._snapshot = _GcSnapshot(
                 last_gc_at=now_wall,
@@ -6647,6 +6653,20 @@ class Supervisor:
     # Health publishing
     # ------------------------------------------------------------------
 
+    def _gc_snapshot(self) -> _GcSnapshot:
+        """Latest GC observation, or an initial snapshot before runner wiring.
+
+        Returns:
+            A snapshot usable for health-only observation. This method never
+            waits for the background GC thread.
+        """
+        runner = cast("_GcRunner | None", getattr(self, "_gc_runner", None))
+        if runner is None:
+            return _GcSnapshot(
+                last_gc_at=None, next_gc_at=0.0, batch_bound_hit=False, last_error_at=None
+            )
+        return runner.snapshot
+
     def _build_health(self, *, alive: bool = True, shutting_down: bool = False) -> WorkerHealth:
         """Build a health snapshot from the current supervisor state.
 
@@ -6663,7 +6683,7 @@ class Supervisor:
         now_mono = time.monotonic()
         now_wall = time.time()
         agg = self._collect_health_aggregates(now_mono)
-        gc_snapshot = self._gc_runner.snapshot
+        gc_snapshot = self._gc_snapshot()
         return WorkerHealth(
             schema_version=WORKER_HEALTH_SCHEMA_VERSION,
             worker_id=self.settings.worker_id,
@@ -6780,7 +6800,7 @@ class Supervisor:
             ),
             gc_overdue=_scan_schedule_overdue(
                 now_mono,
-                self._gc_runner.snapshot.next_gc_at,
+                self._gc_snapshot().next_gc_at,
                 db_operation_timeout_seconds=GC_PASS_TIMEOUT_SECONDS,
                 process_poll_interval_seconds=self.settings.process_poll_interval_seconds,
             ),
