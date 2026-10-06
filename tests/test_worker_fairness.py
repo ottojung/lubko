@@ -9,9 +9,9 @@ from uuid import uuid4
 
 import pytest
 
+from lubko import worker
 from lubko.config import DatabaseConfig
 from lubko.worker import (
-    SATURATED_GC_RETRY_SECONDS,
     DbOperationDeadlineError,
     Settings,
     Supervisor,
@@ -21,8 +21,8 @@ if TYPE_CHECKING:
     from lubko.worker import JobsConnection
 
 
-def test_claiming_precedes_optional_garbage_collection(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A due maintenance pass cannot consume the pending-job opportunity."""
+def test_worker_db_phase_has_no_gc_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Normal worker DB progress never invokes transport GC."""
     settings = Settings(
         worker_id="worker",
         server="server",
@@ -37,19 +37,21 @@ def test_claiming_precedes_optional_garbage_collection(monkeypatch: pytest.Monke
     supervisor.conn = cast("JobsConnection", object())
     supervisor._next_recovery_at = 2.0
     supervisor._next_cancel_scan_at = 2.0
-    supervisor._next_reaper_at = 0.0
-    supervisor._next_gc_at = 0.0
+    supervisor._next_reaper_at = 2.0
     calls: list[str] = []
-    monkeypatch.setattr(supervisor, "_publish_all", lambda _now: None)
-    monkeypatch.setattr(supervisor, "_finalize_completed", lambda: None)
-    monkeypatch.setattr(supervisor, "_retry_terminalizations", lambda: None)
     monkeypatch.setattr(supervisor, "_claim_batch", lambda: calls.append("claim"))
-    monkeypatch.setattr(supervisor, "_run_reaper", lambda: calls.append("reaper"))
-    monkeypatch.setattr(supervisor, "_run_gc", lambda: calls.append("gc"))
+    monkeypatch.setattr(supervisor, "_publish_all", lambda _now: calls.append("publish"))
+    monkeypatch.setattr(supervisor, "_finalize_completed", lambda: calls.append("finalize"))
+    monkeypatch.setattr(supervisor, "_retry_terminalizations", lambda: calls.append("retry"))
+    monkeypatch.setattr(
+        worker,
+        "collect_transport",
+        lambda *_a, **_kw: pytest.fail("GC entered the normal worker DB phase"),
+    )
 
     supervisor._db_phase(1.0)
 
-    assert calls == ["claim", "reaper", "gc"]
+    assert calls == ["claim", "publish", "finalize", "retry"]
 
 
 def test_claiming_precedes_output_publication_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -69,7 +71,6 @@ def test_claiming_precedes_output_publication_failure(monkeypatch: pytest.Monkey
     supervisor._next_recovery_at = 2.0
     supervisor._next_cancel_scan_at = 2.0
     supervisor._next_reaper_at = 2.0
-    supervisor._next_gc_at = 2.0
     calls: list[str] = []
     monkeypatch.setattr(supervisor, "_claim_batch", lambda: calls.append("claim"))
 
@@ -120,106 +121,6 @@ def test_empty_claim_scan_is_backed_off(monkeypatch: pytest.MonkeyPatch) -> None
     assert len(scans) == 2
 
 
-def test_saturated_gc_leaves_service_window_before_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A saturated GC pass leaves time for normal worker service before retry."""
-    settings = Settings(
-        worker_id="worker",
-        server="server",
-        poll_interval_seconds=0.1,
-        process_poll_interval_seconds=0.1,
-        cancel_grace_seconds=1.0,
-        gc_interval_seconds=60.0,
-    )
-    supervisor = Supervisor(
-        settings,
-        DatabaseConfig(host="host", port=5432, dbname="db", user="user", password=str(uuid4())),
-    )
-    supervisor.conn = cast("JobsConnection", object())
-    supervisor._next_recovery_at = 2.0
-    supervisor._next_cancel_scan_at = 2.0
-    supervisor._next_reaper_at = 2.0
-    supervisor._next_gc_at = 0.0
-    monkeypatch.setattr(supervisor, "_publish_all", lambda _now: None)
-    monkeypatch.setattr(supervisor, "_finalize_completed", lambda: None)
-    monkeypatch.setattr(supervisor, "_retry_terminalizations", lambda: None)
-    monkeypatch.setattr(supervisor, "_claim_batch", lambda: None)
-    monkeypatch.setattr(supervisor, "_run_gc", lambda: True)
-    monkeypatch.setattr(time, "monotonic", lambda: 50.0)
-
-    supervisor._db_phase(1.0)
-
-    assert math.isclose(supervisor._next_gc_at, 50.0 + SATURATED_GC_RETRY_SECONDS)
-
-
-def test_caught_up_gc_returns_to_idle_cadence(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-saturated GC pass waits for the configured idle cadence."""
-    settings = Settings(
-        worker_id="worker",
-        server="server",
-        poll_interval_seconds=0.1,
-        process_poll_interval_seconds=0.1,
-        cancel_grace_seconds=1.0,
-        gc_interval_seconds=60.0,
-    )
-    supervisor = Supervisor(
-        settings,
-        DatabaseConfig(host="host", port=5432, dbname="db", user="user", password=str(uuid4())),
-    )
-    supervisor.conn = cast("JobsConnection", object())
-    supervisor._next_recovery_at = 2.0
-    supervisor._next_cancel_scan_at = 2.0
-    supervisor._next_reaper_at = 2.0
-    supervisor._next_gc_at = 0.0
-    monkeypatch.setattr(supervisor, "_publish_all", lambda _now: None)
-    monkeypatch.setattr(supervisor, "_finalize_completed", lambda: None)
-    monkeypatch.setattr(supervisor, "_retry_terminalizations", lambda: None)
-    monkeypatch.setattr(supervisor, "_claim_batch", lambda: None)
-    monkeypatch.setattr(supervisor, "_run_gc", lambda: False)
-    monkeypatch.setattr(time, "monotonic", lambda: 50.0)
-
-    supervisor._db_phase(1.0)
-
-    assert math.isclose(supervisor._next_gc_at, 110.0)
-
-
-def test_gc_failure_still_advances_to_idle_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failed GC pass backs off to the normal idle cadence."""
-    settings = Settings(
-        worker_id="worker",
-        server="server",
-        poll_interval_seconds=0.1,
-        process_poll_interval_seconds=0.1,
-        cancel_grace_seconds=1.0,
-        gc_interval_seconds=60.0,
-    )
-    supervisor = Supervisor(
-        settings,
-        DatabaseConfig(host="host", port=5432, dbname="db", user="user", password=str(uuid4())),
-    )
-    supervisor.conn = cast("JobsConnection", object())
-    supervisor._next_recovery_at = 2.0
-    supervisor._next_cancel_scan_at = 2.0
-    supervisor._next_reaper_at = 2.0
-    supervisor._next_gc_at = 0.0
-    monkeypatch.setattr(supervisor, "_publish_all", lambda _now: None)
-    monkeypatch.setattr(supervisor, "_finalize_completed", lambda: None)
-    monkeypatch.setattr(supervisor, "_retry_terminalizations", lambda: None)
-    monkeypatch.setattr(supervisor, "_claim_batch", lambda: None)
-    monkeypatch.setattr(time, "monotonic", lambda: 50.0)
-
-    failure = DbOperationDeadlineError("deadline")
-
-    def fail_gc() -> bool:
-        raise failure
-
-    monkeypatch.setattr(supervisor, "_run_gc", fail_gc)
-
-    with pytest.raises(DbOperationDeadlineError):
-        supervisor._db_phase(1.0)
-
-    assert math.isclose(supervisor._next_gc_at, 110.0)
-
-
 def test_reaper_respects_and_advances_its_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
     """Retired-version maintenance runs only when due and advances its cadence."""
     settings = Settings(
@@ -238,7 +139,6 @@ def test_reaper_respects_and_advances_its_schedule(monkeypatch: pytest.MonkeyPat
     supervisor._next_recovery_at = 2.0
     supervisor._next_cancel_scan_at = 2.0
     supervisor._next_reaper_at = 2.0
-    supervisor._next_gc_at = 2.0
     calls: list[str] = []
     monkeypatch.setattr(supervisor, "_publish_all", lambda _now: None)
     monkeypatch.setattr(supervisor, "_finalize_completed", lambda: None)
