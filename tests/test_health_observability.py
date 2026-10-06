@@ -226,6 +226,7 @@ def test_scan_schedule_beyond_db_deadline_and_poll_is_overdue() -> None:
     )
     sup._next_cancel_scan_at = 100.0
     sup._next_recovery_at = 100.0
+
     class Runner:
         snapshot = worker._GcSnapshot(
             last_gc_at=None,
