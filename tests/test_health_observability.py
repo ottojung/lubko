@@ -89,7 +89,7 @@ def test_gc_bound_hit_reflected_in_health() -> None:
             last_error_at=None,
         )
 
-    sup._gc_runner = Runner()
+    sup._gc_runner = cast("worker._GcRunner", Runner())
     health = sup._build_health()
     assert health.gc_batch_bound_hit is True
     assert health.last_gc_at == pytest.approx(10.0)
@@ -198,6 +198,7 @@ def test_scan_schedule_jitter_within_db_deadline_is_not_overdue() -> None:
     )
     sup._next_cancel_scan_at = 100.0
     sup._next_recovery_at = 100.0
+
     class Runner:
         snapshot = worker._GcSnapshot(
             last_gc_at=None,
@@ -206,7 +207,7 @@ def test_scan_schedule_jitter_within_db_deadline_is_not_overdue() -> None:
             last_error_at=None,
         )
 
-    sup._gc_runner = Runner()
+    sup._gc_runner = cast("worker._GcRunner", Runner())
 
     agg = sup._collect_health_aggregates(now_mono=105.1)
 
@@ -233,7 +234,7 @@ def test_scan_schedule_beyond_db_deadline_and_poll_is_overdue() -> None:
             last_error_at=None,
         )
 
-    sup._gc_runner = Runner()
+    sup._gc_runner = cast("worker._GcRunner", Runner())
 
     agg = sup._collect_health_aggregates(now_mono=105.100001)
 
