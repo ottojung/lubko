@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from lubko.worker import JobsConnection
 
 
-
 def test_worker_db_phase_has_no_gc_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
     """Normal worker DB progress never invokes transport GC."""
     settings = Settings(
