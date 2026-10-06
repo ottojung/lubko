@@ -114,7 +114,7 @@ def test_gc_connection_has_finite_lock_and_statement_waits(
     class FakeConn:
         operation_deadline = 0.0
 
-    def fake_connect(*args: object, **kwargs: object) -> FakeConn:
+    def fake_connect(*_args: object, **kwargs: object) -> FakeConn:
         captured.update(kwargs)
         return FakeConn()
 
