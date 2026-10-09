@@ -111,6 +111,7 @@ from lubko.health import (
     read_worker_health_by_incarnation,
     worker_health_payload,
 )
+from lubko.lifecycle import QueueConsumption
 from lubko.state import (
     SupervisorStateTokenError,
     rollback_state_path,
@@ -181,6 +182,35 @@ class _HandoffPipes:
     """Pipe file descriptors for the preflight probe readiness protocol."""
 
     ready_r: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReadinessProbe:
+    """One readiness observation about the exact worker child.
+
+    Attributes:
+        ready: Whether the worker is queue-ready and operationally healthy.
+        reason: Human-readable explanation of the observation.
+        consumption: Conclusive classification of the queue roundtrip.
+    """
+
+    ready: bool
+    reason: str
+    consumption: QueueConsumption
+
+
+@dataclass(frozen=True, slots=True)
+class _NoProgressEvidence:
+    """Accumulated, independently verified absence of forward progress.
+
+    Only conclusive observations are counted, and the counter belongs to one
+    exact incarnation, so a newly spawned worker always starts with a clean
+    record and a probe the supervisor could not perform never contributes.
+    """
+
+    token: str
+    first_observed_at: float
+    consecutive_probes: int
 
 
 class _BoundedSupervisorLogHandler(RotatingFileHandler):
@@ -325,6 +355,14 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS: Final = supervise.DEFAULT_REQUEST_TIMEOUT_SECON
 DEFAULT_LOCK_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_PROBE_TIMEOUT_SECONDS: Final = 15.0
 DEFAULT_READINESS_INTERVAL_SECONDS: Final = 5.0
+#: How long independently verified forward progress must stay absent before a
+#: live worker may be retired for it. Degraded readiness (late maintenance
+#: scans, slow database round trips) never reaches this clock: only a
+#: conclusively unresponsive worker accumulates this evidence.
+DEFAULT_NO_PROGRESS_GRACE_SECONDS: Final = 60.0
+#: How many consecutive conclusive no-progress observations corroborate one
+#: retirement decision, so a single probe never signals a live process.
+DEFAULT_NO_PROGRESS_REQUIRED_PROBES: Final = 3
 IDENTITY_POLL_SECONDS: Final = 0.02
 DB_CHECK_INTERVAL_SECONDS: Final = 15.0
 #: Bounded per-step timeout for preparing the migrated commit's CLI
@@ -407,6 +445,8 @@ class Settings:
     lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS
     probe_timeout_seconds: float = DEFAULT_PROBE_TIMEOUT_SECONDS
     readiness_interval_seconds: float = DEFAULT_READINESS_INTERVAL_SECONDS
+    no_progress_grace_seconds: float = DEFAULT_NO_PROGRESS_GRACE_SECONDS
+    no_progress_required_probes: int = DEFAULT_NO_PROGRESS_REQUIRED_PROBES
 
     def __post_init__(self) -> None:
         """Validate the settings so a broken daemon never loops wildly.
@@ -425,6 +465,7 @@ class Settings:
             ("lock_timeout_seconds", self.lock_timeout_seconds),
             ("probe_timeout_seconds", self.probe_timeout_seconds),
             ("readiness_interval_seconds", self.readiness_interval_seconds),
+            ("no_progress_grace_seconds", self.no_progress_grace_seconds),
         )
         for name, value in timing_settings:
             if not math.isfinite(value):
@@ -451,6 +492,12 @@ class Settings:
             raise ValueError(msg)
         if self.probe_timeout_seconds <= 0 or self.readiness_interval_seconds <= 0:
             msg = "LUBKO_SUPERVISOR readiness probe settings must be positive"
+            raise ValueError(msg)
+        if self.no_progress_grace_seconds <= 0:
+            msg = "LUBKO_SUPERVISOR_NO_PROGRESS_GRACE_SECONDS must be positive"
+            raise ValueError(msg)
+        if self.no_progress_required_probes < 1:
+            msg = "LUBKO_SUPERVISOR_NO_PROGRESS_REQUIRED_PROBES must be at least one"
             raise ValueError(msg)
 
     @classmethod
@@ -516,6 +563,18 @@ class Settings:
                 os.getenv(
                     "LUBKO_SUPERVISOR_READINESS_INTERVAL_SECONDS",
                     str(DEFAULT_READINESS_INTERVAL_SECONDS),
+                )
+            ),
+            no_progress_grace_seconds=float(
+                os.getenv(
+                    "LUBKO_SUPERVISOR_NO_PROGRESS_GRACE_SECONDS",
+                    str(DEFAULT_NO_PROGRESS_GRACE_SECONDS),
+                )
+            ),
+            no_progress_required_probes=int(
+                os.getenv(
+                    "LUBKO_SUPERVISOR_NO_PROGRESS_REQUIRED_PROBES",
+                    str(DEFAULT_NO_PROGRESS_REQUIRED_PROBES),
                 )
             ),
         )
@@ -786,6 +845,7 @@ class SupervisorDaemon:
         self._authority_conn_factory: Callable[[], JobsConnection] | None = None
         self._active_child: WorkerChild | None = None
         self._mem_next_attempt_at: float | None = None
+        self._no_progress: _NoProgressEvidence | None = None
 
     def _write_state_authority_safe(self, state: SupervisorState) -> bool:
         """Publish a supervisor transition without erasing newer consumer authority.
@@ -1941,36 +2001,44 @@ class SupervisorDaemon:
         child = state.child
         if child is None or not self._child_alive(state):
             return
+        if self._no_progress is not None and self._no_progress.token != child.token:
+            # Evidence of absent progress belongs to one exact incarnation: a
+            # replacement worker always starts with a clean record.
+            self._reset_forward_progress_evidence()
         if state.ready:
             healthy, reason = self._check_worker_health(child)
             if healthy:
+                self._reset_forward_progress_evidence()
                 return
-            if reason.startswith(
-                "worker operational not ready:"
-            ) and self._worker_health_requires_retirement(child):
-                # Negative lease safety or a genuinely overdue critical scan
-                # proves the worker loop has fallen behind its safety contract.
-                # Retire that exact incarnation. Transient DB error/deadline
-                # recovery is deliberately not fatal here: readiness is
-                # withdrawn below and the same worker may recover in place.
-                self._message = (
-                    f"ready worker pid={child.pid} became operationally unsafe: {reason}; "
-                    "retiring the exact incarnation"
-                )
-                LOGGER.error("%s", self._message)
-                self._retire_child()
+            if self._worker_health_proves_immediate_safety_breach(child):
+                # Negative lease safety proves the worker can no longer keep an
+                # owned job's lease safe. That is a safety breach, not a
+                # degradation, and it never waits for a sustained observation.
+                self._retire_child_for_safety(child, reason)
                 return
-            # Missing/stale/mismatched health and recoverable operational
-            # degradation are not authority to signal a process. Withdraw
-            # readiness and require a fresh queue+health proof.
+            if self._no_progress_evidence_confirms(child, now):
+                # Sustained, independently verified absence of forward
+                # progress. Only this retirement path may signal a live
+                # worker for anything other than an immediate safety breach.
+                self._retire_child_for_absent_forward_progress(child, now, reason)
+                return
+            # Degraded readiness (overdue maintenance scans, slow or failing
+            # database round trips, an unpublished health snapshot) is not
+            # authority to signal a process. Withdraw readiness and require a
+            # fresh queue+health proof, which is the only independent
+            # observation of forward progress available here.
             self._record_not_ready(state, now, child.pid, reason)
             return
         if state.next_readiness_at is not None and now < state.next_readiness_at:
             return
         probe_cwd = _runtime_dir(state.commit)
-        ready, reason = self._check_readiness(child, probe_cwd)
-        if not ready:
-            self._record_not_ready(state, now, child.pid, reason)
+        probe = self._check_readiness(child, probe_cwd)
+        self._note_progress_observation(child, probe, now)
+        if self._no_progress_evidence_confirms(child, now):
+            self._retire_child_for_absent_forward_progress(child, now, probe.reason)
+            return
+        if not probe.ready:
+            self._record_not_ready(state, now, child.pid, probe.reason)
             return
         try:
             publish_current_surfaces(child.token)
@@ -1996,40 +2064,67 @@ class SupervisorDaemon:
         self,
         child: supervise.WorkerChild,
         probe_cwd: str,
-    ) -> tuple[bool, str]:
+    ) -> ReadinessProbe:
         """Verify queue consumption and health identity cross-check.
+
+        Queue consumption and operational health are reported separately on
+        purpose. A worker that demonstrably consumes the queue is making
+        forward progress even while its maintenance schedule or database round
+        trips degrade; that combination must never become authority to signal
+        the process.
 
         Args:
             child: The worker child identity.
             probe_cwd: Working directory for the queue probe.
 
         Returns:
-            A ``(ready, reason)`` tuple.
+            The probe result, including whether the queue roundtrip itself
+            was conclusive.
         """
-        if not lifecycle.verify_worker_consumes_queue(
+        consumption = lifecycle.verify_worker_consumes_queue_detailed(
             child.worker_id,
             probe_cwd,
             child.pid,
             self.settings.probe_timeout_seconds,
             progress_callback=self._accept_control_requests,
-        ):
-            return False, "queue consumption not proven"
-        return self._check_worker_health(child)
+        )
+        if consumption is not QueueConsumption.CONSUMED:
+            detail = (
+                "not proven"
+                if consumption is QueueConsumption.NOT_CONSUMED
+                else "indeterminate: the probe itself could not be performed"
+            )
+            return ReadinessProbe(
+                ready=False,
+                reason=f"queue consumption {detail}",
+                consumption=consumption,
+            )
+        healthy, reason = self._check_worker_health(child)
+        return ReadinessProbe(
+            ready=healthy,
+            reason=reason,
+            consumption=consumption,
+        )
 
     @staticmethod
-    def _worker_health_requires_retirement(child: supervise.WorkerChild) -> bool:
-        """Return whether current health proves the live worker is unsafe.
+    def _worker_health_proves_immediate_safety_breach(child: supervise.WorkerChild) -> bool:
+        """Return whether current health proves an immediate safety breach.
 
-        Database errors and deadline breaches can recover in place and only
-        revoke readiness. Negative lease safety and overdue critical scans are
-        stronger: they prove the supervision loop missed its safety budget and
-        justify exact-incarnation retirement.
+        Negative lease safety is the only health condition that outranks a
+        live, queue-consuming worker: it proves the worker can no longer hold
+        an owned job's lease before expiry, so continuing it puts work the
+        queue has already assigned at risk. Overdue maintenance scans and
+        database deadline breaches deliberately do not qualify — they are
+        self-recovering degradation, and retiring for them discards warm state
+        and in-flight spawns without restoring anything.  A stale or
+        unpinnable snapshot is not a current proof of either, so it can only
+        feed the sustained independent observation instead.
 
         Args:
             child: Exact maintained-worker identity.
 
         Returns:
-            True only for a matching snapshot with a hard safety breach.
+            True only for a matching live snapshot with a hard safety breach.
         """
         snapshot = read_worker_health_by_incarnation(child.token)
         if (
@@ -2039,8 +2134,174 @@ class SupervisorDaemon:
             or snapshot.worker_incarnation != child.token
         ):
             return False
-        operational = interpret_worker_health(snapshot).operational
-        return operational.lease_safety_negative or operational.any_scan_overdue
+        effective = interpret_worker_health(snapshot)
+        if not effective.live:
+            return False
+        return effective.operational.lease_safety_negative
+
+    def _reset_forward_progress_evidence(self) -> None:
+        """Forget accumulated no-progress evidence after observed progress."""
+        self._no_progress = None
+
+    def _note_progress_observation(
+        self,
+        child: supervise.WorkerChild,
+        probe: ReadinessProbe,
+        now: float,
+    ) -> None:
+        """Fold one conclusive readiness observation into the progress record.
+
+        A worker that demonstrably consumed the queue probe made forward
+        progress, whatever its maintenance schedule or database round trips
+        look like, so its record resets. Only a conclusive "the probe ran and
+        this worker did not consume it" accumulates evidence; an inconclusive
+        probe says nothing about the worker and is ignored.
+
+        Args:
+            child: The observed worker child identity.
+            probe: The observation to fold in.
+            now: Monotonic time of the observation.
+        """
+        if probe.consumption is QueueConsumption.CONSUMED:
+            self._reset_forward_progress_evidence()
+            return
+        if probe.consumption is not QueueConsumption.NOT_CONSUMED:
+            return
+        current = self._no_progress
+        if current is None:
+            self._no_progress = _NoProgressEvidence(
+                token=child.token,
+                first_observed_at=now,
+                consecutive_probes=0,
+            )
+            current = self._no_progress
+        self._no_progress = replace(
+            current,
+            consecutive_probes=current.consecutive_probes + 1,
+        )
+
+    def _no_progress_evidence_confirms(
+        self,
+        child: supervise.WorkerChild,
+        now: float,
+    ) -> bool:
+        """Return whether sustained absent progress justifies signalling.
+
+        Both conditions are required: the absence must have been observed for
+        at least the configured grace period, and at least the configured
+        number of consecutive conclusive observations must corroborate it. A
+        single slow probe, tick, or database round trip never qualifies.
+
+        Args:
+            child: The observed worker child identity.
+            now: Monotonic time of the current observation.
+
+        Returns:
+            ``True`` when the sustained-absence evidence confirms.
+        """
+        evidence = self._no_progress
+        if evidence is None or evidence.token != child.token:
+            return False
+        if evidence.consecutive_probes < self.settings.no_progress_required_probes:
+            return False
+        return now - evidence.first_observed_at >= self.settings.no_progress_grace_seconds
+
+    def _retire_child_for_safety(
+        self,
+        child: supervise.WorkerChild,
+        reason: str,
+    ) -> None:
+        """Retire an incarnation that proves an immediate safety breach.
+
+        Args:
+            child: The exact worker child identity to retire.
+            reason: The health reason that proves the breach.
+        """
+        self._message = (
+            f"ready worker pid={child.pid} became operationally unsafe: {reason}; "
+            "retiring the exact incarnation"
+        )
+        LOGGER.error("%s", self._message)
+        self._reset_forward_progress_evidence()
+        self._retire_child()
+
+    def _retire_child_for_absent_forward_progress(
+        self,
+        child: supervise.WorkerChild,
+        now: float,
+        reason: str,
+    ) -> None:
+        """Retire a live worker only after sustained, verified no progress.
+
+        The retirement is published exactly like an unexpected exit: the
+        durable restart counter advances and the next spawn is scheduled
+        through the same bounded exponential backoff, so a repeatedly failing
+        worker backs off instead of being replaced in a tight loop. Stability
+        still resets the counter through the ordinary crash-backoff reset.
+
+        Args:
+            child: The exact worker child identity to retire.
+            now: Monotonic time of the decision.
+            reason: The latest health or probe reason.
+        """
+        evidence = self._no_progress
+        elapsed = 0.0 if evidence is None else now - evidence.first_observed_at
+        probes = 0 if evidence is None else evidence.consecutive_probes
+        self._message = (
+            f"worker pid={child.pid} has shown no independently verified forward progress "
+            f"for {elapsed:.1f}s across {probes} consecutive probes ({reason}); "
+            "retiring the exact incarnation"
+        )
+        LOGGER.error("%s", self._message)
+        if not self._retire_child():
+            # The retirement did not converge: the child identity is preserved
+            # and the accumulated evidence stays valid for the next attempt.
+            return
+        self._record_health_retirement(child, now, elapsed=elapsed, probes=probes)
+
+    def _record_health_retirement(
+        self,
+        child: supervise.WorkerChild,
+        now: float,
+        *,
+        elapsed: float,
+        probes: int,
+    ) -> None:
+        """Publish the bounded backoff for a health-driven retirement.
+
+        Args:
+            child: The retired worker child identity.
+            now: Monotonic time of the retirement.
+            elapsed: How long absent forward progress had been verified.
+            probes: How many consecutive probes corroborated it.
+        """
+        state = read_state()
+        restart_count = state.restart_count + 1
+        backoff = self._backoff_seconds(restart_count)
+        if not self._write_state_authority_safe(
+            replace(
+                state,
+                restart_count=restart_count,
+                next_attempt_at=now + backoff,
+                intent=INTENT_RUN,
+                ready=False,
+                next_readiness_at=None,
+            )
+        ):
+            return
+        self.proc = None
+        self._reset_forward_progress_evidence()
+        LOGGER.warning(
+            "health-driven retirement recorded for worker pid %d: restart=%d backoff=%.1fs",
+            child.pid,
+            restart_count,
+            backoff,
+        )
+        lifecycle.append_deploy_log(
+            f"supervisor retired worker pid={child.pid} for absent forward progress "
+            f"elapsed={elapsed:.1f}s probes={probes} restart={restart_count} "
+            f"backoff={backoff:.1f}s"
+        )
 
     @staticmethod
     def _check_worker_health(child: supervise.WorkerChild) -> tuple[bool, str]:

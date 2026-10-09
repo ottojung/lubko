@@ -1078,6 +1078,63 @@ def test_retirement_gate_clears_dead_recorded_child(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.usefixtures("supervisor_token")
+def test_retirement_gate_clears_durable_readiness_with_the_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A converged retirement publishes a fully cleared record, not just a cleared child.
+
+    Keeping ``ready=True`` beside ``child=None`` would durably claim a retired
+    worker is still queue-ready; every retirement path must drop the readiness
+    flag and the pending probe deadline so the replacement has to prove itself
+    again before the supervisor trusts the queue surface.
+    """
+    monkeypatch.setattr(lifecycle, "worker_alive", lambda _m: True)
+    monkeypatch.setattr(
+        lifecycle_state,
+        "reconcile_authority_facts",
+        lambda: _facts(current_child_identity_proven=True),
+    )
+    token = "tok" + "a" * 20
+    supervise.write_state(
+        replace(
+            supervise.read_state(),
+            child=supervise.WorkerChild(
+                pid=1,
+                pgid=1,
+                sid=1,
+                start_time_ticks=1,
+                token=token,
+                worker_id="w",
+                spawned_at=0.0,
+            ),
+            ready=True,
+            next_readiness_at=123.0,
+        )
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    seed_db_worker(
+        daemon,
+        lifecycle_authority.WorkerRecord(
+            token=token,
+            commit=COMMIT,
+            pid=1,
+            pgid=1,
+            sid=1,
+            start_time_ticks=1,
+            worker_id="w",
+        ),
+    )
+    monkeypatch.setattr(lifecycle, "stop_worker", lambda _m, _g: True)
+    monkeypatch.setattr(supervisor, "recover_owned_groups", lambda _t: None)
+    assert daemon._retire_child() is True
+
+    final = supervise.read_state()
+    assert final.child is None
+    assert final.ready is False, "a retired worker stayed durably ready"
+    assert final.next_readiness_at is None, "a retired worker kept a pending readiness probe"
+
+
+@pytest.mark.usefixtures("supervisor_token")
 def test_confirm_gate_refuses_malformed_authority(monkeypatch: pytest.MonkeyPatch) -> None:
     """_confirm_locked rolls back and refuses when durable authority is malformed."""
     mission = _make_mission(deployctl.STATUS_PENDING)

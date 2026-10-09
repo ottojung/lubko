@@ -484,6 +484,57 @@ own: a surviving orphan process runs to completion inside the container and its
 output is discarded, which keeps the pass safe from recycled process groups and
 never lets it steal a live job.
 
+## Worker retirement: degraded readiness versus safety
+
+`lubko-supervisor` signals a live worker only for a reason stronger than "the
+worker is not in perfect health". The health snapshot separates two classes,
+and the supervisor's response is different for each.
+
+**Degraded readiness.** An overdue maintenance scan (cancellation, recovery,
+GC) or an unrecovered database deadline breach / connectivity error is a
+self-recovering condition. Maintenance runs cooperatively in the same loop as
+bounded database work, so one slow round trip legitimately pushes a scan past
+its lateness budget. The response is to withdraw readiness and re-probe later;
+the live worker keeps its jobs, its warm state, and its in-flight spawns. A
+worker that demonstrably consumes the queue is making forward progress no
+matter how late its scans are, so this class never becomes authority to
+signal it. A probe the supervisor could not perform at all — missing database
+configuration, unreachable database, unproven insert — is not evidence about
+the worker and contributes nothing to any retirement decision.
+
+**Immediate safety.** Negative remaining lease safety
+(`min_lease_safety_remaining_seconds < 0`) proves the worker can no longer
+hold an owned job's lease before expiry, so that exact incarnation is retired
+at once. Ownership and generation authority (canonical worker record, desired
+generation) and real process death are equally immediate, and unchanged by
+this policy.
+
+**Sustained absent forward progress.** When health is degraded but no
+immediate breach is present, a live worker may only be retired after forward
+progress is independently verified absent for at least
+`LUBKO_SUPERVISOR_NO_PROGRESS_GRACE_SECONDS` (60) **and** at least
+`LUBKO_SUPERVISOR_NO_PROGRESS_REQUIRED_PROBES` (3) consecutive supervisor
+probes corroborate it. The independent observation is a real queue roundtrip
+against the exact child: it either proves the worker consumed the probe (which
+resets the evidence), proves it did not, or is inconclusive. Evidence belongs
+to one exact incarnation and is discarded as soon as progress is observed.
+
+A retirement for sustained absent forward progress is published like an
+unexpected exit: the durable restart counter advances and the replacement is
+scheduled behind the same bounded exponential backoff (base, cap, and
+stability reset), so a repeatedly failing worker backs off instead of being
+replaced in a tight loop.
+
+Confirming a replacement worker also does not delete its predecessor's
+evidence. Superseded-incarnation health snapshots and operational logs are
+retained for at least 48 hours, bounded by a maximum file count and a maximum
+total byte budget, so a retirement remains diagnosable after the fact while a
+retirement storm cannot grow the retained set without limit.
+
+Database latency itself is an infrastructure investigation, not a scheduling
+input: Lubko derives no scheduling decision from observed agent counts, host
+resources, or queue pressure.
+
 ## Fresh-install schema
 
 Apply `migrations/0001_two_column_protocol.sql` once to establish the frozen

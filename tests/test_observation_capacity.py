@@ -270,7 +270,13 @@ def test_readiness_survives_stable_surface_outage(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(supervisor, "read_state", lambda: state)
     monkeypatch.setattr(supervisor.SupervisorDaemon, "_child_alive", lambda _self, _s: True)
     monkeypatch.setattr(
-        supervisor.SupervisorDaemon, "_check_readiness", lambda _self, _c, _d: (True, "ok")
+        supervisor.SupervisorDaemon,
+        "_check_readiness",
+        lambda _self, _c, _d: supervisor.ReadinessProbe(
+            ready=True,
+            reason="ok",
+            consumption=lifecycle.QueueConsumption.CONSUMED,
+        ),
     )
     monkeypatch.setattr(supervisor, "publish_current_surfaces", _no_space)
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _msg: None)

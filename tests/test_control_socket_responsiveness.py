@@ -42,8 +42,8 @@ def _blocking_probe(
     client_go: threading.Event,
     client_sent: threading.Event,
     client_served: threading.Event,
-) -> Callable[..., bool]:
-    """Build a ``verify_worker_consumes_queue`` stand-in that blocks on its client.
+) -> Callable[..., lifecycle.QueueConsumption]:
+    """Build a ``verify_worker_consumes_queue_detailed`` stand-in that blocks on its client.
 
     ``_check_readiness`` passes the supervisor's control-request pump to the
     probe as ``progress_callback``; this stand-in forces that pump to be the
@@ -72,8 +72,8 @@ def _blocking_probe(
     missing pump still releases a waiting client rather than stranding it.
 
     Returns:
-        A callable matching ``lifecycle.verify_worker_consumes_queue`` that
-        always reports "not proven".
+        A callable matching ``lifecycle.verify_worker_consumes_queue_detailed``
+        that always reports "the worker did not consume the queue".
     """
 
     def probe(
@@ -82,7 +82,7 @@ def _blocking_probe(
         _pid: int,
         _timeout: float,
         progress_callback: Callable[[], None] | None = None,
-    ) -> bool:
+    ) -> lifecycle.QueueConsumption:
         client_go.set()
         assert progress_callback is not None, "probe was given no control-request pump"
         assert client_sent.wait(timeout=_STARVATION_TIMEOUT), (
@@ -93,7 +93,7 @@ def _blocking_probe(
             "the readiness probe starved the supervisor control socket: a client "
             "connecting while the probe was in flight was not served"
         )
-        return False
+        return lifecycle.QueueConsumption.NOT_CONSUMED
 
     return probe
 
@@ -160,7 +160,7 @@ def test_readiness_wait_services_control_requests(
 
     monkeypatch.setattr(
         lifecycle,
-        "verify_worker_consumes_queue",
+        "verify_worker_consumes_queue_detailed",
         _blocking_probe(client_go, client_sent, client_served),
     )
     child = supervise.WorkerChild(
@@ -173,7 +173,8 @@ def test_readiness_wait_services_control_requests(
         spawned_at=time.time(),
     )
     try:
-        ready, reason = daemon._check_readiness(child, str(tmp_path))
+        probe = daemon._check_readiness(child, str(tmp_path))
+        ready, reason = probe.ready, probe.reason
     finally:
         listener.close()
         daemon._control_sock = None
