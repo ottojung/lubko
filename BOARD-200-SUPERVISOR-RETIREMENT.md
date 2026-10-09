@@ -5,6 +5,73 @@ Host: `marceline-dev` (this container is the host's Lubko container; supervisor 
 state/logs are directly readable). Read-only investigation: no tracked file was modified,
 nothing was committed, pushed, or merged, and the board issue was not touched.
 
+> **Update 2026/10/09 — the blocked human decision is resolved.** `chatgpt@delegated-operator`
+> delegated the supervisor-contract decision on this issue, so section 6 is no longer a
+> blocking question. The remediation recorded below is implemented (degraded readiness never
+> signals a live queue consumer; sustained, independently verified absent forward progress
+> with a 60 s grace period and 3 consecutive probes; crash-style bounded backoff; ≥48 h
+> bounded retention of superseded-incarnation evidence). The investigation findings, the
+> causal path, and the enumeration of retiring conditions are kept unchanged below as the
+> historical record of the defect.
+
+> **Terminal verdict B200-REMEDIATION-LANDED 2026/10/09 — the delegated policy is implemented,
+> tested, mutation-pinned, and pushed. The issue stays OPEN for the human integration
+> decision (review / merge / promotion); per its completion rule it is not closed here.**
+>
+> **What landed** — branch `fix/issue-200-supervisor-retirement-policy` (based on `main` @
+> `72910f6` via `4155d5d`), commit `234811d` (policy enforcement across code, intent records,
+> protocol, and tests) followed by this verdict commit. No merge to `main`, no PR, no
+> promotion.
+>
+> **Measured gates** (each run with `XDG_STATE_HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` /
+> `HOME` fenced in fresh temp dirs; real exit codes captured):
+>
+> | Gate | Result | Exit code |
+> |---|---|---|
+> | `uv run ruff format --check .` | 145 files already formatted | 0 |
+> | `uv run ruff check .` | All checks passed | 0 |
+> | `uv run mypy .` | Success: no issues in 119 source files | 0 |
+> | `uv run pytest` | 1225 passed in ~2.3 s (budget 10 s) | 0 |
+>
+> **Mutation evidence** — 13 guard reverts were applied one at a time on top of the landed
+> tree; the full suite went RED for every one, so each new assertion pins its guard
+> non-vacuously:
+>
+> | Mutation (guard reverted) | Verdict |
+> |---|---|
+> | safety predicate accepts `any_scan_overdue` again | RED |
+> | 60 s grace period removed | RED |
+> | 3-probe corroboration removed | RED |
+> | inconclusive probe counted as no-progress evidence | RED |
+> | queue consumption no longer resets the evidence | RED |
+> | health retirement bypasses the crash backoff counter | RED |
+> | 48 h evidence-retention window removed | RED |
+> | missing DB config treated as conclusive non-consumption | RED |
+> | unreachable DB treated as conclusive non-consumption | RED |
+> | unproven probe insert treated as conclusive non-consumption | RED |
+> | no-progress evidence not bound to one incarnation | RED |
+> | healthy recovery no longer resets the evidence | RED |
+> | failed retirement discards the evidence | RED |
+>
+> Three guards (3-probe corroboration, per-incarnation evidence binding, healthy-recovery
+> reset) were first found **GREEN** — vacuous — and were pinned by four new tests in
+> `tests/test_health_retirement_policy.py` before re-running the suite; one redundant
+> token check in `_note_progress_observation` was removed so each guard has exactly one
+> enforced home.
+>
+> **Scope reconciliation** — `ANTONINA_ORCHESTRATOR_INTERVAL_SECONDS` does not exist anywhere
+> in this repository (no occurrence of `ANTONINA` at all); the Antonina orchestrator is a
+> separate external system, so those interval settings do not belong to this contract and
+> were left untouched.
+>
+> **Remaining human-only residual:**
+> 1. Review, merge, and promotion of the branch are human-gated by design (no PR was opened).
+> 2. The underlying remote-database stalls (`db_deadline_breach`, `gc_batch_bound_hit` against
+>    the Supabase pooler) remain an infrastructure investigation; Lubko now survives them
+>    instead of churning workers, but nothing here fixes the database itself.
+> 3. The issue remains **open**: the human operator must decide integration and confirm the
+>    production behaviour under the next real database stall.
+
 ## 1. Conclusion
 
 **Proven cause.** The 2026-10-05 ~16:12 UTC worker replacement was a **health-driven
@@ -290,9 +357,9 @@ Presented for the human decision; **nothing has been changed.**
 Recommended combination if a code fix is authorised: **(1) + (2) + (5)**, with **(4)**
 pursued in parallel as the likely root-cause mitigation.
 
-## 6. The exact human decision required
+## 6. The decision that was required — resolved by delegated operator
 
-Once the cause is accepted, one decision is needed and it cannot be made from code or
+Once the cause is accepted, one decision was needed and it cannot be made from code or
 tests:
 
 > **Should a queue-ready `lubko-worker` ever be retired — killed and replaced — for a
@@ -300,24 +367,26 @@ tests:
 > remote database round trips), or is "the worker is alive and consuming the queue" a
 > stronger condition than "the worker's maintenance schedule slipped"?**
 
-Concretely, the human must choose:
+`chatgpt@delegated-operator` answered on 2026/10/09 by delegation; no further human ruling
+is required. The four questions are settled as follows, and the current intent lives in
+`docs/intent-records/worker-retirement.md`:
 
-1. **The invariant**: is `any_scan_overdue` (and by extension a transient DB stall) a
-   *safety breach* justifying process replacement, or a *degraded-readiness* condition
-   that must only withdraw readiness? This is a change to Lubko's supervision contract
-   and therefore arguably a change to intent, not an implementation detail — it should be
-   recorded as an Intent Record rather than patched silently.
-2. **The threshold if (1) is "yes, eventually"**: how many consecutive supervisor ticks,
-   or how much sustained lateness, converts degradation into authority to signal a
-   queue-ready worker.
-3. **The backoff policy**: whether repeated health-driven retirements share the crash
-   backoff ladder, and what the maximum delay is.
-4. **The observability policy**: whether the previous incarnation's log and health
-   snapshot must survive its replacement (required to diagnose any recurrence).
-
-Items 1 and 4 are the blocking ones. Until item 1 is answered, no remediation can be
-correctly scoped, and the churn will continue — 40 retirements already occurred on
-2026-10-05 alone.
+1. **The invariant** — `any_scan_overdue` (and a transient database stall) is
+   **degraded readiness**, never a safety breach. "The worker is alive and consuming the
+   queue" is the stronger condition: readiness is withdrawn when appropriate, in-flight
+   jobs and spawns are kept alive, and the process is never signalled. Immediate
+   retirement is preserved for `lease_safety_negative`, invalid ownership/desired
+   generation, and real process death.
+2. **The threshold** — a health-driven retirement requires independently verified absent
+   forward progress for **≥60 s** and **≥3 consecutive supervisor probes**, with evidence
+   reset on recovery. Database latency is a diagnostic trigger, not proof that work
+   stopped; the evidence comes from an independent queue roundtrip, and a probe that could
+   not be performed is not evidence about the worker.
+3. **The backoff policy** — repeated health-driven retirements share the existing
+   crash-style exponential backoff with its existing cap, and stability resets the
+   counter.
+4. **The observability policy** — superseded-incarnation health and log evidence is
+   retained for **≥48 h**, bounded by file count and total bytes.
 
 ## 7. Boundaries observed
 
