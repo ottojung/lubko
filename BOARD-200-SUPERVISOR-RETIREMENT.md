@@ -17,11 +17,15 @@ nothing was committed, pushed, or merged, and the board issue was not touched.
 > **Terminal verdict B200-REMEDIATION-LANDED 2026/10/09 — the delegated policy is implemented,
 > tested, mutation-pinned, and pushed. The issue stays OPEN for the human integration
 > decision (review / merge / promotion); per its completion rule it is not closed here.**
+> A reconciliation pass on 2026/10/09 re-derived every claim below by execution, closed
+> three further vacuities it found, and refreshed the measured gates and mutation table.
 >
 > **What landed** — branch `fix/issue-200-supervisor-retirement-policy` (based on `main` @
-> `72910f6` via `4155d5d`), commit `234811d` (policy enforcement across code, intent records,
-> protocol, and tests) followed by this verdict commit. No merge to `main`, no PR, no
-> promotion.
+> `72910f6` via `4155d5d`): commit `234811d` (policy enforcement across code, intent
+> records, protocol, and tests), `853686f` (verdict), `497b9df` (matching-live-snapshot
+> predicate pin), and the reconciliation commit (vacuity closure: single-home
+> incarnation binding, byte-budget pin, retire-state pin, fixed-size retention-storm
+> test). No merge to `main`, no PR, no promotion.
 >
 > **Measured gates** (each run with `XDG_STATE_HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` /
 > `HOME` fenced in fresh temp dirs; real exit codes captured):
@@ -31,10 +35,10 @@ nothing was committed, pushed, or merged, and the board issue was not touched.
 > | `uv run ruff format --check .` | 145 files already formatted | 0 |
 > | `uv run ruff check .` | All checks passed | 0 |
 > | `uv run mypy .` | Success: no issues in 119 source files | 0 |
-> | `uv run pytest` | 1226 passed in ~2.5 s (budget 10 s) | 0 |
+> | `uv run pytest` | 1228 passed in ~2.4 s (budget 10 s) | 0 |
 >
-> **Mutation evidence** — 13 guard reverts were applied one at a time on top of the landed
-> tree; the full suite went RED for every one, so each new assertion pins its guard
+> **Mutation evidence** — 17 guard reverts were applied one at a time on top of the landed
+> tree; the full suite went RED for every one, so each assertion pins its guard
 > non-vacuously:
 >
 > | Mutation (guard reverted) | Verdict |
@@ -52,13 +56,15 @@ nothing was committed, pushed, or merged, and the board issue was not touched.
 > | no-progress evidence not bound to one incarnation | RED |
 > | healthy recovery no longer resets the evidence | RED |
 > | failed retirement discards the evidence | RED |
+> | evidence file-count bound removed | RED |
+> | evidence byte budget unbounded | RED |
+> | evidence byte-budget condition removed | RED |
+> | retirement keeps stale durable readiness | RED |
 > | supervisor safety predicate accepts `any_scan_overdue` (matching live snapshot) | RED |
 >
 > Three guards (3-probe corroboration, per-incarnation evidence binding, healthy-recovery
 > reset) were first found **GREEN** — vacuous — and were pinned by four new tests in
-> `tests/test_health_retirement_policy.py` before re-running the suite; one redundant
-> token check in `_note_progress_observation` was removed so each guard has exactly one
-> enforced home.
+> `tests/test_health_retirement_policy.py` before re-running the suite.
 >
 > **Fourth vacuity found and closed during verification (2026/10/09).** Reverting the
 > supervisor's `_worker_health_proves_immediate_safety_breach` final return to accept
@@ -71,6 +77,31 @@ nothing was committed, pushed, or merged, and the board issue was not touched.
 > signal. Under the predicate mutation that test goes RED with the incident's exact
 > failure mode (`ready worker pid=… became operationally unsafe: … overdue scans …;
 > retiring the exact incarnation`).
+>
+> **Further vacuities found and closed by the 2026/10/09 reconciliation pass** (each
+> re-derived by execution, not by comment):
+>
+> 1. **Incarnation binding had two enforced homes.** The token check existed both in
+>    `_probe_readiness` and in `_note_progress_observation`; reverting either one alone
+>    stayed GREEN. The redundant check in `_note_progress_observation` was removed so
+>    the guard has exactly one enforced home; reverting the remaining home
+>    (`_probe_readiness`) is RED via
+>    `test_new_incarnation_does_not_inherit_no_progress_evidence`.
+> 2. **The evidence byte budget was unpinned.** `MAX_RETAINED_EVIDENCE_BYTES` had no
+>    test; mutating it to an unbounded value or deleting the byte-budget condition both
+>    stayed GREEN. New test
+>    `test_incarnation_evidence_retention_is_bounded_by_bytes` writes two recent 9 MiB
+>    snapshots (combined 18 MiB > 16 MiB budget) and asserts only the newest is
+>    retained; both mutations are RED.
+> 3. **The retention-storm test scaled with the constant it pinned.** It wrote
+>    `MAX_RETAINED_EVIDENCE_FILES + 3` files, so removing the count bound made the suite
+>    attempt a billion writes and hang instead of failing fast. The storm size is now a
+>    fixed 11 files; removing the count bound is RED.
+> 4. **Retirement did not durably clear readiness.** `_retire_child` cleared only the
+>    child identity, leaving `ready=True` beside `child=None`. New test
+>    `test_retirement_gate_clears_durable_readiness_with_the_child` drives the real
+>    retirement gate and asserts the published record drops `ready` and
+>    `next_readiness_at`; reverting the clearing is RED.
 >
 > **Scope reconciliation** — `ANTONINA_ORCHESTRATOR_INTERVAL_SECONDS` does not exist anywhere
 > in this repository (no occurrence of `ANTONINA` at all); the Antonina orchestrator is a

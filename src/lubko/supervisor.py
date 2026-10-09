@@ -2168,7 +2168,7 @@ class SupervisorDaemon:
         if probe.consumption is not QueueConsumption.NOT_CONSUMED:
             return
         current = self._no_progress
-        if current is None or current.token != child.token:
+        if current is None:
             self._no_progress = _NoProgressEvidence(
                 token=child.token,
                 first_observed_at=now,

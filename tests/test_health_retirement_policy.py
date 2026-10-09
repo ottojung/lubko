@@ -29,6 +29,7 @@ import pytest
 from lubko import lifecycle, supervise, supervisor
 from lubko.health import (
     EVIDENCE_RETENTION_SECONDS,
+    MAX_RETAINED_EVIDENCE_BYTES,
     MAX_RETAINED_EVIDENCE_FILES,
     WORKER_HEALTH_SCHEMA_VERSION,
     WorkerHealth,
@@ -767,7 +768,7 @@ def test_superseded_incarnation_evidence_survives_the_retention_window(
 def test_incarnation_evidence_retention_is_bounded(evidence_dirs: tuple[Path, Path]) -> None:
     """A retirement storm cannot grow the retained evidence without limit."""
     health_dir, _logs_dir = evidence_dirs
-    for index in range(MAX_RETAINED_EVIDENCE_FILES + 3):
+    for index in range(11):
         _write_artifact(health_dir, f"health-{index:032d}.json", 3600.0)
 
     prune_old_incarnation_artifacts(CURRENT_TOKEN)
@@ -775,7 +776,7 @@ def test_incarnation_evidence_retention_is_bounded(evidence_dirs: tuple[Path, Pa
     retained = sorted(path.name for path in health_dir.glob("health-*.json"))
     assert len(retained) == MAX_RETAINED_EVIDENCE_FILES, f"unbounded evidence: {retained}"
     # The newest incarnations are the ones a post-mortem actually needs.
-    assert f"health-{MAX_RETAINED_EVIDENCE_FILES + 2:032d}.json" in retained
+    assert f"health-{10:032d}.json" in retained
     assert "health-00000000000000000000000000000000.json" not in retained
 
 
@@ -791,6 +792,33 @@ def test_incarnation_evidence_expires_after_the_retention_window(
 
     assert not (health_dir / f"health-{'a' * 32}.json").exists()
     assert (health_dir / f"health-{CURRENT_TOKEN}.json").exists()
+
+
+def test_incarnation_evidence_retention_is_bounded_by_bytes(
+    evidence_dirs: tuple[Path, Path],
+) -> None:
+    """The retained evidence byte budget bounds a retirement storm's disk use.
+
+    Two recent superseded snapshots whose combined size exceeds the byte
+    budget cannot both be retained: only the newest fits, so a storm of large
+    artifacts cannot grow the retained set without limit.
+    """
+    health_dir, _logs_dir = evidence_dirs
+    health_dir.mkdir(parents=True, exist_ok=True)
+    oldest = "a" * 32
+    newest = "b" * 32
+    chunk = b"e" * (1024 * 1024)
+    for token, age_seconds in ((oldest, 120.0), (newest, 60.0)):
+        path = health_dir / f"health-{token}.json"
+        path.write_bytes(chunk * 9)
+        stamp = time.time() - age_seconds
+        os.utime(path, (stamp, stamp))
+    assert MAX_RETAINED_EVIDENCE_BYTES < 2 * 9 * 1024 * 1024
+
+    prune_old_incarnation_artifacts(CURRENT_TOKEN)
+
+    retained = sorted(path.name for path in health_dir.glob("health-*.json"))
+    assert retained == [f"health-{newest}.json"], f"byte budget exceeded: {retained}"
 
 
 # ------------------------------------------------------------------
