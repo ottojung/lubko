@@ -264,6 +264,46 @@ def test_ready_worker_with_overdue_scans_only_loses_readiness(
 
 
 @pytest.mark.usefixtures("supervisor_token")
+def test_matching_live_overdue_snapshot_is_not_an_immediate_safety_breach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current, identity-matching overdue snapshot proves degradation only.
+
+    Unlike a stale or unpinnable snapshot, this one passes every liveness and
+    identity cross-check, so it reaches the safety predicate itself: overdue
+    scans with non-negative lease safety must withdraw readiness without
+    signalling the exact incarnation, however current the snapshot is.
+    """
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    retired, retire = _retirement_recorder()
+    withdrawals: list[str] = []
+    monkeypatch.setattr(daemon, "_retire_child", retire)
+    monkeypatch.setattr(
+        daemon,
+        "_record_not_ready",
+        lambda _state, _now, _pid, reason: withdrawals.append(reason),
+    )
+    child = _child()
+    snapshot = replace(
+        _overdue_snapshot(),
+        pid=child.pid,
+        start_time_ticks=child.start_time_ticks,
+        worker_incarnation=child.token,
+        published_at=time.time(),
+    )
+    monkeypatch.setattr(supervisor, "read_worker_health_by_incarnation", lambda _token: snapshot)
+    state = _state(child, ready=True)
+    _wire_daemon(monkeypatch, daemon, _overdue_probe(), lambda: state)
+
+    daemon._probe_readiness(time.monotonic())
+
+    assert retired == [], "a current overdue snapshot retired a lease-safe worker"
+    assert withdrawals == [
+        "worker operational not ready: overdue scans: cancellation, recovery, gc"
+    ]
+
+
+@pytest.mark.usefixtures("supervisor_token")
 def test_inconclusive_probe_creates_no_retirement_authority(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

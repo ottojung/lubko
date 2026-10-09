@@ -31,7 +31,7 @@ nothing was committed, pushed, or merged, and the board issue was not touched.
 > | `uv run ruff format --check .` | 145 files already formatted | 0 |
 > | `uv run ruff check .` | All checks passed | 0 |
 > | `uv run mypy .` | Success: no issues in 119 source files | 0 |
-> | `uv run pytest` | 1225 passed in ~2.3 s (budget 10 s) | 0 |
+> | `uv run pytest` | 1226 passed in ~2.5 s (budget 10 s) | 0 |
 >
 > **Mutation evidence** — 13 guard reverts were applied one at a time on top of the landed
 > tree; the full suite went RED for every one, so each new assertion pins its guard
@@ -52,12 +52,25 @@ nothing was committed, pushed, or merged, and the board issue was not touched.
 > | no-progress evidence not bound to one incarnation | RED |
 > | healthy recovery no longer resets the evidence | RED |
 > | failed retirement discards the evidence | RED |
+> | supervisor safety predicate accepts `any_scan_overdue` (matching live snapshot) | RED |
 >
 > Three guards (3-probe corroboration, per-incarnation evidence binding, healthy-recovery
 > reset) were first found **GREEN** — vacuous — and were pinned by four new tests in
 > `tests/test_health_retirement_policy.py` before re-running the suite; one redundant
 > token check in `_note_progress_observation` was removed so each guard has exactly one
 > enforced home.
+>
+> **Fourth vacuity found and closed during verification (2026/10/09).** Reverting the
+> supervisor's `_worker_health_proves_immediate_safety_breach` final return to accept
+> `any_scan_overdue` was **GREEN** — the existing overdue-readiness tests monkeypatch
+> `_check_worker_health` or use a stale snapshot, so the predicate's final return was
+> never reached. A new test,
+> `test_matching_live_overdue_snapshot_is_not_an_immediate_safety_breach`, drives a
+> current snapshot that passes every identity/liveness cross-check (overdue scans,
+> non-negative lease safety): the ready branch must withdraw readiness and must not
+> signal. Under the predicate mutation that test goes RED with the incident's exact
+> failure mode (`ready worker pid=… became operationally unsafe: … overdue scans …;
+> retiring the exact incarnation`).
 >
 > **Scope reconciliation** — `ANTONINA_ORCHESTRATOR_INTERVAL_SECONDS` does not exist anywhere
 > in this repository (no occurrence of `ANTONINA` at all); the Antonina orchestrator is a
