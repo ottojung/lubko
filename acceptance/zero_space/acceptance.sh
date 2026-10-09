@@ -504,7 +504,8 @@ pass "lubko-install"
 # and each attempt deserves headroom on a busy container host.
 if ! lubko-deploy deploy --bootstrap --repo "${REPO}" --db-timeout 15 >"${SCRATCH}/logs/deploy.log" 2>&1; then
   fail "lubko-deploy deploy --bootstrap failed (see logs/deploy.log)"
-  tail -5 "${SCRATCH}/logs/deploy.log" || true
+  # On validation failure, show enough of the pytest summary to name the failing test.
+  tail -140 "${SCRATCH}/logs/deploy.log" || true
   printf 'ACCEPTANCE FAILED\n'
   exit 1
 fi
