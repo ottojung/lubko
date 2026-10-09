@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
     import pytest
 
-    from lubko.worker import JobsConnection, _SpawnTuple
+    from lubko.worker import JobResult, JobsConnection, _SpawnTuple
 
 _ANON_DIR = "/var/empty"
 
@@ -329,14 +329,19 @@ def test_later_job_progresses_past_blocked_start(
 def test_cleanup_pending_starts_does_not_join_blocked_threads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_shutdown fails pending starts immediately without joining blocked threads."""
+    """_shutdown fails pending starts immediately without joining blocked threads.
+
+    The failure text is part of the supervisor retirement policy: signalling a
+    worker destroys the spawns the queue had already assigned to it, which is
+    why a live, queue-consuming worker must never be signalled.
+    """
     blocker = _BlockingSpawn()
     supervisor = _supervisor(_settings(spawn_deadline_seconds=300.0))
 
-    finalized: list[UUID] = []
+    finalized: list[tuple[UUID, str]] = []
 
-    def fake_finalize(jid: UUID, _result: object) -> None:
-        finalized.append(jid)
+    def fake_finalize(jid: UUID, result: object) -> None:
+        finalized.append((jid, cast("JobResult", result).stderr))
 
     monkeypatch.setattr("lubko.worker.spawn_job", blocker)
     monkeypatch.setattr(supervisor, "_finalize_immediate", fake_finalize)
@@ -358,6 +363,7 @@ def test_cleanup_pending_starts_does_not_join_blocked_threads(
 
     assert elapsed < 0.5, f"_cleanup_pending_starts took {elapsed:.2f}s (must not join)"
     assert len(finalized) == 1, "the pending start was finalized"
+    assert finalized[0][1] == "worker shutting down before spawn completed"
     assert len(supervisor._pending_starts) == 0
 
 

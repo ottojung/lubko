@@ -1,6 +1,7 @@
 """Regression tests for supervisor timing settings validation."""
 
 from dataclasses import replace
+from typing import Any
 
 import pytest
 
@@ -17,7 +18,22 @@ TIMING_FIELDS = (
     "lock_timeout_seconds",
     "probe_timeout_seconds",
     "readiness_interval_seconds",
+    "no_progress_grace_seconds",
 )
+
+
+def _settings_with(field_name: str, value: float) -> supervisor.Settings:
+    """Build supervisor settings with one field replaced.
+
+    Args:
+        field_name: Name of the setting to replace.
+        value: Replacement value.
+
+    Returns:
+        The settings instance.
+    """
+    overrides: dict[str, Any] = {field_name: value}
+    return replace(supervisor.Settings(), **overrides)
 
 
 def test_settings_reject_non_finite_timing_values() -> None:
@@ -25,7 +41,7 @@ def test_settings_reject_non_finite_timing_values() -> None:
     for field_name in TIMING_FIELDS:
         for value in (float("nan"), float("inf"), float("-inf")):
             with pytest.raises(ValueError, match="must be finite"):
-                replace(supervisor.Settings(), **{field_name: value})
+                _settings_with(field_name, value)
 
 
 @pytest.mark.parametrize("spelling", ["nan", "inf", "-inf"])
@@ -44,7 +60,23 @@ def test_settings_reject_non_positive_database_timeouts() -> None:
     for field_name in ("postgres_timeout_seconds", "lock_timeout_seconds"):
         for value in (0.0, -1.0):
             with pytest.raises(ValueError, match="database timeout settings must be positive"):
-                replace(supervisor.Settings(), **{field_name: value})
+                _settings_with(field_name, value)
+
+
+def test_settings_reject_non_positive_forward_progress_settings() -> None:
+    """Reject a non-positive grace period and a zero probe requirement."""
+    with pytest.raises(ValueError, match="NO_PROGRESS_GRACE_SECONDS must be positive"):
+        _settings_with("no_progress_grace_seconds", 0.0)
+    with pytest.raises(ValueError, match="NO_PROGRESS_REQUIRED_PROBES must be at least one"):
+        _settings_with("no_progress_required_probes", 0)
+
+
+def test_settings_require_multiple_probes_and_a_real_grace_period() -> None:
+    """The sustained no-progress rule needs both a duration and corroboration."""
+    settings = supervisor.Settings()
+
+    assert settings.no_progress_grace_seconds >= 60.0
+    assert settings.no_progress_required_probes >= 3
 
 
 def test_settings_accept_valid_finite_timing_values() -> None:

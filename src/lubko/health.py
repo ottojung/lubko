@@ -31,6 +31,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
+from operator import itemgetter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, override
 from uuid import UUID
@@ -51,6 +52,22 @@ HEALTH_SYMLINK_FILENAME: Final = "health.json"
 WORKER_LOG_SYMLINK_FILENAME: Final = "worker.log"
 WORKER_LOG_MAX_BYTES: Final = 2 * 1024 * 1024  # 2 MiB per file
 WORKER_LOG_BACKUP_COUNT: Final = 3
+
+#: Nanoseconds per second, used to convert ``st_mtime_ns`` for the retention
+#: window comparison without floating-point drift at modern timestamps.
+_NANOSECONDS_PER_SECOND: Final = 1_000_000_000
+
+#: How long a superseded incarnation's health snapshot and operational log are
+#: retained after a replacement is confirmed ready. A retirement must stay
+#: diagnosable after the fact, so the evidence outlives the replacement.
+EVIDENCE_RETENTION_SECONDS: Final = 48.0 * 3600.0
+#: Maximum number of superseded evidence files retained per directory. The
+#: retained window is newest-first, so a retirement storm keeps the evidence
+#: that matters and drops the rest.
+MAX_RETAINED_EVIDENCE_FILES: Final = 8
+#: Maximum retained superseded-evidence bytes per directory, bounding the disk
+#: a long-lived supervisor can accumulate under repeated retirements.
+MAX_RETAINED_EVIDENCE_BYTES: Final = 16 * 1024 * 1024
 
 #: Stable on-disk compatibility-envelope version for per-incarnation worker
 #: health. The external supervisor intentionally outlives workers across a
@@ -970,36 +987,96 @@ def _read_health_file(path: Path) -> WorkerHealth | None:
 # ---------------------------------------------------------------------------
 
 
-def prune_old_incarnation_artifacts(current_token: str) -> None:
-    """Best-effort remove health/log files from older incarnations.
+def prune_old_incarnation_artifacts(
+    current_token: str,
+    *,
+    now: float | None = None,
+    retention_seconds: float = EVIDENCE_RETENTION_SECONDS,
+    max_files: int = MAX_RETAINED_EVIDENCE_FILES,
+    max_bytes: int = MAX_RETAINED_EVIDENCE_BYTES,
+) -> None:
+    """Retire superseded incarnations' evidence while keeping it diagnosable.
 
-    Retains the current incarnation's ``health-{token}.json``,
-    ``worker-{token}.log``, and its rotation backups (``.1``, ``.2``, ...).
-    Everything else matching the known filename patterns in the health and
-    logs directories is removed.  Failures are logged as warnings and never
+    The current incarnation's ``health-{token}.json``, ``worker-{token}.log``,
+    and its rotation backups (``.1``, ``.2``, ...) are always retained.
+    Superseded incarnations are kept for :data:`EVIDENCE_RETENTION_SECONDS`
+    so a retirement that needs a post-mortem stays diagnosable, then dropped.
+    Retention is bounded in both file count and total bytes: only the newest
+    artifacts inside the budget are kept, so a retirement storm can never grow
+    the evidence set without limit.  Failures are logged as warnings and never
     undo the current stable surfaces.
 
     Args:
         current_token: The confirmed incarnation token to keep.
+        now: Reference wall-clock time for the retention window.
+        retention_seconds: How long superseded evidence is retained.
+        max_files: Maximum number of retained superseded files per directory.
+        max_bytes: Maximum retained superseded bytes per directory.
     """
-    _prune_dir(_health_dir(), f"health-{current_token}.json", "health-*.json")
-    _prune_dir(_logs_dir(), f"worker-{current_token}.log", "worker-*.log*")
+    window = _EvidenceWindow(
+        now=time.time() if now is None else now,
+        retention_seconds=retention_seconds,
+        max_files=max_files,
+        max_bytes=max_bytes,
+    )
+    _prune_dir(_health_dir(), f"health-{current_token}.json", "health-*.json", window)
+    _prune_dir(_logs_dir(), f"worker-{current_token}.log", "worker-*.log*", window)
 
 
-def _prune_dir(directory: Path, keep_prefix: str, pattern: str) -> None:
-    """Remove files matching ``pattern`` that do not start with ``keep_prefix``.
+@dataclass(frozen=True, slots=True)
+class _EvidenceWindow:
+    """Bounded retention window applied to superseded incarnation evidence."""
+
+    now: float
+    retention_seconds: float
+    max_files: int
+    max_bytes: int
+
+
+def _prune_dir(
+    directory: Path,
+    keep_prefix: str,
+    pattern: str,
+    window: _EvidenceWindow,
+) -> None:
+    """Apply the bounded evidence-retention window to one artifact directory.
 
     Args:
         directory: The directory to scan.
         keep_prefix: Filename prefix to retain (e.g. ``health-abc.json``).
         pattern: Glob pattern for candidate files.
+        window: The bounded retention window to enforce.
     """
     if not directory.is_dir():
         return
+    superseded: list[tuple[Path, int, int]] = []
     for entry in directory.glob(pattern):
         if not entry.is_file():
             continue
         if entry.name == keep_prefix or entry.name.startswith(keep_prefix + "."):
+            continue
+        try:
+            stat = entry.stat()
+        except OSError:
+            # An artifact that cannot even be stat'ed cannot be proven recent;
+            # treating it as expired keeps retention bounded rather than
+            # growing whenever the filesystem misbehaves.
+            superseded.append((entry, 0, 0))
+            continue
+        superseded.append((entry, stat.st_mtime_ns, stat.st_size))
+    # Newest evidence first so the bounded budget keeps the most recent
+    # incarnations, which are the ones a post-mortem actually needs.
+    superseded.sort(key=itemgetter(1), reverse=True)
+    retained_files = 0
+    retained_bytes = 0
+    for entry, mtime_ns, size in superseded:
+        recent = window.now - mtime_ns / _NANOSECONDS_PER_SECOND < window.retention_seconds
+        within_budget = (
+            retained_files < window.max_files and retained_bytes + size <= window.max_bytes
+        )
+        if recent and within_budget:
+            retained_files += 1
+            retained_bytes += size
             continue
         try:
             entry.unlink()

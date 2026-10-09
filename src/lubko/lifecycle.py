@@ -35,6 +35,7 @@ import sys
 import time
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
@@ -120,6 +121,21 @@ UV_HTTP_TIMEOUT: Final = "30"
 
 #: Deterministic sentinel the probe payload writes to stdout on successful exec.
 READINESS_SENTINEL: Final = "lubko-readiness-sentinel"
+
+
+class QueueConsumption(Enum):
+    """Outcome of one queue roundtrip probe against an exact worker.
+
+    The three states are deliberately distinct: only
+    :attr:`NOT_CONSUMED` says anything about the worker.  A probe that could
+    not be performed is a statement about the database or the local
+    environment, never about whether the worker still makes forward progress.
+    """
+
+    CONSUMED = "consumed"
+    NOT_CONSUMED = "not_consumed"
+    INDETERMINATE = "indeterminate"
+
 
 VALIDATION_STEPS: Final = (
     ("sync", "--frozen", "--extra", "dev"),
@@ -3112,7 +3128,45 @@ def verify_worker_consumes_queue(
         ``True`` only when the exact worker consumed the probe and the payload
         produced positive execution evidence.
     """
-    return _verify_queue_roundtrip(
+    return (
+        _probe_queue_consumption(
+            worker_id,
+            cwd,
+            worker_pid,
+            timeout_seconds,
+            progress_callback=progress_callback,
+        )
+        is QueueConsumption.CONSUMED
+    )
+
+
+def verify_worker_consumes_queue_detailed(
+    worker_id: str,
+    cwd: str,
+    worker_pid: int,
+    timeout_seconds: float,
+    progress_callback: Callable[[], None] | None = None,
+) -> QueueConsumption:
+    """Prove queue consumption, distinguishing an inconclusive probe.
+
+    A readiness or retirement decision must never treat "this probe could not
+    be performed" (missing database configuration, unreachable database, or an
+    unproven probe insert) as evidence about the worker: a database-side
+    failure says nothing about whether the worker still makes forward
+    progress.
+
+    Args:
+        worker_id: Worker identifier the worker records on claims.
+        cwd: Working directory for the probe job.
+        worker_pid: Exact PID of the worker process to prove.
+        timeout_seconds: Maximum seconds to wait for the probe to be claimed.
+        progress_callback: Optional cooperative callback invoked while waiting.
+
+    Returns:
+        The conclusive observation, or :attr:`QueueConsumption.INDETERMINATE`
+        when the probe itself could not be performed.
+    """
+    return _probe_queue_consumption(
         worker_id,
         cwd,
         worker_pid,
@@ -3121,53 +3175,47 @@ def verify_worker_consumes_queue(
     )
 
 
-def _verify_queue_roundtrip(
+def _probe_queue_consumption(
     worker_id: str,
     cwd: str,
-    recovery_worker_pid: int,
+    worker_pid: int,
     timeout_seconds: float,
     progress_callback: Callable[[], None] | None = None,
-) -> bool:
-    """Verify the exact recovery worker really consumes the queue.
-
-    A probe job is inserted and must be claimed and executed by the exact
-    recovery worker: the claim is bound to the supplied PID through the
-    persisted ``process_pid`` descendant check, with ``worker_id`` as an
-    additional check.  The probe payload uses the sealed runtime's Python to
-    emit a deterministic sentinel on successful exec; the sentinel must appear
-    in the published output before readiness succeeds.  If any other worker
-    claims the probe, one-consumer semantics are violated and the repair fails.
-    The probe is cancelled, awaited terminal, and removed in all cases, so the
-    roundtrip leaves no queue row and no process behind.
+) -> QueueConsumption:
+    """Run the queue roundtrip probe and classify its outcome conclusively.
 
     Args:
-        worker_id: Worker identifier the recovery worker will record on claims.
+        worker_id: Worker identifier the worker records on claims.
         cwd: Working directory for the probe job.
-        recovery_worker_pid: Exact PID of the worker being adopted.
+        worker_pid: Exact PID of the worker process to prove.
         timeout_seconds: Maximum seconds to wait for the probe to be claimed.
         progress_callback: Optional cooperative callback invoked while waiting.
 
     Returns:
-        ``True`` only when the exact worker consumed the probe.
+        :attr:`QueueConsumption.CONSUMED` when the exact worker consumed the
+        probe, :attr:`QueueConsumption.NOT_CONSUMED` when the probe ran
+        conclusively and the worker did not, and
+        :attr:`QueueConsumption.INDETERMINATE` when the probe itself could not
+        be performed.
     """
     try:
         database = load_database_config()
     except (OSError, ValueError):
-        return False
+        return QueueConsumption.INDETERMINATE
     try:
         conn = psycopg.connect(database.conninfo(), row_factory=tuple_row)
     except (psycopg.Error, OSError):
-        return False
+        return QueueConsumption.INDETERMINATE
     conn.autocommit = True
     try:
         probe_id = _insert_probe_job(conn, cwd)
         if probe_id is None:
-            return False
+            return QueueConsumption.INDETERMINATE
         try:
-            outcome = _wait_for_probe_claim(
+            consumed = _wait_for_probe_claim(
                 conn,
                 probe_id,
-                (worker_id, recovery_worker_pid),
+                (worker_id, worker_pid),
                 timeout_seconds,
                 progress_callback=progress_callback,
             )
@@ -3182,7 +3230,7 @@ def _verify_queue_roundtrip(
             )
             with suppress(psycopg.Error):
                 delete_job_and_chunks(conn, probe_id, server=_probe_server())
-        return outcome
+        return QueueConsumption.CONSUMED if consumed else QueueConsumption.NOT_CONSUMED
     finally:
         conn.close()
 
@@ -3292,8 +3340,11 @@ def _adoption_candidate(
 
     process_env = _read_process_env(recovery_worker_pid)
     worker_id = process_env.get("LUBKO_WORKER_ID") or socket.gethostname()
-    if not _verify_queue_roundtrip(
-        worker_id, str(options.repo), recovery_worker_pid, options.probe_timeout_seconds
+    if (
+        _probe_queue_consumption(
+            worker_id, str(options.repo), recovery_worker_pid, options.probe_timeout_seconds
+        )
+        is not QueueConsumption.CONSUMED
     ):
         msg = (
             f"recovery worker pid {recovery_worker_pid} did not consume the queue as "
@@ -3555,8 +3606,11 @@ def _repair_authority_transition_locked(
     cli.gc_cli_roots((commit,))
     _cleanup_ready_markers(recovery_worker_pid)
     _reconcile_toolchain(options.uv_path)
-    if not _verify_queue_roundtrip(
-        worker_id, str(options.repo), recovery_worker_pid, options.probe_timeout_seconds
+    if (
+        _probe_queue_consumption(
+            worker_id, str(options.repo), recovery_worker_pid, options.probe_timeout_seconds
+        )
+        is not QueueConsumption.CONSUMED
     ):
         _err(
             "post-repair verification failed: the adopted worker no longer exclusively "

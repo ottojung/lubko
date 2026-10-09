@@ -187,18 +187,21 @@ def test_spawned_by_own_pid_succeeds() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_config_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Database config failure must not prove readiness."""
+def test_config_failure_is_indeterminate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A probe that cannot be performed says nothing about the worker."""
     monkeypatch.setattr(
         lifecycle,
         "load_database_config",
         lambda: (_ for _ in ()).throw(OSError("config missing")),
     )
-    assert lifecycle._verify_queue_roundtrip("w", sys.prefix, 1, 0.1) is False
+    assert (
+        lifecycle._probe_queue_consumption("w", sys.prefix, 1, 0.1)
+        is lifecycle.QueueConsumption.INDETERMINATE
+    )
 
 
-def test_connect_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Connection failure must not prove readiness."""
+def test_connect_failure_is_indeterminate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unreachable database is not evidence about the worker."""
     monkeypatch.setattr(
         lifecycle,
         "load_database_config",
@@ -209,11 +212,14 @@ def test_connect_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
         "connect",
         lambda *_a, **_kw: (_ for _ in ()).throw(OSError("no db")),
     )
-    assert lifecycle._verify_queue_roundtrip("w", sys.prefix, 1, 0.1) is False
+    assert (
+        lifecycle._probe_queue_consumption("w", sys.prefix, 1, 0.1)
+        is lifecycle.QueueConsumption.INDETERMINATE
+    )
 
 
-def test_insert_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Probe insert failure must not prove readiness."""
+def test_insert_failure_is_indeterminate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A probe that could not be inserted proves nothing about the worker."""
     monkeypatch.setattr(
         lifecycle,
         "load_database_config",
@@ -229,7 +235,10 @@ def test_insert_failure_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(psycopg, "connect", lambda *_a, **_kw: fake_conn)
     monkeypatch.setattr(lifecycle, "_insert_probe_job", lambda _conn, _cwd: None)
-    assert lifecycle._verify_queue_roundtrip("w", sys.prefix, 1, 0.1) is False
+    assert (
+        lifecycle._probe_queue_consumption("w", sys.prefix, 1, 0.1)
+        is lifecycle.QueueConsumption.INDETERMINATE
+    )
 
 
 # ---------------------------------------------------------------------------

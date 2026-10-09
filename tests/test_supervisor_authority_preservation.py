@@ -498,7 +498,15 @@ def test_deferred_readiness_publication_reports_no_success(monkeypatch: pytest.M
     """Readiness success is only reported once ``ready=True`` is durable."""
     _dead_child_state()
     daemon = supervisor.SupervisorDaemon(supervisor.Settings(lock_timeout_seconds=0.02))
-    monkeypatch.setattr(daemon, "_check_readiness", lambda _child, _cwd: (True, "ok"))
+    monkeypatch.setattr(
+        daemon,
+        "_check_readiness",
+        lambda _child, _cwd: supervisor.ReadinessProbe(
+            ready=True,
+            reason="ok",
+            consumption=lifecycle.QueueConsumption.CONSUMED,
+        ),
+    )
     monkeypatch.setattr(daemon, "_child_alive", lambda _s: True)
     published: list[str] = []
     pruned: list[str] = []

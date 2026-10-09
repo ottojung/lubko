@@ -685,7 +685,9 @@ def _stub_repair(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "gc_cli_roots", lambda _commits: None)
     monkeypatch.setattr(lifecycle, "_cleanup_ready_markers", lambda _pid: None)
     monkeypatch.setattr(lifecycle, "_reconcile_toolchain", lambda _uv: None)
-    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", lambda *_a: True)
+    monkeypatch.setattr(
+        lifecycle, "_probe_queue_consumption", lambda *_a: lifecycle.QueueConsumption.CONSUMED
+    )
     monkeypatch.setattr(lifecycle, "append_deploy_log", lambda _line: None)
 
 
@@ -942,7 +944,7 @@ def test_repair_fails_closed_when_the_consumer_boundary_is_busy(
         msg = "authority transition ran without the consumer lock"
         raise AssertionError(msg)
 
-    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", must_not_run)
+    monkeypatch.setattr(lifecycle, "_probe_queue_consumption", must_not_run)
     lock_path = supervise.supervisor_dir() / ".consumer.lock"
     with lock_path.open("a+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -1026,7 +1028,9 @@ def test_repair_never_publishes_a_candidate_that_exited_before_the_lock(
 
     monkeypatch.setattr(cli, "reconcile_pointer", reconcile)
     monkeypatch.setattr(cli, "gc_cli_roots", gc)
-    monkeypatch.setattr(lifecycle, "_verify_queue_roundtrip", lambda *_a: True)
+    monkeypatch.setattr(
+        lifecycle, "_probe_queue_consumption", lambda *_a: lifecycle.QueueConsumption.CONSUMED
+    )
     monkeypatch.setattr(lifecycle, "_cleanup_ready_markers", lambda _pid: None)
     monkeypatch.setattr(lifecycle, "_reconcile_toolchain", lambda _uv: None)
     monkeypatch.setattr(lifecycle, "git_commit", lambda *_a: COMMIT)

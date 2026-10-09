@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import lubko.health as health_module
-from lubko import supervise, supervisor
+from lubko import lifecycle, supervise, supervisor
 from lubko.health import (
     WORKER_HEALTH_SCHEMA_VERSION,
     WorkerHealth,
@@ -325,8 +325,8 @@ def test_supervisor_check_readiness_rejects_operational_degradation(
     )
 
     monkeypatch.setattr(
-        "lubko.supervisor.lifecycle.verify_worker_consumes_queue",
-        lambda *_args, **_kwargs: True,
+        "lubko.supervisor.lifecycle.verify_worker_consumes_queue_detailed",
+        lambda *_args, **_kwargs: lifecycle.QueueConsumption.CONSUMED,
     )
     # Health snapshot: live but cancellation_scan_overdue => operational not ready
     snapshot = _snapshot(
@@ -342,19 +342,22 @@ def test_supervisor_check_readiness_rejects_operational_degradation(
     )
 
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
-    ready, reason = daemon._check_readiness(child, str(tmp_path))
+    probe = daemon._check_readiness(child, str(tmp_path))
 
-    assert ready is False
-    assert "operational not ready" in reason
-    assert "cancellation" in reason
+    assert probe.ready is False
+    assert "operational not ready" in probe.reason
+    assert "cancellation" in probe.reason
     # Liveness was accepted; the rejection is purely operational
-    assert "not live" not in reason
+    assert "not live" not in probe.reason
+    # The worker did consume the queue probe, so it made forward progress
+    # even though its maintenance schedule degraded.
+    assert probe.consumption is lifecycle.QueueConsumption.CONSUMED
 
 
-def test_ready_supervisor_retires_operationally_unhealthy_worker(
+def test_ready_supervisor_retires_lease_safety_negative_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale durable ready bit cannot mask a live but wedged worker."""
+    """A negative lease-safety worker is retired immediately, without waiting."""
     child = supervise.WorkerChild(
         pid=os.getpid(),
         pgid=os.getpid(),
@@ -379,7 +382,9 @@ def test_ready_supervisor_retires_operationally_unhealthy_worker(
         "_check_worker_health",
         lambda _child: (False, "worker operational not ready: lease safety negative: -1.0s"),
     )
-    monkeypatch.setattr(daemon, "_worker_health_requires_retirement", lambda _child: True)
+    monkeypatch.setattr(
+        daemon, "_worker_health_proves_immediate_safety_breach", lambda _child: True
+    )
 
     def retire() -> bool:
         retired.append(True)
@@ -423,7 +428,9 @@ def test_ready_supervisor_does_not_restart_for_recoverable_db_health(
         "_check_worker_health",
         lambda _child: (False, "worker operational not ready: unrecovered DB error"),
     )
-    monkeypatch.setattr(daemon, "_worker_health_requires_retirement", lambda _child: False)
+    monkeypatch.setattr(
+        daemon, "_worker_health_proves_immediate_safety_breach", lambda _child: False
+    )
 
     def retire() -> bool:
         retired.append(True)
@@ -440,6 +447,75 @@ def test_ready_supervisor_does_not_restart_for_recoverable_db_health(
 
     assert retired == []
     assert not_ready == ["worker operational not ready: unrecovered DB error"]
+
+
+def test_overdue_scans_never_retire_a_ready_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Overdue maintenance scans are degraded readiness, not safety authority.
+
+    A queue-ready worker whose scans are late because the database is slow
+    must keep consuming jobs: the supervisor withdraws readiness and leaves
+    the process alone.
+    """
+    token = "e" * 32
+    child = supervise.WorkerChild(
+        pid=os.getpid(),
+        pgid=os.getpid(),
+        sid=os.getpid(),
+        start_time_ticks=proc_start_ticks(os.getpid()),  # type: ignore[arg-type]
+        token=token,
+        worker_id="test-worker",
+        spawned_at=time.time(),
+    )
+    snapshot = _snapshot(
+        pid=child.pid,
+        start_time_ticks=child.start_time_ticks,
+        published_at=time.time(),
+        worker_incarnation=token,
+        worker_id="test-worker",
+        cancellation_scan_overdue=True,
+        recovery_overdue=True,
+        gc_overdue=True,
+        db_deadline_breached_at=time.time(),
+        db_deadline_breach_count=6,
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    assert daemon._worker_health_proves_immediate_safety_breach(child) is False
+    monkeypatch.setattr(
+        "lubko.supervisor.read_worker_health_by_incarnation", lambda _token: snapshot
+    )
+    assert daemon._worker_health_proves_immediate_safety_breach(child) is False
+    op = interpret_operational_readiness(snapshot)
+    assert op.ready is False
+    assert op.any_scan_overdue is True
+
+
+def test_lease_safety_negative_is_the_immediate_safety_breach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Negative remaining lease safety is the one immediate health breach."""
+    _monkey_liveness(monkeypatch)
+    token = "f" * 32
+    child = supervise.WorkerChild(
+        pid=os.getpid(),
+        pgid=os.getpid(),
+        sid=os.getpid(),
+        start_time_ticks=proc_start_ticks(os.getpid()),  # type: ignore[arg-type]
+        token=token,
+        worker_id="test-worker",
+        spawned_at=time.time(),
+    )
+    monkeypatch.setattr(
+        "lubko.supervisor.read_worker_health_by_incarnation",
+        lambda _token: _snapshot(
+            pid=child.pid,
+            start_time_ticks=child.start_time_ticks,
+            published_at=time.time(),
+            worker_incarnation=token,
+            min_lease_safety_remaining_seconds=-4.0,
+        ),
+    )
+    daemon = supervisor.SupervisorDaemon(supervisor.Settings())
+    assert daemon._worker_health_proves_immediate_safety_breach(child) is True
 
 
 def test_supervisor_check_readiness_accepts_fully_healthy(
@@ -460,8 +536,8 @@ def test_supervisor_check_readiness_accepts_fully_healthy(
     )
 
     monkeypatch.setattr(
-        "lubko.supervisor.lifecycle.verify_worker_consumes_queue",
-        lambda *_args, **_kwargs: True,
+        "lubko.supervisor.lifecycle.verify_worker_consumes_queue_detailed",
+        lambda *_args, **_kwargs: lifecycle.QueueConsumption.CONSUMED,
     )
     snapshot = _snapshot(
         pid=child.pid,
@@ -475,9 +551,10 @@ def test_supervisor_check_readiness_accepts_fully_healthy(
     )
 
     daemon = supervisor.SupervisorDaemon(supervisor.Settings())
-    ready, reason = daemon._check_readiness(child, str(tmp_path))
-    assert ready is True
-    assert reason == "ok"
+    probe = daemon._check_readiness(child, str(tmp_path))
+    assert probe.ready is True
+    assert probe.reason == "ok"
+    assert probe.consumption is lifecycle.QueueConsumption.CONSUMED
 
 
 # ------------------------------------------------------------------
