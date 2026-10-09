@@ -436,6 +436,14 @@ DEFAULT_DB_OPERATION_TIMEOUT_SECONDS: Final = 15.0
 DEFAULT_GC_RETENTION_SECONDS: Final = 3600.0
 DEFAULT_GC_INTERVAL_SECONDS: Final = 60.0
 DEFAULT_GC_BATCH_LIMIT: Final = 100
+#: Hard upper bound on GC row-lock cardinality. This is a protocol safety
+#: constant, not merely a default; Settings rejects larger configured values.
+MAX_GC_BATCH_LIMIT: Final = 100
+#: GC row selection uses SKIP LOCKED. This finite timeout additionally bounds
+#: exceptional table/metadata lock waits such as concurrent DDL.
+GC_LOCK_TIMEOUT_MS: Final = 25
+#: Hard wall-clock budget for one complete background GC pass.
+GC_PASS_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_SPAWN_DEADLINE_SECONDS: Final = 30.0
 NUM_START_LANES: Final = 4
 SPAWN_LANE_QUEUE_SIZE: Final = NUM_START_LANES
@@ -1243,6 +1251,12 @@ class Settings:
             raise ValueError(msg)
         if self.gc_batch_limit <= 0:
             msg = "LUBKO_GC_BATCH_LIMIT must be positive"
+            raise ValueError(msg)
+        if self.gc_batch_limit > MAX_GC_BATCH_LIMIT:
+            msg = (
+                "LUBKO_GC_BATCH_LIMIT must be <= "
+                f"{MAX_GC_BATCH_LIMIT} so GC row-lock cardinality stays constant-bounded"
+            )
             raise ValueError(msg)
 
     def _validate_spool(self) -> None:
@@ -4749,6 +4763,119 @@ def verify_jobs_table_invariant(conn: JobsConnection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Isolated transport GC
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _GcSnapshot:
+    """Observation-only state published by the daemon GC thread.
+
+    The main worker reads this snapshot opportunistically. It never waits for
+    a newer snapshot, so GC observability is not a worker progress dependency.
+    """
+
+    last_gc_at: float | None
+    next_gc_at: float
+    batch_bound_hit: bool
+    last_error_at: float | None
+
+
+class _GcRunner:
+    """Run transport GC outside the worker event loop and connection.
+
+    The worker never joins this thread and never shares its DB connection.
+    Every pass has a finite client deadline and finite lock wait. GC can become
+    stale or fail repeatedly without blocking claim/start/lease/output/finalize.
+    """
+
+    def __init__(self, settings: Settings, database: DatabaseConfig) -> None:
+        self.settings = settings
+        self.database = database
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._snapshot = _GcSnapshot(
+            last_gc_at=None,
+            next_gc_at=time.monotonic(),
+            batch_bound_hit=False,
+            last_error_at=None,
+        )
+
+    @property
+    def snapshot(self) -> _GcSnapshot:
+        """Latest GC observation, available without waiting."""
+        return self._snapshot
+
+    def start(self) -> None:
+        """Start exactly one daemon GC thread."""
+        if self._thread is not None:
+            return
+        thread = threading.Thread(target=self._loop, name="transport-gc", daemon=True)
+        self._thread = thread
+        thread.start()
+
+    def stop(self) -> None:
+        """Request GC shutdown without joining it."""
+        self._stop.set()
+
+    def _connect(self) -> DeadlineConnection:
+        """Open a GC-private connection with finite statement/lock waits.
+
+        Returns:
+            A connection owned exclusively by the GC thread.
+        """
+        timeout_ms = int(GC_PASS_TIMEOUT_SECONDS * 1000)
+        conn = DeadlineConnection.connect(
+            self.database.conninfo(),
+            connect_timeout=max(1, min(5, int(GC_PASS_TIMEOUT_SECONDS))),
+            row_factory=tuple_row,
+            options=(
+                f"-c statement_timeout={timeout_ms} "
+                f"-c lock_timeout={GC_LOCK_TIMEOUT_MS} "
+                f"-c idle_in_transaction_session_timeout={timeout_ms}"
+            ),
+        )
+        conn.operation_deadline = time.monotonic() + GC_PASS_TIMEOUT_SECONDS
+        return conn
+
+    def _run_once(self) -> bool:
+        """Run one finite GC pass on a private connection.
+
+        Returns:
+            Whether the pass saturated a bounded GC batch.
+        """
+        conn = self._connect()
+        try:
+            _roots, _chunks, _orphans, bound_hit = collect_transport(conn, self.settings)
+            return bound_hit
+        finally:
+            with suppress(Exception):
+                conn.close()
+
+    def _loop(self) -> None:
+        """Run finite passes forever without becoming a worker dependency."""
+        delay = 0.0
+        last_error_at: float | None = None
+        while not self._stop.wait(delay):
+            batch_bound_hit = False
+            now_wall = time.time()
+            try:
+                batch_bound_hit = self._run_once()
+            except Exception:
+                last_error_at = now_wall
+                LOGGER.exception("background transport GC pass failed")
+            delay = (
+                SATURATED_GC_RETRY_SECONDS if batch_bound_hit else self.settings.gc_interval_seconds
+            )
+            self._snapshot = _GcSnapshot(
+                last_gc_at=now_wall,
+                next_gc_at=time.monotonic() + delay,
+                batch_bound_hit=batch_bound_hit,
+                last_error_at=last_error_at,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Supervisor
 # ---------------------------------------------------------------------------
 
@@ -4783,7 +4910,6 @@ class Supervisor:
         self._next_lease_refresh_at = 0.0
         self._next_cancel_scan_at = 0.0
         self._next_reconnect_at = 0.0
-        self._next_gc_at = 0.0
         self._next_reaper_at = 0.0
         self._next_claim_scan_at = 0.0
         self._started_at = time.time()
@@ -4800,14 +4926,13 @@ class Supervisor:
         self._db_deadline_breach_count = 0
         self._last_cancellation_scan_at: float | None = None
         self._last_recovery_at: float | None = None
-        self._last_gc_at: float | None = None
-        self._gc_batch_bound_hit = False
         self._cancellation_batch_bound_hit = False
         self._recovery_batch_bound_hit = False
         self._next_health_publish_at = 0.0
         self._health_force = True
         self._pending_starts: dict[UUID, _StartAttempt] = {}
         self._spawn_pool = _SpawnExecutor()
+        self._gc_runner = _GcRunner(settings, database)
 
     def request_shutdown(self) -> None:
         """Request a graceful shutdown from another thread or a signal handler.
@@ -4839,6 +4964,7 @@ class Supervisor:
           external process supervisor's crash-loop backoff.
         """
         self._connect()
+        self._gc_runner.start()
         self._publish_health(force=True)
         while not self._stopping:
             try:
@@ -4966,20 +5092,6 @@ class Supervisor:
                 self._next_reaper_at = (
                     time.monotonic() + self.settings.lease_recovery_interval_seconds
                 )
-        if now >= self._next_gc_at:
-            # A saturated GC pass can take several seconds. Give the normal
-            # worker loop a real service window before retrying instead of
-            # scheduling the next pass at the 100 ms process-poll cadence.
-            # The intervening ticks poll gated starts, drain captures, claim,
-            # publish output, and refresh leases before GC runs again. This
-            # keeps readiness-sensitive commands responsive without allowing a
-            # continuous stream of pending starts to starve GC indefinitely.
-            next_gc_delay = self.settings.gc_interval_seconds
-            try:
-                if self._run_gc():
-                    next_gc_delay = SATURATED_GC_RETRY_SECONDS
-            finally:
-                self._next_gc_at = time.monotonic() + next_gc_delay
 
     def _drain_captures(self, bound: int | None = None) -> None:
         """Drain every active job's capture pipes into their bounded spools.
@@ -5191,34 +5303,6 @@ class Supervisor:
             LOGGER.warning(
                 "reaped %d pending job(s) at an unsupported protocol version", len(reaped)
             )
-
-    def _run_gc(self) -> bool:
-        """Run the transport garbage collection pass.
-
-        Three-phase staged GC: mark terminal roots, drain one root's chunks in
-        a bounded batch, finalize that root when empty, then clean orphan chunks.
-        Abandoned ``running`` rows go through lease recovery first.
-        ``pending`` and ``running`` rows are never collected.
-
-        Returns:
-            Whether the pass hit a GC batch bound and should therefore be
-            scheduled again on the next worker turn.
-        """
-        conn = self.conn
-        if conn is None:
-            return False
-        self._last_gc_at = time.time()
-        roots, chunks, orphans, bound_hit = collect_transport(conn, self.settings)
-        self._gc_batch_bound_hit = bound_hit
-        if roots or chunks or orphans:
-            LOGGER.info(
-                "gc marked %d root(s), deleted %d chunk(s), cleaned %d orphan(s)%s",
-                len(roots),
-                chunks,
-                orphans,
-                "; batch bound hit (saturated)" if bound_hit else "",
-            )
-        return bound_hit
 
     def _heartbeat_root_ids(self) -> set[UUID]:
         """Return the root IDs whose lease is refreshed this turn.
@@ -6569,6 +6653,20 @@ class Supervisor:
     # Health publishing
     # ------------------------------------------------------------------
 
+    def _gc_snapshot(self) -> _GcSnapshot:
+        """Latest GC observation, or an initial snapshot before runner wiring.
+
+        Returns:
+            A snapshot usable for health-only observation. This method never
+            waits for the background GC thread.
+        """
+        runner = cast("_GcRunner | None", getattr(self, "_gc_runner", None))
+        if runner is None:
+            return _GcSnapshot(
+                last_gc_at=None, next_gc_at=0.0, batch_bound_hit=False, last_error_at=None
+            )
+        return runner.snapshot
+
     def _build_health(self, *, alive: bool = True, shutting_down: bool = False) -> WorkerHealth:
         """Build a health snapshot from the current supervisor state.
 
@@ -6585,6 +6683,7 @@ class Supervisor:
         now_mono = time.monotonic()
         now_wall = time.time()
         agg = self._collect_health_aggregates(now_mono)
+        gc_snapshot = self._gc_snapshot()
         return WorkerHealth(
             schema_version=WORKER_HEALTH_SCHEMA_VERSION,
             worker_id=self.settings.worker_id,
@@ -6614,12 +6713,12 @@ class Supervisor:
             last_scan_batch_size=getattr(self, "_last_claim_batch", 0),
             last_cancellation_scan_at=getattr(self, "_last_cancellation_scan_at", None),
             last_recovery_at=getattr(self, "_last_recovery_at", None),
-            last_gc_at=getattr(self, "_last_gc_at", None),
+            last_gc_at=gc_snapshot.last_gc_at,
             cancellation_scan_overdue=agg.cancellation_scan_overdue,
             recovery_overdue=agg.recovery_overdue,
             gc_overdue=agg.gc_overdue,
             gc_batch_limit=self.settings.gc_batch_limit,
-            gc_batch_bound_hit=getattr(self, "_gc_batch_bound_hit", False),
+            gc_batch_bound_hit=gc_snapshot.batch_bound_hit,
             cancellation_batch_limit=CANCEL_DISCOVERY_LIMIT,
             cancellation_batch_bound_hit=getattr(self, "_cancellation_batch_bound_hit", False),
             recovery_batch_limit=LEASE_RECOVERY_LIMIT,
@@ -6701,8 +6800,8 @@ class Supervisor:
             ),
             gc_overdue=_scan_schedule_overdue(
                 now_mono,
-                getattr(self, "_next_gc_at", 0.0),
-                db_operation_timeout_seconds=self.settings.db_operation_timeout_seconds,
+                self._gc_snapshot().next_gc_at,
+                db_operation_timeout_seconds=GC_PASS_TIMEOUT_SECONDS,
                 process_poll_interval_seconds=self.settings.process_poll_interval_seconds,
             ),
         )
@@ -6844,6 +6943,7 @@ class Supervisor:
         (deterministic/schema/programming) fault propagates naturally: Python runs
         the ``finally`` cleanup and final health publication first, then re-raises.
         """
+        self._gc_runner.stop()
         self._cleanup_pending_starts()
         self._spawn_pool.shutdown()
         try:

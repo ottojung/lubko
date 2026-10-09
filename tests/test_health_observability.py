@@ -77,47 +77,22 @@ def test_db_deadline_breach_recorded_at_failure_path() -> None:
     assert health.db_deadline_breached_at == sup._db_deadline_breached_at
 
 
-def test_gc_bound_hit_propagates_from_collect_transport() -> None:
-    """_run_gc wires the saturation flag from collect_transport into health."""
-    sup = _bare_supervisor()
-    sup.conn = cast("JobsConnection", object())  # non-None so _run_gc proceeds
-
-    with patch.object(worker, "collect_transport", return_value=([], 0, 0, True)):
-        assert sup._run_gc() is True
-    assert sup._gc_batch_bound_hit is True
-    assert isinstance(sup._last_gc_at, float)
-
-    with patch.object(worker, "collect_transport", return_value=([], 0, 0, False)):
-        assert sup._run_gc() is False
-    assert sup._gc_batch_bound_hit is False
-
-
 def test_gc_bound_hit_reflected_in_health() -> None:
-    """The saturation flag flows from the worker into the built health snapshot."""
+    """The background GC snapshot flows into worker health without waiting."""
     sup = _bare_supervisor()
-    sup._gc_batch_bound_hit = True
-    assert sup._build_health().gc_batch_bound_hit is True
-    sup._gc_batch_bound_hit = False
-    assert sup._build_health().gc_batch_bound_hit is False
 
+    class Runner:
+        snapshot = worker._GcSnapshot(
+            last_gc_at=10.0,
+            next_gc_at=20.0,
+            batch_bound_hit=True,
+            last_error_at=None,
+        )
 
-def test_scan_recency_fields_wired_from_periodic_passes() -> None:
-    """Cancellation/recovery/GC recency timestamps are set by their passes."""
-    sup = _bare_supervisor()
-    sup.conn = cast("JobsConnection", object())
-
-    with (
-        patch.object(worker, "discover_cancellations", return_value=[]),
-        patch.object(worker, "recover_stale_jobs", return_value=[]),
-        patch.object(worker, "collect_transport", return_value=([], 0, 0, False)),
-    ):
-        sup._discover_cancellations()
-        sup._run_recovery()
-        sup._run_gc()
+    sup._gc_runner = cast("worker._GcRunner", Runner())
     health = sup._build_health()
-    assert isinstance(health.last_cancellation_scan_at, float)
-    assert isinstance(health.last_recovery_at, float)
-    assert isinstance(health.last_gc_at, float)
+    assert health.gc_batch_bound_hit is True
+    assert health.last_gc_at == pytest.approx(10.0)
 
 
 def _fake_active(last_heartbeat_at: float, *, claimed_at: float = 0.0) -> worker.ActiveJob:
@@ -223,7 +198,16 @@ def test_scan_schedule_jitter_within_db_deadline_is_not_overdue() -> None:
     )
     sup._next_cancel_scan_at = 100.0
     sup._next_recovery_at = 100.0
-    sup._next_gc_at = 100.0
+
+    class Runner:
+        snapshot = worker._GcSnapshot(
+            last_gc_at=None,
+            next_gc_at=100.0,
+            batch_bound_hit=False,
+            last_error_at=None,
+        )
+
+    sup._gc_runner = cast("worker._GcRunner", Runner())
 
     agg = sup._collect_health_aggregates(now_mono=105.1)
 
@@ -242,7 +226,16 @@ def test_scan_schedule_beyond_db_deadline_and_poll_is_overdue() -> None:
     )
     sup._next_cancel_scan_at = 100.0
     sup._next_recovery_at = 100.0
-    sup._next_gc_at = 100.0
+
+    class Runner:
+        snapshot = worker._GcSnapshot(
+            last_gc_at=None,
+            next_gc_at=100.0,
+            batch_bound_hit=False,
+            last_error_at=None,
+        )
+
+    sup._gc_runner = cast("worker._GcRunner", Runner())
 
     agg = sup._collect_health_aggregates(now_mono=105.100001)
 
@@ -256,7 +249,6 @@ def test_initial_due_scans_are_not_reported_stalled_before_first_turn() -> None:
     sup = _bare_supervisor()
     sup._next_cancel_scan_at = 0.0
     sup._next_recovery_at = 0.0
-    sup._next_gc_at = 0.0
 
     agg = sup._collect_health_aggregates(now_mono=1_000_000.0)
 
